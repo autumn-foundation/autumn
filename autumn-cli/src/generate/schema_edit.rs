@@ -3748,57 +3748,148 @@ fn is_section_boundary(trimmed: &str, section: &str) -> bool {
     trimmed.starts_with('[') && !trimmed.starts_with(&format!("[{section}."))
 }
 
-/// SQL for adding a stored generated `search_vector` column and GIN index.
+/// Backend-aware `up.sql` for the full-text-search scaffold (issue #1910).
+///
+/// * **Postgres**: a stored generated `search_vector` `tsvector` column
+///   (`setweight`/`to_tsvector` per `SEARCH_FIELDS` weight) plus a GIN index.
+/// * **`SQLite`**: an **external-content FTS5 virtual table** `"<table>__fts"`
+///   over the same `SEARCH_FIELDS` columns (tokenized `unicode61`, so case
+///   folding covers the full Unicode range), kept in sync with `AFTER
+///   INSERT`/`DELETE`/`UPDATE` triggers on the base table, and backfilled with
+///   the FTS5 `'rebuild'` command. `SQLite` FTS5 has no per-language stemmer, so
+///   `language` is unused on that arm (it selects the tokenizer, not a Postgres
+///   text-search dictionary). The generated repository (`#[repository(...,
+///   searchable)]`) queries this table with `MATCH` + `bm25()` ranking.
 #[must_use]
-pub fn add_search_up_sql(table: &str, language: &str, fields: &[(String, char)]) -> String {
+pub fn add_search_up_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    language: &str,
+    fields: &[(String, char)],
+) -> String {
+    match backend {
+        DatabaseBackend::Sqlite => sqlite_add_search_up_sql(table, fields),
+        DatabaseBackend::Postgres => {
+            let mut out = String::new();
+            let _ = writeln!(
+                out,
+                "-- autumn-safety: potentially-blocking \n\
+                 -- adding stored generated column will backfill existing rows"
+            );
+
+            let safe_lang: String = language
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+                .collect();
+            let safe_lang = if safe_lang.is_empty() {
+                "simple".to_string()
+            } else {
+                safe_lang
+            };
+
+            let mut expr = String::new();
+            for (i, (field, weight)) in fields.iter().enumerate() {
+                if i > 0 {
+                    expr.push_str(" || ");
+                }
+                let _ = write!(
+                    expr,
+                    "setweight(to_tsvector('{safe_lang}'::regconfig, coalesce(\"{field}\"::text, '')), '{weight}')"
+                );
+            }
+
+            let _ = writeln!(
+                out,
+                "ALTER TABLE {table} ADD COLUMN search_vector tsvector GENERATED ALWAYS AS ({expr}) STORED;"
+            );
+            let _ = writeln!(
+                out,
+                "CREATE INDEX idx_{table}_search_vector ON {table} USING gin(search_vector);"
+            );
+            out
+        }
+    }
+}
+
+/// Backend-aware `down.sql` companion to [`add_search_up_sql_for`].
+#[must_use]
+pub fn add_search_down_sql_for(backend: DatabaseBackend, table: &str) -> String {
+    match backend {
+        DatabaseBackend::Sqlite => sqlite_add_search_down_sql(table),
+        DatabaseBackend::Postgres => {
+            let mut out = String::new();
+            let _ = writeln!(out, "DROP INDEX IF EXISTS idx_{table}_search_vector;");
+            let _ = writeln!(
+                out,
+                "ALTER TABLE {table} DROP COLUMN IF EXISTS search_vector;"
+            );
+            out
+        }
+    }
+}
+
+/// `SQLite` FTS5 `up.sql`: external-content virtual table + maintenance triggers
+/// + backfill rebuild (issue #1910). The FTS table is `"<table>__fts"`, indexes
+/// the `SEARCH_FIELDS` columns in priority order, and mirrors the base table via
+/// `content='<table>', content_rowid='id'` so the base table stays the single
+/// source of truth (the generated `bm25()`-ranked `MATCH` query joins the two).
+fn sqlite_add_search_up_sql(table: &str, fields: &[(String, char)]) -> String {
+    let fts = format!("{table}__fts");
+    // Quoted, comma-separated indexed column list, shared across the DDL.
+    let cols: Vec<String> = fields.iter().map(|(f, _)| format!("\"{f}\"")).collect();
+    let cols_csv = cols.join(", ");
+    // `new."col"` / `old."col"` lists for the trigger bodies.
+    let new_vals: Vec<String> = fields.iter().map(|(f, _)| format!("new.\"{f}\"")).collect();
+    let new_vals_csv = new_vals.join(", ");
+    let old_vals: Vec<String> = fields.iter().map(|(f, _)| format!("old.\"{f}\"")).collect();
+    let old_vals_csv = old_vals.join(", ");
+
     let mut out = String::new();
     let _ = writeln!(
         out,
         "-- autumn-safety: potentially-blocking \n\
-         -- adding stored generated column will backfill existing rows"
+         -- rebuilding the FTS5 index backfills every existing row"
     );
-
-    let safe_lang: String = language
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
-        .collect();
-    let safe_lang = if safe_lang.is_empty() {
-        "simple".to_string()
-    } else {
-        safe_lang
-    };
-
-    let mut expr = String::new();
-    for (i, (field, weight)) in fields.iter().enumerate() {
-        if i > 0 {
-            expr.push_str(" || ");
-        }
-        let _ = write!(
-            expr,
-            "setweight(to_tsvector('{safe_lang}'::regconfig, coalesce(\"{field}\"::text, '')), '{weight}')"
-        );
-    }
-
+    // External-content FTS5 virtual table over the SEARCH_FIELDS columns.
     let _ = writeln!(
         out,
-        "ALTER TABLE {table} ADD COLUMN search_vector tsvector GENERATED ALWAYS AS ({expr}) STORED;"
+        "CREATE VIRTUAL TABLE \"{fts}\" USING fts5({cols_csv}, content='{table}', content_rowid='id', tokenize='unicode61');"
+    );
+    // Keep the index in sync with the base table (standard external-content
+    // pattern): insert the new row, tombstone the old row on delete, and do both
+    // on update.
+    let _ = writeln!(
+        out,
+        "CREATE TRIGGER \"{fts}_ai\" AFTER INSERT ON \"{table}\" BEGIN\n  \
+         INSERT INTO \"{fts}\"(rowid, {cols_csv}) VALUES (new.id, {new_vals_csv});\n\
+         END;"
     );
     let _ = writeln!(
         out,
-        "CREATE INDEX idx_{table}_search_vector ON {table} USING gin(search_vector);"
+        "CREATE TRIGGER \"{fts}_ad\" AFTER DELETE ON \"{table}\" BEGIN\n  \
+         INSERT INTO \"{fts}\"(\"{fts}\", rowid, {cols_csv}) VALUES('delete', old.id, {old_vals_csv});\n\
+         END;"
     );
+    let _ = writeln!(
+        out,
+        "CREATE TRIGGER \"{fts}_au\" AFTER UPDATE ON \"{table}\" BEGIN\n  \
+         INSERT INTO \"{fts}\"(\"{fts}\", rowid, {cols_csv}) VALUES('delete', old.id, {old_vals_csv});\n  \
+         INSERT INTO \"{fts}\"(rowid, {cols_csv}) VALUES (new.id, {new_vals_csv});\n\
+         END;"
+    );
+    // Backfill the index for rows that already exist.
+    let _ = writeln!(out, "INSERT INTO \"{fts}\"(\"{fts}\") VALUES('rebuild');");
     out
 }
 
-/// `down.sql` companion to [`add_search_up_sql`].
-#[must_use]
-pub fn add_search_down_sql(table: &str) -> String {
+/// `SQLite` FTS5 `down.sql`: drop the maintenance triggers, then the FTS table.
+fn sqlite_add_search_down_sql(table: &str) -> String {
+    let fts = format!("{table}__fts");
     let mut out = String::new();
-    let _ = writeln!(out, "DROP INDEX IF EXISTS idx_{table}_search_vector;");
-    let _ = writeln!(
-        out,
-        "ALTER TABLE {table} DROP COLUMN IF EXISTS search_vector;"
-    );
+    let _ = writeln!(out, "DROP TRIGGER IF EXISTS \"{fts}_au\";");
+    let _ = writeln!(out, "DROP TRIGGER IF EXISTS \"{fts}_ad\";");
+    let _ = writeln!(out, "DROP TRIGGER IF EXISTS \"{fts}_ai\";");
+    let _ = writeln!(out, "DROP TABLE IF EXISTS \"{fts}\";");
     out
 }
 
@@ -7263,13 +7354,70 @@ pub struct Post {
 
     #[test]
     fn test_add_search_up_sql_quotes_columns() {
-        let sql = add_search_up_sql(
+        let sql = add_search_up_sql_for(
+            DatabaseBackend::Postgres,
             "posts",
             "english",
             &[("title".to_string(), 'A'), ("body".to_string(), 'B')],
         );
         assert!(sql.contains("coalesce(\"title\"::text, '')"));
         assert!(sql.contains("coalesce(\"body\"::text, '')"));
+    }
+
+    #[test]
+    fn test_add_search_up_sql_sqlite_emits_fts5_external_content_and_triggers() {
+        // #1910: the SQLite arm emits an external-content FTS5 vtable over the
+        // SEARCH_FIELDS columns, maintenance triggers, and a backfill rebuild —
+        // and NO Postgres tsvector/GIN DDL.
+        let up = add_search_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            "english",
+            &[("title".to_string(), 'A'), ("body".to_string(), 'B')],
+        );
+        assert!(
+            up.contains(
+                "CREATE VIRTUAL TABLE \"posts__fts\" USING fts5(\"title\", \"body\", \
+                 content='posts', content_rowid='id', tokenize='unicode61');"
+            ),
+            "up: {up}"
+        );
+        // Insert trigger writes the new row into the index.
+        assert!(
+            up.contains(
+                "INSERT INTO \"posts__fts\"(rowid, \"title\", \"body\") \
+                 VALUES (new.id, new.\"title\", new.\"body\");"
+            ),
+            "up: {up}"
+        );
+        // Delete trigger tombstones the old row via the external-content 'delete'
+        // command.
+        assert!(
+            up.contains(
+                "INSERT INTO \"posts__fts\"(\"posts__fts\", rowid, \"title\", \"body\") \
+                 VALUES('delete', old.id, old.\"title\", old.\"body\");"
+            ),
+            "up: {up}"
+        );
+        // Update trigger does both (delete-then-insert).
+        assert!(up.contains("CREATE TRIGGER \"posts__fts_au\""), "up: {up}");
+        assert!(
+            up.contains("INSERT INTO \"posts__fts\"(\"posts__fts\") VALUES('rebuild');"),
+            "up: {up}"
+        );
+        for leak in ["tsvector", "to_tsvector", "USING gin", "search_vector"] {
+            assert!(!up.contains(leak), "SQLite up leaked `{leak}`: {up}");
+        }
+
+        // down.sql drops the three triggers then the FTS table.
+        let down = add_search_down_sql_for(DatabaseBackend::Sqlite, "posts");
+        for trig in ["posts__fts_au", "posts__fts_ad", "posts__fts_ai"] {
+            assert!(
+                down.contains(&format!("DROP TRIGGER IF EXISTS \"{trig}\";")),
+                "down: {down}"
+            );
+        }
+        assert!(down.contains("DROP TABLE IF EXISTS \"posts__fts\";"), "down: {down}");
     }
 
     #[test]
@@ -7285,15 +7433,20 @@ pub struct Post {
 
     #[test]
     fn test_add_search_up_sql_sanitizes_language() {
-        let sql = add_search_up_sql(
+        let sql = add_search_up_sql_for(
+            DatabaseBackend::Postgres,
             "posts",
             "english'; DROP TABLE posts;--",
             &[("title".to_string(), 'A')],
         );
         assert!(sql.contains("to_tsvector('englishDROPTABLEposts'::regconfig"));
 
-        let sql_qualified =
-            add_search_up_sql("posts", "pg_catalog.english", &[("title".to_string(), 'A')]);
+        let sql_qualified = add_search_up_sql_for(
+            DatabaseBackend::Postgres,
+            "posts",
+            "pg_catalog.english",
+            &[("title".to_string(), 'A')],
+        );
         assert!(sql_qualified.contains("to_tsvector('pg_catalog.english'::regconfig"));
     }
 

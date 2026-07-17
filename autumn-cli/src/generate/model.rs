@@ -8,7 +8,8 @@ use super::dsl::{Field, FieldConstraints, FieldKind, IdType, parse_fields};
 use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, add_search_down_sql, add_search_up_sql, append_schema_table_with_id_for,
+    add_mod_declaration, add_search_down_sql_for, add_search_up_sql_for,
+    append_schema_table_with_id_for,
     create_table_sql_with_metadata_and_id_for, drop_table_sql, link_models_into_seed_bin,
 };
 use super::{GenerateError, detect_backend, ensure_project_root, read_or_empty};
@@ -146,13 +147,11 @@ pub fn plan_model_with_options(
     let metadata = parse_model_metadata(&fields, options)?;
 
     // Determine the target app's database backend so the emitted DDL / diesel
-    // schema is backend-aware (SQLite foundation, issue #1614). Postgres FTS
-    // (`--searchable`) has no SQLite equivalent in this slice, so reject it at
-    // generate time rather than emit `tsvector` DDL that breaks on SQLite.
+    // schema is backend-aware (SQLite foundation, issue #1614). Full-text search
+    // (`--searchable`) is now supported on both backends — Postgres emits a
+    // `tsvector` column + GIN index, SQLite emits an FTS5 virtual table +
+    // triggers (issue #1910) — so it is no longer rejected here.
     let backend = detect_backend(project_root);
-    if backend == autumn_web::config::DatabaseBackend::Sqlite && !metadata.searchable().is_empty() {
-        return Err(super::sqlite_search_unsupported_error());
-    }
     // A UUID primary key needs app-side id generation on SQLite (no
     // `gen_random_uuid()`), which is part of the deferred runtime slice #1905;
     // reject `--id uuid` on a SQLite app at generate time rather than emit a
@@ -249,18 +248,20 @@ pub fn plan_model_with_options(
     } else {
         table_sql
     };
-    // Full-text search (issue #1319): the `search_vector` generated column + GIN
-    // index are what `#[repository(..., searchable)]`'s `search_page` queries.
-    // Emitted in the same create-table migration so `autumn migrate` yields a
-    // working search with zero manual SQL. The column is a stored generated
-    // column, so it is intentionally NOT added to the model struct or schema.rs
-    // (the macro loads matched rows by id via raw SQL).
+    // Full-text search (issues #1319, #1910): backend-aware FTS scaffold emitted
+    // in the same create-table migration so `autumn migrate` yields a working
+    // search with zero manual SQL. On Postgres this is the `search_vector`
+    // generated column + GIN index; on SQLite it is an external-content FTS5
+    // virtual table + maintenance triggers (`add_search_up_sql_for`). Neither is
+    // added to the model struct or schema.rs (the macro loads matched rows by id
+    // via raw SQL), so the FTS objects stay outside the model surface on both
+    // backends.
     let (up_sql, down_sql) = if metadata.searchable().is_empty() {
         (up_sql, drop_table_sql(&table))
     } else {
         let language = metadata.search_language().unwrap_or("english");
-        let search_up = add_search_up_sql(&table, language, metadata.searchable());
-        let search_down = add_search_down_sql(&table);
+        let search_up = add_search_up_sql_for(backend, &table, language, metadata.searchable());
+        let search_down = add_search_down_sql_for(backend, &table);
         (
             format!("{up_sql}\n{search_up}"),
             format!("{search_down}{}", drop_table_sql(&table)),
@@ -3131,13 +3132,14 @@ mod tests {
         });
     }
 
-    /// Postgres FTS on a `SQLite` app is rejected at generate time citing #1910
-    /// rather than emitting `tsvector` DDL that `SQLite` cannot run (AC #4).
+    /// FTS on a `SQLite` app now emits an FTS5 external-content virtual table +
+    /// maintenance triggers (issue #1910) instead of being rejected — and no
+    /// Postgres-only `tsvector`/GIN DDL leaks into the SQLite migration.
     #[test]
-    fn searchable_on_sqlite_app_is_rejected_citing_1910() {
+    fn searchable_on_sqlite_app_emits_fts5() {
         with_no_db_env(|| {
             let tmp = project_with_db_url("sqlite://app.db");
-            let err = plan_model_with_options(
+            let plan = plan_model_with_options(
                 tmp.path(),
                 "Post",
                 &["title:String".into(), "body:Text".into()],
@@ -3147,17 +3149,51 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .unwrap_err();
-            let msg = err.to_string();
+            .expect("searchable SQLite model plans without rejection");
+            plan.execute(Flags::default()).unwrap();
+
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            let down = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/down.sql"),
+            )
+            .unwrap();
+
+            // External-content FTS5 virtual table over the searchable columns.
             assert!(
-                matches!(err, GenerateError::Config(_)),
-                "expected Config error, got: {err:?}"
+                up.contains(
+                    "CREATE VIRTUAL TABLE \"posts__fts\" USING fts5(\"title\", \"body\", \
+                     content='posts', content_rowid='id', tokenize='unicode61');"
+                ),
+                "up.sql must create the FTS5 vtable: {up}"
             );
-            assert!(msg.contains("1910"), "must cite issue #1910: {msg}");
+            // Maintenance triggers keep the index in sync.
+            for trig in ["posts__fts_ai", "posts__fts_ad", "posts__fts_au"] {
+                assert!(up.contains(trig), "up.sql must create trigger {trig}: {up}");
+            }
             assert!(
-                msg.contains("SQLite") && msg.contains("full-text search"),
-                "message must be actionable: {msg}"
+                up.contains("INSERT INTO \"posts__fts\"(\"posts__fts\") VALUES('rebuild');"),
+                "up.sql must backfill via 'rebuild': {up}"
             );
+            // down.sql drops the triggers and the FTS table.
+            assert!(
+                down.contains("DROP TABLE IF EXISTS \"posts__fts\";"),
+                "down.sql must drop the FTS table: {down}"
+            );
+            for trig in ["posts__fts_ai", "posts__fts_ad", "posts__fts_au"] {
+                assert!(
+                    down.contains(&format!("DROP TRIGGER IF EXISTS \"{trig}\";")),
+                    "down.sql must drop trigger {trig}: {down}"
+                );
+            }
+            // No Postgres-only FTS DDL may leak into the SQLite migration.
+            for leak in ["tsvector", "to_tsvector", "USING gin", "search_vector"] {
+                assert!(!up.contains(leak), "SQLite up.sql leaked `{leak}`: {up}");
+            }
         });
     }
 
