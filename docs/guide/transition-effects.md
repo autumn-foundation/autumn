@@ -63,7 +63,7 @@ impl Order {
 The job receives a framework-provided `TransitionEffect` describing the edge that fired:
 
 ```rust
-#[job(name = "send_shipped_email", unique, by = ["idempotency_key"])]
+#[job(name = "send_shipped_email", unique, unique_by = "idempotency_key")]
 async fn send_shipped_email(state: AppState, effect: TransitionEffect) -> AutumnResult<()> {
     // effect.model / .field / .record_id / .from_state / .to_state / .idempotency_key
     Ok(())
@@ -78,7 +78,7 @@ Every `on_commit` effect carries a dedup key derived automatically from the edge
 {model}:{field}:{record_id}:{from_state}:{to_state}
 ```
 
-Declaring the job `#[job(unique, by = ["idempotency_key"])]` (as above) collapses a retried or duplicated enqueue to a single run, so the same order can never send two "shipped" emails even if the transition is replayed.
+Declaring the job `#[job(unique, unique_by = "idempotency_key")]` (as above) collapses a retried or duplicated enqueue to a single run, so the same order can never send two "shipped" emails even if the transition is replayed.
 
 ---
 

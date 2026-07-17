@@ -52,7 +52,7 @@ Enable the runtime by building the application with the `sqlite` cargo feature (
 
 - **Connection type.** A `RuntimeConnection` alias abstracts the backend: `diesel_async::AsyncPgConnection` by default, and a `SyncConnectionWrapper<SqliteConnection>` under the `sqlite` feature. Generated repositories and hand-written queries take `&mut RuntimeConnection`, so they compile against either backend.
 - **Pool pragmas.** Each pooled connection is set up with `PRAGMA busy_timeout = 5000` (first, so later statements queue on it), `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, and `PRAGMA foreign_keys = ON`. A read-only SQLite target skips the two writing pragmas (WAL + `synchronous`). An in-memory database is pinned to a single pooled connection.
-- **Migrations.** Startup migrations run through diesel's `MigrationHarness` on a plain `SqliteConnection` with **no advisory lock** (SQLite is single-writer, so there is nothing to coordinate). Only `busy_timeout` is set on the migration connection — `foreign_keys = ON` is deliberately *omitted* there because it breaks table-recreating migrations.
+- **Migrations.** Startup migrations run through diesel's `MigrationHarness` on a plain `SqliteConnection` with **no advisory lock** (SQLite is single-writer, so there is nothing to coordinate). Only `busy_timeout` is set on the migration connection — `foreign_keys = ON` is deliberately *omitted* there because it breaks table-recreating migrations. This applies to **file-backed** SQLite only: an **in-memory** target (`sqlite::memory:` / `:memory:` / `file::memory:`, including `cache=shared`) with registered startup migrations is **refused at boot** (`std::process::exit(1)`), because the schema is applied on a transient migration connection and is lost before the runtime pool anchors it. An in-memory target with *no* registered migrations is unaffected (it is the default test-harness configuration).
 - **Repository CRUD.** Generated `#[repository]` / `#[model]` CRUD targets SQLite via two seams: `maybe_for_update!` expands to a plain read on SQLite (which has no `SELECT … FOR UPDATE`), so a pessimistic-lock read degrades to a plain read while write-write correctness still rests on the optimistic `lock_version` check plus the pool `busy_timeout`; and `backend_select! { pg => {…}, sqlite => {…} }` picks backend-specific SQL for the shapes that differ (multi-row batch insert vs. per-row loop, batched `ON CONFLICT` upsert vs. per-row upsert, and `RETURNING` handling). Tenant scoping and `lock_version` semantics are preserved on both backends.
 
 ## When to choose SQLite vs Postgres
@@ -133,7 +133,7 @@ buckets on SQLite:
 | Capability | Postgres | SQLite (eventual) | Mechanism / behavior on SQLite | Status (today) |
 | --- | :---: | :---: | --- | --- |
 | Core models / CRUD / repositories | ✅ | ✅ | Same repository API and query path on the SQLite runtime pool. | ✅ **Available now** (behind the `sqlite` feature) |
-| Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | **Startup** migrations apply on SQLite through diesel's `MigrationHarness` (unlocked). The `autumn migrate` CLI up/down still routes through the Postgres advisory-lock path (`hold_migration_lock` → `PgConnection`), so it is not available for a `sqlite://` URL yet. | ⚠️ **Partial** — startup migrations apply (MigrationHarness); `autumn migrate` CLI up/down is Postgres-only (planned) |
+| Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | **Startup** migrations apply on **file-backed** SQLite through diesel's `MigrationHarness` (unlocked); an **in-memory** target with registered migrations is refused at boot (the migrated schema is lost before the runtime pool anchors it). The `autumn migrate` CLI up/down still routes through the Postgres advisory-lock path (`hold_migration_lock` → `PgConnection`), so it is not available for a `sqlite://` URL yet. | ⚠️ **Partial** — startup migrations apply on file-backed SQLite (MigrationHarness; in-memory + migrations boot-refused); `autumn migrate` CLI up/down is Postgres-only (planned) |
 | `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Offline SQL-file safety linter (reads no DB URL, so it does not fail on a `sqlite://` target); its safety rules target Postgres migration semantics — there is no SQLite-specific classification yet. | ⚠️ **Partial** — the linter runs (no DB connection), but its rules are Postgres-oriented; no SQLite-specific classification |
 | Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Startup migrations run **unlocked** — no advisory lock and no `BEGIN IMMEDIATE` reservation. Concurrent same-host starts are not serialized by an explicit reservation; they rely on SQLite's single-writer semantics plus the pool `busy_timeout`. | ⚠️ **Not serialized** — no advisory lock / no `BEGIN IMMEDIATE`; explicit reservation is a known gap (planned) |
 | Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** |
@@ -167,7 +167,12 @@ published support contract**. Available **today**:
   absolute path), `sqlite:app.db` (the shorter scheme-only form),
   `sqlite::memory:` (in-memory), or `file:app.db`. A **bare filesystem path**
   such as `/var/lib/app.db` is intentionally **not** recognized and fails
-  validation — prefix it with `sqlite://` (or `sqlite:` / `file:`). Postgres-only
+  validation — prefix it with `sqlite://` (or `sqlite:` / `file:`). An
+  **in-memory** target is recognized for a no-migration configuration, but
+  combining it with **registered startup migrations is refused at boot** — the
+  migrated schema lives only on the transient migration connection and is gone
+  before the runtime pool anchors it, so a durable deploy must be
+  **file-backed**. Postgres-only
   settings (read replicas, shard directory, Postgres-only job/scheduler
   backends, multi-replica locks) are **refused at boot** with an actionable
   message rather than silently at first query.
