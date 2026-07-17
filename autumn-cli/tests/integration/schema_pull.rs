@@ -534,6 +534,85 @@ pub struct Member {
     assert_no_secret_leak(&mdiff_out, &mdiff_err);
 }
 
+/// A brownfield column-level `UNIQUE` constraint (`email TEXT UNIQUE`) auto-creates
+/// a `pg_constraint`-backed index Postgres names (`<table>_email_key`). `schema
+/// pull` must RETAIN that constraint-owned index verbatim via its `definition`
+/// (the P1 fixed here) — recording it as an ordinary droppable index would make a
+/// later model-side `schema diff` emit a `DROP INDEX` that Postgres REJECTS
+/// (`cannot drop index ... because constraint ... requires it`), producing a
+/// FAILING migration. The model DSL cannot express a UNIQUE constraint (it models
+/// uniqueness as unique *indexes*), so a model diff that does not redeclare the
+/// unique must be clean: no `DROP INDEX` for the constraint index.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_retains_constraint_owned_unique_index() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_constraint_index_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // A table with a column-level `UNIQUE` constraint, authored via a raw
+    // migration so Postgres auto-creates the constraint-backed `accounts_email_key`
+    // index exactly as a brownfield database would have it.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_accounts",
+        "CREATE TABLE accounts (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE);",
+        "DROP TABLE accounts;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the constraint-backed index must be preserved via its definition.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+
+    assert!(
+        snap.contains("accounts_email_key"),
+        "constraint-backed index preserved by its Postgres-assigned name: {snap}"
+    );
+    assert!(
+        snap.contains("\"definition\"") && snap.contains("CREATE UNIQUE INDEX"),
+        "the constraint-owned index is retained via its verbatim CREATE UNIQUE INDEX definition: {snap}"
+    );
+
+    // doctor agrees the DB matches the pulled baseline (retained index is stable).
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports the DB matches the snapshot with the constraint-owned index:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+
+    // A MODEL-side `schema diff` whose model does NOT redeclare the unique must
+    // RETAIN the constraint-owned index — no `DROP INDEX` (which Postgres would
+    // reject). The diff is clean.
+    write_models(
+        &project,
+        "
+#[autumn_web::model(managed)]
+pub struct Account {
+    #[id]
+    pub id: i64,
+    pub email: String,
+}
+",
+    );
+    let (mdiff_out, mdiff_err) = run_autumn_ok(&project, &["schema", "diff"], &envs);
+    assert!(
+        !mdiff_out.contains("DROP INDEX") && !mdiff_out.contains("accounts_email_key"),
+        "a model-side `schema diff` must NOT drop the constraint-owned index:\n{mdiff_out}"
+    );
+    assert!(
+        mdiff_out.contains("No schema changes"),
+        "model diff against the pulled snapshot is clean (constraint-owned index retained):\n{mdiff_out}"
+    );
+    assert_no_secret_leak(&mdiff_out, &mdiff_err);
+}
+
 /// `SQLite` introspection is a future slice: `schema pull` against a `SQLite` URL
 /// is refused loudly (no Docker needed — the refusal happens before any
 /// connection), names `SQLite`, and writes no snapshot.

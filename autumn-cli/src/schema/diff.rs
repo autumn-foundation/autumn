@@ -3321,6 +3321,41 @@ mod tests {
         );
     }
 
+    /// Model diff: a baseline constraint-owned index (a brownfield `UNIQUE`
+    /// constraint's auto-created index, retained by `schema pull` via its
+    /// `definition`) absent from the desired (model) side is **retained** — no
+    /// `DropIndex`. This is the load-bearing case: Postgres rejects dropping an
+    /// index that backs a constraint, so emitting a `DROP INDEX` would produce a
+    /// failing migration. Retention is purely `definition`-based, so the same code
+    /// path that preserves expression/partial indexes preserves this one.
+    #[test]
+    fn model_diff_retains_constraint_owned_unique_index() {
+        let constraint_idx = Index {
+            name: "users_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX users_email_key ON public.users USING btree (email)"
+                    .to_owned(),
+            ),
+        };
+        let mut base_table = posts_with(vec![col("email", ColumnType::Text)]);
+        base_table.indexes.push(constraint_idx);
+        let want = parsed(
+            vec![posts_with(vec![col("email", ColumnType::Text)])],
+            vec![],
+        );
+        let plan = diff_schema(&[base_table], &want, DEFAULT_OPTS);
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "model diff must retain (not drop) a constraint-owned index; got {:?}",
+            plan.changes
+        );
+    }
+
     /// Retention holds even under `--allow-destructive`: the declarative tool
     /// never drops a construct it cannot express.
     #[test]

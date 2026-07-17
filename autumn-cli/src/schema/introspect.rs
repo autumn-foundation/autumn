@@ -24,7 +24,13 @@
 //! - **Uniqueness**: a single-column unique index sets the owning column's
 //!   `unique` flag *and* is recorded as an [`Index`] (`unique = true`), mirroring
 //!   how the model parser represents a `#[unique]` field, so a round-trip diff is
-//!   empty.
+//!   empty. A *constraint-owned* unique index — the auto-created index behind a
+//!   brownfield column/table-level `UNIQUE`/`EXCLUDE` constraint, which the
+//!   declarative model DSL cannot express (it models uniqueness as unique
+//!   *indexes*, not constraints) and which Postgres refuses to `DROP INDEX`
+//!   independently of its constraint — is instead **retained verbatim** via its
+//!   [`Index::definition`] (exactly like an expression/partial index), so a
+//!   model-side diff never emits a rejected `DROP INDEX`. See [`collapse_indexes`].
 //!
 //! # Deferred blind spots (documented, not silently dropped)
 //!
@@ -57,6 +63,18 @@
 //! - **Enum `CHECK` constraints**: enum recovery from `CHECK` expressions is a
 //!   later slice; a `TEXT`-with-`CHECK` column pulls back as plain
 //!   [`Text`](ColumnType::Text).
+//! - **Constraint-vs-index reconciliation for constraint-owned indexes**: a
+//!   brownfield `UNIQUE`/`EXCLUDE` constraint is retained by its *index*
+//!   definition (`pg_get_indexdef`, a valid `CREATE UNIQUE INDEX …`), not by the
+//!   originating `ALTER TABLE … ADD CONSTRAINT`. So if the authoritative path
+//!   (`pull --dry-run`) ever rendered a recreation it would emit the
+//!   `CREATE UNIQUE INDEX` form rather than re-adding the constraint; and a model
+//!   that *also* declares `#[unique]` on a column already covered by a brownfield
+//!   `UNIQUE` constraint additively creates the model's own
+//!   `idx_<table>_<col>_unique` index — a redundant-but-valid second unique
+//!   index, never a failure. Full constraint↔index reconciliation is deferred;
+//!   the load-bearing property this slice guarantees is only that the generated
+//!   migration no longer *fails* with a rejected `DROP INDEX`.
 //!
 //! Errors are **credential-safe** by construction: no variant ever embeds the
 //! resolved database URL (only a parsed host/port on the connection-error path,
@@ -186,6 +204,10 @@ struct TablePkRow {
 /// columns (the `indkey` entries `> 0`) in true key order; it is empty for an
 /// index whose keys are all expressions. `definition` is the verbatim
 /// `pg_get_indexdef` statement, preserved for expression/partial indexes.
+// A flat `QueryableByName` catalog-row DTO: each bool maps to one `pg_index`
+// classification column (`indisunique`, `indpred IS NOT NULL`, expression-key,
+// constraint-owned), so they are independent flags, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(QueryableByName)]
 struct IndexRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -203,6 +225,12 @@ struct IndexRow {
     /// Whether any key column is an expression (an `indkey` entry equal to `0`).
     #[diesel(sql_type = diesel::sql_types::Bool)]
     has_expression: bool,
+    /// Whether the index backs a constraint (`pg_constraint.conindid` points at
+    /// it) — true for UNIQUE/EXCLUDE (and PK, but PKs are already filtered out).
+    /// Such an index cannot be dropped independently of its constraint, and the
+    /// model DSL cannot express it, so it is retained verbatim.
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    is_constraint: bool,
     /// Comma-joined resolvable ordinary column names, in key order (may be empty).
     #[diesel(sql_type = diesel::sql_types::Text)]
     columns: String,
@@ -343,8 +371,9 @@ fn fetch_primary_keys(
 /// matching `pg_attribute` row — is preserved rather than dropped by an inner
 /// join that returns nothing for it. The resolvable ordinary columns are
 /// aggregated in true key order via a correlated `unnest(indkey) WITH
-/// ORDINALITY` subquery; `has_expression` flags any `0` key and `is_partial`
-/// flags an `indpred`, so the builder can classify each index as
+/// ORDINALITY` subquery; `has_expression` flags any `0` key, `is_partial`
+/// flags an `indpred`, and `is_constraint` flags an index backing a
+/// `pg_constraint` (UNIQUE/EXCLUDE), so the builder can classify each index as
 /// simple-representable vs. preserved-verbatim.
 fn fetch_indexes(
     conn: &mut PgConnection,
@@ -359,6 +388,7 @@ fn fetch_indexes(
          i.indisunique AS is_unique, pg_get_indexdef(i.indexrelid) AS definition, \
          (i.indpred IS NOT NULL) AS is_partial, \
          (0 = ANY(string_to_array(i.indkey::text, ' ')::int[])) AS has_expression, \
+         EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid) AS is_constraint, \
          COALESCE(( \
            SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
            FROM unnest(string_to_array(i.indkey::text, ' ')::int[]) \
@@ -476,15 +506,21 @@ fn build_table(
 /// matching how the model parser represents `#[unique]`).
 ///
 /// Each index is classified:
-/// - **simple/representable** — NOT partial AND has no expression key — is built
-///   as `Index { columns, unique, definition: None }` exactly as before, so a
-///   simple index's serialized JSON is byte-identical to prior snapshots and a
-///   single-column simple unique index still sets the owning column's `unique`
-///   flag for model-parser round-trip parity.
-/// - **expression or partial** — preserved verbatim via `definition:
-///   Some(pg_get_indexdef(...))`, never dropped. Its resolvable columns (if any)
-///   are still recorded for display, but it never sets a column `unique` flag
-///   (there is no single representable column).
+/// - **plain/representable** — NOT partial, NO expression key, AND NOT
+///   constraint-owned — is built as `Index { columns, unique, definition: None }`
+///   exactly as before, so a plain index's serialized JSON is byte-identical to
+///   prior snapshots and a single-column plain unique index (the model-DSL
+///   `#[unique]` shape, a bare `CREATE UNIQUE INDEX` with no backing constraint)
+///   still sets the owning column's `unique` flag for round-trip parity.
+/// - **expression, partial, or constraint-owned** — preserved verbatim via
+///   `definition: Some(pg_get_indexdef(...))`, never dropped. A constraint-owned
+///   index (a brownfield column/table-level `UNIQUE`/`EXCLUDE`, which auto-creates
+///   a `pg_constraint`-backed index Postgres refuses to drop independently, and
+///   which the declarative model DSL cannot express) is retained just like an
+///   expression/partial index, so a model-side diff never emits a `DROP INDEX`
+///   that Postgres would reject. A single-column constraint-owned unique index
+///   still sets the owning column's `unique` flag (accurate, and the flag is not
+///   diffed) — that classification is independent of constraint ownership.
 fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSet<String>) {
     let mut indexes = Vec::with_capacity(rows.len());
     let mut unique_columns = std::collections::BTreeSet::new();
@@ -495,27 +531,30 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
             .filter(|c| !c.is_empty())
             .map(str::to_owned)
             .collect();
+        // "Simple" == a single representable column set (not partial, not an
+        // expression). A single-column simple unique index sets the owning
+        // column's `unique` flag whether or not it backs a constraint (the flag
+        // is accurate either way and is never diffed).
         let simple = !row.is_partial && !row.has_expression;
-        if simple {
-            if row.is_unique && columns.len() == 1 {
-                unique_columns.insert(columns[0].clone());
-            }
-            indexes.push(Index {
-                name: row.index_name.clone(),
-                columns,
-                unique: row.is_unique,
-                definition: None,
-            });
-        } else {
-            // Expression/partial index: preserve its canonical statement so it is
-            // never dropped and diffs by its verbatim text.
-            indexes.push(Index {
-                name: row.index_name.clone(),
-                columns,
-                unique: row.is_unique,
-                definition: Some(row.definition.clone()),
-            });
+        if simple && row.is_unique && columns.len() == 1 {
+            unique_columns.insert(columns[0].clone());
         }
+        // Retain (preserve verbatim, never drop) any index the model DSL cannot
+        // express: an expression or partial index, OR a constraint-owned index
+        // (UNIQUE/EXCLUDE) whose backing constraint Postgres won't let us drop.
+        // A plain, non-constraint index keeps `definition: None` so its JSON is
+        // unchanged and the model round-trip stays clean.
+        let definition = if simple && !row.is_constraint {
+            None
+        } else {
+            Some(row.definition.clone())
+        };
+        indexes.push(Index {
+            name: row.index_name.clone(),
+            columns,
+            unique: row.is_unique,
+            definition,
+        });
     }
     (indexes, unique_columns)
 }
@@ -668,7 +707,9 @@ mod tests {
     }
 
     /// Build a one-per-index [`IndexRow`] for tests. `columns` is the comma-joined
-    /// resolvable-column string the SQL aggregation produces.
+    /// resolvable-column string the SQL aggregation produces. `is_constraint` is
+    /// left `false` (an ordinary/model-style or expression/partial index); use
+    /// [`constraint_index_row`] for a constraint-owned index.
     fn index_row(
         index_name: &str,
         is_unique: bool,
@@ -684,7 +725,23 @@ mod tests {
             definition: definition.to_owned(),
             is_partial,
             has_expression,
+            is_constraint: false,
             columns: columns.to_owned(),
+        }
+    }
+
+    /// Build a constraint-owned (non-primary, non-partial, non-expression)
+    /// [`IndexRow`] — the auto-created index behind a brownfield column/table-level
+    /// `UNIQUE`/`EXCLUDE` constraint (`is_constraint == true`).
+    fn constraint_index_row(
+        index_name: &str,
+        is_unique: bool,
+        columns: &str,
+        definition: &str,
+    ) -> IndexRow {
+        IndexRow {
+            is_constraint: true,
+            ..index_row(index_name, is_unique, columns, false, false, definition)
         }
     }
 
@@ -795,6 +852,58 @@ mod tests {
             unique_cols.is_empty(),
             "partial index sets no column unique flag"
         );
+    }
+
+    #[test]
+    fn collapse_indexes_constraint_owned_index_retained_via_definition() {
+        // A brownfield column-level `UNIQUE` (e.g. `email TEXT UNIQUE`) auto-creates
+        // a constraint-backed index Postgres names (e.g. `users_email_key`). It must
+        // be RETAINED verbatim via `definition` (never an ordinary droppable index),
+        // so a later model-side diff can't emit a `DROP INDEX` Postgres rejects. Its
+        // single-column `unique` flag is still set (accurate, and not diffed).
+        let def = "CREATE UNIQUE INDEX users_email_key ON public.users USING btree (email)";
+        let rows = vec![constraint_index_row("users_email_key", true, "email", def)];
+        let (indexes, unique_cols) = collapse_indexes(&rows);
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "users_email_key");
+        assert_eq!(indexes[0].columns, vec!["email".to_owned()]);
+        assert!(indexes[0].unique);
+        assert_eq!(
+            indexes[0].definition.as_deref(),
+            Some(def),
+            "constraint-owned index must be retained via its definition, not left droppable"
+        );
+        assert!(
+            unique_cols.contains("email"),
+            "single-column constraint-owned unique still sets the column unique flag"
+        );
+    }
+
+    #[test]
+    fn collapse_indexes_model_style_unique_index_stays_ordinary_droppable() {
+        // The MODEL style: `CREATE UNIQUE INDEX idx_users_email_unique` with NO
+        // backing constraint (`is_constraint == false`) must stay an ORDINARY
+        // `Index { definition: None }` so the migrate-from-models round-trip is
+        // clean — a `#[unique]` field produces a plain unique index, not a
+        // constraint, so it is diffable/droppable as before.
+        let def = "CREATE UNIQUE INDEX idx_users_email_unique ON public.users USING btree (email)";
+        let rows = vec![index_row(
+            "idx_users_email_unique",
+            true,
+            "email",
+            false,
+            false,
+            def,
+        )];
+        let (indexes, unique_cols) = collapse_indexes(&rows);
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "idx_users_email_unique");
+        assert!(indexes[0].unique);
+        assert_eq!(
+            indexes[0].definition, None,
+            "a non-constraint (model-style) unique index stays ordinary/droppable"
+        );
+        assert!(unique_cols.contains("email"));
     }
 
     #[test]
