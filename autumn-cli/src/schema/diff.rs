@@ -539,6 +539,31 @@ pub enum DiffError {
         column: String,
     },
 
+    /// A unique-index add whose columns ALL pre-existed on an existing table
+    /// (unsupported this slice, **no override** — the SQL is unappliable on a
+    /// table whose existing rows may already hold duplicate values, not merely
+    /// lossy). Postgres validates uniqueness against every existing row the
+    /// instant `CREATE UNIQUE INDEX` runs, so it fails on any pre-existing
+    /// duplicate; the offline diff engine cannot dedup the data. This is the
+    /// index-level sibling of [`DiffError::SetNotNullRequiresBackfill`]. It fires
+    /// only for an [`SchemaChange::AddIndex`] with `unique: true` on a
+    /// pre-existing table where **none** of the indexed columns is being added in
+    /// the same plan — a unique index on a brand-new [`SchemaChange::CreateTable`]
+    /// (empty table) or one touching a newly-added column (whose existing rows are
+    /// all NULL, which Postgres treats as distinct) is always safe and is never
+    /// refused. A non-unique `AddIndex` is likewise never refused.
+    #[error(
+        "cannot add unique index `{index}` on `{table}`: existing rows may contain duplicate \
+         values that would fail `CREATE UNIQUE INDEX`. Resolve duplicates and apply this \
+         manually, or drop the uniqueness requirement."
+    )]
+    UniqueIndexRequiresDedup {
+        /// The owning table.
+        table: String,
+        /// The unique index being added.
+        index: String,
+    },
+
     /// A column type change on a column that participates in a foreign-key
     /// constraint (unsupported this slice, **no override** — the SQL is
     /// unappliable, not merely lossy). Postgres rejects `ALTER COLUMN ... TYPE` on
@@ -1319,6 +1344,21 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(DiffError::SetNotNullRequiresBackfill { table, column });
     }
 
+    // 6c. A unique index added to a pre-existing table where ALL its indexed
+    //     columns already existed — no override. `CREATE UNIQUE INDEX` validates
+    //     uniqueness against every existing row the instant it runs, so it fails
+    //     on any pre-existing duplicate; the offline engine cannot dedup the data.
+    //     The index-level sibling of the `SET NOT NULL` refusal above. It is not
+    //     destructive, so it always refuses, regardless of `--allow-destructive`
+    //     (checked here, before the `allow_destructive` short-circuit below). A
+    //     unique index on a brand-new `CreateTable` (empty) rides inline on that
+    //     change and never reaches `AddIndex`; a unique index touching a
+    //     newly-added column (whose existing rows are all NULL, treated as
+    //     distinct) and any non-unique index are safe and are never matched here.
+    if let Some(err) = find_unique_index_requires_dedup(plan) {
+        return Err(err);
+    }
+
     if opts.allow_destructive {
         return Ok(());
     }
@@ -1381,6 +1421,44 @@ fn find_fk_type_change_block(plan: &MigrationPlan) -> Option<DiffError> {
             Some(DiffError::TypeChangeOnForeignKeyColumn {
                 table: table.clone(),
                 column: column.clone(),
+            })
+        }
+        _ => None,
+    })
+}
+
+/// The [`DiffError::UniqueIndexRequiresDedup`] refusal for the first unique
+/// `AddIndex` in `plan` whose indexed columns ALL pre-existed on the table — none
+/// is a column being added in this same plan.
+///
+/// An `AddIndex` is produced by [`diff_indexes`] only for a both-present
+/// (pre-existing) table; a brand-new table's indexes ride inline on its
+/// [`SchemaChange::CreateTable`] and never reach this path — so a unique
+/// `AddIndex` already implies the table pre-exists and may hold rows. It is unsafe
+/// (existing rows may contain duplicates that fail `CREATE UNIQUE INDEX`) UNLESS
+/// at least one indexed column is newly added in this plan (an `AddColumn`): a
+/// new column is NULL in every existing row, and Postgres treats NULLs as
+/// distinct in a unique index, so the existing rows cannot conflict.
+fn find_unique_index_requires_dedup(plan: &MigrationPlan) -> Option<DiffError> {
+    let added: BTreeSet<(&str, &str)> = plan
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::AddColumn { table, column } => {
+                Some((table.as_str(), column.name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::AddIndex { table, index } if index.unique => {
+            let touches_new_column = index
+                .columns
+                .iter()
+                .any(|col| added.contains(&(table.as_str(), col.as_str())));
+            (!touches_new_column).then(|| DiffError::UniqueIndexRequiresDedup {
+                table: table.clone(),
+                index: index.name.clone(),
             })
         }
         _ => None,
@@ -3199,6 +3277,119 @@ mod tests {
         assert!(
             guard_plan(&plan, DEFAULT_OPTS).is_ok(),
             "distinct index names must not be refused as a collision"
+        );
+    }
+
+    #[test]
+    fn unique_index_add_on_existing_column_is_refused() {
+        // Marking a pre-existing column `#[unique]` yields a unique `AddIndex`
+        // whose only column (`email`) already existed — `CREATE UNIQUE INDEX`
+        // would fail if the table's existing rows hold duplicate emails. The
+        // engine cannot dedup offline, so it refuses (no override — unappliable,
+        // not merely destructive).
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddIndex {
+                table: "posts".to_owned(),
+                index: Index {
+                    name: "idx_posts_email_unique".to_owned(),
+                    columns: vec!["email".to_owned()],
+                    unique: true,
+                },
+            }],
+        };
+        let err = guard_plan(&plan, DEFAULT_OPTS).unwrap_err();
+        assert!(
+            matches!(err, DiffError::UniqueIndexRequiresDedup { .. }),
+            "a unique index on a pre-existing column is refused: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("idx_posts_email_unique") && err.to_string().contains("posts"),
+            "the error names the index and table: {err}"
+        );
+        // No override — the SQL is unappliable, not merely lossy.
+        assert!(
+            matches!(
+                guard_plan(&plan, ALLOW).unwrap_err(),
+                DiffError::UniqueIndexRequiresDedup { .. }
+            ),
+            "--allow-destructive does not override an unappliable unique-index add"
+        );
+    }
+
+    #[test]
+    fn unique_index_add_on_new_column_is_allowed() {
+        // A brand-new nullable column that also carries `#[unique]` arrives as an
+        // `AddColumn` plus a unique `AddIndex` on that same new column. Every
+        // existing row is NULL in the new column, and Postgres treats NULLs as
+        // distinct in a unique index, so `CREATE UNIQUE INDEX` cannot conflict —
+        // the plan is emittable.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![
+                SchemaChange::AddColumn {
+                    table: "posts".to_owned(),
+                    column: {
+                        let mut c = col("email", ColumnType::Text);
+                        c.nullable = true;
+                        c
+                    },
+                },
+                SchemaChange::AddIndex {
+                    table: "posts".to_owned(),
+                    index: Index {
+                        name: "idx_posts_email_unique".to_owned(),
+                        columns: vec!["email".to_owned()],
+                        unique: true,
+                    },
+                },
+            ],
+        };
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "a unique index on a newly-added column must not be refused"
+        );
+    }
+
+    #[test]
+    fn unique_index_on_new_table_is_allowed() {
+        // A unique index on a brand-new table rides inline on `CreateTable` (an
+        // empty table — no rows to conflict), never as a top-level `AddIndex`, so
+        // it is never refused.
+        let mut table = posts_with(vec![col("email", ColumnType::Text)]);
+        table.indexes = vec![Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+        }];
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::CreateTable(table)],
+        };
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "a unique index on a brand-new table must not be refused"
+        );
+    }
+
+    #[test]
+    fn non_unique_index_add_on_existing_column_still_allowed() {
+        // Control: a plain (non-unique) index on a pre-existing column is always
+        // appliable and must still emit.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddIndex {
+                table: "posts".to_owned(),
+                index: Index {
+                    name: "idx_posts_email".to_owned(),
+                    columns: vec!["email".to_owned()],
+                    unique: false,
+                },
+            }],
+        };
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "a non-unique index on a pre-existing column must not be refused"
         );
     }
 
