@@ -2,7 +2,7 @@
 //! via **FTS5** (issue #1910).
 //!
 //! Postgres searchable repositories rank rows with a `tsvector` +
-//! `websearch_to_tsquery`/`ts_rank_cd` query. SQLite has no `tsvector`, so the
+//! `websearch_to_tsquery`/`ts_rank_cd` query. `SQLite` has no `tsvector`, so the
 //! generated codegen forks (via `backend_select!`): the `SQLite` arm queries an
 //! **external-content FTS5 virtual table** (`"<table>__fts"`, tokenized with
 //! `unicode61`) joined back to the base table (so the tenant / soft-delete /
@@ -351,7 +351,10 @@ async fn search_sanitizes_fts5_operators_on_sqlite() {
     // `OR` is a literal term, not the FTS5 OR operator. Raw FTS5 `alpha OR beta`
     // would match BOTH rows; sanitized it is the implicit-AND of three literal
     // phrases "alpha" AND "or" AND "beta", which no single row contains → empty.
-    let ored = repo.search("alpha OR beta").await.expect("search alpha OR beta");
+    let ored = repo
+        .search("alpha OR beta")
+        .await
+        .expect("search alpha OR beta");
     assert!(
         ored.is_empty(),
         "`OR` must be a literal, not an operator (no row has all of alpha/or/beta): {ored:?}"
@@ -360,13 +363,20 @@ async fn search_sanitizes_fts5_operators_on_sqlite() {
     // A bare `alpha` still matches its one row (the operator neutralization does
     // not break ordinary search).
     let alpha = repo.search("alpha").await.expect("search alpha");
-    assert_eq!(alpha.len(), 1, "plain term still matches its row: {alpha:?}");
+    assert_eq!(
+        alpha.len(),
+        1,
+        "plain term still matches its row: {alpha:?}"
+    );
     assert_eq!(alpha[0].title, "Alpha");
 
     // A `col:` column-filter operator is neutralized: "title:alpha" becomes the
     // literal phrase, whose tokens ("title","alpha") are AND-ed — no row contains
     // the token "title", so it matches nothing (never a targeted column search).
-    let colon = repo.search("title:alpha").await.expect("search title:alpha");
+    let colon = repo
+        .search("title:alpha")
+        .await
+        .expect("search title:alpha");
     assert!(
         colon.is_empty(),
         "`col:` must be neutralized to a literal, matching nothing here: {colon:?}"
@@ -382,7 +392,10 @@ async fn search_sanitizes_fts5_operators_on_sqlite() {
     );
 
     // FAIL-CLOSED: an all-operator query returns an empty page, never everything.
-    let all_ops = repo.search("OR NEAR *").await.expect("search all-operators");
+    let all_ops = repo
+        .search("OR NEAR *")
+        .await
+        .expect("search all-operators");
     assert!(
         all_ops.is_empty(),
         "an all-operator query must return empty, not every row: {all_ops:?}"
@@ -391,10 +404,13 @@ async fn search_sanitizes_fts5_operators_on_sqlite() {
     // FAIL-CLOSED: a whitespace-only query yields no tokens → empty result with
     // NO FTS query run (the sanitizer returns None).
     let blank = repo.search("   ").await.expect("blank search");
-    assert!(blank.is_empty(), "whitespace-only query returns nothing: {blank:?}");
+    assert!(
+        blank.is_empty(),
+        "whitespace-only query returns nothing: {blank:?}"
+    );
 }
 
-/// `search_page` returns the right page slice and total on SQLite.
+/// `search_page` returns the right page slice and total on `SQLite`.
 #[tokio::test]
 async fn search_page_paginates_on_sqlite() {
     let pool = boot_pool("search_page").await;
@@ -486,7 +502,7 @@ async fn search_ranks_title_above_body_on_sqlite() {
 
 /// ADVERSARIAL: fail-closed tenant isolation. A search run under tenant B must
 /// never return tenant A's rows even when the term matches. Without the
-/// `tenant_id = $n` predicate in the SQLite arm this would leak A's data.
+/// `tenant_id = $n` predicate in the `SQLite` arm this would leak A's data.
 #[tokio::test]
 async fn search_never_crosses_tenants_on_sqlite() {
     let pool = boot_pool("search_tenant").await;
@@ -559,7 +575,9 @@ async fn search_never_crosses_tenants_on_sqlite() {
     // operators, so neither layer can leak A's data.
     for probe in ["secret", "secret OR alpha", "tenant_id:tenant-a"] {
         let leaked = with_tenant("tenant-b".to_string(), async {
-            repo.search(probe).await.expect("adversarial search under tenant-b")
+            repo.search(probe)
+                .await
+                .expect("adversarial search under tenant-b")
         })
         .await;
         assert!(

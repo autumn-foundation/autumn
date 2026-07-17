@@ -12,9 +12,9 @@ use super::emit::Plan;
 use super::naming::pascal_to_snake;
 use super::schema_edit::{
     MigrationShape, add_columns_down_sql_for, add_columns_up_sql_for, add_search_down_sql_for,
-    add_search_up_sql_for, detect_migration_shape, encrypt_columns_down_sql, encrypt_columns_up_sql,
-    parse_model_search_config_for_table, remove_columns_down_sql_for, remove_columns_up_sql_for,
-    singularize,
+    add_search_up_sql_for, detect_migration_shape, encrypt_columns_down_sql,
+    encrypt_columns_up_sql, parse_model_search_config_for_table, remove_columns_down_sql_for,
+    remove_columns_up_sql_for, singularize,
 };
 use super::{GenerateError, detect_backend, ensure_project_root};
 
@@ -628,7 +628,7 @@ pub struct Post {
 
     /// `AddSearchTo…` on a `SQLite` app now emits an FTS5 external-content virtual
     /// table + maintenance triggers (issue #1910) instead of being rejected, and
-    /// no Postgres-only `tsvector`/GIN DDL leaks into the SQLite migration.
+    /// no Postgres-only `tsvector`/GIN DDL leaks into the `SQLite` migration.
     #[test]
     fn add_search_migration_on_sqlite_emits_fts5() {
         with_no_db_env(|| {

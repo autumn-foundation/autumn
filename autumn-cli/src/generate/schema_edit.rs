@@ -3828,11 +3828,12 @@ pub fn add_search_down_sql_for(backend: DatabaseBackend, table: &str) -> String 
     }
 }
 
-/// `SQLite` FTS5 `up.sql`: external-content virtual table + maintenance triggers
-/// + backfill rebuild (issue #1910). The FTS table is `"<table>__fts"`, indexes
-/// the `SEARCH_FIELDS` columns in priority order, and mirrors the base table via
-/// `content='<table>', content_rowid='id'` so the base table stays the single
-/// source of truth (the generated `bm25()`-ranked `MATCH` query joins the two).
+/// `SQLite` FTS5 `up.sql`: an external-content virtual table, its maintenance
+/// triggers, and a backfill rebuild (issue #1910). The FTS table is
+/// `"<table>__fts"`, indexes the `SEARCH_FIELDS` columns in priority order, and
+/// mirrors the base table via `content='<table>', content_rowid='id'` so the
+/// base table stays the single source of truth (the generated `bm25()`-ranked
+/// `MATCH` query joins the two).
 fn sqlite_add_search_up_sql(table: &str, fields: &[(String, char)]) -> String {
     let fts = format!("{table}__fts");
     // Quoted, comma-separated indexed column list, shared across the DDL.
@@ -7417,7 +7418,10 @@ pub struct Post {
                 "down: {down}"
             );
         }
-        assert!(down.contains("DROP TABLE IF EXISTS \"posts__fts\";"), "down: {down}");
+        assert!(
+            down.contains("DROP TABLE IF EXISTS \"posts__fts\";"),
+            "down: {down}"
+        );
     }
 
     #[test]

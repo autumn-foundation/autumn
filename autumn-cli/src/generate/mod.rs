@@ -130,7 +130,7 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
 /// rejects *any* `database.shards` against a `SQLite` primary, so no valid
 /// `SQLite` config can ever use a generated sharded resource. Unlike UUID ids
 /// (#1905) or the unsupported field kinds (#1924) — and unlike FTS, now
-/// supported on SQLite via FTS5 (#1910) — this is **not** a deferred slice:
+/// supported on `SQLite` via FTS5 (#1910) — this is **not** a deferred slice:
 /// `SQLite` is single-host / single-writer, so
 /// horizontal sharding is Postgres-only and permanently out of scope for
 /// `SQLite` (see `docs/guide/sqlite-in-production.md`). Rather than emit a

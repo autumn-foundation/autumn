@@ -543,10 +543,10 @@ pub trait AutumnSearchableModel {
     const SEARCH_FIELDS: &'static [(&'static str, char)];
 }
 
-/// Build a fail-closed SQLite FTS5 `MATCH` query string from raw user input
+/// Build a fail-closed `SQLite` FTS5 `MATCH` query string from raw user input
 /// (issue #1910).
 ///
-/// SQLite FTS5's `MATCH` right-hand operand is a query *language*, not a plain
+/// `SQLite` FTS5's `MATCH` right-hand operand is a query *language*, not a plain
 /// string: bare words are terms, but `AND` / `OR` / `NOT` / `NEAR`, a `col:`
 /// prefix, `*` (prefix), `^` (initial-token), `(`/`)` grouping, `"` phrases and
 /// a leading `-` are all operators. Passing raw user input straight to `MATCH`
@@ -721,10 +721,7 @@ mod tests {
             sqlite_fts5_match_query("title:secret").as_deref(),
             Some("\"title:secret\"")
         );
-        assert_eq!(
-            sqlite_fts5_match_query("pre*").as_deref(),
-            Some("\"pre*\"")
-        );
+        assert_eq!(sqlite_fts5_match_query("pre*").as_deref(), Some("\"pre*\""));
         assert_eq!(
             sqlite_fts5_match_query("NEAR(a b)").as_deref(),
             Some("\"NEAR(a\" \"b)\"")

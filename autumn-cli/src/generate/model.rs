@@ -9,8 +9,8 @@ use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, add_search_down_sql_for, add_search_up_sql_for,
-    append_schema_table_with_id_for,
-    create_table_sql_with_metadata_and_id_for, drop_table_sql, link_models_into_seed_bin,
+    append_schema_table_with_id_for, create_table_sql_with_metadata_and_id_for, drop_table_sql,
+    link_models_into_seed_bin,
 };
 use super::{GenerateError, detect_backend, ensure_project_root, read_or_empty};
 
@@ -3134,7 +3134,7 @@ mod tests {
 
     /// FTS on a `SQLite` app now emits an FTS5 external-content virtual table +
     /// maintenance triggers (issue #1910) instead of being rejected — and no
-    /// Postgres-only `tsvector`/GIN DDL leaks into the SQLite migration.
+    /// Postgres-only `tsvector`/GIN DDL leaks into the `SQLite` migration.
     #[test]
     fn searchable_on_sqlite_app_emits_fts5() {
         with_no_db_env(|| {
