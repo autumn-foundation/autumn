@@ -4143,7 +4143,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -4361,7 +4361,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let (record, __vh_before): (#model_name, ::core::option::Option<#model_name>) = if let ::core::option::Option::Some(expected_version) =
@@ -4485,7 +4485,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -4678,7 +4678,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let (record, __vh_before): (#model_name, #model_name) = if let ::core::option::Option::Some(expected_version) =
@@ -4766,7 +4766,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let record: #model_name = if let ::core::option::Option::Some(expected_version) =
@@ -4914,7 +4914,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #tenant_id_setup
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -4978,7 +4978,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
 
@@ -5020,7 +5020,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 Self::__autumn_register_repository_commit_hooks();
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
                             let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -5086,7 +5086,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
@@ -5122,7 +5122,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
@@ -7239,7 +7239,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::core::option::Option::Some(t)
                 };
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(expected_version) =
@@ -7324,7 +7324,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             // SELECT FOR UPDATE grabs an exclusive row lock so
                             // no concurrent writer can commit between our
@@ -7418,7 +7418,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(expected_version) =
@@ -7480,7 +7480,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let load_query = #table_ident::table.find(id);
                             let current = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
@@ -7557,7 +7557,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #tenant_id_setup
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let load_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                             ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
@@ -7636,7 +7636,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let load_query = #table_ident::table.find(id);
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                             ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
@@ -7712,7 +7712,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id)
                             .filter(#table_ident::deleted_at.is_null()))
 
@@ -7776,7 +7776,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
+                ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                     let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id))
 
                         .first::<#model_name>(conn)
@@ -9474,7 +9474,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // (#1369). Accumulated inside the tx and returned on commit, so a
                     // rollback drops them and no spurious client deletes are published.
                     let __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
-                        ::autumn_web::__private::scoped_transaction::<
+                        ::autumn_web::__private::scoped_immediate_transaction::<
                             ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
                             ::autumn_web::AutumnError, _, _,
                         >(
@@ -11574,7 +11574,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let __outcome: ::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)> =
-                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                        ::autumn_web::__private::scoped_immediate_transaction::<::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -11627,7 +11627,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #foc_tenant_id_let
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let __outcome: ::core::option::Option<(#model_name, MutationContext)> =
-                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<(#model_name, MutationContext)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                        ::autumn_web::__private::scoped_immediate_transaction::<::core::option::Option<(#model_name, MutationContext)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -11660,7 +11660,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #foc_tenant_id_let
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let __inserted: ::core::option::Option<#model_name> =
-                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<#model_name>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                        ::autumn_web::__private::scoped_immediate_transaction::<::core::option::Option<#model_name>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let __rec_opt: ::core::option::Option<#model_name> = #insert_new_txconn;
                                 if let ::core::option::Option::Some(ref __record) = __rec_opt {
@@ -15594,7 +15594,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #cross_shard_write_guard
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<T, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<T, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let row = ::autumn_web::maybe_for_update!(#table_ident::table
                             .find(id))
@@ -17297,6 +17297,69 @@ mod tests {
         &rest[..end]
     }
 
+    #[test]
+    fn repository_macro_write_rmw_uses_immediate_transaction_and_reads_stay_deferred() {
+        // #1996 item 3: the write read-modify-write paths (with_lock, update,
+        // delete_by_id) open the write lock up front through
+        // `scoped_immediate_transaction` (BEGIN IMMEDIATE on SQLite; the
+        // unchanged deferred `scoped_transaction` on Postgres). Read paths never
+        // take a write transaction, and the deferred primitive is still used by
+        // non-RMW writes (save/bulk), so the seam is not a blanket swap.
+        let generated = repository_macro(quote! { Post }, quote! { pub trait PostRepository {} })
+            .to_string();
+
+        // with_lock is the canonical pessimistic write RMW.
+        let wl_start = generated
+            .find("pub async fn with_lock")
+            .expect("repository must generate with_lock");
+        let with_lock = &generated[wl_start..];
+        assert!(
+            with_lock.contains("scoped_immediate_transaction"),
+            "with_lock must route through the immediate write transaction: {with_lock}"
+        );
+
+        // update is an RMW write (load + mutate) → immediate.
+        let update = update_section(&generated);
+        assert!(
+            update.contains("scoped_immediate_transaction"),
+            "update must route through the immediate write transaction: {update}"
+        );
+
+        // A dependent-cascade delete_by_id opens a write transaction (load →
+        // cascade children → parent DELETE); it must be immediate too. (A plain
+        // delete is a single atomic DELETE with no transaction, so there is
+        // nothing to make immediate there.)
+        let dep = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let delete = delete_by_id_section(&dep);
+        assert!(
+            delete.contains("scoped_immediate_transaction"),
+            "dependent delete_by_id must route through the immediate write transaction: {delete}"
+        );
+
+        // Read path stays off the write-lock primitive: find_by_id opens no
+        // immediate transaction.
+        let find_start = generated
+            .find("async fn find_by_id")
+            .expect("repository must generate find_by_id");
+        let rest = &generated[find_start + "async fn find_by_id".len()..];
+        let find_by_id = &rest[..rest.find("async fn ").map_or(rest.len(), |p| p)];
+        assert!(
+            !find_by_id.contains("scoped_immediate_transaction"),
+            "find_by_id (read) must not open an immediate write transaction: {find_by_id}"
+        );
+
+        // The deferred primitive is still present (save/bulk insert paths keep
+        // it) — the write-RMW adoption is targeted, not a blanket rename.
+        assert!(
+            generated.contains(":: scoped_transaction"),
+            "non-RMW write paths (save/bulk) must keep the deferred scoped_transaction"
+        );
+    }
+
     /// Helper: slice the `Destroy` match arm of the generated
     /// `__autumn_apply_dependent_on_conn` helper, bounded to the helper method
     /// (which ends right before the always-generated `pub fn on_primary`), so
@@ -17640,8 +17703,9 @@ mod tests {
 
     #[test]
     fn repository_macro_dependent_delete_cascades_inside_transaction_before_parent_delete() {
-        // AC2 + AC6: cascade runs inside a single scoped_transaction and before
-        // the parent DELETE (children removed first → no FK/orphan).
+        // AC2 + AC6: cascade runs inside a single (immediate, per #1996) write
+        // transaction and before the parent DELETE (children removed first → no
+        // FK/orphan).
         let generated = repository_macro(
             quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
             quote! { pub trait PostRepository {} },
@@ -17649,8 +17713,8 @@ mod tests {
         .to_string();
         let section = delete_by_id_section(&generated);
         assert!(
-            section.contains("scoped_transaction"),
-            "dependent delete_by_id must open a transaction: {section}"
+            section.contains("scoped_immediate_transaction"),
+            "dependent delete_by_id must open an immediate write transaction (#1996): {section}"
         );
         let cascade_pos = section
             .find("__autumn_apply_dependent_on_conn")
@@ -18424,8 +18488,8 @@ mod tests {
         // (post-commit), i.e. after the connection is dropped.
         let section = delete_by_id_section(&generated);
         let tx_pos = section
-            .find("scoped_transaction")
-            .expect("dependent delete_by_id opens a transaction");
+            .find("scoped_immediate_transaction")
+            .expect("dependent delete_by_id opens an immediate write transaction (#1996)");
         let drop_pos = section
             .find("mem :: drop")
             .expect("dependent delete_by_id drops the conn after the tx");

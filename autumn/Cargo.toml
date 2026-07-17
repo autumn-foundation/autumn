@@ -492,6 +492,21 @@ path = "tests/sqlite_version_history.rs"
 name = "sqlite_searchable_repository"
 path = "tests/sqlite_searchable_repository.rs"
 
+# SQLite `BEGIN IMMEDIATE` write-transaction proof (issue #1996, item 3). The
+# generated write-RMW paths (with_lock / update / delete_by_id / find_or_create)
+# route through `scoped_immediate_transaction`, whose SQLite arm takes the write
+# lock up front so a second concurrent writer queues on `busy_timeout` instead of
+# failing its deferred snapshot upgrade with `SQLITE_BUSY_SNAPSHOT`. This test
+# proves that on a shared tempfile DB: two concurrent writers serialize with no
+# lost update / no busy error, a queued update commits and bumps lock_version, a
+# single-writer update commits, and an errored RMW rolls back. Only meaningful
+# under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a
+# default `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_immediate_transaction`.
+[[test]]
+name = "sqlite_immediate_transaction"
+path = "tests/sqlite_immediate_transaction.rs"
+
 # SQLite `dependent(..., on_delete = destroy)` cascade proof (issue #1996, PR
 # #2021). The Destroy arm selects child ids with a hand-built SQL string that
 # used to emit a trailing `FOR UPDATE` (rejected by SQLite) — outside the

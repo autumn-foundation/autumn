@@ -516,6 +516,8 @@ pub mod ws;
 pub mod __private {
     #[cfg(feature = "db")]
     pub use crate::db::scoped_transaction;
+    #[cfg(feature = "db")]
+    pub use crate::db::scoped_immediate_transaction;
     #[cfg(all(feature = "db", feature = "ws"))]
     pub use crate::repository_commit_hooks::CURRENT_CHANNELS;
     #[cfg(feature = "db")]
