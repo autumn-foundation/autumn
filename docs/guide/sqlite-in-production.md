@@ -31,10 +31,13 @@ guide is the published contract for exactly which is which.
 > contract from the first SQLite-enabled release, so an unsupported
 > configuration never boots into a surprise at first query.
 >
-> **This release is the foundation slice.** As of this release, configuring a
-> `sqlite://` target is recognized and validated, but the runtime refuses SQLite
-> at boot with an actionable error (`db.rs` `build_pool` → `UnsupportedBackend`,
-> #1905) — **a SQLite app does not yet boot, migrate, or serve.** This guide is
+> **The SQLite runtime has landed** (#1614). A `sqlite://` app now boots, runs
+> its startup migrations, and serves, with a working connection pool and
+> repository CRUD. The **Status** column below marks each capability
+> **Available** when it is verified in this build, or **Planned — #NNNN** when
+> that subsystem's SQLite support is still landing in a follow-on slice — a
+> *Planned* row no longer means the app refuses to boot, only that the named
+> subsystem is not yet wired for SQLite. This guide is
 > the published support contract for the rollout; rows are marked by the slice
 > that delivers them. What ships *today* is listed under
 > [What ships in this slice](#what-ships-in-this-slice).
@@ -113,8 +116,9 @@ not a rewrite.
 The **SQLite** glyph below is the *eventual* single-host contract for each
 capability; the **Status** column tells you which slice delivers it and
 therefore whether it is available **today**. A row whose Status reads
-**Planned** is not in this build — the runtime refuses SQLite at boot (#1905)
-until that slice lands. Every capability falls into one of three eventual
+**Planned** names a subsystem whose SQLite support is still landing in a
+follow-on slice — the app still boots and serves, that subsystem just is not
+wired for SQLite yet. Every capability falls into one of three eventual
 buckets on SQLite:
 
 - ✅ **Works** — same behavior as Postgres (the mechanism may differ; the
@@ -128,16 +132,16 @@ buckets on SQLite:
 
 | Capability | Postgres | SQLite (eventual) | Mechanism / behavior on SQLite | Status (today) |
 | --- | :---: | :---: | --- | --- |
-| Core models / CRUD / repositories | ✅ | ✅ | Same repository API and query path once the runtime pool lands. | ⛔ **Planned — runtime #1905** (fails fast at boot today) |
-| Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | Same embedded migrations, run on SQLite by the deferred migration subsystem. | ⛔ **Planned — migrations #1906** (fails fast at boot today) |
-| `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Same classifier; SQLite-specific rewrites classified. | ⛔ **Planned — migrations #1906** |
-| Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Single-host `BEGIN IMMEDIATE` reservation instead of a cluster advisory lock — safe because only one host applies. | ⛔ **Planned — migrations #1906** |
-| Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** (fails fast at boot today) |
-| Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | ⛔ **Planned — #1907** (fails fast at boot today) |
-| `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** (fails fast at boot today) |
-| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | ⛔ **Planned — runtime #1905** (multi-replica boot-refuse ships now; single-host lock needs the runtime) |
-| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | ⛔ **Planned — runtime #1905** |
-| `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** (fails fast at boot today) |
+| Core models / CRUD / repositories | ✅ | ✅ | Same repository API and query path on the SQLite runtime pool. | ✅ **Available now** (behind the `sqlite` feature) |
+| Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | Same embedded migrations, run on SQLite through diesel's `MigrationHarness` at startup. | ✅ **Available now** (behind the `sqlite` feature) |
+| `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Same classifier; SQLite-specific rewrites classified. | ✅ **Available now** (behind the `sqlite` feature) |
+| Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Single-host `BEGIN IMMEDIATE` reservation instead of a cluster advisory lock — safe because only one host applies. | ✅ **Available now** (behind the `sqlite` feature; single-host `BEGIN IMMEDIATE` reservation) |
+| Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** |
+| Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | ⛔ **Planned — #1907** |
+| `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** |
+| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | ⛔ **Planned — #1905** (multi-replica boot-refuse ships now) |
+| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | ⛔ **Planned — #1905** |
+| `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** |
 | `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
 | Retention sweeps | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
 | `autumn deploy` data-file persistence | ✅ | ✅ | SQLite data file treated as **persistent state**; deploy/rollback never clobbers it. | ⛔ **Planned — #1909** |
@@ -151,9 +155,11 @@ buckets on SQLite:
 
 ## What ships in this slice
 
-This foundation slice (part of #1614) delivers **config detection, boot-time
-validation, the backend-aware generator, `autumn doctor` awareness, and this
-published support contract** — **not** the runtime. Available **today**:
+The SQLite runtime has landed (#1614): a `sqlite://` app **boots, runs its
+startup migrations, serves against a working connection pool, and runs
+repository CRUD**, on top of the earlier **config detection, boot-time
+validation, backend-aware generator, `autumn doctor` awareness, and this
+published support contract**. Available **today**:
 
 - **`sqlite:` / `file:` config recognition + boot-time validation** — a SQLite
   target is recognized and validated when the URL carries one of the accepted
@@ -190,17 +196,21 @@ with the runtime slice — until then there is no SQLite backend to run
 SQLite-dialect smoke SQL against, so the generated smoke test remains
 Postgres-shaped. Tracked under the runtime slice #1905.
 
-Everything in the support matrix marked **Planned** is *not* in this slice: the
-runtime refuses SQLite at boot (`db.rs` `build_pool` → `UnsupportedBackend`,
-#1905) until each row's tracking issue lands.
+The support-matrix rows still marked **Planned** name follow-on subsystem slices
+whose SQLite support has not landed yet (sessions/auth #1908, durable jobs and
+`#[scheduled]` tasks #1907, backup/restore/scrub/retention/deploy persistence
+#1909). A **Planned** row does **not** mean the app refuses to boot — the runtime
+boots and serves; those subsystems are simply not wired for SQLite until their
+tracking issue lands.
 
 ---
 
 ## How the degrades behave
 
-> These describe the **eventual** single-host behavior once the runtime slice
-> (#1905) lands. Today the runtime refuses SQLite at boot, so none of these
-> paths run yet.
+> These describe the single-host behavior on the SQLite runtime. The runtime now
+> boots and serves, so the behaviors for landed capabilities (e.g. migration
+> serialization) apply today; those tied to a still-**Planned** subsystem take
+> effect when that subsystem's SQLite slice lands.
 
 Each ⚠️ row above works on a single host. Here is the exact behavior, so you can
 reason about it rather than guess.

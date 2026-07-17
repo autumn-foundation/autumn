@@ -44,8 +44,8 @@ impl Order {
 }
 ```
 
-- It runs on the same connection and inside the same transaction that persists the new state, so the effect and the state change commit **atomically**.
-- Returning `Err` **aborts the transition and rolls back** — the state does not advance.
+- It runs on the connection you pass to the generated `transition_{field}_to_on_conn` method (see [Generated API](#generated-api)) — it does **not** open a transaction or write the new state itself. Atomicity is the caller's responsibility: run the transition and persist the returned state inside **one** transaction, and the `on` effect commits (or rolls back) together with the state change.
+- Returning `Err` from the handler **aborts that transaction** — the effect and the state change both roll back, so the state does not advance.
 - Reach for `on` when the effect must stay consistent with the state change: audit rows, derived columns, cross-row invariants.
 
 ---
@@ -127,7 +127,20 @@ pub struct Article {
 
 ## Generated API
 
-Declaring any effect gives the model a transaction-aware transition method, `transition_{field}_to_on_conn(&self, conn, target)`, which validates the edge, applies the synchronous `on` effect, and enqueues any `on_commit` job — all on the supplied connection, so callers stay in control of the surrounding transaction.
+Declaring any effect gives the model `transition_{field}_to_on_conn(&self, conn, target)`. It validates the edge, runs the synchronous `on` effect, and enqueues any `on_commit` job — all on the connection you supply — and then **returns the new state string for you to persist**. It does **not** begin a transaction or write the row itself, so to keep the `on` effect atomic with the state change, call it and persist the returned state inside one transaction:
+
+```rust
+// `conn` is the connection the surrounding transaction exposes.
+let new_state = order.transition_status_to_on_conn(conn, "shipped").await?;
+diesel::update(orders::table.find(order.id))
+    .set(orders::status.eq(&new_state))
+    .execute(conn)
+    .await?;
+// The sync `on` effect, this row update, and any `on_commit` enqueue all
+// commit — or roll back — with the transaction.
+```
+
+Open that transaction with a helper that hands you the `AsyncPgConnection` the method expects (for example `Db::tx_with`, or a raw `conn.transaction(...)`); `Db::tx` yields a pooled connection of a different type. An `on_commit` job enqueued inside the transaction is dispatched only after it commits.
 
 ---
 
