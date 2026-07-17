@@ -1881,11 +1881,11 @@ fn emit_up_sql_sqlite(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<Strin
     let rebuild = sqlite_rebuild_tables(&plan.changes);
     let mut emitted: BTreeSet<String> = BTreeSet::new();
     let mut groups = Vec::new();
-    for change in ordered {
+    for change in &ordered {
         let table = change_table_name(change);
         if rebuild.contains(table) {
             if emitted.insert(table.to_owned()) {
-                let block = emit_sqlite_rebuild(table, ctx, RebuildLeg::Up)?;
+                let block = emit_sqlite_rebuild(table, ctx, &ordered, RebuildLeg::Up)?;
                 let block = block.trim_end();
                 if !block.is_empty() {
                     groups.push(block.to_owned());
@@ -1910,11 +1910,11 @@ fn emit_down_sql_sqlite(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<Str
     let rebuild = sqlite_rebuild_tables(&plan.changes);
     let mut emitted: BTreeSet<String> = BTreeSet::new();
     let mut groups = Vec::new();
-    for change in ordered {
+    for change in &ordered {
         let table = change_table_name(change);
         if rebuild.contains(table) {
             if emitted.insert(table.to_owned()) {
-                let block = emit_sqlite_rebuild(table, ctx, RebuildLeg::Down)?;
+                let block = emit_sqlite_rebuild(table, ctx, &ordered, RebuildLeg::Down)?;
                 let block = block.trim_end();
                 if !block.is_empty() {
                     groups.push(block.to_owned());
@@ -1942,15 +1942,25 @@ enum RebuildLeg {
 }
 
 /// Render the `SQLite` table-recreate block for `table` on the given leg, drawing
-/// the target and source shapes from `ctx`.
+/// the target and source shapes from `ctx` and, on the up leg, the plan's own
+/// `changes`.
 ///
 /// The block `CREATE`s a `{table}__autumn_new` staging table with the target shape,
 /// copies the columns common to both shapes, drops the old table, renames the
 /// staging table into place, recreates the target shape's indexes, and validates
 /// referential integrity — all wrapped in `PRAGMA foreign_keys` toggles.
+///
+/// The **up** leg's target shape is the rich baseline table with this table's
+/// explicit diff deltas folded in ([`baseline_with_changes_applied`]) — **not** the
+/// parser's partial `ctx.desired` table — so any baseline facet the parser cannot
+/// see (a non-convention default, a skipped `CHECK`/enum, an association foreign
+/// key) survives a rebuild triggered by an unrelated change. The **down** leg
+/// targets the baseline shape directly (its source is `ctx.desired`); the baseline
+/// already carries every facet, so it needs no delta folding.
 fn emit_sqlite_rebuild(
     table: &str,
     ctx: &SchemaContext,
+    changes: &[&SchemaChange],
     leg: RebuildLeg,
 ) -> Result<String, EmitError> {
     // The `{table}__autumn_new` staging name is not guaranteed collision-free: if a
@@ -1975,11 +1985,91 @@ fn emit_sqlite_rebuild(
         .baseline
         .get(table)
         .ok_or_else(|| missing_rebuild_shape(table, "baseline"))?;
-    let (new_shape, source_shape) = match leg {
-        RebuildLeg::Up => (desired, baseline),
-        RebuildLeg::Down => (baseline, desired),
-    };
-    Ok(render_sqlite_rebuild(table, new_shape, source_shape, leg))
+    match leg {
+        // Build the up-leg target from the rich baseline with this table's explicit
+        // diff deltas applied, preserving every unchanged baseline facet the parser
+        // could not observe; the source (INSERT..SELECT) columns are the baseline's,
+        // i.e. the actual existing table.
+        RebuildLeg::Up => {
+            let new_shape = baseline_with_changes_applied(baseline, changes, table);
+            Ok(render_sqlite_rebuild(table, &new_shape, baseline, leg))
+        }
+        // The down leg rolls back to the rich baseline shape (source: the desired
+        // table). Unchanged — the baseline already carries every facet.
+        RebuildLeg::Down => Ok(render_sqlite_rebuild(table, baseline, desired, leg)),
+    }
+}
+
+/// Apply the table's own plan changes to its baseline shape, preserving every
+/// baseline facet the diff did not explicitly change (parser-invisible defaults,
+/// `CHECK`s, and so on) — the `SQLite` recreate's "new shape" for the up leg.
+///
+/// The slice-2 parser is deliberately partial (see the module header): it cannot
+/// see a non-convention `#[default]`, some `CHECK`/enum facets, or an association
+/// foreign key, and this engine has no `DropDefault` / `DropCheck` /
+/// `DropForeignKey` variant. Rebuilding the whole table from the raw `ctx.desired`
+/// (partial) shape would therefore silently drop any baseline facet the parser
+/// could not observe. Folding the explicit diff deltas into the rich baseline
+/// clone instead leaves every unchanged baseline facet intact, upholding the
+/// engine's "never destroy parser-invisible state" invariant that the Postgres
+/// per-change `ALTER` path already honours.
+///
+/// Only changes whose table is `table` are folded in; anything else (including the
+/// non-emittable guard markers) is ignored.
+fn baseline_with_changes_applied(
+    baseline: &Table,
+    changes: &[&SchemaChange],
+    table: &str,
+) -> Table {
+    let mut shape = baseline.clone();
+    for change in changes {
+        if change_table_name(change) != table {
+            continue;
+        }
+        match change {
+            SchemaChange::AddColumn { column, .. } => shape.columns.push(column.clone()),
+            SchemaChange::DropColumn { column, .. } => {
+                shape.columns.retain(|c| c.name != column.name);
+                shape.primary_key.retain(|n| n != &column.name);
+            }
+            SchemaChange::AlterColumnType { column, to, .. } => {
+                if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
+                    c.ty = to.clone();
+                }
+            }
+            SchemaChange::DropNotNull { column, .. } => {
+                if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
+                    c.nullable = true;
+                }
+            }
+            SchemaChange::SetNotNull { column, .. } => {
+                if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
+                    c.nullable = false;
+                }
+            }
+            SchemaChange::SetDefault { column, to, .. } => {
+                if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
+                    c.default = Some(to.clone());
+                }
+            }
+            SchemaChange::AddCheck { check, .. } => shape.checks.push(check.clone()),
+            SchemaChange::AddForeignKey {
+                column,
+                foreign_key,
+                ..
+            } => {
+                if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
+                    c.references = Some(foreign_key.clone());
+                }
+            }
+            SchemaChange::AddIndex { index, .. } => shape.indexes.push(index.clone()),
+            SchemaChange::DropIndex { index, .. } => {
+                shape.indexes.retain(|i| i.name != index.name);
+            }
+            _ => {}
+        }
+    }
+    shape
 }
 
 /// The [`EmitError::SqliteRebuildUnsupported`] for a rebuild whose `which`
@@ -4999,6 +5089,63 @@ PRAGMA foreign_keys=ON;
         assert!(
             !up.contains("legacy"),
             "dropped column is never copied: {up}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuild_preserves_parser_invisible_baseline_default() {
+        // A rebuild triggered by an UNRELATED change (here `views` Int32 -> Int64)
+        // must not silently drop a baseline facet the partial parser cannot see. The
+        // baseline `status` column carries a non-convention default (`'draft'`) and
+        // the table a hand-written CHECK; the desired (parser) view records neither
+        // and emits NO SetDefault/DropDefault/DropCheck (the engine has no such
+        // variant). Building the up-leg recreate shape from `baseline + deltas`
+        // instead of the raw `desired` table preserves both.
+        let mut status_baseline = col("status", ColumnType::Text);
+        status_baseline.default = Some(ColumnDefault::Sql("'draft'".to_owned()));
+        let mut baseline = sqlite_table(
+            "posts",
+            vec![col("views", ColumnType::Int32), status_baseline],
+            vec![],
+        );
+        baseline.checks.push(CheckConstraint {
+            name: None,
+            expression: "length(status) > 0".to_owned(),
+        });
+
+        // The parser's blind spot: `status.default` recorded as None and the CHECK
+        // absent, plus the unrelated `views` widening that triggers the rebuild.
+        let desired = sqlite_table(
+            "posts",
+            vec![
+                col("views", ColumnType::Int64),
+                col("status", ColumnType::Text),
+            ],
+            vec![],
+        );
+
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::AlterColumnType {
+                table: "posts".to_owned(),
+                column: "views".to_owned(),
+                from: ColumnType::Int32,
+                to: ColumnType::Int64,
+            }],
+        };
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        assert!(
+            up.contains("status TEXT NOT NULL DEFAULT 'draft'"),
+            "the parser-invisible baseline default is preserved in the recreate: {up}"
+        );
+        assert!(
+            up.contains("CHECK (length(status) > 0)"),
+            "the parser-invisible baseline CHECK is preserved in the recreate: {up}"
         );
     }
 
