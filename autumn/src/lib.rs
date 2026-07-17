@@ -518,6 +518,8 @@ pub mod __private {
     pub use crate::db::scoped_transaction;
     #[cfg(all(feature = "db", feature = "ws"))]
     pub use crate::repository_commit_hooks::CURRENT_CHANNELS;
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    pub use crate::repository_commit_hooks::start_repository_commit_hook_worker;
     #[cfg(feature = "db")]
     pub use crate::repository_commit_hooks::{
         RepositoryCommitHookDescriptor, catch_repository_after_hook_unwind,
@@ -528,7 +530,6 @@ pub mod __private {
         finalize_repository_commit_hook_after_hook, kick_repository_commit_hook_dispatcher,
         mark_repository_commit_hook_after_hook_failed, register_repository_commit_hook_runner,
         start_repository_commit_hook_pending_finalizer_heartbeat,
-        start_repository_commit_hook_worker,
     };
     #[cfg(feature = "db")]
     pub use crate::repository_commit_hooks::{
