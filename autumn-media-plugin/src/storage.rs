@@ -363,14 +363,19 @@ impl MediaStorage {
     ///
     /// # Errors
     ///
-    /// Returns [`MediaError::LocalRead`] when the staged file cannot be read
-    /// for upload, and [`MediaError::S3Upload`] when the remote upload fails.
+    /// Returns [`MediaError::InvalidKeySegment`] when the caller key contains a
+    /// dot-only (`.`/`..`) or empty path segment (rejected at this write
+    /// boundary so such an object is never stored or advertised — see
+    /// [`reject_dot_only_segments`]), [`MediaError::LocalRead`] when the staged
+    /// file cannot be read for upload, and [`MediaError::S3Upload`] when the
+    /// remote upload fails.
     pub async fn persist_file_with_content_type(
         &self,
         key: &str,
         local_path: &Path,
         content_type: &str,
     ) -> Result<StoredObject, MediaError> {
+        reject_dot_only_segments(key)?;
         match self {
             Self::Local { .. } => Ok(StoredObject {
                 backend: self.backend_name().to_owned(),
@@ -567,6 +572,33 @@ pub fn join_key_prefix(prefix: &str, key: &str) -> String {
     } else {
         format!("{prefix}/{key}")
     }
+}
+
+/// Reject a caller key whose path carries a dot-only or empty segment.
+///
+/// After trimming outer slashes (the same normalization [`join_key_prefix`] /
+/// [`MediaStorage::resolved_key`] apply), every `/`-split segment must be
+/// non-empty and neither `.` nor `..` once trimmed. This is the boundary check
+/// behind [`MediaStorage::persist_file`]: percent-encoding a dot-only segment
+/// (as [`encode_key_for_url`] does defensively) is insufficient on its own
+/// because WHATWG URL parsers normalize `%2E` back to `.` before the request,
+/// so `clips/../other.mp4` could address a different object than the one stored.
+/// Refusing the key here means such an object is never created or advertised.
+///
+/// # Errors
+///
+/// Returns [`MediaError::InvalidKeySegment`] naming the offending key (a
+/// caller object key, not a secret).
+pub(crate) fn reject_dot_only_segments(key: &str) -> Result<(), MediaError> {
+    for segment in key.trim_matches('/').split('/') {
+        let segment = segment.trim();
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(MediaError::InvalidKeySegment {
+                key: key.to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The inverse of [`join_key_prefix`]: strip a leading `{prefix}/` from a stored
@@ -1053,6 +1085,73 @@ mod tests {
     #[test]
     fn strip_key_prefix_key_equal_to_prefix_is_empty() {
         assert_eq!(strip_key_prefix("media", "media"), "");
+    }
+
+    // ── reject_dot_only_segments ─────────────────────────────────────────────
+
+    #[test]
+    fn reject_dot_only_segments_rejects_dotdot() {
+        assert!(matches!(
+            reject_dot_only_segments("clips/../other.mp4"),
+            Err(MediaError::InvalidKeySegment { .. })
+        ));
+    }
+
+    #[test]
+    fn reject_dot_only_segments_rejects_single_dot() {
+        assert!(matches!(
+            reject_dot_only_segments("clips/./a.mp4"),
+            Err(MediaError::InvalidKeySegment { .. })
+        ));
+    }
+
+    #[test]
+    fn reject_dot_only_segments_accepts_filename_with_dots() {
+        // Dots *inside* a segment (an ordinary filename) are fine.
+        assert!(reject_dot_only_segments("clips/my.file.mp4").is_ok());
+        // A normal nested key round-trips fine.
+        assert!(reject_dot_only_segments("highlights/chan/a-b_c.mp4").is_ok());
+    }
+
+    #[test]
+    fn reject_dot_only_segments_trims_outer_slashes_but_rejects_inner_empties() {
+        // Leading/trailing slashes are trimmed (as resolved_key would), so a
+        // key with only outer slashes is accepted.
+        assert!(reject_dot_only_segments("/clips/a.mp4/").is_ok());
+        // An internal empty segment (`//`) is rejected.
+        assert!(reject_dot_only_segments("clips//a.mp4").is_err());
+        // A whitespace-padded dot-only segment is rejected.
+        assert!(reject_dot_only_segments("clips/ .. /a.mp4").is_err());
+        // An empty key has no legitimate object to name.
+        assert!(reject_dot_only_segments("").is_err());
+    }
+
+    #[tokio::test]
+    async fn persist_file_rejects_dot_only_segment_key() {
+        let storage = MediaStorage::Local {
+            root: PathBuf::from("media"),
+            public_base_url: "/media".to_owned(),
+        };
+        let err = storage
+            .persist_file("clips/../secret.mp4", Path::new("/tmp/staged/x.mp4"))
+            .await
+            .expect_err("dot-only-segment key must be rejected at the boundary");
+        assert!(matches!(err, MediaError::InvalidKeySegment { .. }));
+    }
+
+    #[tokio::test]
+    async fn persist_file_accepts_ordinary_dotted_filename() {
+        // The local backend records the path without I/O, so this exercises the
+        // validation boundary while accepting an ordinary dotted filename.
+        let storage = MediaStorage::Local {
+            root: PathBuf::from("media"),
+            public_base_url: "/media".to_owned(),
+        };
+        let stored = storage
+            .persist_file("clips/my.file.mp4", Path::new("/tmp/staged/my.file.mp4"))
+            .await
+            .expect("ordinary dotted filename must be accepted");
+        assert_eq!(stored.key, "clips/my.file.mp4");
     }
 
     // ── from_config ──────────────────────────────────────────────────────────

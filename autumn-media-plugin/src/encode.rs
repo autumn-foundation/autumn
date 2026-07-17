@@ -711,6 +711,189 @@ impl FfmpegLiveThumbnailCommand {
     }
 }
 
+/// Width, in pixels, of one participant cell in a room-composite grid (16:9).
+pub const ROOM_COMPOSITE_CELL_WIDTH: u32 = 640;
+
+/// Height, in pixels, of one participant cell in a room-composite grid (16:9).
+pub const ROOM_COMPOSITE_CELL_HEIGHT: u32 = 360;
+
+/// Maximum participant recordings a room composite accepts.
+///
+/// Tied to the mesh-room seat cap
+/// ([`crate::config::DEFAULT_ROOM_MAX_PARTICIPANTS`], 6): a mesh call never
+/// exceeds 6 participants, so a composite never tiles more. Kept as a local
+/// const so this dependency-free encode module needs no `config` import.
+const ROOM_COMPOSITE_MAX_INPUTS: usize = 6;
+
+/// Grid-composite encoder for a finished mesh-room recording.
+///
+/// Tiles each participant's recording into a grid — `2x1` for two participants,
+/// `2x2` for three–four, `3x2` for five–six — via `FFmpeg`'s `xstack` filter
+/// (each cell letterboxed to
+/// [`ROOM_COMPOSITE_CELL_WIDTH`]×[`ROOM_COMPOSITE_CELL_HEIGHT`]) and mixes every
+/// participant's audio into one track with `amix`, producing a single
+/// composited MP4. Best-effort by convention, like the other recording
+/// encoders. The composite needs `2..=6` participant recordings (the mesh-room
+/// cap); one input per participant, so — unlike the clip/poster encoders — it
+/// never concatenates.
+///
+/// # Audio-stream assumption
+///
+/// This composite assumes **each participant recording carries an audio
+/// stream**: the `-filter_complex` graph references every input's audio and
+/// mixes them with `amix`, so a **video-only participant recording (no audio
+/// stream) is not supported for composition this slice** — `FFmpeg` would fail
+/// on the missing stream. The **per-participant recordings themselves are
+/// unaffected**; this limitation is only about the composited grid output.
+/// Robust handling (per-input audio detection / silence synthesis) is recorded
+/// future work on the epic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FfmpegRoomCompositeCommand {
+    ffmpeg_bin: String,
+    input_paths: Vec<PathBuf>,
+    output_path: PathBuf,
+}
+
+impl FfmpegRoomCompositeCommand {
+    /// Build a room-composite command. One `input_path` per participant.
+    #[must_use]
+    pub fn new(
+        ffmpeg_bin: impl Into<String>,
+        input_paths: Vec<PathBuf>,
+        output_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            ffmpeg_bin: ffmpeg_bin.into(),
+            input_paths,
+            output_path: output_path.into(),
+        }
+    }
+
+    /// The exact `FFmpeg` argument vector this command runs.
+    #[must_use]
+    pub fn args(&self) -> Vec<String> {
+        let n = self.input_paths.len();
+        let mut args = vec!["-y".to_owned()];
+        for path in &self.input_paths {
+            args.push("-i".to_owned());
+            args.push(path.display().to_string());
+        }
+        args.push("-filter_complex".to_owned());
+        args.push(room_composite_filtergraph(n));
+        args.extend([
+            "-map".to_owned(),
+            "[vout]".to_owned(),
+            "-map".to_owned(),
+            "[aout]".to_owned(),
+            "-c:v".to_owned(),
+            "libx264".to_owned(),
+            "-preset".to_owned(),
+            "veryfast".to_owned(),
+            "-c:a".to_owned(),
+            "aac".to_owned(),
+            "-movflags".to_owned(),
+            "+faststart".to_owned(),
+            self.output_path.display().to_string(),
+        ]);
+        args
+    }
+
+    /// Render the composited MP4 and return its size in bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when there are fewer than two or more than six source
+    /// recordings (the `2..=6` mesh-room band), a source is missing, the output
+    /// directory cannot be created, `FFmpeg` fails, or the output cannot be
+    /// inspected after a successful run.
+    pub fn run(&self) -> Result<u64, MediaError> {
+        require_sources(&self.input_paths)?;
+        if self.input_paths.len() < 2 {
+            return Err(MediaError::FfmpegSourceMissing {
+                path: "<room composite needs at least two participant recordings>".to_owned(),
+            });
+        }
+        if self.input_paths.len() > ROOM_COMPOSITE_MAX_INPUTS {
+            return Err(MediaError::FfmpegSourceMissing {
+                path: "<room composite accepts at most six participant recordings>".to_owned(),
+            });
+        }
+        create_output_parent(&self.output_path)?;
+
+        let output = Command::new(&self.ffmpeg_bin)
+            .args(self.args())
+            .output()
+            .map_err(|source| MediaError::FfmpegSpawn {
+                bin: self.ffmpeg_bin.clone(),
+                source,
+            })?;
+
+        check_exit(&output)?;
+        output_size(&self.output_path)
+    }
+}
+
+/// Grid dimensions `(cols, rows)` for an `n`-participant composite: `2x1` for
+/// two, `2x2` for three–four, `3x2` for five–six.
+const fn room_composite_grid_dims(n: usize) -> (usize, usize) {
+    if n <= 2 {
+        (2, 1)
+    } else if n <= 4 {
+        (2, 2)
+    } else {
+        (3, 2)
+    }
+}
+
+/// Build the `-filter_complex` graph: one letterboxed `scale`/`pad` per input,
+/// an `xstack` grid of them, and an `amix` of every audio track.
+fn room_composite_filtergraph(n: usize) -> String {
+    use std::fmt::Write as _;
+
+    let (cols, _rows) = room_composite_grid_dims(n);
+    let (w, h) = (ROOM_COMPOSITE_CELL_WIDTH, ROOM_COMPOSITE_CELL_HEIGHT);
+    let mut parts = Vec::new();
+    let mut video_labels = String::new();
+    let mut audio_labels = String::new();
+    for i in 0..n {
+        parts.push(format!(
+            "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+        ));
+        let _ = write!(video_labels, "[v{i}]");
+        let _ = write!(audio_labels, "[{i}:a]");
+    }
+    let layout = room_composite_layout(cols, n);
+    parts.push(format!(
+        "{video_labels}xstack=inputs={n}:layout={layout}[vout]"
+    ));
+    parts.push(format!("{audio_labels}amix=inputs={n}:normalize=1[aout]"));
+    parts.join(";")
+}
+
+/// The `xstack` `layout` string. Every cell is the same size, so each input at
+/// `(row, col)` is placed at `X_Y` where the column offset is a sum of the
+/// first cell's width (`w0`) and the row offset a sum of its height (`h0`).
+fn room_composite_layout(cols: usize, n: usize) -> String {
+    (0..n)
+        .map(|i| {
+            let col = i % cols;
+            let row = i / cols;
+            let x = if col == 0 {
+                "0".to_owned()
+            } else {
+                vec!["w0"; col].join("+")
+            };
+            let y = if row == 0 {
+                "0".to_owned()
+            } else {
+                vec!["h0"; row].join("+")
+            };
+            format!("{x}_{y}")
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 // ── Shared run() helpers ────────────────────────────────────────────────────
 
 /// Reject an empty or missing set of source recordings before spawning.
@@ -920,10 +1103,10 @@ mod tests {
 
     use super::{
         FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand,
-        FfmpegPosterCommand, FfmpegPreviewSpriteCommand, PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH,
-        PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS, build_preview_webvtt,
-        newest_recording_files, newest_recording_files_since, recording_segments_covering_window,
-        slugify,
+        FfmpegPosterCommand, FfmpegPreviewSpriteCommand, FfmpegRoomCompositeCommand,
+        PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH, PREVIEW_FRAME_INTERVAL_SECONDS,
+        PREVIEW_SPRITE_COLUMNS, build_preview_webvtt, newest_recording_files,
+        newest_recording_files_since, recording_segments_covering_window, slugify,
     };
 
     // ── Arg-vector contracts (no FFmpeg binary required) ────────────────────
@@ -1067,6 +1250,103 @@ mod tests {
         let i = args.iter().position(|a| a == "-i").unwrap();
         assert_eq!(args[i + 1], "http://mediamtx/live/key/index.m3u8");
         assert_eq!(args.last().map(String::as_str), Some("/out/thumb.jpg"));
+    }
+
+    #[test]
+    fn room_composite_two_participants_side_by_side() {
+        let cmd = FfmpegRoomCompositeCommand::new(
+            "ffmpeg",
+            vec![PathBuf::from("/rec/a.mp4"), PathBuf::from("/rec/b.mp4")],
+            "/out/room.mp4",
+        );
+        let args = cmd.args();
+        assert_eq!(args.first().map(String::as_str), Some("-y"));
+        // One -i per participant.
+        assert_eq!(args.iter().filter(|a| *a == "-i").count(), 2);
+        // Exact filter graph: two letterboxed cells, a 2x1 xstack, an amix.
+        let fc = args.iter().position(|a| a == "-filter_complex").unwrap();
+        assert_eq!(
+            args[fc + 1],
+            "[0:v]scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1[v0];\
+             [1:v]scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1[v1];\
+             [v0][v1]xstack=inputs=2:layout=0_0|w0_0[vout];\
+             [0:a][1:a]amix=inputs=2:normalize=1[aout]"
+        );
+        assert_windowed(&args, "-map", "[vout]");
+        assert_windowed(&args, "-c:v", "libx264");
+        assert_windowed(&args, "-c:a", "aac");
+        assert_windowed(&args, "-movflags", "+faststart");
+        assert_eq!(args.last().map(String::as_str), Some("/out/room.mp4"));
+    }
+
+    #[test]
+    fn room_composite_four_participants_two_by_two_grid() {
+        let cmd = FfmpegRoomCompositeCommand::new(
+            "ffmpeg",
+            vec![
+                PathBuf::from("/rec/a.mp4"),
+                PathBuf::from("/rec/b.mp4"),
+                PathBuf::from("/rec/c.mp4"),
+                PathBuf::from("/rec/d.mp4"),
+            ],
+            "/out/room.mp4",
+        );
+        let args = cmd.args();
+        assert_eq!(args.iter().filter(|a| *a == "-i").count(), 4);
+        let fc = args.iter().position(|a| a == "-filter_complex").unwrap();
+        assert_eq!(
+            args[fc + 1],
+            "[0:v]scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1[v0];\
+             [1:v]scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1[v1];\
+             [2:v]scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1[v2];\
+             [3:v]scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1[v3];\
+             [v0][v1][v2][v3]xstack=inputs=4:layout=0_0|w0_0|0_h0|w0_h0[vout];\
+             [0:a][1:a][2:a][3:a]amix=inputs=4:normalize=1[aout]"
+        );
+    }
+
+    #[test]
+    fn room_composite_grid_dims_match_participant_bands() {
+        use super::room_composite_grid_dims;
+        assert_eq!(room_composite_grid_dims(2), (2, 1));
+        assert_eq!(room_composite_grid_dims(3), (2, 2));
+        assert_eq!(room_composite_grid_dims(4), (2, 2));
+        assert_eq!(room_composite_grid_dims(5), (3, 2));
+        assert_eq!(room_composite_grid_dims(6), (3, 2));
+    }
+
+    #[test]
+    fn room_composite_run_rejects_single_participant() {
+        let dir = tempfile::tempdir().unwrap();
+        let only = dir.path().join("solo.mp4");
+        File::create(&only).unwrap();
+        let cmd =
+            FfmpegRoomCompositeCommand::new("ffmpeg", vec![only], dir.path().join("room.mp4"));
+        // A one-participant composite is meaningless; run() must reject it
+        // before spawning FFmpeg.
+        assert!(matches!(
+            cmd.run(),
+            Err(super::MediaError::FfmpegSourceMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn room_composite_run_rejects_more_than_six_participants() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seven present sources: `require_sources` passes, then the `2..=6`
+        // upper bound rejects before spawning FFmpeg (mesh rooms cap at six).
+        let sources: Vec<PathBuf> = (0..7)
+            .map(|i| {
+                let path = dir.path().join(format!("p{i}.mp4"));
+                File::create(&path).unwrap();
+                path
+            })
+            .collect();
+        let cmd = FfmpegRoomCompositeCommand::new("ffmpeg", sources, dir.path().join("room.mp4"));
+        assert!(matches!(
+            cmd.run(),
+            Err(super::MediaError::FfmpegSourceMissing { .. })
+        ));
     }
 
     /// Assert `flag` appears immediately followed by `value`.

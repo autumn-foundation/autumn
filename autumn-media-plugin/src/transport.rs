@@ -31,6 +31,13 @@ use crate::config::MediaMtxConfig;
 const DEFAULT_TIMEOUT_SECS: u64 = 3;
 /// Timeout used for the best-effort publisher-kick calls.
 const KICK_TIMEOUT_SECS: u64 = 5;
+/// Page size for the paginated `MediaMTX` v3 paths-list fetch.
+const PATHS_ITEMS_PER_PAGE: u32 = 1000;
+/// Hard cap on paths-list pages walked per fetch.
+///
+/// Guards against a malformed or absent `pageCount` ever driving an unbounded
+/// loop; at 1000 items per page this still covers a million live paths.
+const MAX_PATHS_PAGES: u64 = 1000;
 
 // ── Status enums ────────────────────────────────────────────────────────────
 
@@ -136,6 +143,25 @@ pub fn viewer_counts_from_paths_json(json: &serde_json::Value) -> Option<HashMap
         counts.insert(stream_key.to_owned(), count);
     }
     Some(counts)
+}
+
+/// Resolve the total page count from a `MediaMTX` paths-list response.
+///
+/// Clamped to at least 1: an absent or malformed `pageCount` is treated as a
+/// single page so the paginated fetchers can never infinite-loop.
+fn page_count_from_paths_json(json: &serde_json::Value) -> u64 {
+    json.get("pageCount")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Whether a `MediaMTX` paths-list response carries no `items` (a well-formed
+/// empty page), used as a defensive pagination stop.
+fn paths_page_is_empty(json: &serde_json::Value) -> bool {
+    json.get("items")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(Vec::is_empty)
 }
 
 /// Extract per-stream-key ingest statuses from the `MediaMTX` paths list
@@ -256,30 +282,57 @@ impl MediaMtxClient {
         &self.api_base
     }
 
-    /// Read ingest statuses for every path from the `MediaMTX` v3 paths API.
+    /// Fetch one page of the `MediaMTX` v3 paths list.
     ///
-    /// Returns `None` when the API is unreachable or returns an unexpected body
-    /// so callers (a stream reaper) can distinguish "`MediaMTX` is down" from
-    /// "no publisher" — a transport failure must never be treated as feed loss.
-    pub async fn fetch_ingest_statuses(&self) -> Option<HashMap<String, IngestStatus>> {
-        let url = format!("{}/v3/paths/list?itemsPerPage=1000", self.api_base);
+    /// Returns `None` on any transport, non-success, or parse failure so the
+    /// paginated fetchers preserve their "`MediaMTX` is down" sentinel.
+    async fn fetch_paths_page(&self, page: u64) -> Option<serde_json::Value> {
+        let url = format!(
+            "{}/v3/paths/list?itemsPerPage={PATHS_ITEMS_PER_PAGE}&page={page}",
+            self.api_base
+        );
         let response = self.http.get(&url).send().await.ok()?;
         if !response.status().is_success() {
             return None;
         }
-        let json = response.json::<serde_json::Value>().await.ok()?;
-        ingest_statuses_from_paths_json(&json)
+        response.json::<serde_json::Value>().await.ok()
+    }
+
+    /// Read ingest statuses for every path from the `MediaMTX` v3 paths API.
+    ///
+    /// Walks every page of the paginated list so paths beyond the first
+    /// `itemsPerPage` are visible. Returns `None` when the API is unreachable or
+    /// returns an unexpected body so callers (a stream reaper) can distinguish
+    /// "`MediaMTX` is down" from "no publisher" — a transport failure must never
+    /// be treated as feed loss.
+    pub async fn fetch_ingest_statuses(&self) -> Option<HashMap<String, IngestStatus>> {
+        let mut merged = HashMap::new();
+        for page in 0..MAX_PATHS_PAGES {
+            let json = self.fetch_paths_page(page).await?;
+            let statuses = ingest_statuses_from_paths_json(&json)?;
+            merged.extend(statuses);
+            if paths_page_is_empty(&json) || page + 1 >= page_count_from_paths_json(&json) {
+                break;
+            }
+        }
+        Some(merged)
     }
 
     /// Read all active path viewer counts from the `MediaMTX` v3 paths API.
+    ///
+    /// Walks every page of the paginated list so paths beyond the first
+    /// `itemsPerPage` are counted.
     pub async fn fetch_viewer_counts(&self) -> Option<HashMap<String, u64>> {
-        let url = format!("{}/v3/paths/list?itemsPerPage=1000", self.api_base);
-        let response = self.http.get(&url).send().await.ok()?;
-        if !response.status().is_success() {
-            return None;
+        let mut merged = HashMap::new();
+        for page in 0..MAX_PATHS_PAGES {
+            let json = self.fetch_paths_page(page).await?;
+            let counts = viewer_counts_from_paths_json(&json)?;
+            merged.extend(counts);
+            if paths_page_is_empty(&json) || page + 1 >= page_count_from_paths_json(&json) {
+                break;
+            }
         }
-        let json = response.json::<serde_json::Value>().await.ok()?;
-        viewer_counts_from_paths_json(&json)
+        Some(merged)
     }
 
     /// Read ingest and viewer state for one channel from the `MediaMTX` v3 paths
@@ -476,6 +529,28 @@ impl MediaUrls {
         format!("{}/live/{stream_key}/whip", self.webrtc_base)
     }
 
+    /// `WHIP` publish URL for an arbitrary `MediaMTX` `path`.
+    ///
+    /// Unlike [`whip_publish_url`](Self::whip_publish_url) — the broadcast
+    /// helper that inserts the `live/` segment — this takes the full
+    /// `MediaMTX` path verbatim, so the rooms surface (whose participant paths
+    /// are `room/…`, not `live/…`) composes publish URLs through it.
+    #[must_use]
+    pub fn whip_publish_url_for_path(&self, path: &str) -> String {
+        format!("{}/{path}/whip", self.webrtc_base)
+    }
+
+    /// `WHEP` read (subscribe) URL for an arbitrary `MediaMTX` `path`.
+    ///
+    /// Mirrors [`whip_publish_url_for_path`](Self::whip_publish_url_for_path)
+    /// for the subscribe side: the rooms surface builds each peer's subscribe
+    /// URL with it (the broadcast [`webrtc_playback_url`](Self::webrtc_playback_url)
+    /// only serves `live/…` paths).
+    #[must_use]
+    pub fn whep_read_url(&self, path: &str) -> String {
+        format!("{}/{path}/whep", self.webrtc_base)
+    }
+
     /// Browser-facing recorded-`VOD` playback URL for a finished recording.
     ///
     /// Returns `None` when the recording path does not resolve to a
@@ -533,7 +608,7 @@ fn recording_url(
         return None;
     }
     let start = DateTime::<Utc>::from_naive_utc_and_offset(started_at, Utc)
-        .to_rfc3339_opts(SecondsFormat::Secs, true);
+        .to_rfc3339_opts(SecondsFormat::AutoSi, true);
     let duration = duration_seconds_param(duration_millis);
     let mut url =
         reqwest::Url::parse(&format!("{}/get", playback_base.trim_end_matches('/'))).ok()?;
@@ -818,6 +893,20 @@ mod tests {
     }
 
     #[test]
+    fn raw_path_whip_whep_urls_take_the_path_verbatim() {
+        let urls = MediaUrls::from_config(&MediaMtxConfig::default());
+        // No `live/` insertion — the room path is used exactly as given.
+        assert_eq!(
+            urls.whip_publish_url_for_path("room/tenant-a/room1/part1"),
+            "http://127.0.0.1:8889/room/tenant-a/room1/part1/whip"
+        );
+        assert_eq!(
+            urls.whep_read_url("room/tenant-a/room1/part1"),
+            "http://127.0.0.1:8889/room/tenant-a/room1/part1/whep"
+        );
+    }
+
+    #[test]
     fn internal_hls_falls_back_to_hls_base_without_probe_override() {
         let urls = MediaUrls::from_config(&MediaMtxConfig::default());
         assert_eq!(
@@ -861,6 +950,49 @@ mod tests {
             Some(
                 "http://public-playback.example/get?path=live%2Fsk_test&start=2026-05-14T10%3A00%3A00Z&duration=3600&format=fmp4"
             )
+        );
+    }
+
+    #[test]
+    fn recording_playback_url_preserves_subsecond_start_anchor() {
+        let config = MediaMtxConfig {
+            playback_base: "http://public-playback.example".to_owned(),
+            ..MediaMtxConfig::default()
+        };
+        let urls = MediaUrls::from_config(&config);
+        // A start anchor 250ms into the second must not be truncated away.
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 5, 14)
+            .unwrap()
+            .and_hms_milli_opt(10, 0, 0, 250)
+            .unwrap();
+        let end = start + chrono::Duration::hours(1);
+        let url = urls
+            .recording_playback_url(
+                &PathBuf::from("recordings/live/sk_test"),
+                &PathBuf::from("recordings"),
+                start,
+                end,
+            )
+            .expect("playback url should build");
+        // AutoSi renders the millisecond component (percent-encoded `.` stays raw).
+        assert!(
+            url.contains("start=2026-05-14T10%3A00%3A00.250Z"),
+            "sub-second start must be preserved, got {url}"
+        );
+
+        // A whole-second start still renders cleanly with no fractional digits.
+        let whole = started_at();
+        let whole_url = urls
+            .recording_playback_url(
+                &PathBuf::from("recordings/live/sk_test"),
+                &PathBuf::from("recordings"),
+                whole,
+                whole + chrono::Duration::hours(1),
+            )
+            .expect("playback url should build");
+        assert!(
+            whole_url.contains("start=2026-05-14T10%3A00%3A00Z"),
+            "whole-second start must render without a decimal, got {whole_url}"
         );
     }
 
@@ -995,5 +1127,184 @@ mod tests {
     async fn client_constructs_and_reports_api_base() {
         let client = MediaMtxClient::new(&MediaMtxConfig::default());
         assert_eq!(client.api_base(), "http://127.0.0.1:9997");
+    }
+
+    // ── Paths-list pagination (local TcpListener stub) ───────────────────────
+
+    /// Spawn a stub that serves the supplied paths-list pages, dispatching each
+    /// request by its `page=` query parameter and serving a well-formed empty
+    /// page for any out-of-range page.
+    async fn spawn_paths_list_server(pages: Vec<serde_json::Value>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test paths server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test paths server should have address");
+        let page_total = pages.len();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 2048];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let page = parse_page_param(&request);
+                let body = pages.get(page).cloned().unwrap_or_else(|| {
+                    serde_json::json!({
+                        "itemCount": 0,
+                        "pageCount": page_total,
+                        "items": []
+                    })
+                });
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Extract the `page=` value from a raw HTTP request line (defaults to 0).
+    fn parse_page_param(request: &str) -> usize {
+        request
+            .split("page=")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn client_for(base: &str) -> MediaMtxClient {
+        MediaMtxClient::new(&MediaMtxConfig {
+            api_base: base.to_owned(),
+            ..MediaMtxConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn fetch_viewer_counts_walks_all_pages() {
+        let page0 = serde_json::json!({
+            "itemCount": 3,
+            "pageCount": 2,
+            "items": [
+                { "name": "live/room_a", "readers": [ {}, {} ] },
+                { "name": "live/room_b", "readers": [ {} ] }
+            ]
+        });
+        let page1 = serde_json::json!({
+            "itemCount": 3,
+            "pageCount": 2,
+            "items": [
+                { "name": "live/room_c", "readers": [ {}, {}, {} ] }
+            ]
+        });
+        let base = spawn_paths_list_server(vec![page0, page1]).await;
+        let counts = client_for(&base)
+            .fetch_viewer_counts()
+            .await
+            .expect("reachable API must yield counts");
+        assert_eq!(counts.get("room_a"), Some(&2));
+        assert_eq!(counts.get("room_b"), Some(&1));
+        assert_eq!(counts.get("room_c"), Some(&3), "second page must be walked");
+        assert_eq!(counts.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fetch_ingest_statuses_walks_all_pages() {
+        let page0 = serde_json::json!({
+            "itemCount": 2,
+            "pageCount": 2,
+            "items": [
+                { "name": "live/first", "source": { "type": "rtmpConn", "id": "a" }, "readers": [] }
+            ]
+        });
+        let page1 = serde_json::json!({
+            "itemCount": 2,
+            "pageCount": 2,
+            "items": [
+                { "name": "live/second", "source": null, "readers": [] }
+            ]
+        });
+        let base = spawn_paths_list_server(vec![page0, page1]).await;
+        let statuses = client_for(&base)
+            .fetch_ingest_statuses()
+            .await
+            .expect("reachable API must yield statuses");
+        assert!(matches!(
+            statuses.get("first"),
+            Some(IngestStatus::Receiving { .. })
+        ));
+        assert!(
+            matches!(statuses.get("second"), Some(IngestStatus::NotReceiving)),
+            "second page must be walked"
+        );
+        assert_eq!(statuses.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_ingest_statuses_single_page() {
+        let page0 = serde_json::json!({
+            "itemCount": 1,
+            "pageCount": 1,
+            "items": [
+                { "name": "live/only", "source": { "type": "whipSession", "id": "z" }, "readers": [] }
+            ]
+        });
+        let base = spawn_paths_list_server(vec![page0]).await;
+        let statuses = client_for(&base)
+            .fetch_ingest_statuses()
+            .await
+            .expect("reachable API must yield statuses");
+        assert!(matches!(
+            statuses.get("only"),
+            Some(IngestStatus::Receiving { .. })
+        ));
+        assert_eq!(statuses.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_viewer_counts_absent_page_count_is_single_page() {
+        // No `pageCount` field: must be treated as one page (never infinite-loop).
+        let page0 = serde_json::json!({
+            "items": [ { "name": "live/solo", "readers": [ {} ] } ]
+        });
+        let base = spawn_paths_list_server(vec![page0]).await;
+        let counts = client_for(&base)
+            .fetch_viewer_counts()
+            .await
+            .expect("reachable API must yield counts");
+        assert_eq!(counts.get("solo"), Some(&1));
+        assert_eq!(counts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_viewer_counts_unreachable_api_is_none() {
+        // Bind then drop to obtain a port with nothing listening (connection
+        // refused is immediate) — the transport sentinel must stay `None`.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind");
+        let addr = listener.local_addr().expect("should have address");
+        drop(listener);
+        let client = client_for(&format!("http://{addr}"));
+        assert!(client.fetch_viewer_counts().await.is_none());
+        assert!(client.fetch_ingest_statuses().await.is_none());
+    }
+
+    #[test]
+    fn page_count_clamps_and_defaults() {
+        assert_eq!(
+            page_count_from_paths_json(&serde_json::json!({ "pageCount": 4 })),
+            4
+        );
+        // Absent → single page.
+        assert_eq!(page_count_from_paths_json(&serde_json::json!({})), 1);
+        // Malformed (zero) → clamped to at least one page.
+        assert_eq!(
+            page_count_from_paths_json(&serde_json::json!({ "pageCount": 0 })),
+            1
+        );
     }
 }

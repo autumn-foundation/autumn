@@ -23,7 +23,9 @@ The plugin is configured by a `[media]` section in your Autumn profile:
 
 ```toml
 [media]
-room_max_participants = 6            # hard cap, mesh, no SFU
+room_max_participants  = 6           # hard cap, mesh, no SFU (1..=6)
+room_token_ttl_seconds = 300         # room session-token lifetime
+# room_namespace       = "tenant-a"  # optional MediaMTX path namespace
 
 [media.mediamtx]
 api_base            = "http://127.0.0.1:9997"

@@ -26,6 +26,21 @@ pub enum MediaError {
     )]
     PartialS3Credentials,
 
+    /// A caller-supplied storage key contained a dot-only (`.`/`..`) or empty
+    /// path segment.
+    ///
+    /// Percent-encoding such a segment is not enough: WHATWG URL parsers
+    /// normalize `%2E` back to `.`, so the advertised public URL could
+    /// path-normalize down to a *different* object than the one stored. The key
+    /// is refused at the storage boundary instead. `key` is a caller object key
+    /// (not a secret — it already appears in public URLs and the S3 error
+    /// variants).
+    #[error("invalid storage key `{key}`: path segments must not be `.`, `..`, or empty")]
+    InvalidKeySegment {
+        /// The offending caller-relative key.
+        key: String,
+    },
+
     /// A local file staged for persistence could not be read.
     #[error("failed to read local file `{path}`: {source}")]
     LocalRead {
