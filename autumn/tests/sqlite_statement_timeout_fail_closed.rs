@@ -1,7 +1,7 @@
 //! Fail-closed boot guard for `database.statement_timeout` under the `SQLite`
 //! backend (issue #1996, item 4).
 //!
-//! SQLite cannot enforce a per-statement wall-clock timeout through the async
+//! `SQLite` cannot enforce a per-statement wall-clock timeout through the async
 //! connection wrapper: diesel's `SqliteConnection` exposes no
 //! interrupt/progress-handler hook (nor the raw `sqlite3` handle) through
 //! `SyncConnectionWrapper`, so a runaway query cannot be aborted mid-flight.
@@ -12,7 +12,7 @@
 //! into a loud, typed [`autumn_web::db::PoolError`] naming the config key.
 //!
 //! A `None` or zero timeout (the default) asks for no guarantee and boots
-//! cleanly, so ordinary SQLite apps are unaffected.
+//! cleanly, so ordinary `SQLite` apps are unaffected.
 //!
 //! Run it explicitly (never via a members-enable edge — that would trip the
 //! feature-unification hazard):

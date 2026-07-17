@@ -1,13 +1,13 @@
 //! End-to-end `#[repository(versioned = true)]` version-history proof on the
 //! `SQLite` runtime backend (issue #1996).
 //!
-//! Before this slice a `versioned = true` repository could not run on SQLite:
+//! Before this slice a `versioned = true` repository could not run on `SQLite`:
 //! the writer emitted a Postgres-only `$7::jsonb` cast, the reader used
 //! `::bigint` / `::text` / `::timestamptz` / `changes::text` casts plus the
 //! `Timestamptz` diesel type (which has no `FromSql<_, Sqlite>`), and the
 //! `_autumn_version_history` DDL was Postgres-only (`BIGSERIAL` / `JSONB` /
 //! `DEFAULT NOW()` / `ADD COLUMN IF NOT EXISTS`). This test drives the forked
-//! writer + reader against a real in-memory SQLite database and asserts:
+//! writer + reader against a real in-memory `SQLite` database and asserts:
 //!
 //! * a create + update + delete each append one `_autumn_version_history` row,
 //!   read back through `version_history()` with the correct op / actor / changes
@@ -18,7 +18,7 @@
 //! * **fail-closed tenant isolation (adversarial):** `version_history()` scoped
 //!   to tenant B must NOT return tenant A's history rows.
 //!
-//! Uses an in-memory shared-cache SQLite database — no Docker. Only meaningful
+//! Uses an in-memory shared-cache `SQLite` database — no Docker. Only meaningful
 //! under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a
 //! default `cargo test` compiles it to an empty (passing) binary. Run:
 //! `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_version_history`.

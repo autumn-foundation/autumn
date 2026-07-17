@@ -5,7 +5,7 @@
 //! `websearch_to_tsquery`/`ts_rank_cd` query, which has no `SQLite` equivalent.
 //! The generated codegen therefore forks (via `backend_select!`): the `SQLite`
 //! arm matches each `SEARCH_FIELDS` column with a case-insensitive
-//! `lower(col) LIKE '%term%' ESCAPE '\'` substring test, ORed across the fields,
+//! `lower(col) LIKE '%term%' ESCAPE '\'` substring test, OR-ed across the fields,
 //! ordered `id DESC` (unranked — FTS5 ranking is a separate slice, #1910). This
 //! suite drives that fallback end-to-end on an in-memory `SQLite` database (no
 //! Docker):

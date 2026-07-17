@@ -19331,11 +19331,11 @@ mod tests {
     }
 
     /// #1996: the version-history writer and reader must fork through
-    /// `backend_select!` so a `versioned = true` repository runs on SQLite.
+    /// `backend_select!` so a `versioned = true` repository runs on `SQLite`.
     ///
     /// The Postgres arm keeps its `::jsonb` / `::bigint` / `::timestamptz` /
     /// `changes::text` casts and the `Timestamptz` diesel type verbatim; the
-    /// SQLite arm drops every cast (JSON is stored as TEXT) and names
+    /// `SQLite` arm drops every cast (JSON is stored as TEXT) and names
     /// `TimestamptzSqlite` (there is no `FromSql<Timestamptz, Sqlite>`), and the
     /// writer additionally binds `recorded_at` so TEXT range comparisons stay
     /// monotonic. This assertion pins each of those forks in the generated tokens.
@@ -20004,13 +20004,13 @@ mod tests {
 
     /// The connection-acquire helper forks `statement_timeout` per backend
     /// (issue #1996, item 4). The Postgres arm keeps `SET statement_timeout`
-    /// exactly; the SQLite arm is a deliberate no-op — SQLite cannot enforce a
-    /// per-statement timeout through the async connection wrapper, so autumn-web
+    /// exactly; the `SQLite` arm is a deliberate no-op — `SQLite` cannot enforce
+    /// a per-statement timeout through the async connection wrapper, so autumn-web
     /// fail-closes at boot (`db::reject_sqlite_statement_timeout`) whenever a
     /// non-zero timeout is configured under the sqlite backend, which guarantees
-    /// `timeout_ms` is always 0 by the time it reaches the SQLite arm. This test
+    /// `timeout_ms` is always 0 by the time it reaches the `SQLite` arm. This test
     /// pins BOTH arms so a future edit cannot (a) drop the Postgres `SET`, or
-    /// (b) turn the SQLite arm into something that silently applies/misuses a
+    /// (b) turn the `SQLite` arm into something that silently applies/misuses a
     /// real timeout value.
     #[test]
     fn statement_timeout_forks_per_backend_with_sqlite_noop() {
