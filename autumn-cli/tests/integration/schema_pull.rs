@@ -86,11 +86,17 @@ async fn start_postgres() -> (
     String,
     u16,
 ) {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::postgres::Postgres;
 
+    // Pin a modern Postgres image (the module default is `postgres:11-alpine`).
+    // The round-trip fixture's UUID PK generates `DEFAULT gen_random_uuid()`, a
+    // built-in only from PostgreSQL 13+, so PG11 would fail `schema migrate` with
+    // `function gen_random_uuid() does not exist`.
     let container = Postgres::default()
         .with_password(SECRET_PW)
+        .with_tag("16-alpine")
         .start()
         .await
         .expect("failed to start Postgres testcontainer — is Docker running?");
@@ -449,7 +455,11 @@ async fn schema_pull_preserves_expression_and_partial_indexes() {
     write_raw_migration(
         &project,
         "20260101000000_create_members",
-        "CREATE TABLE members (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL, deleted_at TIMESTAMP);\n\
+        // `created_at TIMESTAMP NOT NULL DEFAULT NOW()` matches the column the
+        // managed-model parser synthesizes for `Member` below, so the later
+        // model-side `schema diff` is genuinely empty (no spurious ADD COLUMN)
+        // and validates only the index-retention behavior.
+        "CREATE TABLE members (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL, deleted_at TIMESTAMP, created_at TIMESTAMP NOT NULL DEFAULT NOW());\n\
          CREATE INDEX members_lower_email_idx ON members (lower(email));\n\
          CREATE INDEX members_active_email_idx ON members (email) WHERE deleted_at IS NULL;",
         "DROP TABLE members;",
@@ -560,7 +570,11 @@ async fn schema_pull_retains_constraint_owned_unique_index() {
     write_raw_migration(
         &project,
         "20260101000000_create_accounts",
-        "CREATE TABLE accounts (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE);",
+        // `created_at TIMESTAMP NOT NULL DEFAULT NOW()` matches the column the
+        // managed-model parser synthesizes for `Account` below, so the later
+        // model-side `schema diff` is genuinely empty (no spurious ADD COLUMN)
+        // and validates only the constraint-owned-index retention.
+        "CREATE TABLE accounts (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, created_at TIMESTAMP NOT NULL DEFAULT NOW());",
         "DROP TABLE accounts;",
     );
     run_autumn_ok(&project, &["schema", "migrate"], &envs);
@@ -706,6 +720,102 @@ pub struct Account {
     assert!(
         doc_out.contains("database schema matches the snapshot baseline"),
         "doctor reports no drift after dropping the uniquely-indexed column:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
+/// Dropping a column whose name merely appears as a STRING LITERAL in an unrelated
+/// partial index's predicate (`WHERE kind = 'email'`) must NOT prune that index —
+/// Postgres keeps it (the index depends on `id`/`kind`, never `email`). This guards
+/// the exact-`pg_depend` dependency detection (Codex P1): the prior string scan of
+/// the `definition` text false-matched the `'email'` literal, wrongly pruned the
+/// retained index from the projected snapshot, and left `doctor` perpetually
+/// drifting (or the down migration recreating an index Postgres never dropped).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_diff_dropping_column_named_in_index_predicate_literal_stays_clean() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_predicate_literal_app");
+
+    // Brownfield `events(id, kind, email)` with a PARTIAL index on `id` whose
+    // predicate is a string literal `kind = 'email'` — it depends on `id` and
+    // `kind`, NOT on the `email` column. `created_at` matches the synthesized model
+    // column so the only real change below is the DROP COLUMN.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_events",
+        "CREATE TABLE events (id BIGSERIAL PRIMARY KEY, kind TEXT, email TEXT, created_at TIMESTAMP NOT NULL DEFAULT NOW());\n\
+         CREATE INDEX events_id_when_email_idx ON events (id) WHERE kind = 'email';",
+        "DROP TABLE events;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+
+    // Model DROPS `email` (keeps id + kind). The partial index does not depend on
+    // `email`, so it must survive both the projection and the actual DROP COLUMN.
+    write_models(
+        &project,
+        "
+#[autumn_web::model(managed)]
+pub struct Event {
+    #[id]
+    pub id: i64,
+    pub kind: Option<String>,
+}
+",
+    );
+    let (diff_out, diff_err) = run_autumn_ok(
+        &project,
+        &[
+            "schema",
+            "diff",
+            "--write-migration",
+            "--name",
+            "drop_email",
+            "--allow-destructive",
+        ],
+        &envs,
+    );
+    assert_no_secret_leak(&diff_out, &diff_err);
+
+    let mig_root = project.join("migrations");
+    let mut up_sql = String::new();
+    let mut down_sql = String::new();
+    for entry in std::fs::read_dir(&mig_root).expect("migrations dir") {
+        let dir = entry.expect("entry").path();
+        if dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("drop_email"))
+        {
+            up_sql = std::fs::read_to_string(dir.join("up.sql")).unwrap_or_default();
+            down_sql = std::fs::read_to_string(dir.join("down.sql")).unwrap_or_default();
+        }
+    }
+    assert!(
+        up_sql.contains("DROP COLUMN email"),
+        "up migration drops the column: {up_sql}"
+    );
+    // The unrelated partial index is NOT cascade-dropped, so the down migration
+    // must NOT try to recreate it (Postgres never removed it).
+    assert!(
+        !down_sql.contains("events_id_when_email_idx"),
+        "down migration must NOT recreate an index Postgres never dropped: {down_sql}"
+    );
+
+    // Apply: Postgres drops only the column and KEEPS the partial index.
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // doctor must be clean: the projected snapshot retained the partial index
+    // (exact dependency detection), matching the live DB that still has it.
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports no drift — the partial index was not falsely pruned:\n{doc_out}"
     );
     assert_no_secret_leak(&doc_out, &doc_err);
 }
