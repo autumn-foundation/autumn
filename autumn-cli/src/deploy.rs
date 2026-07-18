@@ -847,30 +847,36 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
     let resolved = ResolvedDeployConfig::resolve(&deploy_cfg, &resolve_project_name())
         .map_err(DeployError::Config)?;
 
-    // MediaMTX host-provisioning config (issue #1974, Slice 7). Read straight
-    // from the project `autumn.toml` string (like the media plugin reads
-    // `[media]`), so it needs no `AutumnConfig`/plugin coupling and defaults to
-    // disabled — a non-media project is byte-for-byte unaffected.
-    let (media_cfg, ffmpeg_bin) = load_media_host_config()?;
-
+    // MediaMTX host-provisioning config (issue #1974, Slice 7) is loaded ONLY in
+    // the actions that plan/provision media (`plan` and `up`). `check`/`rollback`
+    // neither read nor provision `MediaMTX`, so parsing `[media]` there would let a
+    // typo in `[media.mediamtx]`/`[media.ffmpeg]` fail-close a rollback that does
+    // not touch media at all — a regression the round-2 fail-closed fix must not
+    // introduce. The load stays fail-closed where it IS relevant (`plan`/`up`): a
+    // present-but-invalid `[media]` table still aborts those two.
     match action {
         // `plan` is a pure dry-run over `resolved` alone — it never grades or
         // uploads runtime VALUES, so it needs no reload under the target profile.
         DeployAction::Plan => {
+            let (media_cfg, _ffmpeg_bin) = load_media_host_config()?;
             print_plan(&resolved, &media_cfg);
             Ok(())
         }
         // `check`/`rollback`/`up` grade and (for `up`) upload the signing secret
         // and DB URL, so they must see those VALUES resolved under the TARGET
         // deploy profile — not the operator's ambient/dev config. Reload here.
+        // `check`/`rollback` deliberately do NOT load the media config.
         DeployAction::Check => run_check(&load_runtime_config(&resolved)?, &resolved),
         DeployAction::Rollback => run_rollback(&load_runtime_config(&resolved)?, &resolved),
-        DeployAction::Up => run_up(
-            &load_runtime_config(&resolved)?,
-            &resolved,
-            &media_cfg,
-            &ffmpeg_bin,
-        ),
+        DeployAction::Up => {
+            let (media_cfg, ffmpeg_bin) = load_media_host_config()?;
+            run_up(
+                &load_runtime_config(&resolved)?,
+                &resolved,
+                &media_cfg,
+                &ffmpeg_bin,
+            )
+        }
     }
 }
 
@@ -2962,5 +2968,53 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.jobs.backend = "redis".to_owned();
         assert!(!requires_database_pool(&config));
+    }
+
+    #[test]
+    fn rollback_dispatch_does_not_load_media_config() {
+        // Finding F: the media host config is loaded ONLY in the plan/up action
+        // paths. `check`/`rollback` neither read nor provision MediaMTX, so a typo
+        // in `[media.mediamtx]`/`[media.ffmpeg]` must not fail-close a rollback (a
+        // regression the round-2 fail-closed load would otherwise reintroduce). The
+        // load is filesystem-coupled (`manifest_project_dirs()`), so we assert the
+        // dispatch source itself: the fallible load call appears only inside the
+        // Plan and Up match arms, never in Check/Rollback.
+        let src = include_str!("deploy.rs");
+        // Build the needle at runtime so this test's own source text (which mentions
+        // the fn name) can never be miscounted as a call site.
+        let needle = ["load_media_host_config", "()?"].concat();
+        let call_sites = src.matches(needle.as_str()).count();
+        assert_eq!(
+            call_sites, 2,
+            "expected exactly two fallible load-media call sites (Plan + Up), found {call_sites}",
+        );
+
+        // Isolate `run()`'s match arms and prove Rollback/Check don't load media.
+        let run_body = src
+            .split("pub fn run(action: DeployAction)")
+            .nth(1)
+            .expect("run() present");
+        let rollback_arm = run_body
+            .split("DeployAction::Rollback =>")
+            .nth(1)
+            .expect("Rollback arm present");
+        // Rollback dispatch line runs to the next arm.
+        let rollback_line = rollback_arm
+            .split("DeployAction::Up")
+            .next()
+            .expect("Up arm follows Rollback");
+        assert!(
+            !rollback_line.contains("load_media_host_config"),
+            "the Rollback arm must not load the media config",
+        );
+        let check_arm = run_body
+            .split("DeployAction::Check =>")
+            .nth(1)
+            .and_then(|s| s.split("DeployAction::Rollback").next())
+            .expect("Check arm present");
+        assert!(
+            !check_arm.contains("load_media_host_config"),
+            "the Check arm must not load the media config",
+        );
     }
 }

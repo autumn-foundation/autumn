@@ -33,6 +33,30 @@
 //!   unverifiable result (transport error, unparseable output) reports a clear
 //!   failure — never a silent pass.
 //!
+//! ## `FFmpeg` path resolution (decoupled from the plugin)
+//!
+//! `[media.ffmpeg] bin` may be written as a `${VAR}` placeholder or overridden by
+//! the `AUTUMN_MEDIA__FFMPEG__BIN` environment variable — the plugin resolves both
+//! before it ever shells out to `FFmpeg`. So the deploy-side preflight must probe
+//! the binary the app will *actually* run, not the raw TOML literal.
+//! [`resolve_ffmpeg_bin`] mirrors the plugin's resolution: the
+//! `AUTUMN_MEDIA__FFMPEG__BIN` process-env override wins over the configured
+//! value, and a whole-string `${VAR}` value is interpolated from the process env
+//! (unset ⇒ empty). It is a deliberately decoupled re-implementation — this crate
+//! takes **no** `autumn-media-plugin` dependency — so it matches only the plugin's
+//! *whole-string* `${VAR}` rule; an *embedded* placeholder (`/opt/${VER}/ffmpeg`)
+//! is left literal and therefore still contains `${`.
+//!
+//! **Fail-closed-honest.** When resolution leaves the path empty or still
+//! containing an unresolved `${`, [`ffmpeg_preflight`] does **not** probe a literal
+//! placeholder or a wrong default — it returns a clear non-passing outcome
+//! ("ffmpeg path unresolved (env/interpolation indirection); deferring
+//! verification to runtime") so the operator sees the indirection rather than a
+//! false pass/fail against the wrong binary. Known limitation of the decoupled
+//! resolver: an embedded `${...}` the plugin *could* resolve is reported as
+//! deferred here (the plugin only interpolates whole-string placeholders, so full
+//! parity holds for the whole-string form).
+//!
 //! ## `MediaMTX` = a SEPARATE host daemon
 //!
 //! Compose/Fly deployments can still run `MediaMTX` as a separate service/app
@@ -332,6 +356,20 @@ pub fn render_mediamtx_yml(cfg: &MediaMtxHostConfig) -> String {
     format!(
         "logLevel: info\n\
          \n\
+         # Only the protocols autumn-media manages are enabled below (RTMP ingest,\n\
+         # HLS, WebRTC/WHEP playback, the control API, and the recording-playback\n\
+         # server). Every other protocol MediaMTX turns on by default is disabled\n\
+         # explicitly, so the systemd unit only ever opens the ports this deploy\n\
+         # plan declares — an occupied default RTSP (:8554) or SRT (:8890) port\n\
+         # cannot make `systemctl restart mediamtx` fail after preflight passed.\n\
+         # (`rtsp: no` also disables RTSPS; `metrics`/`pprof` default off but are\n\
+         # pinned off for the same 'declared ports only' contract. This MediaMTX\n\
+         # release line ships no MoQ server, so there is no MoQ listener to close.)\n\
+         rtsp: no\n\
+         srt: no\n\
+         metrics: no\n\
+         pprof: no\n\
+         \n\
          api: true\n\
          apiAddress: :{api}\n\
          \n\
@@ -543,31 +581,98 @@ const RECORDINGS_HINT: &str =
 const PORTS_HINT: &str =
     "Free the conflicting MediaMTX ports on the host (or stop the service already bound to them)";
 
+/// The plugin's `FFmpeg` bin env override (`[media.ffmpeg] bin`). Set in the
+/// deploy/runtime environment, it wins over the configured TOML value — exactly
+/// as `autumn-media-plugin` resolves it before running any workflow.
+pub const FFMPEG_BIN_ENV_OVERRIDE: &str = "AUTUMN_MEDIA__FFMPEG__BIN";
+
+/// Remediation hint shown when the resolved `FFmpeg` path is still an unresolved
+/// `${VAR}` / env indirection the deploy-side resolver cannot expand.
+const FFMPEG_UNRESOLVED_HINT: &str = "Set AUTUMN_MEDIA__FFMPEG__BIN (or export the ${VAR} it references) in the deploy \
+     environment so the FFmpeg path resolves to a concrete binary";
+
+/// Resolve `[media.ffmpeg] bin` to the path the app will actually run, from the
+/// process environment — mirroring `autumn-media-plugin`'s own resolution without
+/// depending on the plugin. Delegates to [`resolve_ffmpeg_bin_with`] with a
+/// `std::env`-backed lookup.
+#[must_use]
+pub fn resolve_ffmpeg_bin(configured: &str) -> String {
+    resolve_ffmpeg_bin_with(configured, |key| std::env::var(key).ok())
+}
+
+/// Pure resolver core (testable with an injected `lookup`, so no process-env
+/// mutation is needed): the `AUTUMN_MEDIA__FFMPEG__BIN` override wins over
+/// `configured`, and a **whole-string** `${VAR}` value is interpolated from
+/// `lookup` (unset ⇒ empty string, matching the plugin's `resolve_placeholder`).
+/// An *embedded* placeholder is deliberately left literal — the plugin only
+/// interpolates whole-string placeholders — so it survives as an unresolved
+/// `${...}` the caller's guard treats as deferred.
+#[must_use]
+fn resolve_ffmpeg_bin_with(configured: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    // Whole-string `${VAR}` interpolation of the configured value (plugin parity:
+    // only an exact `${VAR}` is expanded; unset resolves to empty).
+    let interpolated = configured
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .map_or_else(
+            || configured.to_owned(),
+            |var| lookup(var).unwrap_or_default(),
+        );
+    // The env override wins (verbatim), like the plugin's `override_string` applied
+    // after interpolation. A blank/whitespace override is treated as unset so an
+    // empty export never silently becomes the path.
+    match lookup(FFMPEG_BIN_ENV_OVERRIDE) {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => interpolated,
+    }
+}
+
 /// Grade that `FFmpeg` resolves on the host and reports a version banner
 /// (generalized from arroyo's boot preflight).
 ///
-/// Runs `<ffmpeg_bin> -version` over the executor and requires the standard
+/// First resolves `ffmpeg_bin` via [`resolve_ffmpeg_bin`] (env override +
+/// whole-string `${VAR}` interpolation) so the probe targets the binary the app
+/// will actually run — not a raw `${VAR}` literal. **Fail-closed-honest:** if the
+/// resolved path is empty or still contains an unresolved `${`, it does NOT probe
+/// (a literal placeholder / wrong default would be a false pass/fail); it reports
+/// a clear non-passing "deferred to runtime" outcome instead. Otherwise it runs
+/// `<resolved> -version` over the executor and requires the standard
 /// `ffmpeg version` banner in stdout — a binary that is missing, not executable,
 /// or is not actually `FFmpeg` (no banner) is a clear failure. Fail-closed: a
 /// transport error is a failure, not a pass.
 #[must_use]
 pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> PreflightCheck {
+    let resolved = resolve_ffmpeg_bin(ffmpeg_bin);
+    // Unverifiable path: empty (an unset whole-string `${VAR}`) or an embedded
+    // placeholder we cannot expand. Defer to runtime rather than probe the wrong
+    // binary — the plugin resolves these itself before it runs FFmpeg.
+    if resolved.trim().is_empty() || resolved.contains("${") {
+        return PreflightCheck {
+            name: CHECK_FFMPEG_PREFLIGHT,
+            passed: false,
+            detail: format!(
+                "FFmpeg path unresolved (env/interpolation indirection): `{ffmpeg_bin}` \
+                 resolves to `{resolved}`; deferring verification to runtime"
+            ),
+            hint: Some(FFMPEG_UNRESOLVED_HINT),
+        };
+    }
     let cmd = RemoteCommand::new(
         "media-ffmpeg-preflight",
-        format!("{} -version", super::exec::shell_quote(ffmpeg_bin)),
+        format!("{} -version", super::exec::shell_quote(&resolved)),
     );
     match exec.run(&cmd) {
         Ok(out) if out.stdout.contains("ffmpeg version") => PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
             passed: true,
-            detail: format!("FFmpeg resolves at `{ffmpeg_bin}` and reports a version banner"),
+            detail: format!("FFmpeg resolves at `{resolved}` and reports a version banner"),
             hint: None,
         },
         Ok(_) => PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
             passed: false,
             detail: format!(
-                "`{ffmpeg_bin} -version` ran but did not report an `ffmpeg version` banner — \
+                "`{resolved} -version` ran but did not report an `ffmpeg version` banner — \
                  the binary is not FFmpeg"
             ),
             hint: Some(FFMPEG_HINT),
@@ -575,7 +680,7 @@ pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> Preflig
         Err(err) => PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
             passed: false,
-            detail: format!("could not run `{ffmpeg_bin} -version` on the host: {err}"),
+            detail: format!("could not run `{resolved} -version` on the host: {err}"),
             hint: Some(FFMPEG_HINT),
         },
     }
@@ -1024,6 +1129,27 @@ unit_name = \"mediamtx-prod\"
     }
 
     #[test]
+    fn rendered_yml_disables_unmanaged_protocols_but_keeps_managed_ones() {
+        // Finding E: MediaMTX fills omitted protocol flags from its own defaults, so
+        // RTSP (:8554) and SRT (:8890) would otherwise listen even though the deploy
+        // plan never declares/checks those ports — an occupied default port could
+        // then fail `systemctl restart mediamtx` after preflight passed. The template
+        // pins every unmanaged default-on protocol OFF so the unit only opens the
+        // declared ports.
+        let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
+        assert!(yml.contains("rtsp: no"), "RTSP must be disabled: {yml}");
+        assert!(yml.contains("srt: no"), "SRT must be disabled: {yml}");
+        assert!(yml.contains("metrics: no"), "metrics must be off: {yml}");
+        assert!(yml.contains("pprof: no"), "pprof must be off: {yml}");
+        // The managed protocols stay enabled (RTMP/HLS/WebRTC/API/playback).
+        assert!(yml.contains("rtmp: true"), "rtmp managed: {yml}");
+        assert!(yml.contains("hls: true"), "hls managed: {yml}");
+        assert!(yml.contains("webrtc: true"), "webrtc managed: {yml}");
+        assert!(yml.contains("api: true"), "api managed: {yml}");
+        assert!(yml.contains("playback: true"), "playback managed: {yml}");
+    }
+
+    #[test]
     fn rendered_yml_has_both_live_and_room_path_matchers() {
         let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
         assert!(yml.contains("~^live/.+$:"), "broadcast matcher: {yml}");
@@ -1236,6 +1362,75 @@ unit_name = \"mediamtx-prod\"
         let check = ffmpeg_preflight(&exec, "/usr/bin/ffmpeg");
         assert!(!check.passed);
         assert!(check.detail.contains("could not run"));
+    }
+
+    // ── Finding G: FFmpeg path resolution (env override + `${VAR}`) ───────────
+    //
+    // The resolver core is exercised through the injected-`lookup` variant so no
+    // process-env mutation (unsafe under edition 2024, and racy across parallel
+    // tests) is needed. `ffmpeg_preflight`'s public wrapper reads `std::env`, but
+    // its unverifiable-path guard is exercised via `resolve_ffmpeg_bin_with` +
+    // the fake executor below.
+
+    #[test]
+    fn resolve_honors_env_override_over_toml_value() {
+        // Finding G (1): AUTUMN_MEDIA__FFMPEG__BIN wins over the configured value.
+        let resolved = resolve_ffmpeg_bin_with("/usr/bin/ffmpeg", |k| {
+            (k == FFMPEG_BIN_ENV_OVERRIDE).then(|| "/opt/custom/ffmpeg".to_owned())
+        });
+        assert_eq!(resolved, "/opt/custom/ffmpeg");
+        // A blank override is treated as unset — the TOML value stands.
+        let resolved_blank = resolve_ffmpeg_bin_with("/usr/bin/ffmpeg", |k| {
+            (k == FFMPEG_BIN_ENV_OVERRIDE).then(|| "   ".to_owned())
+        });
+        assert_eq!(resolved_blank, "/usr/bin/ffmpeg");
+    }
+
+    #[test]
+    fn resolve_interpolates_whole_string_placeholder_from_env() {
+        // Finding G (2): a whole-string `${VAR}` value is expanded from the env.
+        let resolved = resolve_ffmpeg_bin_with("${FF_BIN}", |k| {
+            (k == "FF_BIN").then(|| "/usr/local/bin/ffmpeg".to_owned())
+        });
+        assert_eq!(resolved, "/usr/local/bin/ffmpeg");
+        // An unset whole-string placeholder resolves to empty (plugin parity).
+        let unset = resolve_ffmpeg_bin_with("${FF_BIN}", |_| None);
+        assert_eq!(unset, "");
+    }
+
+    #[test]
+    fn ffmpeg_preflight_defers_on_unresolved_path_without_probing() {
+        // Finding G (3): an empty resolution (unset whole-string `${VAR}`) and an
+        // embedded placeholder we can't expand both DEFER — a clear non-passing
+        // outcome, and crucially NO probe of a literal placeholder runs.
+        for configured in ["${FF_BIN_UNSET_XYZ}", "/opt/${VER}/ffmpeg"] {
+            let exec = RecordingExecutor::new();
+            let check = ffmpeg_preflight(&exec, configured);
+            assert!(!check.passed, "must be non-passing for `{configured}`");
+            assert!(
+                check.detail.contains("unresolved") && check.detail.contains("deferring"),
+                "detail must name the deferral for `{configured}`: {}",
+                check.detail
+            );
+            assert!(check.hint.is_some());
+            // Fail-closed-honest: never probed the wrong/placeholder binary.
+            assert!(
+                exec.labels().is_empty(),
+                "no probe must run for `{configured}`, ran {:?}",
+                exec.labels()
+            );
+        }
+    }
+
+    #[test]
+    fn ffmpeg_preflight_probes_a_concrete_resolved_path() {
+        // A concrete (non-placeholder, no override) path resolves to itself and IS
+        // probed — the healthy path is unchanged by the resolver.
+        let exec = RecordingExecutor::new()
+            .with_stdout("media-ffmpeg-preflight", "ffmpeg version 6.1.1 Copyright");
+        let check = ffmpeg_preflight(&exec, "/usr/bin/ffmpeg");
+        assert!(check.passed, "detail: {}", check.detail);
+        assert_eq!(exec.labels(), vec!["media-ffmpeg-preflight"]);
     }
 
     // ── Doctor: recordings dir writable ──────────────────────────────────────
