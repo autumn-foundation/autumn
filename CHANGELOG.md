@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-18
+
 ### Added
 
 - **media:** autumn-media gained a full **Rooms** primitive (#1974) — a
@@ -1928,6 +1930,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unsharded control role — enforced at config validation. New
     `examples/bookmarks-sharded` Docker Compose stack and
     `docs/guide/sharding.md`.
+- **ui:** reusable `card` and `stat_card` Maud widget helpers in
+  `autumn_web::widgets`, re-exported from the prelude. `card()` renders a
+  titled content panel with an optional header-action slot, footer, and
+  configurable heading level (`HeadingLevel::H1`–`H6`, default `H2`);
+  `stat_card()` renders a metric tile with label, value, and optional link.
+  Both are CSP-safe and HTML-escape caller-supplied text via Maud.
+  `CardConfig` uses a builder pattern with `const fn` and private fields
+  so the `title()` / `title_html()` escape path cannot be bypassed.
+  The admin plugin's 12 hand-rolled card blocks and dashboard stat tiles are
+  migrated to the new helpers, removing the duplication (#1122).
+- **schema:** `autumn schema pull` gained SQLite database introspection (a
+  batched `sqlite_master` + `pragma_*` walk into the shared snapshot IR, gated
+  on the `sqlite` backend-flip) alongside sharper id-generation fidelity across
+  backends: a new `SerialKind`/`serial` marker distinguishes an owned-sequence
+  auto-increment PK (`SERIAL`/`BIGSERIAL`, SQLite `INTEGER PRIMARY KEY
+  AUTOINCREMENT`) from a plain manually-assigned integer PK, a Postgres
+  `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` clause now round-trips a pull
+  verbatim via a new `identity` field, and a PG15+ `NULLS NOT DISTINCT` unique
+  index is retained through its version-safe `pg_get_indexdef` text. The new IR
+  fields are `#[serde(default, skip_serializing_if)]` so pre-existing snapshots
+  stay byte-identical (#2064).
+- **cli:** `autumn migrate` up/down/status now run against a `sqlite://`
+  database under `--features sqlite`, routed by `DatabaseBackend::detect` through
+  the unlocked in-process diesel harness — no Postgres advisory lock, no `diesel`
+  CLI subprocess, no content-checksum table, and no control-plane/shard framework
+  migrations (their DDL is Postgres-specific). Postgres and libpq keyword/value
+  targets keep the historical advisory-locked path byte-for-byte; the default
+  Postgres-only build points a detected SQLite URL at a clear "rebuild with
+  `--features sqlite`" seam, and a SQLite `migrate status` emits a clear
+  provider-appropriate message instead of a raw `diesel` subprocess error (#2062).
+- **config:** new `AppBuilder::config_section(root)` seam lets a plugin declare
+  ownership of a top-level config table so it is accepted as an opaque,
+  never-descended-into subtree under `server.strict_config = true` (the plugin
+  owns its own validation) while every other unknown root still hard-fails —
+  fail-closed, only explicitly declared roots are exempt. Threaded through every
+  config-loading run mode into the strict unknown-key check; `MediaPlugin`
+  declares `.config_section("media")` so a media-enabled app no longer fails boot
+  with `unknown key "media"` (#2061).
 
 ### Fixed
 
@@ -2178,6 +2218,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **generate:** scaffolded create/update handlers now delete already-uploaded blobs when the handler returns early (e.g. on a validation failure) instead of orphaning them in the blob store (#1888).
 - **config:** the startup schema walk no longer aborts when it hits a `statement_timeout`; strict schema enforcement rolls out warn-first, and a new `strict_config_enforce_all` knob opts into failing on every strict finding rather than warning (#1914).
 - **security:** tenant-isolation fixes for the repository layer (#1962) — a cross-tenant `update` targeting a foreign or missing id now returns a 404 rather than a 500, and a bulk upsert silently filters out cross-tenant rows for non-versioned records instead of writing across the tenant boundary.
+- **media:** autumn-media encode/compose hardening — the `FfmpegvCommand` run paths now cap child output buffering, draining stdout and stderr concurrently with `wait()` (stderr retained only as a bounded tail, stdout drained-and-discarded) so a chatty or hostile encoder can neither grow an unbounded buffer nor wedge on a full pipe; arg builders thread paths as `OsString` (raw bytes preserved via `as_os_str`, byte-wise concat-list escaping) instead of a lossy `display()` conversion, so non-UTF-8 recording paths reach `Command` intact; and the room grid-composite filtergraph is now audio-aware, mixing only the inputs that actually carry an audio stream (and emitting a silent grid with no `amix`/`-c:a` when every input is video-only) rather than failing the whole composite on a lone video-only participant (#2068).
+- **deploy:** the standalone `autumn` deploy CLI no longer fail-closes on a plugin-owned top-level config table (e.g. `[media]`) under `server.strict_config = true` — an additive `UnknownRootPolicy::LenientWarn` accepts a genuinely-unknown, table-shaped, true top-level root as opaque with a single doctor-style warning while malformed TOML and unknown keys inside known sections still hard-fail. The CLI structurally cannot know an app's plugin set, so it must not be the strict gate; app boot keeps passing `Strict` and remains the authoritative gate for plugin roots via the `config_section` seam (#2067).
+- **deploy:** kamal-proxy routes now survive a host reboot — the proxy state directory is persisted, and on redeploy the shared proxy unit is refreshed and restarted-if-changed (re-registering the still-live release at its actual persisted port) so reboot-durability reaches already-provisioned hosts rather than only freshly-installed ones (#2069, #2071).
 
 ### Changed
 
@@ -2301,21 +2344,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed `--test repo_hygiene` target) and documents that published 0.5.0
   repositories have no pool constructor (`with_pool_untracked` is
   trunk-dev-only).
-
-## [0.6.0] - 2026-06-30
-
-### Added
-
-- **ui:** reusable `card` and `stat_card` Maud widget helpers in
-  `autumn_web::widgets`, re-exported from the prelude. `card()` renders a
-  titled content panel with an optional header-action slot, footer, and
-  configurable heading level (`HeadingLevel::H1`–`H6`, default `H2`);
-  `stat_card()` renders a metric tile with label, value, and optional link.
-  Both are CSP-safe and HTML-escape caller-supplied text via Maud.
-  `CardConfig` uses a builder pattern with `const fn` and private fields
-  so the `title()` / `title_html()` escape path cannot be bypassed.
-  The admin plugin's 12 hand-rolled card blocks and dashboard stat tiles are
-  migrated to the new helpers, removing the duplication (#1122).
 
 ## [0.5.0] - 2026-06-16
 
