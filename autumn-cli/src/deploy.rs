@@ -926,40 +926,57 @@ fn load_media_host_config(
 /// Builds a merged `[media]` subtree exactly as `AutumnConfig::load_with_env`
 /// builds the app config (minus the env-override layer, see the caller docs):
 /// base `autumn.toml` ← inline `[profile.<name>]` sections ←
-/// `autumn-<profile>.toml`. A base file that is absent/unreadable yields the
-/// disabled default; a base or profile file that does not parse, or a merged
-/// `[media]` subtree with a wrong-typed value, is a fail-closed
-/// [`DeployError::Config`].
+/// `autumn-<profile>.toml`. The base `autumn.toml` is **optional** — an
+/// absent/unreadable base skips only that layer, exactly like `load_with_env`,
+/// so a deploy that keeps `[media.mediamtx] enabled = true` ONLY in
+/// `autumn-<profile>.toml` (with `[deploy] host` supplied via env and no base
+/// file) still resolves the profile override and provisions `MediaMTX` (Finding
+/// R). When no layer contributes a `[media]` subtree the `#[serde(default)]`
+/// `MediaTomlRoot` deserializes to the disabled default; a base or profile file
+/// that does not parse, or a merged `[media]` subtree with a wrong-typed value,
+/// is a fail-closed [`DeployError::Config`].
 fn load_media_host_config_in(
     dirs: &[PathBuf],
     profile_raw: &str,
 ) -> Result<(media::MediaMtxHostConfig, String), DeployError> {
-    let disabled = || {
-        (
-            media::MediaMtxHostConfig::default(),
-            media::DEFAULT_FFMPEG_BIN.to_owned(),
-        )
-    };
-    let Some(base_path) = first_dir_with_file(dirs, "autumn.toml") else {
-        return Ok(disabled());
-    };
-    let Ok(base_str) = std::fs::read_to_string(&base_path) else {
-        return Ok(disabled());
-    };
-    // Layer 3: base autumn.toml (a malformed base is fail-closed).
-    let base: toml::Value = toml::from_str(&base_str).map_err(|e| {
-        DeployError::Config(format!("invalid config in {}: {e}", base_path.display()))
-    })?;
-    let mut merged = base.clone();
+    // Start from an empty root and deep-merge each contributing layer in the same
+    // order `AutumnConfig::load_with_env` does, so the deploy-side `[media]`
+    // resolution matches the app/runtime resolution for every base/profile
+    // combination. The runtime seeds `merged` with `profile_defaults_as_toml`, but
+    // those smart defaults carry NO `[media]` keys, so an empty root is faithful
+    // for the media subtree — an absent `[media]` deserializes to the disabled
+    // default via the `#[serde(default)]` `MediaTomlRoot`. The env-override layer
+    // is deliberately excluded (see the caller docs).
+    let mut merged = toml::Value::Table(toml::map::Map::new());
 
-    // Layer 4: inline `[profile.<name>]` sections in the base autumn.toml, in the
-    // runtime's alias-then-canonical merge order (`production` then `prod`), so a
-    // `[profile.prod.media.mediamtx]` wins over the base — matching
-    // `AutumnConfig::load_with_env`.
+    // Layer 3: base `autumn.toml` — OPTIONAL, exactly like `load_with_env`. A
+    // missing or unreadable base skips only this layer (a project without
+    // autumn-media is unaffected) but does NOT skip the profile override file
+    // below; a base present-but-malformed is fail-closed.
+    let base_toml: Option<toml::Value> = match first_dir_with_file(dirs, "autumn.toml") {
+        Some(base_path) => match std::fs::read_to_string(&base_path) {
+            Ok(base_str) => {
+                let base: toml::Value = toml::from_str(&base_str).map_err(|e| {
+                    DeployError::Config(format!("invalid config in {}: {e}", base_path.display()))
+                })?;
+                deep_merge_toml(&mut merged, base.clone());
+                Some(base)
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
+
+    // Layer 4: inline `[profile.<name>]` sections in the base autumn.toml (only
+    // present when the base parsed), in the runtime's alias-then-canonical merge
+    // order (`production` then `prod`), so a `[profile.prod.media.mediamtx]` wins
+    // over the base — matching `AutumnConfig::load_with_env`.
     let canonical = canonicalize_deploy_profile(profile_raw);
-    for name in profile_inline_lookup_names(&canonical) {
-        if let Some(section) = profile_section_from_base_toml(&base, name) {
-            deep_merge_toml(&mut merged, section);
+    if let Some(base) = &base_toml {
+        for name in profile_inline_lookup_names(&canonical) {
+            if let Some(section) = profile_section_from_base_toml(base, name) {
+                deep_merge_toml(&mut merged, section);
+            }
         }
     }
 
@@ -2653,6 +2670,35 @@ mod tests {
         let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
         assert!(prod.enabled, "autumn-prod.toml enables media");
         assert_eq!(prod.rtmp_port, 11935);
+    }
+
+    #[test]
+    fn media_config_honors_profile_override_file_without_base_autumn_toml() {
+        // Finding R: the base `autumn.toml` is OPTIONAL, exactly like
+        // `AutumnConfig::load_with_env`. A deploy that supplies `[deploy] host` via
+        // env and keeps `[media.mediamtx] enabled = true` ONLY in `autumn-prod.toml`
+        // (with NO base autumn.toml) must still resolve the profile override and
+        // provision MediaMTX — previously the loader early-returned the disabled
+        // default the moment no base file existed, silently skipping the override.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[media.mediamtx]\nenabled = true\nrtmp_port = 11935\n",
+        )
+        .expect("write prod override");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
+        assert!(
+            prod.enabled,
+            "profile-only media config is provisioned with no base autumn.toml"
+        );
+        assert_eq!(prod.rtmp_port, 11935);
+
+        // dev: no `autumn-dev.toml` and no base → disabled default (the override
+        // file is profile-scoped, so a different profile is unaffected).
+        let (dev, _) = load_media_host_config_in(&dirs, "dev").expect("loads dev");
+        assert!(!dev.enabled, "dev has no override file → disabled default");
     }
 
     #[test]

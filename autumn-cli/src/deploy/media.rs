@@ -366,13 +366,15 @@ pub fn render_mediamtx_yml(cfg: &MediaMtxHostConfig) -> String {
          # HLS, WebRTC/WHEP playback, the control API, and the recording-playback\n\
          # server). Every other protocol MediaMTX turns on by default is disabled\n\
          # explicitly, so the systemd unit only ever opens the ports this deploy\n\
-         # plan declares — an occupied default RTSP (:8554) or SRT (:8890) port\n\
-         # cannot make `systemctl restart mediamtx` fail after preflight passed.\n\
-         # (`rtsp: no` also disables RTSPS; `metrics`/`pprof` default off but are\n\
-         # pinned off for the same 'declared ports only' contract. This MediaMTX\n\
-         # release line ships no MoQ server, so there is no MoQ listener to close.)\n\
+         # plan declares — an occupied default RTSP (:8554), SRT (:8890), or MoQ\n\
+         # (:8892) port cannot make `systemctl restart mediamtx` fail after\n\
+         # preflight passed. (`rtsp: no` also disables RTSPS; `moq: no` closes the\n\
+         # default-on MoQ HTTP/2+HTTP/3 listeners — autumn-media does not use MoQ;\n\
+         # `metrics`/`pprof` default off but are pinned off for the same 'declared\n\
+         # ports only' contract.)\n\
          rtsp: no\n\
          srt: no\n\
+         moq: no\n\
          metrics: no\n\
          pprof: no\n\
          \n\
@@ -1406,15 +1408,16 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn rendered_yml_disables_unmanaged_protocols_but_keeps_managed_ones() {
-        // Finding E: MediaMTX fills omitted protocol flags from its own defaults, so
-        // RTSP (:8554) and SRT (:8890) would otherwise listen even though the deploy
-        // plan never declares/checks those ports — an occupied default port could
-        // then fail `systemctl restart mediamtx` after preflight passed. The template
-        // pins every unmanaged default-on protocol OFF so the unit only opens the
-        // declared ports.
+        // Finding E/Q: MediaMTX fills omitted protocol flags from its own defaults, so
+        // RTSP (:8554), SRT (:8890), and MoQ (:8892) would otherwise listen even though
+        // the deploy plan never declares/checks those ports — an occupied default port
+        // could then fail `systemctl restart mediamtx` after preflight passed. The
+        // template pins every unmanaged default-on protocol OFF so the unit only opens
+        // the declared ports.
         let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
         assert!(yml.contains("rtsp: no"), "RTSP must be disabled: {yml}");
         assert!(yml.contains("srt: no"), "SRT must be disabled: {yml}");
+        assert!(yml.contains("moq: no"), "MoQ must be disabled: {yml}");
         assert!(yml.contains("metrics: no"), "metrics must be off: {yml}");
         assert!(yml.contains("pprof: no"), "pprof must be off: {yml}");
         // The managed protocols stay enabled (RTMP/HLS/WebRTC/API/playback).
