@@ -2,7 +2,7 @@ name: Provision self-hosted runner
 
 # Manually provisions a Hetzner Cloud VM that hosts N EPHEMERAL GitHub Actions
 # runners (labels: self-hosted, hetzner, linux, x64). See
-# docs/guide/self-hosted-ci-runners.md for the full runbook.
+# .github/self-hosted-ci-runners.md for the full runbook.
 #
 # Secrets required (create these first — this workflow never fabricates them):
 #   HCLOUD_TOKEN    already present (used by deploy-real-vps.yml).
