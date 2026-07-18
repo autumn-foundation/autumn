@@ -126,11 +126,20 @@ jobs:
           set -euo pipefail
           hcloud ssh-key create --name "${HCLOUD_SSH_KEY_NAME}" --public-key-from-file "${SSH_KEY}.pub"
 
-          # Cheapest-first preference list. The workflow_dispatch `server_type`
-          # input is kept for backward-compat but is now only a HINT: it is tried
-          # first when set (empty on scheduled runs), then the live selection is
-          # authoritative — a retired/sold-out hint simply falls through.
-          PREF_TYPES="${{ inputs.server_type }} cpx22 cx32 cpx31 cpx41 cx42 cpx51"
+          # Cheapest-first preference list of CURRENT Hetzner shared-vCPU plans
+          # (verified 2026-07 against docs.hetzner.cloud/changelog): cost-optimized
+          # Intel `cx*3` (cx23/cx33/cx43/cx53) interleaved small->large with AMD
+          # `cpx*` (cpx22/cpx32/cpx42/cpx52/cpx62). The prior cx22/cx32/cx42/cx52
+          # and cpx11/cpx21/cpx31/cpx41/cpx51 generations were retired for new
+          # orders on 2026-01-01, so those names are dropped (a stale name is
+          # harmless — it just never matches — but omitting a current one is the
+          # bug this list guards against). Refresh when Hetzner retires a
+          # generation (watch the changelog for the next server-type deprecation).
+          # The workflow_dispatch `server_type` input is kept for backward-compat
+          # but is now only a HINT: it is tried first when set (empty on scheduled
+          # runs), then the live selection is authoritative — a retired/sold-out
+          # hint simply falls through.
+          PREF_TYPES="${{ inputs.server_type }} cx23 cpx22 cx33 cpx32 cx43 cpx42 cx53 cpx52 cpx62"
           # Configured location first, then EU fallbacks (deduped, order kept).
           LOCATIONS="${{ inputs.location || 'nbg1' }} fsn1 hel1 nbg1"
 
