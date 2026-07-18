@@ -116,13 +116,22 @@ retry regenerates a single migration rather than a duplicate.
 
 On SQLite, `schema diff` emits real migrations for the ALTER-family changes
 SQLite's `ALTER TABLE` cannot express directly (`ALTER COLUMN TYPE`,
-`SET`/`DROP NOT NULL`, `SET DEFAULT`, `ADD CHECK`, `ADD CONSTRAINT`) using the
+`DROP NOT NULL`, `SET DEFAULT`, `ADD CHECK`, `ADD CONSTRAINT`) using the
 standard **table-recreate** procedure — create a new table, `INSERT..SELECT` the
 common columns, drop the old table, rename, and recreate indexes, all wrapped in
 `PRAGMA foreign_keys=OFF` … `foreign_key_check` … `ON` and coalesced to one
 recreate block per table. Postgres output is byte-for-byte unchanged. When a
 recreate cannot be expressed safely the command **refuses loudly** rather than
 emitting unsafe SQL.
+
+Making an existing **nullable column required** (`SET NOT NULL`) is the one
+exception that is *not* rebuilt: on **both** backends the plan guard refuses it
+*before* any SQL is emitted (SQLite never recreates the table for it). The
+offline engine has no backfill value to synthesize for the rows that are already
+NULL, so `schema diff` stops with a message telling you to backfill the column
+and apply the change manually — or keep it nullable (`Option<...>`). The inverse
+change, `DROP NOT NULL` (required → nullable), is always safe and *is* handled by
+the table-recreate path above.
 
 ---
 
@@ -141,6 +150,13 @@ autumn schema migrate --profile prod
 
 - On **Postgres** it is advisory-locked, so concurrent migrators serialize; on
   **SQLite** it applies unlocked under the single-writer backend.
+- **Applying against a `sqlite://` URL requires a CLI built with the non-default
+  `sqlite` cargo feature** (`cargo build -p autumn-cli --no-default-features
+  --features sqlite`). The default/published `autumn` binary is **Postgres-only**;
+  point it at a SQLite backend and `autumn schema migrate` stops with a "rebuild
+  with `--features sqlite`" error and never touches the database. Only *applying*
+  migrations is gated this way — `autumn schema diff` still generates SQLite
+  migration SQL offline in the default build.
 - It is **provider-locked** against the snapshot's dialect before applying.
 - It **does not touch the snapshot** — the baseline already advanced at
   generation time (`schema diff --write-migration`), so this command only applies
@@ -149,8 +165,11 @@ autumn schema migrate --profile prod
 
 > This declarative `autumn schema migrate` verb is distinct from the classic
 > `autumn migrate` up/down CLI documented in [Migrations](./migrations.md). The
-> classic verb is currently Postgres-only; `autumn schema migrate` applies on
-> both backends.
+> classic verb is currently Postgres-only; `autumn schema migrate` can apply on
+> both backends, but — as noted above — the SQLite path needs a CLI built
+> `--features sqlite` (the default binary is Postgres-only). `schema pull` remains
+> Postgres-only in this slice, and `schema doctor`'s database-touching checks
+> (pending-migrations, database-schema-drift) are likewise Postgres-only.
 
 ---
 

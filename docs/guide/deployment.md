@@ -419,10 +419,12 @@ When `enabled = true`, `autumn deploy`:
 1. Renders `mediamtx.yml` (LL-HLS window, fmp4 recording under `recordings_dir`,
    WebRTC config, and a `~^room/.+$` path matcher for autumn-media Rooms) plus
    the systemd unit, then runs `daemon-reload && enable --now && restart`.
-2. Runs **three fail-closed host preflight checks before touching the host** —
-   FFmpeg resolves (the concrete `[media.ffmpeg] bin`), the recordings directory
-   is writable, and the MediaMTX ports are free — and **aborts the deploy** if the
-   host cannot serve media, rather than shipping a half-provisioned box.
+2. Runs **four fail-closed host preflight checks before touching the host** —
+   FFmpeg resolves (the concrete `[media.ffmpeg] bin`), the MediaMTX binary is
+   executable, the recordings directory is writable, and the MediaMTX ports are
+   free — plus a pure-config precheck that the configured MediaMTX listener ports
+   are distinct, and **aborts the deploy** if the host cannot serve media, rather
+   than shipping a half-provisioned box.
 
 `autumn deploy plan` surfaces the media unit, its provisioning steps, and the
 CSP origins your app must allow. The three browser-facing MediaMTX origins
@@ -447,7 +449,7 @@ be allowed in `media-src` for recorded playback.
 
 **Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
 installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
-a host-bootstrap step), and wiring the three doctor checks into the offline
+a host-bootstrap step), and wiring the four host preflight checks into the offline
 `autumn doctor` CLI (they run only in the executor-holding `deploy up` / `deploy
 plan` paths today).
 
