@@ -695,6 +695,10 @@ pub fn first_deploy_ops(
 /// migration or readiness timeout aborts here with the old release still serving
 /// (no flip, no drain, no promote). The sequence:
 ///
+/// 0. refresh the shared proxy unit (issue #2070) — rewrite the reboot-durable
+///    unit so an existing host adopts it on upgrade, restarting + re-registering the
+///    live upstream ONLY when the unit actually changed (an unchanged unit does
+///    nothing, preserving steady-state behavior),
 /// 1. prepare remote dirs,
 /// 2. upload the release binary (`0755`),
 /// 3. write the secret env file (`0600`, AC-5),
@@ -737,22 +741,44 @@ pub fn cutover_ops(
     let candidate_unit_path = format!("/etc/systemd/system/{candidate_unit}.service");
     let live_unit = slot_unit_name(&cfg.service_name, plan.live_slot);
 
-    let mut ops = vec![
-        DeployOp::Run(RemoteCommand::new(
-            "prepare-dirs",
-            format!(
-                "mkdir -p {} {}",
-                shell_quote(&release_dir),
-                shell_quote(&shared_dir)
-            ),
-        )),
-        DeployOp::UploadFile {
-            label: "upload-binary",
-            local: binary_local.to_path_buf(),
-            remote_path: remote_binary,
-            mode: Some(0o755),
-        },
-    ];
+    // Refresh the SHARED proxy unit on the redeploy path too (issue #2070).
+    // Previously only `first_deploy_ops` wrote the proxy unit, so a fix landed in
+    // the unit (e.g. the reboot-durable `StateDirectory`/`HOME` of #2069) never
+    // reached an already-provisioned host on upgrade. Prepending the idempotent
+    // install (mirroring how `first_deploy_ops` starts) rewrites it on every
+    // redeploy, and — kamal-proxy only — restarts + re-registers the live upstream
+    // ONLY when the unit actually changed, so an existing host adopts the new unit
+    // with a routeless window bounded to ~the restart (see
+    // `ProxyController::refresh_installed_ops`). Writing the unit is deterministic,
+    // lands at the final path, and causes no restart on its own, so it is safe to do
+    // at the very start of the cutover; the live upstream re-registered on a change
+    // is the release serving RIGHT NOW, targeted at the DERIVED live-slot port
+    // (`plan.live_port`). That derived port is CORRECT here because the redeploy path
+    // refuses a concurrent `server.port` change at pre-flight (#2073,
+    // `refuse_concurrent_public_port_change`), so the public port is unchanged and the
+    // derived live port necessarily equals the port the live release actually binds —
+    // a live-safe port change is future work (Option C). The candidate/flip below use
+    // the new derived candidate port, which the new release genuinely binds.
+    let mut ops = proxy.refresh_installed_ops(
+        plan.public_port,
+        &cfg.service_name,
+        &loopback_upstream(plan.live_port),
+        &proxy_unit_snapshot_path(release_id),
+    );
+    ops.push(DeployOp::Run(RemoteCommand::new(
+        "prepare-dirs",
+        format!(
+            "mkdir -p {} {}",
+            shell_quote(&release_dir),
+            shell_quote(&shared_dir)
+        ),
+    )));
+    ops.push(DeployOp::UploadFile {
+        label: "upload-binary",
+        local: binary_local.to_path_buf(),
+        remote_path: remote_binary,
+        mode: Some(0o755),
+    });
     // Re-upload the project config manifest(s) into the per-release dir on every
     // redeploy so the config on the server always matches the shipped binary and
     // is coupled to it for rollback (#1952).
@@ -1155,6 +1181,15 @@ fn loopback_upstream(port: u16) -> String {
     format!("127.0.0.1:{port}")
 }
 
+/// Per-deploy scratch path holding the pre-refresh kamal-proxy unit's content hash,
+/// so [`ProxyController::refresh_installed_ops`](super::proxy::ProxyController::refresh_installed_ops)
+/// can decide whether the unit ACTUALLY changed on this host (issue #2070). Keyed on
+/// the unique `release_id` so two shared-host deploys never race on a fixed scratch
+/// path; the restart step removes it.
+fn proxy_unit_snapshot_path(release_id: &str) -> String {
+    format!("/tmp/autumn-kamal-proxy-unit-{release_id}.sha256")
+}
+
 /// Command that records which slot now serves live traffic AND the loopback
 /// `port` its unit was rendered with, as `{slot}\t{port}` (read by the next
 /// redeploy's [`probe_deploy_state`], and copied into the previous-release marker
@@ -1353,16 +1388,50 @@ pub enum DeployMode {
     },
 }
 
+/// The `--http-port` state of the currently-installed kamal-proxy systemd unit,
+/// captured in the same deploy-start probe round-trip (#2073). The redeploy path
+/// uses it to REFUSE a concurrent `server.port` change before touching the proxy:
+/// the reboot-durability restart-refresh (#2070) re-execs `kamal-proxy run` and
+/// re-registers the still-live upstream at its DERIVED port, which is only correct
+/// when the public port is unchanged — so a mismatch must fail the pre-flight
+/// rather than strand `:80` mid-cutover. Supporting a live-safe port change is
+/// tracked separately (Option C).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstalledProxyPort {
+    /// No proxy unit file on disk (a first-deploy shape — the durability refresh
+    /// writes it fresh). The refuse guard treats this as "nothing to conflict with".
+    Absent,
+    /// The unit file is present but its `run --http-port {N}` value could not be
+    /// read/parsed (missing flag, non-numeric, out of range, or ambiguous). The
+    /// refuse guard FAILS CLOSED here — derived correctness can't be guaranteed.
+    Unreadable,
+    /// The port the installed unit's `ExecStart … run --http-port {N}` binds.
+    Port(u16),
+}
+
 /// Delimiter appended by the deploy-start probe between the first-vs-redeploy
 /// detection and the raw `kamal-proxy list` output, so both are captured in ONE
 /// remote round-trip and split apart by the Rust side. Deliberately distinctive
 /// so it can never collide with a marker/slot value.
 const PROXY_LIST_DELIM: &str = "---autumn-kamal-proxy-list---";
 
-/// The outcome of the deploy-start probe: the first-vs-redeploy [`DeployMode`]
-/// PLUS the raw `kamal-proxy list` output captured in the SAME remote round-trip,
-/// so a drifted live-slot marker can be reconciled against the live proxy without
-/// a second probe.
+/// Delimiter appended after the `kamal-proxy list` section, before the installed
+/// proxy unit's `--http-port` grep (#2073), so the three sections ride in ONE
+/// round-trip. Its ABSENCE (older recorded output / a scripted test that stubs
+/// only the mode) is treated as [`InstalledProxyPort::Absent`] — a conservative
+/// "nothing to conflict with" so the refuse guard never fires on synthetic input.
+const PROXY_UNIT_DELIM: &str = "---autumn-kamal-proxy-unit---";
+
+/// Sentinel the probe prints in the unit section when the proxy unit file does
+/// NOT exist on disk — distinguishing [`InstalledProxyPort::Absent`] (no unit) from
+/// [`InstalledProxyPort::Unreadable`] (unit present but no parseable `--http-port`).
+const NO_PROXY_UNIT_SENTINEL: &str = "---autumn-no-proxy-unit---";
+
+/// The outcome of the deploy-start probe: the first-vs-redeploy [`DeployMode`],
+/// the raw `kamal-proxy list` output, AND the installed proxy unit's `--http-port`
+/// state — all captured in the SAME remote round-trip, so a drifted live-slot
+/// marker can be reconciled against the live proxy and a concurrent `server.port`
+/// change refused, both without a second probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeployProbe {
     /// First-vs-redeploy decision (parsed exactly as before from the marker).
@@ -1370,6 +1439,38 @@ pub struct DeployProbe {
     /// Raw `kamal-proxy list` stdout (empty when the proxy could not be listed —
     /// the reconcile then falls back to the marker, fail-safe).
     pub proxy_list: String,
+    /// The installed kamal-proxy unit's `--http-port` (#2073), used by the redeploy
+    /// path to refuse a concurrent `server.port` change before touching the proxy.
+    pub installed_proxy_port: InstalledProxyPort,
+}
+
+/// Parse the probe's unit section into an [`InstalledProxyPort`] (#2073).
+///
+/// The section is the stdout the probe shell prints between [`PROXY_UNIT_DELIM`]
+/// and end-of-output:
+///
+/// - exactly the [`NO_PROXY_UNIT_SENTINEL`] → [`InstalledProxyPort::Absent`] (the
+///   `[ -f … ]` test failed: no unit file);
+/// - a single `--http-port {N}` line with an in-range `u16` → [`InstalledProxyPort::Port`];
+/// - anything else — empty (unit present but `grep` matched nothing), multiple
+///   matches, or a non-`u16` number → [`InstalledProxyPort::Unreadable`] (fail closed).
+fn parse_installed_proxy_port(section: &str) -> InstalledProxyPort {
+    let trimmed = section.trim();
+    if trimmed == NO_PROXY_UNIT_SENTINEL {
+        return InstalledProxyPort::Absent;
+    }
+    // The unit exists (the probe printed no sentinel) but we must find EXACTLY one
+    // `--http-port {N}` match — an empty section (no match) or multiple matches can't
+    // be trusted to name the bound port, so fail closed.
+    let mut lines = trimmed.lines().map(str::trim).filter(|l| !l.is_empty());
+    let (Some(single), None) = (lines.next(), lines.next()) else {
+        return InstalledProxyPort::Unreadable;
+    };
+    // `single` is like `--http-port 80`; take the trailing integer.
+    single
+        .rsplit_once(char::is_whitespace)
+        .and_then(|(_, n)| n.trim().parse::<u16>().ok())
+        .map_or(InstalledProxyPort::Unreadable, InstalledProxyPort::Port)
 }
 
 /// The full deploy-start probe: first-vs-redeploy mode AND the raw `kamal-proxy
@@ -1377,12 +1478,20 @@ pub struct DeployProbe {
 ///
 /// The probe shell keeps the existing `current`/`live-slot` detection byte-for-
 /// byte (its meaning is unchanged), then appends a delimited section running
-/// `kamal-proxy list` best-effort (`|| true`, stderr suppressed) so a missing
-/// binary, dead control socket, or unlisted service can never fail the probe.
-/// The two sections are split on [`PROXY_LIST_DELIM`]; when the delimiter is
-/// absent (older recorded output / a scripted test) the whole stdout is treated
-/// as the mode section and the proxy list is empty — the reconcile then falls
-/// back to the marker.
+/// `env -u XDG_RUNTIME_DIR kamal-proxy list` best-effort (`|| true`, stderr
+/// suppressed) so a missing binary, dead control socket, or unlisted service can
+/// never fail the probe. The `env -u XDG_RUNTIME_DIR` control-socket pin mirrors
+/// `deploy_shell` (issue #1948 item 4): without it the SSH session's `pam_systemd`
+/// `XDG_RUNTIME_DIR=/run/user/0` points the CLI at a different socket than the
+/// supervised `kamal-proxy run` service (which has no `XDG_RUNTIME_DIR` → `/tmp`),
+/// so on a real pam host the list would silently come back empty — disabling both
+/// the #1938 drift reconcile and the observed-port path.
+/// The mode section is split off on [`PROXY_LIST_DELIM`]; the remainder is split on
+/// [`PROXY_UNIT_DELIM`] into the proxy list and the installed-unit `--http-port`
+/// grep. When a delimiter is absent (older recorded output / a scripted test) that
+/// trailing section is empty and the probe degrades safely — an empty proxy list
+/// (reconcile falls back to the marker) and [`InstalledProxyPort::Absent`] (the
+/// refuse guard treats it as "nothing to conflict with").
 ///
 /// # Errors
 ///
@@ -1395,28 +1504,46 @@ pub fn probe_deploy_state(
         "if [ -L {current} ]; then printf 'redeploy:'; cat {marker} 2>/dev/null || printf '{blue}'; \
          else printf 'first'; fi; \
          printf '\\n{delim}\\n'; \
-         kamal-proxy list 2>/dev/null || true",
+         env -u XDG_RUNTIME_DIR kamal-proxy list 2>/dev/null || true; \
+         printf '\\n{unit_delim}\\n'; \
+         if [ -f {unit} ]; then grep -hoE -e '--http-port[[:space:]]+[0-9]+' {unit} 2>/dev/null || true; \
+         else printf '{no_unit}'; fi",
         current = shell_quote(&cfg.current_symlink()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
         delim = PROXY_LIST_DELIM,
+        unit_delim = PROXY_UNIT_DELIM,
+        unit = shell_quote(super::proxy::KAMAL_PROXY_UNIT_PATH),
+        no_unit = NO_PROXY_UNIT_SENTINEL,
     );
     let out = exec.run(&RemoteCommand::new("detect-current", shell))?;
-    let (mode_part, proxy_list) = out
+    let (mode_part, rest) = out
         .stdout
         .split_once(PROXY_LIST_DELIM)
         .unwrap_or((out.stdout.as_str(), ""));
+    // Split the proxy list from the installed-unit section. A missing unit delimiter
+    // (older/scripted output) → empty unit section → `Absent` (never a spurious refuse).
+    let (proxy_list, installed_proxy_port) = match rest.split_once(PROXY_UNIT_DELIM) {
+        Some((list, unit_section)) => (list, parse_installed_proxy_port(unit_section)),
+        None => (rest, InstalledProxyPort::Absent),
+    };
     let mode = mode_part
         .trim()
         .strip_prefix("redeploy:")
-        .map_or(DeployMode::First, |marker| DeployMode::Redeploy {
+        .map_or(DeployMode::First, |marker| {
             // The live-slot marker is `{slot}\t{port}` (older markers are slot-only);
-            // the slot is the FIRST tab-separated field either way.
-            live_slot: canonical_slot(marker.split('\t').next().unwrap_or(SLOT_BLUE)),
+            // the slot is the FIRST tab-separated field either way. The persisted port
+            // (SECOND field, when present) is not read here — the cutover re-register
+            // uses the DERIVED port, which the pre-flight refuse guard (#2073) proves
+            // equals the actual live port by rejecting any concurrent `server.port`
+            // change. The marker keeps persisting the port for forward-compatibility.
+            let live_slot = canonical_slot(marker.split('\t').next().unwrap_or(SLOT_BLUE));
+            DeployMode::Redeploy { live_slot }
         });
     Ok(DeployProbe {
         mode,
         proxy_list: proxy_list.to_owned(),
+        installed_proxy_port,
     })
 }
 
@@ -1504,20 +1631,21 @@ fn loopback_port(field: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
-/// The slot `kamal-proxy list` UNAMBIGUOUSLY reports serving `service_name`, or
-/// `None` when the signal is absent or unclear (→ caller falls back to the marker).
+/// The single loopback target port `kamal-proxy list` UNAMBIGUOUSLY reports
+/// serving `service_name`, or `None` when the signal is absent or unclear.
 ///
-/// A definite slot is returned ONLY when: exactly one output row carries
-/// `service_name` as a standalone whitespace field (the header row never does, and
-/// a service listed twice is ambiguous → `None`), that row carries exactly one
-/// distinct `127.0.0.1:<port>` target, and `port - public_port` maps to a slot
-/// (1=blue, 2=green). Every other shape — service absent, no/garbled target, two
-/// different target ports, a port mapping to neither slot — yields `None`.
-fn proxy_live_slot(
-    list_stdout: &str,
-    service_name: &str,
-    public_port: u16,
-) -> Option<&'static str> {
+/// This is the proxy's OBSERVED current upstream target — the port the live slot
+/// is ACTUALLY routed to right now — and is the ground truth of what is being
+/// served, independent of the public port or any persisted marker (#2071). It is
+/// returned ONLY when exactly one output row carries `service_name` as a standalone
+/// whitespace field (the header row never does, and a service listed twice is
+/// ambiguous → `None`) and that row carries exactly one distinct `127.0.0.1:<port>`
+/// target. Deliberately does NOT require the port to map to a slot band under the
+/// current public port: on a `server.port` change the live release still binds its
+/// OLD port, which no longer maps to a slot relative to the NEW public port, yet is
+/// exactly the port we must preserve.
+#[must_use]
+pub fn proxy_live_target_port(list_stdout: &str, service_name: &str) -> Option<u16> {
     let service = service_name.trim();
     if service.is_empty() {
         return None;
@@ -1542,7 +1670,25 @@ fn proxy_live_slot(
             }
         }
     }
-    slot_for_port(public_port, port?)
+    port
+}
+
+/// The slot `kamal-proxy list` UNAMBIGUOUSLY reports serving `service_name`, or
+/// `None` when the signal is absent or unclear (→ caller falls back to the marker).
+///
+/// A definite slot is returned ONLY when [`proxy_live_target_port`] resolves an
+/// unambiguous single `127.0.0.1:<port>` target AND `port - public_port` maps to a
+/// slot (1=blue, 2=green). Every other shape — service absent, no/garbled target,
+/// two different target ports, a port mapping to neither slot — yields `None`.
+fn proxy_live_slot(
+    list_stdout: &str,
+    service_name: &str,
+    public_port: u16,
+) -> Option<&'static str> {
+    slot_for_port(
+        public_port,
+        proxy_live_target_port(list_stdout, service_name)?,
+    )
 }
 
 /// The decision from reconciling the live-slot marker against the live proxy.
@@ -2162,7 +2308,10 @@ mod tests {
     }
 
     /// Redeploy cutover ops: the live release is on blue, so the candidate takes
-    /// green (loopback 3002).
+    /// green (loopback 3002). The cutover re-registers the still-live OLD release at
+    /// the DERIVED live-slot port (`plan.live_port`, blue = 3001) — correct because
+    /// the redeploy path refuses a concurrent `server.port` change at pre-flight
+    /// (#2073), so the public port is unchanged and derived == actual.
     fn sample_cutover_ops(env: Secret) -> Vec<DeployOp> {
         let cfg = resolved();
         let plan = SlotPlan::redeploy(3000, SLOT_BLUE);
@@ -2274,9 +2423,17 @@ mod tests {
         run_ops(&ops, &exec).expect("recording executor never fails");
 
         // The full ordered run sequence (uploads interleave; asserted separately).
+        // The cutover now LEADS with the proxy-unit refresh (issue #2070): the
+        // snapshot of the pre-write unit, the idempotent install, then the
+        // change-gated restart+re-register — before the candidate is prepared.
+        // (`proxy-write-unit` is a WriteFile → uploaded, so excluded from
+        // `run_labels`; asserted separately.)
         assert_eq!(
             exec.run_labels(),
             vec![
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed",
                 "prepare-dirs",
                 "daemon-reload",
                 "start-candidate",
@@ -2430,6 +2587,100 @@ mod tests {
             "commit the markers before draining the old release"
         );
         assert!(pos("drain-old") < pos("prune"), "drain before prune");
+    }
+
+    #[test]
+    fn cutover_refreshes_proxy_unit_and_restarts_only_when_changed() {
+        // Issue #2070: the redeploy path must now REFRESH the shared proxy unit so a
+        // reboot-durable unit reaches existing hosts on upgrade — and restart the
+        // running proxy to adopt it ONLY when the unit actually changed, immediately
+        // re-registering the CURRENT live upstream so :80 is routeless for only ~the
+        // restart, not the whole cutover.
+        let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+
+        // (a) The unit is (re)written to its FINAL path on the redeploy path, exactly
+        // like the first deploy — this is what delivers the reboot-durable unit to an
+        // already-provisioned host.
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                DeployOp::WriteFile { label: "proxy-write-unit", remote_path, contents: FileContents::Plain(unit), .. }
+                    if remote_path == "/etc/systemd/system/kamal-proxy.service"
+                        && unit.contains("StateDirectory=kamal-proxy\n")
+                        && unit.contains("Environment=HOME=/var/lib/kamal-proxy\n")
+            )),
+            "cutover must rewrite the reboot-durable proxy unit to its final path"
+        );
+
+        let exec = RecordingExecutor::new();
+        run_ops(&ops, &exec).expect("recording executor never fails");
+        let labels = exec.run_labels();
+        let pos = |l: &str| labels.iter().position(|&x| x == l);
+
+        // (b) The proxy refresh LEADS the cutover (before the candidate is prepared)
+        // and, crucially, the change-gated restart+re-register runs BEFORE the flip —
+        // so on a changed unit the live route is restored up front, keeping :80 served
+        // through the whole candidate-start/migrate/readiness window.
+        assert!(
+            pos("proxy-install").is_some(),
+            "cutover installs the proxy unit"
+        );
+        let restart = pos("proxy-restart-if-changed").expect("restart-if-changed present");
+        assert!(
+            pos("proxy-snapshot-unit").unwrap() < pos("proxy-install").unwrap()
+                && pos("proxy-install").unwrap() < restart,
+            "snapshot → install → restart-if-changed, in order: {labels:?}"
+        );
+        assert!(
+            restart < pos("prepare-dirs").unwrap() && restart < pos("proxy-flip").unwrap(),
+            "the proxy refresh precedes the candidate work and the flip: {labels:?}"
+        );
+
+        // (c) The snapshot captures the CURRENT unit's content hash before the write.
+        let snapshot = exec.shell_for("proxy-snapshot-unit").expect("snapshot ran");
+        assert!(
+            snapshot.contains("sha256sum '/etc/systemd/system/kamal-proxy.service'")
+                && snapshot.contains("/tmp/autumn-kamal-proxy-unit-20260714T120000Z.sha256"),
+            "snapshot hashes the live unit into a per-release scratch path: {snapshot}"
+        );
+
+        // (d) The restart is CHANGE-GATED (unchanged unit → no restart), only fires
+        // while the proxy is active, and — only then — re-registers the CURRENT live
+        // upstream (blue = 127.0.0.1:3001), socket-pinned like every other CLI call.
+        let restart_sh = exec
+            .shell_for("proxy-restart-if-changed")
+            .expect("restart-if-changed ran");
+        assert!(
+            restart_sh.contains("if [ \"$new\" = \"$old\" ]; then exit 0; fi"),
+            "an UNCHANGED unit must short-circuit before any restart: {restart_sh}"
+        );
+        assert!(
+            restart_sh.contains("systemctl is-active --quiet kamal-proxy.service")
+                && restart_sh.contains("systemctl restart kamal-proxy.service"),
+            "on a change it restarts the live proxy: {restart_sh}"
+        );
+        assert!(
+            restart_sh.contains(
+                "env -u XDG_RUNTIME_DIR kamal-proxy deploy 'myapp' --target '127.0.0.1:3001'"
+            ),
+            "on a change it re-registers the CURRENT live upstream, socket-pinned: {restart_sh}"
+        );
+        // The re-register sits AFTER the restart within the one command (so no SSH
+        // round-trip interposes), and the whole restart block is downstream of the
+        // change gate.
+        let gate = restart_sh
+            .find("if [ \"$new\" = \"$old\" ]")
+            .expect("change gate present");
+        let do_restart = restart_sh
+            .find("systemctl restart kamal-proxy.service")
+            .expect("restart present");
+        let reregister = restart_sh
+            .find("kamal-proxy deploy 'myapp' --target '127.0.0.1:3001'")
+            .expect("re-register present");
+        assert!(
+            gate < do_restart && do_restart < reregister,
+            "order must be change-gate → restart → re-register: {restart_sh}"
+        );
     }
 
     /// The candidate-teardown ops for the redeploy sample (candidate on green).
@@ -3586,13 +3837,15 @@ mod tests {
         );
         // `current` present + marker says green → redeploy onto blue candidate.
         // New-format live-slot marker is `{slot}\t{port}`: the slot is the FIRST
-        // field, the trailing port must not leak into the parsed slot.
+        // field, the trailing port must not leak into the parsed slot (and the port
+        // itself is no longer parsed into the mode — the derived port is used, proven
+        // correct by the #2073 refuse guard).
         let redeploy =
             RecordingExecutor::new().with_stdout("detect-current", "redeploy:green\t3002");
         assert_eq!(
             probe_deploy_state(&cfg, &redeploy).unwrap().mode,
             DeployMode::Redeploy {
-                live_slot: SLOT_GREEN
+                live_slot: SLOT_GREEN,
             }
         );
         // Backward-compat: an older slot-only marker (no port field) still parses.
@@ -3600,7 +3853,7 @@ mod tests {
         assert_eq!(
             probe_deploy_state(&cfg, &legacy).unwrap().mode,
             DeployMode::Redeploy {
-                live_slot: SLOT_GREEN
+                live_slot: SLOT_GREEN,
             }
         );
         // A missing/blank marker on a redeploy defaults the live slot to blue.
@@ -3608,7 +3861,7 @@ mod tests {
         assert_eq!(
             probe_deploy_state(&cfg, &default_blue).unwrap().mode,
             DeployMode::Redeploy {
-                live_slot: SLOT_BLUE
+                live_slot: SLOT_BLUE,
             }
         );
     }
@@ -3635,7 +3888,7 @@ mod tests {
         assert_eq!(
             probe.mode,
             DeployMode::Redeploy {
-                live_slot: SLOT_BLUE
+                live_slot: SLOT_BLUE,
             }
         );
         assert!(
@@ -3650,18 +3903,132 @@ mod tests {
             shell.contains("kamal-proxy list") && shell.contains("|| true"),
             "probe runs kamal-proxy list best-effort: {shell}"
         );
-        // No delimiter in the output (older/scripted) → empty list, mode unchanged.
+        // The list invocation must be control-socket-pinned exactly like
+        // `deploy_shell` (issue #1948 item 4): without `env -u XDG_RUNTIME_DIR`
+        // the SSH session's pam_systemd `XDG_RUNTIME_DIR` points the CLI at a
+        // different socket than the supervised `kamal-proxy run` service, so on a
+        // real pam host the list comes back silently empty — disabling the #1938
+        // drift reconcile and the observed-port path. Pin it to `kamal-proxy list`.
+        assert!(
+            shell.contains("env -u XDG_RUNTIME_DIR kamal-proxy list"),
+            "probe socket-pins the kamal-proxy list invocation: {shell}"
+        );
+        // No delimiter in the output (older/scripted) → empty list, mode unchanged,
+        // and the installed-proxy-port degrades to Absent (never a spurious refuse).
         let legacy = RecordingExecutor::new().with_stdout("detect-current", "redeploy:green\t3002");
         let probe = probe_deploy_state(&cfg, &legacy).unwrap();
         assert_eq!(
             probe.mode,
             DeployMode::Redeploy {
-                live_slot: SLOT_GREEN
+                live_slot: SLOT_GREEN,
             }
         );
         assert!(
             probe.proxy_list.is_empty(),
             "no delimiter → empty proxy list"
+        );
+        assert_eq!(
+            probe.installed_proxy_port,
+            InstalledProxyPort::Absent,
+            "a missing unit delimiter degrades to Absent (no spurious refuse)"
+        );
+    }
+
+    #[test]
+    fn probe_deploy_state_captures_the_installed_proxy_port() {
+        let cfg = resolved();
+        // Realistic full probe stdout: mode, the list section, then the unit section
+        // carrying the installed unit's `run --http-port 80` grep result.
+        let stdout = format!(
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n{}\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80",
+            proxy_list_serving("myapp", 3001)
+        );
+        let exec = RecordingExecutor::new().with_stdout("detect-current", stdout);
+        let probe = probe_deploy_state(&cfg, &exec).unwrap();
+        assert_eq!(
+            probe.installed_proxy_port,
+            InstalledProxyPort::Port(80),
+            "the installed unit's --http-port is captured"
+        );
+        // The proxy list section is still cleanly split off (the unit delimiter does
+        // not leak into it).
+        assert!(
+            probe.proxy_list.contains("127.0.0.1:3001")
+                && !probe.proxy_list.contains("--http-port"),
+            "the list section is split off from the unit section: {}",
+            probe.proxy_list
+        );
+        // The probe shell reads the installed unit's --http-port, guarded on the unit
+        // file existing, from the shared kamal-proxy unit path.
+        let shell = exec.shell_for("detect-current").expect("probe ran");
+        assert!(
+            shell.contains("--http-port")
+                && shell.contains("/etc/systemd/system/kamal-proxy.service")
+                && shell.contains("[ -f "),
+            "probe greps the installed unit's --http-port guarded on the file: {shell}"
+        );
+
+        // Unit file absent → the probe prints the no-unit sentinel → Absent.
+        let absent = RecordingExecutor::new().with_stdout(
+            "detect-current",
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n---autumn-no-proxy-unit---",
+        );
+        assert_eq!(
+            probe_deploy_state(&cfg, &absent)
+                .unwrap()
+                .installed_proxy_port,
+            InstalledProxyPort::Absent,
+            "the no-unit sentinel parses to Absent"
+        );
+
+        // Unit present but no parseable --http-port (empty unit section) → Unreadable
+        // (fail closed).
+        let unreadable = RecordingExecutor::new().with_stdout(
+            "detect-current",
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n",
+        );
+        assert_eq!(
+            probe_deploy_state(&cfg, &unreadable)
+                .unwrap()
+                .installed_proxy_port,
+            InstalledProxyPort::Unreadable,
+            "a present unit with no readable --http-port fails closed as Unreadable"
+        );
+    }
+
+    #[test]
+    fn parse_installed_proxy_port_classifies_the_unit_section() {
+        // Sentinel → Absent.
+        assert_eq!(
+            parse_installed_proxy_port("---autumn-no-proxy-unit---"),
+            InstalledProxyPort::Absent
+        );
+        // A single `--http-port N` match → Port(N) (whitespace tolerant).
+        assert_eq!(
+            parse_installed_proxy_port("--http-port 80"),
+            InstalledProxyPort::Port(80)
+        );
+        assert_eq!(
+            parse_installed_proxy_port("  --http-port    3000  "),
+            InstalledProxyPort::Port(3000)
+        );
+        // Empty (unit present, no match) → Unreadable (fail closed).
+        assert_eq!(
+            parse_installed_proxy_port("   "),
+            InstalledProxyPort::Unreadable
+        );
+        // Ambiguous (two matches) → Unreadable (fail closed).
+        assert_eq!(
+            parse_installed_proxy_port("--http-port 80\n--http-port 8080"),
+            InstalledProxyPort::Unreadable
+        );
+        // Non-u16 / overflow → Unreadable.
+        assert_eq!(
+            parse_installed_proxy_port("--http-port 99999"),
+            InstalledProxyPort::Unreadable
         );
     }
 
@@ -3669,7 +4036,8 @@ mod tests {
     fn compatible_deploy_help() -> &'static str {
         "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
          --target host:port\n  --health-check-path string\n  --host strings\n  \
-         --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n"
+         --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n  \
+         --force\n"
     }
 
     #[test]
@@ -3845,6 +4213,37 @@ mod tests {
         assert_eq!(decision.live_slot, SLOT_GREEN);
         assert!(!decision.repair);
         assert!(decision.warn.is_none());
+    }
+
+    #[test]
+    fn proxy_live_target_port_extracts_the_observed_upstream_port() {
+        // The observed port is returned even when it does NOT map to a slot band
+        // under the CURRENT public port — the #2071 legacy/port-change case. Here the
+        // live blue release still binds 3001 while the operator's new public port is
+        // 5000, so `slot_for_port(5000, 3001)` is None yet the observed port is 3001.
+        let list = proxy_list_serving("myapp", 3001);
+        assert_eq!(proxy_live_target_port(&list, "myapp"), Some(3001));
+        // And `proxy_live_slot` (slot-mapped) correctly reports None for that same
+        // list under the new public port, proving the observed port is the ONLY
+        // signal that survives a `server.port` change.
+        assert_eq!(proxy_live_slot(&list, "myapp", 5000), None);
+        // Under the matching public port it still maps to the slot as before.
+        assert_eq!(proxy_live_slot(&list, "myapp", 3000), Some(SLOT_BLUE));
+
+        // Unclear signals → None (mirrors proxy_live_slot's fall-back conditions):
+        // service absent, listed twice, no target, two different ports, empty name.
+        assert_eq!(proxy_live_target_port(&list, "other"), None);
+        assert_eq!(proxy_live_target_port(&list, ""), None);
+        let twice = format!(
+            "{}{}",
+            proxy_list_serving("myapp", 3001),
+            "myapp   x   127.0.0.1:3002\n"
+        );
+        assert_eq!(proxy_live_target_port(&twice, "myapp"), None);
+        let two_ports = "Service   Target             Prev\n\
+                         myapp   127.0.0.1:3001   127.0.0.1:3002\n";
+        assert_eq!(proxy_live_target_port(two_ports, "myapp"), None);
+        assert_eq!(proxy_live_target_port("", "myapp"), None);
     }
 
     #[test]

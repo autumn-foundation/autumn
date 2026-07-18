@@ -1697,6 +1697,65 @@ fn validate_public_port(public_port: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse a concurrent `server.port` change on the **redeploy** path, BEFORE any op
+/// runs — so the live release keeps serving (#2073).
+///
+/// The reboot-durability upgrade (#2070) makes every redeploy refresh the shared
+/// kamal-proxy unit and, when that unit changed, restart `kamal-proxy run` and
+/// re-register the still-live upstream. Both the restart's public bind and the
+/// re-register's DERIVED loopback target are correct ONLY when the public port is
+/// unchanged: if the operator changed `server.port` since the live release was
+/// deployed, the restart would rebind a different public port and the re-register
+/// would aim at a port nothing listens on, stranding `:80` mid-cutover. Rather than
+/// try to sequence a live-safe port move here (Option C, #2073), refuse the deploy
+/// at pre-flight with an actionable message.
+///
+/// The comparison is sourced from the INSTALLED proxy unit's `--http-port` (captured
+/// by [`exec::probe_deploy_state`]), which is the ground truth of what the running
+/// proxy actually binds:
+///
+///   - [`exec::InstalledProxyPort::Absent`] → no installed unit, i.e. a first-deploy
+///     shape (the durability refresh writes it fresh). Nothing to conflict with →
+///     allowed. (This branch only runs when `current` is a symlink, so this is the
+///     rare shape where the proxy unit is missing but a release symlink exists.)
+///   - [`exec::InstalledProxyPort::Port`] equal to the requested port → unchanged
+///     redeploy (the common durability-upgrade path) → allowed.
+///   - [`exec::InstalledProxyPort::Port`] DIFFERENT from the requested port → refuse,
+///     naming old vs new port and the two-deploy operator sequence.
+///   - [`exec::InstalledProxyPort::Unreadable`] → the unit is present but its
+///     `--http-port` couldn't be read/parsed, so we can't prove the port is unchanged
+///     → **fail closed** (refuse) rather than risk a mid-cutover bind failure.
+fn refuse_concurrent_public_port_change(
+    installed: &exec::InstalledProxyPort,
+    new_public_port: u16,
+) -> Result<(), String> {
+    match installed {
+        // No installed proxy unit — first-deploy shape; the durability refresh writes
+        // it fresh at the requested port, so there is nothing to conflict with.
+        exec::InstalledProxyPort::Absent => Ok(()),
+        // Unchanged public port — the common redeploy / durability-upgrade path.
+        exec::InstalledProxyPort::Port(current) if *current == new_public_port => Ok(()),
+        exec::InstalledProxyPort::Port(current) => Err(format!(
+            "Changing server.port on an existing deployment isn't supported here yet \
+             (the installed kamal-proxy is on port {current}, config requests \
+             {new_public_port}): first redeploy with server.port unchanged (adopts the \
+             reboot-durability upgrade), then change the port in a separate deploy. \
+             Tracked in #2073."
+        )),
+        // Fail closed: the unit is present but its --http-port is unreadable, so we
+        // cannot prove the public port is unchanged — refuse rather than risk the
+        // durability restart rebinding a different port and stranding `:80`.
+        exec::InstalledProxyPort::Unreadable => Err(format!(
+            "Cannot verify the installed kamal-proxy's HTTP port before a redeploy \
+             (its systemd unit is present but its `--http-port` could not be read), so \
+             a concurrent server.port change (config requests {new_public_port}) cannot \
+             be ruled out and is refused to avoid stranding public traffic mid-cutover. \
+             Re-provision the host (or repair the kamal-proxy unit) and retry. Live-safe \
+             server.port changes are tracked in #2073."
+        )),
+    }
+}
+
 // Linear deploy orchestrator; the added MediaMTX host-prep step (#1974 Slice 7)
 // tips it one line over the threshold, and it reads clearest as one sequence.
 #[allow(clippy::too_many_lines)]
@@ -1787,6 +1846,19 @@ fn run_up(
             (ops, teardown, "first deploy".to_owned(), true)
         }
         exec::DeployMode::Redeploy { live_slot } => {
+            // Pre-flight refuse (#2073): the reboot-durability restart-refresh (#2070)
+            // re-execs `kamal-proxy run` on the public port and re-registers the
+            // still-live upstream at its DERIVED loopback port — both correct ONLY
+            // when the public port is unchanged. If the operator changed `server.port`
+            // since the live release was deployed, that restart would rebind a
+            // different public port and the re-register would aim at a dead loopback
+            // port, stranding `:80` mid-cutover with no auto-recovery. Refuse here —
+            // BEFORE any op runs, sourced from the INSTALLED proxy unit's `--http-port`
+            // (captured in the deploy-start probe) — so the live release keeps serving.
+            // A live-safe port change is future work (Option C, #2073). No installed
+            // unit → first-deploy shape (allowed); an unreadable unit → fail closed.
+            refuse_concurrent_public_port_change(&probe.installed_proxy_port, public_port)
+                .map_err(DeployError::Config)?;
             // Reconcile the (possibly stale) live-slot marker against the live
             // proxy before choosing the candidate slot. On an UNAMBIGUOUS
             // proxy-vs-marker disagreement the proxy is authoritative (so the
@@ -1980,6 +2052,67 @@ mod tests {
         assert!(validate_public_port(80).is_ok());
         assert!(validate_public_port(3000).is_ok());
         assert!(validate_public_port(8080).is_ok());
+    }
+
+    #[test]
+    fn redeploy_refuses_a_concurrent_server_port_change() {
+        // #2073 pre-flight refuse. The installed proxy unit binds port 80; the operator
+        // now redeploys with `server.port = 8080` — a concurrent public-port change the
+        // durability restart-refresh (#2070) can't perform live-safely, so it is refused
+        // BEFORE any op runs, naming old vs new port and the two-deploy sequence.
+        let err = refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(80), 8080)
+            .expect_err("a changed server.port must be refused on the redeploy path");
+        assert!(
+            err.contains("80") && err.contains("8080"),
+            "the refuse message must name the installed (80) and requested (8080) ports: {err}",
+        );
+        assert!(
+            err.contains("server.port unchanged") && err.contains("#2073"),
+            "the refuse message must spell out the operator sequence and reference the \
+             tracking issue: {err}",
+        );
+    }
+
+    #[test]
+    fn redeploy_allows_an_unchanged_server_port() {
+        // The common durability-upgrade path: the installed unit's `--http-port` equals
+        // the requested port, so the redeploy proceeds (the restart re-execs on the SAME
+        // port, no collision, derived == actual live port).
+        assert!(
+            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(80), 80).is_ok(),
+            "an unchanged-port redeploy must be allowed",
+        );
+        // And with a non-default port that also happens to match.
+        assert!(
+            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(3000), 3000)
+                .is_ok(),
+            "an unchanged non-default port must also be allowed",
+        );
+    }
+
+    #[test]
+    fn redeploy_fails_closed_on_an_unreadable_installed_port() {
+        // The installed unit is present but its `--http-port` couldn't be read/parsed,
+        // so we cannot prove the public port is unchanged — refuse (fail closed) rather
+        // than risk the durability restart rebinding a different port and stranding `:80`.
+        let err = refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Unreadable, 80)
+            .expect_err("an unreadable installed proxy port must fail closed");
+        assert!(
+            err.contains("could not be read") && err.contains("#2073"),
+            "the fail-closed message must explain the unreadable unit and reference the \
+             tracking issue: {err}",
+        );
+    }
+
+    #[test]
+    fn redeploy_allows_when_no_proxy_unit_is_installed() {
+        // No installed proxy unit at all is a first-deploy shape (the durability refresh
+        // writes it fresh at the requested port) — nothing to conflict with, so the
+        // refuse guard passes regardless of the requested port.
+        assert!(
+            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Absent, 8080).is_ok(),
+            "an absent installed proxy unit must not trigger the refuse",
+        );
     }
 
     #[test]
