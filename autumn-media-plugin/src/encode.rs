@@ -13,12 +13,13 @@
 //! encoders read those segments; the poster/sprite encoders sample frames from
 //! them; the live-thumbnail encoder reads a live playlist URL instead.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{MediaError, stderr_tail};
+use crate::error::{MediaError, STDERR_TAIL_MAX_BYTES, stderr_tail};
 
 /// Tail-of-file clip/highlight encoder that transcodes a fixed window of a
 /// recording to an MP4.
@@ -54,25 +55,29 @@ impl FfmpegHighlightCommand {
     }
 
     /// The exact `FFmpeg` argument vector this command runs.
+    ///
+    /// Paths are threaded through as `OsString` (their raw `OsStr` bytes) rather
+    /// than a lossy `String`, so a non-UTF-8 recording/output path reaches
+    /// `Command` intact.
     #[must_use]
-    pub fn args(&self) -> Vec<String> {
+    pub fn args(&self) -> Vec<OsString> {
         vec![
-            "-y".to_owned(),
-            "-ss".to_owned(),
-            self.start_seconds.to_string(),
-            "-i".to_owned(),
-            self.input_path.display().to_string(),
-            "-t".to_owned(),
-            self.duration_seconds.to_string(),
-            "-c:v".to_owned(),
-            "libx264".to_owned(),
-            "-preset".to_owned(),
-            "veryfast".to_owned(),
-            "-c:a".to_owned(),
-            "aac".to_owned(),
-            "-movflags".to_owned(),
-            "+faststart".to_owned(),
-            self.output_path.display().to_string(),
+            OsString::from("-y"),
+            OsString::from("-ss"),
+            OsString::from(self.start_seconds.to_string()),
+            OsString::from("-i"),
+            self.input_path.as_os_str().to_owned(),
+            OsString::from("-t"),
+            OsString::from(self.duration_seconds.to_string()),
+            OsString::from("-c:v"),
+            OsString::from("libx264"),
+            OsString::from("-preset"),
+            OsString::from("veryfast"),
+            OsString::from("-c:a"),
+            OsString::from("aac"),
+            OsString::from("-movflags"),
+            OsString::from("+faststart"),
+            self.output_path.as_os_str().to_owned(),
         ]
     }
 
@@ -91,13 +96,12 @@ impl FfmpegHighlightCommand {
         }
         create_output_parent(&self.output_path)?;
 
-        let output = Command::new(&self.ffmpeg_bin)
-            .args(self.args())
-            .output()
-            .map_err(|source| MediaError::FfmpegSpawn {
+        let output = run_ffmpeg_capped(&self.ffmpeg_bin, self.args()).map_err(|source| {
+            MediaError::FfmpegSpawn {
                 bin: self.ffmpeg_bin.clone(),
                 source,
-            })?;
+            }
+        })?;
 
         check_exit(&output)?;
         output_size(&self.output_path)
@@ -141,30 +145,33 @@ impl FfmpegPosterCommand {
     /// The `FFmpeg` argument vector for this command. `concat_list` is `Some`
     /// when multiple source segments are demuxed through a concat list.
     #[must_use]
-    pub(crate) fn poster_args(&self, concat_list: Option<&Path>) -> Vec<String> {
+    pub(crate) fn poster_args(&self, concat_list: Option<&Path>) -> Vec<OsString> {
         let mut args = vec![
-            "-y".to_owned(),
-            "-sseof".to_owned(),
-            format!("-{}", self.tail_offset_seconds),
+            OsString::from("-y"),
+            OsString::from("-sseof"),
+            OsString::from(format!("-{}", self.tail_offset_seconds)),
         ];
         if let Some(list) = concat_list {
             args.extend([
-                "-f".to_owned(),
-                "concat".to_owned(),
-                "-safe".to_owned(),
-                "0".to_owned(),
-                "-i".to_owned(),
-                list.display().to_string(),
+                OsString::from("-f"),
+                OsString::from("concat"),
+                OsString::from("-safe"),
+                OsString::from("0"),
+                OsString::from("-i"),
+                list.as_os_str().to_owned(),
             ]);
         } else {
-            args.extend(["-i".to_owned(), self.input_paths[0].display().to_string()]);
+            args.extend([
+                OsString::from("-i"),
+                self.input_paths[0].as_os_str().to_owned(),
+            ]);
         }
         args.extend([
-            "-frames:v".to_owned(),
-            "1".to_owned(),
-            "-q:v".to_owned(),
-            "4".to_owned(),
-            self.output_path.display().to_string(),
+            OsString::from("-frames:v"),
+            OsString::from("1"),
+            OsString::from("-q:v"),
+            OsString::from("4"),
+            self.output_path.as_os_str().to_owned(),
         ]);
         args
     }
@@ -189,13 +196,14 @@ impl FfmpegPosterCommand {
             None
         };
 
-        let output = Command::new(&self.ffmpeg_bin)
-            .args(self.poster_args(concat_list_path.as_deref()))
-            .output()
-            .map_err(|source| MediaError::FfmpegSpawn {
-                bin: self.ffmpeg_bin.clone(),
-                source,
-            })?;
+        let output = run_ffmpeg_capped(
+            &self.ffmpeg_bin,
+            self.poster_args(concat_list_path.as_deref()),
+        )
+        .map_err(|source| MediaError::FfmpegSpawn {
+            bin: self.ffmpeg_bin.clone(),
+            source,
+        })?;
 
         check_exit(&output)?;
         output_size(&self.output_path)
@@ -303,19 +311,22 @@ impl FfmpegPreviewSpriteCommand {
     /// The `FFmpeg` argument vector for this command. `concat_list` is `Some`
     /// when multiple source segments are demuxed through a concat list.
     #[must_use]
-    pub(crate) fn sprite_args(&self, concat_list: Option<&Path>) -> Vec<String> {
-        let mut args = vec!["-y".to_owned()];
+    pub(crate) fn sprite_args(&self, concat_list: Option<&Path>) -> Vec<OsString> {
+        let mut args = vec![OsString::from("-y")];
         if let Some(list) = concat_list {
             args.extend([
-                "-f".to_owned(),
-                "concat".to_owned(),
-                "-safe".to_owned(),
-                "0".to_owned(),
-                "-i".to_owned(),
-                list.display().to_string(),
+                OsString::from("-f"),
+                OsString::from("concat"),
+                OsString::from("-safe"),
+                OsString::from("0"),
+                OsString::from("-i"),
+                list.as_os_str().to_owned(),
             ]);
         } else {
-            args.extend(["-i".to_owned(), self.input_paths[0].display().to_string()]);
+            args.extend([
+                OsString::from("-i"),
+                self.input_paths[0].as_os_str().to_owned(),
+            ]);
         }
         let filter = format!(
             "fps=1/{PREVIEW_FRAME_INTERVAL_SECONDS},scale={cw}:{ch}:force_original_aspect_ratio=decrease,pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2,tile={cols}x{rows}",
@@ -325,13 +336,13 @@ impl FfmpegPreviewSpriteCommand {
             rows = self.rows,
         );
         args.extend([
-            "-frames:v".to_owned(),
-            "1".to_owned(),
-            "-vf".to_owned(),
-            filter,
-            "-q:v".to_owned(),
-            "5".to_owned(),
-            self.output_path.display().to_string(),
+            OsString::from("-frames:v"),
+            OsString::from("1"),
+            OsString::from("-vf"),
+            OsString::from(filter),
+            OsString::from("-q:v"),
+            OsString::from("5"),
+            self.output_path.as_os_str().to_owned(),
         ]);
         args
     }
@@ -356,13 +367,14 @@ impl FfmpegPreviewSpriteCommand {
             None
         };
 
-        let output = Command::new(&self.ffmpeg_bin)
-            .args(self.sprite_args(concat_list_path.as_deref()))
-            .output()
-            .map_err(|source| MediaError::FfmpegSpawn {
-                bin: self.ffmpeg_bin.clone(),
-                source,
-            })?;
+        let output = run_ffmpeg_capped(
+            &self.ffmpeg_bin,
+            self.sprite_args(concat_list_path.as_deref()),
+        )
+        .map_err(|source| MediaError::FfmpegSpawn {
+            bin: self.ffmpeg_bin.clone(),
+            source,
+        })?;
 
         check_exit(&output)?;
         output_size(&self.output_path)
@@ -409,15 +421,21 @@ fn write_concat_list(input_paths: &[PathBuf], near_path: &Path) -> Result<PathBu
         // a literal single quote is written as `'\''` (close-quote,
         // backslash-escaped quote, reopen-quote). Backslashes are literal
         // inside the quotes for the demuxer, so Windows paths need no escaping.
-        writeln!(
-            list_file,
-            "file '{}'",
-            concat_escape(&absolute.display().to_string())
-        )
-        .map_err(|source| MediaError::ConcatList {
-            path: list_path.display().to_string(),
-            source,
-        })?;
+        //
+        // The path is written as its raw `OsStr` bytes (not a lossy `String`),
+        // so a non-UTF-8 recording path reaches FFmpeg's demuxer intact. The
+        // surrounding `file '…'\n` framing and the single-quote escape are
+        // plain ASCII, so byte-splicing them around the raw path is well-formed.
+        let mut line = Vec::with_capacity(absolute.as_os_str().len() + 8);
+        line.extend_from_slice(b"file '");
+        line.extend_from_slice(&concat_escape(&path_to_bytes(&absolute)));
+        line.extend_from_slice(b"'\n");
+        list_file
+            .write_all(&line)
+            .map_err(|source| MediaError::ConcatList {
+                path: list_path.display().to_string(),
+                source,
+            })?;
     }
     Ok(list_path)
 }
@@ -427,14 +445,40 @@ fn write_concat_list(input_paths: &[PathBuf], near_path: &Path) -> Result<PathBu
 /// never share a list file.
 static CONCAT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Escape a path for a single-quoted `FFmpeg` concat-demuxer `file` entry.
+/// Escape a path (as raw bytes) for a single-quoted `FFmpeg` concat-demuxer
+/// `file` entry.
 ///
 /// The demuxer treats everything inside the single quotes literally except the
-/// closing quote, so only `'` needs escaping — as `'\''` (close-quote,
-/// backslash-escaped quote, reopen-quote). Backslashes stay literal, so Windows
-/// paths pass through unchanged.
-fn concat_escape(path: &str) -> String {
-    path.replace('\'', "'\\''")
+/// closing quote, so only `'` (a single ASCII byte, `0x27`) needs escaping — as
+/// `'\''` (close-quote, backslash-escaped quote, reopen-quote). Every other byte
+/// (including non-UTF-8 path bytes and backslashes, so Windows paths pass through
+/// unchanged) is copied verbatim.
+fn concat_escape(path: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(path.len());
+    for &byte in path {
+        if byte == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(byte);
+        }
+    }
+    out
+}
+
+/// The raw bytes of a path, so a non-UTF-8 path reaches the concat list intact.
+///
+/// On Unix the `OsStr` bytes are used directly; on other platforms (where
+/// `OsStr` has no documented byte view) it falls back to the lossy display form.
+fn path_to_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.display().to_string().into_bytes()
+    }
 }
 
 fn absolutize_for_concat(path: &Path) -> Result<PathBuf, MediaError> {
@@ -511,17 +555,22 @@ impl FfmpegClipTailCommand {
     }
 
     #[must_use]
-    fn input_args(&self, concat_list: Option<&Path>) -> Vec<String> {
+    fn input_args(&self, concat_list: Option<&Path>) -> Vec<OsString> {
         concat_list.map_or_else(
-            || vec!["-i".to_owned(), self.input_paths[0].display().to_string()],
+            || {
+                vec![
+                    OsString::from("-i"),
+                    self.input_paths[0].as_os_str().to_owned(),
+                ]
+            },
             |list| {
                 vec![
-                    "-f".to_owned(),
-                    "concat".to_owned(),
-                    "-safe".to_owned(),
-                    "0".to_owned(),
-                    "-i".to_owned(),
-                    list.display().to_string(),
+                    OsString::from("-f"),
+                    OsString::from("concat"),
+                    OsString::from("-safe"),
+                    OsString::from("0"),
+                    OsString::from("-i"),
+                    list.as_os_str().to_owned(),
                 ]
             },
         )
@@ -530,25 +579,25 @@ impl FfmpegClipTailCommand {
     /// The `FFmpeg` argument vector for this command. `concat_list` is `Some`
     /// when multiple source segments are demuxed through a concat list.
     #[must_use]
-    pub(crate) fn encode_args(&self, concat_list: Option<&Path>) -> Vec<String> {
+    pub(crate) fn encode_args(&self, concat_list: Option<&Path>) -> Vec<OsString> {
         let mut args = vec![
-            "-y".to_owned(),
-            "-sseof".to_owned(),
-            format!("-{}", self.tail_offset_seconds),
+            OsString::from("-y"),
+            OsString::from("-sseof"),
+            OsString::from(format!("-{}", self.tail_offset_seconds)),
         ];
         args.extend(self.input_args(concat_list));
         args.extend([
-            "-t".to_owned(),
-            self.duration_seconds.to_string(),
-            "-c:v".to_owned(),
-            "libx264".to_owned(),
-            "-preset".to_owned(),
-            "veryfast".to_owned(),
-            "-c:a".to_owned(),
-            "aac".to_owned(),
-            "-movflags".to_owned(),
-            "+faststart".to_owned(),
-            self.output_path.display().to_string(),
+            OsString::from("-t"),
+            OsString::from(self.duration_seconds.to_string()),
+            OsString::from("-c:v"),
+            OsString::from("libx264"),
+            OsString::from("-preset"),
+            OsString::from("veryfast"),
+            OsString::from("-c:a"),
+            OsString::from("aac"),
+            OsString::from("-movflags"),
+            OsString::from("+faststart"),
+            self.output_path.as_os_str().to_owned(),
         ]);
         args
     }
@@ -573,13 +622,14 @@ impl FfmpegClipTailCommand {
             None
         };
 
-        let output = Command::new(&self.ffmpeg_bin)
-            .args(self.encode_args(concat_list_path.as_deref()))
-            .output()
-            .map_err(|source| MediaError::FfmpegSpawn {
-                bin: self.ffmpeg_bin.clone(),
-                source,
-            })?;
+        let output = run_ffmpeg_capped(
+            &self.ffmpeg_bin,
+            self.encode_args(concat_list_path.as_deref()),
+        )
+        .map_err(|source| MediaError::FfmpegSpawn {
+            bin: self.ffmpeg_bin.clone(),
+            source,
+        })?;
 
         check_exit(&output)?;
         output_size(&self.output_path)
@@ -616,23 +666,26 @@ impl FfmpegLiveThumbnailCommand {
     }
 
     /// The exact `FFmpeg` argument vector this command runs.
+    ///
+    /// The output path is threaded through as its raw `OsStr` (not a lossy
+    /// `String`) so a non-UTF-8 path reaches `Command` intact.
     #[must_use]
-    pub fn args(&self) -> Vec<String> {
+    pub fn args(&self) -> Vec<OsString> {
         vec![
-            "-y".to_owned(),
+            OsString::from("-y"),
             // Bound HLS network reads so a stalled source can't wedge the
             // per-channel capture loop. 5s is well under a typical capture
             // cadence; a hung source fails this tick and the next one tries.
-            "-rw_timeout".to_owned(),
-            "5000000".to_owned(),
-            "-i".to_owned(),
-            self.input_url.clone(),
-            "-frames:v".to_owned(),
-            "1".to_owned(),
-            "-q:v".to_owned(),
-            "4".to_owned(),
-            "-an".to_owned(),
-            self.output_path.display().to_string(),
+            OsString::from("-rw_timeout"),
+            OsString::from("5000000"),
+            OsString::from("-i"),
+            OsString::from(self.input_url.clone()),
+            OsString::from("-frames:v"),
+            OsString::from("1"),
+            OsString::from("-q:v"),
+            OsString::from("4"),
+            OsString::from("-an"),
+            self.output_path.as_os_str().to_owned(),
         ]
     }
 
@@ -645,13 +698,12 @@ impl FfmpegLiveThumbnailCommand {
     pub fn run(&self) -> Result<u64, MediaError> {
         create_output_parent(&self.output_path)?;
 
-        let output = Command::new(&self.ffmpeg_bin)
-            .args(self.args())
-            .output()
-            .map_err(|source| MediaError::FfmpegSpawn {
+        let output = run_ffmpeg_capped(&self.ffmpeg_bin, self.args()).map_err(|source| {
+            MediaError::FfmpegSpawn {
                 bin: self.ffmpeg_bin.clone(),
                 source,
-            })?;
+            }
+        })?;
 
         check_exit(&output)?;
         output_size(&self.output_path)
@@ -679,10 +731,11 @@ impl FfmpegLiveThumbnailCommand {
             })?;
         }
 
-        let child = tokio::process::Command::new(&self.ffmpeg_bin)
+        let mut child = tokio::process::Command::new(&self.ffmpeg_bin)
             .args(self.args())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|source| MediaError::FfmpegSpawn {
@@ -690,12 +743,22 @@ impl FfmpegLiveThumbnailCommand {
                 source,
             })?;
 
-        let output = match tokio::time::timeout(deadline, child.wait_with_output()).await {
+        // Stream the child's pipes with incremental, capped reads (see
+        // `capture_child_capped`): stderr is retained only as a bounded tail and
+        // stdout is drained-and-discarded, so neither a chatty nor a hostile
+        // encoder can grow an unbounded in-memory buffer. The capture future is
+        // boxed so the awaited deadline future stays small. On timeout the early
+        // return drops `child`, whose `kill_on_drop` reaps the process.
+        let output = match tokio::time::timeout(
+            deadline,
+            Box::pin(capture_child_capped(&mut child)),
+        )
+        .await
+        {
             Ok(result) => result.map_err(|source| MediaError::FfmpegSpawn {
                 bin: self.ffmpeg_bin.clone(),
                 source,
             })?,
-            // `kill_on_drop` reaps the child as it drops on the early return.
             Err(_elapsed) => return Err(MediaError::FfmpegTimeout),
         };
 
@@ -770,30 +833,34 @@ impl FfmpegRoomCompositeCommand {
     }
 
     /// The exact `FFmpeg` argument vector this command runs.
+    ///
+    /// Each participant input path and the output path are threaded through as
+    /// their raw `OsStr` (not a lossy `String`) so non-UTF-8 paths reach
+    /// `Command` intact.
     #[must_use]
-    pub fn args(&self) -> Vec<String> {
+    pub fn args(&self) -> Vec<OsString> {
         let n = self.input_paths.len();
-        let mut args = vec!["-y".to_owned()];
+        let mut args = vec![OsString::from("-y")];
         for path in &self.input_paths {
-            args.push("-i".to_owned());
-            args.push(path.display().to_string());
+            args.push(OsString::from("-i"));
+            args.push(path.as_os_str().to_owned());
         }
-        args.push("-filter_complex".to_owned());
-        args.push(room_composite_filtergraph(n));
+        args.push(OsString::from("-filter_complex"));
+        args.push(OsString::from(room_composite_filtergraph(n)));
         args.extend([
-            "-map".to_owned(),
-            "[vout]".to_owned(),
-            "-map".to_owned(),
-            "[aout]".to_owned(),
-            "-c:v".to_owned(),
-            "libx264".to_owned(),
-            "-preset".to_owned(),
-            "veryfast".to_owned(),
-            "-c:a".to_owned(),
-            "aac".to_owned(),
-            "-movflags".to_owned(),
-            "+faststart".to_owned(),
-            self.output_path.display().to_string(),
+            OsString::from("-map"),
+            OsString::from("[vout]"),
+            OsString::from("-map"),
+            OsString::from("[aout]"),
+            OsString::from("-c:v"),
+            OsString::from("libx264"),
+            OsString::from("-preset"),
+            OsString::from("veryfast"),
+            OsString::from("-c:a"),
+            OsString::from("aac"),
+            OsString::from("-movflags"),
+            OsString::from("+faststart"),
+            self.output_path.as_os_str().to_owned(),
         ]);
         args
     }
@@ -820,13 +887,12 @@ impl FfmpegRoomCompositeCommand {
         }
         create_output_parent(&self.output_path)?;
 
-        let output = Command::new(&self.ffmpeg_bin)
-            .args(self.args())
-            .output()
-            .map_err(|source| MediaError::FfmpegSpawn {
+        let output = run_ffmpeg_capped(&self.ffmpeg_bin, self.args()).map_err(|source| {
+            MediaError::FfmpegSpawn {
                 bin: self.ffmpeg_bin.clone(),
                 source,
-            })?;
+            }
+        })?;
 
         check_exit(&output)?;
         output_size(&self.output_path)
@@ -922,8 +988,173 @@ fn create_output_parent(output_path: &Path) -> Result<(), MediaError> {
     Ok(())
 }
 
+/// The bounded outcome of a spawned `FFmpeg` process.
+///
+/// Unlike [`std::process::Output`], `stderr` here is not the child's full stderr
+/// but only the last [`STDERR_TAIL_MAX_BYTES`] of it (what [`stderr_tail`] would
+/// ultimately surface), and stdout is discarded entirely — so a chatty or
+/// hostile encoder can never grow an unbounded in-memory buffer.
+struct CapturedOutput {
+    status: std::process::ExitStatus,
+    stderr: Vec<u8>,
+}
+
+/// A fixed-capacity tail buffer: retains only the last `cap` bytes pushed, so
+/// draining an unbounded stream keeps memory bounded at `cap`.
+struct TailBuffer {
+    cap: usize,
+    buf: Vec<u8>,
+}
+
+impl TailBuffer {
+    const fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Append `data`, retaining only the last `cap` bytes overall.
+    fn push(&mut self, data: &[u8]) {
+        if self.cap == 0 {
+            return;
+        }
+        if data.len() >= self.cap {
+            // The new chunk alone overflows the cap: keep only its tail.
+            self.buf.clear();
+            self.buf.extend_from_slice(&data[data.len() - self.cap..]);
+            return;
+        }
+        let overflow = (self.buf.len() + data.len()).saturating_sub(self.cap);
+        if overflow > 0 {
+            self.buf.drain(..overflow);
+        }
+        self.buf.extend_from_slice(data);
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+/// Drain a blocking reader into a bounded tail buffer (the last `cap` bytes).
+fn drain_tail_sync<R: std::io::Read>(mut reader: R, cap: usize) -> Vec<u8> {
+    let mut tail = TailBuffer::new(cap);
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => tail.push(&buf[..n]),
+        }
+    }
+    tail.into_vec()
+}
+
+/// Drain a blocking reader to EOF, discarding its bytes (keeps a full stdout
+/// pipe from wedging the child while using no memory).
+fn drain_discard_sync<R: std::io::Read>(mut reader: R) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Spawn `bin` with `args`, streaming its pipes with capped reads.
+///
+/// stdout is drained-and-discarded and stderr is retained only as a bounded
+/// tail (both drained concurrently with `wait()` so a full pipe can never wedge
+/// the child), so the transient in-memory buffer is bounded regardless of how
+/// much the child writes. Stdin is `/dev/null`, matching `Command::output()`.
+fn run_ffmpeg_capped(bin: &str, args: Vec<OsString>) -> std::io::Result<CapturedOutput> {
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        stderr.map_or_else(Vec::new, |reader| {
+            drain_tail_sync(reader, STDERR_TAIL_MAX_BYTES)
+        })
+    });
+    let stdout_handle = std::thread::spawn(move || {
+        if let Some(reader) = stdout {
+            drain_discard_sync(reader);
+        }
+    });
+
+    let status = child.wait()?;
+    let stderr = stderr_handle.join().unwrap_or_default();
+    let _ = stdout_handle.join();
+    Ok(CapturedOutput { status, stderr })
+}
+
+/// Async twin of [`drain_tail_sync`].
+async fn drain_tail_async<R: tokio::io::AsyncRead + Unpin>(mut reader: R, cap: usize) -> Vec<u8> {
+    use tokio::io::AsyncReadExt as _;
+    let mut tail = TailBuffer::new(cap);
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => tail.push(&buf[..n]),
+        }
+    }
+    tail.into_vec()
+}
+
+/// Async twin of [`drain_discard_sync`].
+async fn drain_discard_async<R: tokio::io::AsyncRead + Unpin>(mut reader: R) {
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Await a spawned child while draining its pipes with capped reads.
+///
+/// stderr is retained only as a bounded tail (matching [`stderr_tail`]) and
+/// stdout is drained-and-discarded; both are drained concurrently with `wait()`
+/// so a full pipe can never wedge the child. Kept a free function (rather than
+/// an inline block in the async command method) so the `tokio::join!` expansion
+/// — and the pin `unsafe` it emits — does not live inside a `Deserialize`-
+/// deriving command's impl. The caller owns the child, so `kill_on_drop` still
+/// reaps it when a surrounding deadline drops this future.
+async fn capture_child_capped(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<CapturedOutput> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stderr_fut = async {
+        match stderr {
+            Some(reader) => drain_tail_async(reader, STDERR_TAIL_MAX_BYTES).await,
+            None => Vec::new(),
+        }
+    };
+    let stdout_fut = async {
+        if let Some(reader) = stdout {
+            drain_discard_async(reader).await;
+        }
+    };
+    let (status, stderr, ()) = tokio::join!(child.wait(), stderr_fut, stdout_fut);
+    Ok(CapturedOutput {
+        status: status?,
+        stderr,
+    })
+}
+
 /// Map a non-zero `FFmpeg` exit into [`MediaError::FfmpegNonZeroExit`].
-fn check_exit(output: &std::process::Output) -> Result<(), MediaError> {
+fn check_exit(output: &CapturedOutput) -> Result<(), MediaError> {
     if output.status.success() {
         return Ok(());
     }
@@ -1114,7 +1345,7 @@ mod tests {
     #[test]
     fn highlight_args_have_expected_flags() {
         let cmd = FfmpegHighlightCommand::new("ffmpeg", "/rec/in.mp4", "/out/clip.mp4", 12, 30);
-        let args = cmd.args();
+        let args = lossy(&cmd.args());
         assert_eq!(args.first().map(String::as_str), Some("-y"));
         // -ss <start> comes before -i (an input-seek).
         let ss = args.iter().position(|a| a == "-ss").unwrap();
@@ -1140,7 +1371,7 @@ mod tests {
             20,
             25,
         );
-        let args = cmd.encode_args(None);
+        let args = lossy(&cmd.encode_args(None));
         // -sseof -<tail>
         let sseof = args.iter().position(|a| a == "-sseof").unwrap();
         assert_eq!(args[sseof + 1], "-25");
@@ -1163,7 +1394,7 @@ mod tests {
             25,
         );
         let list = PathBuf::from("/out/.clip.concat.txt");
-        let args = cmd.encode_args(Some(&list));
+        let args = lossy(&cmd.encode_args(Some(&list)));
         assert_windowed(&args, "-f", "concat");
         assert_windowed(&args, "-safe", "0");
         let i = args.iter().position(|a| a == "-i").unwrap();
@@ -1180,7 +1411,7 @@ mod tests {
             "/out/poster.jpg",
             4,
         );
-        let sa = single.poster_args(None);
+        let sa = lossy(&single.poster_args(None));
         let sseof = sa.iter().position(|a| a == "-sseof").unwrap();
         assert_eq!(sa[sseof + 1], "-4");
         assert!(!sa.iter().any(|a| a == "concat"));
@@ -1195,7 +1426,7 @@ mod tests {
             "/out/poster.jpg",
             4,
         );
-        let ma = multi.poster_args(Some(&list));
+        let ma = lossy(&multi.poster_args(Some(&list)));
         assert_windowed(&ma, "-f", "concat");
         assert_windowed(&ma, "-safe", "0");
         let i = ma.iter().position(|a| a == "-i").unwrap();
@@ -1211,7 +1442,7 @@ mod tests {
             10,
             3,
         );
-        let args = cmd.sprite_args(None);
+        let args = lossy(&cmd.sprite_args(None));
         let vf = args.iter().position(|a| a == "-vf").unwrap();
         assert_eq!(
             args[vf + 1],
@@ -1231,7 +1462,7 @@ mod tests {
             0,
             0,
         );
-        let args = cmd.sprite_args(None);
+        let args = lossy(&cmd.sprite_args(None));
         let vf = args.iter().position(|a| a == "-vf").unwrap();
         assert!(args[vf + 1].ends_with("tile=1x1"));
     }
@@ -1243,7 +1474,7 @@ mod tests {
             "http://mediamtx/live/key/index.m3u8",
             "/out/thumb.jpg",
         );
-        let args = cmd.args();
+        let args = lossy(&cmd.args());
         assert_windowed(&args, "-rw_timeout", "5000000");
         assert_windowed(&args, "-frames:v", "1");
         assert!(args.iter().any(|a| a == "-an"), "must drop audio");
@@ -1259,7 +1490,7 @@ mod tests {
             vec![PathBuf::from("/rec/a.mp4"), PathBuf::from("/rec/b.mp4")],
             "/out/room.mp4",
         );
-        let args = cmd.args();
+        let args = lossy(&cmd.args());
         assert_eq!(args.first().map(String::as_str), Some("-y"));
         // One -i per participant.
         assert_eq!(args.iter().filter(|a| *a == "-i").count(), 2);
@@ -1291,7 +1522,7 @@ mod tests {
             ],
             "/out/room.mp4",
         );
-        let args = cmd.args();
+        let args = lossy(&cmd.args());
         assert_eq!(args.iter().filter(|a| *a == "-i").count(), 4);
         let fc = args.iter().position(|a| a == "-filter_complex").unwrap();
         assert_eq!(
@@ -1347,6 +1578,14 @@ mod tests {
             cmd.run(),
             Err(super::MediaError::FfmpegSourceMissing { .. })
         ));
+    }
+
+    /// Render an `OsString` arg vector as lossy `String`s for `&str` assertions.
+    /// The builders' paths are ASCII in these tests, so the lossy view is exact.
+    fn lossy(args: &[std::ffi::OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 
     /// Assert `flag` appears immediately followed by `value`.
@@ -1473,15 +1712,20 @@ mod tests {
     fn concat_escape_handles_single_quotes_and_leaves_others_literal() {
         // A single quote becomes the demuxer's close/escape/reopen sequence.
         assert_eq!(
-            super::concat_escape("creator's-stream/seg.mp4"),
-            "creator'\\''s-stream/seg.mp4"
+            super::concat_escape(b"creator's-stream/seg.mp4"),
+            b"creator'\\''s-stream/seg.mp4"
         );
         // Multiple quotes each get the treatment.
-        assert_eq!(super::concat_escape("a'b'c"), "a'\\''b'\\''c");
+        assert_eq!(super::concat_escape(b"a'b'c"), b"a'\\''b'\\''c");
         // Backslashes are literal for the demuxer (Windows paths untouched).
-        assert_eq!(super::concat_escape(r"C:\rec\seg.mp4"), r"C:\rec\seg.mp4");
+        assert_eq!(super::concat_escape(br"C:\rec\seg.mp4"), br"C:\rec\seg.mp4");
         // A normal path is unchanged.
-        assert_eq!(super::concat_escape("/rec/seg.mp4"), "/rec/seg.mp4");
+        assert_eq!(super::concat_escape(b"/rec/seg.mp4"), b"/rec/seg.mp4");
+        // Non-UTF-8 bytes (0xff) pass through verbatim, single quote still escaped.
+        assert_eq!(
+            super::concat_escape(&[0xff, b'\'', 0xfe]),
+            vec![0xff, b'\'', b'\\', b'\'', b'\'', 0xfe]
+        );
     }
 
     #[test]
