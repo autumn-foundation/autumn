@@ -1562,20 +1562,21 @@ fn loopback_port(field: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
-/// The slot `kamal-proxy list` UNAMBIGUOUSLY reports serving `service_name`, or
-/// `None` when the signal is absent or unclear (→ caller falls back to the marker).
+/// The single loopback target port `kamal-proxy list` UNAMBIGUOUSLY reports
+/// serving `service_name`, or `None` when the signal is absent or unclear.
 ///
-/// A definite slot is returned ONLY when: exactly one output row carries
-/// `service_name` as a standalone whitespace field (the header row never does, and
-/// a service listed twice is ambiguous → `None`), that row carries exactly one
-/// distinct `127.0.0.1:<port>` target, and `port - public_port` maps to a slot
-/// (1=blue, 2=green). Every other shape — service absent, no/garbled target, two
-/// different target ports, a port mapping to neither slot — yields `None`.
-fn proxy_live_slot(
-    list_stdout: &str,
-    service_name: &str,
-    public_port: u16,
-) -> Option<&'static str> {
+/// This is the proxy's OBSERVED current upstream target — the port the live slot
+/// is ACTUALLY routed to right now — and is the ground truth of what is being
+/// served, independent of the public port or any persisted marker (#2071). It is
+/// returned ONLY when exactly one output row carries `service_name` as a standalone
+/// whitespace field (the header row never does, and a service listed twice is
+/// ambiguous → `None`) and that row carries exactly one distinct `127.0.0.1:<port>`
+/// target. Deliberately does NOT require the port to map to a slot band under the
+/// current public port: on a `server.port` change the live release still binds its
+/// OLD port, which no longer maps to a slot relative to the NEW public port, yet is
+/// exactly the port we must preserve.
+#[must_use]
+pub fn proxy_live_target_port(list_stdout: &str, service_name: &str) -> Option<u16> {
     let service = service_name.trim();
     if service.is_empty() {
         return None;
@@ -1600,7 +1601,25 @@ fn proxy_live_slot(
             }
         }
     }
-    slot_for_port(public_port, port?)
+    port
+}
+
+/// The slot `kamal-proxy list` UNAMBIGUOUSLY reports serving `service_name`, or
+/// `None` when the signal is absent or unclear (→ caller falls back to the marker).
+///
+/// A definite slot is returned ONLY when [`proxy_live_target_port`] resolves an
+/// unambiguous single `127.0.0.1:<port>` target AND `port - public_port` maps to a
+/// slot (1=blue, 2=green). Every other shape — service absent, no/garbled target,
+/// two different target ports, a port mapping to neither slot — yields `None`.
+fn proxy_live_slot(
+    list_stdout: &str,
+    service_name: &str,
+    public_port: u16,
+) -> Option<&'static str> {
+    slot_for_port(
+        public_port,
+        proxy_live_target_port(list_stdout, service_name)?,
+    )
 }
 
 /// The decision from reconciling the live-slot marker against the live proxy.
@@ -4073,6 +4092,37 @@ mod tests {
         assert_eq!(decision.live_slot, SLOT_GREEN);
         assert!(!decision.repair);
         assert!(decision.warn.is_none());
+    }
+
+    #[test]
+    fn proxy_live_target_port_extracts_the_observed_upstream_port() {
+        // The observed port is returned even when it does NOT map to a slot band
+        // under the CURRENT public port — the #2071 legacy/port-change case. Here the
+        // live blue release still binds 3001 while the operator's new public port is
+        // 5000, so `slot_for_port(5000, 3001)` is None yet the observed port is 3001.
+        let list = proxy_list_serving("myapp", 3001);
+        assert_eq!(proxy_live_target_port(&list, "myapp"), Some(3001));
+        // And `proxy_live_slot` (slot-mapped) correctly reports None for that same
+        // list under the new public port, proving the observed port is the ONLY
+        // signal that survives a `server.port` change.
+        assert_eq!(proxy_live_slot(&list, "myapp", 5000), None);
+        // Under the matching public port it still maps to the slot as before.
+        assert_eq!(proxy_live_slot(&list, "myapp", 3000), Some(SLOT_BLUE));
+
+        // Unclear signals → None (mirrors proxy_live_slot's fall-back conditions):
+        // service absent, listed twice, no target, two different ports, empty name.
+        assert_eq!(proxy_live_target_port(&list, "other"), None);
+        assert_eq!(proxy_live_target_port(&list, ""), None);
+        let twice = format!(
+            "{}{}",
+            proxy_list_serving("myapp", 3001),
+            "myapp   x   127.0.0.1:3002\n"
+        );
+        assert_eq!(proxy_live_target_port(&twice, "myapp"), None);
+        let two_ports = "Service   Target             Prev\n\
+                         myapp   127.0.0.1:3001   127.0.0.1:3002\n";
+        assert_eq!(proxy_live_target_port(two_ports, "myapp"), None);
+        assert_eq!(proxy_live_target_port("", "myapp"), None);
     }
 
     #[test]
