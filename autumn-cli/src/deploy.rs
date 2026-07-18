@@ -23,6 +23,7 @@
 //! shared with `autumn doctor`.
 
 pub mod exec;
+pub mod media;
 pub mod proxy;
 
 use std::net::{TcpStream, ToSocketAddrs};
@@ -846,11 +847,17 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
     let resolved = ResolvedDeployConfig::resolve(&deploy_cfg, &resolve_project_name())
         .map_err(DeployError::Config)?;
 
+    // MediaMTX host-provisioning config (issue #1974, Slice 7). Read straight
+    // from the project `autumn.toml` string (like the media plugin reads
+    // `[media]`), so it needs no `AutumnConfig`/plugin coupling and defaults to
+    // disabled — a non-media project is byte-for-byte unaffected.
+    let (media_cfg, ffmpeg_bin) = load_media_host_config();
+
     match action {
         // `plan` is a pure dry-run over `resolved` alone — it never grades or
         // uploads runtime VALUES, so it needs no reload under the target profile.
         DeployAction::Plan => {
-            print_plan(&resolved);
+            print_plan(&resolved, &media_cfg);
             Ok(())
         }
         // `check`/`rollback`/`up` grade and (for `up`) upload the signing secret
@@ -858,8 +865,41 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
         // deploy profile — not the operator's ambient/dev config. Reload here.
         DeployAction::Check => run_check(&load_runtime_config(&resolved)?, &resolved),
         DeployAction::Rollback => run_rollback(&load_runtime_config(&resolved)?, &resolved),
-        DeployAction::Up => run_up(&load_runtime_config(&resolved)?, &resolved),
+        DeployAction::Up => run_up(
+            &load_runtime_config(&resolved)?,
+            &resolved,
+            &media_cfg,
+            &ffmpeg_bin,
+        ),
     }
+}
+
+/// Load the `[media.mediamtx]` host-provisioning config and the `[media.ffmpeg]
+/// bin` path from the project `autumn.toml` (issue #1974, Slice 7).
+///
+/// Reads the raw `autumn.toml` string and deserializes only the `[media]`
+/// subtree (mirroring how `autumn-media-plugin` reads its own config), so it
+/// bypasses `autumn-web`'s strict `AutumnConfig` schema and adds no dependency on
+/// the plugin. A missing or unparseable file yields the disabled default plus
+/// the default `FFmpeg` path, so a project that does not use autumn-media is
+/// unaffected.
+fn load_media_host_config() -> (media::MediaMtxHostConfig, String) {
+    let disabled = || {
+        (
+            media::MediaMtxHostConfig::default(),
+            media::DEFAULT_FFMPEG_BIN.to_owned(),
+        )
+    };
+    let Some(path) = first_dir_with_file(&manifest_project_dirs(), "autumn.toml") else {
+        return disabled();
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return disabled();
+    };
+    let cfg = media::MediaMtxHostConfig::from_toml_str(&contents).unwrap_or_default();
+    let bin = media::ffmpeg_bin_from_toml_str(&contents)
+        .unwrap_or_else(|_| media::DEFAULT_FFMPEG_BIN.to_owned());
+    (cfg, bin)
 }
 
 /// An [`Env`] that forces `AUTUMN_ENV` to a specific deploy profile while
@@ -1130,7 +1170,7 @@ fn run_check(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(
     }
 }
 
-fn print_plan(resolved: &ResolvedDeployConfig) {
+fn print_plan(resolved: &ResolvedDeployConfig, media_cfg: &media::MediaMtxHostConfig) {
     println!("\u{1F342} autumn deploy plan (dry-run)\n");
     println!("systemd unit ({}.service):\n", resolved.service_name);
     println!("{}", render_systemd_unit(resolved));
@@ -1139,6 +1179,74 @@ fn print_plan(resolved: &ResolvedDeployConfig) {
     for (i, step) in build_deploy_plan(resolved).iter().enumerate() {
         println!("  {}. [{}] {}", i + 1, step.label, step.description);
     }
+
+    // MediaMTX host provisioning (issue #1974, Slice 7): only when the
+    // `[media.mediamtx]` section is enabled — a non-media deploy prints nothing
+    // new here.
+    if media_cfg.enabled {
+        print_media_plan(media_cfg);
+    }
+}
+
+/// Print the `MediaMTX` host-provisioning section of `deploy plan` — the rendered
+/// systemd unit, the ordered provisioning ops, and the CSP origins the app must
+/// allow. Pure output; runs nothing.
+fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
+    let controller = media::MediaMtxController::new(media_cfg.clone());
+    println!(
+        "\nMediaMTX host provisioning (media unit {}.service):\n",
+        media_cfg.unit_name
+    );
+    println!("{}", media::render_mediamtx_unit(media_cfg));
+    println!("MediaMTX provisioning steps:");
+    for (i, op) in controller.ensure_installed_ops().iter().enumerate() {
+        println!("  {}. [{}]", i + 1, op.label());
+    }
+    println!(
+        "\nMediaMTX doctor checks at `deploy up`: {}, {}, {}",
+        media::CHECK_FFMPEG_PREFLIGHT,
+        media::CHECK_RECORDINGS_DIR_WRITABLE,
+        media::CHECK_MEDIAMTX_PORTS_AVAILABLE,
+    );
+    println!(
+        "CSP: the app must allow these MediaMTX origins in connect-src/media-src \
+         (frame-src for WebRTC): {}",
+        media_cfg.required_csp_origins().join(", "),
+    );
+}
+
+/// Grade the media host and provision `MediaMTX` as a systemd unit over the live
+/// executor (issue #1974, Slice 7). A no-op when `[media.mediamtx]` is not
+/// enabled.
+///
+/// Runs the three fail-closed doctor checks first (`FFmpeg` preflight, recordings
+/// dir writable, ports available) and aborts the deploy on any failure — so a
+/// host that cannot serve media never gets a half-provisioned unit — then drives
+/// the controller's write-config / write-unit / enable+restart ops.
+fn provision_media_host(
+    media_cfg: &media::MediaMtxHostConfig,
+    ffmpeg_bin: &str,
+    executor: &impl exec::DeployExecutor,
+) -> Result<(), DeployError> {
+    if !media_cfg.enabled {
+        return Ok(());
+    }
+    eprintln!("\u{1F3A5} provisioning MediaMTX host (autumn-media)\n");
+
+    let checks = media::collect_media_doctor_checks(executor, media_cfg, ffmpeg_bin);
+    let failed = report_preflight(&checks);
+    if failed > 0 {
+        return Err(DeployError::PreflightFailed(failed));
+    }
+
+    let controller = media::MediaMtxController::new(media_cfg.clone());
+    exec::run_ops(&controller.ensure_installed_ops(), executor)
+        .map_err(|e| DeployError::Exec(e.to_string()))?;
+    eprintln!(
+        "\u{2705} MediaMTX provisioned ({}.service)",
+        media_cfg.unit_name
+    );
+    Ok(())
 }
 
 /// Build the secret env-file body sourced by the systemd unit's
@@ -1368,7 +1476,15 @@ fn validate_public_port(public_port: u16) -> Result<(), String> {
     Ok(())
 }
 
-fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
+// Linear deploy orchestrator; the added MediaMTX host-prep step (#1974 Slice 7)
+// tips it one line over the threshold, and it reads clearest as one sequence.
+#[allow(clippy::too_many_lines)]
+fn run_up(
+    config: &AutumnConfig,
+    resolved: &ResolvedDeployConfig,
+    media_cfg: &media::MediaMtxHostConfig,
+    ffmpeg_bin: &str,
+) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy up\n");
 
     // Fail fast: run the full preflight and abort BEFORE any remote call.
@@ -1401,6 +1517,9 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
     let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs)
         .with_tls_host(resolved.tls_host.clone());
     let executor = exec::SshExecutor::new(target);
+    // MediaMTX host provisioning (#1974 Slice 7) — no-op unless enabled (see fn).
+    provision_media_host(media_cfg, ffmpeg_bin, &executor)?;
+
     let release_dir = format!("{}/{release_id}", resolved.releases_dir());
 
     // Probe the target to choose first-deploy vs zero-downtime redeploy. The same
