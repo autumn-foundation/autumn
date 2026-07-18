@@ -120,7 +120,7 @@ retry regenerates a single migration rather than a duplicate.
 
 On SQLite, `schema diff` emits real migrations for the ALTER-family changes
 SQLite's `ALTER TABLE` cannot express directly (`ALTER COLUMN TYPE`,
-`DROP NOT NULL`, `SET DEFAULT`, `ADD CHECK`, `ADD FOREIGN KEY`) using the
+`DROP NOT NULL`, `SET DEFAULT`, `ADD CHECK`) using the
 standard **table-recreate** procedure — create a new table, `INSERT..SELECT` the
 common columns, drop the old table, rename, and recreate indexes, all wrapped in
 `PRAGMA foreign_keys=OFF` … `foreign_key_check` … `ON` and coalesced to one
@@ -136,6 +136,17 @@ NULL, so `schema diff` stops with a message telling you to backfill the column
 and apply the change manually — or keep it nullable (`Option<...>`). The inverse
 change, `DROP NOT NULL` (required → nullable), is always safe and *is* handled by
 the table-recreate path above.
+
+**Adding a foreign key to a pre-existing column** (attaching `#[references]` to a
+column that already exists) is likewise *not* rebuilt — the plan guard refuses it
+on **both** backends before any SQL is emitted. The offline snapshot cannot
+confirm the database doesn't already carry a generated `<table>_<column>_fkey`
+association constraint (a `#[belongs_to(...)]` `<name>_id` column parses as a
+plain integer with no visible foreign key), so re-adding that constraint could
+collide. `schema diff` stops and directs you to add the foreign key via a manual
+migration (or re-snapshot from an authoritative source). A brand-new foreign-key
+column is unaffected: it arrives as an ordinary `ADD COLUMN` with an inline
+`REFERENCES` and needs no table-recreate at all.
 
 ---
 
