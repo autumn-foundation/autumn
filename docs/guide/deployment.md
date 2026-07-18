@@ -443,18 +443,29 @@ collapse to your public MediaMTX origin, and your object-store origin must also
 be allowed in `media-src` for recorded playback.
 
 > **`strict_config` interaction.** The `[media]` table is **plugin-owned** — it
-> is not part of autumn-web's `AutumnConfig` schema. `autumn deploy` reads
-> `[media.mediamtx]` / `[media.ffmpeg]` straight from the merged `autumn.toml`
-> (base ← inline `[profile.<name>]` ← `autumn-<profile>.toml`) precisely so it
-> never routes through that strict schema. But the **app runtime** is a different
-> story: if you turn on autumn-web's strict config validation
-> (`[server] strict_config = true`, or `AUTUMN_SERVER__STRICT_CONFIG=1`), a
-> top-level `[media]` table is flagged as an **unknown top-level key** and the app
-> **fails to boot**, because unknown top-level keys hard-fail under
-> `strict_config` (they are not one of the sections the plugin registers with the
-> validator). If you run a media app with strict config, keep this in mind — the
-> deploy-side provisioning is unaffected, but the running app's strict validation
-> is not aware of the plugin's `[media]` section.
+> is not part of autumn-web's `AutumnConfig` schema. `autumn deploy` reads the
+> `[media.mediamtx]` / `[media.ffmpeg]` **subtree** straight from the merged
+> `autumn.toml` (base ← inline `[profile.<name>]` ← `autumn-<profile>.toml`), so
+> that media-subtree read never itself routes through the strict schema. But that
+> does **not** make strict config deploy-safe. Before it ever reads the raw
+> `[media]` subtree, `deploy::run` calls `AutumnConfig::load()` — the strict
+> loader (`autumn-cli/src/deploy.rs`, ahead of `load_media_host_config`) — for
+> **every** subcommand. So if you turn on autumn-web's strict config validation
+> (`[server] strict_config = true`, or `AUTUMN_SERVER__STRICT_CONFIG=1`) **and**
+> keep a top-level `[media]` table in that strict-loaded config, the `[media]`
+> table is flagged as an **unknown top-level key** and **hard-fails** during that
+> load (unknown top-level keys were already strict pre-#1890, so this fails even
+> without `strict_config_enforce_all`). That means **both**:
+>
+> - the **app runtime fails to boot**, *and*
+> - **`autumn deploy plan` / `deploy up` also exit during config load** on the
+>   unknown `[media]` key — they never reach `load_media_host_config` and never
+>   provision MediaMTX, because the strict `AutumnConfig::load()` runs first.
+>
+> **Workaround:** treat `strict_config` and a top-level `[media]` table as
+> mutually exclusive today — don't enable `strict_config` while the strict-loaded
+> config carries a top-level `[media]` table (the validator has no knowledge of
+> the plugin's `[media]` section, on either the app-boot or the deploy path).
 
 **Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
 installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
