@@ -74,6 +74,16 @@ const REQUIRED_DEPLOY_FLAGS: &[&str] = &[
 /// matching the `--host <h> --tls` segment `deploy_shell` adds for a TLS app.
 const REQUIRED_TLS_DEPLOY_FLAGS: &[&str] = &["--host", "--tls"];
 
+/// Extra `deploy` flag the post-restart live-route RE-REGISTER emits (issue
+/// #2071). The re-register in [`KamalProxyController::refresh_installed_ops`] runs
+/// `kamal-proxy deploy … --force` (NOT the route/flip), so `--force` is part of
+/// the CLI surface this controller can emit and the compat probe must guard it too
+/// — otherwise a drifted binary lacking `--force` would only surface at
+/// re-register time (post-restart), the worst possible moment. It is kept separate
+/// from [`REQUIRED_DEPLOY_FLAGS`] precisely because it is NOT emitted on every
+/// route/flip, only on the re-register.
+const REQUIRED_REREGISTER_FLAGS: &[&str] = &["--force"];
+
 /// A read-only CLI-surface compatibility probe a [`ProxyController`] can declare,
 /// run ONCE before any cutover (issue #2053).
 ///
@@ -248,10 +258,21 @@ impl KamalProxyController {
         self
     }
 
-    /// The single `kamal-proxy deploy` invocation shared by the initial route and
-    /// the health-gated flip. Centralized so the exact CLI contract lives in one
-    /// place (a Caddy controller would replace THIS with an admin-API call).
-    fn deploy_shell(&self, service: &str, target: &str) -> String {
+    /// The single `kamal-proxy deploy` invocation shared by the initial route, the
+    /// health-gated flip, and the post-restart live-route re-register. Centralized
+    /// so the exact CLI contract lives in one place (a Caddy controller would
+    /// replace THIS with an admin-API call).
+    ///
+    /// `force` appends `--force`, which makes kamal-proxy install+persist the route
+    /// WITHOUT waiting for a fresh `/ready` health check (issue #2071). It is passed
+    /// `true` ONLY by the re-register in [`Self::refresh_installed_ops`] — which is
+    /// re-pinning a route to the release that is ALREADY LIVE and serving, so a
+    /// fresh readiness gate is both unnecessary and dangerous (a transient `/ready`
+    /// blip during the one-time durability restart could otherwise strand `:80` or
+    /// abort the deploy). The initial route ([`Self::route_op`]) and the cutover
+    /// flip ([`Self::flip_op`]) pass `false` and STAY health-gated (unchanged): they
+    /// route to a candidate whose readiness must genuinely be proven first.
+    fn deploy_shell(&self, service: &str, target: &str, force: bool) -> String {
         // Every string parameter is shell-quoted so a service name, upstream, or
         // health-check path carrying query params / special chars can't break out
         // of the command. The numeric timeouts need no quoting.
@@ -274,9 +295,14 @@ impl KamalProxyController {
         let tls = self.tls_host.as_deref().map_or_else(String::new, |host| {
             format!("--host {host} --tls ", host = shell_quote(host))
         });
+        // `--force` (re-register only, issue #2071) trails the stable flag block, so
+        // for the common route/flip (`force = false`) the command is byte-for-byte
+        // the prior health-gated form.
+        let force_flag = if force { " --force" } else { "" };
         format!(
             "env -u XDG_RUNTIME_DIR kamal-proxy deploy {service} --target {target} \
-             --health-check-path {path} {tls}--deploy-timeout {deploy}s --drain-timeout {drain}s",
+             --health-check-path {path} {tls}--deploy-timeout {deploy}s \
+             --drain-timeout {drain}s{force_flag}",
             service = shell_quote(service),
             target = shell_quote(target),
             path = shell_quote(&self.health_check_path),
@@ -305,13 +331,17 @@ impl KamalProxyController {
     }
 
     /// The `deploy` flags this controller requires to be present in the probe
-    /// output — the base set plus the TLS flags when TLS is enabled.
+    /// output — the base set, the TLS flags when TLS is enabled, and the
+    /// re-register `--force` (#2071). The compat probe guards every flag the
+    /// controller can emit on ANY deploy invocation, so `--force` is included even
+    /// though only the post-restart re-register passes it.
     #[must_use]
     pub fn required_deploy_flags(&self) -> Vec<&'static str> {
         let mut flags = REQUIRED_DEPLOY_FLAGS.to_vec();
         if self.tls_host.is_some() {
             flags.extend_from_slice(REQUIRED_TLS_DEPLOY_FLAGS);
         }
+        flags.extend_from_slice(REQUIRED_REREGISTER_FLAGS);
         flags
     }
 
@@ -412,16 +442,20 @@ impl ProxyController for KamalProxyController {
     }
 
     fn route_op(&self, service: &str, upstream: &str) -> DeployOp {
+        // First-deploy route: health-gated (force = false) — the candidate's
+        // readiness must be proven before it receives live traffic.
         DeployOp::Run(RemoteCommand::new(
             "proxy-route",
-            self.deploy_shell(service, upstream),
+            self.deploy_shell(service, upstream, false),
         ))
     }
 
     fn flip_op(&self, service: &str, new_upstream: &str) -> DeployOp {
+        // Cutover flip: health-gated (force = false) — this is THE readiness gate
+        // that keeps an unready candidate from ever taking live traffic.
         DeployOp::Run(RemoteCommand::new(
             "proxy-flip",
-            self.deploy_shell(service, new_upstream),
+            self.deploy_shell(service, new_upstream, false),
         ))
     }
 
@@ -468,15 +502,32 @@ impl ProxyController for KamalProxyController {
         //     readiness window (a zero-downtime violation). Re-registering the CURRENT
         //     live upstream (the slot serving at cutover-start) right after the
         //     restart bounds the routeless window to ~the restart itself.
+        //   * The re-register uses `--force` (#2071). It is re-pinning a route to the
+        //     release that is ALREADY LIVE and serving, so a fresh readiness gate is
+        //     both unnecessary and DANGEROUS: a health-gated re-register would block
+        //     on a fresh `/ready` pass, and a transient `/ready` blip during the
+        //     one-time restart could strand :80 or abort the whole deploy (up to
+        //     30×deploy-timeout). `--force` makes kamal-proxy install+persist the
+        //     route IMMEDIATELY (it skips `WaitUntilHealthy` but still runs
+        //     `saveStateSnapshot`), and the target self-heals via background health
+        //     checks (~1s) — during a real blip it starts serving the instant
+        //     `/ready` recovers, WITHOUT failing the deploy. (A residual ~1s
+        //     `TargetStateAdding` window before the first background `/ready` pass
+        //     remains — kamal-proxy won't route to an unready backend — a documented
+        //     footnote, not a hard failure.)
         //   * The restart and the re-register are ONE remote command, so no SSH
-        //     round-trip can interpose between them, and a bounded retry rides out the
-        //     brief window before the just-restarted proxy's control socket accepts a
-        //     route.
+        //     round-trip can interpose between them. Because `--force` returns
+        //     WITHOUT waiting for readiness, the re-register succeeds on the first
+        //     attempt in the normal case; the long 30×deploy-timeout burn is gone.
+        //     A SMALL bounded retry (5) is kept only to ride out a transient CLI /
+        //     control-socket hiccup in the brief window before the just-restarted
+        //     proxy's socket accepts a connection.
         //   * An UNCHANGED unit (steady-state redeploy) takes NEITHER branch — today's
         //     no-restart behavior is preserved exactly, so a routine redeploy never
         //     churns the shared proxy.
-        // The re-register reuses `deploy_shell`, so it keeps the `env -u
-        // XDG_RUNTIME_DIR` control-socket pin (#2019) and any `--host/--tls` segment.
+        // The re-register reuses `deploy_shell` (with `force = true`), so it keeps the
+        // `env -u XDG_RUNTIME_DIR` control-socket pin (#2019) and any `--host/--tls`
+        // segment. The `|| exit 1` fail-fast on `systemctl restart` is unchanged.
         ops.push(DeployOp::Run(RemoteCommand::new(
             "proxy-restart-if-changed",
             format!(
@@ -489,11 +540,11 @@ impl ProxyController for KamalProxyController {
                  n=0; \
                  until {reregister}; do \
                  n=$((n+1)); \
-                 if [ \"$n\" -ge 30 ]; then \
+                 if [ \"$n\" -ge 5 ]; then \
                  echo 'kamal-proxy did not accept the live route after restart' >&2; exit 1; fi; \
                  sleep 0.5; \
                  done",
-                reregister = self.deploy_shell(service, live_upstream),
+                reregister = self.deploy_shell(service, live_upstream, true),
             ),
         )));
         ops
@@ -671,6 +722,64 @@ mod tests {
             cmd.shell,
             "env -u XDG_RUNTIME_DIR kamal-proxy deploy 'myapp' --target '127.0.0.1:3002' \
              --health-check-path '/ready' --deploy-timeout 60s --drain-timeout 30s",
+        );
+    }
+
+    #[test]
+    fn reregister_is_forced_but_route_and_flip_stay_health_gated() {
+        // #2071: the post-restart re-register re-pins the ALREADY-LIVE upstream, so it
+        // must use `--force` (install+persist immediately, no fresh readiness gate a
+        // transient /ready blip could fail). The first-deploy route and the cutover
+        // flip route to a candidate whose readiness must be PROVEN, so they stay
+        // health-gated (NO --force) — unchanged.
+        let proxy = KamalProxyController::new(60);
+
+        // The re-register (last op of the refresh) is forced, socket-pinned, and
+        // targets the LIVE upstream.
+        let ops = proxy.refresh_installed_ops(8080, "myapp", "127.0.0.1:3001", "/tmp/snap.sha256");
+        let DeployOp::Run(restart) = ops.last().expect("has ops") else {
+            panic!("last op must be the restart/re-register");
+        };
+        assert!(
+            restart.shell.contains(
+                "env -u XDG_RUNTIME_DIR kamal-proxy deploy 'myapp' --target '127.0.0.1:3001' \
+                 --health-check-path '/ready' --deploy-timeout 60s --drain-timeout 30s --force"
+            ),
+            "re-register must be forced + socket-pinned + target the live upstream: {}",
+            restart.shell,
+        );
+        // The `|| exit 1` fail-fast on the restart itself is preserved.
+        assert!(
+            restart
+                .shell
+                .contains("systemctl restart kamal-proxy.service || exit 1"),
+            "restart fail-fast must be preserved: {}",
+            restart.shell,
+        );
+        // With --force the deploy returns without waiting, so the long 30×retry burn
+        // is gone — only a SMALL bounded retry (5) rides out a transient socket hiccup.
+        assert!(
+            restart.shell.contains("if [ \"$n\" -ge 5 ]"),
+            "the retry ceiling is small (5), not the old 30: {}",
+            restart.shell,
+        );
+
+        // The cutover flip and the first-deploy route are health-gated: NO --force.
+        let DeployOp::Run(flip) = proxy.flip_op("myapp", "127.0.0.1:3002") else {
+            panic!("flip_op must be a Run op");
+        };
+        assert!(
+            !flip.shell.contains("--force"),
+            "the cutover flip must STAY health-gated (no --force): {}",
+            flip.shell,
+        );
+        let DeployOp::Run(route) = proxy.route_op("myapp", "127.0.0.1:3002") else {
+            panic!("route_op must be a Run op");
+        };
+        assert!(
+            !route.shell.contains("--force"),
+            "the first-deploy route must STAY health-gated (no --force): {}",
+            route.shell,
         );
     }
 
@@ -951,10 +1060,13 @@ mod tests {
         assert!(
             s.contains(
                 "env -u XDG_RUNTIME_DIR kamal-proxy deploy 'myapp' --target '127.0.0.1:3001' \
-                 --health-check-path '/ready' --deploy-timeout 60s --drain-timeout 30s"
+                 --health-check-path '/ready' --deploy-timeout 60s --drain-timeout 30s --force"
             ),
-            "re-register the current live upstream, socket-pinned: {s}"
+            "re-register the current live upstream, socket-pinned and forced (#2071): {s}"
         );
+        // The re-register is FORCED (#2071): re-pinning the already-live upstream must
+        // not block on a fresh readiness gate that a transient /ready blip could fail.
+        assert!(s.contains("--force"), "re-register must be --force: {s}");
         assert!(
             s.contains("rm -f '/tmp/autumn-kamal-proxy-unit-REL.sha256'"),
             "the scratch snapshot is cleaned up: {s}"
@@ -983,9 +1095,9 @@ mod tests {
             restart.shell.contains(
                 "env -u XDG_RUNTIME_DIR kamal-proxy deploy 'myapp' --target '127.0.0.1:3001' \
                  --health-check-path '/ready' --host 'app.example.com' --tls \
-                 --deploy-timeout 60s --drain-timeout 30s"
+                 --deploy-timeout 60s --drain-timeout 30s --force"
             ),
-            "TLS re-register carries --host/--tls: {}",
+            "TLS re-register carries --host/--tls and --force: {}",
             restart.shell,
         );
     }
@@ -1035,7 +1147,8 @@ mod tests {
          \x20     --host strings                Host(s) to route\n\
          \x20     --tls                         Configure TLS for this service\n\
          \x20     --deploy-timeout duration     How long to wait for the target\n\
-         \x20     --drain-timeout duration      How long to drain the old target\n"
+         \x20     --drain-timeout duration      How long to drain the old target\n\
+         \x20     --force                       Skip health checks and force deployment\n"
     }
 
     #[test]
@@ -1057,6 +1170,9 @@ mod tests {
                 "--health-check-path",
                 "--deploy-timeout",
                 "--drain-timeout",
+                // The post-restart re-register (#2071) emits `--force`, so the probe
+                // guards it too.
+                "--force",
             ],
         );
         let with_tls =
@@ -1070,15 +1186,18 @@ mod tests {
                 "--drain-timeout",
                 "--host",
                 "--tls",
+                "--force",
             ],
         );
-        // Every required flag is one deploy_shell actually emits, so the contract
-        // can never drift from what the controller passes.
-        let flip_shell = with_tls.deploy_shell("svc", "127.0.0.1:3001");
+        // Every required flag is one deploy_shell actually emits (checking the
+        // re-register form, `force = true`, which is the superset that emits every
+        // flag including `--force`), so the contract can never drift from what the
+        // controller passes.
+        let reregister_shell = with_tls.deploy_shell("svc", "127.0.0.1:3001", true);
         for flag in with_tls.required_deploy_flags() {
             assert!(
-                flip_shell.contains(flag),
-                "required flag {flag} must be one deploy_shell emits, got: {flip_shell}",
+                reregister_shell.contains(flag),
+                "required flag {flag} must be one deploy_shell emits, got: {reregister_shell}",
             );
         }
     }
@@ -1094,7 +1213,7 @@ mod tests {
         // Non-TLS controller does not require --host/--tls, so a help capture that
         // lacks them is still compatible for it.
         let no_tls_help = "Flags:\n  --target x\n  --health-check-path p\n  \
-                           --deploy-timeout d\n  --drain-timeout d\n";
+                           --deploy-timeout d\n  --drain-timeout d\n  --force\n";
         assert_eq!(
             KamalProxyController::new(60).assess_deploy_help(no_tls_help),
             Ok(()),
@@ -1104,9 +1223,10 @@ mod tests {
     #[test]
     fn tls_controller_requires_tls_flags() {
         // With TLS enabled, a help capture missing --tls is incompatible for THIS
-        // controller even though a non-TLS controller would accept it.
+        // controller even though a non-TLS controller would accept it. (`--force` is
+        // present so the ONLY missing flag under test is `--tls`.)
         let no_tls_help = "Flags:\n  --target x\n  --health-check-path p\n  \
-                           --deploy-timeout d\n  --drain-timeout d\n  --host h\n";
+                           --deploy-timeout d\n  --drain-timeout d\n  --host h\n  --force\n";
         let with_tls =
             KamalProxyController::new(60).with_tls_host(Some("app.example.com".to_owned()));
         assert_eq!(

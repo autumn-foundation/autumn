@@ -4036,7 +4036,8 @@ mod tests {
     fn compatible_deploy_help() -> &'static str {
         "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
          --target host:port\n  --health-check-path string\n  --host strings\n  \
-         --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n"
+         --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n  \
+         --force\n"
     }
 
     #[test]
