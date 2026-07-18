@@ -131,7 +131,9 @@
 
 use std::collections::BTreeMap;
 
-use autumn_schema_core::{Backend, Column, ColumnDefault, ColumnType, ForeignKey, Index, Table};
+use autumn_schema_core::{
+    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, ForeignKey, Index, Table,
+};
 use diesel::{Connection as _, PgConnection, QueryableByName, RunQueryDsl as _, sql_query};
 
 /// Failure modes for Postgres introspection. `Display` is credential-safe: the
@@ -187,6 +189,7 @@ pub fn introspect_postgres(url: &str) -> Result<Vec<Table>, IntrospectError> {
     let pks_by_table = fetch_primary_keys(&mut conn, &table_names)?;
     let indexes_by_table = fetch_indexes(&mut conn, &table_names)?;
     let fks_by_table = fetch_foreign_keys(&mut conn, &table_names)?;
+    let checks_by_table = fetch_checks(&mut conn, &table_names)?;
 
     let mut tables = Vec::with_capacity(table_names.len());
     for name in &table_names {
@@ -196,6 +199,7 @@ pub fn introspect_postgres(url: &str) -> Result<Vec<Table>, IntrospectError> {
             pks_by_table.get(name).map_or(&[][..], Vec::as_slice),
             indexes_by_table.get(name).map_or(&[][..], Vec::as_slice),
             fks_by_table.get(name).map_or(&[][..], Vec::as_slice),
+            checks_by_table.get(name).map_or(&[][..], Vec::as_slice),
         ));
     }
     Ok(tables)
@@ -235,6 +239,16 @@ struct ColumnRow {
     numeric_precision: Option<i32>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     numeric_scale: Option<i32>,
+    /// The Postgres DOMAIN name backing this column, or `NULL` when the column's
+    /// type is not a domain. When set, the column's type is preserved verbatim as
+    /// [`ColumnType::Opaque`] (schema-qualified via `domain_schema`) so the
+    /// domain's identity/validation is never flattened to its base `udt_name`.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    domain_name: Option<String>,
+    /// The schema owning the column's domain (`NULL` for a non-domain column).
+    /// Only qualifies the emitted type when it is not `public`.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    domain_schema: Option<String>,
 }
 
 #[derive(QueryableByName)]
@@ -343,8 +357,26 @@ struct ForeignKeyRow {
     column_name: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     foreign_table: String,
+    /// The schema owning the referenced table. A cross-schema FK target (not
+    /// `public`) is stored schema-qualified in [`ForeignKey::table`] so it never
+    /// silently retargets a same-named table in `public` on recreation.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    foreign_schema: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     foreign_column: String,
+}
+
+#[derive(QueryableByName)]
+struct CheckRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    table_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    constraint_name: String,
+    /// The full `pg_get_constraintdef` text (`CHECK ((price >= 0))`), stripped to
+    /// the inner predicate (`price >= 0`) at build time to match the emitter's
+    /// `CHECK ({expression})` wrapping.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    definition: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +438,8 @@ fn fetch_columns(
     let query = format!(
         "SELECT table_name, column_name, udt_name, is_nullable, column_default, \
          numeric_precision::integer AS numeric_precision, \
-         numeric_scale::integer AS numeric_scale FROM information_schema.columns \
+         numeric_scale::integer AS numeric_scale, \
+         domain_name, domain_schema FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name IN ({}) \
          ORDER BY table_name, ordinal_position",
         quoted_in_list(tables)
@@ -571,11 +604,13 @@ fn fetch_foreign_keys(
 ) -> Result<BTreeMap<String, Vec<ForeignKeyRow>>, IntrospectError> {
     let query = format!(
         "SELECT t.relname AS table_name, att.attname AS column_name, \
-         ft.relname AS foreign_table, fatt.attname AS foreign_column \
+         ft.relname AS foreign_table, fn.nspname AS foreign_schema, \
+         fatt.attname AS foreign_column \
          FROM pg_constraint con \
          JOIN pg_class t ON t.oid = con.conrelid \
          JOIN pg_namespace n ON n.oid = t.relnamespace \
          JOIN pg_class ft ON ft.oid = con.confrelid \
+         JOIN pg_namespace fn ON fn.oid = ft.relnamespace \
          JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = con.conkey[1] \
          JOIN pg_attribute fatt ON fatt.attrelid = con.confrelid AND fatt.attnum = con.confkey[1] \
          WHERE con.contype = 'f' AND n.nspname = 'public' AND t.relname IN ({})",
@@ -594,6 +629,58 @@ fn fetch_foreign_keys(
     Ok(by_table)
 }
 
+/// Fetch every table-level `CHECK` constraint for all `tables`, grouped by table.
+///
+/// `contype = 'c'` selects **real** CHECK constraints only — a column's `NOT NULL`
+/// is `pg_attribute.attnotnull` (not a check), and a DOMAIN's check has
+/// `conrelid = 0`, so scoping the join to the table's own `conrelid` naturally
+/// excludes domain checks. `pg_get_constraintdef` renders the constraint's full
+/// `CHECK (...)` definition, which `build_table` strips to the inner predicate to
+/// match the emitter's `CHECK ({expression})` wrapping.
+fn fetch_checks(
+    conn: &mut PgConnection,
+    tables: &[String],
+) -> Result<BTreeMap<String, Vec<CheckRow>>, IntrospectError> {
+    let query = format!(
+        "SELECT t.relname AS table_name, con.conname AS constraint_name, \
+         pg_get_constraintdef(con.oid) AS definition \
+         FROM pg_constraint con \
+         JOIN pg_class t ON t.oid = con.conrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         WHERE con.contype = 'c' AND n.nspname = 'public' AND t.relname IN ({}) \
+         ORDER BY t.relname, con.conname",
+        quoted_in_list(tables)
+    );
+    let rows: Vec<CheckRow> = sql_query(query)
+        .load(conn)
+        .map_err(|e| IntrospectError::Query(e.to_string()))?;
+    let mut by_table: BTreeMap<String, Vec<CheckRow>> = BTreeMap::new();
+    for row in rows {
+        by_table
+            .entry(row.table_name.clone())
+            .or_default()
+            .push(row);
+    }
+    Ok(by_table)
+}
+
+/// Strip a `pg_get_constraintdef` CHECK definition (`CHECK ((price >= 0))`) to the
+/// inner predicate (`price >= 0`) the emitter re-wraps in `CHECK (...)`. Removes
+/// the leading `CHECK ` keyword and exactly one balanced outer paren pair; a
+/// definition that does not match the expected shape is returned trimmed verbatim
+/// (never silently dropped).
+fn strip_check_wrapper(definition: &str) -> String {
+    let trimmed = definition.trim();
+    let inner = trimmed
+        .strip_prefix("CHECK ")
+        .or_else(|| trimmed.strip_prefix("CHECK"))
+        .map_or(trimmed, str::trim);
+    inner
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .map_or_else(|| inner.to_owned(), |unwrapped| unwrapped.trim().to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // IR assembly (pure over the fetched rows)
 // ---------------------------------------------------------------------------
@@ -605,6 +692,7 @@ fn build_table(
     primary_key: &[String],
     indexes: &[IndexRow],
     foreign_keys: &[ForeignKeyRow],
+    checks: &[CheckRow],
 ) -> Table {
     let mut table = Table::new(name, Backend::Postgres);
     table.managed = true;
@@ -622,10 +710,30 @@ fn build_table(
         .collect();
 
     for row in columns {
-        let ty = ColumnType::from_pg_introspection(
-            &row.udt_name,
-            row.numeric_precision,
-            row.numeric_scale,
+        // Fail-closed floor for Postgres DOMAIN columns: when the column is typed
+        // on a domain (`CREATE DOMAIN email_dom AS text CHECK (…)`),
+        // `information_schema` reports the base type in `udt_name` (`text`) while
+        // naming the domain in `domain_name`. Flattening to the base type would
+        // silently drop the domain's identity and validation on recreation, so
+        // preserve the domain verbatim as `Opaque` (schema-qualified when not in
+        // `public`). `Opaque`'s `sql_type` emits `pg_type` unchanged, so the down
+        // migration re-references the still-existing domain type. A non-domain
+        // column (`domain_name` NULL) maps exactly as before.
+        let ty = row.domain_name.as_ref().map_or_else(
+            || {
+                ColumnType::from_pg_introspection(
+                    &row.udt_name,
+                    row.numeric_precision,
+                    row.numeric_scale,
+                )
+            },
+            |domain| {
+                let pg_type = match row.domain_schema.as_deref() {
+                    Some(schema) if schema != "public" => format!("{schema}.{domain}"),
+                    _ => domain.clone(),
+                };
+                ColumnType::Opaque { pg_type }
+            },
         );
         let is_pk = primary_key.iter().any(|c| c == &row.column_name);
         let mut column = Column::new(row.column_name.clone(), ty.clone());
@@ -634,15 +742,37 @@ fn build_table(
         column.unique = unique_columns.contains(row.column_name.as_str());
         column.default = normalize_default(row.column_default.as_deref(), &ty, is_pk, primary_key);
         if let Some(fk) = fk_by_column.get(row.column_name.as_str()) {
-            column.references = Some(ForeignKey::new(
-                fk.foreign_table.clone(),
-                fk.foreign_column.clone(),
-            ));
+            // Fail-closed floor for cross-schema FK targets: a FK to a table
+            // outside `public` (`REFERENCES auth.users(id)`) must be stored
+            // schema-qualified, else `render_column_def` would emit
+            // `REFERENCES users(id)` and point at the wrong (or a nonexistent)
+            // `public.users`. A `public` target stays bare (the common case,
+            // unchanged).
+            let foreign_table = if fk.foreign_schema == "public" {
+                fk.foreign_table.clone()
+            } else {
+                format!("{}.{}", fk.foreign_schema, fk.foreign_table)
+            };
+            column.references = Some(ForeignKey::new(foreign_table, fk.foreign_column.clone()));
         }
         table.columns.push(column);
     }
 
     table.indexes = ir_indexes;
+
+    // Preserve real `CHECK` constraints (Fix 4): recording them faithfully so a
+    // pull never silently drops a `CHECK (price >= 0)`. The definition is stripped
+    // to the inner predicate the emitter re-wraps in `CHECK (...)`. Snapshot
+    // canonicalization sorts checks by name, so no explicit ordering is needed
+    // here (the query already orders by `conname`).
+    table.checks = checks
+        .iter()
+        .map(|c| CheckConstraint {
+            name: Some(c.constraint_name.clone()),
+            expression: strip_check_wrapper(&c.definition),
+        })
+        .collect();
+
     table
 }
 
@@ -1328,6 +1458,8 @@ mod tests {
                 column_default: Some("nextval('comments_id_seq'::regclass)".to_owned()),
                 numeric_precision: None,
                 numeric_scale: None,
+                domain_name: None,
+                domain_schema: None,
             },
             ColumnRow {
                 table_name: "comments".to_owned(),
@@ -1337,6 +1469,8 @@ mod tests {
                 column_default: None,
                 numeric_precision: None,
                 numeric_scale: None,
+                domain_name: None,
+                domain_schema: None,
             },
         ];
         let pk = vec!["id".to_owned()];
@@ -1353,9 +1487,10 @@ mod tests {
             table_name: "comments".to_owned(),
             column_name: "post_id".to_owned(),
             foreign_table: "posts".to_owned(),
+            foreign_schema: "public".to_owned(),
             foreign_column: "id".to_owned(),
         }];
-        let table = build_table("comments", &columns, &pk, &indexes, &fks);
+        let table = build_table("comments", &columns, &pk, &indexes, &fks, &[]);
         assert_eq!(table.name, "comments");
         assert!(table.managed);
         assert_eq!(table.primary_key, vec!["id".to_owned()]);
@@ -1383,8 +1518,10 @@ mod tests {
             column_default: None,
             numeric_precision: None,
             numeric_scale: None,
+            domain_name: None,
+            domain_schema: None,
         }];
-        let table = build_table("widgets", &columns, &[], &[], &[]);
+        let table = build_table("widgets", &columns, &[], &[], &[], &[]);
         let addr = table.columns.iter().find(|c| c.name == "addr").unwrap();
         assert_eq!(
             addr.ty,
@@ -1393,5 +1530,203 @@ mod tests {
             }
         );
         assert!(addr.nullable);
+    }
+
+    #[test]
+    fn build_table_preserves_domain_column_as_opaque() {
+        // A column typed on a Postgres DOMAIN reports its base type in `udt_name`
+        // (`text`) but names the domain in `domain_name`. The fail-closed floor
+        // must preserve the domain verbatim as `Opaque`, NOT flatten to `Text`.
+        let columns = vec![
+            ColumnRow {
+                table_name: "contacts".to_owned(),
+                column_name: "email".to_owned(),
+                udt_name: "text".to_owned(),
+                is_nullable: "NO".to_owned(),
+                column_default: None,
+                numeric_precision: None,
+                numeric_scale: None,
+                domain_name: Some("email_dom".to_owned()),
+                domain_schema: Some("public".to_owned()),
+            },
+            // A non-domain column (`domain_name` NULL) maps exactly as before.
+            ColumnRow {
+                table_name: "contacts".to_owned(),
+                column_name: "note".to_owned(),
+                udt_name: "text".to_owned(),
+                is_nullable: "YES".to_owned(),
+                column_default: None,
+                numeric_precision: None,
+                numeric_scale: None,
+                domain_name: None,
+                domain_schema: None,
+            },
+        ];
+        let table = build_table("contacts", &columns, &[], &[], &[], &[]);
+        let email = table.columns.iter().find(|c| c.name == "email").unwrap();
+        assert_eq!(
+            email.ty,
+            ColumnType::Opaque {
+                pg_type: "email_dom".to_owned()
+            },
+            "a public-schema domain column preserves the bare domain name as Opaque"
+        );
+        let note = table.columns.iter().find(|c| c.name == "note").unwrap();
+        assert_eq!(
+            note.ty,
+            ColumnType::Text,
+            "a non-domain text column maps to Text unchanged"
+        );
+    }
+
+    #[test]
+    fn build_table_qualifies_non_public_domain_column() {
+        // A domain in a non-`public` schema is schema-qualified so recreation
+        // references the correct domain type.
+        let columns = vec![ColumnRow {
+            table_name: "contacts".to_owned(),
+            column_name: "email".to_owned(),
+            udt_name: "text".to_owned(),
+            is_nullable: "NO".to_owned(),
+            column_default: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            domain_name: Some("email_dom".to_owned()),
+            domain_schema: Some("otherschema".to_owned()),
+        }];
+        let table = build_table("contacts", &columns, &[], &[], &[], &[]);
+        let email = table.columns.iter().find(|c| c.name == "email").unwrap();
+        assert_eq!(
+            email.ty,
+            ColumnType::Opaque {
+                pg_type: "otherschema.email_dom".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn build_table_qualifies_non_public_fk_target() {
+        // A FK referencing a table outside `public` is stored schema-qualified in
+        // `ForeignKey.table` so recreation emits `REFERENCES auth.users(id)`, not
+        // a wrong bare `REFERENCES users(id)`.
+        let columns = vec![ColumnRow {
+            table_name: "sessions".to_owned(),
+            column_name: "account_id".to_owned(),
+            udt_name: "int8".to_owned(),
+            is_nullable: "YES".to_owned(),
+            column_default: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            domain_name: None,
+            domain_schema: None,
+        }];
+        let fks = vec![ForeignKeyRow {
+            table_name: "sessions".to_owned(),
+            column_name: "account_id".to_owned(),
+            foreign_table: "accounts".to_owned(),
+            foreign_schema: "auth".to_owned(),
+            foreign_column: "id".to_owned(),
+        }];
+        let table = build_table("sessions", &columns, &[], &[], &fks, &[]);
+        let account_id = table
+            .columns
+            .iter()
+            .find(|c| c.name == "account_id")
+            .unwrap();
+        assert_eq!(
+            account_id.references,
+            Some(ForeignKey::new("auth.accounts", "id")),
+            "a cross-schema FK target is stored schema-qualified"
+        );
+    }
+
+    #[test]
+    fn build_table_keeps_public_fk_target_bare() {
+        // The common case — a FK to a `public` table — stays a bare relname.
+        let columns = vec![ColumnRow {
+            table_name: "comments".to_owned(),
+            column_name: "post_id".to_owned(),
+            udt_name: "int8".to_owned(),
+            is_nullable: "YES".to_owned(),
+            column_default: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            domain_name: None,
+            domain_schema: None,
+        }];
+        let fks = vec![ForeignKeyRow {
+            table_name: "comments".to_owned(),
+            column_name: "post_id".to_owned(),
+            foreign_table: "posts".to_owned(),
+            foreign_schema: "public".to_owned(),
+            foreign_column: "id".to_owned(),
+        }];
+        let table = build_table("comments", &columns, &[], &[], &fks, &[]);
+        let post_id = table.columns.iter().find(|c| c.name == "post_id").unwrap();
+        assert_eq!(
+            post_id.references,
+            Some(ForeignKey::new("posts", "id")),
+            "a public FK target stays bare, unchanged"
+        );
+    }
+
+    #[test]
+    fn build_table_populates_check_constraints() {
+        // A fetched CHECK row is preserved as a named CheckConstraint whose
+        // expression is stripped to the inner predicate the emitter re-wraps.
+        let columns = vec![ColumnRow {
+            table_name: "products".to_owned(),
+            column_name: "price".to_owned(),
+            udt_name: "int4".to_owned(),
+            is_nullable: "NO".to_owned(),
+            column_default: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            domain_name: None,
+            domain_schema: None,
+        }];
+        let checks = vec![CheckRow {
+            table_name: "products".to_owned(),
+            constraint_name: "products_price_check".to_owned(),
+            definition: "CHECK ((price >= 0))".to_owned(),
+        }];
+        let table = build_table("products", &columns, &[], &[], &[], &checks);
+        assert_eq!(table.checks.len(), 1);
+        assert_eq!(
+            table.checks[0].name.as_deref(),
+            Some("products_price_check")
+        );
+        assert_eq!(table.checks[0].expression, "(price >= 0)");
+    }
+
+    #[test]
+    fn build_table_without_checks_is_empty() {
+        let columns = vec![ColumnRow {
+            table_name: "products".to_owned(),
+            column_name: "price".to_owned(),
+            udt_name: "int4".to_owned(),
+            is_nullable: "NO".to_owned(),
+            column_default: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            domain_name: None,
+            domain_schema: None,
+        }];
+        let table = build_table("products", &columns, &[], &[], &[], &[]);
+        assert!(
+            table.checks.is_empty(),
+            "a table with no CHECK rows has empty checks (unchanged)"
+        );
+    }
+
+    #[test]
+    fn strip_check_wrapper_unwraps_pg_constraintdef() {
+        assert_eq!(strip_check_wrapper("CHECK ((price >= 0))"), "(price >= 0)");
+        assert_eq!(
+            strip_check_wrapper("CHECK (status IN ('a','b'))"),
+            "status IN ('a','b')"
+        );
+        // A shape that doesn't match is returned trimmed verbatim (never dropped).
+        assert_eq!(strip_check_wrapper("price >= 0"), "price >= 0");
     }
 }

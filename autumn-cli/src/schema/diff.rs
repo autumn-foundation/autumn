@@ -1289,6 +1289,19 @@ fn baseline_unique_index_covers(base: &Table, want_columns: &[String]) -> bool {
     })
 }
 
+/// The single suppression predicate shared by **both** [`diff_indexes`] branches
+/// (the same-name match and the desired-only `AddIndex`), so they can never
+/// drift: a desired UNIQUE index is already satisfied — and may be suppressed —
+/// only when SOME baseline index provides **full** coverage, i.e. a non-partial,
+/// non-expression unique index over exactly its key columns (see
+/// [`baseline_unique_index_covers`]). A non-unique desired index is never
+/// suppressed by this rule, and a merely same-named baseline index that is
+/// partial, an expression index (empty key columns), or keyed on a different
+/// column set does **not** count as coverage.
+fn baseline_satisfies_desired_unique(base: &Table, want_idx: &Index) -> bool {
+    want_idx.unique && baseline_unique_index_covers(base, &want_idx.columns)
+}
+
 fn diff_indexes(
     table: &str,
     base: &Table,
@@ -1319,8 +1332,7 @@ fn diff_indexes(
                 // untouched: a brownfield constraint index has the same name on both
                 // sides there and already matches by name, so real drift stays detected.
                 if !opts.definitions_authoritative
-                    && want_idx.unique
-                    && baseline_unique_index_covers(base, &want_idx.columns)
+                    && baseline_satisfies_desired_unique(base, want_idx)
                 {
                     continue;
                 }
@@ -1338,6 +1350,23 @@ fn diff_indexes(
                 let involves_definition =
                     base_idx.definition.is_some() || want_idx.definition.is_some();
                 if involves_definition && !opts.definitions_authoritative {
+                    // Model diff: the desired side cannot express B's
+                    // definition, so the same-named definition-carrying baseline
+                    // index B is retained (the drop loop below skips a name still
+                    // present in `want`). But a unique D whose uniqueness B does
+                    // NOT fully cover — B is partial, an expression index (empty
+                    // key columns), or keyed on a different column set — leaves
+                    // the model's table-wide `#[unique]` UNENFORCED even though a
+                    // conventionally-named index exists. Emit `AddIndex(D)` so the
+                    // full unique index is created ALONGSIDE the retained B;
+                    // suppress D only when SOME baseline index fully covers it
+                    // (or D is non-unique).
+                    if want_idx.unique && !baseline_satisfies_desired_unique(base, want_idx) {
+                        changes.push(SchemaChange::AddIndex {
+                            table: table.to_owned(),
+                            index: want_idx.clone(),
+                        });
+                    }
                     continue;
                 }
                 if !indexes_equivalent(base_idx, want_idx) {
@@ -3913,6 +3942,166 @@ mod tests {
         assert!(
             plan.changes.is_empty(),
             "model diff must retain the definition index and emit no drop/replace; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// A model-parsed unique index over `[email]` on the `posts` table, carrying
+    /// the parser's conventional name `idx_posts_email_unique` (`definition: None`).
+    fn desired_posts_email_unique() -> Index {
+        Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        }
+    }
+
+    /// Fix 1 (a): a baseline **partial** unique index that happens to carry the
+    /// model's conventional name (`idx_posts_email_unique`) hits the same-NAME
+    /// match branch but does NOT provide table-wide coverage. It must NOT suppress
+    /// the model's `#[unique]` — the full unique `AddIndex` is emitted — while the
+    /// partial index (definition-carrying) is itself RETAINED (no `DropIndex`).
+    #[test]
+    fn model_diff_same_named_partial_unique_does_not_suppress_and_retains_partial() {
+        let partial = Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX idx_posts_email_unique ON posts (email) \
+                 WHERE email IS NOT NULL"
+                    .to_owned(),
+            ),
+            is_partial: true,
+            key_columns: vec!["email".to_owned()],
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(partial);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(desired_posts_email_unique());
+        let plan = diff_schema(&[base], &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AddIndex { index, .. }
+                    if index.name == "idx_posts_email_unique" && index.definition.is_none()
+            )),
+            "a same-named PARTIAL unique index must not suppress the model's full \
+             #[unique]; got {:?}",
+            plan.changes
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "the retained partial index must not be dropped; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Fix 1 (b): a baseline **expression** unique index (empty `key_columns`)
+    /// carrying the model's conventional name must NOT suppress the model's
+    /// `#[unique]` — the full unique `AddIndex` is emitted, and the expression
+    /// index is retained (no `DropIndex`).
+    #[test]
+    fn model_diff_same_named_expression_unique_does_not_suppress() {
+        let expr = Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX idx_posts_email_unique ON posts (lower(email))".to_owned(),
+            ),
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(expr);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(desired_posts_email_unique());
+        let plan = diff_schema(&[base], &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AddIndex { index, .. }
+                    if index.name == "idx_posts_email_unique" && index.definition.is_none()
+            )),
+            "a same-named EXPRESSION unique index must not suppress the model's \
+             #[unique]; got {:?}",
+            plan.changes
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "the retained expression index must not be dropped; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Fix 1 (c) regression guard: a baseline **full plain** unique index
+    /// (`definition: None`) over exactly the model's key, sharing its name, STILL
+    /// suppresses the model `#[unique]` — a clean, empty plan (no `AddIndex`, no
+    /// `DropIndex`).
+    #[test]
+    fn model_diff_same_named_full_plain_unique_still_suppresses() {
+        let plain_index = Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(plain_index);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(desired_posts_email_unique());
+        let plan = diff_schema(&[base], &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.is_empty(),
+            "a same-named FULL plain unique index over the same key must still \
+             suppress the model #[unique]; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Fix 1 (d): a baseline **full constraint** (definition-carrying) unique index
+    /// over exactly the model's key, sharing its name, fully covers the model
+    /// `#[unique]` — so it is retained and the model index is suppressed (empty
+    /// plan). This exercises the same-NAME branch's "B fully covers → suppress D"
+    /// path.
+    #[test]
+    fn model_diff_same_named_full_constraint_unique_suppresses() {
+        let constraint = Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX idx_posts_email_unique ON posts USING btree (email)"
+                    .to_owned(),
+            ),
+            is_partial: false,
+            key_columns: vec!["email".to_owned()],
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(constraint);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(desired_posts_email_unique());
+        let plan = diff_schema(&[base], &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.is_empty(),
+            "a same-named FULL constraint unique index that fully covers the key \
+             must suppress the model #[unique] (retained, no add); got {:?}",
             plan.changes
         );
     }

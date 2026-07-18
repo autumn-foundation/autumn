@@ -1355,6 +1355,249 @@ pub struct Account {
     assert_no_secret_leak(&mdiff_out, &mdiff_err);
 }
 
+/// Fix 1 (same-name coverage): a brownfield PARTIAL unique index deliberately
+/// NAMED with the model's conventional index name (`idx_members_email_unique`)
+/// hits the same-NAME match branch in `diff_indexes`. Because it is
+/// definition-carrying it is RETAINED, but a partial index does NOT enforce
+/// table-wide uniqueness — so it must NOT suppress the model's `#[unique] email`.
+/// The model diff must still emit the full unique `AddIndex`, which the policy
+/// guard then refuses on the pre-existing `email` column — the decisive signal
+/// that the same-named partial index did NOT silently satisfy the annotation.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_diff_same_named_partial_unique_index_does_not_satisfy_model_unique() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_same_named_partial_unique_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // Brownfield `members(id, email, created_at)` with a PARTIAL unique index on
+    // `email` that carries the MODEL'S CONVENTIONAL NAME `idx_members_email_unique`
+    // (the parser emits exactly this name for `#[unique] email` on `Member`).
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_members",
+        "CREATE TABLE members (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT NOW());\n\
+         CREATE UNIQUE INDEX idx_members_email_unique ON members (email) WHERE email IS NOT NULL;",
+        "DROP TABLE members;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the partial unique index is retained verbatim and flagged partial.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("idx_members_email_unique"),
+        "the conventionally-named partial unique index is retained by name: {snap}"
+    );
+    assert!(
+        snap.contains("\"is_partial\"") && snap.contains("WHERE"),
+        "the pulled index is flagged partial and keeps its predicate: {snap}"
+    );
+
+    // The natural model declares `#[unique]` on email, whose parser emits an index
+    // named `idx_members_email_unique` — the SAME name as the retained partial
+    // index. The same-NAME branch must NOT suppress it (a partial index cannot
+    // enforce table-wide uniqueness): the diff emits the unique AddIndex, which the
+    // guard refuses on the pre-existing column.
+    write_models(
+        &project,
+        "
+#[autumn_web::model(managed)]
+pub struct Member {
+    #[id]
+    pub id: i64,
+    #[unique]
+    pub email: String,
+}
+",
+    );
+    let (mdiff_out, mdiff_err) = run_autumn_fail(&project, &["schema", "diff"], &envs);
+    let combined = format!("{mdiff_out}{mdiff_err}");
+    assert!(
+        combined.contains("cannot add unique index") && combined.contains("members"),
+        "a same-named partial unique index must NOT satisfy the model #[unique]; the diff \
+         must emit the unique AddIndex (guard-refused on the pre-existing column):\n{combined}"
+    );
+    assert_no_secret_leak(&mdiff_out, &mdiff_err);
+}
+
+/// Fix 2 (fail-closed floor for Postgres DOMAIN columns): a column typed on a
+/// domain (`CREATE DOMAIN email_dom AS text CHECK (…)`) reports its base type in
+/// `udt_name` (`text`) but names the domain in `information_schema.columns`. Pull
+/// must preserve the domain verbatim as an `Opaque` type carrying the domain name
+/// — NOT flatten it to `Text`, which would silently drop the domain's identity and
+/// validation on recreation. Re-pull is byte-stable and doctor is clean.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_preserves_domain_column_as_opaque() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_domain_opaque_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_contacts",
+        "CREATE DOMAIN email_dom AS text CHECK (VALUE LIKE '%@%');\n\
+         CREATE TABLE contacts (id BIGSERIAL PRIMARY KEY, email email_dom NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT NOW());",
+        "DROP TABLE contacts; DROP DOMAIN email_dom;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the domain column is preserved as Opaque{pg_type: "email_dom"}, not Text.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("\"name\": \"email\""),
+        "the domain column is present: {snap}"
+    );
+    assert!(
+        snap.contains("\"Opaque\"") && snap.contains("\"pg_type\": \"email_dom\""),
+        "the domain column is preserved as Opaque carrying the domain name (NOT Text): {snap}"
+    );
+
+    // Re-pull is byte-for-byte stable.
+    let snap_before = snap;
+    let (pull2_out, pull2_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull2_out, &pull2_err);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("snapshot after second pull");
+    assert_eq!(
+        snap_before, snap_after,
+        "a re-pull of the same database must be byte-for-byte stable (no domain drift)"
+    );
+
+    // doctor agrees the DB matches the pulled baseline.
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports the DB matches the snapshot with the domain column:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
+/// Fix 3 (fail-closed floor for cross-schema FK targets): a FK referencing a table
+/// outside `public` (`REFERENCES auth.accounts(id)`) must be recorded
+/// schema-qualified (`auth.accounts`) so recreation emits `REFERENCES
+/// auth.accounts(id)` — never a wrong bare `REFERENCES accounts(id)` pointing at a
+/// (nonexistent) `public.accounts`. Re-pull is byte-stable and doctor is clean.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_qualifies_cross_schema_foreign_key_target() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_cross_schema_fk_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_sessions",
+        "CREATE SCHEMA auth;\n\
+         CREATE TABLE auth.accounts (id BIGSERIAL PRIMARY KEY);\n\
+         CREATE TABLE public.sessions (id BIGSERIAL PRIMARY KEY, account_id BIGINT REFERENCES auth.accounts(id), created_at TIMESTAMP NOT NULL DEFAULT NOW());",
+        "DROP TABLE public.sessions; DROP TABLE auth.accounts; DROP SCHEMA auth;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the FK target is recorded schema-qualified as `auth.accounts`.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("\"table\": \"auth.accounts\""),
+        "the cross-schema FK target is recorded schema-qualified: {snap}"
+    );
+    assert!(
+        !snap.contains("\"table\": \"accounts\""),
+        "the FK target must NOT be recorded as a bare (wrong) `accounts`: {snap}"
+    );
+
+    // Re-pull is byte-for-byte stable.
+    let snap_before = snap;
+    let (pull2_out, pull2_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull2_out, &pull2_err);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("snapshot after second pull");
+    assert_eq!(
+        snap_before, snap_after,
+        "a re-pull of the same database must be byte-for-byte stable (no cross-schema FK drift)"
+    );
+
+    // doctor agrees the DB matches the pulled baseline.
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports the DB matches the snapshot with the cross-schema FK:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
+/// Fix 4 (preserve CHECK constraints): a real table-level `CHECK (price >= 0)`
+/// must be pulled into the snapshot's `Table.checks` — previously `checks` was
+/// always left empty, silently dropping the constraint on recreation. The column
+/// `NOT NULL` is not a check (it is `attnotnull`), so it never appears here.
+/// Re-pull is byte-stable and doctor is clean.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_preserves_check_constraints() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_check_constraint_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_products",
+        "CREATE TABLE products (id BIGSERIAL PRIMARY KEY, price INTEGER NOT NULL CHECK (price >= 0), created_at TIMESTAMP NOT NULL DEFAULT NOW());",
+        "DROP TABLE products;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the CHECK constraint is preserved in the products table's checks.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("\"name\": \"products\""),
+        "products pulled: {snap}"
+    );
+    assert!(
+        snap.contains("\"checks\"") && snap.contains("price >= 0"),
+        "the CHECK constraint predicate is preserved on pull (not dropped): {snap}"
+    );
+
+    // Re-pull is byte-for-byte stable.
+    let snap_before = snap;
+    let (pull2_out, pull2_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull2_out, &pull2_err);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("snapshot after second pull");
+    assert_eq!(
+        snap_before, snap_after,
+        "a re-pull of the same database must be byte-for-byte stable (no check drift)"
+    );
+
+    // doctor agrees the DB matches the pulled baseline.
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports the DB matches the snapshot with the CHECK constraint:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
 /// `SQLite` introspection is a future slice: `schema pull` against a `SQLite` URL
 /// is refused loudly (no Docker needed — the refusal happens before any
 /// connection), names `SQLite`, and writes no snapshot.
