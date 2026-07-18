@@ -1425,8 +1425,14 @@ pub struct DeployProbe {
 ///
 /// The probe shell keeps the existing `current`/`live-slot` detection byte-for-
 /// byte (its meaning is unchanged), then appends a delimited section running
-/// `kamal-proxy list` best-effort (`|| true`, stderr suppressed) so a missing
-/// binary, dead control socket, or unlisted service can never fail the probe.
+/// `env -u XDG_RUNTIME_DIR kamal-proxy list` best-effort (`|| true`, stderr
+/// suppressed) so a missing binary, dead control socket, or unlisted service can
+/// never fail the probe. The `env -u XDG_RUNTIME_DIR` control-socket pin mirrors
+/// `deploy_shell` (issue #1948 item 4): without it the SSH session's `pam_systemd`
+/// `XDG_RUNTIME_DIR=/run/user/0` points the CLI at a different socket than the
+/// supervised `kamal-proxy run` service (which has no `XDG_RUNTIME_DIR` → `/tmp`),
+/// so on a real pam host the list would silently come back empty — disabling both
+/// the #1938 drift reconcile and the observed-port path.
 /// The two sections are split on [`PROXY_LIST_DELIM`]; when the delimiter is
 /// absent (older recorded output / a scripted test) the whole stdout is treated
 /// as the mode section and the proxy list is empty — the reconcile then falls
@@ -1443,7 +1449,7 @@ pub fn probe_deploy_state(
         "if [ -L {current} ]; then printf 'redeploy:'; cat {marker} 2>/dev/null || printf '{blue}'; \
          else printf 'first'; fi; \
          printf '\\n{delim}\\n'; \
-         kamal-proxy list 2>/dev/null || true",
+         env -u XDG_RUNTIME_DIR kamal-proxy list 2>/dev/null || true",
         current = shell_quote(&cfg.current_symlink()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
@@ -3895,6 +3901,16 @@ mod tests {
         assert!(
             shell.contains("kamal-proxy list") && shell.contains("|| true"),
             "probe runs kamal-proxy list best-effort: {shell}"
+        );
+        // The list invocation must be control-socket-pinned exactly like
+        // `deploy_shell` (issue #1948 item 4): without `env -u XDG_RUNTIME_DIR`
+        // the SSH session's pam_systemd `XDG_RUNTIME_DIR` points the CLI at a
+        // different socket than the supervised `kamal-proxy run` service, so on a
+        // real pam host the list comes back silently empty — disabling the #1938
+        // drift reconcile and the observed-port path. Pin it to `kamal-proxy list`.
+        assert!(
+            shell.contains("env -u XDG_RUNTIME_DIR kamal-proxy list"),
+            "probe socket-pins the kamal-proxy list invocation: {shell}"
         );
         // No delimiter in the output (older/scripted) → empty list, mode unchanged.
         let legacy = RecordingExecutor::new().with_stdout("detect-current", "redeploy:green\t3002");
