@@ -44,6 +44,51 @@ pub enum Backend {
     Sqlite,
 }
 
+/// A `SQLite` **type-affinity class** — the five storage-affinity buckets `SQLite`
+/// assigns a column from its declared type (`SQLite` docs §3.1).
+///
+/// Because `SQLite` stores only the declared-type string, distinct IR
+/// [`ColumnType`]s that the emitter renders to the same declared type share an
+/// affinity class and are indistinguishable after a pull; the diff compares by this
+/// class on the `SQLite` backend (see [`ColumnType::sqlite_affinity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteAffinity {
+    /// Declared type contains `INT` (e.g. `INTEGER`, `BIGINT`).
+    Integer,
+    /// Declared type contains `CHAR`, `CLOB`, or `TEXT`.
+    Text,
+    /// Declared type contains `BLOB`, or is empty.
+    Blob,
+    /// Declared type contains `REAL`, `FLOA`, or `DOUB`.
+    Real,
+    /// Anything else (e.g. `NUMERIC`, `DECIMAL`) — the ambiguous catch-all.
+    Numeric,
+}
+
+/// Compute the `SQLite` type-affinity class of a declared-type string.
+///
+/// Follows `SQLite`'s canonical affinity-determination algorithm (docs §3.1),
+/// matched in order (case-insensitively): contains `INT` →
+/// [`Integer`](SqliteAffinity::Integer); contains `CHAR`/`CLOB`/`TEXT` →
+/// [`Text`](SqliteAffinity::Text); contains `BLOB` or empty →
+/// [`Blob`](SqliteAffinity::Blob); contains `REAL`/`FLOA`/`DOUB` →
+/// [`Real`](SqliteAffinity::Real); otherwise [`Numeric`](SqliteAffinity::Numeric).
+#[must_use]
+pub fn sqlite_affinity(declared_type: &str) -> SqliteAffinity {
+    let t = declared_type.to_ascii_uppercase();
+    if t.contains("INT") {
+        SqliteAffinity::Integer
+    } else if t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT") {
+        SqliteAffinity::Text
+    } else if t.is_empty() || t.contains("BLOB") {
+        SqliteAffinity::Blob
+    } else if t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB") {
+        SqliteAffinity::Real
+    } else {
+        SqliteAffinity::Numeric
+    }
+}
+
 /// A logical, dialect-independent column type.
 ///
 /// This is the canonical vocabulary the IR speaks in; the concrete Rust type,
@@ -241,6 +286,25 @@ impl ColumnType {
                 Self::Opaque { pg_type } => pg_type.clone(),
             },
         }
+    }
+
+    /// The `SQLite` **type-affinity class** of this column type, derived from the
+    /// declared type the emitter renders on `SQLite` ([`sql_type`](Self::sql_type)
+    /// with [`Backend::Sqlite`]) via [`sqlite_affinity`].
+    ///
+    /// Because `SQLite` stores only the declared-type STRING (and applies affinity
+    /// rules), the emitter collapses several distinct IR types onto the same
+    /// declared type — `Int32`/`Int64`/`Bool` → `INTEGER`, `Float32`/`Float64` →
+    /// `REAL`, `Text`/`Uuid`/`Timestamp`/`TimestampTz`/`Decimal`/`Attachment`/`Enum`
+    /// → `TEXT`, `Bytes` → `BLOB` — so a pulled `SQLite` snapshot cannot recover the
+    /// original variant. The diff uses THIS class (not exact [`ColumnType`]
+    /// equality) on the `SQLite` backend so a matching model↔pull round-trips clean
+    /// while a genuine class change (e.g. `INTEGER`→`TEXT`) still drifts. Deriving it
+    /// from the rendered declared type keeps it automatically consistent with
+    /// whatever the emitter produces.
+    #[must_use]
+    pub fn sqlite_affinity(&self) -> SqliteAffinity {
+        sqlite_affinity(&self.sql_type(Backend::Sqlite))
     }
 
     /// Whether this type's rendered Rust model type has a working diesel
@@ -514,6 +578,43 @@ impl IdKind {
     }
 }
 
+/// Distinguishes an owned-sequence auto-increment integer primary key from a
+/// plain, manually-assigned integer primary key of the same storage width.
+///
+/// Without this marker a `BIGINT PRIMARY KEY` (a plain, manually-assigned id) and
+/// a `BIGSERIAL` (an owned-sequence auto-increment id) both land in the IR as
+/// `Column { ty: Int64, primary_key: true, default: None }` — indistinguishable —
+/// so `schema pull` / `schema diff` could not tell a brownfield plain-int PK from
+/// a generated serial id. It is populated **symmetrically** by the model parser
+/// (for a convention `BigSerial` id) and by database introspection (only when the
+/// pulled column genuinely owns its sequence), so a model↔database diff of matching
+/// schemas stays empty while a genuine plain-`BIGINT PK` vs `BIGSERIAL` mismatch
+/// surfaces as drift. See [`Column::serial`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SerialKind {
+    /// `SERIAL` (int4) — an owned-sequence auto-increment 32-bit id. Only ever
+    /// produced by brownfield introspection (the model `#[id]` is always
+    /// `BigSerial` or `Uuid`).
+    Serial,
+    /// `BIGSERIAL` (int8) — an owned-sequence auto-increment 64-bit id, the Autumn
+    /// model `#[id]` convention. On `SQLite` this is an `INTEGER PRIMARY KEY
+    /// AUTOINCREMENT` column.
+    BigSerial,
+    /// A **plain**, manually-assigned single-column integer primary key with **no**
+    /// owned sequence — a genuine `INTEGER`/`BIGINT PRIMARY KEY` (Postgres) or a
+    /// non-`AUTOINCREMENT` `INTEGER PRIMARY KEY` (`SQLite`). Emitted **only** by
+    /// database introspection.
+    ///
+    /// It is deliberately distinct from `None`: `None` means the marker is *unknown*
+    /// — a snapshot written before this field existed (serde default) — whereas
+    /// `Plain` is an **explicit** "introspected, and it genuinely owns no sequence"
+    /// signal. The diff treats `None` on either side as compatible (never drift), so
+    /// a legacy snapshot keeps round-tripping clean; a `Plain` vs `BigSerial`
+    /// mismatch (both explicit) still surfaces as real drift. The model parser never
+    /// emits `Plain` (its `#[id]` is always `BigSerial` or `Uuid`).
+    Plain,
+}
+
 /// A foreign-key relationship carried by a [`Column`] (see [`Column::references`]).
 ///
 /// A `references` column stores an [`Int64`](ColumnType::Int64); its FK-ness is
@@ -562,6 +663,24 @@ pub struct Column {
     pub default: Option<ColumnDefault>,
     /// The foreign-key relationship, if this column is a `references` column.
     pub references: Option<ForeignKey>,
+    /// The auto-increment id-generation strategy of an owned-sequence integer
+    /// primary key, distinguishing a generated `SERIAL`/`BIGSERIAL` id from a plain
+    /// manually-assigned `INTEGER`/`BIGINT` primary key of the same storage width
+    /// (see [`SerialKind`]). `None` for every non-serial column — including a
+    /// plain-int PK with no owned sequence. Populated symmetrically by the model
+    /// parser and by database introspection so a matching model↔database diff stays
+    /// empty. Defaults to `None` and is skipped when serializing, so snapshots
+    /// written before this field existed stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<SerialKind>,
+    /// A preserved `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` clause — the
+    /// verbatim `identity_generation` (`"ALWAYS"` / `"BY DEFAULT"`) of a Postgres
+    /// identity column — so an identity column round-trips through `schema pull`
+    /// instead of flattening to a plain integer column. `None` for every
+    /// non-identity column. Defaults to `None` and is skipped when serializing, so
+    /// pre-existing snapshots stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 impl Column {
@@ -577,6 +696,8 @@ impl Column {
             unique: false,
             default: None,
             references: None,
+            serial: None,
+            identity: None,
         }
     }
 }
@@ -902,6 +1023,47 @@ mod tests {
                 expected,
                 "sqlite sql_type for {ct:?}"
             );
+        }
+    }
+
+    #[test]
+    fn sqlite_affinity_of_declared_type_follows_the_canonical_algorithm() {
+        for (decl, expected) in [
+            ("INTEGER", SqliteAffinity::Integer),
+            ("BIGINT", SqliteAffinity::Integer),
+            ("TINYINT", SqliteAffinity::Integer),
+            ("VARCHAR(255)", SqliteAffinity::Text),
+            ("CLOB", SqliteAffinity::Text),
+            ("TEXT", SqliteAffinity::Text),
+            ("", SqliteAffinity::Blob),
+            ("BLOB", SqliteAffinity::Blob),
+            ("REAL", SqliteAffinity::Real),
+            ("FLOAT", SqliteAffinity::Real),
+            ("DOUBLE PRECISION", SqliteAffinity::Real),
+            ("NUMERIC", SqliteAffinity::Numeric),
+            ("DECIMAL(10,2)", SqliteAffinity::Numeric),
+            ("BOOLEAN", SqliteAffinity::Numeric),
+        ] {
+            assert_eq!(sqlite_affinity(decl), expected, "affinity of {decl:?}");
+        }
+    }
+
+    #[test]
+    fn column_type_sqlite_affinity_class_collapses_the_emitter_groups() {
+        use SqliteAffinity::{Blob, Integer, Real, Text};
+        for (ct, expected) in [
+            (ColumnType::Int32, Integer),
+            (ColumnType::Int64, Integer),
+            (ColumnType::Bool, Integer),
+            (ColumnType::Float32, Real),
+            (ColumnType::Float64, Real),
+            (ColumnType::Text, Text),
+            (ColumnType::Uuid, Text),
+            (ColumnType::Timestamp, Text),
+            (ColumnType::TimestampTz, Text),
+            (ColumnType::Bytes, Blob),
+        ] {
+            assert_eq!(ct.sqlite_affinity(), expected, "affinity class of {ct:?}");
         }
     }
 
@@ -1259,6 +1421,8 @@ mod tests {
         let col = Column::new("name", ColumnType::Text);
         assert!(!col.nullable && !col.primary_key && !col.unique);
         assert!(col.default.is_none() && col.references.is_none());
+        // The serial / identity markers default to absent (a plain column).
+        assert!(col.serial.is_none() && col.identity.is_none());
 
         let table = Table::new("widgets", Backend::Sqlite);
         assert!(table.managed);
@@ -1267,5 +1431,39 @@ mod tests {
 
         let schema = Schema::new(Backend::Sqlite);
         assert!(schema.tables.is_empty());
+    }
+
+    #[test]
+    fn serial_and_identity_markers_are_serde_backward_compatible() {
+        // A plain column (both markers absent) serializes WITHOUT the new keys, so
+        // snapshots written before the fields existed stay byte-identical.
+        let plain = Column::new("id", ColumnType::Int64);
+        let json = serde_json::to_string(&plain).expect("serialize");
+        assert!(
+            !json.contains("serial") && !json.contains("identity"),
+            "absent markers must be omitted from the serialized form: {json}"
+        );
+
+        // A pre-existing snapshot JSON with neither key deserializes to `None`.
+        let legacy = r#"{"name":"id","ty":"Int64","nullable":false,"primary_key":true,"unique":false,"default":null,"references":null}"#;
+        let back: Column = serde_json::from_str(legacy).expect("deserialize legacy");
+        assert!(back.serial.is_none() && back.identity.is_none());
+
+        // A populated marker round-trips.
+        let mut serial_id = Column::new("id", ColumnType::Int64);
+        serial_id.primary_key = true;
+        serial_id.serial = Some(SerialKind::BigSerial);
+        let mut identity_col = Column::new("n", ColumnType::Int64);
+        identity_col.identity = Some("ALWAYS".to_owned());
+        for col in [&serial_id, &identity_col] {
+            let json = serde_json::to_string(col).expect("serialize");
+            let back: Column = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(*col, back);
+        }
+        assert!(
+            serde_json::to_string(&serial_id)
+                .unwrap()
+                .contains("BigSerial")
+        );
     }
 }

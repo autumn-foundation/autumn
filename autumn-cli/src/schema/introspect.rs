@@ -130,14 +130,16 @@
 //!   note above.)
 //! - **CHECK constraint `NO INHERIT` / `NOT VALID` suffixes**: dropped on
 //!   recreation (the predicate is preserved; the suffix is not modeled).
-//! - **`GENERATED ... AS IDENTITY` columns**: pulled as ordinary integer columns
-//!   (their identity metadata from `information_schema.columns.is_identity` is not
-//!   modeled); recreation emits a plain column / loses the identity — identity
-//!   modeling is deferred alongside owned sequences.
-//! - **PG15+ `NULLS NOT DISTINCT` unique indexes**: pulled as ordinary unique
-//!   indexes; the `NULLS NOT DISTINCT` clause is not preserved (detecting it needs
-//!   the PG15+ `pg_index.indnullsnotdistinct` catalog column, which would break
-//!   introspection on PG13/14). Deferred.
+//! - **`GENERATED ... AS IDENTITY` columns**: the identity generation clause
+//!   (`information_schema.columns.is_identity` / `identity_generation`) is now
+//!   **preserved verbatim** on [`Column::identity`] so the column round-trips a
+//!   pull rather than flattening to a plain integer column. (Emitting the identity
+//!   clause back out into recreated DDL is a later slice — the IR preserves it, the
+//!   DDL emitter does not yet re-render it.)
+//! - **PG15+ `NULLS NOT DISTINCT` unique indexes**: now **retained verbatim** via
+//!   [`Index::definition`] — detected in the `pg_get_indexdef` text (version-safe on
+//!   PG13/14, which never emit the clause) rather than via the PG15-only
+//!   `pg_index.indnullsnotdistinct` catalog column — so the clause round-trips.
 //! - **Stored/virtual `GENERATED ALWAYS AS (...) STORED` generated columns**: pulled
 //!   as ordinary columns; the generation expression
 //!   (`information_schema.columns.generation_expression`) is not modeled, so
@@ -151,7 +153,8 @@
 use std::collections::BTreeMap;
 
 use autumn_schema_core::{
-    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, ForeignKey, Index, Table,
+    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, ForeignKey, Index, SerialKind,
+    Table,
 };
 use diesel::{Connection as _, PgConnection, QueryableByName, RunQueryDsl as _, sql_query};
 
@@ -174,6 +177,14 @@ pub enum IntrospectError {
     /// A catalog query failed. The message comes from the server, not the URL.
     #[error("database introspection query failed: {0}")]
     Query(String),
+    /// The `SQLite` database file could not be opened. Carries only the parsed
+    /// file path (a `SQLite` DSN carries no credentials), never the raw URL.
+    #[cfg(feature = "sqlite")]
+    #[error("could not open the SQLite database at {path} — is the file present and readable?")]
+    ConnectionSqlite {
+        /// The resolved `SQLite` file path (`:memory:` for an in-memory target).
+        path: String,
+    },
 }
 
 /// Introspect the `public` schema of the Postgres database at `url` into a set of
@@ -275,18 +286,33 @@ struct ColumnRow {
     /// Only qualifies the emitted type when it is not `public`.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     domain_schema: Option<String>,
-    /// Whether this column **owns** the sequence backing its `nextval(...)`
-    /// default — the conventional `SERIAL`/`BIGSERIAL` shape, where Postgres links
-    /// the sequence to the column with an `OWNED BY` auto-dependency (`pg_depend`
-    /// `deptype = 'a'`). A `nextval(...)` default over a *shared*/custom sequence
-    /// that is **not** owned by the column reports `false`, so its raw default is
-    /// preserved verbatim rather than collapsed to a fresh owned `BIGSERIAL` on
+    /// Whether this column **owns the same sequence its `nextval(...)` default
+    /// allocates from** — the conventional `SERIAL`/`BIGSERIAL` shape, where the
+    /// sequence is both `OWNED BY` the column (`pg_depend` `deptype = 'a'`) AND the
+    /// sequence the column's default expression references (`pg_attrdef`
+    /// `deptype = 'n'`). A `nextval(...)` default over a *shared*/custom sequence the
+    /// column does not own — OR a column that still owns an OLD sequence but whose
+    /// default was repointed to a DIFFERENT one — reports `false`, so its raw default
+    /// is preserved verbatim rather than collapsed to a fresh owned `BIGSERIAL` on
     /// recreation (which would silently change ID-allocation behavior — see
     /// [`normalize_serial_pk_default`]). Detected via long-standing catalogs only
-    /// (`pg_depend` / `pg_class` / `pg_attribute`), so it is version-safe on every
-    /// supported Postgres (no PG15+ catalog columns).
+    /// (`pg_depend` / `pg_attrdef` / `pg_class` / `pg_attribute`), so it is
+    /// version-safe on every supported Postgres (no PG15+ catalog columns).
     #[diesel(sql_type = diesel::sql_types::Bool)]
     owns_sequence: bool,
+    /// `information_schema.columns.is_identity` (`'YES'`/`'NO'`) — whether the
+    /// column is declared `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`. An
+    /// identity column has no `column_default` (its value is minted by an internal
+    /// sequence Postgres owns), so without this flag it would pull back as an
+    /// ordinary integer column and silently lose its identity behavior. Version-safe:
+    /// `is_identity` has existed since PG10 (identity columns were introduced there).
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    is_identity: String,
+    /// `information_schema.columns.identity_generation` (`'ALWAYS'` / `'BY DEFAULT'`,
+    /// or `NULL` for a non-identity column) — preserved verbatim on
+    /// [`Column::identity`] so the identity clause round-trips through a pull.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    identity_generation: Option<String>,
 }
 
 #[derive(QueryableByName)]
@@ -474,36 +500,52 @@ fn fetch_columns(
     // the output type is guaranteed `int4` regardless of the domain. The `AS <name>`
     // aliases keep the result column names aligned with the `ColumnRow` field bindings.
     //
-    // `owns_sequence` is an `EXISTS` over `pg_depend`: a serial column OWNS its
-    // sequence through an `OWNED BY` auto-dependency — a `pg_depend` row whose
-    // `deptype = 'a'` links a sequence (`pg_class.relkind = 'S'`, as `objid`) to
-    // this exact column (`refobjid = <table oid>`, `refobjsubid = <column
-    // attnum>`, `refclassid = classid = 'pg_class'::regclass`). This is the
-    // conventional `SERIAL`/`BIGSERIAL` shape. A `nextval(...)` default over a
-    // shared/custom sequence NOT owned by the column has no such row, so
-    // `owns_sequence` is `false` and the raw default is preserved. `pg_depend`
-    // exists in every supported Postgres, so this never breaks older servers.
+    // `owns_sequence` is an `EXISTS` over `pg_depend` that is `true` only when the
+    // column OWNS the SAME sequence its `nextval(...)` default allocates from — the
+    // conventional `SERIAL`/`BIGSERIAL` shape. It ties TWO dependencies to one
+    // sequence:
+    //   * OWNED BY (`deptype = 'a'`): a `pg_depend` row linking a sequence
+    //     (`pg_class.relkind = 'S'`, as `objid`) to this exact column
+    //     (`refobjid = <table oid>`, `refobjsubid = <column attnum>`).
+    //   * used-by-default (`deptype = 'n'`): a `pg_depend` row from the column's
+    //     default expression (`pg_attrdef`, `classid = 'pg_attrdef'::regclass`) to
+    //     that SAME sequence (`refobjid = seq.oid`).
+    // Requiring BOTH on the same sequence closes the brownfield hole where a column
+    // still owns an old sequence (`t_id_seq`, `deptype = 'a'`) but its default was
+    // repointed to a different one (`DEFAULT nextval('global_ids')`): the used-by
+    // dependency then targets `global_ids`, not the owned `t_id_seq`, so `EXISTS` is
+    // `false`, the raw `nextval('global_ids')` default is preserved verbatim (never
+    // stripped to a fresh owned `BIGSERIAL`), and the column classifies as
+    // `Some(Plain)`. A plain shared/custom-sequence PK (owns nothing) likewise has no
+    // `deptype = 'a'` row → `false` → preserved. `pg_depend`/`pg_attrdef` exist in
+    // every supported Postgres, so this never breaks older servers.
     let query = format!(
         "SELECT c.table_name, c.column_name, c.udt_name, c.is_nullable, c.column_default, \
          c.numeric_precision::integer AS numeric_precision, \
          c.numeric_scale::integer AS numeric_scale, \
          c.character_maximum_length::integer AS character_maximum_length, \
          c.domain_name, c.domain_schema, \
+         c.is_identity, c.identity_generation, \
          EXISTS ( \
            SELECT 1 \
-           FROM pg_depend dep \
-           JOIN pg_class seq ON seq.oid = dep.objid AND seq.relkind = 'S' \
-           JOIN pg_class tbl ON tbl.oid = dep.refobjid \
+           FROM pg_class tbl \
            JOIN pg_namespace tn ON tn.oid = tbl.relnamespace \
            JOIN pg_attribute att \
-             ON att.attrelid = dep.refobjid AND att.attnum = dep.refobjsubid \
-           WHERE dep.classid = 'pg_class'::regclass \
-             AND dep.refclassid = 'pg_class'::regclass \
-             AND dep.deptype = 'a' \
-             AND dep.refobjsubid > 0 \
-             AND tn.nspname = 'public' \
+             ON att.attrelid = tbl.oid AND att.attname = c.column_name \
+           JOIN pg_attrdef ad ON ad.adrelid = tbl.oid AND ad.adnum = att.attnum \
+           JOIN pg_depend owned \
+             ON owned.refobjid = tbl.oid AND owned.refobjsubid = att.attnum \
+             AND owned.refclassid = 'pg_class'::regclass \
+             AND owned.classid = 'pg_class'::regclass \
+             AND owned.deptype = 'a' \
+           JOIN pg_class seq ON seq.oid = owned.objid AND seq.relkind = 'S' \
+           JOIN pg_depend usedby \
+             ON usedby.objid = ad.oid AND usedby.classid = 'pg_attrdef'::regclass \
+             AND usedby.refobjid = seq.oid AND usedby.refclassid = 'pg_class'::regclass \
+             AND usedby.deptype = 'n' \
+           WHERE tn.nspname = 'public' \
              AND tbl.relname = c.table_name \
-             AND att.attname = c.column_name \
+             AND att.attnum > 0 \
          ) AS owns_sequence \
          FROM information_schema.columns c \
          WHERE c.table_schema = 'public' AND c.table_name IN ({}) \
@@ -860,6 +902,31 @@ fn build_table(
             primary_key,
             row.owns_sequence,
         );
+        // Serial-vs-plain marker: a single-column integer PK whose `nextval(...)`
+        // default the column OWNS is a `SERIAL`/`BIGSERIAL` id (distinguished by
+        // int4 vs int8). A plain manually-assigned `INTEGER`/`BIGINT` PK (no owned
+        // sequence) leaves this `None`, so the two are no longer indistinguishable
+        // in the IR. Computed from the RAW default (before `normalize_default`
+        // strips an int8 owned-serial default to `None`).
+        column.serial = serial_kind_for(
+            row.column_default.as_deref(),
+            &ty,
+            is_pk,
+            primary_key,
+            row.owns_sequence,
+            row.is_identity.eq_ignore_ascii_case("YES"),
+        );
+        // Identity marker: preserve a `GENERATED { ALWAYS | BY DEFAULT } AS
+        // IDENTITY` column's generation clause verbatim so it round-trips a pull
+        // instead of flattening to a plain integer column. An identity column has
+        // no `column_default`, so it never collides with the serial marker.
+        if row.is_identity.eq_ignore_ascii_case("YES") {
+            column.identity = Some(
+                row.identity_generation
+                    .clone()
+                    .unwrap_or_else(|| "ALWAYS".to_owned()),
+            );
+        }
         if let Some(fk) = fk_by_column.get(row.column_name.as_str()) {
             // Fail-closed floor for cross-schema FK targets: a FK to a table
             // outside `public` (`REFERENCES auth.users(id)`) must be stored
@@ -951,7 +1018,21 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
         // way and is never diffed). A covering `INCLUDE` unique index is NOT
         // simple, so it never sets that flag (its uniqueness scope is only its
         // key columns) and is retained verbatim via its `definition`.
-        let simple = !row.is_partial && !row.has_expression && !row.has_include;
+        // A PG15+ `NULLS NOT DISTINCT` unique index enforces STRICTER uniqueness
+        // than a plain (nulls-distinct) unique index, and the model DSL cannot
+        // express it. `pg_get_indexdef` (version-safe on every supported Postgres —
+        // it never emits the clause on PG13/14) renders the `NULLS NOT DISTINCT`
+        // clause into the `definition` text; detecting it there (rather than via the
+        // PG15-only `pg_index.indnullsnotdistinct` catalog column, which would break
+        // introspection on PG13/14) forces the index to be retained VERBATIM via its
+        // `definition` so the clause round-trips, instead of collapsing to an
+        // ordinary unique index that would silently drop it.
+        let nulls_not_distinct = row
+            .definition
+            .to_ascii_uppercase()
+            .contains("NULLS NOT DISTINCT");
+        let simple =
+            !row.is_partial && !row.has_expression && !row.has_include && !nulls_not_distinct;
         if simple && row.is_unique && key_columns.len() == 1 {
             unique_columns.insert(key_columns[0].clone());
         }
@@ -1074,14 +1155,16 @@ fn normalize_default(
 /// `BIGSERIAL` id round-trips against the model parser (whose `pk_kind_for` requires
 /// `default.is_none()` for a `BigSerial` PK).
 ///
-/// **Ownership is load-bearing**: only a *conventional* serial — where Postgres
-/// links the sequence to the column via an `OWNED BY` auto-dependency
-/// (`owns_sequence == true`, sourced from `pg_depend` `deptype = 'a'`) — is the
-/// default-less `BIGSERIAL` shape. A brownfield int8 PK backed by a **shared/custom**
-/// sequence it does NOT own (`id BIGINT PRIMARY KEY DEFAULT nextval('global_ids')`)
-/// is deliberately **not** stripped: stripping it would make recreation/rollback
-/// emit a fresh owned `BIGSERIAL` (a NEW sequence) instead of continuing to allocate
-/// from `global_ids` — a silent, wrong ID-allocation change. Its raw
+/// **Ownership is load-bearing**: only a *conventional* serial — where the column
+/// owns the SAME sequence its default allocates from (`owns_sequence == true`,
+/// requiring both the `OWNED BY` `deptype = 'a'` link AND the default's `pg_attrdef`
+/// `deptype = 'n'` reference to point at one sequence) — is the default-less
+/// `BIGSERIAL` shape. A brownfield int8 PK backed by a **shared/custom** sequence it
+/// does NOT own (`id BIGINT PRIMARY KEY DEFAULT nextval('global_ids')`), OR one that
+/// still owns an old sequence but whose default was repointed to a different one, is
+/// deliberately **not** stripped: stripping it would make recreation/rollback emit a
+/// fresh owned `BIGSERIAL` (a NEW sequence) instead of continuing to allocate from
+/// the sequence the default names — a silent, wrong ID-allocation change. Its raw
 /// `nextval(...)` default is preserved verbatim instead.
 ///
 /// A single-column **`SERIAL`** (int4) PK is deliberately **not** stripped (this
@@ -1103,6 +1186,1410 @@ fn normalize_serial_pk_default(
         && matches!(ty, ColumnType::Int64)
         && lowered_default.starts_with("nextval(")
         && owns_sequence
+}
+
+/// The [`SerialKind`] marker for a column: `Some` only for a single-column integer
+/// primary key whose `nextval(...)` default the column **owns** — a conventional
+/// `SERIAL` (int4) / `BIGSERIAL` (int8). A plain manually-assigned `INTEGER` /
+/// `BIGINT` PK (no owned sequence), a non-PK serial, a composite PK, or a shared
+/// (non-owned) sequence default all return `None`, so the marker cleanly separates
+/// an owned-sequence auto-increment id from a plain integer PK of the same width.
+///
+/// This mirrors [`normalize_serial_pk_default`]'s ownership rule but distinguishes
+/// int4 vs int8 (so a brownfield `SERIAL` PK is marked `Serial` and a `BIGSERIAL`
+/// PK `BigSerial`), and is independent of the default-stripping: an int8 owned
+/// serial's `nextval(...)` default is stripped to `None` while an int4 serial keeps
+/// its default, but BOTH carry the marker.
+fn serial_kind_for(
+    raw_default: Option<&str>,
+    ty: &ColumnType,
+    is_primary_key: bool,
+    primary_key: &[String],
+    owns_sequence: bool,
+    is_identity: bool,
+) -> Option<SerialKind> {
+    // The serial-vs-plain distinction only applies to a single-column INTEGER
+    // primary key. A composite/non-PK column, a non-integer PK (e.g. a UUID id), or
+    // a `GENERATED … AS IDENTITY` column (whose id-generation is carried by the
+    // separate `identity` marker) leaves this `None` — "not applicable", which the
+    // diff treats as compatible.
+    if !is_primary_key
+        || primary_key.len() != 1
+        || is_identity
+        || !matches!(ty, ColumnType::Int32 | ColumnType::Int64)
+    {
+        return None;
+    }
+    // An owned `nextval(...)` default is a `SERIAL`/`BIGSERIAL` id (distinguished by
+    // int4 vs int8). Computed from the RAW default (before `normalize_default`
+    // strips an int8 owned-serial default to `None`).
+    if owns_sequence
+        && raw_default
+            .map(|d| d.trim().to_ascii_lowercase())
+            .is_some_and(|d| d.starts_with("nextval("))
+    {
+        return Some(match ty {
+            ColumnType::Int32 => SerialKind::Serial,
+            _ => SerialKind::BigSerial,
+        });
+    }
+    // A single-column integer PK that owns no sequence is a genuine plain,
+    // manually-assigned id. Emit an EXPLICIT `Plain` marker (never `None`, which is
+    // reserved for legacy/unknown) so a plain-int-PK ↔ serial mismatch surfaces as
+    // drift while a legacy snapshot (marker absent) stays compatible.
+    Some(SerialKind::Plain)
+}
+
+// ===========================================================================
+// SQLite introspection (`autumn schema pull` on the sqlite backend-flip)
+// ===========================================================================
+//
+// Compiled only under the `sqlite` cargo feature (the backend-flip that must never
+// be co-built with the default Postgres backend — see `autumn-cli/Cargo.toml`), so
+// the default (Postgres) build references no `SqliteConnection` here. It lifts a
+// live SQLite database into the SAME `autumn_schema_core` snapshot IR as
+// [`introspect_postgres`], reading the SQLite catalog through `sqlite_master` and
+// the table-valued `pragma_*` functions in a constant number of batched queries
+// (one per catalog, joined against `sqlite_master` — never one query per table
+// beyond what a PRAGMA inherently requires).
+//
+// # Fidelity / fail-closed posture (mirrors the Postgres arm)
+//
+// - **Type mapping is conservative**: SQLite type affinity maps to the IR
+//   [`ColumnType`] only where unambiguous — INTEGER affinity → [`Int64`], TEXT →
+//   [`Text`], REAL → [`Float64`], BLOB → [`Bytes`]. A NUMERIC-affinity (or otherwise
+//   unmapped) declared type is preserved verbatim as [`Opaque`](ColumnType::Opaque),
+//   never dropped, exactly like the Postgres arm's `Opaque` floor.
+// - **Convention recovery** keeps a model↔database round-trip clean: a single-column
+//   `INTEGER PRIMARY KEY AUTOINCREMENT` id maps to an [`Int64`] PK carrying
+//   `serial: Some(BigSerial)` (Autumn's `#[id]` convention; AUTOINCREMENT is detected
+//   from the table's `CREATE TABLE` SQL because `sqlite_sequence` is empty until the
+//   first insert), and a column defaulting to `CURRENT_TIMESTAMP` — the exact DDL
+//   Autumn emits for a `Timestamp` `#[default]` column — is recovered as a
+//   [`Timestamp`](ColumnType::Timestamp) with a [`ColumnDefault::Now`] default.
+// - **Errors are credential-safe**: a connection failure carries only the parsed
+//   file path; a query/PRAGMA failure is an [`IntrospectError::Query`] carrying only
+//   the SQLite message — never the URL, and never a partial result.
+//
+// # Deferred (recorded, not silently dropped)
+//
+// - **Table-level `CHECK` constraints**: parsing a `CHECK (...)` predicate out of the
+//   raw `CREATE TABLE` SQL text is deferred (SQLite exposes no catalog view for it,
+//   unlike Postgres `pg_get_constraintdef`); `checks` is left empty for SQLite.
+// - **`SERIAL` vs `BIGSERIAL` distinction**: SQLite has a single 64-bit rowid, so an
+//   AUTOINCREMENT id is always recorded as `BigSerial` (there is no int4 serial).
+// - **FK on-update/on-delete actions, composite FKs, expression/collation index
+//   attributes**: same deferrals as the Postgres arm.
+// - **Composite inline `UNIQUE(a, b)` constraints (#1975)**: a table-level
+//   `UNIQUE(a, b)` produces a `sqlite_autoindex_*` auto-index whose name is
+//   un-creatable (`SQLite` refuses `CREATE … "sqlite_…"`) and un-droppable, and the
+//   IR has no table-level unique-constraint node — so it is skipped entirely (a rare
+//   brownfield shape; the live constraint is untouched). A SINGLE-column inline
+//   `col TEXT UNIQUE` IS modeled (folded into `Column.unique`, rendered inline on
+//   rebuild/rollback so uniqueness is preserved). Deferred narrow edge: an
+//   authoritative diff does not surface a MANUALLY-dropped single-column inline
+//   `UNIQUE` (the fold's `Column.unique` change is not diffed — on Postgres the
+//   equivalent drift is caught via the index diff).
+// - **Generated columns' expressions**: generated columns are PRESERVED (read via
+//   `pragma_table_xinfo`, never dropped), but their `GENERATED ALWAYS AS (...)`
+//   expression is not captured — a generated column round-trips as an ordinary column
+//   of its declared type. Full verbatim re-emission is future work.
+
+/// Resolve a `sqlite:`/`sqlite://`/`file:` URL (or a bare path) to the concrete
+/// target [`diesel::SqliteConnection::establish`] expects, mirroring autumn-web's
+/// own `normalize_sqlite_target` (kept in lock-step so the pull connects to the same
+/// file `schema migrate` does). An empty or `:memory:` target stays `:memory:`.
+#[cfg(feature = "sqlite")]
+fn sqlite_target(url: &str) -> String {
+    if url.starts_with("file:") {
+        return url.to_owned();
+    }
+    let rest = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    if rest.is_empty() || rest == ":memory:" {
+        return ":memory:".to_owned();
+    }
+    rest.to_owned()
+}
+
+/// Classify a resolved `SQLite` target for the create-on-open existence guard:
+/// `Some(path)` is a concrete filesystem path that must be checked for existence
+/// (bare path or a `file:` URI with a real path); `None` is an in-memory database
+/// (nothing to check).
+///
+/// `SQLite`'s `sqlite3_open` CREATES a missing file, so a typo'd path (bare OR inside
+/// a `file:` URI) would otherwise pull zero tables and overwrite the snapshot. Only
+/// genuine in-memory targets are exempt: `:memory:`, `file::memory:` (and its
+/// shared-cache `?cache=shared` form), and any `file:` URI carrying `mode=memory`.
+/// For a `file:` URI with a real path the path is parsed out — the `file:` scheme
+/// stripped (handling `file:p`, `file:/p`, `file://host/p`, `file:///p`), the `?query`
+/// separator honored, and the path percent-decoded — then existence-checked like a
+/// bare path.
+#[cfg(feature = "sqlite")]
+fn sqlite_existence_check_path(target: &str) -> Option<String> {
+    if target.is_empty() || target == ":memory:" {
+        return None;
+    }
+    let Some(rest) = target.strip_prefix("file:") else {
+        // A bare filesystem path.
+        return Some(target.to_owned());
+    };
+    // Split off the `?query` (URI parameters like `mode=`, `cache=`).
+    let (path_part, query) = rest.split_once('?').unwrap_or((rest, ""));
+    // Strip an optional authority: `file://host/path` / `file:///path`.
+    let path_part = path_part.strip_prefix("//").map_or(path_part, |after| {
+        after.find('/').map_or(after, |idx| &after[idx..])
+    });
+    // In-memory forms are exempt (no file to check).
+    let is_memory = path_part == ":memory:"
+        || query
+            .split('&')
+            .any(|kv| kv.trim().eq_ignore_ascii_case("mode=memory"));
+    if is_memory {
+        return None;
+    }
+    let decoded = percent_encoding::percent_decode_str(path_part)
+        .decode_utf8_lossy()
+        .into_owned();
+    Some(decoded)
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod target_tests {
+    use super::sqlite_existence_check_path;
+
+    #[test]
+    fn existence_check_path_parses_files_and_exempts_memory() {
+        // In-memory targets: no file to check.
+        for mem in [
+            ":memory:",
+            "",
+            "file::memory:",
+            "file::memory:?cache=shared",
+            "file:app.db?mode=memory",
+            "file:app.db?cache=shared&mode=memory",
+        ] {
+            assert_eq!(
+                sqlite_existence_check_path(mem),
+                None,
+                "{mem} is in-memory (exempt)"
+            );
+        }
+        // Bare filesystem path.
+        assert_eq!(
+            sqlite_existence_check_path("/srv/app.db"),
+            Some("/srv/app.db".to_owned())
+        );
+        // `file:` URI forms → the real path is parsed out (scheme/authority/query
+        // stripped, percent-decoded).
+        assert_eq!(
+            sqlite_existence_check_path("file:/srv/app.db"),
+            Some("/srv/app.db".to_owned())
+        );
+        assert_eq!(
+            sqlite_existence_check_path("file:///srv/app.db"),
+            Some("/srv/app.db".to_owned())
+        );
+        assert_eq!(
+            sqlite_existence_check_path("file://localhost/srv/app.db"),
+            Some("/srv/app.db".to_owned())
+        );
+        assert_eq!(
+            sqlite_existence_check_path("file:app.db?mode=ro"),
+            Some("app.db".to_owned())
+        );
+        assert_eq!(
+            sqlite_existence_check_path("file:/srv/my%20app.db"),
+            Some("/srv/my app.db".to_owned()),
+            "percent-decoded"
+        );
+    }
+}
+
+/// Introspect a live `SQLite` database at `url` into a set of [`Table`]s tagged
+/// [`Backend::Sqlite`] and marked `managed` — the `SQLite` counterpart of
+/// [`introspect_postgres`], producing the identical snapshot IR so a pulled snapshot
+/// and the model-derived snapshot are diffable by the same engine.
+///
+/// Framework-owned tables (`is_framework_table`), `SQLite` internal tables
+/// (`sqlite_*`), and the Diesel migrations table are excluded, mirroring the
+/// Postgres arm's unscoped-pull rule.
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::ConnectionSqlite`] if the database file cannot be
+/// opened, or [`IntrospectError::Query`] if a catalog query/PRAGMA fails. Neither
+/// leaks the database URL.
+#[cfg(feature = "sqlite")]
+pub fn introspect_sqlite(url: &str) -> Result<Vec<Table>, IntrospectError> {
+    use diesel::{Connection as _, SqliteConnection};
+
+    let target = sqlite_target(url);
+    // Guard against SQLite's create-if-missing behavior: `establish` on a nonexistent
+    // file SUCCEEDS against a brand-new EMPTY database, so a typo'd or missing DB path
+    // would otherwise pull ZERO tables and (on a non-dry-run pull) silently overwrite
+    // the checked-in snapshot with an empty one. Require a concrete file-backed target
+    // (bare path OR a `file:` URI with a real path) to already exist; genuine
+    // in-memory targets have no file to check and are exempt.
+    if let Some(path) = sqlite_existence_check_path(&target)
+        && !std::path::Path::new(&path).exists()
+    {
+        return Err(IntrospectError::ConnectionSqlite { path });
+    }
+    let mut conn = SqliteConnection::establish(&target)
+        .map_err(|_| IntrospectError::ConnectionSqlite { path: target })?;
+    sqlite::introspect(&mut conn)
+}
+
+/// `SQLite` catalog probes + IR assembly. All row DTOs and helpers live here so the
+/// default (Postgres) build never compiles a `SqliteConnection` reference.
+#[cfg(feature = "sqlite")]
+mod sqlite {
+    use std::collections::BTreeMap;
+
+    use autumn_schema_core::{
+        Backend, Column, ColumnDefault, ColumnType, ForeignKey, Index, SerialKind, Table,
+    };
+    use diesel::sql_types::{Integer, Nullable, Text};
+    use diesel::{QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query};
+
+    use super::IntrospectError;
+
+    /// `(table_name, index_name)` identity for grouping index columns.
+    type IndexKey = (String, String);
+
+    #[derive(QueryableByName)]
+    struct TableRow {
+        #[diesel(sql_type = Text)]
+        name: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        sql: Option<String>,
+    }
+
+    #[derive(QueryableByName)]
+    struct ColumnRow {
+        #[diesel(sql_type = Text)]
+        table_name: String,
+        #[diesel(sql_type = Text)]
+        column_name: String,
+        /// The declared type verbatim (`INTEGER`, `TEXT`, `REAL`, `BLOB`, …); may be
+        /// the empty string for a typeless `SQLite` column.
+        #[diesel(sql_type = Text)]
+        decl_type: String,
+        /// `PRAGMA table_info.notnull` (`0`/`1`).
+        #[diesel(sql_type = Integer)]
+        not_null: i32,
+        /// `PRAGMA table_info.dflt_value` (raw default text, `NULL` for none).
+        #[diesel(sql_type = Nullable<Text>)]
+        dflt_value: Option<String>,
+        /// `PRAGMA table_info.pk` — `0` for a non-key column, else the 1-based key
+        /// position.
+        #[diesel(sql_type = Integer)]
+        pk: i32,
+        /// `PRAGMA table_xinfo.hidden` — `0` = ordinary column, `1` = hidden column
+        /// (virtual-table / `WITHOUT ROWID` internal — not a user column), `2` =
+        /// `VIRTUAL` generated column, `3` = `STORED` generated column. Read via
+        /// `table_xinfo` (NOT `table_info`, which OMITS generated columns entirely and
+        /// would silently drop them from the pull).
+        #[diesel(sql_type = Integer)]
+        hidden: i32,
+    }
+
+    #[derive(QueryableByName)]
+    struct IndexRow {
+        #[diesel(sql_type = Text)]
+        table_name: String,
+        #[diesel(sql_type = Text)]
+        index_name: String,
+        /// `PRAGMA index_list.unique` (`0`/`1`).
+        #[diesel(sql_type = Integer)]
+        is_unique: i32,
+        /// `PRAGMA index_list.origin` — `'c'` explicit CREATE INDEX, `'u'` UNIQUE
+        /// constraint, `'pk'` primary key.
+        #[diesel(sql_type = Text)]
+        origin: String,
+        /// `PRAGMA index_list.partial` (`0`/`1`).
+        #[diesel(sql_type = Integer)]
+        partial: i32,
+        /// The verbatim `CREATE [UNIQUE] INDEX …` statement from `sqlite_master`
+        /// (`NULL` for a constraint/PK auto-index, which has no standalone SQL).
+        #[diesel(sql_type = Nullable<Text>)]
+        index_sql: Option<String>,
+    }
+
+    #[derive(QueryableByName)]
+    struct IndexColumnRow {
+        #[diesel(sql_type = Text)]
+        table_name: String,
+        #[diesel(sql_type = Text)]
+        index_name: String,
+        #[diesel(sql_type = Integer)]
+        seqno: i32,
+        /// The indexed column name, or `NULL` for an expression key.
+        #[diesel(sql_type = Nullable<Text>)]
+        column_name: Option<String>,
+    }
+
+    #[derive(QueryableByName)]
+    struct ForeignKeyRow {
+        #[diesel(sql_type = Text)]
+        table_name: String,
+        #[diesel(sql_type = Text)]
+        foreign_table: String,
+        #[diesel(sql_type = Text)]
+        column_name: String,
+        /// The referenced column; `NULL` when the FK targets the referenced table's
+        /// PK implicitly (`REFERENCES parent` with no column) — then resolved to the
+        /// parent's actual single-column PK, or the FK is omitted if the parent has a
+        /// composite / no single-column PK.
+        #[diesel(sql_type = Nullable<Text>)]
+        foreign_column: Option<String>,
+    }
+
+    fn query_err(e: &diesel::result::Error) -> IntrospectError {
+        IntrospectError::Query(e.to_string())
+    }
+
+    /// Introspect every app table of an open `SQLite` connection into the IR. Keeps
+    /// the private row DTOs entirely inside this module (the outer `introspect_sqlite`
+    /// only opens the connection), so the default Postgres build compiles no `SQLite`
+    /// type into a public signature.
+    pub(super) fn introspect(conn: &mut SqliteConnection) -> Result<Vec<Table>, IntrospectError> {
+        let tables = list_tables(conn)?;
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        let columns_by_table = fetch_columns(conn)?;
+        let indexes_by_table = fetch_indexes(conn)?;
+        let index_columns = fetch_index_columns(conn)?;
+        let fks_by_table = fetch_foreign_keys(conn)?;
+        // Each table's single-column primary key (absent for composite / PK-less
+        // tables), used to resolve an implicit `REFERENCES parent` FK target.
+        let single_col_pks = single_column_pks(&columns_by_table);
+
+        let mut out = Vec::with_capacity(tables.len());
+        for (name, table_sql) in &tables {
+            out.push(build_table(
+                name,
+                table_sql.as_deref().unwrap_or_default(),
+                columns_by_table.get(name).map_or(&[][..], Vec::as_slice),
+                indexes_by_table.get(name).map_or(&[][..], Vec::as_slice),
+                &index_columns,
+                fks_by_table.get(name).map_or(&[][..], Vec::as_slice),
+                &single_col_pks,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Map each table to its SINGLE-column primary-key column name, if it has exactly
+    /// one. Composite-PK (or PK-less) tables are deliberately ABSENT — an implicit
+    /// `REFERENCES parent` FK (`SQLite` reports `.to = NULL`) to such a parent has no
+    /// unambiguous target column and is omitted rather than guessed.
+    fn single_column_pks(
+        columns_by_table: &BTreeMap<String, Vec<ColumnRow>>,
+    ) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for (table, cols) in columns_by_table {
+            let mut pk_cols = cols.iter().filter(|c| c.pk > 0);
+            if let (Some(first), None) = (pk_cols.next(), pk_cols.next()) {
+                out.insert(table.clone(), first.column_name.clone());
+            }
+        }
+        out
+    }
+
+    /// List app tables (name + `CREATE TABLE` SQL), excluding `SQLite` internal
+    /// tables, the Diesel migrations table, framework-owned tables, and **FTS5
+    /// search-index tables** — the `CREATE VIRTUAL TABLE "<table>__fts" USING fts5(…)`
+    /// index a `--searchable` model generates (issue #1910) plus its internal shadow
+    /// tables (`<vtab>_data`/`_idx`/`_content`/`_docsize`/`_config`). Those are stored
+    /// in `sqlite_master` as `type = 'table'` with non-`sqlite_` names, but the model
+    /// parser never emits them, so pulling them as managed application tables would
+    /// make a follow-up `schema diff`/doctor report/drop the search-index state.
+    fn list_tables(
+        conn: &mut SqliteConnection,
+    ) -> Result<Vec<(String, Option<String>)>, IntrospectError> {
+        let rows: Vec<TableRow> = sql_query(
+            "SELECT name AS name, sql AS sql FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .load(conn)
+        .map_err(|e| query_err(&e))?;
+        // Virtual tables (their `sql` starts with `CREATE VIRTUAL TABLE`) are never
+        // model-expressible; collect them so their FTS5 shadow tables can be
+        // excluded alongside the vtab itself.
+        let virtual_tables: Vec<String> = rows
+            .iter()
+            .filter(|r| r.sql.as_deref().is_some_and(is_create_virtual_table))
+            .map(|r| r.name.clone())
+            .collect();
+        Ok(rows
+            .into_iter()
+            .filter(|r| {
+                !super::is_framework_table(&r.name)
+                    && !is_virtual_or_fts5_shadow_table(&r.name, &virtual_tables)
+            })
+            .map(|r| (r.name, r.sql))
+            .collect())
+    }
+
+    /// Whether `sql` is a `CREATE VIRTUAL TABLE …` statement (an FTS5 search index or
+    /// any other module-backed vtab) — none of which the model parser can express.
+    fn is_create_virtual_table(sql: &str) -> bool {
+        sql.trim_start()
+            .to_ascii_uppercase()
+            .starts_with("CREATE VIRTUAL TABLE")
+    }
+
+    /// The FTS5 internal shadow-table suffixes appended to the virtual-table name.
+    const FTS5_SHADOW_SUFFIXES: [&str; 5] = ["_data", "_idx", "_content", "_docsize", "_config"];
+
+    /// Whether `name` is one of the `virtual_tables` itself or one of its FTS5 shadow
+    /// tables (`<vtab>` + a [`FTS5_SHADOW_SUFFIXES`] suffix).
+    fn is_virtual_or_fts5_shadow_table(name: &str, virtual_tables: &[String]) -> bool {
+        virtual_tables.iter().any(|vtab| {
+            name == vtab
+                || FTS5_SHADOW_SUFFIXES
+                    .iter()
+                    .any(|suffix| name == format!("{vtab}{suffix}"))
+        })
+    }
+
+    /// Fetch every column of every table in one batched `pragma_table_xinfo` join.
+    ///
+    /// Uses `table_xinfo` (not `table_info`) BECAUSE the latter OMITS generated
+    /// columns, so a pull would silently drop them and a recreate would omit the
+    /// column (a fail-closed violation). `table_xinfo` includes them with a `hidden`
+    /// discriminator so [`build_table`] can preserve generated columns instead of
+    /// dropping them.
+    fn fetch_columns(
+        conn: &mut SqliteConnection,
+    ) -> Result<BTreeMap<String, Vec<ColumnRow>>, IntrospectError> {
+        let rows: Vec<ColumnRow> = sql_query(
+            "SELECT m.name AS table_name, ti.name AS column_name, ti.type AS decl_type, \
+             ti.\"notnull\" AS not_null, ti.dflt_value AS dflt_value, ti.pk AS pk, \
+             ti.hidden AS hidden \
+             FROM sqlite_master m JOIN pragma_table_xinfo(m.name) ti \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             ORDER BY m.name, ti.cid",
+        )
+        .load(conn)
+        .map_err(|e| query_err(&e))?;
+        Ok(group_by(rows, |r| r.table_name.clone()))
+    }
+
+    /// Fetch every non-PK index of every table in one batched `pragma_index_list`
+    /// join, carrying each index's standalone `CREATE INDEX` SQL when it has one.
+    fn fetch_indexes(
+        conn: &mut SqliteConnection,
+    ) -> Result<BTreeMap<String, Vec<IndexRow>>, IntrospectError> {
+        let rows: Vec<IndexRow> = sql_query(
+            "SELECT m.name AS table_name, il.name AS index_name, il.\"unique\" AS is_unique, \
+             il.origin AS origin, il.partial AS partial, idx.sql AS index_sql \
+             FROM sqlite_master m JOIN pragma_index_list(m.name) il \
+             LEFT JOIN sqlite_master idx ON idx.type = 'index' AND idx.name = il.name \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             ORDER BY m.name, il.name",
+        )
+        .load(conn)
+        .map_err(|e| query_err(&e))?;
+        Ok(group_by(rows, |r| r.table_name.clone()))
+    }
+
+    /// Fetch the columns of every index in one batched `pragma_index_info` join,
+    /// grouped by `(table, index)` in key order.
+    fn fetch_index_columns(
+        conn: &mut SqliteConnection,
+    ) -> Result<BTreeMap<IndexKey, Vec<IndexColumnRow>>, IntrospectError> {
+        let mut rows: Vec<IndexColumnRow> = sql_query(
+            "SELECT m.name AS table_name, il.name AS index_name, ii.seqno AS seqno, \
+             ii.name AS column_name \
+             FROM sqlite_master m JOIN pragma_index_list(m.name) il \
+             JOIN pragma_index_info(il.name) ii \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             ORDER BY m.name, il.name, ii.seqno",
+        )
+        .load(conn)
+        .map_err(|e| query_err(&e))?;
+        rows.sort_by_key(|r| r.seqno);
+        let mut by_index: BTreeMap<IndexKey, Vec<IndexColumnRow>> = BTreeMap::new();
+        for row in rows {
+            by_index
+                .entry((row.table_name.clone(), row.index_name.clone()))
+                .or_default()
+                .push(row);
+        }
+        Ok(by_index)
+    }
+
+    /// Fetch **single-column** foreign keys of every table in one batched
+    /// `pragma_foreign_key_list` join.
+    ///
+    /// `pragma_foreign_key_list` returns one row PER referencing column, grouped by
+    /// the `id` column and ordered by `seq`; a composite (multi-column) FK spans
+    /// several rows sharing the same `id`. The IR [`ForeignKey`] is single-column
+    /// only, and the model parser never emits a composite FK, so — matching the
+    /// fail-closed posture of the Postgres arm (which defers composite FKs) — a
+    /// composite FK is **omitted entirely** here rather than flattened to a wrong
+    /// single-column FK (which would cause spurious drift / an incorrect recreate).
+    /// The `fkl.id NOT IN (… seq > 0 …)` predicate drops every `id` group that has
+    /// any `seq > 0` row, keeping only genuinely single-column FKs (the surviving
+    /// `seq = 0` rows).
+    fn fetch_foreign_keys(
+        conn: &mut SqliteConnection,
+    ) -> Result<BTreeMap<String, Vec<ForeignKeyRow>>, IntrospectError> {
+        let rows: Vec<ForeignKeyRow> = sql_query(
+            "SELECT m.name AS table_name, fkl.\"table\" AS foreign_table, \
+             fkl.\"from\" AS column_name, fkl.\"to\" AS foreign_column \
+             FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) fkl \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND fkl.seq = 0 \
+             AND fkl.id NOT IN ( \
+               SELECT fkl2.id FROM pragma_foreign_key_list(m.name) fkl2 WHERE fkl2.seq > 0)",
+        )
+        .load(conn)
+        .map_err(|e| query_err(&e))?;
+        Ok(group_by(rows, |r| r.table_name.clone()))
+    }
+
+    /// Group a flat row list into a per-table map, preserving row order within each
+    /// table (input already ordered by table then position).
+    fn group_by<T>(rows: Vec<T>, key: impl Fn(&T) -> String) -> BTreeMap<String, Vec<T>> {
+        let mut out: BTreeMap<String, Vec<T>> = BTreeMap::new();
+        for row in rows {
+            out.entry(key(&row)).or_default().push(row);
+        }
+        out
+    }
+
+    /// The `SQLite` type affinity of a declared type, per the `SQLite` type-affinity
+    /// determination rules (`SQLite` docs §3.1).
+    #[derive(PartialEq, Eq)]
+    enum Affinity {
+        Integer,
+        Text,
+        Blob,
+        Real,
+        Numeric,
+    }
+
+    fn affinity(decl_type: &str) -> Affinity {
+        let t = decl_type.to_ascii_uppercase();
+        if t.contains("INT") {
+            Affinity::Integer
+        } else if t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT") {
+            Affinity::Text
+        } else if t.is_empty() || t.contains("BLOB") {
+            Affinity::Blob
+        } else if t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB") {
+            Affinity::Real
+        } else {
+            Affinity::Numeric
+        }
+    }
+
+    /// Normalize a raw `SQLite` `dflt_value` into a [`ColumnDefault`]. Recovers the
+    /// Autumn `Timestamp` convention default (`CURRENT_TIMESTAMP` → [`Now`]) and
+    /// preserves anything else verbatim.
+    ///
+    /// `pragma_table_info.dflt_value` reports the literal keyword `NULL` (bareword,
+    /// any case) for a `DEFAULT NULL` clause — which is semantically "no default",
+    /// the same as a column with no `DEFAULT` at all. Capturing it as a real
+    /// `Sql("NULL")` default would create spurious drift against a model column that
+    /// simply has no default, so a bareword `NULL` maps to `None`. A **quoted**
+    /// `'NULL'` (the 4-character text value) is a genuine string default and is
+    /// preserved verbatim — only the unquoted keyword means "no default".
+    fn sqlite_default(raw: Option<&str>) -> Option<ColumnDefault> {
+        let raw = raw?.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("NULL") {
+            return None;
+        }
+        if raw.eq_ignore_ascii_case("CURRENT_TIMESTAMP") {
+            return Some(ColumnDefault::Now);
+        }
+        Some(ColumnDefault::Sql(raw.to_owned()))
+    }
+
+    /// Map a `SQLite` declared type + resolved default to an IR [`ColumnType`],
+    /// conservatively (fail-closed to [`Opaque`](ColumnType::Opaque) for a
+    /// non-cleanly-mappable NUMERIC-affinity type). A `CURRENT_TIMESTAMP` default
+    /// recovers the Autumn `Timestamp` convention (a `Timestamp` column is stored as
+    /// `TEXT DEFAULT CURRENT_TIMESTAMP`), keeping a model round-trip clean.
+    fn sqlite_column_type(decl_type: &str, default: Option<&ColumnDefault>) -> ColumnType {
+        if matches!(default, Some(ColumnDefault::Now)) {
+            return ColumnType::Timestamp;
+        }
+        match affinity(decl_type) {
+            Affinity::Integer => ColumnType::Int64,
+            Affinity::Text => ColumnType::Text,
+            Affinity::Real => ColumnType::Float64,
+            Affinity::Blob => ColumnType::Bytes,
+            // Fail-closed: a NUMERIC-affinity (or otherwise unmapped) declared type is
+            // preserved verbatim rather than guessed, matching the Postgres arm's
+            // `Opaque` floor. An empty declared type is BLOB affinity above, so this
+            // never produces an empty `pg_type`.
+            Affinity::Numeric => ColumnType::Opaque {
+                pg_type: decl_type.to_owned(),
+            },
+        }
+    }
+
+    /// Whether the table's `CREATE TABLE` SQL declares an `AUTOINCREMENT` primary key.
+    ///
+    /// Detects the `AUTOINCREMENT` **keyword** as a word-bounded token, AFTER
+    /// neutralizing string literals (`'…'`) and quoted identifiers (`"…"`, `` `…` ``,
+    /// `[…]`), so neither a NAME containing the substring (`autoincrement_events`) nor
+    /// a string literal (`DEFAULT 'AUTOINCREMENT'`) nor a quoted identifier
+    /// (`"AUTOINCREMENT"`) is ever mistaken for the keyword. `SQLite`'s grammar only
+    /// permits the `AUTOINCREMENT` keyword inside an `INTEGER PRIMARY KEY
+    /// AUTOINCREMENT` column definition, so a genuine word-bounded keyword occurrence
+    /// unambiguously marks the table as auto-incrementing.
+    fn table_sql_has_autoincrement_keyword(table_sql: &str) -> bool {
+        const KW: &str = "AUTOINCREMENT";
+        let stripped = neutralize_sqlite_literals_and_quoted_idents(table_sql).to_ascii_uppercase();
+        let bytes = stripped.as_bytes();
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut from = 0;
+        while let Some(rel) = stripped[from..].find(KW) {
+            let start = from + rel;
+            let end = start + KW.len();
+            let before_ok = start == 0 || !is_word(bytes[start - 1]);
+            let after_ok = end == bytes.len() || !is_word(bytes[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    }
+
+    /// Replace the CONTENTS (and delimiters) of `SQLite` string literals (`'…'`),
+    /// quoted identifiers (`"…"`, `` `…` ``, `[…]`), AND SQL comments (`-- …` to
+    /// end-of-line, `/* … */` block — `SQLite` preserves comments in
+    /// `sqlite_master.sql`) with spaces, preserving all other text positionally, so a
+    /// keyword scan never matches inside a name, literal, or comment. Doubled-delimiter
+    /// escapes (`''`, `""`, ``` `` ```) keep the quote open; block comments do not
+    /// nest (matching `SQLite`). Pure.
+    fn neutralize_sqlite_literals_and_quoted_idents(sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len());
+        let mut chars = sql.chars().peekable();
+        while let Some(c) = chars.next() {
+            // `-- …` line comment → blank to end of line (the newline is preserved).
+            if c == '-' && chars.peek() == Some(&'-') {
+                out.push(' ');
+                while let Some(&n) = chars.peek() {
+                    if n == '\n' {
+                        break;
+                    }
+                    chars.next();
+                    out.push(' ');
+                }
+                continue;
+            }
+            // `/* … */` block comment (non-nesting) → blank through the closing `*/`.
+            if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                out.push(' ');
+                out.push(' ');
+                let mut prev_star = false;
+                for n in chars.by_ref() {
+                    out.push(' ');
+                    if prev_star && n == '/' {
+                        break;
+                    }
+                    prev_star = n == '*';
+                }
+                continue;
+            }
+            let close = match c {
+                '\'' => Some('\''),
+                '"' => Some('"'),
+                '`' => Some('`'),
+                '[' => Some(']'),
+                _ => None,
+            };
+            let Some(close) = close else {
+                out.push(c);
+                continue;
+            };
+            out.push(' '); // opening delimiter
+            while let Some(n) = chars.next() {
+                if n == close {
+                    // A doubled delimiter is an escape (not for the `[…]` form) — stay
+                    // inside the quote.
+                    if close != ']' && chars.peek() == Some(&close) {
+                        chars.next();
+                        out.push(' ');
+                        out.push(' ');
+                        continue;
+                    }
+                    break;
+                }
+                out.push(' ');
+            }
+            out.push(' '); // closing delimiter
+        }
+        out
+    }
+
+    /// Assemble one [`Table`] from its pre-fetched `SQLite` catalog rows. Pure.
+    fn build_table(
+        name: &str,
+        table_sql: &str,
+        columns: &[ColumnRow],
+        indexes: &[IndexRow],
+        index_columns: &BTreeMap<IndexKey, Vec<IndexColumnRow>>,
+        foreign_keys: &[ForeignKeyRow],
+        single_col_pks: &BTreeMap<String, String>,
+    ) -> Table {
+        let mut table = Table::new(name, Backend::Sqlite);
+        table.managed = true;
+
+        // Primary key, in key order (`pk` is the 1-based key position).
+        let mut pk_cols: Vec<(i32, String)> = columns
+            .iter()
+            .filter(|c| c.pk > 0)
+            .map(|c| (c.pk, c.column_name.clone()))
+            .collect();
+        pk_cols.sort_by_key(|(ord, _)| *ord);
+        table.primary_key = pk_cols.into_iter().map(|(_, n)| n).collect();
+        let single_pk = table.primary_key.len() == 1;
+        // AUTOINCREMENT lives in the table's CREATE SQL (sqlite_sequence is empty
+        // until the first insert, so it cannot be relied on). Matched as a KEYWORD
+        // token, not a substring, so a table/column name or literal containing the
+        // substring never misclassifies a plain rowid PK as a serial.
+        let autoincrement = table_sql_has_autoincrement_keyword(table_sql);
+
+        let (ir_indexes, unique_columns) = collapse_indexes(name, indexes, index_columns);
+        let fk_by_column: BTreeMap<&str, &ForeignKeyRow> = foreign_keys
+            .iter()
+            .map(|fk| (fk.column_name.as_str(), fk))
+            .collect();
+
+        for row in columns {
+            // `hidden = 1` is an internal hidden column (virtual-table / rowid
+            // machinery), never a user column — skip it. `hidden = 2` (VIRTUAL) / `3`
+            // (STORED) are GENERATED columns: they are included (via `table_xinfo`) so
+            // they are NEVER silently dropped from the pull. NOTE (DEFERRED): the
+            // generation EXPRESSION is not captured here, so a generated column
+            // round-trips as an ordinary column of its declared type — enough to keep
+            // it in the snapshot (doctor/dry-run see it, a recreate no longer omits
+            // it), but full generated-column fidelity (verbatim `GENERATED ALWAYS AS
+            // (...)` re-emission) is future work.
+            if row.hidden == 1 {
+                continue;
+            }
+            let is_pk = row.pk > 0;
+            let default = sqlite_default(row.dflt_value.as_deref());
+            let ty = sqlite_column_type(&row.decl_type, default.as_ref());
+            let mut column = Column::new(row.column_name.clone(), ty);
+            // A SQLite PRIMARY KEY column reports notnull=0 for an INTEGER rowid PK,
+            // but is effectively NOT NULL; the model always has non-null PKs, so force
+            // a PK column non-null for a clean round-trip.
+            column.nullable = row.not_null == 0 && !is_pk;
+            column.primary_key = is_pk;
+            column.unique = unique_columns.contains(row.column_name.as_str());
+            column.default = default;
+            // Serial marker (three-state): a single-column INTEGER PK of an
+            // AUTOINCREMENT table is the Autumn `BigSerial` id (SQLite has one 64-bit
+            // rowid — always BigSerial), symmetric with what the model parser
+            // records. A single-column INTEGER PK WITHOUT `AUTOINCREMENT` is a
+            // genuine plain, manually-assigned id → an EXPLICIT `Plain` marker (never
+            // `None`, which is reserved for legacy/unknown snapshots) so a
+            // plain-int-PK ↔ `BigSerial`-model mismatch surfaces as drift while a
+            // legacy snapshot stays compatible.
+            if is_pk && single_pk && matches!(affinity(&row.decl_type), Affinity::Integer) {
+                column.serial = Some(if autoincrement {
+                    SerialKind::BigSerial
+                } else {
+                    SerialKind::Plain
+                });
+            }
+            if let Some(fk) = fk_by_column.get(row.column_name.as_str()) {
+                // An implicit `REFERENCES parent` (SQLite reports `to = NULL`) targets
+                // the parent's PRIMARY KEY — resolve the parent's actual single-column
+                // PK rather than guessing `id`. A parent with a composite (or no)
+                // single-column PK is unresolvable, so the FK is OMITTED (fail-closed)
+                // rather than recorded with a wrong target that would re-emit wrong on
+                // rebuild/rollback and never drift.
+                let foreign_column = fk.foreign_column.clone().or_else(|| {
+                    // Implicit target → the parent's actual single-column PK.
+                    single_col_pks.get(&fk.foreign_table).cloned()
+                });
+                if let Some(foreign_column) = foreign_column {
+                    column.references =
+                        Some(ForeignKey::new(fk.foreign_table.clone(), foreign_column));
+                }
+            }
+            table.columns.push(column);
+        }
+
+        table.indexes = ir_indexes;
+        // Table-level CHECK extraction from the raw CREATE TABLE SQL is deferred (see
+        // the module note), so `checks` is left empty for SQLite.
+        table
+    }
+
+    /// Map `SQLite` index rows into IR [`Index`]es plus the set of columns covered by a
+    /// single-column simple unique index (mirroring the Postgres arm's
+    /// `collapse_indexes`). A partial or expression index is retained verbatim via its
+    /// `CREATE INDEX` SQL; a plain index is representable by its columns. The primary
+    /// key auto-index (`origin = 'pk'`) is skipped (the PK is modeled separately).
+    ///
+    /// A `UNIQUE`-constraint auto-index (`origin = 'u'`, named
+    /// `sqlite_autoindex_<table>_<n>`) is **never** recorded as an [`Index`] — its
+    /// `sqlite_*` name is un-creatable (`SQLite` refuses to `CREATE` a
+    /// `sqlite_`-prefixed object) and un-droppable, so re-emitting it by name on a
+    /// rebuild / `DropTable` rollback would produce illegal DDL. Instead a
+    /// **single-column** inline `col TEXT UNIQUE` is folded into the column's
+    /// `unique = true` flag: a matching `#[unique]` model is recognized as already
+    /// satisfied ([`baseline_unique_index_covers`], no `AddIndex` / no guard refusal),
+    /// and the emitter renders it as inline `UNIQUE` on a rebuild/rollback
+    /// ([`render_create_table_body`]) so uniqueness is preserved. A **composite**
+    /// table-level `UNIQUE(a, b)` has no single-column flag and no recreatable IR form,
+    /// so it is skipped entirely (DEFERRED, #1975 — a rare brownfield shape; the live
+    /// constraint is untouched).
+    fn collapse_indexes(
+        table_name: &str,
+        rows: &[IndexRow],
+        index_columns: &BTreeMap<IndexKey, Vec<IndexColumnRow>>,
+    ) -> (Vec<Index>, std::collections::BTreeSet<String>) {
+        let mut indexes = Vec::new();
+        let mut unique_columns = std::collections::BTreeSet::new();
+        for row in rows {
+            if row.origin == "pk" {
+                continue;
+            }
+            // A UNIQUE-constraint auto-index (`origin = 'u'`) is NEVER an Index; a
+            // single-column one folds into the column's `unique` flag, a composite one
+            // is skipped (see the fn note).
+            if row.origin == "u" {
+                let cols = index_columns
+                    .get(&(table_name.to_owned(), row.index_name.clone()))
+                    .map_or(&[][..], Vec::as_slice);
+                let key_columns: Vec<String> =
+                    cols.iter().filter_map(|c| c.column_name.clone()).collect();
+                if row.is_unique != 0 && key_columns.len() == 1 {
+                    unique_columns.insert(key_columns[0].clone());
+                }
+                continue;
+            }
+            let cols = index_columns
+                .get(&(table_name.to_owned(), row.index_name.clone()))
+                .map_or(&[][..], Vec::as_slice);
+            let has_expression = cols.iter().any(|c| c.column_name.is_none());
+            let key_columns: Vec<String> =
+                cols.iter().filter_map(|c| c.column_name.clone()).collect();
+            let is_unique = row.is_unique != 0;
+            let is_partial = row.partial != 0;
+
+            let simple = !is_partial && !has_expression;
+            if simple && is_unique && key_columns.len() == 1 {
+                unique_columns.insert(key_columns[0].clone());
+            }
+            // A partial or expression index is retained verbatim via its CREATE INDEX
+            // SQL (when present); a plain index is representable by its columns.
+            let definition = if simple { None } else { row.index_sql.clone() };
+            indexes.push(Index {
+                name: row.index_name.clone(),
+                columns: key_columns,
+                unique: is_unique,
+                definition,
+                is_partial,
+                key_columns: Vec::new(),
+            });
+        }
+        (indexes, unique_columns)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn affinity_maps_the_common_declared_types() {
+            assert!(matches!(affinity("INTEGER"), Affinity::Integer));
+            assert!(matches!(affinity("BIGINT"), Affinity::Integer));
+            assert!(matches!(affinity("TEXT"), Affinity::Text));
+            assert!(matches!(affinity("VARCHAR(255)"), Affinity::Text));
+            assert!(matches!(affinity("REAL"), Affinity::Real));
+            assert!(matches!(affinity("DOUBLE"), Affinity::Real));
+            assert!(matches!(affinity("BLOB"), Affinity::Blob));
+            assert!(matches!(affinity(""), Affinity::Blob));
+            assert!(matches!(affinity("NUMERIC"), Affinity::Numeric));
+            assert!(matches!(affinity("DECIMAL(10,2)"), Affinity::Numeric));
+        }
+
+        #[test]
+        fn column_type_is_conservative_and_recovers_conventions() {
+            assert_eq!(sqlite_column_type("INTEGER", None), ColumnType::Int64);
+            assert_eq!(sqlite_column_type("TEXT", None), ColumnType::Text);
+            assert_eq!(sqlite_column_type("REAL", None), ColumnType::Float64);
+            assert_eq!(sqlite_column_type("BLOB", None), ColumnType::Bytes);
+            // Convention recovery: a CURRENT_TIMESTAMP default → Timestamp.
+            assert_eq!(
+                sqlite_column_type("TEXT", Some(&ColumnDefault::Now)),
+                ColumnType::Timestamp
+            );
+            // Fail-closed: a NUMERIC-affinity declared type is preserved verbatim.
+            assert_eq!(
+                sqlite_column_type("NUMERIC", None),
+                ColumnType::Opaque {
+                    pg_type: "NUMERIC".to_owned()
+                }
+            );
+        }
+
+        #[test]
+        fn default_recovers_now_and_preserves_others() {
+            assert_eq!(sqlite_default(None), None);
+            assert_eq!(sqlite_default(Some("  ")), None);
+            assert_eq!(
+                sqlite_default(Some("CURRENT_TIMESTAMP")),
+                Some(ColumnDefault::Now)
+            );
+            assert_eq!(
+                sqlite_default(Some("'draft'")),
+                Some(ColumnDefault::Sql("'draft'".to_owned()))
+            );
+        }
+
+        #[test]
+        fn default_bareword_null_is_no_default_but_quoted_null_is_preserved() {
+            // A `DEFAULT NULL` clause surfaces as the bareword keyword `NULL`
+            // (any case, possibly padded), which is semantically "no default" — it
+            // must map to `None` so it never drifts against a model column that has
+            // no default.
+            assert_eq!(sqlite_default(Some("NULL")), None);
+            assert_eq!(sqlite_default(Some("null")), None);
+            assert_eq!(sqlite_default(Some("  Null  ")), None);
+            // A QUOTED `'NULL'` is the real 4-character text value, a genuine string
+            // default — it must survive verbatim.
+            assert_eq!(
+                sqlite_default(Some("'NULL'")),
+                Some(ColumnDefault::Sql("'NULL'".to_owned()))
+            );
+        }
+
+        fn col_row(
+            name: &str,
+            decl: &str,
+            not_null: i32,
+            dflt: Option<&str>,
+            pk: i32,
+        ) -> ColumnRow {
+            ColumnRow {
+                table_name: "posts".to_owned(),
+                column_name: name.to_owned(),
+                decl_type: decl.to_owned(),
+                not_null,
+                dflt_value: dflt.map(str::to_owned),
+                pk,
+                hidden: 0,
+            }
+        }
+
+        /// A `ColumnRow` with an explicit `table_xinfo.hidden` discriminator (`2` =
+        /// VIRTUAL generated, `3` = STORED generated, `1` = internal hidden).
+        fn col_row_hidden(name: &str, decl: &str, hidden: i32) -> ColumnRow {
+            ColumnRow {
+                hidden,
+                ..col_row(name, decl, 0, None, 0)
+            }
+        }
+
+        #[test]
+        fn build_table_marks_autoincrement_id_and_recovers_created_at() {
+            let columns = vec![
+                col_row("id", "INTEGER", 0, None, 1),
+                col_row("title", "TEXT", 1, None, 0),
+                col_row("body", "TEXT", 0, None, 0),
+                col_row("created_at", "TEXT", 1, Some("CURRENT_TIMESTAMP"), 0),
+            ];
+            let table_sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                             title TEXT NOT NULL, body TEXT NULL, \
+                             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)";
+            let table = build_table(
+                "posts",
+                table_sql,
+                &columns,
+                &[],
+                &BTreeMap::new(),
+                &[],
+                &BTreeMap::new(),
+            );
+            assert_eq!(table.primary_key, vec!["id".to_owned()]);
+
+            let id = table.columns.iter().find(|c| c.name == "id").unwrap();
+            assert_eq!(id.ty, ColumnType::Int64);
+            assert!(id.primary_key);
+            assert!(!id.nullable, "an INTEGER PK is forced non-null");
+            assert_eq!(id.serial, Some(SerialKind::BigSerial));
+
+            let body = table.columns.iter().find(|c| c.name == "body").unwrap();
+            assert!(body.nullable);
+
+            let created = table
+                .columns
+                .iter()
+                .find(|c| c.name == "created_at")
+                .unwrap();
+            assert_eq!(created.ty, ColumnType::Timestamp);
+            assert_eq!(created.default, Some(ColumnDefault::Now));
+            assert!(!created.nullable);
+        }
+
+        #[test]
+        fn build_table_plain_integer_pk_is_marked_plain() {
+            // Without AUTOINCREMENT in the table SQL, an INTEGER PK is a plain rowid
+            // alias, not an Autumn BigSerial id → an EXPLICIT `Plain` marker (three-
+            // state: never `None`, which is reserved for legacy/unknown snapshots),
+            // so it drifts against a `BigSerial` model while a legacy snapshot stays
+            // compatible.
+            let columns = vec![col_row("id", "INTEGER", 0, None, 1)];
+            let table_sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY)";
+            let table = build_table(
+                "posts",
+                table_sql,
+                &columns,
+                &[],
+                &BTreeMap::new(),
+                &[],
+                &BTreeMap::new(),
+            );
+            let id = table.columns.iter().find(|c| c.name == "id").unwrap();
+            assert_eq!(id.serial, Some(SerialKind::Plain));
+        }
+
+        #[test]
+        fn autoincrement_keyword_is_tokenized_not_substring_matched() {
+            assert!(table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            ));
+            assert!(table_sql_has_autoincrement_keyword(
+                "create table t (id integer primary key   autoincrement )"
+            ));
+            // A table NAME containing the substring is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE autoincrement_events (id INTEGER PRIMARY KEY)"
+            ));
+            // A column NAME containing the substring is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (autoincrement_flag INTEGER, id INTEGER PRIMARY KEY)"
+            ));
+            // A string-literal default equal to the keyword is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, kind TEXT DEFAULT 'AUTOINCREMENT')"
+            ));
+            // A quoted identifier equal to the keyword is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (\"AUTOINCREMENT\" INTEGER, id INTEGER PRIMARY KEY)"
+            ));
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, [AUTOINCREMENT] TEXT)"
+            ));
+            // A block comment mentioning the keyword is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY /* AUTOINCREMENT */)"
+            ));
+            // A line comment mentioning the keyword is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY -- AUTOINCREMENT\n)"
+            ));
+            // A genuine keyword AFTER a block comment still matches.
+            assert!(table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER /* pk */ PRIMARY KEY AUTOINCREMENT)"
+            ));
+        }
+
+        #[test]
+        fn build_table_autoincrement_substring_name_is_plain_not_serial() {
+            // A plain INTEGER PK in a table whose NAME contains the `autoincrement`
+            // substring must be `Some(Plain)`, never mis-flagged BigSerial.
+            let columns = vec![col_row("id", "INTEGER", 0, None, 1)];
+            let table_sql = "CREATE TABLE autoincrement_events (id INTEGER PRIMARY KEY)";
+            let table = build_table(
+                "autoincrement_events",
+                table_sql,
+                &columns,
+                &[],
+                &BTreeMap::new(),
+                &[],
+                &BTreeMap::new(),
+            );
+            let id = table.columns.iter().find(|c| c.name == "id").unwrap();
+            assert_eq!(id.serial, Some(SerialKind::Plain));
+        }
+
+        #[test]
+        fn build_table_preserves_generated_columns_and_skips_internal_hidden() {
+            // `table_xinfo` surfaces generated columns (hidden 2 = VIRTUAL, 3 =
+            // STORED); they must be PRESERVED (never silently dropped), while a truly
+            // internal hidden column (hidden = 1) is skipped.
+            let columns = vec![
+                col_row("id", "INTEGER", 0, None, 1),
+                col_row("first", "TEXT", 1, None, 0),
+                col_row_hidden("full_stored", "TEXT", 3),
+                col_row_hidden("full_virtual", "TEXT", 2),
+                col_row_hidden("internal", "TEXT", 1),
+            ];
+            let table_sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY, first TEXT NOT NULL, \
+                             full_stored TEXT GENERATED ALWAYS AS (first) STORED, \
+                             full_virtual TEXT GENERATED ALWAYS AS (first) VIRTUAL)";
+            let table = build_table(
+                "posts",
+                table_sql,
+                &columns,
+                &[],
+                &BTreeMap::new(),
+                &[],
+                &BTreeMap::new(),
+            );
+            let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+            assert!(
+                names.contains(&"full_stored") && names.contains(&"full_virtual"),
+                "generated columns must be preserved, not dropped: {names:?}"
+            );
+            assert!(
+                !names.contains(&"internal"),
+                "an internal hidden column (hidden = 1) is skipped: {names:?}"
+            );
+        }
+
+        #[test]
+        fn build_table_resolves_implicit_fk_target_from_parent_pk() {
+            let columns = vec![
+                col_row("id", "INTEGER", 0, None, 1),
+                col_row("parent_code", "TEXT", 1, None, 0),
+                col_row("orphan_ref", "TEXT", 1, None, 0),
+            ];
+            // Two implicit FKs (`foreign_column = None`): one to a parent with a real
+            // single-column non-`id` PK (`code`), one to a composite-PK parent.
+            let fks = vec![
+                ForeignKeyRow {
+                    table_name: "children".to_owned(),
+                    foreign_table: "parents".to_owned(),
+                    column_name: "parent_code".to_owned(),
+                    foreign_column: None,
+                },
+                ForeignKeyRow {
+                    table_name: "children".to_owned(),
+                    foreign_table: "composite_parent".to_owned(),
+                    column_name: "orphan_ref".to_owned(),
+                    foreign_column: None,
+                },
+            ];
+            // `parents` has a single-column PK `code`; `composite_parent` is absent
+            // (composite/unresolvable).
+            let mut single_col_pks = BTreeMap::new();
+            single_col_pks.insert("parents".to_owned(), "code".to_owned());
+            let table = build_table(
+                "children",
+                "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_code TEXT NOT NULL \
+                 REFERENCES parents, orphan_ref TEXT NOT NULL REFERENCES composite_parent)",
+                &columns,
+                &[],
+                &BTreeMap::new(),
+                &fks,
+                &single_col_pks,
+            );
+            // The implicit FK resolves to the parent's REAL single-column PK, not `id`.
+            let parent_code = table
+                .columns
+                .iter()
+                .find(|c| c.name == "parent_code")
+                .unwrap();
+            let fk = parent_code.references.as_ref().expect("FK resolved");
+            assert_eq!(fk.table, "parents");
+            assert_eq!(fk.column, "code", "resolved to the real PK, not `id`");
+            // The FK to a composite/unresolvable parent is OMITTED (not guessed `id`).
+            let orphan = table
+                .columns
+                .iter()
+                .find(|c| c.name == "orphan_ref")
+                .unwrap();
+            assert!(
+                orphan.references.is_none(),
+                "an implicit FK to a composite/unresolvable-PK parent is omitted"
+            );
+        }
+
+        #[test]
+        fn single_column_pks_excludes_composite_and_pkless() {
+            let mut columns_by_table = BTreeMap::new();
+            columns_by_table.insert(
+                "parents".to_owned(),
+                vec![col_row("code", "TEXT", 1, None, 1)],
+            );
+            columns_by_table.insert(
+                "composite".to_owned(),
+                vec![
+                    col_row("a", "INTEGER", 1, None, 1),
+                    col_row("b", "INTEGER", 1, None, 2),
+                ],
+            );
+            columns_by_table.insert("pkless".to_owned(), vec![col_row("x", "TEXT", 0, None, 0)]);
+            let pks = single_column_pks(&columns_by_table);
+            assert_eq!(pks.get("parents").map(String::as_str), Some("code"));
+            assert!(!pks.contains_key("composite"), "composite PK excluded");
+            assert!(!pks.contains_key("pkless"), "PK-less table excluded");
+        }
+
+        #[test]
+        fn collapse_indexes_simple_unique_sets_flag() {
+            let rows = vec![IndexRow {
+                table_name: "authors".to_owned(),
+                index_name: "idx_authors_email_unique".to_owned(),
+                is_unique: 1,
+                origin: "c".to_owned(),
+                partial: 0,
+                index_sql: Some(
+                    "CREATE UNIQUE INDEX idx_authors_email_unique ON authors (email)".to_owned(),
+                ),
+            }];
+            let mut index_columns = BTreeMap::new();
+            index_columns.insert(
+                ("authors".to_owned(), "idx_authors_email_unique".to_owned()),
+                vec![IndexColumnRow {
+                    table_name: "authors".to_owned(),
+                    index_name: "idx_authors_email_unique".to_owned(),
+                    seqno: 0,
+                    column_name: Some("email".to_owned()),
+                }],
+            );
+            let (indexes, unique_cols) = collapse_indexes("authors", &rows, &index_columns);
+            assert_eq!(indexes.len(), 1);
+            assert_eq!(indexes[0].columns, vec!["email".to_owned()]);
+            assert!(indexes[0].unique);
+            assert_eq!(
+                indexes[0].definition, None,
+                "a simple index carries no definition"
+            );
+            assert!(unique_cols.contains("email"));
+        }
+
+        #[test]
+        fn collapse_indexes_skips_pk_and_retains_partial_verbatim() {
+            let rows = vec![
+                IndexRow {
+                    table_name: "t".to_owned(),
+                    index_name: "sqlite_autoindex_t_1".to_owned(),
+                    is_unique: 1,
+                    origin: "pk".to_owned(),
+                    partial: 0,
+                    index_sql: None,
+                },
+                IndexRow {
+                    table_name: "t".to_owned(),
+                    index_name: "t_active_idx".to_owned(),
+                    is_unique: 0,
+                    origin: "c".to_owned(),
+                    partial: 1,
+                    index_sql: Some(
+                        "CREATE INDEX t_active_idx ON t (email) WHERE deleted_at IS NULL"
+                            .to_owned(),
+                    ),
+                },
+            ];
+            let mut index_columns = BTreeMap::new();
+            index_columns.insert(
+                ("t".to_owned(), "t_active_idx".to_owned()),
+                vec![IndexColumnRow {
+                    table_name: "t".to_owned(),
+                    index_name: "t_active_idx".to_owned(),
+                    seqno: 0,
+                    column_name: Some("email".to_owned()),
+                }],
+            );
+            let (indexes, _unique) = collapse_indexes("t", &rows, &index_columns);
+            assert_eq!(indexes.len(), 1, "the PK auto-index is skipped");
+            assert_eq!(indexes[0].name, "t_active_idx");
+            assert!(indexes[0].is_partial);
+            assert!(
+                indexes[0].definition.as_deref().unwrap().contains("WHERE"),
+                "a partial index is retained verbatim via its CREATE INDEX SQL"
+            );
+        }
+
+        #[test]
+        fn collapse_indexes_unique_constraint_autoindex_folds_or_skips() {
+            // A `sqlite_autoindex_*` (origin = 'u') is NEVER an Index (un-creatable /
+            // un-droppable name). A SINGLE-column one folds into the column's `unique`
+            // flag; a COMPOSITE one is skipped entirely (no flag either).
+            for (cols, expect_flag) in [(vec!["email"], Some("email")), (vec!["a", "b"], None)] {
+                let rows = vec![IndexRow {
+                    table_name: "t".to_owned(),
+                    index_name: "sqlite_autoindex_t_1".to_owned(),
+                    is_unique: 1,
+                    origin: "u".to_owned(),
+                    partial: 0,
+                    index_sql: None,
+                }];
+                let mut index_columns = BTreeMap::new();
+                index_columns.insert(
+                    ("t".to_owned(), "sqlite_autoindex_t_1".to_owned()),
+                    cols.iter()
+                        .enumerate()
+                        .map(|(i, c)| IndexColumnRow {
+                            table_name: "t".to_owned(),
+                            index_name: "sqlite_autoindex_t_1".to_owned(),
+                            seqno: i32::try_from(i).unwrap(),
+                            column_name: Some((*c).to_owned()),
+                        })
+                        .collect(),
+                );
+                let (indexes, unique_cols) = collapse_indexes("t", &rows, &index_columns);
+                assert!(
+                    indexes.is_empty(),
+                    "a UNIQUE-constraint autoindex is never an Index: {indexes:?}"
+                );
+                match expect_flag {
+                    Some(c) => assert!(
+                        unique_cols.contains(c),
+                        "single-column inline UNIQUE folds into the column flag"
+                    ),
+                    None => assert!(
+                        unique_cols.is_empty(),
+                        "a composite UNIQUE marks no single column unique: {unique_cols:?}"
+                    ),
+                }
+            }
+        }
+
+        #[test]
+        fn create_virtual_table_and_fts5_shadow_detection() {
+            assert!(is_create_virtual_table(
+                "CREATE VIRTUAL TABLE \"posts__fts\" USING fts5(\"title\")"
+            ));
+            assert!(is_create_virtual_table(
+                "  create virtual table x using fts5(a)"
+            ));
+            assert!(!is_create_virtual_table(
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY)"
+            ));
+
+            let vtabs = vec!["posts__fts".to_owned()];
+            // The vtab itself and each FTS5 shadow table are excluded.
+            for shadow in [
+                "posts__fts",
+                "posts__fts_data",
+                "posts__fts_idx",
+                "posts__fts_content",
+                "posts__fts_docsize",
+                "posts__fts_config",
+            ] {
+                assert!(
+                    is_virtual_or_fts5_shadow_table(shadow, &vtabs),
+                    "{shadow} must be excluded"
+                );
+            }
+            // A real application table (and a lookalike that is not a shadow) is kept.
+            assert!(!is_virtual_or_fts5_shadow_table("posts", &vtabs));
+            assert!(!is_virtual_or_fts5_shadow_table("posts__fts_other", &vtabs));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1259,6 +2746,159 @@ mod tests {
             true,
         );
         assert!(matches!(d, Some(ColumnDefault::Sql(_))));
+    }
+
+    #[test]
+    fn serial_kind_marker_distinguishes_bigserial_from_plain_bigint_pk() {
+        let pk = vec!["id".to_owned()];
+        // An int8 owned-sequence serial PK → BigSerial.
+        assert_eq!(
+            serial_kind_for(
+                Some("nextval('posts_id_seq'::regclass)"),
+                &ColumnType::Int64,
+                true,
+                &pk,
+                true,
+                false
+            ),
+            Some(SerialKind::BigSerial)
+        );
+        // An int4 owned-sequence serial PK → Serial.
+        assert_eq!(
+            serial_kind_for(
+                Some("nextval('counters_id_seq'::regclass)"),
+                &ColumnType::Int32,
+                true,
+                &pk,
+                true,
+                false
+            ),
+            Some(SerialKind::Serial)
+        );
+        // A plain BIGINT PRIMARY KEY (no default, no owned sequence) → the EXPLICIT
+        // `Plain` marker (three-state): it is NOT a BigSerial, and the IR now tells
+        // them apart, while a legacy/unknown snapshot (marker absent) stays `None`.
+        assert_eq!(
+            serial_kind_for(None, &ColumnType::Int64, true, &pk, false, false),
+            Some(SerialKind::Plain)
+        );
+        // A shared/custom (non-owned) sequence default is still a single-column
+        // integer PK with no OWNED sequence → the explicit `Plain` marker (it is not
+        // a conventional owned serial).
+        assert_eq!(
+            serial_kind_for(
+                Some("nextval('global_ids'::regclass)"),
+                &ColumnType::Int64,
+                true,
+                &pk,
+                false,
+                false
+            ),
+            Some(SerialKind::Plain)
+        );
+        // A non-PK serial column → None (not an id).
+        assert_eq!(
+            serial_kind_for(
+                Some("nextval('c_seq'::regclass)"),
+                &ColumnType::Int64,
+                false,
+                &[],
+                true,
+                false
+            ),
+            None
+        );
+        // A UUID PK → None (the serial-vs-plain distinction is integer-only).
+        assert_eq!(
+            serial_kind_for(None, &ColumnType::Uuid, true, &pk, false, false),
+            None
+        );
+        // A GENERATED … AS IDENTITY integer PK → None (its id-generation is carried
+        // by the separate `identity` marker, never the serial marker).
+        assert_eq!(
+            serial_kind_for(None, &ColumnType::Int64, true, &pk, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn build_table_marks_bigserial_id_and_preserves_identity() {
+        let columns = vec![
+            // A conventional BIGSERIAL id (owns its sequence).
+            ColumnRow {
+                table_name: "t".to_owned(),
+                column_name: "id".to_owned(),
+                udt_name: "int8".to_owned(),
+                is_nullable: "NO".to_owned(),
+                column_default: Some("nextval('t_id_seq'::regclass)".to_owned()),
+                numeric_precision: None,
+                numeric_scale: None,
+                character_maximum_length: None,
+                domain_name: None,
+                domain_schema: None,
+                owns_sequence: true,
+                is_identity: "NO".to_owned(),
+                identity_generation: None,
+            },
+            // A GENERATED ALWAYS AS IDENTITY column (no default, is_identity=YES).
+            ColumnRow {
+                table_name: "t".to_owned(),
+                column_name: "seqno".to_owned(),
+                udt_name: "int8".to_owned(),
+                is_nullable: "NO".to_owned(),
+                column_default: None,
+                numeric_precision: None,
+                numeric_scale: None,
+                character_maximum_length: None,
+                domain_name: None,
+                domain_schema: None,
+                owns_sequence: false,
+                is_identity: "YES".to_owned(),
+                identity_generation: Some("ALWAYS".to_owned()),
+            },
+        ];
+        let pk = vec!["id".to_owned()];
+        let table = build_table("t", &columns, &pk, &[], &[], &[]);
+        let id = table.columns.iter().find(|c| c.name == "id").unwrap();
+        assert_eq!(id.serial, Some(SerialKind::BigSerial));
+        assert_eq!(
+            id.default, None,
+            "the owned int8 serial default is stripped"
+        );
+        assert!(id.identity.is_none());
+        let seqno = table.columns.iter().find(|c| c.name == "seqno").unwrap();
+        assert_eq!(
+            seqno.identity.as_deref(),
+            Some("ALWAYS"),
+            "an identity column preserves its generation clause verbatim"
+        );
+        assert!(
+            seqno.serial.is_none(),
+            "an identity column is not a serial (no owned nextval default)"
+        );
+    }
+
+    #[test]
+    fn collapse_indexes_nulls_not_distinct_unique_retained_verbatim() {
+        // A PG15+ `NULLS NOT DISTINCT` unique index (a bare CREATE UNIQUE INDEX, no
+        // backing constraint) must be RETAINED via `definition` so the clause
+        // round-trips — never collapsed to an ordinary unique index that drops it.
+        let def = "CREATE UNIQUE INDEX u_idx ON public.t USING btree (email) NULLS NOT DISTINCT";
+        let rows = vec![index_row(
+            "u_idx", true, "email", "email", false, false, def,
+        )];
+        let (indexes, unique_cols) = collapse_indexes(&rows);
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(
+            indexes[0].definition.as_deref(),
+            Some(def),
+            "a NULLS NOT DISTINCT unique index must be retained verbatim via its definition"
+        );
+        assert!(
+            unique_cols.is_empty(),
+            "a NULLS NOT DISTINCT unique index is not a plain simple unique, so it \
+             sets no single-column unique flag"
+        );
     }
 
     #[test]
@@ -1649,6 +3289,8 @@ mod tests {
                 // The conventional BIGSERIAL id owns its sequence, so the nextval
                 // default is stripped to None below.
                 owns_sequence: true,
+                is_identity: "NO".to_owned(),
+                identity_generation: None,
             },
             ColumnRow {
                 table_name: "comments".to_owned(),
@@ -1662,6 +3304,8 @@ mod tests {
                 domain_name: None,
                 domain_schema: None,
                 owns_sequence: false,
+                is_identity: "NO".to_owned(),
+                identity_generation: None,
             },
         ];
         let pk = vec!["id".to_owned()];
@@ -1713,6 +3357,8 @@ mod tests {
             domain_name: None,
             domain_schema: None,
             owns_sequence: false,
+            is_identity: "NO".to_owned(),
+            identity_generation: None,
         }];
         let table = build_table("widgets", &columns, &[], &[], &[], &[]);
         let addr = table.columns.iter().find(|c| c.name == "addr").unwrap();
@@ -1743,6 +3389,8 @@ mod tests {
                 domain_name: Some("email_dom".to_owned()),
                 domain_schema: Some("public".to_owned()),
                 owns_sequence: false,
+                is_identity: "NO".to_owned(),
+                identity_generation: None,
             },
             // A non-domain column (`domain_name` NULL) maps exactly as before.
             ColumnRow {
@@ -1757,6 +3405,8 @@ mod tests {
                 domain_name: None,
                 domain_schema: None,
                 owns_sequence: false,
+                is_identity: "NO".to_owned(),
+                identity_generation: None,
             },
         ];
         let table = build_table("contacts", &columns, &[], &[], &[], &[]);
@@ -1795,6 +3445,8 @@ mod tests {
                 domain_name: None,
                 domain_schema: None,
                 owns_sequence: false,
+                is_identity: "NO".to_owned(),
+                identity_generation: None,
             },
             ColumnRow {
                 table_name: "labels".to_owned(),
@@ -1808,6 +3460,8 @@ mod tests {
                 domain_name: None,
                 domain_schema: None,
                 owns_sequence: false,
+                is_identity: "NO".to_owned(),
+                identity_generation: None,
             },
             ColumnRow {
                 table_name: "labels".to_owned(),
@@ -1821,6 +3475,8 @@ mod tests {
                 domain_name: None,
                 domain_schema: None,
                 owns_sequence: false,
+                is_identity: "NO".to_owned(),
+                identity_generation: None,
             },
         ];
         let table = build_table("labels", &columns, &[], &[], &[], &[]);
@@ -1865,6 +3521,8 @@ mod tests {
             domain_name: Some("code_dom".to_owned()),
             domain_schema: Some("public".to_owned()),
             owns_sequence: false,
+            is_identity: "NO".to_owned(),
+            identity_generation: None,
         }];
         let table = build_table("labels", &columns, &[], &[], &[], &[]);
         let code = table.columns.iter().find(|c| c.name == "code").unwrap();
@@ -1893,6 +3551,8 @@ mod tests {
             domain_name: Some("email_dom".to_owned()),
             domain_schema: Some("otherschema".to_owned()),
             owns_sequence: false,
+            is_identity: "NO".to_owned(),
+            identity_generation: None,
         }];
         let table = build_table("contacts", &columns, &[], &[], &[], &[]);
         let email = table.columns.iter().find(|c| c.name == "email").unwrap();
@@ -1921,6 +3581,8 @@ mod tests {
             domain_name: None,
             domain_schema: None,
             owns_sequence: false,
+            is_identity: "NO".to_owned(),
+            identity_generation: None,
         }];
         let fks = vec![ForeignKeyRow {
             table_name: "sessions".to_owned(),
@@ -1957,6 +3619,8 @@ mod tests {
             domain_name: None,
             domain_schema: None,
             owns_sequence: false,
+            is_identity: "NO".to_owned(),
+            identity_generation: None,
         }];
         let fks = vec![ForeignKeyRow {
             table_name: "comments".to_owned(),
@@ -1990,6 +3654,8 @@ mod tests {
             domain_name: None,
             domain_schema: None,
             owns_sequence: false,
+            is_identity: "NO".to_owned(),
+            identity_generation: None,
         }];
         let checks = vec![CheckRow {
             table_name: "products".to_owned(),
@@ -2019,6 +3685,8 @@ mod tests {
             domain_name: None,
             domain_schema: None,
             owns_sequence: false,
+            is_identity: "NO".to_owned(),
+            identity_generation: None,
         }];
         let table = build_table("products", &columns, &[], &[], &[], &[]);
         assert!(
