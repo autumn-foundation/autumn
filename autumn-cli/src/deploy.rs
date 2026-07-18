@@ -1239,15 +1239,14 @@ fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
     );
 }
 
-/// Grade the media host and provision `MediaMTX` as a systemd unit over the live
-/// executor (issue #1974, Slice 7). A no-op when `[media.mediamtx]` is not
-/// enabled.
-///
-/// Runs the three fail-closed doctor checks first (`FFmpeg` preflight, recordings
-/// dir writable, ports available) and aborts the deploy on any failure — so a
-/// host that cannot serve media never gets a half-provisioned unit — then drives
-/// the controller's write-config / write-unit / enable+restart ops.
-fn provision_media_host(
+/// Grade the media host with the three fail-closed, **non-mutating** doctor
+/// checks (`FFmpeg` preflight, recordings dir writable, ports available) and abort
+/// the deploy on any failure — so a host that cannot serve media fails fast BEFORE
+/// the app deploy touches anything. A no-op when `[media.mediamtx]` is not
+/// enabled. This writes and restarts nothing; the mutating provisioning is
+/// deferred to [`provision_media_host`], which runs only after the app cutover
+/// succeeds.
+fn check_media_host_preflight(
     media_cfg: &media::MediaMtxHostConfig,
     ffmpeg_bin: &str,
     executor: &impl exec::DeployExecutor,
@@ -1255,13 +1254,37 @@ fn provision_media_host(
     if !media_cfg.enabled {
         return Ok(());
     }
-    eprintln!("\u{1F3A5} provisioning MediaMTX host (autumn-media)\n");
+    eprintln!("\u{1F3A5} media host preflight (autumn-media)\n");
 
     let checks = media::collect_media_doctor_checks(executor, media_cfg, ffmpeg_bin);
     let failed = report_preflight(&checks);
     if failed > 0 {
         return Err(DeployError::PreflightFailed(failed));
     }
+    Ok(())
+}
+
+/// Provision `MediaMTX` as a systemd unit over the live executor — write the
+/// rendered `mediamtx.yml` + unit and enable/restart the service (issue #1974,
+/// Slice 7). A no-op when `[media.mediamtx]` is not enabled.
+///
+/// **Runs only AFTER the app deploy/cutover has fully succeeded.** The app deploy
+/// rolls back on failure (readiness-gate miss, migration failure) and leaves the
+/// OLD release serving; there is deliberately no media teardown restoring the
+/// previous `mediamtx.yml`, so mutating (and possibly restarting) the host
+/// `MediaMTX` unit BEFORE the app is committed would strand a rolled-back release
+/// against a media daemon whose ports/recording-paths/matchers just moved.
+/// Deferring the mutation until the deploy is committed means a failed/rolled-back
+/// app deploy never writes or restarts `MediaMTX`. The non-mutating doctor checks
+/// already ran up front in [`check_media_host_preflight`].
+fn provision_media_host(
+    media_cfg: &media::MediaMtxHostConfig,
+    executor: &impl exec::DeployExecutor,
+) -> Result<(), DeployError> {
+    if !media_cfg.enabled {
+        return Ok(());
+    }
+    eprintln!("\u{1F3A5} provisioning MediaMTX host (autumn-media)\n");
 
     let controller = media::MediaMtxController::new(media_cfg.clone());
     exec::run_ops(&controller.ensure_installed_ops(), executor)
@@ -1541,8 +1564,12 @@ fn run_up(
     let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs)
         .with_tls_host(resolved.tls_host.clone());
     let executor = exec::SshExecutor::new(target);
-    // MediaMTX host provisioning (#1974 Slice 7) — no-op unless enabled (see fn).
-    provision_media_host(media_cfg, ffmpeg_bin, &executor)?;
+    // MediaMTX host preflight (#1974 Slice 7) — non-mutating doctor checks run
+    // BEFORE the app deploy so a bad media host fails fast without anything being
+    // written. The MUTATING provisioning (write config/unit + restart) is deferred
+    // until after the app cutover succeeds (below) so a rolled-back app deploy
+    // never touches the host MediaMTX unit. No-op unless enabled (see fn).
+    check_media_host_preflight(media_cfg, ffmpeg_bin, &executor)?;
 
     let release_dir = format!("{}/{release_id}", resolved.releases_dir());
 
@@ -1646,6 +1673,13 @@ fn run_up(
         exec::execute_redeploy(&checks, &ops, &teardown, &executor)
     };
     result.map_err(|e| DeployError::Exec(e.to_string()))?;
+
+    // App deploy is committed here: the cutover succeeded and there is no longer a
+    // rollback path. Only NOW provision the host MediaMTX unit (write config/unit +
+    // restart) — deferring the mutation past this point means a failed/rolled-back
+    // app deploy above never wrote or restarted MediaMTX (#1974 Slice 7). No-op
+    // unless enabled (see fn).
+    provision_media_host(media_cfg, &executor)?;
 
     eprintln!("\n\u{2705} Deploy complete. Roll back with `autumn deploy rollback`.");
     Ok(())
@@ -3015,6 +3049,71 @@ mod tests {
         assert!(
             !check_arm.contains("load_media_host_config"),
             "the Check arm must not load the media config",
+        );
+    }
+
+    #[test]
+    fn media_provisioning_is_deferred_past_app_cutover_in_up() {
+        // Finding K: the MUTATING MediaMTX provisioning must run only AFTER the app
+        // deploy/cutover commits. The app deploy rolls back on failure (readiness
+        // gate, migrations) and leaves the OLD release serving, and there is
+        // deliberately no media teardown — so writing/restarting the host MediaMTX
+        // unit BEFORE the app is committed would strand a rolled-back release
+        // against a moved media daemon. We assert the `run_up` source order: the
+        // non-mutating preflight precedes the app deploy, and `provision_media_host`
+        // is invoked only after the committing `result.map_err(...)?` line.
+        let src = include_str!("deploy.rs");
+        let up_body = src
+            .split("fn run_up(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn run_rollback(").next())
+            .expect("run_up body present");
+
+        let preflight_at = up_body
+            .find("check_media_host_preflight(media_cfg")
+            .expect("preflight call present in run_up");
+        // The app deploy is executed via execute_first_deploy/execute_redeploy and
+        // committed by this `result.map_err(...)?` line; a failed deploy returns
+        // here (after the teardown-on-failure) before anything below runs.
+        let commit_at = up_body
+            .find("result.map_err(|e| DeployError::Exec(e.to_string()))?;")
+            .expect("app deploy commit line present in run_up");
+        let provision_at = up_body
+            .find("provision_media_host(media_cfg, &executor)?;")
+            .expect("deferred provisioning call present in run_up");
+
+        assert!(
+            preflight_at < commit_at,
+            "media preflight must precede the app deploy commit",
+        );
+        assert!(
+            commit_at < provision_at,
+            "MediaMTX provisioning must run only AFTER the app deploy commits — so a \
+             rolled-back app deploy (which returns at the commit line) never reaches it",
+        );
+
+        // The preflight itself is non-mutating: it runs the doctor checks but must
+        // NOT drive the controller ops (those live only in provision_media_host).
+        let preflight_fn = src
+            .split("fn check_media_host_preflight(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn provision_media_host(").next())
+            .expect("check_media_host_preflight present");
+        assert!(
+            preflight_fn.contains("collect_media_doctor_checks"),
+            "preflight must run the doctor checks",
+        );
+        assert!(
+            !preflight_fn.contains("ensure_installed_ops"),
+            "preflight must NOT drive the mutating controller ops (write/restart)",
+        );
+
+        // And the mutating provisioning is reachable only on the post-commit path.
+        let after_commit = &up_body[commit_at..];
+        assert!(
+            after_commit.contains("provision_media_host(media_cfg, &executor)?;"),
+            "provisioning must sit on the post-commit path (unreachable when the app \
+             deploy errors out at the commit line)",
         );
     }
 }
