@@ -453,9 +453,13 @@ be allowed in `media-src` for recorded playback.
 
 **Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
 installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
-a host-bootstrap step), and wiring the four host preflight checks into the offline
-`autumn doctor` CLI (they run only in the executor-holding `deploy up` path today;
-`deploy plan` names them but never executes them).
+a host-bootstrap step); **creating and permissioning the `recordings_dir`**
+(default `/recordings`) so the media user can write to it — `autumn deploy` only
+`mkdir`s the MediaMTX config file's parent directory, so the fail-closed
+recordings-dir preflight (`test -d && test -w`) aborts `deploy up` when the
+directory is missing or not writable; and wiring the four host preflight checks
+into the offline `autumn doctor` CLI (they run only in the executor-holding
+`deploy up` path today; `deploy plan` names them but never executes them).
 
 ### How the deploy path is validated in CI
 
