@@ -514,6 +514,30 @@ impl IdKind {
     }
 }
 
+/// Distinguishes an owned-sequence auto-increment integer primary key from a
+/// plain, manually-assigned integer primary key of the same storage width.
+///
+/// Without this marker a `BIGINT PRIMARY KEY` (a plain, manually-assigned id) and
+/// a `BIGSERIAL` (an owned-sequence auto-increment id) both land in the IR as
+/// `Column { ty: Int64, primary_key: true, default: None }` — indistinguishable —
+/// so `schema pull` / `schema diff` could not tell a brownfield plain-int PK from
+/// a generated serial id. It is populated **symmetrically** by the model parser
+/// (for a convention `BigSerial` id) and by database introspection (only when the
+/// pulled column genuinely owns its sequence), so a model↔database diff of matching
+/// schemas stays empty while a genuine plain-`BIGINT PK` vs `BIGSERIAL` mismatch
+/// surfaces as drift. See [`Column::serial`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SerialKind {
+    /// `SERIAL` (int4) — an owned-sequence auto-increment 32-bit id. Only ever
+    /// produced by brownfield introspection (the model `#[id]` is always
+    /// `BigSerial` or `Uuid`).
+    Serial,
+    /// `BIGSERIAL` (int8) — an owned-sequence auto-increment 64-bit id, the Autumn
+    /// model `#[id]` convention. On `SQLite` this is an `INTEGER PRIMARY KEY
+    /// AUTOINCREMENT` column.
+    BigSerial,
+}
+
 /// A foreign-key relationship carried by a [`Column`] (see [`Column::references`]).
 ///
 /// A `references` column stores an [`Int64`](ColumnType::Int64); its FK-ness is
@@ -562,6 +586,24 @@ pub struct Column {
     pub default: Option<ColumnDefault>,
     /// The foreign-key relationship, if this column is a `references` column.
     pub references: Option<ForeignKey>,
+    /// The auto-increment id-generation strategy of an owned-sequence integer
+    /// primary key, distinguishing a generated `SERIAL`/`BIGSERIAL` id from a plain
+    /// manually-assigned `INTEGER`/`BIGINT` primary key of the same storage width
+    /// (see [`SerialKind`]). `None` for every non-serial column — including a
+    /// plain-int PK with no owned sequence. Populated symmetrically by the model
+    /// parser and by database introspection so a matching model↔database diff stays
+    /// empty. Defaults to `None` and is skipped when serializing, so snapshots
+    /// written before this field existed stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<SerialKind>,
+    /// A preserved `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` clause — the
+    /// verbatim `identity_generation` (`"ALWAYS"` / `"BY DEFAULT"`) of a Postgres
+    /// identity column — so an identity column round-trips through `schema pull`
+    /// instead of flattening to a plain integer column. `None` for every
+    /// non-identity column. Defaults to `None` and is skipped when serializing, so
+    /// pre-existing snapshots stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 impl Column {
@@ -577,6 +619,8 @@ impl Column {
             unique: false,
             default: None,
             references: None,
+            serial: None,
+            identity: None,
         }
     }
 }
@@ -1259,6 +1303,8 @@ mod tests {
         let col = Column::new("name", ColumnType::Text);
         assert!(!col.nullable && !col.primary_key && !col.unique);
         assert!(col.default.is_none() && col.references.is_none());
+        // The serial / identity markers default to absent (a plain column).
+        assert!(col.serial.is_none() && col.identity.is_none());
 
         let table = Table::new("widgets", Backend::Sqlite);
         assert!(table.managed);
@@ -1267,5 +1313,39 @@ mod tests {
 
         let schema = Schema::new(Backend::Sqlite);
         assert!(schema.tables.is_empty());
+    }
+
+    #[test]
+    fn serial_and_identity_markers_are_serde_backward_compatible() {
+        // A plain column (both markers absent) serializes WITHOUT the new keys, so
+        // snapshots written before the fields existed stay byte-identical.
+        let plain = Column::new("id", ColumnType::Int64);
+        let json = serde_json::to_string(&plain).expect("serialize");
+        assert!(
+            !json.contains("serial") && !json.contains("identity"),
+            "absent markers must be omitted from the serialized form: {json}"
+        );
+
+        // A pre-existing snapshot JSON with neither key deserializes to `None`.
+        let legacy = r#"{"name":"id","ty":"Int64","nullable":false,"primary_key":true,"unique":false,"default":null,"references":null}"#;
+        let back: Column = serde_json::from_str(legacy).expect("deserialize legacy");
+        assert!(back.serial.is_none() && back.identity.is_none());
+
+        // A populated marker round-trips.
+        let mut serial_id = Column::new("id", ColumnType::Int64);
+        serial_id.primary_key = true;
+        serial_id.serial = Some(SerialKind::BigSerial);
+        let mut identity_col = Column::new("n", ColumnType::Int64);
+        identity_col.identity = Some("ALWAYS".to_owned());
+        for col in [&serial_id, &identity_col] {
+            let json = serde_json::to_string(col).expect("serialize");
+            let back: Column = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(*col, back);
+        }
+        assert!(
+            serde_json::to_string(&serial_id)
+                .unwrap()
+                .contains("BigSerial")
+        );
     }
 }
