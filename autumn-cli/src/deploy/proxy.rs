@@ -144,6 +144,34 @@ pub trait ProxyController {
     /// `public_port` (idempotent — safe to run on every deploy).
     fn ensure_installed_ops(&self, public_port: u16) -> Vec<DeployOp>;
 
+    /// Ordered ops that REFRESH the supervised proxy on a redeploy/upgrade (issue
+    /// #2070): (idempotently) re-write + enable the unit, and — for a controller
+    /// that supervises an unpinned long-running proxy (kamal-proxy) — restart it to
+    /// adopt a CHANGED unit while IMMEDIATELY re-registering the still-live
+    /// `live_upstream` (`host:port`, the slot serving at cutover-start) so the
+    /// public port is routeless for only ~the restart rather than the entire
+    /// candidate-start + migrate + readiness window a naive restart would strand.
+    ///
+    /// `snapshot_path` is a per-deploy scratch path the implementation may use to
+    /// capture the pre-write unit so it can decide whether the unit ACTUALLY changed
+    /// (an unchanged unit must NOT restart — that preserves today's steady-state
+    /// no-restart behavior).
+    ///
+    /// The default is exactly [`Self::ensure_installed_ops`] (write + enable, NO
+    /// restart): a controller that provisions its own pinned binary/config and has
+    /// nothing to "restart to adopt" — e.g. a future `CaddyController` — inherits
+    /// the first-deploy behavior unchanged, so only kamal-proxy overrides this.
+    fn refresh_installed_ops(
+        &self,
+        public_port: u16,
+        service: &str,
+        live_upstream: &str,
+        snapshot_path: &str,
+    ) -> Vec<DeployOp> {
+        let _ = (service, live_upstream, snapshot_path);
+        self.ensure_installed_ops(public_port)
+    }
+
     /// Op that points `service`'s public port at `upstream` (`host:port`) for the
     /// first time (first deploy — there is nothing to swap yet).
     fn route_op(&self, service: &str, upstream: &str) -> DeployOp;
@@ -393,6 +421,80 @@ impl ProxyController for KamalProxyController {
             "proxy-flip",
             self.deploy_shell(service, new_upstream),
         ))
+    }
+
+    fn refresh_installed_ops(
+        &self,
+        public_port: u16,
+        service: &str,
+        live_upstream: &str,
+        snapshot_path: &str,
+    ) -> Vec<DeployOp> {
+        let unit = shell_quote(KAMAL_PROXY_UNIT_PATH);
+        let snap = shell_quote(snapshot_path);
+
+        // (1) Snapshot the CURRENTLY-installed unit's CONTENT hash BEFORE the write
+        // below overwrites it. A rewrite always bumps the file's mtime even when the
+        // bytes are identical, so systemd's own change tracking (`NeedDaemonReload`)
+        // cannot distinguish "actually changed" from "merely rewritten" — a content
+        // hash can. An absent file yields an empty hash, which compares unequal to
+        // the freshly-written one and so counts as "changed" (correct: a brand-new
+        // unit is a change). This is deliberately a HASH, not a copy of the unit
+        // (one of the two mechanisms the design allows), so the scratch file is tiny.
+        let snapshot = DeployOp::Run(RemoteCommand::new(
+            "proxy-snapshot-unit",
+            format!("{{ sha256sum {unit} 2>/dev/null || true; }} | cut -d' ' -f1 > {snap}"),
+        ));
+
+        let mut ops = Vec::with_capacity(4);
+        ops.push(snapshot);
+        // (2)+(3) The idempotent install — write the refreshed unit to its FINAL path
+        // + daemon-reload + `enable --now` — byte-for-byte the first-deploy path
+        // (labels `proxy-write-unit` / `proxy-install`). This is what makes the
+        // reboot-durable `StateDirectory`/`HOME` unit (#2069) reach EXISTING hosts on
+        // every redeploy. On its own it restarts NO running process: `enable --now`
+        // never relaunches an already-active unit, so a live proxy keeps serving with
+        // its old settings until the change-gated restart below (if any).
+        ops.extend(self.ensure_installed_ops(public_port));
+        // (4) Restart ONLY when the unit CONTENT actually changed AND the proxy is
+        // live, then IMMEDIATELY re-register the current live upstream. Rationale:
+        //   * A fresh `kamal-proxy run` restores its LAST-SAVED routing table on
+        //     start; on the first upgrade onto the persistent `StateDirectory` that
+        //     table is empty, so a bare restart would leave the public port routeless
+        //     until the next deploy step re-registered it — and a naive restart at
+        //     cutover-start would strand :80 for the WHOLE candidate-start + migrate +
+        //     readiness window (a zero-downtime violation). Re-registering the CURRENT
+        //     live upstream (the slot serving at cutover-start) right after the
+        //     restart bounds the routeless window to ~the restart itself.
+        //   * The restart and the re-register are ONE remote command, so no SSH
+        //     round-trip can interpose between them, and a bounded retry rides out the
+        //     brief window before the just-restarted proxy's control socket accepts a
+        //     route.
+        //   * An UNCHANGED unit (steady-state redeploy) takes NEITHER branch — today's
+        //     no-restart behavior is preserved exactly, so a routine redeploy never
+        //     churns the shared proxy.
+        // The re-register reuses `deploy_shell`, so it keeps the `env -u
+        // XDG_RUNTIME_DIR` control-socket pin (#2019) and any `--host/--tls` segment.
+        ops.push(DeployOp::Run(RemoteCommand::new(
+            "proxy-restart-if-changed",
+            format!(
+                "new=\"$( {{ sha256sum {unit} 2>/dev/null || true; }} | cut -d' ' -f1 )\"; \
+                 old=\"$(cat {snap} 2>/dev/null || true)\"; \
+                 rm -f {snap}; \
+                 if [ \"$new\" = \"$old\" ]; then exit 0; fi; \
+                 if ! systemctl is-active --quiet kamal-proxy.service; then exit 0; fi; \
+                 systemctl restart kamal-proxy.service; \
+                 n=0; \
+                 until {reregister}; do \
+                 n=$((n+1)); \
+                 if [ \"$n\" -ge 30 ]; then \
+                 echo 'kamal-proxy did not accept the live route after restart' >&2; exit 1; fi; \
+                 sleep 0.5; \
+                 done",
+                reregister = self.deploy_shell(service, live_upstream),
+            ),
+        )));
+        ops
     }
 
     fn compat_probe(&self) -> Option<ProxyCompatProbe> {
@@ -762,6 +864,157 @@ mod tests {
         assert_eq!(
             cmd.shell,
             "systemctl daemon-reload && systemctl enable --now kamal-proxy.service",
+        );
+    }
+
+    #[test]
+    fn refresh_installed_ops_snapshots_installs_then_restarts_only_when_changed() {
+        // Issue #2070: the redeploy refresh wraps the (unchanged) idempotent install
+        // with a pre-write content snapshot and a change-gated restart that
+        // re-registers the current live upstream — WITHOUT altering the shared
+        // `ensure_installed_ops` shape (so the first-deploy path is untouched).
+        let proxy = KamalProxyController::new(60);
+        let ops = proxy.refresh_installed_ops(
+            8080,
+            "myapp",
+            "127.0.0.1:3001",
+            "/tmp/autumn-kamal-proxy-unit-REL.sha256",
+        );
+        assert_eq!(ops.len(), 4, "snapshot + write-unit + install + restart");
+
+        // (1) snapshot the live unit's content hash into the scratch path.
+        let DeployOp::Run(snapshot) = &ops[0] else {
+            panic!("op 0 must be the snapshot Run op");
+        };
+        assert_eq!(snapshot.label, "proxy-snapshot-unit");
+        assert_eq!(
+            snapshot.shell,
+            "{ sha256sum '/etc/systemd/system/kamal-proxy.service' 2>/dev/null || true; } \
+             | cut -d' ' -f1 > '/tmp/autumn-kamal-proxy-unit-REL.sha256'",
+        );
+
+        // (2)+(3) the install ops are byte-for-byte `ensure_installed_ops` (write the
+        // reboot-durable unit to its final path + the unchanged enable --now).
+        let install = proxy.ensure_installed_ops(8080);
+        match (&ops[1], &install[0]) {
+            (
+                DeployOp::WriteFile {
+                    label: l1,
+                    remote_path: p1,
+                    contents: FileContents::Plain(u1),
+                    ..
+                },
+                DeployOp::WriteFile {
+                    contents: FileContents::Plain(u2),
+                    ..
+                },
+            ) => {
+                assert_eq!(*l1, "proxy-write-unit");
+                assert_eq!(p1, KAMAL_PROXY_UNIT_PATH);
+                assert_eq!(u1, u2, "refresh writes the same unit as first deploy");
+                assert!(u1.contains("StateDirectory=kamal-proxy\n"));
+                assert!(u1.contains("Environment=HOME=/var/lib/kamal-proxy\n"));
+            }
+            _ => panic!("op 1 must re-write the proxy unit"),
+        }
+        let DeployOp::Run(inst) = &ops[2] else {
+            panic!("op 2 must be proxy-install");
+        };
+        assert_eq!(inst.label, "proxy-install");
+        assert_eq!(
+            inst.shell,
+            "systemctl daemon-reload && systemctl enable --now kamal-proxy.service",
+        );
+
+        // (4) restart-if-changed: gate on a content change, only restart an ACTIVE
+        // proxy, then re-register the current live upstream (socket-pinned, TLS-aware
+        // via deploy_shell), with a bounded retry for the post-restart socket window.
+        let DeployOp::Run(restart) = &ops[3] else {
+            panic!("op 3 must be proxy-restart-if-changed");
+        };
+        assert_eq!(restart.label, "proxy-restart-if-changed");
+        let s = &restart.shell;
+        assert!(
+            s.contains("if [ \"$new\" = \"$old\" ]; then exit 0; fi"),
+            "unchanged unit → no restart: {s}"
+        );
+        assert!(
+            s.contains("if ! systemctl is-active --quiet kamal-proxy.service; then exit 0; fi"),
+            "restart only an active proxy: {s}"
+        );
+        assert!(
+            s.contains("systemctl restart kamal-proxy.service"),
+            "restart to adopt the changed unit: {s}"
+        );
+        assert!(
+            s.contains(
+                "env -u XDG_RUNTIME_DIR kamal-proxy deploy 'myapp' --target '127.0.0.1:3001' \
+                 --health-check-path '/ready' --deploy-timeout 60s --drain-timeout 30s"
+            ),
+            "re-register the current live upstream, socket-pinned: {s}"
+        );
+        assert!(
+            s.contains("rm -f '/tmp/autumn-kamal-proxy-unit-REL.sha256'"),
+            "the scratch snapshot is cleaned up: {s}"
+        );
+        // Order within the single command: gate → restart → re-register.
+        let gate = s.find("if [ \"$new\" = \"$old\" ]").unwrap();
+        let do_restart = s.find("systemctl restart kamal-proxy.service").unwrap();
+        let reregister = s.find("kamal-proxy deploy 'myapp'").unwrap();
+        assert!(
+            gate < do_restart && do_restart < reregister,
+            "gate→restart→re-register: {s}"
+        );
+    }
+
+    #[test]
+    fn refresh_installed_ops_tls_reregister_carries_host_and_tls() {
+        // With TLS enabled, the change-gated re-register carries the same
+        // `--host <h> --tls` segment as the flip, so a restarted TLS proxy re-adopts
+        // the live route with its cert config intact.
+        let proxy = KamalProxyController::new(60).with_tls_host(Some("app.example.com".to_owned()));
+        let ops = proxy.refresh_installed_ops(8080, "myapp", "127.0.0.1:3001", "/tmp/snap.sha256");
+        let DeployOp::Run(restart) = ops.last().expect("has ops") else {
+            panic!("last op must be the restart");
+        };
+        assert!(
+            restart.shell.contains(
+                "env -u XDG_RUNTIME_DIR kamal-proxy deploy 'myapp' --target '127.0.0.1:3001' \
+                 --health-check-path '/ready' --host 'app.example.com' --tls \
+                 --deploy-timeout 60s --drain-timeout 30s"
+            ),
+            "TLS re-register carries --host/--tls: {}",
+            restart.shell,
+        );
+    }
+
+    #[test]
+    fn refresh_installed_ops_default_is_plain_install_no_restart() {
+        // A controller that provisions its own pinned binary/config (e.g. a future
+        // Caddy controller) inherits the trait default: refresh == ensure_installed,
+        // with NO snapshot and NO restart op.
+        struct PinnedController;
+        impl ProxyController for PinnedController {
+            fn ensure_installed_ops(&self, _public_port: u16) -> Vec<DeployOp> {
+                vec![DeployOp::Run(RemoteCommand::new("install", "true"))]
+            }
+            fn route_op(&self, _service: &str, _upstream: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("route", "true"))
+            }
+            fn flip_op(&self, _service: &str, _new_upstream: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("flip", "true"))
+            }
+        }
+        let refreshed =
+            PinnedController.refresh_installed_ops(80, "svc", "127.0.0.1:9001", "/tmp/x");
+        let installed = PinnedController.ensure_installed_ops(80);
+        assert_eq!(refreshed.len(), installed.len());
+        assert!(
+            refreshed
+                .iter()
+                .all(|op| op.label() != "proxy-restart-if-changed"
+                    && op.label() != "proxy-snapshot-unit"),
+            "the default refresh adds neither a snapshot nor a restart op",
         );
     }
 

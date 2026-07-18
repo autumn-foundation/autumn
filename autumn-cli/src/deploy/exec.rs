@@ -695,6 +695,10 @@ pub fn first_deploy_ops(
 /// migration or readiness timeout aborts here with the old release still serving
 /// (no flip, no drain, no promote). The sequence:
 ///
+/// 0. refresh the shared proxy unit (issue #2070) — rewrite the reboot-durable
+///    unit so an existing host adopts it on upgrade, restarting + re-registering the
+///    live upstream ONLY when the unit actually changed (an unchanged unit does
+///    nothing, preserving steady-state behavior),
 /// 1. prepare remote dirs,
 /// 2. upload the release binary (`0755`),
 /// 3. write the secret env file (`0600`, AC-5),
@@ -737,22 +741,39 @@ pub fn cutover_ops(
     let candidate_unit_path = format!("/etc/systemd/system/{candidate_unit}.service");
     let live_unit = slot_unit_name(&cfg.service_name, plan.live_slot);
 
-    let mut ops = vec![
-        DeployOp::Run(RemoteCommand::new(
-            "prepare-dirs",
-            format!(
-                "mkdir -p {} {}",
-                shell_quote(&release_dir),
-                shell_quote(&shared_dir)
-            ),
-        )),
-        DeployOp::UploadFile {
-            label: "upload-binary",
-            local: binary_local.to_path_buf(),
-            remote_path: remote_binary,
-            mode: Some(0o755),
-        },
-    ];
+    // Refresh the SHARED proxy unit on the redeploy path too (issue #2070).
+    // Previously only `first_deploy_ops` wrote the proxy unit, so a fix landed in
+    // the unit (e.g. the reboot-durable `StateDirectory`/`HOME` of #2069) never
+    // reached an already-provisioned host on upgrade. Prepending the idempotent
+    // install (mirroring how `first_deploy_ops` starts) rewrites it on every
+    // redeploy, and — kamal-proxy only — restarts + re-registers the live upstream
+    // ONLY when the unit actually changed, so an existing host adopts the new unit
+    // with a routeless window bounded to ~the restart (see
+    // `ProxyController::refresh_installed_ops`). Writing the unit is deterministic,
+    // lands at the final path, and causes no restart on its own, so it is safe to do
+    // at the very start of the cutover; the live upstream re-registered on a change
+    // is the slot serving RIGHT NOW (`plan.live_port`), the same target the proxy
+    // already fronts.
+    let mut ops = proxy.refresh_installed_ops(
+        plan.public_port,
+        &cfg.service_name,
+        &loopback_upstream(plan.live_port),
+        &proxy_unit_snapshot_path(release_id),
+    );
+    ops.push(DeployOp::Run(RemoteCommand::new(
+        "prepare-dirs",
+        format!(
+            "mkdir -p {} {}",
+            shell_quote(&release_dir),
+            shell_quote(&shared_dir)
+        ),
+    )));
+    ops.push(DeployOp::UploadFile {
+        label: "upload-binary",
+        local: binary_local.to_path_buf(),
+        remote_path: remote_binary,
+        mode: Some(0o755),
+    });
     // Re-upload the project config manifest(s) into the per-release dir on every
     // redeploy so the config on the server always matches the shipped binary and
     // is coupled to it for rollback (#1952).
@@ -1153,6 +1174,15 @@ pub fn rollback_teardown_ops(cfg: &ResolvedDeployConfig, target: &RollbackTarget
 /// The `host:port` loopback upstream string the proxy routes at.
 fn loopback_upstream(port: u16) -> String {
     format!("127.0.0.1:{port}")
+}
+
+/// Per-deploy scratch path holding the pre-refresh kamal-proxy unit's content hash,
+/// so [`ProxyController::refresh_installed_ops`](super::proxy::ProxyController::refresh_installed_ops)
+/// can decide whether the unit ACTUALLY changed on this host (issue #2070). Keyed on
+/// the unique `release_id` so two shared-host deploys never race on a fixed scratch
+/// path; the restart step removes it.
+fn proxy_unit_snapshot_path(release_id: &str) -> String {
+    format!("/tmp/autumn-kamal-proxy-unit-{release_id}.sha256")
 }
 
 /// Command that records which slot now serves live traffic AND the loopback
@@ -2274,9 +2304,17 @@ mod tests {
         run_ops(&ops, &exec).expect("recording executor never fails");
 
         // The full ordered run sequence (uploads interleave; asserted separately).
+        // The cutover now LEADS with the proxy-unit refresh (issue #2070): the
+        // snapshot of the pre-write unit, the idempotent install, then the
+        // change-gated restart+re-register — before the candidate is prepared.
+        // (`proxy-write-unit` is a WriteFile → uploaded, so excluded from
+        // `run_labels`; asserted separately.)
         assert_eq!(
             exec.run_labels(),
             vec![
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed",
                 "prepare-dirs",
                 "daemon-reload",
                 "start-candidate",
@@ -2430,6 +2468,100 @@ mod tests {
             "commit the markers before draining the old release"
         );
         assert!(pos("drain-old") < pos("prune"), "drain before prune");
+    }
+
+    #[test]
+    fn cutover_refreshes_proxy_unit_and_restarts_only_when_changed() {
+        // Issue #2070: the redeploy path must now REFRESH the shared proxy unit so a
+        // reboot-durable unit reaches existing hosts on upgrade — and restart the
+        // running proxy to adopt it ONLY when the unit actually changed, immediately
+        // re-registering the CURRENT live upstream so :80 is routeless for only ~the
+        // restart, not the whole cutover.
+        let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+
+        // (a) The unit is (re)written to its FINAL path on the redeploy path, exactly
+        // like the first deploy — this is what delivers the reboot-durable unit to an
+        // already-provisioned host.
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                DeployOp::WriteFile { label: "proxy-write-unit", remote_path, contents: FileContents::Plain(unit), .. }
+                    if remote_path == "/etc/systemd/system/kamal-proxy.service"
+                        && unit.contains("StateDirectory=kamal-proxy\n")
+                        && unit.contains("Environment=HOME=/var/lib/kamal-proxy\n")
+            )),
+            "cutover must rewrite the reboot-durable proxy unit to its final path"
+        );
+
+        let exec = RecordingExecutor::new();
+        run_ops(&ops, &exec).expect("recording executor never fails");
+        let labels = exec.run_labels();
+        let pos = |l: &str| labels.iter().position(|&x| x == l);
+
+        // (b) The proxy refresh LEADS the cutover (before the candidate is prepared)
+        // and, crucially, the change-gated restart+re-register runs BEFORE the flip —
+        // so on a changed unit the live route is restored up front, keeping :80 served
+        // through the whole candidate-start/migrate/readiness window.
+        assert!(
+            pos("proxy-install").is_some(),
+            "cutover installs the proxy unit"
+        );
+        let restart = pos("proxy-restart-if-changed").expect("restart-if-changed present");
+        assert!(
+            pos("proxy-snapshot-unit").unwrap() < pos("proxy-install").unwrap()
+                && pos("proxy-install").unwrap() < restart,
+            "snapshot → install → restart-if-changed, in order: {labels:?}"
+        );
+        assert!(
+            restart < pos("prepare-dirs").unwrap() && restart < pos("proxy-flip").unwrap(),
+            "the proxy refresh precedes the candidate work and the flip: {labels:?}"
+        );
+
+        // (c) The snapshot captures the CURRENT unit's content hash before the write.
+        let snapshot = exec.shell_for("proxy-snapshot-unit").expect("snapshot ran");
+        assert!(
+            snapshot.contains("sha256sum '/etc/systemd/system/kamal-proxy.service'")
+                && snapshot.contains("/tmp/autumn-kamal-proxy-unit-20260714T120000Z.sha256"),
+            "snapshot hashes the live unit into a per-release scratch path: {snapshot}"
+        );
+
+        // (d) The restart is CHANGE-GATED (unchanged unit → no restart), only fires
+        // while the proxy is active, and — only then — re-registers the CURRENT live
+        // upstream (blue = 127.0.0.1:3001), socket-pinned like every other CLI call.
+        let restart_sh = exec
+            .shell_for("proxy-restart-if-changed")
+            .expect("restart-if-changed ran");
+        assert!(
+            restart_sh.contains("if [ \"$new\" = \"$old\" ]; then exit 0; fi"),
+            "an UNCHANGED unit must short-circuit before any restart: {restart_sh}"
+        );
+        assert!(
+            restart_sh.contains("systemctl is-active --quiet kamal-proxy.service")
+                && restart_sh.contains("systemctl restart kamal-proxy.service"),
+            "on a change it restarts the live proxy: {restart_sh}"
+        );
+        assert!(
+            restart_sh.contains(
+                "env -u XDG_RUNTIME_DIR kamal-proxy deploy 'myapp' --target '127.0.0.1:3001'"
+            ),
+            "on a change it re-registers the CURRENT live upstream, socket-pinned: {restart_sh}"
+        );
+        // The re-register sits AFTER the restart within the one command (so no SSH
+        // round-trip interposes), and the whole restart block is downstream of the
+        // change gate.
+        let gate = restart_sh
+            .find("if [ \"$new\" = \"$old\" ]")
+            .expect("change gate present");
+        let do_restart = restart_sh
+            .find("systemctl restart kamal-proxy.service")
+            .expect("restart present");
+        let reregister = restart_sh
+            .find("kamal-proxy deploy 'myapp' --target '127.0.0.1:3001'")
+            .expect("re-register present");
+        assert!(
+            gate < do_restart && do_restart < reregister,
+            "order must be change-gate → restart → re-register: {restart_sh}"
+        );
     }
 
     /// The candidate-teardown ops for the redeploy sample (candidate on green).
