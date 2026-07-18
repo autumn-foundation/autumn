@@ -1218,6 +1218,56 @@ pub fn index_depends_on_column(index: &Index, col: &str) -> bool {
 /// index IS authoritative and a dropped/changed one is reported as real drift via
 /// [`indexes_equivalent`]. Plain (`definition: None`) indexes are diffed
 /// identically in both modes — a model may always ADD a brand-new plain index.
+///
+/// ## Model `#[unique]` satisfied by an existing unique index (brownfield adoption)
+///
+/// In a *model diff* only, a desired UNIQUE index whose name is absent from the
+/// baseline is nonetheless treated as **already satisfied** when the baseline
+/// carries some `unique` index (under ANY name — including a `definition`-carrying
+/// constraint index a brownfield `UNIQUE` produced, e.g. `accounts_email_key`)
+/// over the **exact same column set** ([`baseline_unique_index_covers`]). This is
+/// the brownfield-adoption case: the user pulls `email TEXT UNIQUE`, then writes
+/// the natural model `Account { id, email }` with `#[unique]` on `email`. The
+/// parser emits `idx_accounts_email_unique` (a differently-named unique index over
+/// `{email}`); without this recognition `diff_indexes` would emit a redundant
+/// `AddIndex`, which `guard_plan`'s dedup refusal would then reject on a populated
+/// table — leaving the user unable to keep the annotation. Instead the desired
+/// unique index is suppressed (no `AddIndex`, and no `DropIndex` for the retained
+/// baseline index), so the model resolves to a clean, empty diff. Uniqueness must
+/// match: a desired unique index over `{email}` is NOT satisfied by a baseline
+/// *non-unique* index over `{email}` (it still emits `AddIndex`). Authoritative
+/// diffs are unaffected — a brownfield constraint index shares its name on both
+/// introspected sides and already matches by name, so real drift stays intact.
+/// Whether the baseline table already carries a `unique` index whose covered
+/// column set is **exactly** `want_columns` (order-insensitive) — used only in the
+/// model-diff path to recognize that a desired `#[unique]` index is already
+/// enforced by a differently-named brownfield constraint/unique index.
+///
+/// ## Why exact-set-equality (not subset)
+///
+/// For a `definition`-carrying baseline index, [`Index::columns`] is the exact
+/// `pg_depend` dependent-column set (key + expression + predicate columns). That
+/// set does **not** cheaply distinguish an index's *key* columns from a covering
+/// index's non-key `INCLUDE` columns: a `UNIQUE(a) INCLUDE(b)` index has unique
+/// scope `{a}` but `columns == {a, b}`. Treating such an index as unique over
+/// `{a, b}` (or letting it satisfy a desired unique on the superset) would be
+/// wrong. Since the IR does not carry the key/include split, we are conservative:
+/// only an EXACT set match suppresses the `AddIndex`. A covering index with extra
+/// `INCLUDE` columns simply does not match here and falls back to today's behavior
+/// for that rarer case — not a regression, just no new suppression.
+fn baseline_unique_index_covers(base: &Table, want_columns: &[String]) -> bool {
+    let want_set: BTreeSet<&str> = want_columns.iter().map(String::as_str).collect();
+    base.indexes.iter().any(|idx| {
+        idx.unique
+            && idx
+                .columns
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                == want_set
+    })
+}
+
 fn diff_indexes(
     table: &str,
     base: &Table,
@@ -1233,10 +1283,31 @@ fn diff_indexes(
 
     for want_idx in &want.indexes {
         match base_by_name.get(want_idx.name.as_str()) {
-            None => changes.push(SchemaChange::AddIndex {
-                table: table.to_owned(),
-                index: want_idx.clone(),
-            }),
+            None => {
+                // In a MODEL diff (`!definitions_authoritative`), a desired UNIQUE
+                // index whose column SET is already enforced by an existing baseline
+                // unique index — under ANY name, including a `definition`-carrying
+                // constraint index a brownfield `UNIQUE` produced (`accounts_email_key`)
+                // — is already satisfied. The differently-named baseline index enforces
+                // the exact uniqueness the model's `#[unique]` asks for, so emitting an
+                // `AddIndex` here would be redundant AND would trip `guard_plan`'s
+                // unique-index-on-populated-table dedup refusal, blocking the user from
+                // ever keeping the annotation. Suppress it (and leave the retained
+                // baseline index in place — no `DropIndex`). Matching is by EXACT column
+                // set (see [`baseline_unique_index_covers`]). Authoritative diffs are
+                // untouched: a brownfield constraint index has the same name on both
+                // sides there and already matches by name, so real drift stays detected.
+                if !opts.definitions_authoritative
+                    && want_idx.unique
+                    && baseline_unique_index_covers(base, &want_idx.columns)
+                {
+                    continue;
+                }
+                changes.push(SchemaChange::AddIndex {
+                    table: table.to_owned(),
+                    index: want_idx.clone(),
+                });
+            }
             Some(base_idx) => {
                 // A same-named pair where EITHER carries a `definition`: in a model
                 // diff the desired side cannot express the definition, so retain
@@ -3435,6 +3506,134 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
             "model diff must retain (not drop) a constraint-owned index; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Brownfield adoption (the P2 fix): a table pulled with `email TEXT UNIQUE`
+    /// retains the constraint-owned unique index Postgres named `accounts_email_key`
+    /// (`definition: Some(..)`, `unique`, columns `[email]`). The user then writes
+    /// the natural model `Account { id, email }` with `#[unique]` on `email`, whose
+    /// parser emits a differently-named unique index `idx_accounts_email_unique`
+    /// over `[email]` (`definition: None`). A model diff must recognize the existing
+    /// unique index as already satisfying the desired `#[unique]` — emitting NEITHER
+    /// an `AddIndex` (which `guard_plan` would reject on a populated table) NOR a
+    /// `DropIndex` for the retained constraint index. The plan must be clean.
+    #[test]
+    fn model_diff_existing_unique_index_satisfies_model_unique_by_columns() {
+        let constraint_idx = Index {
+            name: "accounts_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX accounts_email_key ON public.accounts USING btree (email)"
+                    .to_owned(),
+            ),
+        };
+        let mut base_table = posts_with(vec![col("email", ColumnType::Text)]);
+        base_table.indexes.push(constraint_idx);
+
+        // Desired (model): the parser-emitted, differently-named unique index.
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+        });
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert!(
+            plan.changes.is_empty(),
+            "existing unique index over the same column set must satisfy the model \
+             #[unique]; expected a clean plan, got {:?}",
+            plan.changes
+        );
+        // And the whole plan must pass the policy guard (no dedup refusal).
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "clean plan must not trip guard_plan"
+        );
+    }
+
+    /// The satisfaction is uniqueness-aware: a desired UNIQUE index over `[email]`
+    /// is NOT satisfied by a baseline **non-unique** index over `[email]`, so the
+    /// `AddIndex` is still emitted (the uniqueness is genuinely new).
+    #[test]
+    fn model_diff_nonunique_baseline_does_not_satisfy_unique_model_index() {
+        let nonunique = Index {
+            name: "idx_posts_email".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: false,
+            definition: None,
+        };
+        let mut base_table = posts_with(vec![col("email", ColumnType::Text)]);
+        base_table.indexes.push(nonunique);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+        });
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AddIndex { index, .. } if index.name == "idx_posts_email_unique"
+            )),
+            "a unique model index over a column with only a non-unique baseline index \
+             must still emit AddIndex; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Authoritative mode (doctor drift / `pull --dry-run`, both sides introspected)
+    /// is unaffected: a differently-named desired unique index is NOT suppressed by a
+    /// column-set match, so real drift (a renamed/added unique index) is still
+    /// detected. There the brownfield constraint index has the same name on both
+    /// sides and would match by name; a genuinely new name is genuine drift.
+    #[test]
+    fn authoritative_diff_still_emits_add_for_differently_named_unique_index() {
+        let constraint_idx = Index {
+            name: "accounts_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX accounts_email_key ON public.accounts USING btree (email)"
+                    .to_owned(),
+            ),
+        };
+        let mut base_table = posts_with(vec![col("email", ColumnType::Text)]);
+        base_table.indexes.push(constraint_idx);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+        });
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            AUTHORITATIVE,
+        );
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AddIndex { index, .. } if index.name == "idx_posts_email_unique"
+            )),
+            "authoritative diff must still emit AddIndex for a differently-named unique \
+             index (column-set suppression is model-diff-only); got {:?}",
             plan.changes
         );
     }

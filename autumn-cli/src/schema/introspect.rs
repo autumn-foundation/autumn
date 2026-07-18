@@ -77,13 +77,18 @@
 //!   definition (`pg_get_indexdef`, a valid `CREATE UNIQUE INDEX …`), not by the
 //!   originating `ALTER TABLE … ADD CONSTRAINT`. So if the authoritative path
 //!   (`pull --dry-run`) ever rendered a recreation it would emit the
-//!   `CREATE UNIQUE INDEX` form rather than re-adding the constraint; and a model
-//!   that *also* declares `#[unique]` on a column already covered by a brownfield
-//!   `UNIQUE` constraint additively creates the model's own
-//!   `idx_<table>_<col>_unique` index — a redundant-but-valid second unique
-//!   index, never a failure. Full constraint↔index reconciliation is deferred;
-//!   the load-bearing property this slice guarantees is only that the generated
-//!   migration no longer *fails* with a rejected `DROP INDEX`.
+//!   `CREATE UNIQUE INDEX` form rather than re-adding the constraint. A model that
+//!   *also* declares `#[unique]` on a column already covered by a brownfield
+//!   `UNIQUE` constraint is now **recognized as satisfied** by the existing unique
+//!   index: `diff_indexes` (model-diff path) treats a desired unique index whose
+//!   exact column set is already enforced by any baseline `unique` index — including
+//!   the retained constraint index — as fulfilled, so it emits **no** redundant
+//!   `AddIndex` (and no `DropIndex`), and the plan is clean rather than tripping
+//!   `guard_plan`'s unique-index dedup refusal. (This resolves the earlier
+//!   "additively creates a redundant `idx_<table>_<col>_unique` index" caveat.)
+//!   Full constraint↔index reconciliation is otherwise deferred; the load-bearing
+//!   property this slice guarantees is only that the generated migration no longer
+//!   *fails* with a rejected `DROP INDEX`.
 //! - **Cascade-dropped retained indexes on a dropped column**: when a model
 //!   removes a column that a retained (`definition`-carrying) expression / partial
 //!   / constraint-owned index depends on, Postgres cascade-drops that index with

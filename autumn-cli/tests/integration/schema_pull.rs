@@ -627,6 +627,79 @@ pub struct Account {
     assert_no_secret_leak(&mdiff_out, &mdiff_err);
 }
 
+/// Brownfield adoption with the natural `#[unique]` annotation (the P2 fix): after
+/// `schema pull` retains the constraint-owned `accounts_email_key` index, the user
+/// writes the natural model `Account { id, email }` and DOES declare `#[unique]` on
+/// `email`. The parser emits its own differently-named `idx_accounts_email_unique`
+/// unique index over `[email]`. Before the fix, the model-side `schema diff` saw
+/// that name as absent from the baseline and emitted a unique `AddIndex`, which the
+/// policy guard then REJECTED (a unique index on a populated table needs dedup
+/// verification) — so the user could not keep the `#[unique]` annotation even
+/// though the database already enforces that exact uniqueness. After the fix the
+/// existing unique index (same column set) satisfies the desired `#[unique]`, so
+/// the diff is CLEAN: no `AddIndex`, no `DROP INDEX`, no guard rejection.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_diff_model_unique_matches_pulled_constraint_index() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_model_unique_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // Brownfield `accounts(id, email UNIQUE, created_at)` — Postgres auto-creates
+    // the constraint-backed `accounts_email_key` index. `created_at TIMESTAMP NOT
+    // NULL DEFAULT NOW()` matches the column the managed-model parser synthesizes
+    // for `Account` below, so the diff isolates the unique-index behavior.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_accounts",
+        "CREATE TABLE accounts (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, created_at TIMESTAMP NOT NULL DEFAULT NOW());",
+        "DROP TABLE accounts;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull the brownfield shape (retains the constraint-owned index).
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("accounts_email_key"),
+        "constraint-backed index retained by its Postgres-assigned name: {snap}"
+    );
+
+    // The natural model DOES declare `#[unique]` on email. The existing unique
+    // index must satisfy it — the diff must be clean, with no guard rejection.
+    write_models(
+        &project,
+        "
+#[autumn_web::model(managed)]
+pub struct Account {
+    #[id]
+    pub id: i64,
+    #[unique]
+    pub email: String,
+}
+",
+    );
+    let (mdiff_out, mdiff_err) = run_autumn_ok(&project, &["schema", "diff"], &envs);
+    assert!(
+        !mdiff_out.contains("AddIndex") && !mdiff_out.contains("CREATE UNIQUE INDEX"),
+        "a model #[unique] over a brownfield-UNIQUE column must NOT emit AddIndex:\n{mdiff_out}"
+    );
+    assert!(
+        !mdiff_out.contains("DROP INDEX") && !mdiff_out.contains("accounts_email_key"),
+        "the retained constraint-owned index must NOT be dropped:\n{mdiff_out}"
+    );
+    assert!(
+        mdiff_out.contains("No schema changes"),
+        "model diff with #[unique] against the pulled unique constraint is clean:\n{mdiff_out}"
+    );
+    assert_no_secret_leak(&mdiff_out, &mdiff_err);
+}
+
 /// A covering `INCLUDE` index (`CREATE UNIQUE INDEX … ON t (a) INCLUDE (b)`) must
 /// be RETAINED verbatim via its `definition`, not recorded as a plain `(a, b)`
 /// unique index. Recording it as an ordinary index would widen the uniqueness
