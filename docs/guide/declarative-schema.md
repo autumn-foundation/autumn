@@ -148,6 +148,17 @@ migration (or re-snapshot from an authoritative source). A brand-new foreign-key
 column is unaffected: it arrives as an ordinary `ADD COLUMN` with an inline
 `REFERENCES` and needs no table-recreate at all.
 
+**Hand-written triggers and dependent views are *not* preserved and do *not*
+refuse the rebuild.** The table-recreate copies columns and re-creates indexes
+only — it does not see triggers or views, which live outside the offline model.
+The generated `DROP TABLE` drops any triggers on the table (they are *not*
+re-created by the migration), and views that reference the table are left
+dangling and may block the rename. This is a case the command does **not** fail
+closed on: instead of refusing, the emitted migration carries an
+`-- autumn-safety:` advisory comment naming the gap, so if your SQLite table has
+hand-written triggers or dependent views you must re-create the triggers and
+repair the views in a manual migration after applying the rebuild.
+
 ---
 
 ## `autumn schema migrate`
