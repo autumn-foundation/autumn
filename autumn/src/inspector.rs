@@ -233,10 +233,17 @@ pub fn detect_n_plus_one(queries: &[QueryRecord], threshold: usize) -> Option<NP
 
 /// Collapse whitespace and lower-case a SQL string for comparison.
 fn normalize_sql(sql: &str) -> String {
-    sql.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    let mut out = String::with_capacity(sql.len());
+    let mut first = true;
+    for word in sql.split_whitespace() {
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(word);
+        first = false;
+    }
+    out.make_ascii_lowercase();
+    out
 }
 
 // ── Per-request query accumulator ─────────────────────────────────────────────

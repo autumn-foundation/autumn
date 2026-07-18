@@ -81,7 +81,16 @@ fn collect_text(nodes: &[Node], out: &mut String) {
 /// text/`assert_text` comparisons survive indentation and line-wrapping
 /// changes in templates.
 pub fn normalize_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(s.len());
+    let mut first = true;
+    for word in s.split_whitespace() {
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(word);
+        first = false;
+    }
+    out
 }
 
 // ── Parser ───────────────────────────────────────────────────────────────────

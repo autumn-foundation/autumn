@@ -49,7 +49,16 @@ pub fn upcase(s: &str) -> String {
 /// Trim and collapse every internal run of whitespace to a single ASCII space.
 #[must_use]
 pub fn squish(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(s.len());
+    let mut first = true;
+    for word in s.split_whitespace() {
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(word);
+        first = false;
+    }
+    out
 }
 
 /// A type whose `#[normalize]` columns can be canonicalized in place.

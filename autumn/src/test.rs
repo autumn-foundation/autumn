@@ -3689,9 +3689,16 @@ impl TestResponse {
         // Counts per normalized statement (stable, sorted for determinism).
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for q in &self.queries {
-            *counts
-                .entry(q.sql.split_whitespace().collect::<Vec<_>>().join(" "))
-                .or_insert(0) += 1;
+            let mut normalized = String::with_capacity(q.sql.len());
+            let mut first = true;
+            for word in q.sql.split_whitespace() {
+                if !first {
+                    normalized.push(' ');
+                }
+                normalized.push_str(word);
+                first = false;
+            }
+            *counts.entry(normalized).or_insert(0) += 1;
         }
         if counts.len() != self.queries.len() {
             out.push_str("\n  ── counts per statement ──");
