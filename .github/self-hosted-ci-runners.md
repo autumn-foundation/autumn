@@ -145,7 +145,7 @@ and the slot would die after a single job.
 
 1. Confirm both secrets exist (§4).
 2. **Actions → "Provision self-hosted runner" → Run workflow.** Inputs:
-   - `server_type` — `cpx41` (8 vCPU / 16 GB, default) or `cpx31` (4 vCPU / 8 GB).
+   - `server_type` — `cpx42` (8 vCPU / 16 GB, default) or `cpx32` (4 vCPU / 8 GB).
    - `location` — Hetzner location, default `nbg1`.
    - `ubuntu_image` — base image, default `ubuntu-24.04`.
    - `runner_count` — number of ephemeral slots, default `6`.
@@ -234,19 +234,19 @@ than failing; flip the variable to drain them onto hosted runners immediately.
 
 | Type | vCPU | RAM | Disk | Suggested slots |
 |------|------|-----|------|-----------------|
-| `cpx31` | 4 | 8 GB | 160 GB | 3–4 |
-| `cpx41` | 8 | 16 GB | 240 GB | 6 (recommended) |
+| `cpx32` | 4 | 8 GB | 160 GB | 3–4 |
+| `cpx42` | 8 | 16 GB | 240 GB | 6 (recommended) |
 
 Rust + Docker builds are **CPU- and disk-heavy**: a cold-cache workspace build
 plus the wide-feature Postgres-testcontainer test step sits near a runner's disk
 ceiling (ci.yml actively frees disk on hosted runners for exactly this reason),
-and coverage instrumentation roughly doubles `target/` size. `cpx41` with 6
+and coverage instrumentation roughly doubles `target/` size. `cpx42` with 6
 slots gives each concurrent job ~1.3 vCPU / ~2.7 GB / ~40 GB headroom, which
-comfortably runs autumn's heaviest lanes in parallel. `cpx31` works for a
+comfortably runs autumn's heaviest lanes in parallel. `cpx32` works for a
 lighter cadence but expect fewer safe concurrent slots.
 
 **Approximate monthly cost:** on the order of a low-double-digit EUR/month for a
-`cpx31` and roughly double that for a `cpx41`, plus a small IPv4 surcharge and
+`cpx32` and roughly double that for a `cpx42`, plus a small IPv4 surcharge and
 egress. **These are ballpark figures — verify current Hetzner Cloud pricing at
 <https://www.hetzner.com/cloud> before budgeting; do not treat them as exact.**
 Billing is hourly, so deleting the box when idle (§8) genuinely stops the meter.
