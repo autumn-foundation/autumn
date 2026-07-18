@@ -7077,8 +7077,10 @@ pub struct TomlEnvConfigLoader {
 impl TomlEnvConfigLoader {
     /// Construct a new default loader with no declared plugin config roots.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            allowed_plugin_roots: BTreeSet::new(),
+        }
     }
 
     /// Declare the plugin-owned top-level config roots this loader should treat
