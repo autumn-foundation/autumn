@@ -148,7 +148,7 @@ buckets on SQLite:
 | `autumn deploy` data-file persistence | ✅ | ✅ | SQLite data file treated as **persistent state**; deploy/rollback never clobbers it. | ⛔ **Planned — #1909** |
 | Read replicas (`replica_url`) | ✅ | ⛔ | **Boot-refuse.** No networked replicas on a single-file DB — out of scope. | ✅ **Available now — boot-refuse** |
 | Sharding / shard directory | ✅ | ⛔ | **Boot-refuse.** Native sharding is Postgres-only. | ✅ **Available now — boot-refuse** |
-| Full-text search (`--search` / `#[searchable]`) | ✅ `tsvector` + GIN | ✅ FTS5 | **Available now on both backends.** Postgres uses a `tsvector` generated column + GIN index; SQLite uses an external-content **FTS5** virtual table with `unicode61` tokenization and `bm25` ranking (weights from `#[searchable(weight=…)]`). The `--search` / `#[searchable]` scaffold generates on both (#1910 / #2047). | ✅ **Available now** |
+| Full-text search (`--searchable` / `#[searchable]`) | ✅ `tsvector` + GIN | ✅ FTS5 | **Available now on both backends.** Postgres uses a `tsvector` generated column + GIN index; SQLite uses an external-content **FTS5** virtual table with `unicode61` tokenization and `bm25` ranking (weights from `#[searchable(weight=…)]`). The `--searchable` / `#[searchable]` scaffold generates on both (#1910 / #2047). | ✅ **Available now** |
 | Streaming replication (Litestream-style) | n/a | ⛔ | Out of scope; snapshot backup is the durability story. | Contract (out of scope) |
 | Multi-writer / networked SQLite (LiteFS, rqlite) | n/a | ⛔ | Out of scope; single-host, single-writer only. | Contract (out of scope) |
 
@@ -318,7 +318,7 @@ Additional generator shapes are refused on SQLite:
   refusal only — `generate destroy`/revert of an existing scaffold still works.
   Tracked in #1927.
 
-> **Full-text search now generates on SQLite (#2047).** The `--search` /
+> **Full-text search now generates on SQLite (#2047).** The `--searchable` /
 > `#[searchable]` scaffold — historically rejected at generate time on SQLite —
 > now emits a backend-appropriate index on both backends: a `tsvector` generated
 > column + GIN index on Postgres, and an external-content **FTS5** virtual table
@@ -376,7 +376,7 @@ bugs; they are the scale-out tier's reason to exist, and every one of them
   contention) only, not a wall-clock cap.
 
 > **Now supported on SQLite (previously listed here).** Full-text search
-> (the `--search` / `#[searchable]` scaffold) is available via **FTS5** (#2047),
+> (the `--searchable` / `#[searchable]` scaffold) is available via **FTS5** (#2047),
 > searchable repositories generate and run on SQLite, and **version-history**
 > (`versioned = true`) columns are supported on the SQLite runtime with JSON
 > stored as `TEXT` (#2034). A single-record write-RMW site also issues an

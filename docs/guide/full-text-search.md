@@ -236,7 +236,7 @@ pub async fn search(
 
 The same `#[searchable]` model annotation and the same generated repository
 APIs (`search`, `search_page`, `search_page_scoped`) also work on the **SQLite**
-backend (#2047). The `--search` / `#[searchable]` scaffold now generates on both
+backend (#2047). The `--searchable` / `#[searchable]` scaffold now generates on both
 backends — you write your models the same way, and the generator emits a
 backend-appropriate search index:
 
