@@ -315,6 +315,23 @@ impl KamalProxyController {
     /// `deploy` time via `--host <h> --tls` (see [`Self::deploy_shell`]), which
     /// makes kamal-proxy provision a Let's Encrypt cert on-demand for that host
     /// on the always-bound 443.
+    ///
+    /// ## Reboot durability
+    ///
+    /// kamal-proxy `run` persists the live routing table on every `deploy` and
+    /// RESTORES it on startup (`RestoreLastSavedState`) from its state file at
+    /// `$HOME/.config/kamal-proxy/kamal-proxy.state`. Under a bare systemd unit
+    /// `HOME` is unset, so that state dir falls back to ephemeral `/tmp` and the
+    /// deploy-time route snapshot is wiped on reboot — after a power-cycle `run`
+    /// restores an empty routing table and `:80` has no upstream. `StateDirectory`
+    /// makes systemd create/own a persistent `/var/lib/kamal-proxy` that survives
+    /// reboot, and `Environment=HOME=/var/lib/kamal-proxy` points kamal-proxy's
+    /// state (and cert) dir there — so the state file lives at
+    /// `/var/lib/kamal-proxy/.config/kamal-proxy/kamal-proxy.state` and the
+    /// deployed route is restored on boot. This is independent of the control
+    /// socket (`XDG_RUNTIME_DIR`-derived, see [`Self::deploy_shell`]): the
+    /// deploy-time CLI talks to `run` over that socket and writes no state, so the
+    /// `env -u XDG_RUNTIME_DIR` socket pin is untouched.
     #[must_use]
     pub fn render_proxy_unit(public_port: u16) -> String {
         format!(
@@ -325,6 +342,8 @@ impl KamalProxyController {
              \n\
              [Service]\n\
              Type=simple\n\
+             StateDirectory=kamal-proxy\n\
+             Environment=HOME=/var/lib/kamal-proxy\n\
              ExecStart={KAMAL_PROXY_BIN} run --http-port {public_port}\n\
              Restart=on-failure\n\
              RestartSec=2\n\
@@ -656,6 +675,54 @@ mod tests {
             unit_for(&with_tls),
             "the shared run unit must be identical regardless of any app's TLS flag",
         );
+    }
+
+    #[test]
+    fn run_unit_persists_state_dir_so_routes_survive_reboot() {
+        // kamal-proxy v0.9.2 `run` restores routes on boot from
+        // `$HOME/.config/kamal-proxy/kamal-proxy.state`. A bare unit has no HOME
+        // (state dir -> ephemeral /tmp), so the deploy-time route snapshot is wiped
+        // on reboot and :80 comes back with no upstream. The `run` unit therefore
+        // pins a persistent StateDirectory and points HOME at it so the deployed
+        // route is restored after a power-cycle.
+        let unit = KamalProxyController::render_proxy_unit(8080);
+        assert!(
+            unit.contains("StateDirectory=kamal-proxy\n"),
+            "run unit must declare a persistent StateDirectory, got: {unit}",
+        );
+        assert!(
+            unit.contains("Environment=HOME=/var/lib/kamal-proxy\n"),
+            "run unit must point HOME at the persistent state dir, got: {unit}",
+        );
+        // Both lines live in the [Service] block (before [Install]).
+        let service = unit
+            .split("[Install]")
+            .next()
+            .expect("unit must have a [Service] section before [Install]");
+        assert!(service.contains("StateDirectory=kamal-proxy\n"));
+        assert!(service.contains("Environment=HOME=/var/lib/kamal-proxy\n"));
+
+        // The persistent-state wiring is INDEPENDENT of the control socket: the
+        // deploy-time CLI socket pin (#2019) writes no state and is untouched here.
+        assert!(
+            !unit.contains("XDG_RUNTIME_DIR"),
+            "the run unit does not touch the control socket, got: {unit}",
+        );
+    }
+
+    #[test]
+    fn run_unit_state_dir_is_deterministic_across_renders() {
+        // The persistent state dir must be stable across renders so successive
+        // deploys/flips persist to (and a redeploy that changes the target updates)
+        // the SAME state file — that is what makes the restored-on-boot route
+        // reflect the latest deploy after a reboot.
+        let a = KamalProxyController::render_proxy_unit(8080);
+        let b = KamalProxyController::render_proxy_unit(8080);
+        assert_eq!(a, b, "render_proxy_unit must be deterministic");
+        // The state path is fixed regardless of the public port.
+        let other_port = KamalProxyController::render_proxy_unit(9090);
+        assert!(other_port.contains("StateDirectory=kamal-proxy\n"));
+        assert!(other_port.contains("Environment=HOME=/var/lib/kamal-proxy\n"));
     }
 
     #[test]
