@@ -1697,95 +1697,63 @@ fn validate_public_port(public_port: u16) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse a **redeploy** whose new port band collides with the still-live slot's
-/// actual loopback port, BEFORE any op runs — so traffic stays up (#2071).
+/// Refuse a concurrent `server.port` change on the **redeploy** path, BEFORE any op
+/// runs — so the live release keeps serving (#2073).
 ///
-/// On a redeploy the operator may have changed `server.port` since the live
-/// release was deployed. The proxy binds `0.0.0.0:{public_port}` (covering
-/// `127.0.0.1:{public_port}`) and the candidate app slot binds
-/// `127.0.0.1:{candidate_port}`, while the still-live release is holding its own
-/// `127.0.0.1:{live_upstream_port}` (the proxy-OBSERVED ACTUAL live-slot port,
-/// falling back to the persisted marker port then the derived port). If the
-/// new public port or the new candidate port equals that live loopback port, the
-/// #2070 proxy restart-refresh or the `start-candidate` step fails to bind
-/// (`EADDRINUSE`) mid-cutover — taking public traffic down with no auto-recovery.
+/// The reboot-durability upgrade (#2070) makes every redeploy refresh the shared
+/// kamal-proxy unit and, when that unit changed, restart `kamal-proxy run` and
+/// re-register the still-live upstream. Both the restart's public bind and the
+/// re-register's DERIVED loopback target are correct ONLY when the public port is
+/// unchanged: if the operator changed `server.port` since the live release was
+/// deployed, the restart would rebind a different public port and the re-register
+/// would aim at a port nothing listens on, stranding `:80` mid-cutover. Rather than
+/// try to sequence a live-safe port move here (Option C, #2073), refuse the deploy
+/// at pre-flight with an actionable message.
 ///
-/// This guard runs after `live_upstream_port` is resolved and before any cutover
-/// op executes: on a genuine collision it returns an error so **nothing is run**
-/// and the live release keeps serving. It is intentionally narrow — it refuses
-/// ONLY the two band members that can actually collide (`public_port` and
-/// `candidate_port` vs `live_upstream_port`). A live-slot *port* is never equal
-/// to its own candidate/public on an unchanged-port redeploy (the candidate takes
-/// the OTHER slot, and the public port is never a slot port), so unchanged-port
-/// durability upgrades pass, and a non-colliding `server.port` change (e.g.
-/// 3000→5000) also passes. A fully live-safe colliding-port change is future work
-/// (Option C).
-/// Resolve the loopback port the cutover proxy-refresh must re-register the
-/// still-live OLD release at (#2071), authoritative → last resort:
+/// The comparison is sourced from the INSTALLED proxy unit's `--http-port` (captured
+/// by [`exec::probe_deploy_state`]), which is the ground truth of what the running
+/// proxy actually binds:
 ///
-///   1. `observed_live_port` — the PROXY-OBSERVED live target port
-///      ([`exec::proxy_live_target_port`] over the probe's `kamal-proxy list`).
-///      This is the ground truth of what is being served RIGHT NOW — correct for
-///      BOTH modern and legacy/slot-only markers, and correct across a
-///      `server.port` change (the live release still binds its OLD port, which the
-///      derived port would NOT name). On a #1938 drift repair the proxy's actual
-///      routing is likewise the trustworthy signal (the marker is the untrusted
-///      party), so we prefer observed even then.
-///   2. `marker_live_port` — the PERSISTED live-slot marker port (6699b99), the
-///      port the last deploy recorded, used when the proxy reports nothing (down /
-///      no live route) and we kept the marker's slot. Untrusted on a drift repair,
-///      so skipped there.
-///   3. `derived_live_port` — `slot_app_port(NEW public_port, slot)`, the true last
-///      resort. Wrong across a `server.port` change, but if the proxy isn't routing
-///      anything there is no live traffic to preserve.
-///
-/// So an older slot-only marker (`marker_live_port = None`) no longer falls straight
-/// through to the derived port whenever the proxy is routing — it uses the observed
-/// port, closing the legacy-marker live-port hole. This single resolution flows into
-/// BOTH the cutover re-register (#2070) and the collision guard
-/// ([`validate_no_live_port_collision`]).
-fn resolve_live_upstream_port(
-    observed_live_port: Option<u16>,
-    marker_live_port: Option<u16>,
-    derived_live_port: u16,
-    repair: bool,
-) -> u16 {
-    if repair {
-        // Marker untrusted on a drift repair: proxy routing, else derived.
-        observed_live_port.unwrap_or(derived_live_port)
-    } else {
-        observed_live_port
-            .or(marker_live_port)
-            .unwrap_or(derived_live_port)
-    }
-}
-
-fn validate_no_live_port_collision(
-    public_port: u16,
-    candidate_port: u16,
-    live_upstream_port: u16,
+///   - [`exec::InstalledProxyPort::Absent`] → no installed unit, i.e. a first-deploy
+///     shape (the durability refresh writes it fresh). Nothing to conflict with →
+///     allowed. (This branch only runs when `current` is a symlink, so this is the
+///     rare shape where the proxy unit is missing but a release symlink exists.)
+///   - [`exec::InstalledProxyPort::Port`] equal to the requested port → unchanged
+///     redeploy (the common durability-upgrade path) → allowed.
+///   - [`exec::InstalledProxyPort::Port`] DIFFERENT from the requested port → refuse,
+///     naming old vs new port and the two-deploy operator sequence.
+///   - [`exec::InstalledProxyPort::Unreadable`] → the unit is present but its
+///     `--http-port` couldn't be read/parsed, so we can't prove the port is unchanged
+///     → **fail closed** (refuse) rather than risk a mid-cutover bind failure.
+fn refuse_concurrent_public_port_change(
+    installed: &exec::InstalledProxyPort,
+    new_public_port: u16,
 ) -> Result<(), String> {
-    let offender = if public_port == live_upstream_port {
-        Some(("the proxy's public listener", public_port))
-    } else if candidate_port == live_upstream_port {
-        Some(("the candidate app slot", candidate_port))
-    } else {
-        None
-    };
-    if let Some((which, offending_port)) = offender {
-        return Err(format!(
-            "redeploy public port {public_port} is invalid — {which} (port {offending_port}) \
-             would collide with the currently-live release's loopback port \
-             {live_upstream_port}, so the proxy/candidate restart would fail to bind \
-             (EADDRINUSE) mid-cutover and take public traffic down with no auto-recovery. \
-             Choose a public port whose band {{{public_port}, {p1}, {p2}}} does not include \
-             the currently-live port {live_upstream_port}, or take a maintenance window (a \
-             fully live-safe colliding-port change is future work).",
-            p1 = exec::slot_app_port(public_port, exec::SLOT_BLUE),
-            p2 = exec::slot_app_port(public_port, exec::SLOT_GREEN),
-        ));
+    match installed {
+        // No installed proxy unit — first-deploy shape; the durability refresh writes
+        // it fresh at the requested port, so there is nothing to conflict with.
+        exec::InstalledProxyPort::Absent => Ok(()),
+        // Unchanged public port — the common redeploy / durability-upgrade path.
+        exec::InstalledProxyPort::Port(current) if *current == new_public_port => Ok(()),
+        exec::InstalledProxyPort::Port(current) => Err(format!(
+            "Changing server.port on an existing deployment isn't supported here yet \
+             (the installed kamal-proxy is on port {current}, config requests \
+             {new_public_port}): first redeploy with server.port unchanged (adopts the \
+             reboot-durability upgrade), then change the port in a separate deploy. \
+             Tracked in #2073."
+        )),
+        // Fail closed: the unit is present but its --http-port is unreadable, so we
+        // cannot prove the public port is unchanged — refuse rather than risk the
+        // durability restart rebinding a different port and stranding `:80`.
+        exec::InstalledProxyPort::Unreadable => Err(format!(
+            "Cannot verify the installed kamal-proxy's HTTP port before a redeploy \
+             (its systemd unit is present but its `--http-port` could not be read), so \
+             a concurrent server.port change (config requests {new_public_port}) cannot \
+             be ruled out and is refused to avoid stranding public traffic mid-cutover. \
+             Re-provision the host (or repair the kamal-proxy unit) and retry. Live-safe \
+             server.port changes are tracked in #2073."
+        )),
     }
-    Ok(())
 }
 
 // Linear deploy orchestrator; the added MediaMTX host-prep step (#1974 Slice 7)
@@ -1877,10 +1845,20 @@ fn run_up(
             let teardown = exec::first_deploy_teardown_ops(resolved, &release_id, &plan);
             (ops, teardown, "first deploy".to_owned(), true)
         }
-        exec::DeployMode::Redeploy {
-            live_slot,
-            live_port,
-        } => {
+        exec::DeployMode::Redeploy { live_slot } => {
+            // Pre-flight refuse (#2073): the reboot-durability restart-refresh (#2070)
+            // re-execs `kamal-proxy run` on the public port and re-registers the
+            // still-live upstream at its DERIVED loopback port — both correct ONLY
+            // when the public port is unchanged. If the operator changed `server.port`
+            // since the live release was deployed, that restart would rebind a
+            // different public port and the re-register would aim at a dead loopback
+            // port, stranding `:80` mid-cutover with no auto-recovery. Refuse here —
+            // BEFORE any op runs, sourced from the INSTALLED proxy unit's `--http-port`
+            // (captured in the deploy-start probe) — so the live release keeps serving.
+            // A live-safe port change is future work (Option C, #2073). No installed
+            // unit → first-deploy shape (allowed); an unreadable unit → fail closed.
+            refuse_concurrent_public_port_change(&probe.installed_proxy_port, public_port)
+                .map_err(DeployError::Config)?;
             // Reconcile the (possibly stale) live-slot marker against the live
             // proxy before choosing the candidate slot. On an UNAMBIGUOUS
             // proxy-vs-marker disagreement the proxy is authoritative (so the
@@ -1900,32 +1878,6 @@ fn run_up(
                 eprintln!("\u{26A0}\u{FE0F}  {warn}");
             }
             let plan = exec::SlotPlan::redeploy(public_port, reconcile.live_slot);
-            // Port the cutover proxy-refresh re-registers the still-live OLD release
-            // at. The proxy currently fronts that release, so we must target the port
-            // it ACTUALLY binds (#2071) — sourced from the proxy-OBSERVED routing
-            // first, then the persisted marker port, then the derived port. See
-            // `resolve_live_upstream_port` for the full precedence and rationale.
-            let observed_live_port =
-                exec::proxy_live_target_port(&probe.proxy_list, &resolved.service_name);
-            let live_upstream_port = resolve_live_upstream_port(
-                observed_live_port,
-                live_port,
-                plan.live_port,
-                reconcile.repair,
-            );
-            // Pre-flight guard (#2071): if the operator changed `server.port` such
-            // that the new public port OR the new candidate slot port collides with
-            // the port the still-live release is ACTUALLY holding on loopback, the
-            // #2070 proxy restart-refresh / start-candidate would fail to bind and
-            // take public traffic down with no auto-recovery. Refuse here — BEFORE
-            // any op runs — so the live release keeps serving. Unchanged-port
-            // redeploys and non-colliding port changes are unaffected.
-            validate_no_live_port_collision(
-                plan.public_port,
-                plan.candidate_port,
-                live_upstream_port,
-            )
-            .map_err(DeployError::Config)?;
             let unit = render_app_unit(
                 resolved,
                 &release_dir,
@@ -1941,7 +1893,6 @@ fn run_up(
                 &manifests,
                 &release_id,
                 &plan,
-                live_upstream_port,
             );
             // Repair the drifted marker as an early op — before the cutover's
             // record-previous-release reads it — so the on-disk marker matches the
@@ -2104,186 +2055,63 @@ mod tests {
     }
 
     #[test]
-    fn redeploy_refuses_new_port_band_colliding_with_live_slot() {
-        // #2071 pre-flight guard. Baseline: the live release was deployed at public
-        // 3000 on the blue slot, so it holds `127.0.0.1:3001` (public+1). The
-        // operator now redeploys with a changed `server.port`; the candidate takes
-        // the GREEN slot (public+2).
-
-        // --- Collision variant 1: new public port == the live loopback port. ---
-        // Operator sets server.port = 3001, so the proxy would rebind 0.0.0.0:3001
-        // (covering 127.0.0.1:3001) — the exact port the live app holds.
-        let plan = exec::SlotPlan::redeploy(3001, exec::SLOT_BLUE);
-        let live_upstream_port = 3001; // persisted actual live-slot port (old public+1)
-        let err = validate_no_live_port_collision(
-            plan.public_port,
-            plan.candidate_port,
-            live_upstream_port,
-        )
-        .expect_err("new public port == live loopback port must be refused");
+    fn redeploy_refuses_a_concurrent_server_port_change() {
+        // #2073 pre-flight refuse. The installed proxy unit binds port 80; the operator
+        // now redeploys with `server.port = 8080` — a concurrent public-port change the
+        // durability restart-refresh (#2070) can't perform live-safely, so it is refused
+        // BEFORE any op runs, naming old vs new port and the two-deploy sequence.
+        let err = refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(80), 8080)
+            .expect_err("a changed server.port must be refused on the redeploy path");
         assert!(
-            err.contains("3001")
-                && err.contains("public listener")
-                && err.contains("currently-live"),
-            "public-collision message must name the offending/live port + the proxy \
-             listener, got: {err}",
+            err.contains("80") && err.contains("8080"),
+            "the refuse message must name the installed (80) and requested (8080) ports: {err}",
         );
-
-        // --- Collision variant 2: new candidate slot port == the live loopback. ---
-        // Operator sets server.port = 2999; the green candidate binds public+2 =
-        // 3001, colliding with the still-live blue app's 127.0.0.1:3001.
-        let plan = exec::SlotPlan::redeploy(2999, exec::SLOT_BLUE);
-        assert_eq!(plan.candidate_port, 3001, "green candidate binds public+2");
-        let err = validate_no_live_port_collision(
-            plan.public_port,
-            plan.candidate_port,
-            live_upstream_port,
-        )
-        .expect_err("new candidate port == live loopback port must be refused");
         assert!(
-            err.contains("3001")
-                && err.contains("candidate app slot")
-                && err.contains("currently-live"),
-            "candidate-collision message must name the offending/live port + the \
-             candidate slot, got: {err}",
-        );
-
-        // --- ALLOWED (a): unchanged-port redeploy (3000, still blue live). ---
-        // The candidate takes the green slot (3002) and the public port (3000) is
-        // never a slot port, so nothing collides with the live 3001.
-        let plan = exec::SlotPlan::redeploy(3000, exec::SLOT_BLUE);
-        assert!(
-            validate_no_live_port_collision(plan.public_port, plan.candidate_port, 3001).is_ok(),
-            "unchanged-port durability redeploy must pass (candidate 3002, public \
-             3000, live 3001)",
-        );
-
-        // --- ALLOWED (b): non-colliding port change 3000 -> 5000. ---
-        // The live app still holds 3001; the new band is {5000, 5001, 5002}, which
-        // does not include 3001.
-        let plan = exec::SlotPlan::redeploy(5000, exec::SLOT_BLUE);
-        assert!(
-            validate_no_live_port_collision(plan.public_port, plan.candidate_port, 3001).is_ok(),
-            "non-colliding server.port change (3000->5000, live 3001) must pass",
-        );
-    }
-
-    // A realistic `kamal-proxy list` stdout serving `service` on 127.0.0.1:`port`.
-    fn proxy_list_serving(service: &str, port: u16) -> String {
-        format!(
-            "Service   Host          Target            State    TLS\n\
-             {service}     example.com   127.0.0.1:{port}   running  no\n"
-        )
-    }
-
-    #[test]
-    fn legacy_marker_sources_live_port_from_proxy_observed_routing() {
-        // #2071 legacy-marker live-port hole (the first-upgrade population). A host
-        // deployed BEFORE the marker gained a port field has a slot-only marker →
-        // `live_port = None`. The operator now redeploys with `server.port` changed
-        // 3000 -> 5000, but the still-live blue release is ACTUALLY bound on
-        // 127.0.0.1:3001. The deploy probe's `kamal-proxy list` observes that 3001.
-        let proxy_list = proxy_list_serving("myapp", 3001);
-        let plan = exec::SlotPlan::redeploy(5000, exec::SLOT_BLUE);
-        assert_eq!(
-            plan.live_port, 5001,
-            "the new-config-DERIVED live port would be the wrong 5001",
-        );
-
-        // The observed port is extracted from the real proxy-list stdout even though
-        // 3001 no longer maps to a slot band under the new public port 5000.
-        let observed = exec::proxy_live_target_port(&proxy_list, "myapp");
-        assert_eq!(
-            observed,
-            Some(3001),
-            "proxy observes the live upstream on 3001"
-        );
-
-        // Legacy slot-only marker → marker port None; this is not a drift repair.
-        let live_upstream_port = resolve_live_upstream_port(observed, None, plan.live_port, false);
-        assert_eq!(
-            live_upstream_port, 3001,
-            "the live port must come from the proxy-OBSERVED routing (3001), NOT the \
-             new-config-derived 5001",
-        );
-
-        // The cutover re-registers the still-live release at exactly this port
-        // (`cutover_ops`'s `live_upstream_port` arg), so the proxy keeps routing to
-        // the real 127.0.0.1:3001 across the restart-refresh — and the collision
-        // guard compares the new band against that same real port.
-        assert!(
-            validate_no_live_port_collision(
-                plan.public_port,
-                plan.candidate_port,
-                live_upstream_port,
-            )
-            .is_ok(),
-            "new band {{5000,5001,5002}} does not collide with the REAL live port 3001",
+            err.contains("server.port unchanged") && err.contains("#2073"),
+            "the refuse message must spell out the operator sequence and reference the \
+             tracking issue: {err}",
         );
     }
 
     #[test]
-    fn resolve_live_upstream_port_precedence_observed_marker_derived() {
-        // 1. Observed present → wins over BOTH marker and derived (non-repair).
-        assert_eq!(
-            resolve_live_upstream_port(Some(3001), Some(9999), 5001, false),
-            3001,
-            "proxy-observed routing is authoritative",
+    fn redeploy_allows_an_unchanged_server_port() {
+        // The common durability-upgrade path: the installed unit's `--http-port` equals
+        // the requested port, so the redeploy proceeds (the restart re-execs on the SAME
+        // port, no collision, derived == actual live port).
+        assert!(
+            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(80), 80).is_ok(),
+            "an unchanged-port redeploy must be allowed",
         );
-        // 2. Observed absent (proxy down / no live route) → persisted marker port.
-        assert_eq!(
-            resolve_live_upstream_port(None, Some(3001), 5001, false),
-            3001,
-            "fall back to the 6699b99 persisted marker port when the proxy is silent",
-        );
-        // 3. Observed AND marker absent (legacy marker, proxy silent) → derived last
-        //    resort (nothing is being routed, so no live traffic to preserve).
-        assert_eq!(
-            resolve_live_upstream_port(None, None, 5001, false),
-            5001,
-            "derived port is the true last resort",
-        );
-        // Modern marker + a routing proxy: both agree on the observed port.
-        assert_eq!(
-            resolve_live_upstream_port(Some(3001), Some(3001), 3001, false),
-            3001,
-        );
-
-        // #1938 drift repair: the marker is the untrusted party, so the OBSERVED
-        // proxy routing wins; with no observed signal it falls to DERIVED, NEVER the
-        // (untrusted) marker port.
-        assert_eq!(
-            resolve_live_upstream_port(Some(3001), Some(9999), 5001, true),
-            3001,
-            "repair prefers observed proxy routing over the untrusted marker",
-        );
-        assert_eq!(
-            resolve_live_upstream_port(None, Some(9999), 5001, true),
-            5001,
-            "repair with no observed signal uses derived, never the untrusted marker",
+        // And with a non-default port that also happens to match.
+        assert!(
+            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(3000), 3000)
+                .is_ok(),
+            "an unchanged non-default port must also be allowed",
         );
     }
 
     #[test]
-    fn legacy_marker_collision_guard_refuses_via_observed_port() {
-        // Legacy marker, operator changes 3000 -> 3001 while the live app really
-        // holds 3001. Observed = 3001; the new public listener 3001 collides with the
-        // live loopback, so the guard refuses using the OBSERVED port — the earlier
-        // hole (comparing against the derived 3002) would have let this through.
-        let proxy_list = proxy_list_serving("myapp", 3001);
-        let observed = exec::proxy_live_target_port(&proxy_list, "myapp");
-        let plan = exec::SlotPlan::redeploy(3001, exec::SLOT_BLUE);
-        let live_upstream_port = resolve_live_upstream_port(observed, None, plan.live_port, false);
-        assert_eq!(live_upstream_port, 3001, "guard sees the REAL live port");
-        let err = validate_no_live_port_collision(
-            plan.public_port,
-            plan.candidate_port,
-            live_upstream_port,
-        )
-        .expect_err("new public port 3001 collides with the real live loopback 3001");
+    fn redeploy_fails_closed_on_an_unreadable_installed_port() {
+        // The installed unit is present but its `--http-port` couldn't be read/parsed,
+        // so we cannot prove the public port is unchanged — refuse (fail closed) rather
+        // than risk the durability restart rebinding a different port and stranding `:80`.
+        let err = refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Unreadable, 80)
+            .expect_err("an unreadable installed proxy port must fail closed");
         assert!(
-            err.contains("3001") && err.contains("currently-live"),
-            "collision message names the real live port, got: {err}",
+            err.contains("could not be read") && err.contains("#2073"),
+            "the fail-closed message must explain the unreadable unit and reference the \
+             tracking issue: {err}",
+        );
+    }
+
+    #[test]
+    fn redeploy_allows_when_no_proxy_unit_is_installed() {
+        // No installed proxy unit at all is a first-deploy shape (the durability refresh
+        // writes it fresh at the requested port) — nothing to conflict with, so the
+        // refuse guard passes regardless of the requested port.
+        assert!(
+            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Absent, 8080).is_ok(),
+            "an absent installed proxy unit must not trigger the refuse",
         );
     }
 

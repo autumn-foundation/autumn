@@ -44,8 +44,10 @@ use super::exec::{DeployOp, FileContents, RemoteCommand, shell_quote};
 /// Absolute path the proxy binary is expected at on the target.
 const KAMAL_PROXY_BIN: &str = "/usr/local/bin/kamal-proxy";
 
-/// Systemd unit path supervising the proxy process.
-const KAMAL_PROXY_UNIT_PATH: &str = "/etc/systemd/system/kamal-proxy.service";
+/// Systemd unit path supervising the proxy process. `pub` (crate-internal in this
+/// binary crate) so the deploy-start probe ([`super::exec::probe_deploy_state`]) can
+/// read the installed unit's `--http-port` in the same round-trip (#2073).
+pub const KAMAL_PROXY_UNIT_PATH: &str = "/etc/systemd/system/kamal-proxy.service";
 
 /// Known-good kamal-proxy version this controller's CLI contract was verified
 /// against — the same version the real-VPS validation harness pins
