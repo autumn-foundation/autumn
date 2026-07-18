@@ -441,16 +441,61 @@ impl KamalProxyCompatIssue {
     }
 }
 
-/// Does the probe output signal that the `kamal-proxy` binary itself is absent or
-/// not executable (as opposed to responding with help/usage text)? Matches the
-/// common shell/OS "not found" phrasings across `bash`/`sh`/`env` so a missing
-/// binary is classified as unusable rather than misread as "missing every flag".
+/// Does the probe output signal that the `kamal-proxy` binary itself could not be
+/// run (absent, not executable, wrong architecture) — as opposed to responding
+/// with help/usage text? Matches the common shell/OS phrasings across
+/// `bash`/`sh`/`env` so such a binary is classified as unusable rather than
+/// misread as "missing every flag". The probe folds stderr in via `2>&1`, so even
+/// though `|| true` swallows the non-zero exit status, the distinguishing *text*
+/// (`Permission denied`, `Exec format error`) is still captured and matchable.
 fn output_signals_missing_binary(output: &str) -> bool {
     let lower = output.to_ascii_lowercase();
     lower.contains("command not found")
         || lower.contains("no such file or directory")
         || lower.contains("kamal-proxy: not found")
         || lower.contains("executable file not found")
+        // Non-executable file (bad mode): `.../kamal-proxy: Permission denied` (exit 126).
+        || lower.contains("permission denied")
+        // Wrong-arch / not a real binary (ENOEXEC):
+        // `.../kamal-proxy: cannot execute binary file: Exec format error` (exit 126).
+        || lower.contains("cannot execute")
+        || lower.contains("exec format error")
+}
+
+/// Is `flag` present in `output` as a standalone CLI flag token — not merely a
+/// substring of a longer, renamed flag (e.g. `--target` inside `--target-host`,
+/// or `--tls` inside `--tls-enabled`)?
+///
+/// A flag renamed to a superstring is EXACTLY the drift this probe must catch, so
+/// a plain substring match would false-negative (report the old flag as present)
+/// and silently defeat the guardrail. The match therefore requires a token
+/// boundary on both sides: the char immediately before and after the match must be
+/// neither an ASCII alphanumeric nor `-` (the characters that continue a flag
+/// token). Boundaries are resolved from the surrounding `str` slices' `chars()`,
+/// never by slicing mid-codepoint, so it is UTF-8-safe (the flag itself is ASCII,
+/// so `find`/`end` always land on char boundaries).
+fn output_lists_flag(output: &str, flag: &str) -> bool {
+    let flen = flag.len();
+    let mut search_from = 0;
+    while let Some(rel) = output[search_from..].find(flag) {
+        let start = search_from + rel;
+        let end = start + flen;
+        let before_ok = output[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-');
+        let after_ok = output[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-');
+        if before_ok && after_ok {
+            return true;
+        }
+        // The match started at the flag's leading `-` (ASCII), so `start + 1` is a
+        // valid char boundary to resume from.
+        search_from = start + 1;
+    }
+    false
 }
 
 /// Pure verdict on a `kamal-proxy deploy --help` capture given the flags the
@@ -482,7 +527,7 @@ fn assess_kamal_proxy_deploy_help(
     let missing: Vec<&'static str> = required_flags
         .iter()
         .copied()
-        .filter(|flag| !output.contains(*flag))
+        .filter(|flag| !output_lists_flag(output, flag))
         .collect();
     if missing.is_empty() {
         Ok(())
@@ -795,6 +840,10 @@ mod tests {
         for output in [
             "bash: kamal-proxy: command not found\n",
             "/usr/local/bin/kamal-proxy: No such file or directory\n",
+            // Non-executable file (bad mode) → the binary couldn't run.
+            "bash: /usr/local/bin/kamal-proxy: Permission denied\n",
+            // Wrong-arch / not a real binary (ENOEXEC) → couldn't run.
+            "bash: /usr/local/bin/kamal-proxy: cannot execute binary file: Exec format error\n",
             "", // no output at all → cannot confirm → fail closed
         ] {
             assert_eq!(
@@ -809,6 +858,32 @@ mod tests {
             "names the path: {msg}"
         );
         assert!(msg.contains("v0.9.2"), "names the pin: {msg}");
+    }
+
+    #[test]
+    fn a_prefix_renamed_flag_is_caught_by_the_boundary_matcher() {
+        // A future kamal-proxy that renamed --target to --target-host: a plain
+        // substring check would find "--target" inside "--target-host" and wrongly
+        // pass, silently defeating the guardrail. The boundary matcher rejects the
+        // superstring and reports the exact missing flag.
+        let drifted = sample_deploy_help().replace("--target ", "--target-host ");
+        assert!(
+            drifted.contains("--target-host") && !drifted.contains("--target "),
+            "fixture must carry the renamed superstring and no standalone --target",
+        );
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(&drifted),
+            Err(KamalProxyCompatIssue::MissingFlags(vec!["--target"])),
+        );
+        // And the boundary matcher itself: a standalone flag matches, a superstring
+        // does not, whichever side the extra token sits on.
+        assert!(output_lists_flag("  --tls    Configure TLS\n", "--tls"));
+        // Trailing boundary: a superstring flag is not a match.
+        assert!(!output_lists_flag("  --tls-enabled  ...\n", "--tls"));
+        // Leading boundary: a flag glued onto a preceding token is not a match.
+        assert!(!output_lists_flag("run--tls now", "--tls"));
+        // A `=value` form (no trailing space) is still a standalone flag.
+        assert!(output_lists_flag("--target=host:port", "--target"));
     }
 
     #[test]
