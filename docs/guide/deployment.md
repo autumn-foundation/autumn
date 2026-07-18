@@ -421,8 +421,13 @@ When `enabled = true`, `autumn deploy up`:
    executable, the recordings directory is writable, and the MediaMTX ports are
    free — plus a pure-config precheck that the configured MediaMTX listener ports
    are distinct, and **aborts the deploy** if the host cannot serve media, rather
-   than shipping a half-provisioned box. These checks require a live host
-   executor and run **only at `deploy up`**.
+   than shipping a half-provisioned box. One caveat on the FFmpeg check: only a
+   **concrete literal** `[media.ffmpeg] bin` is probed and fail-closed here; an
+   env/interpolation-indirected path (an empty value, or one carrying a `${...}`
+   placeholder such as `${AUTUMN_MEDIA__FFMPEG__BIN}`) is resolved by the deployed
+   service from its own environment, so it is **deferred to runtime** — surfaced as
+   a non-blocking warning that does **not** abort the deploy. These checks require a
+   live host executor and run **only at `deploy up`**.
 2. After the app cutover succeeds, renders `mediamtx.yml` (LL-HLS window, fmp4
    recording under `recordings_dir`, WebRTC config, and a `~^room/.+$` path
    matcher for autumn-media Rooms) plus the systemd unit, then runs

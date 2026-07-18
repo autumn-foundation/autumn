@@ -39,7 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory is writable, and the MediaMTX ports are free) — plus a pure-config
   precheck that the configured MediaMTX listener ports are distinct (five checks
   total via `collect_media_doctor_checks`) — and **abort the deploy** if the host
-  cannot serve media. A missing or non-executable MediaMTX binary is one of the
+  cannot serve media. The FFmpeg check is fail-closed only for a **concrete
+  literal** `[media.ffmpeg] bin`; an env/interpolation-indirected path (empty or
+  `${...}`) is deferred to the service runtime as a non-blocking warning. A
+  missing or non-executable MediaMTX binary is one of the
   prerequisites that can block `deploy up`.
   `autumn deploy plan` surfaces the media unit, its provisioning steps, and the
   required `connect-src`/`media-src`/`frame-src` CSP origins. The
@@ -103,7 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boot dependency: `libsqlite3-sys` is built bundled with `SQLITE_ENABLE_FTS5`,
   the per-connection setup probes FTS5, and a missing FTS5 **fails loudly at
   boot** with an actionable message rather than silently downgrading. The
-  `--search` / `#[searchable]` scaffold now generates on both backends (#2047).
+  `--searchable` / `#[searchable]` scaffold now generates on both backends (#2047).
 - **lifecycle:** the `#[state_machine(lifecycle = …, effects(...))]` path now
   **rejects at compile time** an `effects(...)` edge that is not a real
   transition of the referenced lifecycle enum — previously such an edge compiled
