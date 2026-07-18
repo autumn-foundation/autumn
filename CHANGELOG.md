@@ -9,6 +9,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **media:** autumn-media gained a full **Rooms** primitive (#1974) — a
+  `/api/media/rooms` signaling API with create/join/leave/roster, a short-lived
+  per-participant `SessionToken` (uuid v4, constant-time verify, default 300s
+  TTL, redacted `Debug`, never serialized into the roster), a WHIP publish URL
+  plus per-peer WHEP subscribe URLs, a `RoomService` `AppState` extension, and a
+  durable `compose_room_recording` grid workflow (`FfmpegRoomCompositeCommand`,
+  xstack/hstack video + amix audio, a `#[job]` on the `media` queue). Isolation
+  is fail-closed and keyed by `(namespace, room_id)`; the full-mesh cap is **6**
+  participants (fail-fast on `0` or `> 6` from config or the builder — no silent
+  clamp). Flat `[media]` config keys `room_max_participants` /
+  `room_token_ttl_seconds` / `room_namespace` (env `AUTUMN_MEDIA__ROOM_*`)
+  configure it, and the in-memory room store is capped at 10,000 rooms
+  (`503 RegistryFull` beyond that). Same PR folds in three deferred hardening
+  items: sub-second VOD anchoring, MediaMTX paths-list pagination, and rejecting
+  dot-only storage-key segments. Recorded limitations: single-process store, no
+  `#[job]` timeout/heartbeat, and no automatic reaping of abandoned
+  participants; operators must add a `~^room/.+$` MediaMTX path matcher and allow
+  the MediaMTX WebRTC origin (`:8889`) in their `connect-src` CSP (#2030).
+- **media/deploy:** `autumn deploy` can now provision **MediaMTX as a host
+  systemd unit** when a project opts in with `[media.mediamtx] enabled = true`
+  (#1974) — it renders `mediamtx.yml` and the unit, then runs
+  `daemon-reload && enable --now && restart`, exactly as it already provisions
+  kamal-proxy. Three fail-closed host preflight checks run **before** the host is
+  touched (FFmpeg resolves, the recordings directory is writable, the MediaMTX
+  ports are free) and **abort the deploy** if the host cannot serve media.
+  `autumn deploy plan` surfaces the media unit, its provisioning steps, and the
+  required `connect-src`/`media-src`/`frame-src` CSP origins. The
+  `[media.mediamtx]` / `[media.ffmpeg]` deploy config is read straight from the
+  merged `autumn.toml` (base ← profile ← `autumn-<profile>.toml`) so it never
+  touches autumn-web's `AutumnConfig` schema, and the whole controller is a no-op
+  when disabled — a non-media project is byte-for-byte unaffected. See the new
+  [media deployment guide](docs/guide/deployment.md#mediamtx-host-provisioning-media)
+  (#2051).
+- **cli:** the declarative-schema command group (`autumn schema`, tracking
+  #1975) reached a usable end-to-end shape. `autumn schema diff` targeting SQLite
+  now emits real migrations for the previously-refused ALTER-family changes via
+  the standard **table-recreate** procedure (create-new → `INSERT..SELECT` →
+  drop → rename → recreate indexes, wrapped in `PRAGMA foreign_keys=OFF`…
+  `foreign_key_check`… `ON`), coalesced to one recreate block per table;
+  Postgres output is byte-for-byte unchanged (#2035). Two new verbs land:
+  `autumn schema migrate` applies pending generated migrations against the
+  configured database (Postgres advisory-locked, SQLite unlocked;
+  provider-locked against the snapshot dialect), and `autumn schema doctor`
+  gives a read-only, `--json`-capable health report over the project scaffold,
+  snapshot presence, model-vs-snapshot drift, backend provider-lock,
+  snapshot-dialect-vs-DB, and pending migrations — exiting non-zero only on an
+  actionable error (#2036). `autumn schema diff --write-migration` now **advances
+  the checked-in snapshot at generation time** (so `schema migrate` only applies
+  files and never touches the snapshot), keeping snapshot and migrations in
+  lock-step and leaving un-generated model drift visible (#2042). And
+  `autumn schema pull` introspects a live Postgres database into the same
+  snapshot IR the model parser produces (with `--dry-run` and a provider-lock
+  guard; a SQLite URL is refused loudly), while `schema doctor` gains a
+  `database-schema-drift` check (#2045). See the new
+  [declarative schema guide](docs/guide/declarative-schema.md).
+- **sqlite:** the `#[repository]` / `#[model]` runtime reached CRUD parity on the
+  SQLite backend (#1996). Searchable repositories, version-history
+  (`versioned = true`, JSON stored as TEXT), and single-record write-RMW sites
+  (now wrapped in `BEGIN IMMEDIATE` via `scoped_immediate_transaction`) all work
+  on SQLite, and a non-zero `database.statement_timeout` on a `sqlite` URL is
+  now **refused at boot** (`PoolError::UnsupportedBackend`) rather than silently
+  ignored, since diesel's async `SqliteConnection` has no interrupt hook (#2034).
+  Follow-up correctness fixes moved the statement-timeout guard to the
+  pool-provider dispatch boundary (so a custom `with_pool_provider` pool cannot
+  bypass it), made both sides of SQLite search fold with `to_ascii_lowercase()`,
+  and re-based the `BEGIN IMMEDIATE` write reservation on diesel's
+  `AnsiTransactionManager` so nested transactions become savepoints (#2038). The
+  **durable commit-hook worker** — previously Postgres-only — now runs on SQLite
+  too: queued hooks survive restarts, deliver exactly once (reusing the #1995
+  idempotency-key dedup), retry with backoff, dead-letter after max attempts, and
+  drain gracefully on shutdown, with a `BEGIN IMMEDIATE` single-writer claim and
+  fail-closed tenant isolation (the ambient `CURRENT_TENANT` is embedded in the
+  persisted context JSON and re-established before each hook) (#2054).
+- **sqlite:** SQLite searchable repositories now use **FTS5** instead of the
+  interim ASCII `LIKE` fallback (#1910). Search runs over an external-content
+  FTS5 virtual table synced by AFTER INSERT/DELETE/UPDATE triggers, with
+  `unicode61` tokenization (full-Unicode case/diacritic folding, so `äpfel`
+  matches `Äpfel`) and **`bm25` ranking** whose per-column weights come from
+  `#[searchable(weight=…)]` priorities (A=10, B=5, C=2, else 1). A new pure
+  `repository::sqlite_fts5_match_query` sanitizer is **fail-closed and
+  injection-safe**: it tokenizes on Unicode whitespace and turns every token —
+  including every FTS5 operator (`AND`/`OR`/`NOT`/`NEAR`/`col:`/`*`/parens/
+  quotes/`-`) — into a literal quoted phrase, and empty/no-token input yields an
+  empty page with **no query run** (never an unfiltered scan). FTS5 is a hard
+  boot dependency: `libsqlite3-sys` is built bundled with `SQLITE_ENABLE_FTS5`,
+  the per-connection setup probes FTS5, and a missing FTS5 **fails loudly at
+  boot** with an actionable message rather than silently downgrading. The
+  `--search` / `#[searchable]` scaffold now generates on both backends (#2047).
+- **lifecycle:** the `#[state_machine(lifecycle = …, effects(...))]` path now
+  **rejects at compile time** an `effects(...)` edge that is not a real
+  transition of the referenced lifecycle enum — previously such an edge compiled
+  and silently dropped the effect; it now emits a const-eval `assert!` against
+  the enum's `STATE_MACHINE_TRANSITIONS` table and fails to compile with a clear
+  message (empty `effects` is byte-identical to before) (#2027). Relatedly,
+  `autumn lifecycle diagram` now annotates transition edges that carry a
+  correlated effect — Mermaid `Draft --> Published : on_commit: AnnouncePublishJob`
+  and the DOT equivalent — while effect-free edges render exactly as before
+  (#2029).
+- **ci:** cargo-deny supply-chain gating — a checked-in `deny.toml` plus a
+  standalone `supply-chain` job (`cargo deny check advisories licenses sources`,
+  pinned cargo-deny 0.20.2) now blocks on new advisories, un-allowed licenses,
+  and unknown sources, with first-run advisories triaged as documented,
+  review-dated `ignore`s and a `CONTRIBUTING.md` triage section (references
+  #1600) (#2050).
+- **ci:** heavy trusted Linux CI lanes can now offload to an **opt-in
+  self-hosted Hetzner ephemeral runner set** (default 6, gated on the repo var
+  `AUTUMN_SELF_HOSTED_HEAVY == "1"`) via a reusable `runner-routing.yml`; by
+  construction every `pull_request` — fork and same-repo alike — stays on
+  `ubuntu-latest`, and unsetting the var reverts all lanes to hosted (#2046).
+  The `deploy-real-vps` validation harness (#2019) was hardened across several
+  fixes: the hcloud CLI pin was corrected (`1.49.1`→`1.66.0`), the retired
+  Hetzner server type replaced (`cx22`→`cpx11`), server-type selection made to
+  resolve an orderable type at runtime from a refreshed cheapest-first
+  preference list across fallback locations, and the kamal-proxy probe pinned to
+  `v0.9.2` with a `set -u` crash fixed (#2039, #2043, #2048, #2049, #2052).
+- **ci:** tagged releases now publish a native Windows CLI binary
+  (`autumn-x86_64-pc-windows-msvc.zip` + `.sha256`) alongside a `scripts/
+  install.ps1` and a README Windows install subsection (part of #2005) (#2033).
+  The `pam_systemd` deploy end-to-end test was un-gated (the `deploy-e2e-pam`
+  cargo feature removed) so it now runs in the default Docker `--ignored` sweep;
+  `docs/guide/deployment.md` was reworded to the standard `--ignored` invocation
+  (references #2019) (#2032).
 - **a11y:** the typed `a11y::TextField` primitive (issue #1706) can now carry
   the wrapper/validation attributes that raw scaffold form-fields need — a
   `class`, the `aria-invalid`/`aria-describedby` error wiring, and the HTML5
@@ -1790,6 +1912,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `docs/guide/sharding.md`.
 
 ### Fixed
+
+- **docs:** aligned the `autumn-cli` install pin to the workspace `0.6.0` across
+  `getting-started.md`, `docs-smoke.md`, `deployment.md`, `websockets.md`, and
+  `tutorial/01-project-setup.md` (fixing `repo_hygiene::first_run_docs_match_current_release_line`),
+  and removed an obsolete note in `deployment.md` that claimed 0.6.0 lacks
+  `autumn deploy` — trunk-dev's in-prep 0.6.0 does ship it (#2037).
+- **docs:** fixed the `ProvideProbeState::mark_startup_complete` doctest in
+  `autumn/src/probe.rs` (`crate::db::RuntimeConnection` →
+  `autumn_web::db::RuntimeConnection`), which reddened `cargo test --workspace`
+  because a doctest's `crate` is the synthetic doctest crate with no `db` module
+  (#2057). [no-plugin]
 
 - **idempotency:** the in-memory idempotency store no longer panics on extreme
   TTL values. `Instant::now() + ttl` panics when the sum is not representable by

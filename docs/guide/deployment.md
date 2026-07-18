@@ -382,6 +382,75 @@ or error messages.
   marker on disk. If the proxy signal is absent or unclear it falls back to the
   marker exactly as before, so the reconcile never changes a healthy deploy.
 
+### MediaMTX host provisioning (`[media]`)
+
+An app that uses the [autumn-media](../../autumn-media-plugin/README.md) plugin
+(RTMP/WHIP ingest, HLS/WebRTC playback, recording) can have `autumn deploy`
+provision **MediaMTX** as a host **systemd unit** on the same box — exactly as it
+already provisions kamal-proxy (#2051). It is **opt-in and disabled by default**,
+so a non-media project is byte-for-byte unaffected.
+
+Enable it in `autumn.toml` (or a profile / `autumn-<profile>.toml` layer):
+
+```toml
+[media.mediamtx]
+enabled = true                 # off by default; the controller is a no-op when false
+# recordings_dir = "/var/lib/mediamtx/recordings"
+# record_delete_after = "72h"  # MediaMTX recordDeleteAfter retention window
+# webrtc_additional_hosts = ["my-app-mediamtx.example.com"]  # extra WebRTC ICE hosts
+# The listen ports below default to MediaMTX's standard values; override only if
+# you also change the app-side *_base URLs to match.
+# api_port = 9997        # control API
+# rtmp_port = 1935       # RTMP/WHIP ingest
+# hls_port = 8888        # HLS playback
+# webrtc_port = 8889     # WebRTC/WHEP playback
+# playback_port = 9996   # recording playback
+# webrtc_local_udp = 8189
+# config_path = "/etc/mediamtx/mediamtx.yml"   # where the rendered config is written
+# binary_path = "/usr/local/bin/mediamtx"      # host bootstrap installs it; deploy does not download it
+# unit_name = "mediamtx"                        # systemd unit name (no .service suffix)
+
+[media.ffmpeg]
+# bin = "/usr/bin/ffmpeg"  # concrete path; verified by the deploy-time FFmpeg preflight
+```
+
+When `enabled = true`, `autumn deploy`:
+
+1. Renders `mediamtx.yml` (LL-HLS window, fmp4 recording under `recordings_dir`,
+   WebRTC config, and a `~^room/.+$` path matcher for autumn-media Rooms) plus
+   the systemd unit, then runs `daemon-reload && enable --now && restart`.
+2. Runs **three fail-closed host preflight checks before touching the host** —
+   FFmpeg resolves (the concrete `[media.ffmpeg] bin`), the recordings directory
+   is writable, and the MediaMTX ports are free — and **aborts the deploy** if the
+   host cannot serve media, rather than shipping a half-provisioned box.
+
+`autumn deploy plan` surfaces the media unit, its provisioning steps, and the
+CSP origins your app must allow. The three browser-facing MediaMTX origins
+(WebRTC `:8889`, HLS `:8888`, playback `:9996`) must appear in your
+`connect-src` / `media-src` (and `frame-src` for WebRTC) CSP; in production they
+collapse to your public MediaMTX origin, and your object-store origin must also
+be allowed in `media-src` for recorded playback.
+
+> **`strict_config` interaction.** The `[media]` table is **plugin-owned** — it
+> is not part of autumn-web's `AutumnConfig` schema. `autumn deploy` reads
+> `[media.mediamtx]` / `[media.ffmpeg]` straight from the merged `autumn.toml`
+> (base ← inline `[profile.<name>]` ← `autumn-<profile>.toml`) precisely so it
+> never routes through that strict schema. But the **app runtime** is a different
+> story: if you turn on autumn-web's strict config validation
+> (`[server] strict_config = true`, or `AUTUMN_SERVER__STRICT_CONFIG=1`), a
+> top-level `[media]` table is flagged as an **unknown top-level key** and the app
+> **fails to boot**, because unknown top-level keys hard-fail under
+> `strict_config` (they are not one of the sections the plugin registers with the
+> validator). If you run a media app with strict config, keep this in mind — the
+> deploy-side provisioning is unaffected, but the running app's strict validation
+> is not aware of the plugin's `[media]` section.
+
+**Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
+installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
+a host-bootstrap step), and wiring the three doctor checks into the offline
+`autumn doctor` CLI (they run only in the executor-holding `deploy up` / `deploy
+plan` paths today).
+
 ### How the deploy path is validated in CI
 
 Two layers exercise the real `autumn deploy` lifecycle over real ssh/scp +

@@ -229,3 +229,47 @@ pub async fn search(
     })
 }
 ```
+
+---
+
+## 6. SQLite FTS5
+
+The same `#[searchable]` model annotation and the same generated repository
+APIs (`search`, `search_page`, `search_page_scoped`) also work on the **SQLite**
+backend (#2047). The `--search` / `#[searchable]` scaffold now generates on both
+backends — you write your models the same way, and the generator emits a
+backend-appropriate search index:
+
+| | Postgres | SQLite |
+| --- | --- | --- |
+| Index | `tsvector` generated column + `GIN` index | external-content **FTS5** virtual table kept in sync by AFTER INSERT/DELETE/UPDATE triggers |
+| Tokenizer | Postgres text-search config | `unicode61` (full-Unicode case/diacritic folding, so `äpfel` matches `Äpfel`) |
+| Ranking | `ts_rank` | `bm25`, with per-column weights derived from `#[searchable(weight=…)]` priorities (A=10, B=5, C=2, else 1) |
+
+Nothing in your application or repository call sites changes — the tenant,
+soft-delete, and owner scoping predicates are applied identically on both
+backends.
+
+### Query safety (fail-closed)
+
+On SQLite, the free-text query is passed through a **fail-closed,
+injection-safe** sanitizer (`repository::sqlite_fts5_match_query`) before it ever
+reaches FTS5. It tokenizes the input on Unicode whitespace and turns every token
+into a literal quoted phrase — so every FTS5 operator (`AND` / `OR` / `NOT` /
+`NEAR` / `col:` / `*` / parentheses / quotes / a leading `-`) is treated as a
+**literal search term**, never as syntax. An empty or whitespace-only query (or
+one that produces no tokens) yields an **empty result page with no query run** —
+it never degrades into an unfiltered table scan.
+
+### FTS5 is a hard boot dependency
+
+FTS5 is not optional at runtime. `libsqlite3-sys` is built bundled with
+`SQLITE_ENABLE_FTS5`, and each SQLite connection probes FTS5 availability during
+setup. If FTS5 is missing, the app **fails loudly at boot** with an actionable
+message rather than silently falling back to a slower `LIKE` scan — so a SQLite
+search app is either correct or it does not start.
+
+> SQLite full-text search is part of the single-host [SQLite in
+> production](./sqlite-in-production.md) tier. For the scale-out reasons to
+> prefer Postgres (read replicas, sharding, multi-replica scheduling), see the
+> comparison table at the top of that guide.
