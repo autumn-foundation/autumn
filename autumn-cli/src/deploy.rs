@@ -23,6 +23,7 @@
 //! shared with `autumn doctor`.
 
 pub mod exec;
+pub mod media;
 pub mod proxy;
 
 use std::net::{TcpStream, ToSocketAddrs};
@@ -294,6 +295,13 @@ pub struct PreflightCheck {
     pub name: &'static str,
     /// Whether the check passed.
     pub passed: bool,
+    /// Whether the check could not be verified here and is deliberately
+    /// **deferred to the service's own runtime** (e.g. an env/interpolation
+    /// indirected `[media.ffmpeg] bin` the deploy side must not guess). A
+    /// deferred check is non-passing but **non-blocking** — it is surfaced as a
+    /// warning and never aborts a deploy, distinct from an honest failure. See
+    /// [`PreflightCheck::blocking`].
+    pub deferred: bool,
     /// Human-readable detail (what was found).
     pub detail: String,
     /// One-line remediation hint shown on failure.
@@ -305,6 +313,7 @@ impl PreflightCheck {
         Self {
             name,
             passed: true,
+            deferred: false,
             detail: detail.into(),
             hint: None,
         }
@@ -314,9 +323,20 @@ impl PreflightCheck {
         Self {
             name,
             passed: false,
+            deferred: false,
             detail: detail.into(),
             hint: Some(hint),
         }
+    }
+
+    /// Whether this check must abort the deploy. A check blocks only when it
+    /// genuinely failed — a **deferred** check (non-passing, but resolved in the
+    /// service's own runtime environment) is surfaced as a warning and never
+    /// blocks. This is the single predicate every preflight gate keys on so a
+    /// deferred outcome can never silently pass *or* hard-fail a deploy.
+    #[must_use]
+    pub const fn blocking(&self) -> bool {
+        !self.passed && !self.deferred
     }
 }
 
@@ -846,19 +866,222 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
     let resolved = ResolvedDeployConfig::resolve(&deploy_cfg, &resolve_project_name())
         .map_err(DeployError::Config)?;
 
+    // MediaMTX host-provisioning config (issue #1974, Slice 7) is loaded ONLY in
+    // the actions that plan/provision media (`plan` and `up`). `check`/`rollback`
+    // neither read nor provision `MediaMTX`, so parsing `[media]` there would let a
+    // typo in `[media.mediamtx]`/`[media.ffmpeg]` fail-close a rollback that does
+    // not touch media at all — a regression the round-2 fail-closed fix must not
+    // introduce. The load stays fail-closed where it IS relevant (`plan`/`up`): a
+    // present-but-invalid `[media]` table still aborts those two.
     match action {
         // `plan` is a pure dry-run over `resolved` alone — it never grades or
         // uploads runtime VALUES, so it needs no reload under the target profile.
         DeployAction::Plan => {
-            print_plan(&resolved);
+            let (media_cfg, _ffmpeg_bin) = load_media_host_config(&resolved)?;
+            print_plan(&resolved, &media_cfg);
             Ok(())
         }
         // `check`/`rollback`/`up` grade and (for `up`) upload the signing secret
         // and DB URL, so they must see those VALUES resolved under the TARGET
         // deploy profile — not the operator's ambient/dev config. Reload here.
+        // `check`/`rollback` deliberately do NOT load the media config.
         DeployAction::Check => run_check(&load_runtime_config(&resolved)?, &resolved),
         DeployAction::Rollback => run_rollback(&load_runtime_config(&resolved)?, &resolved),
-        DeployAction::Up => run_up(&load_runtime_config(&resolved)?, &resolved),
+        DeployAction::Up => {
+            let (media_cfg, ffmpeg_bin) = load_media_host_config(&resolved)?;
+            run_up(
+                &load_runtime_config(&resolved)?,
+                &resolved,
+                &media_cfg,
+                &ffmpeg_bin,
+            )
+        }
+    }
+}
+
+/// Load the `[media.mediamtx]` host-provisioning config and the `[media.ffmpeg]
+/// bin` path from the project config, resolved **under the target deploy profile**
+/// (issue #1974, Slice 7; issue #2051, Finding O).
+///
+/// Reads the raw project TOML and deserializes only the `[media]` subtree
+/// (mirroring how `autumn-media-plugin` reads its own config), so it bypasses
+/// `autumn-web`'s strict `AutumnConfig` schema and adds no dependency on the
+/// plugin. Crucially it applies the **same base+profile TOML layering
+/// `AutumnConfig::load()` applies to the app config** — base `autumn.toml`, then
+/// the inline `[profile.<name>]` sections, then `autumn-<profile>.toml` — so a
+/// profiled deploy (`prod`/`staging`) provisions `MediaMTX` from the profile's
+/// `[media.mediamtx]` / `[media.ffmpeg]` (`[profile.<name>.media.*]` or
+/// `autumn-<profile>.toml`) instead of the base default. Without this a
+/// prod-enabled `[profile.prod.media.mediamtx]` (or `autumn-prod.toml`) would be
+/// ignored and `plan`/`up` would see the disabled base config, so the release
+/// boots under the target profile with no media daemon provisioned. The env-var
+/// override layer (`AUTUMN_MEDIA__*`) is deliberately NOT applied here — an
+/// env/interpolation-indirected value is resolved from the SERVICE'S OWN
+/// environment at runtime (see [`media::ffmpeg_preflight`]'s fail-closed-honest
+/// deferral), which the CLI neither has nor may guess.
+///
+/// A missing file (or one that cannot be read) yields the disabled default plus
+/// the default `FFmpeg` path, so a project that does not use autumn-media is
+/// unaffected.
+///
+/// **Fails closed on invalid media config.** A `[media.mediamtx]` /
+/// `[media.ffmpeg]` table that is *present but does not deserialize* (a
+/// wrong-typed value) **in any contributing layer** is an error, not a silent
+/// fallback: the merged value carries the bad type and
+/// [`media::media_host_config_from_value`] returns [`DeployError::Config`] so
+/// `deploy plan`/`deploy up` abort with a clear message instead of proceeding
+/// WITHOUT provisioning a media-enabled app's `MediaMTX` daemon. The disabled
+/// default is reserved for the genuinely *absent* case.
+fn load_media_host_config(
+    resolved: &ResolvedDeployConfig,
+) -> Result<(media::MediaMtxHostConfig, String), DeployError> {
+    load_media_host_config_in(&manifest_project_dirs(), &resolved.profile)
+}
+
+/// Pure core of [`load_media_host_config`] over an explicit ordered search path
+/// and RAW deploy-profile spelling, so the base+profile media layering is
+/// unit-testable against temp dirs (mirrors [`manifest_uploads_in`]).
+///
+/// Builds a merged `[media]` subtree exactly as `AutumnConfig::load_with_env`
+/// builds the app config (minus the env-override layer, see the caller docs):
+/// base `autumn.toml` ← inline `[profile.<name>]` sections ←
+/// `autumn-<profile>.toml`. The base `autumn.toml` is **optional** — an
+/// absent/unreadable base skips only that layer, exactly like `load_with_env`,
+/// so a deploy that keeps `[media.mediamtx] enabled = true` ONLY in
+/// `autumn-<profile>.toml` (with `[deploy] host` supplied via env and no base
+/// file) still resolves the profile override and provisions `MediaMTX` (Finding
+/// R). When no layer contributes a `[media]` subtree the `#[serde(default)]`
+/// `MediaTomlRoot` deserializes to the disabled default; a base or profile file
+/// that does not parse, or a merged `[media]` subtree with a wrong-typed value,
+/// is a fail-closed [`DeployError::Config`].
+fn load_media_host_config_in(
+    dirs: &[PathBuf],
+    profile_raw: &str,
+) -> Result<(media::MediaMtxHostConfig, String), DeployError> {
+    // Start from an empty root and deep-merge each contributing layer in the same
+    // order `AutumnConfig::load_with_env` does, so the deploy-side `[media]`
+    // resolution matches the app/runtime resolution for every base/profile
+    // combination. The runtime seeds `merged` with `profile_defaults_as_toml`, but
+    // those smart defaults carry NO `[media]` keys, so an empty root is faithful
+    // for the media subtree — an absent `[media]` deserializes to the disabled
+    // default via the `#[serde(default)]` `MediaTomlRoot`. The env-override layer
+    // is deliberately excluded (see the caller docs).
+    let mut merged = toml::Value::Table(toml::map::Map::new());
+
+    // Layer 3: base `autumn.toml` — OPTIONAL, exactly like `load_with_env`. A
+    // missing or unreadable base skips only this layer (a project without
+    // autumn-media is unaffected) but does NOT skip the profile override file
+    // below; a base present-but-malformed is fail-closed.
+    let base_toml: Option<toml::Value> = match first_dir_with_file(dirs, "autumn.toml") {
+        Some(base_path) => match std::fs::read_to_string(&base_path) {
+            Ok(base_str) => {
+                let base: toml::Value = toml::from_str(&base_str).map_err(|e| {
+                    DeployError::Config(format!("invalid config in {}: {e}", base_path.display()))
+                })?;
+                deep_merge_toml(&mut merged, base.clone());
+                Some(base)
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
+
+    // Layer 4: inline `[profile.<name>]` sections in the base autumn.toml (only
+    // present when the base parsed), in the runtime's alias-then-canonical merge
+    // order (`production` then `prod`), so a `[profile.prod.media.mediamtx]` wins
+    // over the base — matching `AutumnConfig::load_with_env`.
+    let canonical = canonicalize_deploy_profile(profile_raw);
+    if let Some(base) = &base_toml {
+        for name in profile_inline_lookup_names(&canonical) {
+            if let Some(section) = profile_section_from_base_toml(base, name) {
+                deep_merge_toml(&mut merged, section);
+            }
+        }
+    }
+
+    // Layer 5: `autumn-<profile>.toml` (first existing in the ordered lookup wins,
+    // reusing the runtime's own pure override-file name resolver so the deploy
+    // reads the SAME profile file the host runtime loads).
+    for name in autumn_web::config::profile_override_file_lookup_names(&canonical, profile_raw) {
+        let basename = format!("autumn-{name}.toml");
+        if let Some(path) = first_dir_with_file(dirs, &basename) {
+            let overlay_str = std::fs::read_to_string(&path).map_err(|e| {
+                DeployError::Config(format!("could not read {}: {e}", path.display()))
+            })?;
+            let overlay: toml::Value = toml::from_str(&overlay_str).map_err(|e| {
+                DeployError::Config(format!("invalid config in {}: {e}", path.display()))
+            })?;
+            deep_merge_toml(&mut merged, overlay);
+            break;
+        }
+    }
+
+    // Deserialize the merged `[media]` subtree — fail-closed on an ill-typed value
+    // in any contributing layer.
+    media::media_host_config_from_value(merged).map_err(|e| {
+        DeployError::Config(format!(
+            "invalid [media] config for deploy profile `{profile_raw}`: {e}"
+        ))
+    })
+}
+
+/// Inline `[profile.<name>]` lookup names for the canonical profile, mirroring
+/// `autumn-web`'s private `profile_lookup_names`: canonical profiles also pull
+/// their legacy alias (`prod`→`production`,`prod`; `dev`→`development`,`dev`) so
+/// a `[profile.production.media.mediamtx]` is honored for a `prod` deploy, while a
+/// custom profile is looked up verbatim. Merged in list order (alias first) so the
+/// canonical spelling wins — identical to the runtime. Kept a local mirror (like
+/// [`canonicalize_deploy_profile`] mirrors `normalize_profile_name`) because the
+/// runtime helper is private.
+fn profile_inline_lookup_names(canonical: &str) -> Vec<&str> {
+    match canonical {
+        "prod" => vec!["production", "prod"],
+        "dev" => vec!["development", "dev"],
+        other => vec![other],
+    }
+}
+
+/// Extract a `[profile.<name>]` table from a parsed `autumn.toml` value as a
+/// standalone TOML value (mirrors `autumn-web`'s private
+/// `profile_section_from_base_toml`). `None` when the section is absent.
+fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<toml::Value> {
+    base.get("profile")
+        .and_then(toml::Value::as_table)
+        .and_then(|profiles| profiles.get(profile))
+        .and_then(toml::Value::as_table)
+        .map(|table| toml::Value::Table(table.clone()))
+}
+
+/// Deep-merge two TOML values — tables merged recursively, non-table `overlay`
+/// values replace `base` (a faithful copy of `autumn-web`'s private `deep_merge`,
+/// so the deploy-side media layering matches the runtime's app-config layering
+/// exactly). Bounded recursion mirrors the runtime's `MAX_MERGE_DEPTH`.
+fn deep_merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    deep_merge_toml_depth(base, overlay, 0);
+}
+
+fn deep_merge_toml_depth(base: &mut toml::Value, overlay: toml::Value, depth: usize) {
+    /// Matches `autumn-web`'s `MAX_MERGE_DEPTH`.
+    const MAX_MERGE_DEPTH: usize = 16;
+    if depth > MAX_MERGE_DEPTH {
+        return;
+    }
+    let toml::Value::Table(overlay_table) = overlay else {
+        return;
+    };
+    let Some(base_table) = base.as_table_mut() else {
+        return;
+    };
+    for (key, overlay_val) in overlay_table {
+        let is_recursive_merge =
+            overlay_val.is_table() && base_table.get(&key).is_some_and(toml::Value::is_table);
+        if is_recursive_merge {
+            if let Some(base_val) = base_table.get_mut(&key) {
+                deep_merge_toml_depth(base_val, overlay_val, depth + 1);
+            }
+        } else {
+            base_table.insert(key, overlay_val);
+        }
     }
 }
 
@@ -1100,6 +1323,13 @@ fn report_preflight(checks: &[PreflightCheck]) -> usize {
     for check in checks {
         if check.passed {
             eprintln!("\u{2705} {}: {}", check.name, check.detail);
+        } else if check.deferred {
+            // Non-blocking: verified in the service's own runtime, not here.
+            // Surfaced as a warning so it is visible but never aborts the deploy.
+            eprintln!("\u{26A0}\u{FE0F}  {}: {}", check.name, check.detail);
+            if let Some(hint) = check.hint {
+                eprintln!("   \u{2192} {hint}");
+            }
         } else {
             failed += 1;
             eprintln!("\u{274C} {}: {}", check.name, check.detail);
@@ -1130,7 +1360,7 @@ fn run_check(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(
     }
 }
 
-fn print_plan(resolved: &ResolvedDeployConfig) {
+fn print_plan(resolved: &ResolvedDeployConfig, media_cfg: &media::MediaMtxHostConfig) {
     println!("\u{1F342} autumn deploy plan (dry-run)\n");
     println!("systemd unit ({}.service):\n", resolved.service_name);
     println!("{}", render_systemd_unit(resolved));
@@ -1139,6 +1369,105 @@ fn print_plan(resolved: &ResolvedDeployConfig) {
     for (i, step) in build_deploy_plan(resolved).iter().enumerate() {
         println!("  {}. [{}] {}", i + 1, step.label, step.description);
     }
+
+    // MediaMTX host provisioning (issue #1974, Slice 7): only when the
+    // `[media.mediamtx]` section is enabled — a non-media deploy prints nothing
+    // new here.
+    if media_cfg.enabled {
+        print_media_plan(media_cfg);
+    }
+}
+
+/// Print the `MediaMTX` host-provisioning section of `deploy plan` — the rendered
+/// systemd unit, the ordered provisioning ops, and the CSP origins the app must
+/// allow. Pure output; runs nothing.
+fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
+    let controller = media::MediaMtxController::new(media_cfg.clone());
+    println!(
+        "\nMediaMTX host provisioning (media unit {}.service):\n",
+        media_cfg.unit_name
+    );
+    println!("{}", media::render_mediamtx_unit(media_cfg));
+    println!("MediaMTX provisioning steps:");
+    for (i, op) in controller.ensure_installed_ops().iter().enumerate() {
+        println!("  {}. [{}]", i + 1, op.label());
+    }
+    println!(
+        "\nMediaMTX doctor checks at `deploy up`: {}, {}, {}, {}, {}",
+        media::CHECK_MEDIAMTX_PORTS_DISTINCT,
+        media::CHECK_FFMPEG_PREFLIGHT,
+        media::CHECK_MEDIAMTX_BINARY,
+        media::CHECK_RECORDINGS_DIR_WRITABLE,
+        media::CHECK_MEDIAMTX_PORTS_AVAILABLE,
+    );
+    println!(
+        "CSP: the app must allow these MediaMTX origins in connect-src/media-src \
+         (frame-src for WebRTC): {}",
+        media_cfg.required_csp_origins().join(", "),
+    );
+}
+
+/// Grade the media host with the fail-closed, **non-mutating** doctor checks
+/// (`FFmpeg` preflight, `MediaMTX` binary, recordings dir writable, ports
+/// distinct/available) and abort the deploy on any **blocking** failure — so a
+/// host that cannot serve media fails fast BEFORE the app deploy touches
+/// anything. A **deferred** check (an env/interpolation-indirected
+/// `[media.ffmpeg] bin` the deployed service resolves from its own runtime
+/// environment) is surfaced as a warning and does **not** abort — the service
+/// resolves `FFmpeg` at runtime, so blocking the deploy here would be wrong,
+/// while a concrete literal `FFmpeg` path that is missing/not-executable still
+/// fails closed (see [`media::ffmpeg_preflight`] and
+/// [`PreflightCheck::blocking`]). A no-op when `[media.mediamtx]` is not enabled.
+/// This writes and restarts nothing; the mutating provisioning is deferred to
+/// [`provision_media_host`], which runs only after the app cutover succeeds.
+fn check_media_host_preflight(
+    media_cfg: &media::MediaMtxHostConfig,
+    ffmpeg_bin: &str,
+    executor: &impl exec::DeployExecutor,
+) -> Result<(), DeployError> {
+    if !media_cfg.enabled {
+        return Ok(());
+    }
+    eprintln!("\u{1F3A5} media host preflight (autumn-media)\n");
+
+    let checks = media::collect_media_doctor_checks(executor, media_cfg, ffmpeg_bin);
+    let failed = report_preflight(&checks);
+    if failed > 0 {
+        return Err(DeployError::PreflightFailed(failed));
+    }
+    Ok(())
+}
+
+/// Provision `MediaMTX` as a systemd unit over the live executor — write the
+/// rendered `mediamtx.yml` + unit and enable/restart the service (issue #1974,
+/// Slice 7). A no-op when `[media.mediamtx]` is not enabled.
+///
+/// **Runs only AFTER the app deploy/cutover has fully succeeded.** The app deploy
+/// rolls back on failure (readiness-gate miss, migration failure) and leaves the
+/// OLD release serving; there is deliberately no media teardown restoring the
+/// previous `mediamtx.yml`, so mutating (and possibly restarting) the host
+/// `MediaMTX` unit BEFORE the app is committed would strand a rolled-back release
+/// against a media daemon whose ports/recording-paths/matchers just moved.
+/// Deferring the mutation until the deploy is committed means a failed/rolled-back
+/// app deploy never writes or restarts `MediaMTX`. The non-mutating doctor checks
+/// already ran up front in [`check_media_host_preflight`].
+fn provision_media_host(
+    media_cfg: &media::MediaMtxHostConfig,
+    executor: &impl exec::DeployExecutor,
+) -> Result<(), DeployError> {
+    if !media_cfg.enabled {
+        return Ok(());
+    }
+    eprintln!("\u{1F3A5} provisioning MediaMTX host (autumn-media)\n");
+
+    let controller = media::MediaMtxController::new(media_cfg.clone());
+    exec::run_ops(&controller.ensure_installed_ops(), executor)
+        .map_err(|e| DeployError::Exec(e.to_string()))?;
+    eprintln!(
+        "\u{2705} MediaMTX provisioned ({}.service)",
+        media_cfg.unit_name
+    );
+    Ok(())
 }
 
 /// Build the secret env-file body sourced by the systemd unit's
@@ -1368,7 +1697,15 @@ fn validate_public_port(public_port: u16) -> Result<(), String> {
     Ok(())
 }
 
-fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
+// Linear deploy orchestrator; the added MediaMTX host-prep step (#1974 Slice 7)
+// tips it one line over the threshold, and it reads clearest as one sequence.
+#[allow(clippy::too_many_lines)]
+fn run_up(
+    config: &AutumnConfig,
+    resolved: &ResolvedDeployConfig,
+    media_cfg: &media::MediaMtxHostConfig,
+    ffmpeg_bin: &str,
+) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy up\n");
 
     // Fail fast: run the full preflight and abort BEFORE any remote call.
@@ -1401,6 +1738,13 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
     let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs)
         .with_tls_host(resolved.tls_host.clone());
     let executor = exec::SshExecutor::new(target);
+    // MediaMTX host preflight (#1974 Slice 7) — non-mutating doctor checks run
+    // BEFORE the app deploy so a bad media host fails fast without anything being
+    // written. The MUTATING provisioning (write config/unit + restart) is deferred
+    // until after the app cutover succeeds (below) so a rolled-back app deploy
+    // never touches the host MediaMTX unit. No-op unless enabled (see fn).
+    check_media_host_preflight(media_cfg, ffmpeg_bin, &executor)?;
+
     let release_dir = format!("{}/{release_id}", resolved.releases_dir());
 
     // Probe the target to choose first-deploy vs zero-downtime redeploy. The same
@@ -1503,6 +1847,13 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
         exec::execute_redeploy(&checks, &ops, &teardown, &executor)
     };
     result.map_err(|e| DeployError::Exec(e.to_string()))?;
+
+    // App deploy is committed here: the cutover succeeded and there is no longer a
+    // rollback path. Only NOW provision the host MediaMTX unit (write config/unit +
+    // restart) — deferring the mutation past this point means a failed/rolled-back
+    // app deploy above never wrote or restarted MediaMTX (#1974 Slice 7). No-op
+    // unless enabled (see fn).
+    provision_media_host(media_cfg, &executor)?;
 
     eprintln!("\n\u{2705} Deploy complete. Roll back with `autumn deploy rollback`.");
     Ok(())
@@ -2297,6 +2648,159 @@ mod tests {
         assert!(uploads.is_empty(), "no autumn.toml → nothing to upload");
     }
 
+    // ── Media config resolves under the deploy profile (Finding O) ───────────
+
+    #[test]
+    fn media_config_no_manifest_is_disabled_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dirs = vec![dir.path().to_path_buf()];
+        let (cfg, bin) = load_media_host_config_in(&dirs, "prod").expect("loads");
+        assert!(!cfg.enabled, "no autumn.toml → controller disabled");
+        assert_eq!(bin, media::DEFAULT_FFMPEG_BIN);
+    }
+
+    #[test]
+    fn media_config_honors_inline_profile_section() {
+        // `[profile.prod.media.mediamtx]` enables media over a base that omits it —
+        // a profiled deploy must see the profile's config, not the base default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[media.ffmpeg]\nbin = \"/usr/bin/ffmpeg\"\n\
+             [profile.prod.media.mediamtx]\nenabled = true\napi_port = 19997\n",
+        )
+        .expect("write base");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        // prod: the inline profile section is layered on.
+        let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
+        assert!(prod.enabled, "prod profile enables media");
+        assert_eq!(prod.api_port, 19997);
+
+        // dev: no matching profile section → base default (media disabled).
+        let (dev, _) = load_media_host_config_in(&dirs, "dev").expect("loads dev");
+        assert!(
+            !dev.enabled,
+            "dev has no profile media section → base default"
+        );
+    }
+
+    #[test]
+    fn media_config_honors_profile_override_file() {
+        // The `autumn-prod.toml` override file enables media over a base that omits
+        // it, matching the runtime's Layer-5 override.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\nport = 3000\n")
+            .expect("write base");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[media.mediamtx]\nenabled = true\nrtmp_port = 11935\n",
+        )
+        .expect("write prod override");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
+        assert!(prod.enabled, "autumn-prod.toml enables media");
+        assert_eq!(prod.rtmp_port, 11935);
+    }
+
+    #[test]
+    fn media_config_honors_profile_override_file_without_base_autumn_toml() {
+        // Finding R: the base `autumn.toml` is OPTIONAL, exactly like
+        // `AutumnConfig::load_with_env`. A deploy that supplies `[deploy] host` via
+        // env and keeps `[media.mediamtx] enabled = true` ONLY in `autumn-prod.toml`
+        // (with NO base autumn.toml) must still resolve the profile override and
+        // provision MediaMTX — previously the loader early-returned the disabled
+        // default the moment no base file existed, silently skipping the override.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[media.mediamtx]\nenabled = true\nrtmp_port = 11935\n",
+        )
+        .expect("write prod override");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
+        assert!(
+            prod.enabled,
+            "profile-only media config is provisioned with no base autumn.toml"
+        );
+        assert_eq!(prod.rtmp_port, 11935);
+
+        // dev: no `autumn-dev.toml` and no base → disabled default (the override
+        // file is profile-scoped, so a different profile is unaffected).
+        let (dev, _) = load_media_host_config_in(&dirs, "dev").expect("loads dev");
+        assert!(!dev.enabled, "dev has no override file → disabled default");
+    }
+
+    #[test]
+    fn media_config_profile_layer_overrides_base_value() {
+        // Base enables media on one api_port; the profile override wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[media.mediamtx]\nenabled = true\napi_port = 9997\n",
+        )
+        .expect("write base");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[media.mediamtx]\napi_port = 29997\n",
+        )
+        .expect("write prod override");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
+        assert!(
+            prod.enabled,
+            "base enablement is preserved under deep merge"
+        );
+        assert_eq!(
+            prod.api_port, 29997,
+            "profile override wins over the base value"
+        );
+    }
+
+    #[test]
+    fn media_config_base_only_when_profile_has_no_media_layer() {
+        // No inline `[profile.prod]` and no autumn-prod.toml → the base config is
+        // read verbatim under the profile.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[media.mediamtx]\nenabled = true\napi_port = 9001\n",
+        )
+        .expect("write base");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
+        assert!(prod.enabled);
+        assert_eq!(prod.api_port, 9001);
+    }
+
+    #[test]
+    fn media_config_fails_closed_on_invalid_value_in_active_profile_layer() {
+        // A present-but-ill-typed value in the ACTIVE profile layer aborts, even
+        // though the base is valid — the fail-closed rule spans every layer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[media.mediamtx]\nenabled = true\n",
+        )
+        .expect("write base");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[media.mediamtx]\napi_port = \"nope\"\n",
+        )
+        .expect("write bad prod override");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let err = load_media_host_config_in(&dirs, "prod").expect_err("must fail closed");
+        assert!(
+            matches!(err, DeployError::Config(_)),
+            "invalid profile-layer media config aborts the deploy: {err:?}"
+        );
+    }
+
     #[test]
     fn manifest_notice_warns_loudly_when_no_manifest() {
         let notice = manifest_preflight_notice(&[]);
@@ -2825,5 +3329,119 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.jobs.backend = "redis".to_owned();
         assert!(!requires_database_pool(&config));
+    }
+
+    #[test]
+    fn rollback_dispatch_does_not_load_media_config() {
+        // Finding F: the media host config is loaded ONLY in the plan/up action
+        // paths. `check`/`rollback` neither read nor provision MediaMTX, so a typo
+        // in `[media.mediamtx]`/`[media.ffmpeg]` must not fail-close a rollback (a
+        // regression the round-2 fail-closed load would otherwise reintroduce). The
+        // load is filesystem-coupled (`manifest_project_dirs()`), so we assert the
+        // dispatch source itself: the fallible load call appears only inside the
+        // Plan and Up match arms, never in Check/Rollback.
+        let src = include_str!("deploy.rs");
+        // Build the needle at runtime so this test's own source text (which mentions
+        // the fn name) can never be miscounted as a call site. The loader now takes
+        // the resolved deploy config (Finding O), so match the call shape, not `()`.
+        let needle = ["load_media_host_config", "(&resolved)?"].concat();
+        let call_sites = src.matches(needle.as_str()).count();
+        assert_eq!(
+            call_sites, 2,
+            "expected exactly two fallible load-media call sites (Plan + Up), found {call_sites}",
+        );
+
+        // Isolate `run()`'s match arms and prove Rollback/Check don't load media.
+        let run_body = src
+            .split("pub fn run(action: DeployAction)")
+            .nth(1)
+            .expect("run() present");
+        let rollback_arm = run_body
+            .split("DeployAction::Rollback =>")
+            .nth(1)
+            .expect("Rollback arm present");
+        // Rollback dispatch line runs to the next arm.
+        let rollback_line = rollback_arm
+            .split("DeployAction::Up")
+            .next()
+            .expect("Up arm follows Rollback");
+        assert!(
+            !rollback_line.contains("load_media_host_config"),
+            "the Rollback arm must not load the media config",
+        );
+        let check_arm = run_body
+            .split("DeployAction::Check =>")
+            .nth(1)
+            .and_then(|s| s.split("DeployAction::Rollback").next())
+            .expect("Check arm present");
+        assert!(
+            !check_arm.contains("load_media_host_config"),
+            "the Check arm must not load the media config",
+        );
+    }
+
+    #[test]
+    fn media_provisioning_is_deferred_past_app_cutover_in_up() {
+        // Finding K: the MUTATING MediaMTX provisioning must run only AFTER the app
+        // deploy/cutover commits. The app deploy rolls back on failure (readiness
+        // gate, migrations) and leaves the OLD release serving, and there is
+        // deliberately no media teardown — so writing/restarting the host MediaMTX
+        // unit BEFORE the app is committed would strand a rolled-back release
+        // against a moved media daemon. We assert the `run_up` source order: the
+        // non-mutating preflight precedes the app deploy, and `provision_media_host`
+        // is invoked only after the committing `result.map_err(...)?` line.
+        let src = include_str!("deploy.rs");
+        let up_body = src
+            .split("fn run_up(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn run_rollback(").next())
+            .expect("run_up body present");
+
+        let preflight_at = up_body
+            .find("check_media_host_preflight(media_cfg")
+            .expect("preflight call present in run_up");
+        // The app deploy is executed via execute_first_deploy/execute_redeploy and
+        // committed by this `result.map_err(...)?` line; a failed deploy returns
+        // here (after the teardown-on-failure) before anything below runs.
+        let commit_at = up_body
+            .find("result.map_err(|e| DeployError::Exec(e.to_string()))?;")
+            .expect("app deploy commit line present in run_up");
+        let provision_at = up_body
+            .find("provision_media_host(media_cfg, &executor)?;")
+            .expect("deferred provisioning call present in run_up");
+
+        assert!(
+            preflight_at < commit_at,
+            "media preflight must precede the app deploy commit",
+        );
+        assert!(
+            commit_at < provision_at,
+            "MediaMTX provisioning must run only AFTER the app deploy commits — so a \
+             rolled-back app deploy (which returns at the commit line) never reaches it",
+        );
+
+        // The preflight itself is non-mutating: it runs the doctor checks but must
+        // NOT drive the controller ops (those live only in provision_media_host).
+        let preflight_fn = src
+            .split("fn check_media_host_preflight(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn provision_media_host(").next())
+            .expect("check_media_host_preflight present");
+        assert!(
+            preflight_fn.contains("collect_media_doctor_checks"),
+            "preflight must run the doctor checks",
+        );
+        assert!(
+            !preflight_fn.contains("ensure_installed_ops"),
+            "preflight must NOT drive the mutating controller ops (write/restart)",
+        );
+
+        // And the mutating provisioning is reachable only on the post-commit path.
+        let after_commit = &up_body[commit_at..];
+        assert!(
+            after_commit.contains("provision_media_host(media_cfg, &executor)?;"),
+            "provisioning must sit on the post-commit path (unreachable when the app \
+             deploy errors out at the commit line)",
+        );
     }
 }
