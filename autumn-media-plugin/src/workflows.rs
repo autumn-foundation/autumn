@@ -36,6 +36,7 @@ use crate::encode::{
     FfmpegHighlightCommand, FfmpegPosterCommand, FfmpegPreviewSpriteCommand,
     FfmpegRoomCompositeCommand, PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH,
     PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS, build_preview_webvtt,
+    validate_room_composite_input_count,
 };
 use crate::error::MediaError;
 use crate::sink::{MediaArtifact, MediaArtifactFile, MediaArtifactKind, MediaArtifactSinkExt};
@@ -603,6 +604,11 @@ async fn run_room_composite(
         workflow_id,
         source_id,
     } = args;
+    // Reject a malformed job (fewer than two / more than six source paths)
+    // against the same `2..=6` band `FfmpegRoomCompositeCommand::run()` enforces
+    // *before* spawning any `ffprobe`, so a bad queued job can never fan out one
+    // probe child process per supplied path only to be rejected afterwards.
+    validate_room_composite_input_count(source_paths.len())?;
     let (output_path, ephemeral) = staged_output(storage, &output_key, "mp4")?;
     // Detect, per input, whether it carries an audio stream so the composite
     // mixes only the inputs that actually have audio. Probing is async I/O and
@@ -846,8 +852,9 @@ mod tests {
         FinalizeRecordingJobArgs, MediaWorkflowDelegate, MediaWorkflowDelegateExt,
         MediaWorkflowRequest, MediaWorkflows, PreviewJobArgs, RoomCompositeJobArgs,
         ThumbnailJobArgs, TranscodeJobArgs, compose_room_recording, extract_thumbnail,
-        media_job_infos, persist_and_cleanup, staged_output,
+        media_job_infos, persist_and_cleanup, run_room_composite, staged_output,
     };
+    use crate::error::MediaError;
     use crate::sink::MediaArtifactSinkExt;
     use crate::sink::tests::CountingSink;
     use crate::storage::MediaStorage;
@@ -1155,6 +1162,29 @@ mod tests {
         assert!(result.is_err(), "missing sources must fail the job");
         assert_eq!(sink.failed.load(Ordering::SeqCst), 1);
         assert_eq!(sink.completed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn room_composite_rejects_more_than_six_paths_before_probing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = local_storage(temp.path());
+        // Seven paths (over the 2..=6 mesh-room band). A bogus ffmpeg bin means
+        // its sibling `ffprobe` cannot resolve either, so if this reached the
+        // probe loop it would spawn seven child processes; the input-count guard
+        // must reject first and return the same `2..=6` cap error `run()` uses.
+        let sources: Vec<PathBuf> = (0..7)
+            .map(|i| temp.path().join(format!("missing-{i}.mp4")))
+            .collect();
+        let args = room_composite_args(sources);
+        let result = run_room_composite("/nonexistent/ffmpeg-bin", &storage, args).await;
+        assert!(
+            matches!(
+                result,
+                Err(MediaError::FfmpegSourceMissing { ref path })
+                    if path.contains("at most six")
+            ),
+            "a >6-path job must be rejected by the input-count cap before probing, got {result:?}"
+        );
     }
 
     #[test]

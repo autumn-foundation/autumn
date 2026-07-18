@@ -788,6 +788,31 @@ pub const ROOM_COMPOSITE_CELL_HEIGHT: u32 = 360;
 /// const so this dependency-free encode module needs no `config` import.
 const ROOM_COMPOSITE_MAX_INPUTS: usize = 6;
 
+/// Minimum participant recordings a room composite accepts (a grid needs ≥ 2).
+const ROOM_COMPOSITE_MIN_INPUTS: usize = 2;
+
+/// Validate a room-composite input count against the `2..=6` mesh-room band,
+/// returning the same [`MediaError::FfmpegSourceMissing`] `run()` produces.
+///
+/// Shared by [`FfmpegRoomCompositeCommand::run`] and the composite job caller
+/// (`run_room_composite`) so the caller can reject a malformed (`> 6` or `< 2`)
+/// job **before** spawning any `ffprobe` — a bad queued job otherwise fans out
+/// one probe child process per supplied path before `run()` rejects it anyway.
+/// Single source of truth for both the bound and the error message.
+pub(crate) fn validate_room_composite_input_count(count: usize) -> Result<(), MediaError> {
+    if count < ROOM_COMPOSITE_MIN_INPUTS {
+        return Err(MediaError::FfmpegSourceMissing {
+            path: "<room composite needs at least two participant recordings>".to_owned(),
+        });
+    }
+    if count > ROOM_COMPOSITE_MAX_INPUTS {
+        return Err(MediaError::FfmpegSourceMissing {
+            path: "<room composite accepts at most six participant recordings>".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Grid-composite encoder for a finished mesh-room recording.
 ///
 /// Tiles each participant's recording into a grid — `2x1` for two participants,
@@ -895,16 +920,7 @@ impl FfmpegRoomCompositeCommand {
     /// inspected after a successful run.
     pub fn run(&self) -> Result<u64, MediaError> {
         require_sources(&self.input_paths)?;
-        if self.input_paths.len() < 2 {
-            return Err(MediaError::FfmpegSourceMissing {
-                path: "<room composite needs at least two participant recordings>".to_owned(),
-            });
-        }
-        if self.input_paths.len() > ROOM_COMPOSITE_MAX_INPUTS {
-            return Err(MediaError::FfmpegSourceMissing {
-                path: "<room composite accepts at most six participant recordings>".to_owned(),
-            });
-        }
+        validate_room_composite_input_count(self.input_paths.len())?;
         create_output_parent(&self.output_path)?;
 
         let output = run_ffmpeg_capped(&self.ffmpeg_bin, self.args()).map_err(|source| {
@@ -1380,6 +1396,7 @@ mod tests {
         PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH, PREVIEW_FRAME_INTERVAL_SECONDS,
         PREVIEW_SPRITE_COLUMNS, build_preview_webvtt, newest_recording_files,
         newest_recording_files_since, recording_segments_covering_window, slugify,
+        validate_room_composite_input_count,
     };
 
     // ── Arg-vector contracts (no FFmpeg binary required) ────────────────────
@@ -1729,6 +1746,28 @@ mod tests {
             cmd.run(),
             Err(super::MediaError::FfmpegSourceMissing { .. })
         ));
+    }
+
+    #[test]
+    fn validate_room_composite_input_count_enforces_two_to_six_band() {
+        // Below the band → "at least two" error.
+        for count in [0, 1] {
+            assert!(matches!(
+                validate_room_composite_input_count(count),
+                Err(super::MediaError::FfmpegSourceMissing { .. })
+            ));
+        }
+        // In-band → Ok.
+        for count in 2..=6 {
+            assert!(validate_room_composite_input_count(count).is_ok());
+        }
+        // Above the band → "at most six" error.
+        for count in [7, 100] {
+            assert!(matches!(
+                validate_room_composite_input_count(count),
+                Err(super::MediaError::FfmpegSourceMissing { .. })
+            ));
+        }
     }
 
     /// Render an `OsString` arg vector as lossy `String`s for `&str` assertions.
