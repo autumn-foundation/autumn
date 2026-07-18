@@ -441,27 +441,6 @@ impl KamalProxyCompatIssue {
     }
 }
 
-/// Does the probe output signal that the `kamal-proxy` binary itself could not be
-/// run (absent, not executable, wrong architecture) — as opposed to responding
-/// with help/usage text? Matches the common shell/OS phrasings across
-/// `bash`/`sh`/`env` so such a binary is classified as unusable rather than
-/// misread as "missing every flag". The probe folds stderr in via `2>&1`, so even
-/// though `|| true` swallows the non-zero exit status, the distinguishing *text*
-/// (`Permission denied`, `Exec format error`) is still captured and matchable.
-fn output_signals_missing_binary(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("command not found")
-        || lower.contains("no such file or directory")
-        || lower.contains("kamal-proxy: not found")
-        || lower.contains("executable file not found")
-        // Non-executable file (bad mode): `.../kamal-proxy: Permission denied` (exit 126).
-        || lower.contains("permission denied")
-        // Wrong-arch / not a real binary (ENOEXEC):
-        // `.../kamal-proxy: cannot execute binary file: Exec format error` (exit 126).
-        || lower.contains("cannot execute")
-        || lower.contains("exec format error")
-}
-
 /// Is `flag` present in `output` as a standalone CLI flag token — not merely a
 /// substring of a longer, renamed flag (e.g. `--target` inside `--target-host`,
 /// or `--tls` inside `--tls-enabled`)?
@@ -501,39 +480,55 @@ fn output_lists_flag(output: &str, flag: &str) -> bool {
 /// Pure verdict on a `kamal-proxy deploy --help` capture given the flags the
 /// caller requires (issue #2053).
 ///
-/// A compatible surface — every required flag present, `deploy` intact, a real
-/// binary — returns `Ok(())` (the deploy proceeds untouched). Otherwise it
-/// classifies the failure so the caller can fail closed with a precise message.
-/// The checks are ordered so the most specific cause wins: binary-missing, then a
-/// renamed/removed `deploy` subcommand, then empty output, then absent flags.
+/// Decides on the **deploy help's own content first**, because the probe folds
+/// the remote shell's stderr into the capture via `2>&1`: a healthy target whose
+/// login shell prints startup noise (e.g. a `.bashrc` line failing with `foo:
+/// command not found`) alongside a perfectly valid `deploy --help` must NEVER be
+/// blocked — that would break a host that is already fine. So:
+///
+/// 1. If **every** required flag is present (boundary-matched), the deploy help
+///    rendered correctly → `Ok(())`, regardless of any unrelated stderr noise in
+///    the same stream. (A missing/broken binary or a removed subcommand prints
+///    NONE of these flags, so their presence is a reliable "help rendered" signal.)
+/// 2. If **some** required flag is present but not all, the help genuinely
+///    rendered and a flag has drifted → [`KamalProxyCompatIssue::MissingFlags`]
+///    (naming only the absent ones). Because at least one flag is present, shell
+///    noise can't tip this into a false "binary missing" verdict.
+/// 3. If **no** required flag is present, the deploy help did not render at all.
+///    Classify why: a cobra `unknown command "deploy"` means the subcommand was
+///    renamed/removed ([`KamalProxyCompatIssue::DeploySubcommandMissing`]);
+///    anything else (a missing / non-executable / wrong-arch binary, or no output)
+///    is [`KamalProxyCompatIssue::BinaryUnusable`]. Either way the deploy fails
+///    closed.
 fn assess_kamal_proxy_deploy_help(
     output: &str,
     required_flags: &[&'static str],
 ) -> Result<(), KamalProxyCompatIssue> {
-    if output_signals_missing_binary(output) {
-        return Err(KamalProxyCompatIssue::BinaryUnusable);
-    }
-    // cobra prints `Error: unknown command "deploy" for "kamal-proxy"` (to stderr,
-    // folded in via 2>&1) when the subcommand was renamed/removed.
-    let lower = output.to_ascii_lowercase();
-    if lower.contains("unknown command") && lower.contains("deploy") {
-        return Err(KamalProxyCompatIssue::DeploySubcommandMissing);
-    }
-    // No output at all: we cannot confirm the surface, so fail closed rather than
-    // assume compatibility.
-    if output.trim().is_empty() {
-        return Err(KamalProxyCompatIssue::BinaryUnusable);
-    }
     let missing: Vec<&'static str> = required_flags
         .iter()
         .copied()
         .filter(|flag| !output_lists_flag(output, flag))
         .collect();
+
+    // (1) All required flags present → valid deploy help → compatible, even if the
+    // capture also carries benign shell/login noise.
     if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(KamalProxyCompatIssue::MissingFlags(missing))
+        return Ok(());
     }
+
+    // (2) Some (but not all) required flags present → the deploy help rendered, so
+    // this is real flag drift, not shell noise. Report exactly the absent flag(s).
+    if missing.len() < required_flags.len() {
+        return Err(KamalProxyCompatIssue::MissingFlags(missing));
+    }
+
+    // (3) No required flag rendered → the deploy help did not print. Distinguish a
+    // renamed/removed `deploy` subcommand from an unusable binary; both fail closed.
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("unknown command") && lower.contains("deploy") {
+        return Err(KamalProxyCompatIssue::DeploySubcommandMissing);
+    }
+    Err(KamalProxyCompatIssue::BinaryUnusable)
 }
 
 #[cfg(test)]
@@ -820,6 +815,37 @@ mod tests {
         assert!(
             msg.contains("before any cutover"),
             "message states nothing was cut over: {msg}",
+        );
+    }
+
+    #[test]
+    fn valid_help_with_benign_stderr_noise_still_passes() {
+        // The probe folds stderr into the capture via 2>&1. A healthy target whose
+        // login shell prints startup noise — here a .bashrc line failing with
+        // `command not found` — must NOT block the deploy when `deploy --help`
+        // itself rendered valid help (AC: never break a host that is already fine).
+        let noisy = format!("bash: nvm: command not found\n{}", sample_deploy_help());
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(&noisy),
+            Ok(()),
+            "valid help alongside unrelated stderr noise must pass",
+        );
+        // Same for a TLS controller (which requires the extra --host/--tls flags).
+        let with_tls =
+            KamalProxyController::new(60).with_tls_host(Some("app.example.com".to_owned()));
+        assert_eq!(with_tls.assess_deploy_help(&noisy), Ok(()));
+    }
+
+    #[test]
+    fn a_renamed_flag_amid_stderr_noise_is_still_caught_as_missing_not_unusable() {
+        // The inverse guard: noise must not tip a genuine flag drift into a false
+        // BinaryUnusable. Only --drain-timeout is renamed, so other flags render →
+        // the help clearly printed, and the "command not found" noise is irrelevant.
+        let drifted = sample_deploy_help().replace("--drain-timeout", "--drain-window");
+        let noisy = format!("bash: nvm: command not found\n{drifted}");
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(&noisy),
+            Err(KamalProxyCompatIssue::MissingFlags(vec!["--drain-timeout"])),
         );
     }
 
