@@ -731,6 +731,12 @@ pub fn cutover_ops(
     manifests: &[ManifestUpload],
     release_id: &str,
     plan: &SlotPlan,
+    // The port the currently-live (OLD) release ACTUALLY binds, used only for the
+    // cutover proxy-refresh re-register (below). This is threaded in — rather than
+    // taken from `plan.live_port` — because `plan.live_port` is derived from the NEW
+    // config's `public_port` and is wrong if `server.port` changed since the last
+    // deploy; the caller sources this from the persisted live-slot marker (#2071).
+    live_upstream_port: u16,
 ) -> Vec<DeployOp> {
     let release_dir = format!("{}/{release_id}", cfg.releases_dir());
     let remote_binary = format!("{release_dir}/{}", cfg.app_name);
@@ -752,12 +758,17 @@ pub fn cutover_ops(
     // `ProxyController::refresh_installed_ops`). Writing the unit is deterministic,
     // lands at the final path, and causes no restart on its own, so it is safe to do
     // at the very start of the cutover; the live upstream re-registered on a change
-    // is the slot serving RIGHT NOW (`plan.live_port`), the same target the proxy
-    // already fronts.
+    // is the release serving RIGHT NOW, targeted at its ACTUAL loopback port
+    // (`live_upstream_port`, sourced from the persisted live-slot marker) rather than
+    // the new-config-derived `plan.live_port`. If `server.port` changed since the last
+    // deploy, `plan.live_port` names a port nothing listens on, so the health-gated
+    // re-register would never pass and the cutover would fail with the proxy already
+    // restarted and `:80` routeless (#2071). The candidate/flip below still use the
+    // new derived ports — the new release genuinely binds them.
     let mut ops = proxy.refresh_installed_ops(
         plan.public_port,
         &cfg.service_name,
-        &loopback_upstream(plan.live_port),
+        &loopback_upstream(live_upstream_port),
         &proxy_unit_snapshot_path(release_id),
     );
     ops.push(DeployOp::Run(RemoteCommand::new(
@@ -1380,6 +1391,13 @@ pub enum DeployMode {
     Redeploy {
         /// Slot the currently-live release serves on.
         live_slot: &'static str,
+        /// Loopback port the currently-live release ACTUALLY binds, read from the
+        /// live-slot marker's persisted port field (`{slot}\t{port}`). `None` for an
+        /// older slot-only marker with no port field. This is authoritative across a
+        /// `server.port` change since the last deploy (the derived
+        /// `slot_app_port(current server.port, slot)` is not), mirroring how
+        /// [`resolve_rollback_target`] reads the previous-release marker's port.
+        live_port: Option<u16>,
     },
 }
 
@@ -1439,10 +1457,20 @@ pub fn probe_deploy_state(
     let mode = mode_part
         .trim()
         .strip_prefix("redeploy:")
-        .map_or(DeployMode::First, |marker| DeployMode::Redeploy {
+        .map_or(DeployMode::First, |marker| {
             // The live-slot marker is `{slot}\t{port}` (older markers are slot-only);
             // the slot is the FIRST tab-separated field either way.
-            live_slot: canonical_slot(marker.split('\t').next().unwrap_or(SLOT_BLUE)),
+            let mut fields = marker.split('\t');
+            let live_slot = canonical_slot(fields.next().unwrap_or(SLOT_BLUE));
+            // Parse the persisted port (SECOND field) so the cutover can re-register
+            // the live release at the port it ACTUALLY binds — correct across a
+            // `server.port` change — mirroring how `resolve_rollback_target` reads the
+            // previous-release marker's port. An older slot-only marker → `None`.
+            let live_port = fields.next().and_then(|p| p.trim().parse::<u16>().ok());
+            DeployMode::Redeploy {
+                live_slot,
+                live_port,
+            }
         });
     Ok(DeployProbe {
         mode,
@@ -2194,6 +2222,15 @@ mod tests {
     /// Redeploy cutover ops: the live release is on blue, so the candidate takes
     /// green (loopback 3002).
     fn sample_cutover_ops(env: Secret) -> Vec<DeployOp> {
+        // Default: the live release's actual port matches the config-derived port
+        // (no `server.port` change since the last deploy), so the re-register target
+        // is `plan.live_port` (blue = 3001) — the pre-#2071 behavior every other
+        // cutover test asserts.
+        let plan = SlotPlan::redeploy(3000, SLOT_BLUE);
+        sample_cutover_ops_with_live_port(env, plan.live_port)
+    }
+
+    fn sample_cutover_ops_with_live_port(env: Secret, live_upstream_port: u16) -> Vec<DeployOp> {
         let cfg = resolved();
         let plan = SlotPlan::redeploy(3000, SLOT_BLUE);
         let unit = super::super::render_app_unit(
@@ -2211,6 +2248,7 @@ mod tests {
             &sample_manifests(),
             RELEASE_ID,
             &plan,
+            live_upstream_port,
         )
     }
 
@@ -2561,6 +2599,58 @@ mod tests {
         assert!(
             gate < do_restart && do_restart < reregister,
             "order must be change-gate → restart → re-register: {restart_sh}"
+        );
+    }
+
+    #[test]
+    fn cutover_reregisters_live_release_at_its_actual_persisted_port() {
+        // Issue #2071 P2: if `server.port` changed since the last deploy, the live
+        // (OLD) release still binds the port derived from the PREVIOUS config, not the
+        // new one. The cutover proxy-refresh re-register must target that ACTUAL live
+        // port (sourced from the live-slot marker), NOT the new-config-derived
+        // `plan.live_port` — otherwise the health-gated re-register aims at a dead port
+        // and the deploy fails with the proxy already restarted and `:80` routeless.
+        let plan = SlotPlan::redeploy(3000, SLOT_BLUE);
+        let derived = plan.live_port; // 3001 under the NEW config (public_port 3000)
+        let actual = 4001; // blue's port under the OLD server.port = 4000
+        assert_ne!(
+            derived, actual,
+            "the scenario is meaningful only when server.port changed"
+        );
+
+        let ops = sample_cutover_ops_with_live_port(
+            Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"),
+            actual,
+        );
+        let exec = RecordingExecutor::new();
+        run_ops(&ops, &exec).expect("recording executor never fails");
+
+        // The change-gated re-register of the still-live OLD release targets its ACTUAL
+        // persisted port (4001), never the new-config-derived port (3001).
+        let restart_sh = exec
+            .shell_for("proxy-restart-if-changed")
+            .expect("restart-if-changed ran");
+        assert!(
+            restart_sh.contains("kamal-proxy deploy 'myapp' --target '127.0.0.1:4001'"),
+            "re-register must target the live release's ACTUAL persisted port (4001): {restart_sh}"
+        );
+        assert!(
+            !restart_sh.contains("127.0.0.1:3001"),
+            "re-register must NOT target the new-config-derived port (3001): {restart_sh}"
+        );
+
+        // The CANDIDATE and the flip are unchanged — the new release genuinely binds
+        // the new derived candidate port (green = 3002); only the OLD-release
+        // re-register uses the persisted live port.
+        let flip = exec.shell_for("proxy-flip").expect("flip ran");
+        assert!(
+            flip.contains("kamal-proxy deploy 'myapp' --target '127.0.0.1:3002'"),
+            "the candidate flip still targets the new derived candidate port (3002): {flip}"
+        );
+        let gate = exec.shell_for("readiness-gate").expect("gate ran");
+        assert!(
+            gate.contains("127.0.0.1:3002/ready"),
+            "readiness gate still probes the candidate's new derived port (3002): {gate}"
         );
     }
 
@@ -3724,23 +3814,27 @@ mod tests {
         assert_eq!(
             probe_deploy_state(&cfg, &redeploy).unwrap().mode,
             DeployMode::Redeploy {
-                live_slot: SLOT_GREEN
+                live_slot: SLOT_GREEN,
+                live_port: Some(3002),
             }
         );
-        // Backward-compat: an older slot-only marker (no port field) still parses.
+        // Backward-compat: an older slot-only marker (no port field) still parses, and
+        // reports `None` for the port (the caller falls back to the derived port).
         let legacy = RecordingExecutor::new().with_stdout("detect-current", "redeploy:green");
         assert_eq!(
             probe_deploy_state(&cfg, &legacy).unwrap().mode,
             DeployMode::Redeploy {
-                live_slot: SLOT_GREEN
+                live_slot: SLOT_GREEN,
+                live_port: None,
             }
         );
-        // A missing/blank marker on a redeploy defaults the live slot to blue.
+        // A missing/blank marker on a redeploy defaults the live slot to blue, no port.
         let default_blue = RecordingExecutor::new().with_stdout("detect-current", "redeploy:");
         assert_eq!(
             probe_deploy_state(&cfg, &default_blue).unwrap().mode,
             DeployMode::Redeploy {
-                live_slot: SLOT_BLUE
+                live_slot: SLOT_BLUE,
+                live_port: None,
             }
         );
     }
@@ -3767,7 +3861,8 @@ mod tests {
         assert_eq!(
             probe.mode,
             DeployMode::Redeploy {
-                live_slot: SLOT_BLUE
+                live_slot: SLOT_BLUE,
+                live_port: Some(3001),
             }
         );
         assert!(
@@ -3788,7 +3883,8 @@ mod tests {
         assert_eq!(
             probe.mode,
             DeployMode::Redeploy {
-                live_slot: SLOT_GREEN
+                live_slot: SLOT_GREEN,
+                live_port: Some(3002),
             }
         );
         assert!(

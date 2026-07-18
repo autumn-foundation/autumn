@@ -1786,7 +1786,10 @@ fn run_up(
             let teardown = exec::first_deploy_teardown_ops(resolved, &release_id, &plan);
             (ops, teardown, "first deploy".to_owned(), true)
         }
-        exec::DeployMode::Redeploy { live_slot } => {
+        exec::DeployMode::Redeploy {
+            live_slot,
+            live_port,
+        } => {
             // Reconcile the (possibly stale) live-slot marker against the live
             // proxy before choosing the candidate slot. On an UNAMBIGUOUS
             // proxy-vs-marker disagreement the proxy is authoritative (so the
@@ -1806,6 +1809,22 @@ fn run_up(
                 eprintln!("\u{26A0}\u{FE0F}  {warn}");
             }
             let plan = exec::SlotPlan::redeploy(public_port, reconcile.live_slot);
+            // Port the cutover proxy-refresh re-registers the still-live OLD release
+            // at. The proxy currently fronts that release, so we must target the port
+            // it ACTUALLY binds (#2071): the persisted live-slot marker's port field is
+            // authoritative across a `server.port` change, mirroring how
+            // `resolve_rollback_target` reads the previous-release marker's port. We
+            // trust that marker port ONLY when we kept the marker's slot; on a drift
+            // repair the marker is the untrusted party (#1938), so we fall back to the
+            // derived port for the proxy-authoritative slot (which — since the reconcile
+            // only repairs when the proxy port already mapped to that slot via
+            // `public_port` — equals the port the proxy reported). An older slot-only
+            // marker (no port field) also falls back to the derived port.
+            let live_upstream_port = if reconcile.repair {
+                plan.live_port
+            } else {
+                live_port.unwrap_or(plan.live_port)
+            };
             let unit = render_app_unit(
                 resolved,
                 &release_dir,
@@ -1821,6 +1840,7 @@ fn run_up(
                 &manifests,
                 &release_id,
                 &plan,
+                live_upstream_port,
             );
             // Repair the drifted marker as an early op — before the cutover's
             // record-previous-release reads it — so the on-disk marker matches the
