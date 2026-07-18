@@ -1745,6 +1745,13 @@ fn run_up(
     // never touches the host MediaMTX unit. No-op unless enabled (see fn).
     check_media_host_preflight(media_cfg, ffmpeg_bin, &executor)?;
 
+    // Fail closed on kamal-proxy CLI-surface drift BEFORE any cutover (#2053): the
+    // controller consumes an UNPINNED kamal-proxy from host bootstrap, so a
+    // renamed/removed subcommand or flag on `kamal-proxy deploy` would otherwise
+    // break a real cutover with no warning. A compatible binary passes silently;
+    // an incompatible one aborts here (read-only `--help` probe, nothing mutated).
+    exec::probe_proxy_compat(&proxy, &executor).map_err(|e| DeployError::Exec(e.to_string()))?;
+
     let release_dir = format!("{}/{release_id}", resolved.releases_dir());
 
     // Probe the target to choose first-deploy vs zero-downtime redeploy. The same

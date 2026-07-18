@@ -2795,7 +2795,7 @@ impl AutumnConfig {
         content: &str,
         schema: &HashMap<String, HashSet<String>>,
     ) -> Vec<(String, Option<String>)> {
-        Self::validate_toml_detailed(content, schema)
+        Self::validate_toml_detailed(content, schema, &BTreeSet::new())
             .into_iter()
             .map(|(path, sug, _parent)| (path, sug))
             .collect()
@@ -2806,10 +2806,16 @@ impl AutumnConfig {
     /// correct even for quoted dotted profile names like
     /// `[profile."prod.eu".server]`). Used by strict-config classification;
     /// `validate_toml` maps this down to `(path, suggestion)`.
+    ///
+    /// `plugin_config_roots` lists top-level roots a plugin has declared via
+    /// [`config_section`](crate::app::AppBuilder::config_section): each is
+    /// treated as a known, opaque table — accepted at the root and never
+    /// descended into. An empty set restores the pre-seam behavior.
     #[must_use]
     pub(crate) fn validate_toml_detailed(
         content: &str,
         schema: &HashMap<String, HashSet<String>>,
+        plugin_config_roots: &BTreeSet<String>,
     ) -> Vec<(String, Option<String>, String)> {
         let Ok(table) = toml::from_str::<toml::Table>(content) else {
             return Vec::new();
@@ -2817,7 +2823,7 @@ impl AutumnConfig {
 
         let mut errors = Vec::new();
         let mut path = Vec::new();
-        Self::validate_toml_table(&table, &mut path, schema, &mut errors);
+        Self::validate_toml_table(&table, &mut path, schema, plugin_config_roots, &mut errors);
         errors
     }
 
@@ -2826,6 +2832,7 @@ impl AutumnConfig {
         table: &toml::Table,
         path: &mut Vec<String>,
         schema: &HashMap<String, HashSet<String>>,
+        plugin_config_roots: &BTreeSet<String>,
         errors: &mut Vec<(String, Option<String>, String)>,
     ) {
         let mut schema_path_parts = Vec::new();
@@ -2842,12 +2849,18 @@ impl AutumnConfig {
                     path.push(k.clone());
                     match val {
                         toml::Value::Table(t) => {
-                            Self::validate_toml_table(t, path, schema, errors);
+                            Self::validate_toml_table(t, path, schema, plugin_config_roots, errors);
                         }
                         toml::Value::Array(arr) => {
                             for item in arr {
                                 if let toml::Value::Table(t) = item {
-                                    Self::validate_toml_table(t, path, schema, errors);
+                                    Self::validate_toml_table(
+                                        t,
+                                        path,
+                                        schema,
+                                        plugin_config_roots,
+                                        errors,
+                                    );
                                 }
                             }
                         }
@@ -2861,18 +2874,55 @@ impl AutumnConfig {
                     path.push(k.clone());
                     match val {
                         toml::Value::Table(t) => {
-                            Self::validate_toml_table(t, path, schema, errors);
+                            Self::validate_toml_table(t, path, schema, plugin_config_roots, errors);
                         }
                         toml::Value::Array(arr) => {
                             for item in arr {
                                 if let toml::Value::Table(t) = item {
-                                    Self::validate_toml_table(t, path, schema, errors);
+                                    Self::validate_toml_table(
+                                        t,
+                                        path,
+                                        schema,
+                                        plugin_config_roots,
+                                        errors,
+                                    );
                                 }
                             }
                         }
                         _ => {}
                     }
                     path.pop();
+                } else if path.is_empty() && plugin_config_roots.contains(k) && val.is_table() {
+                    // A plugin has declared this TOP-LEVEL root as its own config
+                    // section (via `AppBuilder::config_section`). It is known AND
+                    // opaque: accept it and do NOT descend — the plugin, not core,
+                    // owns validation of its subtree. The `path.is_empty()` guard
+                    // keeps this strictly the TRUE top-level root (`[media]`,
+                    // path `[]`), so a key that merely shares a plugin-root name
+                    // while nested inside a known section is still validated
+                    // normally (fail-closed).
+                    //
+                    // The `val.is_table()` guard keeps the exemption TABLE-only:
+                    // `config_section` declares a top-level config TABLE (`[media]`),
+                    // so a registered root written as a scalar or array
+                    // (`media = "enabled"`, `media = ["a", "b"]`) is a malformed
+                    // section — nothing would deserialize it and the app would boot
+                    // on default plugin config. A non-table value therefore does NOT
+                    // match here and falls through to the normal unknown-root strict
+                    // rejection below, failing loudly instead of booting on defaults.
+                    //
+                    // A profile-prefixed plugin root (`[profile.<env>.media]`,
+                    // path `["profile","<env>"]`) is deliberately NOT exempted and
+                    // falls through to the normal unknown-root strict rejection:
+                    // the plugin consumes ONLY the top-level `[media]` table (its
+                    // reader deserializes `root.media` directly and does not apply
+                    // Autumn's profile merge), so exempting a profile layer the
+                    // plugin cannot read would let a strict app with media settings
+                    // only under `[profile.<env>.media]` boot SILENTLY on default
+                    // plugin config instead of failing loudly. Profile-aware plugin
+                    // config is a separate, larger enhancement. Deliberately NOT
+                    // added to `valid_keys`, which would make the walk recurse and
+                    // flag every one of the plugin's children as unknown.
                 } else {
                     let mut full_path_parts = path.clone();
                     full_path_parts.push(k.clone());
@@ -2901,7 +2951,7 @@ impl AutumnConfig {
             for (k, val) in table {
                 if let toml::Value::Table(t) = val {
                     path.push(k.clone());
-                    Self::validate_toml_table(t, path, schema, errors);
+                    Self::validate_toml_table(t, path, schema, plugin_config_roots, errors);
                     path.pop();
                 } else {
                     let mut full_path_parts = path.clone();
@@ -2912,7 +2962,42 @@ impl AutumnConfig {
         } else if path.is_empty() {
             let root_keys = schema.get("").cloned().unwrap_or_default();
             for (k, val) in table {
-                if k != "profile" && !root_keys.contains(k) {
+                if k == "profile" || root_keys.contains(k) {
+                    path.push(k.clone());
+                    match val {
+                        toml::Value::Table(t) => {
+                            Self::validate_toml_table(t, path, schema, plugin_config_roots, errors);
+                        }
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::Table(t) = item {
+                                    Self::validate_toml_table(
+                                        t,
+                                        path,
+                                        schema,
+                                        plugin_config_roots,
+                                        errors,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    path.pop();
+                } else if plugin_config_roots.contains(k) && val.is_table() {
+                    // A plugin has declared this top-level root as its own config
+                    // section (via `AppBuilder::config_section`). It is known AND
+                    // opaque: accept it and do NOT descend — the plugin, not core,
+                    // owns validation of its subtree. Deliberately NOT injected
+                    // into `root_keys`, which would make the walk recurse and flag
+                    // every one of the plugin's children as unknown.
+                    //
+                    // The `val.is_table()` guard keeps the exemption TABLE-only
+                    // (`config_section` declares a top-level `[media]` TABLE): a
+                    // registered root written as a scalar/array is malformed and
+                    // falls through to the unknown-root strict rejection below
+                    // instead of being silently exempted and booting on defaults.
+                } else {
                     let mut closest: Option<&str> = None;
                     let mut min_dist = usize::MAX;
                     for valid_key in &root_keys {
@@ -2923,22 +3008,6 @@ impl AutumnConfig {
                         }
                     }
                     errors.push((k.clone(), closest.map(String::from), schema_path.clone()));
-                } else {
-                    path.push(k.clone());
-                    match val {
-                        toml::Value::Table(t) => {
-                            Self::validate_toml_table(t, path, schema, errors);
-                        }
-                        toml::Value::Array(arr) => {
-                            for item in arr {
-                                if let toml::Value::Table(t) = item {
-                                    Self::validate_toml_table(t, path, schema, errors);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    path.pop();
                 }
             }
         }
@@ -3004,6 +3073,39 @@ impl AutumnConfig {
     /// # Panics
     /// Panics if the internally-built TOML table fails to re-serialize.
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
+        Self::load_with_env_and_plugin_roots(env, &BTreeSet::new())
+    }
+
+    /// Like [`load_with_env`](Self::load_with_env), but treats each top-level
+    /// root in `plugin_config_roots` as a **known, opaque** config table under
+    /// `server.strict_config`.
+    ///
+    /// A plugin owns a top-level `[root]` table (e.g. `[media]`) that core's
+    /// closed [`AutumnConfig`] schema knows nothing about. Without a
+    /// registration seam, the strict unknown-key check hard-rejects that root as
+    /// an unknown key and a plugin-enabled app cannot boot under
+    /// `strict_config = true`. Passing the plugin's declared roots here exempts
+    /// exactly those roots from the check: each listed root is accepted and its
+    /// subtree is **not** descended into (the plugin, not core, validates its own
+    /// section). Every other unknown root still hard-fails — the seam is
+    /// fail-closed, never a blanket "allow unknown roots" escape hatch.
+    ///
+    /// This is the roots-aware path the [`AppBuilder`](crate::app::AppBuilder)
+    /// wires up from [`config_section`](crate::app::AppBuilder::config_section)
+    /// declarations; the plain [`load_with_env`](Self::load_with_env) delegates
+    /// here with an empty set, so all existing callers are unaffected.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Io`] if a config file cannot be read,
+    /// [`ConfigError::Parse`] if a file contains invalid TOML, or
+    /// [`ConfigError::Validation`] if a value is invalid.
+    ///
+    /// # Panics
+    /// Panics if the internally-built TOML table fails to re-serialize.
+    pub fn load_with_env_and_plugin_roots(
+        env: &dyn Env,
+        plugin_config_roots: &BTreeSet<String>,
+    ) -> Result<Self, ConfigError> {
         let selected_profile_input = resolve_profile_input(env);
         let profile =
             normalize_profile_name(&selected_profile_input).unwrap_or_else(|| "dev".to_owned());
@@ -3059,7 +3161,7 @@ impl AutumnConfig {
                 || env
                     .var("AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL")
                     .is_ok_and(|v| v == "true" || v == "1");
-            Self::run_strict_unknown_key_check(&toml_str, enforce_all)?;
+            Self::run_strict_unknown_key_check(&toml_str, enforce_all, plugin_config_roots)?;
         }
 
         // ── Deprecation channel (purely additive; never mutates `config`). ──────
@@ -3126,9 +3228,13 @@ impl AutumnConfig {
     /// schema-walk fix (or all keys when `enforce_all` is set) hard-fail; keys
     /// in sections that only became covered by the fix are warned about but
     /// tolerated for one release (warn-first rollout).
-    fn run_strict_unknown_key_check(toml_str: &str, enforce_all: bool) -> Result<(), ConfigError> {
+    fn run_strict_unknown_key_check(
+        toml_str: &str,
+        enforce_all: bool,
+        plugin_config_roots: &BTreeSet<String>,
+    ) -> Result<(), ConfigError> {
         let schema = Self::get_schema_keys();
-        let errors = Self::validate_toml_detailed(toml_str, &schema);
+        let errors = Self::validate_toml_detailed(toml_str, &schema, plugin_config_roots);
 
         let mut hard_errors = Vec::new();
         let mut warn_only = Vec::new();
@@ -6985,14 +7091,38 @@ pub trait ConfigLoader: Send + Sync + 'static {
 /// Delegates to [`AutumnConfig::load_with_env`] using [`OsEnv`] for environment
 /// variable reads. This is the loader used when no override is installed via
 /// [`with_config_loader`](crate::app::AppBuilder::with_config_loader).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TomlEnvConfigLoader;
+#[derive(Debug, Default, Clone)]
+pub struct TomlEnvConfigLoader {
+    /// Top-level config roots declared by plugins via
+    /// [`AppBuilder::config_section`](crate::app::AppBuilder::config_section).
+    /// Each is treated as known-and-opaque under `server.strict_config`. Empty
+    /// by default, so a bare `TomlEnvConfigLoader::new()` behaves exactly as
+    /// before the plugin config-section seam.
+    allowed_plugin_roots: BTreeSet<String>,
+}
 
 impl TomlEnvConfigLoader {
-    /// Construct a new default loader.
+    /// Construct a new default loader with no declared plugin config roots.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self {
+            allowed_plugin_roots: BTreeSet::new(),
+        }
+    }
+
+    /// Declare the plugin-owned top-level config roots this loader should treat
+    /// as known-and-opaque under `server.strict_config`.
+    ///
+    /// Wired by [`AppBuilder::run`](crate::app::AppBuilder::run) from the roots
+    /// registered through
+    /// [`config_section`](crate::app::AppBuilder::config_section), so a
+    /// plugin-enabled app boots under strict config while genuinely-unknown
+    /// roots still hard-fail. See
+    /// [`load_with_env_and_plugin_roots`](AutumnConfig::load_with_env_and_plugin_roots).
+    #[must_use]
+    pub fn with_plugin_config_roots(mut self, roots: BTreeSet<String>) -> Self {
+        self.allowed_plugin_roots = roots;
+        self
     }
 }
 
@@ -7015,7 +7145,7 @@ impl ConfigLoader for TomlEnvConfigLoader {
         let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
             .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
         let env = crate::dotenv::DotenvEnv::new(&base, vars);
-        AutumnConfig::load_with_env(&env)
+        AutumnConfig::load_with_env_and_plugin_roots(&env, &self.allowed_plugin_roots)
     }
 }
 
@@ -7319,7 +7449,7 @@ impl AutumnConfig {
 }
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -7973,6 +8103,256 @@ mod tests {
         assert!(
             err_str.contains("bogus_zzz"),
             "error should name the key: {err_str}"
+        );
+    }
+
+    // ── Plugin config-section seam (#1974 item 7) ─────────────────────────────
+    //
+    // A plugin owns a top-level `[media]` table core's closed schema knows
+    // nothing about. `load_with_env_and_plugin_roots` exempts declared roots
+    // from the strict unknown-key check as known-and-opaque, while every other
+    // unknown root still hard-fails. All tests pin `AUTUMN_ENV=prod` so the dev
+    // smart-defaults' feature-gated `[storage]` root isn't injected (storage
+    // feature off), which would otherwise be flagged independently of `[media]`.
+
+    fn plugin_roots(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn strict_prod_env(dir: &std::path::Path, enforce_all: bool) -> FakeEnv {
+        let mut vars = vec![
+            ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+            ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+            (
+                "AUTUMN_MANIFEST_DIR".to_owned(),
+                dir.to_str().unwrap().to_owned(),
+            ),
+        ];
+        if enforce_all {
+            vars.push((
+                "AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL".to_owned(),
+                "true".to_owned(),
+            ));
+        }
+        FakeEnv(vars.into_iter().collect())
+    }
+
+    // A registered `[media]` root boots green under strict_config: a
+    // media-enabled app no longer fails at boot with `unknown key "media"`.
+    #[test]
+    fn strict_config_accepts_registered_plugin_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[media]\nqueue = \"media\"\n[media.mediamtx]\napi_base = \"http://localhost:9997\"\n",
+        )
+        .unwrap();
+
+        let env = strict_prod_env(temp.path(), false);
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &plugin_roots(&["media"]));
+        assert!(
+            res.is_ok(),
+            "a registered [media] root must boot under strict_config: {res:?}"
+        );
+    }
+
+    // A registered plugin root written as a NON-TABLE (scalar or array) is a
+    // malformed section, not the opaque `[media]` TABLE `config_section`
+    // declares. It must NOT be exempted: nothing would deserialize it and the
+    // app would boot silently on default plugin config, so it stays a strict
+    // unknown-root HARD failure instead. Only a table-shaped `[media]` is opaque.
+    #[test]
+    fn strict_config_rejects_non_table_registered_plugin_root() {
+        // Scalar misspelling of a registered root (`media = "enabled"` instead of
+        // the `[media]` table) must hard-fail under strict_config.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("autumn.toml"), "media = \"enabled\"\n").unwrap();
+
+        let env = strict_prod_env(temp.path(), false);
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &plugin_roots(&["media"]));
+        assert!(
+            res.is_err(),
+            "a scalar-valued registered root (media = \"enabled\") must hard-fail \
+             under strict_config, not be exempted as an opaque table: {res:?}"
+        );
+        assert!(
+            format!("{:?}", res.err().unwrap()).contains("media"),
+            "error should name the malformed media root"
+        );
+
+        // Array-valued registered root (`media = ["a", "b"]`) is likewise
+        // malformed and must hard-fail.
+        let temp_arr = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_arr.path().join("autumn.toml"),
+            "media = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+
+        let env_arr = strict_prod_env(temp_arr.path(), false);
+        let res_arr =
+            AutumnConfig::load_with_env_and_plugin_roots(&env_arr, &plugin_roots(&["media"]));
+        assert!(
+            res_arr.is_err(),
+            "an array-valued registered root (media = [\"a\", \"b\"]) must hard-fail \
+             under strict_config, not be exempted as an opaque table: {res_arr:?}"
+        );
+        assert!(
+            format!("{:?}", res_arr.err().unwrap()).contains("media"),
+            "error should name the malformed media array root"
+        );
+    }
+
+    // Without registration the same `[media]` root is still an unknown top-level
+    // key and hard-fails — the seam is fail-closed, not a blanket allow.
+    #[test]
+    fn strict_config_rejects_unregistered_plugin_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[media]\nqueue = \"media\"\n",
+        )
+        .unwrap();
+
+        let env = strict_prod_env(temp.path(), false);
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &BTreeSet::new());
+        assert!(
+            res.is_err(),
+            "an unregistered [media] root must still hard-fail under strict_config"
+        );
+        assert!(format!("{:?}", res.err().unwrap()).contains("media"));
+    }
+
+    // Registering `[media]` does not weaken the check for OTHER unknown roots: a
+    // genuinely-unknown top-level table still hard-fails.
+    #[test]
+    fn strict_config_still_rejects_other_unknown_root_when_plugin_registered() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[media]\nqueue = \"media\"\n\n[definitely_not_a_root]\nx = 1\n",
+        )
+        .unwrap();
+
+        let env = strict_prod_env(temp.path(), false);
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &plugin_roots(&["media"]));
+        assert!(
+            res.is_err(),
+            "an unrelated unknown root must still hard-fail even with [media] registered"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("definitely_not_a_root"),
+            "error should name the unknown root: {err_str}"
+        );
+    }
+
+    // A registered root is OPAQUE: even with `strict_config_enforce_all` set,
+    // arbitrary nested children of `[media]` are never descended into and so are
+    // never flagged — the plugin owns validation of its own subtree.
+    #[test]
+    fn registered_plugin_root_is_opaque_under_enforce_all() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[media]\nwholly_made_up = true\n[media.deeply.nested]\nalso_bogus = 42\n",
+        )
+        .unwrap();
+
+        let env = strict_prod_env(temp.path(), true);
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &plugin_roots(&["media"]));
+        assert!(
+            res.is_ok(),
+            "enforce_all must NOT flag children of a registered opaque root: {res:?}"
+        );
+    }
+
+    // A registered plugin root under a PROFILE prefix (`[profile.prod.media]`)
+    // stays STRICT and must be rejected — the exemption only ever covers the
+    // TRUE top-level `[media]` table. Soundness rationale: the media plugin's
+    // reader deserializes only the top-level `root.media` and does NOT apply
+    // Autumn's profile merge, so a profile layer the plugin cannot consume must
+    // not be exempted — otherwise a strict app with media settings only under
+    // `[profile.prod.media]` would boot silently on default plugin config
+    // instead of failing loudly. (Profile-aware plugin config is a separate,
+    // larger enhancement.)
+    #[test]
+    fn strict_config_still_rejects_profile_prefixed_plugin_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[profile.prod.media]\nwholly_made_up = true\n\
+             [profile.prod.media.deeply.nested]\nalso_bogus = 42\n",
+        )
+        .unwrap();
+
+        let env = strict_prod_env(temp.path(), true);
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &plugin_roots(&["media"]));
+        assert!(
+            res.is_err(),
+            "a profile-prefixed plugin root ([profile.prod.media]) must stay strict \
+             and be rejected — the plugin reads only the top-level [media] table, so \
+             exempting the profile layer would boot silently on default config: {res:?}"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("media"),
+            "error should name the media/profile root: {err_str}"
+        );
+    }
+
+    // The profile-prefix opacity is NOT a blanket allow of profile subtrees: a
+    // genuinely-unknown root under a profile prefix
+    // (`[profile.prod.definitely_not_a_root]`) still hard-fails, because it is
+    // validated against the root schema and is not a registered plugin root.
+    #[test]
+    fn strict_config_rejects_profile_prefixed_unknown_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[profile.prod.definitely_not_a_root]\nx = 1\n",
+        )
+        .unwrap();
+
+        let env = strict_prod_env(temp.path(), false);
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &plugin_roots(&["media"]));
+        assert!(
+            res.is_err(),
+            "a profile-prefixed genuinely-unknown root must still hard-fail even \
+             with [media] registered (the fix must not blanket-allow profile subtrees)"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("definitely_not_a_root"),
+            "error should name the unknown root: {err_str}"
+        );
+    }
+
+    // When strict_config is OFF, behavior is unchanged: `[media]` is tolerated
+    // even with no roots registered (non-strict never ran the check).
+    #[test]
+    fn non_strict_config_tolerates_media_root_without_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[media]\nqueue = \"media\"\n",
+        )
+        .unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &BTreeSet::new());
+        assert!(
+            res.is_ok(),
+            "non-strict config must tolerate an unregistered [media] root: {res:?}"
         );
     }
 

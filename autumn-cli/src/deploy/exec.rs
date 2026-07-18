@@ -300,6 +300,15 @@ pub enum DeployExecError {
         /// Number of failing preflight checks.
         failed: usize,
     },
+    /// The installed reverse-proxy binary's CLI surface is incompatible with what
+    /// the cutover requires, so the deploy is aborted BEFORE any cutover (issue
+    /// #2053). The `message` is a clear, actionable, secret-free operator string
+    /// (which flag/subcommand is missing + the remedy).
+    #[error("{message}")]
+    ProxyIncompatible {
+        /// The actionable operator message built by the proxy controller.
+        message: String,
+    },
     /// An on-demand rollback found no prior release to roll back to (Slice 3).
     #[error(
         "no previous release to roll back to — the current release is the only one on the target"
@@ -1409,6 +1418,53 @@ pub fn probe_deploy_state(
         mode,
         proxy_list: proxy_list.to_owned(),
     })
+}
+
+/// Fail closed on reverse-proxy CLI-surface drift BEFORE any cutover (issue #2053).
+///
+/// The proxy controller ([`KamalProxyController`](super::proxy::KamalProxyController))
+/// consumes an UNPINNED kamal-proxy binary from host bootstrap and never checked
+/// its CLI surface, so a renamed/removed subcommand or flag on `kamal-proxy deploy`
+/// (the route/flip command) would break a real cutover with no warning. This runs
+/// the controller's read-only compat probe (a `--help` invocation) and applies its
+/// verdict:
+///
+/// - a controller that declares no probe ([`ProxyController::compat_probe`] →
+///   `None`, e.g. a Caddy controller provisioning its own pinned binary) → `Ok(())`
+///   (nothing to check);
+/// - an installed binary that still supports every subcommand/flag the cutover uses
+///   → `Ok(())` and **silent**, so a host that is already fine is untouched;
+/// - otherwise → [`DeployExecError::ProxyIncompatible`] with a clear, actionable
+///   operator message naming exactly what is missing and the remedy, aborting the
+///   deploy before it touches live traffic.
+///
+/// It runs before the first-vs-redeploy decision, so it gates BOTH deploy paths
+/// (the first deploy's `proxy-route` and the redeploy's `proxy-flip` are the same
+/// `kamal-proxy deploy` command).
+///
+/// # Errors
+///
+/// Returns [`DeployExecError::ProxyIncompatible`] when the installed proxy's CLI
+/// surface is incompatible, or the executor's error if the probe cannot run.
+pub fn probe_proxy_compat(
+    proxy: &impl ProxyController,
+    exec: &impl DeployExecutor,
+) -> Result<(), DeployExecError> {
+    let Some(probe) = proxy.compat_probe() else {
+        // No declared probe (e.g. a Caddy controller): nothing to guard.
+        return Ok(());
+    };
+    let out = exec.run(&probe.command)?;
+    // The probe folds stderr into stdout via `2>&1`; assess both defensively so a
+    // stderr-only capture (a different executor) is still classified correctly.
+    let combined = if out.stderr.trim().is_empty() {
+        out.stdout
+    } else {
+        format!("{}\n{}", out.stdout, out.stderr)
+    };
+    probe
+        .assess(&combined)
+        .map_err(|message| DeployExecError::ProxyIncompatible { message })
 }
 
 /// Map a live loopback port back to its slot using the public port: blue binds
@@ -3606,6 +3662,86 @@ mod tests {
         assert!(
             probe.proxy_list.is_empty(),
             "no delimiter → empty proxy list"
+        );
+    }
+
+    /// A compatible `kamal-proxy deploy --help` capture for the compat probe tests.
+    fn compatible_deploy_help() -> &'static str {
+        "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
+         --target host:port\n  --health-check-path string\n  --host strings\n  \
+         --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n"
+    }
+
+    #[test]
+    fn probe_proxy_compat_passes_silently_on_a_compatible_host() {
+        // A host whose kamal-proxy still has every flag the cutover uses passes the
+        // probe with no error and no cutover impact (#2053 — do not break fine hosts).
+        let exec =
+            RecordingExecutor::new().with_stdout("proxy-compat-probe", compatible_deploy_help());
+        assert!(probe_proxy_compat(&proxy(), &exec).is_ok());
+        // It ran exactly the read-only `deploy --help` probe.
+        assert_eq!(exec.run_labels(), vec!["proxy-compat-probe"]);
+        let shell = exec.shell_for("proxy-compat-probe").expect("probe ran");
+        assert_eq!(shell, "kamal-proxy deploy --help 2>&1 || true");
+    }
+
+    #[test]
+    fn probe_proxy_compat_fails_closed_on_a_drifted_cli_surface() {
+        // A future kamal-proxy that renamed --drain-timeout: the probe fails closed
+        // with an actionable message BEFORE any cutover op runs.
+        let drifted = compatible_deploy_help().replace("--drain-timeout", "--drain-window");
+        let exec = RecordingExecutor::new().with_stdout("proxy-compat-probe", drifted);
+        let err = probe_proxy_compat(&proxy(), &exec)
+            .expect_err("a drifted CLI surface must fail closed");
+        match err {
+            DeployExecError::ProxyIncompatible { message } => {
+                assert!(
+                    message.contains("--drain-timeout"),
+                    "names the flag: {message}"
+                );
+                assert!(message.contains("v0.9.2"), "names the pin: {message}");
+                assert!(
+                    message.contains("before any cutover"),
+                    "states nothing was cut over: {message}",
+                );
+            }
+            other => panic!("expected ProxyIncompatible, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_proxy_compat_fails_closed_on_a_missing_binary() {
+        // Empty output (a missing/unusable binary) fails closed rather than being
+        // misread as compatible.
+        let exec = RecordingExecutor::new(); // no scripted stdout → empty capture
+        let err =
+            probe_proxy_compat(&proxy(), &exec).expect_err("an unusable binary must fail closed");
+        assert!(matches!(err, DeployExecError::ProxyIncompatible { .. }));
+    }
+
+    #[test]
+    fn probe_proxy_compat_is_a_noop_when_the_controller_declares_no_probe() {
+        // A controller that declares no compat probe (e.g. a Caddy controller that
+        // provisions its own pinned binary) is never gated — and never even runs a
+        // remote command.
+        struct NoProbeController;
+        impl ProxyController for NoProbeController {
+            fn ensure_installed_ops(&self, _public_port: u16) -> Vec<DeployOp> {
+                Vec::new()
+            }
+            fn route_op(&self, _service: &str, _upstream: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            }
+            fn flip_op(&self, _service: &str, _new_upstream: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            }
+            // compat_probe() uses the trait default → None.
+        }
+        let exec = RecordingExecutor::new();
+        assert!(probe_proxy_compat(&NoProbeController, &exec).is_ok());
+        assert!(
+            exec.run_labels().is_empty(),
+            "no probe declared → no remote command runs"
         );
     }
 

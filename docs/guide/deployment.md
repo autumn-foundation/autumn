@@ -382,6 +382,101 @@ or error messages.
   marker on disk. If the proxy signal is absent or unclear it falls back to the
   marker exactly as before, so the reconcile never changes a healthy deploy.
 
+### MediaMTX host provisioning (`[media]`)
+
+An app that uses the [autumn-media](../../autumn-media-plugin/README.md) plugin
+(RTMP/WHIP ingest, HLS/WebRTC playback, recording) can have `autumn deploy`
+provision **MediaMTX** as a host **systemd unit** on the same box — exactly as it
+already provisions kamal-proxy (#2051). It is **opt-in and disabled by default**,
+so a non-media project is byte-for-byte unaffected.
+
+Enable it in `autumn.toml` (or a profile / `autumn-<profile>.toml` layer):
+
+```toml
+[media.mediamtx]
+enabled = true                 # off by default; the controller is a no-op when false
+# recordings_dir = "/var/lib/mediamtx/recordings"
+# record_delete_after = "72h"  # MediaMTX recordDeleteAfter retention window
+# webrtc_additional_hosts = ["my-app-mediamtx.example.com"]  # extra WebRTC ICE hosts
+# The listen ports below default to MediaMTX's standard values; override only if
+# you also change the app-side *_base URLs to match.
+# api_port = 9997        # control API
+# rtmp_port = 1935       # RTMP ingest only (OBS / RTMP encoders)
+# hls_port = 8888        # HLS playback
+# webrtc_port = 8889     # WebRTC: WHIP publish (browser + room) AND WHEP/WebRTC playback
+# playback_port = 9996   # recording playback
+# webrtc_local_udp = 8189
+# config_path = "/etc/mediamtx/mediamtx.yml"   # where the rendered config is written
+# binary_path = "/usr/local/bin/mediamtx"      # host bootstrap installs it; deploy does not download it
+# unit_name = "mediamtx"                        # systemd unit name (no .service suffix)
+
+[media.ffmpeg]
+# bin = "/usr/bin/ffmpeg"  # concrete path; verified by the deploy-time FFmpeg preflight
+```
+
+When `enabled = true`, `autumn deploy up`:
+
+1. Runs **four fail-closed host preflight checks before touching the host** —
+   FFmpeg resolves (the concrete `[media.ffmpeg] bin`), the MediaMTX binary is
+   executable, the recordings directory is writable, and the MediaMTX ports are
+   free — plus a pure-config precheck that the configured MediaMTX listener ports
+   are distinct, and **aborts the deploy** if the host cannot serve media, rather
+   than shipping a half-provisioned box. One caveat on the FFmpeg check: only a
+   **concrete literal** `[media.ffmpeg] bin` is probed and fail-closed here; an
+   env/interpolation-indirected path (an empty value, or one carrying a `${...}`
+   placeholder such as `${AUTUMN_MEDIA__FFMPEG__BIN}`) is resolved by the deployed
+   service from its own environment, so it is **deferred to runtime** — surfaced as
+   a non-blocking warning that does **not** abort the deploy. These checks require a
+   live host executor and run **only at `deploy up`**.
+2. After the app cutover succeeds, renders `mediamtx.yml` (LL-HLS window, fmp4
+   recording under `recordings_dir`, WebRTC config, and a `~^room/.+$` path
+   matcher for autumn-media Rooms) plus the systemd unit, then runs
+   `daemon-reload && enable --now && restart`.
+
+`autumn deploy plan` is a pure dry-run: it surfaces the media unit, its
+provisioning steps, the names of the host preflight checks that **will** run at
+`deploy up`, and the CSP origins your app must allow — but it holds no host
+executor, so it **does not** probe MediaMTX/FFmpeg or validate ports remotely. The three browser-facing MediaMTX origins
+(WebRTC `:8889`, HLS `:8888`, playback `:9996`) must appear in your
+`connect-src` / `media-src` (and `frame-src` for WebRTC) CSP; in production they
+collapse to your public MediaMTX origin, and your object-store origin must also
+be allowed in `media-src` for recorded playback.
+
+> **`strict_config` interaction.** The `[media]` table is **plugin-owned** — it
+> is not part of autumn-web's `AutumnConfig` schema. `autumn deploy` reads the
+> `[media.mediamtx]` / `[media.ffmpeg]` **subtree** straight from the merged
+> `autumn.toml` (base ← inline `[profile.<name>]` ← `autumn-<profile>.toml`), so
+> that media-subtree read never itself routes through the strict schema. But that
+> does **not** make strict config deploy-safe. Before it ever reads the raw
+> `[media]` subtree, `deploy::run` calls `AutumnConfig::load()` — the strict
+> loader (`autumn-cli/src/deploy.rs`, ahead of `load_media_host_config`) — for
+> **every** subcommand. So if you turn on autumn-web's strict config validation
+> (`[server] strict_config = true`, or `AUTUMN_SERVER__STRICT_CONFIG=1`) **and**
+> keep a top-level `[media]` table in that strict-loaded config, the `[media]`
+> table is flagged as an **unknown top-level key** and **hard-fails** during that
+> load (unknown top-level keys were already strict pre-#1890, so this fails even
+> without `strict_config_enforce_all`). That means **both**:
+>
+> - the **app runtime fails to boot**, *and*
+> - **`autumn deploy plan` / `deploy up` also exit during config load** on the
+>   unknown `[media]` key — they never reach `load_media_host_config` and never
+>   provision MediaMTX, because the strict `AutumnConfig::load()` runs first.
+>
+> **Workaround:** treat `strict_config` and a top-level `[media]` table as
+> mutually exclusive today — don't enable `strict_config` while the strict-loaded
+> config carries a top-level `[media]` table (the validator has no knowledge of
+> the plugin's `[media]` section, on either the app-boot or the deploy path).
+
+**Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
+installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
+a host-bootstrap step); **creating and permissioning the `recordings_dir`**
+(default `/recordings`) so the media user can write to it — `autumn deploy` only
+`mkdir`s the MediaMTX config file's parent directory, so the fail-closed
+recordings-dir preflight (`test -d && test -w`) aborts `deploy up` when the
+directory is missing or not writable; and wiring the four host preflight checks
+into the offline `autumn doctor` CLI (they run only in the executor-holding
+`deploy up` path today; `deploy plan` names them but never executes them).
+
 ### How the deploy path is validated in CI
 
 Two layers exercise the real `autumn deploy` lifecycle over real ssh/scp +

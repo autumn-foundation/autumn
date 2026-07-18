@@ -25,7 +25,7 @@
 //! ```
 
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -87,6 +87,7 @@ pub fn app() -> AppBuilder {
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
         registered_plugins: HashSet::new(),
+        plugin_config_roots: BTreeSet::new(),
         #[cfg(feature = "maud")]
         error_page_renderer: None,
         #[cfg(feature = "db")]
@@ -336,6 +337,11 @@ pub struct AppBuilder {
     pub(crate) extensions: HashMap<TypeId, Box<dyn Any + Send>>,
     /// Plugin names that have already been applied, for duplicate detection.
     pub(crate) registered_plugins: HashSet<String>,
+    /// Top-level config roots plugins have declared as their own opaque config
+    /// sections via [`config_section`](AppBuilder::config_section). Threaded into
+    /// the default config loader so `server.strict_config` treats them as
+    /// known-and-opaque instead of unknown-key hard errors.
+    pub(crate) plugin_config_roots: BTreeSet<String>,
     /// Custom error page renderer (overrides built-in pages).
     #[cfg(feature = "maud")]
     error_page_renderer: Option<SharedRenderer>,
@@ -2429,6 +2435,63 @@ impl AppBuilder {
         self.registered_plugins.contains(name)
     }
 
+    /// Declare a plugin-owned top-level config section so it coexists with
+    /// `server.strict_config = true`.
+    ///
+    /// Core's [`AutumnConfig`](crate::config::AutumnConfig) schema is closed: any
+    /// top-level `[root]` table it does not know about is an unknown key. Under
+    /// `strict_config`, an unknown root is a **hard** boot error. A plugin that
+    /// reads its own top-level table — for example `autumn-media-plugin` reading
+    /// `[media]` via raw TOML — would therefore make a `strict_config` app fail
+    /// at boot with `unknown key "media"`.
+    ///
+    /// Calling `config_section("media")` registers `[media]` as a **known,
+    /// opaque** section: the strict unknown-key check accepts the root and does
+    /// **not** validate its contents (the plugin owns that — core has no schema
+    /// for it). The seam is **fail-closed**: only the roots a plugin explicitly
+    /// declares are exempt; every other unknown top-level root still hard-fails,
+    /// so a typo like `[medai]` is still caught.
+    ///
+    /// Call this from your [`Plugin::build`](crate::plugin::Plugin::build)
+    /// implementation, where the plugin is applied to the builder:
+    ///
+    /// ```ignore
+    /// impl Plugin for MediaPlugin {
+    ///     fn build(self, app: AppBuilder) -> AppBuilder {
+    ///         app.config_section("media") // `[media]` is now strict-config-safe
+    ///         // … register routes, jobs, startup hooks, …
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The declared roots are threaded into the default config loader
+    /// ([`TomlEnvConfigLoader`](crate::config::TomlEnvConfigLoader)); a fully
+    /// custom loader installed via
+    /// [`with_config_loader`](AppBuilder::with_config_loader) owns its own
+    /// strict-config handling and is unaffected.
+    ///
+    /// Future: an optional eager per-section validation hook (handing each
+    /// plugin its raw `[root]` table at boot to validate uniformly) could be
+    /// layered on top of this registry later. It is deliberately deferred — the
+    /// media plugin already fail-fast-validates its own `[media]` config in its
+    /// startup hook, and an eager hook adds callback-storage and error-surface
+    /// plumbing this declarative seam does not need.
+    #[must_use]
+    pub fn config_section(mut self, root: impl Into<String>) -> Self {
+        self.plugin_config_roots.insert(root.into());
+        self
+    }
+
+    /// Return `true` if the given top-level config root has been declared as a
+    /// plugin config section via [`config_section`](AppBuilder::config_section).
+    ///
+    /// Mirrors [`has_plugin`](AppBuilder::has_plugin); useful for tests and
+    /// builder introspection.
+    #[must_use]
+    pub fn has_config_section(&self, root: &str) -> bool {
+        self.plugin_config_roots.contains(root)
+    }
+
     /// Register a named [`MetricsSource`](crate::actuator::MetricsSource) that contributes
     /// metric families to `/actuator/prometheus` and `/actuator/metrics`.
     ///
@@ -2716,6 +2779,7 @@ impl AppBuilder {
             shutdown_hooks,
             extensions: _,
             registered_plugins: _,
+            plugin_config_roots,
             #[cfg(feature = "maud")]
             error_page_renderer,
             #[cfg(feature = "db")]
@@ -2786,8 +2850,12 @@ impl AppBuilder {
         let all_routes = routes;
 
         // 1 & 2. Load configuration and initialize logging/telemetry
-        let (mut config, telemetry_guard) =
-            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        let (mut config, telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
 
         // Process role selects which slice of the runtime this replica runs. A
         // split role (web/worker) requires a durable jobs backend the separate
@@ -4242,6 +4310,7 @@ impl AppBuilder {
             shutdown_hooks: _,
             extensions: _,
             registered_plugins: _,
+            plugin_config_roots,
             #[cfg(feature = "maud")]
                 error_page_renderer: _,
             #[cfg(feature = "db")]
@@ -4315,8 +4384,12 @@ impl AppBuilder {
         let all_routes = routes;
 
         // Load config (same as normal startup)
-        let (mut config, telemetry_guard) =
-            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        let (mut config, telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
 
         #[cfg(feature = "mail")]
         if mount_unsubscribe_endpoint {
@@ -4710,6 +4783,7 @@ impl AppBuilder {
     /// Triggered when `AUTUMN_DUMP_ROUTES=1` is set (by `autumn routes`).
     /// Exits with code 0 on success, code 1 on JSON serialization failure.
     /// Does not connect to a database or bind a TCP port.
+    #[allow(clippy::too_many_lines)]
     async fn run_dump_routes_mode(self) {
         let Self {
             routes,
@@ -4723,6 +4797,7 @@ impl AppBuilder {
             telemetry_provider,
             #[cfg(feature = "openapi")]
             openapi,
+            plugin_config_roots,
             ..
         } = self;
 
@@ -4785,8 +4860,12 @@ impl AppBuilder {
             );
         }
 
-        let (config, _telemetry_guard) =
-            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        let (config, _telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
 
         // Emit the resolved security configuration for the manifest's `declared`
         // dimensions (CSRF, security headers). Gated on `AUTUMN_DUMP_SECURITY`
@@ -4846,11 +4925,16 @@ impl AppBuilder {
             listeners,
             config_loader_factory,
             telemetry_provider,
+            plugin_config_roots,
             ..
         } = self;
 
-        let (config, _telemetry_guard) =
-            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        let (config, _telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
 
         // Fold in the synthesized durable-listener jobs exactly as the boot path
         // does, so the manifest reflects the same effective drained-queue set the
@@ -4904,14 +4988,19 @@ impl AppBuilder {
             migrations,
             config_loader_factory,
             telemetry_provider,
+            plugin_config_roots,
             ..
         } = self;
 
         // The telemetry guard is dropped at end of scope; a migrate-only run does
         // not need tracing wired, but loading config the same way keeps env/profile
         // resolution identical to a normal boot.
-        let (config, _telemetry_guard) =
-            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        let (config, _telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
 
         // Fold in the framework migration sets a normal boot would apply, using the
         // SAME helper as `setup_database`, so the applied set is identical.
@@ -5088,6 +5177,7 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            plugin_config_roots,
             ..
         } = self;
 
@@ -5111,8 +5201,12 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        let (config, telemetry_guard) =
-            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        let (config, telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
 
         // Register the embedded `static/` tree (if any) before the router is
         // built so `/static/*` serves from the binary and `asset_url()` resolves
@@ -6972,12 +7066,25 @@ fn bootstrap_local_storage(
 async fn load_config_and_telemetry(
     config_loader: Option<ConfigLoaderFactory>,
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
+    plugin_config_roots: BTreeSet<String>,
 ) -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
     // 1. Load configuration via the installed loader, falling back to the
     //    five-layer TOML + env default.
+    //
+    // A custom `config_loader` factory owns its entire load + strict-config
+    // handling (it bypasses the default TOML path), so it does not receive the
+    // declared plugin config roots — such a loader is responsible for accepting
+    // its own plugin-owned sections. The default `TomlEnvConfigLoader` is handed
+    // the roots so `server.strict_config` treats each plugin-declared `[root]`
+    // (e.g. `[media]`) as known-and-opaque instead of an unknown-key hard error.
     let mut config = match config_loader {
         Some(factory) => factory().await,
-        None => crate::config::TomlEnvConfigLoader::new().load().await,
+        None => {
+            crate::config::TomlEnvConfigLoader::new()
+                .with_plugin_config_roots(plugin_config_roots)
+                .load()
+                .await
+        }
     }
     .unwrap_or_else(|e| {
         eprintln!("Failed to load configuration: {e}");
@@ -9217,6 +9324,30 @@ mod tests {
 
     // ── omitted-router accounting for `autumn routes audit` ──────────────────
 
+    // #1974 item 7: a plugin declares a top-level config section from its
+    // `build()` via `config_section`, so `server.strict_config` treats that root
+    // as known-and-opaque. Prove the declaration lands on the builder and that
+    // the registry is fail-closed (an undeclared root is not registered).
+    #[test]
+    fn plugin_declares_config_section_via_build() {
+        struct DummyMediaPlugin;
+        impl crate::plugin::Plugin for DummyMediaPlugin {
+            fn build(self, app: AppBuilder) -> AppBuilder {
+                app.config_section("media")
+            }
+        }
+
+        let builder = app().plugin(DummyMediaPlugin);
+        assert!(
+            builder.has_config_section("media"),
+            "a plugin's build() must declare its [media] config section"
+        );
+        assert!(
+            !builder.has_config_section("definitely_not_a_root"),
+            "only explicitly-declared roots are registered — the seam is fail-closed"
+        );
+    }
+
     /// Compute the omitted-router count for a builder using the same inputs
     /// `run_dump_routes_mode` feeds `omitted_router_count`: the merge count, the
     /// nest prefixes, and the declared routes that prove nest coverage.
@@ -10594,11 +10725,16 @@ mod tests {
             telemetry_provider,
             i18n_bundle,
             i18n_auto_load,
+            plugin_config_roots,
             ..
         } = builder;
 
-        let (loaded_config, _guard) =
-            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        let (loaded_config, _guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
         let env = crate::config::MockEnv::new().with(
             "AUTUMN_MANIFEST_DIR",
             project.path().to_str().expect("utf-8 path"),

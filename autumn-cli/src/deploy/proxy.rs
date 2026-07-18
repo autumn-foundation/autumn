@@ -47,6 +47,89 @@ const KAMAL_PROXY_BIN: &str = "/usr/local/bin/kamal-proxy";
 /// Systemd unit path supervising the proxy process.
 const KAMAL_PROXY_UNIT_PATH: &str = "/etc/systemd/system/kamal-proxy.service";
 
+/// Known-good kamal-proxy version this controller's CLI contract was verified
+/// against — the same version the real-VPS validation harness pins
+/// (`scripts/deploy-real-vps-validate.sh`, issue #2052). Named in the
+/// incompatibility message (issue #2053) so an operator knows exactly what to
+/// install on host bootstrap. kamal-proxy is otherwise consumed UNPINNED from
+/// host bootstrap, so this is the version to pin to when the compat probe fails.
+pub const KAMAL_PROXY_KNOWN_GOOD_VERSION: &str = "v0.9.2";
+
+/// The exact `deploy`-subcommand flags [`KamalProxyController::deploy_shell`]
+/// emits on every route/flip. These ARE the cutover contract: if a future
+/// kamal-proxy renames or removes one of them, a real cutover would break with no
+/// warning (issue #2053). The compat probe requires every one of these to appear
+/// in `kamal-proxy deploy --help`, so the required set can never drift from what
+/// the controller actually passes.
+const REQUIRED_DEPLOY_FLAGS: &[&str] = &[
+    "--target",
+    "--health-check-path",
+    "--deploy-timeout",
+    "--drain-timeout",
+];
+
+/// Extra `deploy` flags required ONLY when TLS is enabled ([`KamalProxyController::with_tls_host`]),
+/// matching the `--host <h> --tls` segment `deploy_shell` adds for a TLS app.
+const REQUIRED_TLS_DEPLOY_FLAGS: &[&str] = &["--host", "--tls"];
+
+/// A read-only CLI-surface compatibility probe a [`ProxyController`] can declare,
+/// run ONCE before any cutover (issue #2053).
+///
+/// It pairs the remote command to run — whose combined stdout/stderr is the
+/// proxy's own help/surface output — with a pure `verdict` over that output. The
+/// verdict returns `Ok(())` when the installed proxy still supports every
+/// subcommand/flag the cutover depends on (a compatible host passes silently) and
+/// `Err(message)` with a clear, actionable operator message when it does not, so
+/// the deploy can fail closed BEFORE touching live traffic.
+///
+/// The command is deliberately side-effect-free (a `--help` invocation), never
+/// fails the ssh step itself (the Rust side owns the verdict), and carries no
+/// secret — so it is safe to run and log at deploy time.
+pub struct ProxyCompatProbe {
+    /// The read-only remote command whose output the verdict inspects.
+    pub command: RemoteCommand,
+    /// Pure verdict over the command's combined output.
+    verdict: CompatVerdict,
+}
+
+/// The pure verdict a [`ProxyCompatProbe`] applies to its command's combined
+/// output: `Ok(())` when compatible, `Err(message)` with an actionable operator
+/// message otherwise.
+type CompatVerdict = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+impl ProxyCompatProbe {
+    /// Build a probe from its command and a pure verdict closure.
+    #[must_use]
+    pub fn new(
+        command: RemoteCommand,
+        verdict: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            command,
+            verdict: Box::new(verdict),
+        }
+    }
+
+    /// Apply the verdict to the probe command's combined output.
+    ///
+    /// # Errors
+    ///
+    /// Returns the actionable operator message when the installed proxy's CLI
+    /// surface is incompatible with what the cutover requires.
+    pub fn assess(&self, output: &str) -> Result<(), String> {
+        (self.verdict)(output)
+    }
+}
+
+impl std::fmt::Debug for ProxyCompatProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The verdict closure is not `Debug`; expose only the command.
+        f.debug_struct("ProxyCompatProbe")
+            .field("command", &self.command)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Controls the reverse proxy that fronts the public port.
 ///
 /// The methods return ordered [`DeployOp`]s (rather than driving the executor
@@ -69,6 +152,18 @@ pub trait ProxyController {
     /// atomically swaps live traffic to it and drains the old target. This is the
     /// cutover.
     fn flip_op(&self, service: &str, new_upstream: &str) -> DeployOp;
+
+    /// Optional CLI-surface compatibility probe (issue #2053), run once BEFORE any
+    /// cutover so a drifted/renamed proxy CLI fails the deploy closed instead of
+    /// breaking a live cutover with no warning.
+    ///
+    /// `None` (the default) means the controller declares no probe — the caller
+    /// then skips the check entirely (a `CaddyController` that provisions its own
+    /// pinned binary needs no CLI-surface guardrail). A controller that consumes an
+    /// unpinned external binary (kamal-proxy) returns `Some`.
+    fn compat_probe(&self) -> Option<ProxyCompatProbe> {
+        None
+    }
 }
 
 /// [`ProxyController`] backed by [kamal-proxy](https://github.com/basecamp/kamal-proxy).
@@ -160,6 +255,53 @@ impl KamalProxyController {
         )
     }
 
+    /// The read-only command the compat probe runs: `kamal-proxy deploy --help`
+    /// (issue #2053).
+    ///
+    /// `deploy` is the ONE subcommand both the initial route and the health-gated
+    /// flip use, so its help output is the authoritative surface for the cutover
+    /// contract. `--help` is a built-in that survives across kamal-proxy releases
+    /// (v0.9.2, which dropped the `version` subcommand, still has it — so this is
+    /// the reliable probe the harness settled on). `2>&1` folds cobra's
+    /// error/usage output (e.g. an `unknown command` when `deploy` was renamed)
+    /// into the captured stream, and `|| true` keeps the ssh step itself from
+    /// failing — the Rust-side verdict, not the exit status, decides compatibility.
+    #[must_use]
+    pub fn compat_probe_command() -> RemoteCommand {
+        RemoteCommand::new(
+            "proxy-compat-probe",
+            "kamal-proxy deploy --help 2>&1 || true",
+        )
+    }
+
+    /// The `deploy` flags this controller requires to be present in the probe
+    /// output — the base set plus the TLS flags when TLS is enabled.
+    #[must_use]
+    pub fn required_deploy_flags(&self) -> Vec<&'static str> {
+        let mut flags = REQUIRED_DEPLOY_FLAGS.to_vec();
+        if self.tls_host.is_some() {
+            flags.extend_from_slice(REQUIRED_TLS_DEPLOY_FLAGS);
+        }
+        flags
+    }
+
+    /// Pure verdict on a `kamal-proxy deploy --help` capture for this controller's
+    /// TLS configuration (issue #2053). Exposed for unit assertions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the specific [`KamalProxyCompatIssue`] when the installed binary is
+    /// missing/unusable, has no `deploy` subcommand, or is missing a flag the
+    /// cutover passes.
+    // The production path applies the verdict through the trait's `compat_probe`
+    // closure (which calls the free `assess_kamal_proxy_deploy_help`); this typed
+    // wrapper exists for direct unit assertions, mirroring `run_ops`'s test-only
+    // reachability in `super::exec`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn assess_deploy_help(&self, output: &str) -> Result<(), KamalProxyCompatIssue> {
+        assess_kamal_proxy_deploy_help(output, &self.required_deploy_flags())
+    }
+
     /// Render the systemd unit that supervises `kamal-proxy run` on the public
     /// port. Pure — exposed for unit assertions.
     ///
@@ -233,6 +375,160 @@ impl ProxyController for KamalProxyController {
             self.deploy_shell(service, new_upstream),
         ))
     }
+
+    fn compat_probe(&self) -> Option<ProxyCompatProbe> {
+        // Capture the required flag set (which depends on this controller's TLS
+        // config) into the pure verdict closure, so the probe is self-contained
+        // and Caddy-swappable through the trait.
+        let required = self.required_deploy_flags();
+        Some(ProxyCompatProbe::new(
+            Self::compat_probe_command(),
+            move |output| {
+                assess_kamal_proxy_deploy_help(output, &required).map_err(|issue| issue.message())
+            },
+        ))
+    }
+}
+
+/// Why the installed kamal-proxy's CLI surface is incompatible with what the
+/// cutover requires (issue #2053). Each variant carries enough to build a clear,
+/// actionable operator [`Self::message`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KamalProxyCompatIssue {
+    /// The probe reached no working `kamal-proxy` binary (missing, not executable,
+    /// or produced no help output at all).
+    BinaryUnusable,
+    /// The binary responded but has no `deploy` subcommand (renamed/removed) — the
+    /// route/flip command the cutover is built on is gone.
+    DeploySubcommandMissing,
+    /// `kamal-proxy deploy` exists but is missing flag(s) the cutover passes; the
+    /// CLI surface has drifted from what this release was built against.
+    MissingFlags(Vec<&'static str>),
+}
+
+impl KamalProxyCompatIssue {
+    /// A clear, actionable, secret-free operator message naming the exact problem
+    /// and the remedy (pin kamal-proxy to the known-good version on host
+    /// bootstrap), and stating that nothing was cut over.
+    #[must_use]
+    pub fn message(&self) -> String {
+        let pin = KAMAL_PROXY_KNOWN_GOOD_VERSION;
+        match self {
+            Self::BinaryUnusable => format!(
+                "the kamal-proxy binary at `{KAMAL_PROXY_BIN}` did not respond to \
+                 `kamal-proxy deploy --help` (missing or not executable). Install a \
+                 known-good kamal-proxy (pin {pin}) in the target's host bootstrap \
+                 before deploying — see scripts/deploy-real-vps-validate.sh. Aborting \
+                 before any cutover, so live traffic was not touched."
+            ),
+            Self::DeploySubcommandMissing => format!(
+                "the installed kamal-proxy has no `deploy` subcommand — the CLI \
+                 surface this deploy is built on has changed. Pin kamal-proxy to a \
+                 compatible version ({pin}) in the target's host bootstrap and \
+                 redeploy. Aborting before any cutover, so live traffic was not \
+                 touched."
+            ),
+            Self::MissingFlags(flags) => format!(
+                "the installed kamal-proxy `deploy` command is missing flag(s) this \
+                 deploy requires: {missing}. The kamal-proxy CLI surface has drifted \
+                 from what this release was built against. Pin kamal-proxy to a \
+                 compatible version ({pin}) in the target's host bootstrap and \
+                 redeploy. Aborting before any cutover, so live traffic was not \
+                 touched.",
+                missing = flags.join(", "),
+            ),
+        }
+    }
+}
+
+/// Is `flag` present in `output` as a standalone CLI flag token — not merely a
+/// substring of a longer, renamed flag (e.g. `--target` inside `--target-host`,
+/// or `--tls` inside `--tls-enabled`)?
+///
+/// A flag renamed to a superstring is EXACTLY the drift this probe must catch, so
+/// a plain substring match would false-negative (report the old flag as present)
+/// and silently defeat the guardrail. The match therefore requires a token
+/// boundary on both sides: the char immediately before and after the match must be
+/// neither an ASCII alphanumeric nor `-` (the characters that continue a flag
+/// token). Boundaries are resolved from the surrounding `str` slices' `chars()`,
+/// never by slicing mid-codepoint, so it is UTF-8-safe (the flag itself is ASCII,
+/// so `find`/`end` always land on char boundaries).
+fn output_lists_flag(output: &str, flag: &str) -> bool {
+    let flen = flag.len();
+    let mut search_from = 0;
+    while let Some(rel) = output[search_from..].find(flag) {
+        let start = search_from + rel;
+        let end = start + flen;
+        let before_ok = output[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-');
+        let after_ok = output[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-');
+        if before_ok && after_ok {
+            return true;
+        }
+        // The match started at the flag's leading `-` (ASCII), so `start + 1` is a
+        // valid char boundary to resume from.
+        search_from = start + 1;
+    }
+    false
+}
+
+/// Pure verdict on a `kamal-proxy deploy --help` capture given the flags the
+/// caller requires (issue #2053).
+///
+/// Decides on the **deploy help's own content first**, because the probe folds
+/// the remote shell's stderr into the capture via `2>&1`: a healthy target whose
+/// login shell prints startup noise (e.g. a `.bashrc` line failing with `foo:
+/// command not found`) alongside a perfectly valid `deploy --help` must NEVER be
+/// blocked — that would break a host that is already fine. So:
+///
+/// 1. If **every** required flag is present (boundary-matched), the deploy help
+///    rendered correctly → `Ok(())`, regardless of any unrelated stderr noise in
+///    the same stream. (A missing/broken binary or a removed subcommand prints
+///    NONE of these flags, so their presence is a reliable "help rendered" signal.)
+/// 2. If **some** required flag is present but not all, the help genuinely
+///    rendered and a flag has drifted → [`KamalProxyCompatIssue::MissingFlags`]
+///    (naming only the absent ones). Because at least one flag is present, shell
+///    noise can't tip this into a false "binary missing" verdict.
+/// 3. If **no** required flag is present, the deploy help did not render at all.
+///    Classify why: a cobra `unknown command "deploy"` means the subcommand was
+///    renamed/removed ([`KamalProxyCompatIssue::DeploySubcommandMissing`]);
+///    anything else (a missing / non-executable / wrong-arch binary, or no output)
+///    is [`KamalProxyCompatIssue::BinaryUnusable`]. Either way the deploy fails
+///    closed.
+fn assess_kamal_proxy_deploy_help(
+    output: &str,
+    required_flags: &[&'static str],
+) -> Result<(), KamalProxyCompatIssue> {
+    let missing: Vec<&'static str> = required_flags
+        .iter()
+        .copied()
+        .filter(|flag| !output_lists_flag(output, flag))
+        .collect();
+
+    // (1) All required flags present → valid deploy help → compatible, even if the
+    // capture also carries benign shell/login noise.
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    // (2) Some (but not all) required flags present → the deploy help rendered, so
+    // this is real flag drift, not shell noise. Report exactly the absent flag(s).
+    if missing.len() < required_flags.len() {
+        return Err(KamalProxyCompatIssue::MissingFlags(missing));
+    }
+
+    // (3) No required flag rendered → the deploy help did not print. Distinguish a
+    // renamed/removed `deploy` subcommand from an unusable binary; both fail closed.
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("unknown command") && lower.contains("deploy") {
+        return Err(KamalProxyCompatIssue::DeploySubcommandMissing);
+    }
+    Err(KamalProxyCompatIssue::BinaryUnusable)
 }
 
 #[cfg(test)]
@@ -399,6 +695,240 @@ mod tests {
         assert_eq!(
             cmd.shell,
             "systemctl daemon-reload && systemctl enable --now kamal-proxy.service",
+        );
+    }
+
+    // --- CLI-surface compatibility probe (issue #2053) -----------------------
+
+    /// A realistic `kamal-proxy deploy --help` capture carrying every flag the
+    /// controller passes (base set + TLS flags). A compatible host looks like this.
+    fn sample_deploy_help() -> &'static str {
+        "Deploy a new version of a service\n\
+         \n\
+         Usage:\n  kamal-proxy deploy SERVICE [flags]\n\
+         \n\
+         Flags:\n\
+         \x20     --target host:port            Target host and port to route to\n\
+         \x20     --health-check-path string    Path kamal-proxy health-checks\n\
+         \x20     --host strings                Host(s) to route\n\
+         \x20     --tls                         Configure TLS for this service\n\
+         \x20     --deploy-timeout duration     How long to wait for the target\n\
+         \x20     --drain-timeout duration      How long to drain the old target\n"
+    }
+
+    #[test]
+    fn compat_probe_command_is_the_readonly_deploy_help_check() {
+        let cmd = KamalProxyController::compat_probe_command();
+        assert_eq!(cmd.label, "proxy-compat-probe");
+        // A side-effect-free `--help` on the cutover subcommand, combined streams,
+        // never failing the ssh step (the Rust verdict decides compatibility).
+        assert_eq!(cmd.shell, "kamal-proxy deploy --help 2>&1 || true");
+    }
+
+    #[test]
+    fn required_flags_track_tls_config() {
+        let http_only = KamalProxyController::new(60);
+        assert_eq!(
+            http_only.required_deploy_flags(),
+            vec![
+                "--target",
+                "--health-check-path",
+                "--deploy-timeout",
+                "--drain-timeout",
+            ],
+        );
+        let with_tls =
+            KamalProxyController::new(60).with_tls_host(Some("app.example.com".to_owned()));
+        assert_eq!(
+            with_tls.required_deploy_flags(),
+            vec![
+                "--target",
+                "--health-check-path",
+                "--deploy-timeout",
+                "--drain-timeout",
+                "--host",
+                "--tls",
+            ],
+        );
+        // Every required flag is one deploy_shell actually emits, so the contract
+        // can never drift from what the controller passes.
+        let flip_shell = with_tls.deploy_shell("svc", "127.0.0.1:3001");
+        for flag in with_tls.required_deploy_flags() {
+            assert!(
+                flip_shell.contains(flag),
+                "required flag {flag} must be one deploy_shell emits, got: {flip_shell}",
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_help_passes_silently() {
+        // A host whose kamal-proxy still has every flag we use passes with no error
+        // (MUST NOT break hosts that are already fine).
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(sample_deploy_help()),
+            Ok(()),
+        );
+        // Non-TLS controller does not require --host/--tls, so a help capture that
+        // lacks them is still compatible for it.
+        let no_tls_help = "Flags:\n  --target x\n  --health-check-path p\n  \
+                           --deploy-timeout d\n  --drain-timeout d\n";
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(no_tls_help),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn tls_controller_requires_tls_flags() {
+        // With TLS enabled, a help capture missing --tls is incompatible for THIS
+        // controller even though a non-TLS controller would accept it.
+        let no_tls_help = "Flags:\n  --target x\n  --health-check-path p\n  \
+                           --deploy-timeout d\n  --drain-timeout d\n  --host h\n";
+        let with_tls =
+            KamalProxyController::new(60).with_tls_host(Some("app.example.com".to_owned()));
+        assert_eq!(
+            with_tls.assess_deploy_help(no_tls_help),
+            Err(KamalProxyCompatIssue::MissingFlags(vec!["--tls"])),
+        );
+    }
+
+    #[test]
+    fn a_renamed_flag_is_caught_with_the_exact_missing_flag() {
+        // Simulate a future kamal-proxy that renamed --drain-timeout.
+        let drifted = sample_deploy_help().replace("--drain-timeout", "--drain-window");
+        let issue = KamalProxyController::new(60)
+            .assess_deploy_help(&drifted)
+            .expect_err("a renamed flag must be caught");
+        assert_eq!(
+            issue,
+            KamalProxyCompatIssue::MissingFlags(vec!["--drain-timeout"]),
+        );
+        // The operator message names the missing flag, the pinned known-good
+        // version, and states nothing was cut over.
+        let msg = issue.message();
+        assert!(
+            msg.contains("--drain-timeout"),
+            "message names the flag: {msg}"
+        );
+        assert!(msg.contains("v0.9.2"), "message names the pin: {msg}");
+        assert!(
+            msg.contains("before any cutover"),
+            "message states nothing was cut over: {msg}",
+        );
+    }
+
+    #[test]
+    fn valid_help_with_benign_stderr_noise_still_passes() {
+        // The probe folds stderr into the capture via 2>&1. A healthy target whose
+        // login shell prints startup noise — here a .bashrc line failing with
+        // `command not found` — must NOT block the deploy when `deploy --help`
+        // itself rendered valid help (AC: never break a host that is already fine).
+        let noisy = format!("bash: nvm: command not found\n{}", sample_deploy_help());
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(&noisy),
+            Ok(()),
+            "valid help alongside unrelated stderr noise must pass",
+        );
+        // Same for a TLS controller (which requires the extra --host/--tls flags).
+        let with_tls =
+            KamalProxyController::new(60).with_tls_host(Some("app.example.com".to_owned()));
+        assert_eq!(with_tls.assess_deploy_help(&noisy), Ok(()));
+    }
+
+    #[test]
+    fn a_renamed_flag_amid_stderr_noise_is_still_caught_as_missing_not_unusable() {
+        // The inverse guard: noise must not tip a genuine flag drift into a false
+        // BinaryUnusable. Only --drain-timeout is renamed, so other flags render →
+        // the help clearly printed, and the "command not found" noise is irrelevant.
+        let drifted = sample_deploy_help().replace("--drain-timeout", "--drain-window");
+        let noisy = format!("bash: nvm: command not found\n{drifted}");
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(&noisy),
+            Err(KamalProxyCompatIssue::MissingFlags(vec!["--drain-timeout"])),
+        );
+    }
+
+    #[test]
+    fn a_removed_deploy_subcommand_is_caught() {
+        // cobra's error when `deploy` is renamed/removed.
+        let output = "Error: unknown command \"deploy\" for \"kamal-proxy\"\n\
+                      Run 'kamal-proxy --help' for usage.\n";
+        let issue = KamalProxyController::new(60)
+            .assess_deploy_help(output)
+            .expect_err("a removed deploy subcommand must be caught");
+        assert_eq!(issue, KamalProxyCompatIssue::DeploySubcommandMissing);
+        assert!(issue.message().contains("no `deploy` subcommand"));
+    }
+
+    #[test]
+    fn a_missing_binary_is_caught() {
+        for output in [
+            "bash: kamal-proxy: command not found\n",
+            "/usr/local/bin/kamal-proxy: No such file or directory\n",
+            // Non-executable file (bad mode) → the binary couldn't run.
+            "bash: /usr/local/bin/kamal-proxy: Permission denied\n",
+            // Wrong-arch / not a real binary (ENOEXEC) → couldn't run.
+            "bash: /usr/local/bin/kamal-proxy: cannot execute binary file: Exec format error\n",
+            "", // no output at all → cannot confirm → fail closed
+        ] {
+            assert_eq!(
+                KamalProxyController::new(60).assess_deploy_help(output),
+                Err(KamalProxyCompatIssue::BinaryUnusable),
+                "output {output:?} must classify as an unusable binary",
+            );
+        }
+        let msg = KamalProxyCompatIssue::BinaryUnusable.message();
+        assert!(
+            msg.contains("/usr/local/bin/kamal-proxy"),
+            "names the path: {msg}"
+        );
+        assert!(msg.contains("v0.9.2"), "names the pin: {msg}");
+    }
+
+    #[test]
+    fn a_prefix_renamed_flag_is_caught_by_the_boundary_matcher() {
+        // A future kamal-proxy that renamed --target to --target-host: a plain
+        // substring check would find "--target" inside "--target-host" and wrongly
+        // pass, silently defeating the guardrail. The boundary matcher rejects the
+        // superstring and reports the exact missing flag.
+        let drifted = sample_deploy_help().replace("--target ", "--target-host ");
+        assert!(
+            drifted.contains("--target-host") && !drifted.contains("--target "),
+            "fixture must carry the renamed superstring and no standalone --target",
+        );
+        assert_eq!(
+            KamalProxyController::new(60).assess_deploy_help(&drifted),
+            Err(KamalProxyCompatIssue::MissingFlags(vec!["--target"])),
+        );
+        // And the boundary matcher itself: a standalone flag matches, a superstring
+        // does not, whichever side the extra token sits on.
+        assert!(output_lists_flag("  --tls    Configure TLS\n", "--tls"));
+        // Trailing boundary: a superstring flag is not a match.
+        assert!(!output_lists_flag("  --tls-enabled  ...\n", "--tls"));
+        // Leading boundary: a flag glued onto a preceding token is not a match.
+        assert!(!output_lists_flag("run--tls now", "--tls"));
+        // A `=value` form (no trailing space) is still a standalone flag.
+        assert!(output_lists_flag("--target=host:port", "--target"));
+    }
+
+    #[test]
+    fn compat_probe_trait_method_wires_command_and_verdict() {
+        let probe = KamalProxyController::new(60)
+            .compat_probe()
+            .expect("kamal-proxy declares a compat probe");
+        assert_eq!(
+            probe.command.shell,
+            "kamal-proxy deploy --help 2>&1 || true"
+        );
+        assert_eq!(probe.assess(sample_deploy_help()), Ok(()));
+        let drifted = sample_deploy_help().replace("--target", "--upstream");
+        let err = probe
+            .assess(&drifted)
+            .expect_err("drift must fail the verdict");
+        assert!(
+            err.contains("--target"),
+            "verdict message names the flag: {err}"
         );
     }
 }
