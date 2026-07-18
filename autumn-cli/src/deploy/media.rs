@@ -342,6 +342,28 @@ pub fn media_host_config_from_value(
 /// and the same WebRTC config — plus a **`~^room/.+$` path matcher** for
 /// autumn-media's Rooms primitive (Slice 6), which arroyo lacks (it is
 /// broadcast-only). Pure — exposed for unit assertions.
+///
+/// # `MediaMTX` schema currency (validated against v1.19.x / `bluenviron/mediamtx:1`)
+///
+/// `MediaMTX` rejects an **unknown** config field at startup (`json: unknown
+/// field ...`), and this config is installed by a post-cutover `systemctl
+/// restart` — so a single stale key would commit the app release then leave the
+/// daemon dead and playback stranded. Every key rendered here is therefore
+/// cross-checked against the current `MediaMTX` reference config
+/// (<https://github.com/bluenviron/mediamtx/blob/main/mediamtx.yml> and
+/// `internal/conf/conf.go`), the schema targeted by arroyo's pinned
+/// `bluenviron/mediamtx:1` image. Notably the HLS CORS key is the plural array
+/// `hlsAllowOrigins: ['*']` — the singular scalar `hlsAllowOrigin` is a
+/// deprecated alias, so the current plural form is emitted (issue #2051,
+/// Finding S). The globals (`api`/`apiAddress`, `playback`/`playbackAddress`,
+/// `rtmp`/`rtmpAddress`, `hls`/`hlsAddress`/`hlsVariant`/`hlsPartDuration`/
+/// `hlsSegmentCount`/`hlsSegmentDuration`, `webrtc`/`webrtcAddress`/
+/// `webrtcAllowOrigins`/`webrtcLocalUDPAddress`/`webrtcAdditionalHosts`, the
+/// `rtsp`/`srt`/`moq`/`metrics`/`pprof` disable toggles), the `pathDefaults`
+/// recording keys (`record`/`recordPath`/`recordFormat`/`recordPartDuration`/
+/// `recordSegmentDuration`/`recordDeleteAfter`), and the `paths` matchers all
+/// match that reference in name and value shape. Future edits: re-validate any
+/// added key against that reference before shipping it.
 #[must_use]
 pub fn render_mediamtx_yml(cfg: &MediaMtxHostConfig) -> String {
     // `webrtcAdditionalHosts` renders as an inline YAML list. Each host is
@@ -395,7 +417,7 @@ pub fn render_mediamtx_yml(cfg: &MediaMtxHostConfig) -> String {
          \n\
          hls: true\n\
          hlsAddress: :{hls}\n\
-         hlsAllowOrigin: \"*\"\n\
+         hlsAllowOrigins: ['*']\n\
          hlsVariant: {hls_variant}\n\
          hlsPartDuration: {hls_part}\n\
          # DVR-on-live window: retained window = hlsSegmentCount x hlsSegmentDuration\n\
@@ -1404,6 +1426,29 @@ unit_name = \"mediamtx-prod\"
         // WebRTC config.
         assert!(yml.contains("webrtc: true"));
         assert!(yml.contains("webrtcAdditionalHosts: []"));
+    }
+
+    #[test]
+    fn rendered_yml_uses_current_mediamtx_cors_schema() {
+        // Finding S (issue #2051): MediaMTX rejects unknown config fields at
+        // startup, and this config is installed by a post-cutover `systemctl
+        // restart`. The HLS CORS key is the plural array `hlsAllowOrigins` in the
+        // current schema (v1.19.x / `bluenviron/mediamtx:1`); the singular scalar
+        // `hlsAllowOrigin` is a deprecated alias, so the template must emit the
+        // current plural form, matching the already-plural `webrtcAllowOrigins`.
+        let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
+        assert!(
+            yml.contains("hlsAllowOrigins: ['*']"),
+            "HLS CORS must use the current plural array key: {yml}"
+        );
+        assert!(
+            !yml.contains("hlsAllowOrigin:"),
+            "the deprecated singular hlsAllowOrigin key must not be rendered: {yml}"
+        );
+        assert!(
+            yml.contains("webrtcAllowOrigins: ['*']"),
+            "WebRTC CORS must use the plural array key: {yml}"
+        );
     }
 
     #[test]
