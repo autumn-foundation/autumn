@@ -500,58 +500,97 @@ impl MediaMtxController {
     }
 
     /// Ordered ops that render `mediamtx.yml` + the systemd unit to the host and
-    /// make `MediaMTX` enabled, running, and reloaded with the freshest config.
+    /// make `MediaMTX` enabled, running, and reloaded — **restarting the daemon
+    /// only when the rendered config/unit actually changed, or when the unit is
+    /// not already running.**
     ///
     /// Returns an **empty vector when the section is not `enabled`** — the
     /// controller is a no-op for an app that does not provision `MediaMTX`. When
     /// enabled it emits, in order:
     /// 1. `Run` `mkdir -p <config parent dir>` — `scp` (the upload transport)
     ///    does not create parents, so the config dir must exist before op 2
-    ///    writes into it (omitted only for a parent-less `config_path`). The
-    ///    unit's parent (`/etc/systemd/system`) is a standard existing dir and
-    ///    needs no `mkdir`.
-    /// 2. `WriteFile` the rendered `mediamtx.yml` to `config_path` (mode `0644`).
-    /// 3. `WriteFile` the rendered unit to `/etc/systemd/system/<unit>.service`
-    ///    (mode `0644`).
-    /// 4. `Run` `systemctl daemon-reload && systemctl enable --now <unit>.service
-    ///    && systemctl restart <unit>.service` — idempotent, and the trailing
-    ///    `restart` reloads the freshly-written config on a redeploy.
+    ///    writes the staged config into it (omitted only for a parent-less
+    ///    `config_path`). The unit's parent (`/etc/systemd/system`) is a standard
+    ///    existing dir and needs no `mkdir`.
+    /// 2. `WriteFile` the rendered `mediamtx.yml` to a **temp path**
+    ///    (`<config_path>.autumn-new`, mode `0644`) — a sibling of the live file,
+    ///    never over it, so the live config is untouched until op 4 proves a real
+    ///    change.
+    /// 3. `WriteFile` the rendered unit to a **temp path**
+    ///    (`/etc/systemd/system/<unit>.service.autumn-new`, mode `0644`).
+    /// 4. `Run` a single idempotent shell command that `cmp -s`-compares each
+    ///    staged temp file to its live counterpart (a missing live file counts as
+    ///    changed), copies over only the changed ones (tracking a `changed`
+    ///    flag), removes the temp files, runs `systemctl daemon-reload` +
+    ///    `systemctl enable <unit>.service` (both idempotent), and restarts the
+    ///    unit **only if** `changed` is set **or** the unit is not currently
+    ///    active (`systemctl is-active --quiet <unit>.service` fails).
+    ///
+    /// The load-bearing behaviour (issue #2051, Finding H): a pure app redeploy
+    /// or a no-op media-config redeploy leaves the config and unit byte-identical
+    /// and the unit already active, so **no restart runs** — active
+    /// RTMP/WebRTC/HLS sessions are never killed before cutover. A genuine config
+    /// or unit change (or a dead/never-started unit) still restarts, so the
+    /// freshest config always takes effect.
     #[must_use]
     pub fn ensure_installed_ops(&self) -> Vec<DeployOp> {
         if !self.cfg.enabled {
             return Vec::new();
         }
         let unit = self.cfg.unit_name.clone();
+        let config_tmp = format!("{}.autumn-new", self.cfg.config_path);
+        let unit_path = self.unit_path();
+        let unit_tmp = format!("{unit_path}.autumn-new");
         let mut ops = Vec::new();
-        // Create the config's parent dir before scp writes the file into it —
-        // `scp` never creates missing parents, so the default
+        // Create the config's parent dir before scp writes the staged file into
+        // it — `scp` never creates missing parents, so the default
         // `/etc/mediamtx/mediamtx.yml` would fail at `media-write-config` on a
-        // fresh host without this. Skipped for a parent-less path (root/bare).
+        // fresh host without this. The temp file is a sibling of the live config,
+        // so this one `mkdir` covers both. Skipped for a parent-less path.
         if let Some(parent) = parent_dir(&self.cfg.config_path) {
             ops.push(DeployOp::Run(RemoteCommand::new(
                 "media-prepare-dirs",
                 format!("mkdir -p {}", super::exec::shell_quote(parent)),
             )));
         }
+        // Stage config + unit to TEMP paths (never directly over the live files),
+        // so op 4 can diff them and restart only on a real change.
         ops.push(DeployOp::WriteFile {
             label: "media-write-config",
             contents: FileContents::Plain(render_mediamtx_yml(&self.cfg)),
-            remote_path: self.cfg.config_path.clone(),
+            remote_path: config_tmp.clone(),
             mode: Some(0o644),
         });
         ops.push(DeployOp::WriteFile {
             label: "media-write-unit",
             contents: FileContents::Plain(render_mediamtx_unit(&self.cfg)),
-            remote_path: self.unit_path(),
+            remote_path: unit_tmp.clone(),
             mode: Some(0o644),
         });
-        ops.push(DeployOp::Run(RemoteCommand::new(
-            "media-install",
-            format!(
-                "systemctl daemon-reload && systemctl enable --now {unit}.service && \
-                 systemctl restart {unit}.service",
-            ),
-        )));
+
+        let cfg_live = super::exec::shell_quote(&self.cfg.config_path);
+        let cfg_new = super::exec::shell_quote(&config_tmp);
+        let unit_live = super::exec::shell_quote(&unit_path);
+        let unit_new = super::exec::shell_quote(&unit_tmp);
+        // POSIX-sh, fail-fast (`set -e`): compare each staged file to its live
+        // counterpart; a missing live file (`cmp` non-zero) or a real diff copies
+        // it over and flags `changed`. daemon-reload + enable are idempotent. The
+        // unit is restarted ONLY when the config/unit changed OR it is not
+        // already active — an app-only redeploy over unchanged, already-running
+        // media never interrupts live sessions.
+        let install = format!(
+            "set -e; \
+             changed=0; \
+             if ! cmp -s {cfg_new} {cfg_live}; then cp {cfg_new} {cfg_live}; chmod 0644 {cfg_live}; changed=1; fi; \
+             if ! cmp -s {unit_new} {unit_live}; then cp {unit_new} {unit_live}; chmod 0644 {unit_live}; changed=1; fi; \
+             rm -f {cfg_new} {unit_new}; \
+             systemctl daemon-reload; \
+             systemctl enable {unit}.service; \
+             if [ \"$changed\" -ne 0 ] || ! systemctl is-active --quiet {unit}.service; then \
+             systemctl restart {unit}.service; \
+             fi",
+        );
+        ops.push(DeployOp::Run(RemoteCommand::new("media-install", install)));
         ops
     }
 }
@@ -719,43 +758,74 @@ pub fn recordings_dir_writable(
     }
 }
 
-/// The `MediaMTX` ports a bare host must have free before provisioning: the five
-/// TCP listeners plus the WebRTC local UDP port. A port already bound by another
-/// service is a conflict `MediaMTX` cannot resolve.
+/// The transport protocol of a listening socket (the `ss` Netid column). Only
+/// `tcp` / `udp` are relevant to `MediaMTX`; any other Netid is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    Tcp,
+    Udp,
+}
+
+/// The `MediaMTX` ports a bare host must have free before provisioning, **each
+/// tagged with the protocol `MediaMTX` actually binds** (issue #2051, Finding I):
+/// the five TCP listeners (RTMP, HLS, WebRTC/WHEP, playback, control API) plus the
+/// WebRTC local **UDP** port (`webrtcLocalUDPAddress`, ICE host candidates). A
+/// listener conflicts only when it matches BOTH the port AND the protocol — a
+/// same-port/different-protocol listener (e.g. a TCP service on the UDP-only
+/// `:8189`) is not a conflict.
 #[must_use]
-fn mediamtx_required_ports(cfg: &MediaMtxHostConfig) -> Vec<u16> {
+fn mediamtx_required_ports(cfg: &MediaMtxHostConfig) -> Vec<(u16, Protocol)> {
     vec![
-        cfg.api_port,
-        cfg.rtmp_port,
-        cfg.hls_port,
-        cfg.webrtc_port,
-        cfg.playback_port,
-        cfg.webrtc_local_udp,
+        (cfg.api_port, Protocol::Tcp),
+        (cfg.rtmp_port, Protocol::Tcp),
+        (cfg.hls_port, Protocol::Tcp),
+        (cfg.webrtc_port, Protocol::Tcp),
+        (cfg.playback_port, Protocol::Tcp),
+        (cfg.webrtc_local_udp, Protocol::Udp),
     ]
 }
 
-/// A listening socket parsed from `ss -H -tulnp`: the local port plus the owning
-/// process name (`None` when `ss` could not attribute the socket — e.g. the
+/// A listening socket parsed from `ss -H -tulnp`: the local port, its transport
+/// protocol (the Netid column — issue #2051, Finding I), and the owning process
+/// name (`None` when `ss` could not attribute the socket — e.g. the
 /// `users:(("name",…))` column is absent because the caller lacked privilege).
-type ListeningSocket = (u16, Option<String>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListeningSocket {
+    port: u16,
+    protocol: Protocol,
+    owner: Option<String>,
+}
 
-/// Parse the listening sockets out of `ss -H -tulnp` output as
-/// `(port, owner_process)` pairs.
+/// Parse the listening sockets out of `ss -H -tulnp` output.
 ///
-/// Each line's 5th column (index 4: `Netid State Recv-Q Send-Q Local Peer …`) is
-/// the `Local Address:Port` — the port is the tail after the last `:` (covers
-/// IPv4 `0.0.0.0:8888`, IPv6 `[::]:8888`, and `*:8888`). The owning process is
-/// read from the trailing `users:(("<name>",pid=…,fd=…))` column (added by `-p`),
-/// or `None` when that column is absent. Lines whose port does not parse are
-/// skipped. Pure — unit-tested against captured `ss` output.
+/// Each row's 1st column (index 0) is the `Netid` (`tcp` / `udp`) and its 5th
+/// column (index 4: `Netid State Recv-Q Send-Q Local Peer …`) is the
+/// `Local Address:Port` — the port is the tail after the last `:` (covers IPv4
+/// `0.0.0.0:8888`, IPv6 `[::]:8888`, and `*:8888`). The owning process is read
+/// from the trailing `users:(("<name>",pid=…,fd=…))` column (added by `-p`), or
+/// `None` when that column is absent. Rows whose Netid is not `tcp`/`udp`, or
+/// whose port does not parse, are skipped. Pure — unit-tested against captured
+/// `ss` output.
 #[must_use]
 fn parse_listening_sockets(ss_output: &str) -> Vec<ListeningSocket> {
     ss_output
         .lines()
         .filter_map(|line| {
-            let local = line.split_whitespace().nth(4)?;
+            let mut cols = line.split_whitespace();
+            let protocol = match cols.next()? {
+                "tcp" => Protocol::Tcp,
+                "udp" => Protocol::Udp,
+                _ => return None,
+            };
+            // We already consumed index 0 (Netid); the Local column is index 4,
+            // i.e. the 4th remaining column (skip State/Recv-Q/Send-Q).
+            let local = cols.nth(3)?;
             let port = local.rsplit(':').next()?.parse::<u16>().ok()?;
-            Some((port, process_name_from_ss_line(line)))
+            Some(ListeningSocket {
+                port,
+                protocol,
+                owner: process_name_from_ss_line(line),
+            })
         })
         .collect()
 }
@@ -785,29 +855,48 @@ fn managed_process_name(cfg: &MediaMtxHostConfig) -> &str {
         .unwrap_or(cfg.binary_path.as_str())
 }
 
+/// Whether our configured `MediaMTX` systemd unit is currently active, via
+/// `systemctl is-active --quiet <unit>.service` (exit `0` ⇒ active). Any failure
+/// (inactive, unknown unit, or transport error) is read as **not active** — the
+/// fail-closed direction for [`mediamtx_ports_available`]'s Finding-J gate. Run
+/// at most once per check and the result reused.
+#[must_use]
+fn unit_is_active(exec: &impl DeployExecutor, unit_name: &str) -> bool {
+    let cmd = RemoteCommand::new(
+        "media-unit-active",
+        format!("systemctl is-active --quiet {unit_name}.service"),
+    );
+    exec.run(&cmd).is_ok()
+}
+
 /// Grade that the `MediaMTX` ports are free on the host (no *foreign* service is
 /// already bound to them).
 ///
-/// **Process-aware, redeploy-safe on changed ports.** It always runs the port
-/// scan — `ss -H -tulnp` (the `-p` adds the owning-process column) over the
-/// executor — and classifies each configured target port by *who* holds it, not
-/// merely whether it is occupied:
+/// **Protocol-aware and unit-verified** (issue #2051, Findings I + J). It runs a
+/// single port scan — `ss -H -tulnp` (the `-p` adds the owning-process column,
+/// the leading Netid gives the protocol) over the executor — and classifies each
+/// configured target `(port, protocol)`:
 ///
-/// - No listener → the port is free → pass.
-/// - Every listener owned by *our own* managed `MediaMTX` (process basename of
-///   [`MediaMtxHostConfig::binary_path`]) → a same-port redeploy, not a conflict
-///   → pass (informational note).
-/// - A listener owned by any *other* process, **or** a listener whose owner
+/// - No **same-protocol** listener on the port → free → pass. A same-port but
+///   *different-protocol* listener is NOT a conflict: the WebRTC local port
+///   `:8189` is UDP-only, so a TCP service on `8189` (or a UDP service on a TCP
+///   `MediaMTX` port) never cross-conflicts (Finding I).
+/// - Every same-protocol listener owned by *our own* managed `MediaMTX` (process
+///   basename of [`MediaMtxHostConfig::binary_path`]) **and** our configured unit
+///   reports active (`systemctl is-active --quiet <unit>.service`) → a same-port
+///   redeploy of our own daemon, not a conflict → pass (informational note).
+/// - A same-protocol listener owned by a `MediaMTX` process while our configured
+///   unit is **not** active (manual run, a differently-named service, or a
+///   crashed unit) → conflict → fail-closed (Finding J): `enable --now` would
+///   start a *second* instance over ports the old process still owns.
+/// - A same-protocol listener owned by any *other* process, **or** whose owner
 ///   cannot be attributed (empty process column — e.g. insufficient privilege) →
 ///   conflict → fail-closed. `autumn deploy` runs as root managing systemd, so
 ///   `-p` attribution is normally available; an unattributable listener on a
 ///   target port is deliberately treated as a conflict rather than assumed benign.
 ///
-/// This replaces an earlier blanket `systemctl is-active` skip, which passed a
-/// running unit without scanning at all — so a redeploy that *changed* a `MediaMTX`
-/// port could not detect a foreign service already bound to the new port (the old
-/// unit only holds the old ports). The per-port ownership check keeps the
-/// same-port redeploy self-conflict passing while still catching that case.
+/// The unit `is-active` query runs at most **once** (only when a MediaMTX-owned
+/// port is actually found) and the result is reused across the held ports.
 ///
 /// Fail-closed: if `ss` cannot run, or its output does not parse into any
 /// recognizable listener, the check fails with a "could not verify" message
@@ -819,7 +908,8 @@ pub fn mediamtx_ports_available(
 ) -> PreflightCheck {
     // `-p` attaches the owning-process column so a target port held by our own
     // managed MediaMTX (a same-port redeploy) is distinguished from a foreign
-    // conflict. Deploy runs as root, so `-p` attribution is available.
+    // conflict; the Netid column gives the protocol. Deploy runs as root, so `-p`
+    // attribution is available.
     let cmd = RemoteCommand::new("media-ports", "ss -H -tulnp".to_owned());
     let output = match exec.run(&cmd) {
         Ok(out) => out.stdout,
@@ -849,46 +939,71 @@ pub fn mediamtx_ports_available(
     }
 
     let ours = managed_process_name(cfg);
-    let mut conflicts: Vec<u16> = Vec::new();
-    let mut held_by_us: Vec<u16> = Vec::new();
-    for port in mediamtx_required_ports(cfg) {
-        let mut has_listener = false;
-        let mut all_ours = true;
-        for (socket_port, owner) in &sockets {
-            if *socket_port != port {
-                continue;
-            }
-            has_listener = true;
-            // A listener owned by our own mediamtx is fine; a foreign process OR
-            // an unattributable listener (owner `None`) is a conflict → fail-closed.
-            if owner.as_deref() != Some(ours) {
-                all_ours = false;
-            }
+    // Ports held by a foreign / unattributable same-protocol listener.
+    let mut foreign: Vec<u16> = Vec::new();
+    // Ports held only by our own MediaMTX process (pending the Finding-J
+    // is-active gate below).
+    let mut ours_ports: Vec<u16> = Vec::new();
+    for (port, protocol) in mediamtx_required_ports(cfg) {
+        // A listener conflicts only when it matches BOTH the port AND the
+        // protocol (Finding I) — a same-port/different-protocol listener is not
+        // a conflict.
+        let mut matching = sockets
+            .iter()
+            .filter(|s| s.port == port && s.protocol == protocol)
+            .peekable();
+        if matching.peek().is_none() {
+            continue; // no same-protocol listener → free
         }
-        if !has_listener {
-            continue; // free
-        }
-        if all_ours {
-            held_by_us.push(port);
+        // A listener owned by our own mediamtx is (provisionally) ours; a foreign
+        // process OR an unattributable listener (owner `None`) is a conflict.
+        if matching.all(|s| s.owner.as_deref() == Some(ours)) {
+            ours_ports.push(port);
         } else {
-            conflicts.push(port);
+            foreign.push(port);
         }
     }
-    conflicts.sort_unstable();
-    conflicts.dedup();
 
-    if !conflicts.is_empty() {
-        let list = conflicts
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
+    // Finding J: a MediaMTX-owned port counts as "ours" only when our configured
+    // unit is actually active. If the ports are held by a `mediamtx` process that
+    // is NOT our managed unit (manual run / differently-named service / crashed),
+    // treat them as conflicts (fail-closed) — `enable --now` must not start a
+    // second instance over them. The is-active query runs at most once.
+    let mut held_by_us: Vec<u16> = Vec::new();
+    let mut unmanaged: Vec<u16> = Vec::new();
+    if !ours_ports.is_empty() {
+        if unit_is_active(exec, &cfg.unit_name) {
+            held_by_us = ours_ports;
+        } else {
+            unmanaged = ours_ports;
+        }
+    }
+
+    let mut conflict_msgs: Vec<String> = Vec::new();
+    foreign.sort_unstable();
+    foreign.dedup();
+    if !foreign.is_empty() {
+        conflict_msgs.push(format!(
+            "MediaMTX port(s) already in use by another service on the host: {}",
+            join_ports(&foreign)
+        ));
+    }
+    unmanaged.sort_unstable();
+    unmanaged.dedup();
+    if !unmanaged.is_empty() {
+        conflict_msgs.push(format!(
+            "MediaMTX port(s) {} are held by a `{ours}` process, but the configured \
+             `{}` unit is not active — an unmanaged/manual MediaMTX (or a crashed unit) still \
+             owns them, so starting our unit would launch a second instance over them",
+            join_ports(&unmanaged),
+            cfg.unit_name,
+        ));
+    }
+    if !conflict_msgs.is_empty() {
         return PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
             passed: false,
-            detail: format!(
-                "MediaMTX port(s) already in use by another service on the host: {list}"
-            ),
+            detail: conflict_msgs.join("; "),
             hint: Some(PORTS_HINT),
         };
     }
@@ -896,14 +1011,10 @@ pub fn mediamtx_ports_available(
     let detail = if held_by_us.is_empty() {
         "all MediaMTX ports are free on the host".to_owned()
     } else {
-        let list = held_by_us
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
         format!(
-            "MediaMTX ports are available; port(s) {list} are already held by our own managed \
-             MediaMTX (same-port redeploy)"
+            "MediaMTX ports are available; port(s) {} are already held by our own managed \
+             MediaMTX (same-port redeploy)",
+            join_ports(&held_by_us),
         )
     };
     PreflightCheck {
@@ -912,6 +1023,16 @@ pub fn mediamtx_ports_available(
         detail,
         hint: None,
     }
+}
+
+/// Join a sorted list of ports as a `"1935, 8888"` string for messages.
+#[must_use]
+fn join_ports(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Collect the three `MediaMTX` host doctor checks against a live executor.
@@ -967,6 +1088,15 @@ mod tests {
 
         fn with_stdout(mut self, label: &'static str, stdout: impl Into<String>) -> Self {
             self.stdout_by_label.push((label, stdout.into()));
+            self
+        }
+
+        /// Chainable variant of [`Self::failing_on`]: mark an additional command
+        /// label as failing (so a check can succeed on one command and fail on
+        /// another — e.g. `ss` succeeds but `systemctl is-active` reports the unit
+        /// inactive).
+        fn failing(mut self, label: &'static str) -> Self {
+            self.fail_labels.push(label);
             self
         }
 
@@ -1217,7 +1347,8 @@ unit_name = \"mediamtx-prod\"
         assert_eq!(mkdir.label, "media-prepare-dirs");
         assert_eq!(mkdir.shell, "mkdir -p '/etc/mediamtx'");
 
-        // op 1: write mediamtx.yml to config_path (0644), with rendered config.
+        // Finding H: op 1 writes mediamtx.yml to a TEMP path (never over the live
+        // file), so op 3 can diff it and restart only on a real change.
         match &ops[1] {
             DeployOp::WriteFile {
                 label,
@@ -1226,7 +1357,7 @@ unit_name = \"mediamtx-prod\"
                 mode,
             } => {
                 assert_eq!(*label, "media-write-config");
-                assert_eq!(remote_path, "/etc/mediamtx/mediamtx.yml");
+                assert_eq!(remote_path, "/etc/mediamtx/mediamtx.yml.autumn-new");
                 assert_eq!(*mode, Some(0o644));
                 let FileContents::Plain(yml) = contents else {
                     panic!("config must be plain text");
@@ -1236,7 +1367,7 @@ unit_name = \"mediamtx-prod\"
             other => panic!("op 1 must write the config, got {other:?}"),
         }
 
-        // op 2: write the unit to /etc/systemd/system/mediamtx.service (0644).
+        // op 2: write the unit to a TEMP path next to the live unit (0644).
         match &ops[2] {
             DeployOp::WriteFile {
                 label,
@@ -1245,7 +1376,10 @@ unit_name = \"mediamtx-prod\"
                 mode,
             } => {
                 assert_eq!(*label, "media-write-unit");
-                assert_eq!(remote_path, "/etc/systemd/system/mediamtx.service");
+                assert_eq!(
+                    remote_path,
+                    "/etc/systemd/system/mediamtx.service.autumn-new"
+                );
                 assert_eq!(*mode, Some(0o644));
                 let FileContents::Plain(unit) = contents else {
                     panic!("unit must be plain text");
@@ -1255,15 +1389,81 @@ unit_name = \"mediamtx-prod\"
             other => panic!("op 2 must write the unit, got {other:?}"),
         }
 
-        // op 3: daemon-reload + enable --now + restart.
+        // op 3 (the conditional-restart install) is asserted in
+        // `controller_install_op_is_conditional_restart` below.
+        assert!(matches!(&ops[3], DeployOp::Run(c) if c.label == "media-install"));
+    }
+
+    #[test]
+    fn controller_install_op_is_conditional_restart() {
+        // Finding H: op 3 must `cmp` the staged temp files against the live ones,
+        // copy only the changed, and restart the unit ONLY on a real change or an
+        // inactive unit — never unconditionally (which would kill live sessions on
+        // a pure app redeploy).
+        let cfg = MediaMtxHostConfig {
+            enabled: true,
+            ..MediaMtxHostConfig::default()
+        };
+        let ops = MediaMtxController::new(cfg).ensure_installed_ops();
         let DeployOp::Run(cmd) = &ops[3] else {
             panic!("op 3 must be the install Run op");
         };
         assert_eq!(cmd.label, "media-install");
-        assert_eq!(
-            cmd.shell,
-            "systemctl daemon-reload && systemctl enable --now mediamtx.service && \
-             systemctl restart mediamtx.service",
+        let shell = &cmd.shell;
+        // Diffs the staged temp files against the live counterparts.
+        assert!(
+            shell.contains(
+                "cmp -s '/etc/mediamtx/mediamtx.yml.autumn-new' '/etc/mediamtx/mediamtx.yml'"
+            ),
+            "must cmp the staged config against the live config: {shell}"
+        );
+        assert!(
+            shell.contains(
+                "cmp -s '/etc/systemd/system/mediamtx.service.autumn-new' \
+                 '/etc/systemd/system/mediamtx.service'"
+            ),
+            "must cmp the staged unit against the live unit: {shell}"
+        );
+        // Copies over only the changed files and tracks a `changed` flag.
+        assert!(
+            shell.contains("changed=1"),
+            "must track a changed flag: {shell}"
+        );
+        assert!(
+            shell.contains(
+                "cp '/etc/mediamtx/mediamtx.yml.autumn-new' '/etc/mediamtx/mediamtx.yml'"
+            ),
+            "must copy the staged config into place on change: {shell}"
+        );
+        // Cleans up the temp files.
+        assert!(
+            shell.contains(
+                "rm -f '/etc/mediamtx/mediamtx.yml.autumn-new' \
+                 '/etc/systemd/system/mediamtx.service.autumn-new'"
+            ),
+            "must clean up the staged temp files: {shell}"
+        );
+        // Idempotent daemon-reload + enable (NOT `enable --now` — start is handled
+        // by the conditional restart).
+        assert!(shell.contains("systemctl daemon-reload"), "{shell}");
+        assert!(
+            shell.contains("systemctl enable mediamtx.service"),
+            "{shell}"
+        );
+        assert!(
+            !shell.contains("enable --now"),
+            "must not `enable --now` (that would start unconditionally): {shell}"
+        );
+        // Restart gated on change-OR-inactive, never unconditional.
+        assert!(
+            shell.contains(
+                "if [ \"$changed\" -ne 0 ] || ! systemctl is-active --quiet mediamtx.service; then"
+            ),
+            "restart must be gated on change or an inactive unit: {shell}"
+        );
+        assert!(
+            shell.contains("systemctl restart mediamtx.service"),
+            "{shell}"
         );
     }
 
@@ -1283,8 +1483,17 @@ unit_name = \"mediamtx-prod\"
         let DeployOp::Run(cmd) = &ops[3] else {
             panic!("op 3 must be the install Run op");
         };
-        assert!(cmd.shell.contains("enable --now mediamtx-prod.service"));
+        assert!(cmd.shell.contains("systemctl enable mediamtx-prod.service"));
+        assert!(
+            cmd.shell
+                .contains("is-active --quiet mediamtx-prod.service")
+        );
         assert!(cmd.shell.contains("restart mediamtx-prod.service"));
+        // The staged temp unit tracks the custom unit name too.
+        assert!(
+            cmd.shell
+                .contains("/etc/systemd/system/mediamtx-prod.service.autumn-new")
+        );
     }
 
     #[test]
@@ -1457,17 +1666,28 @@ unit_name = \"mediamtx-prod\"
     // ── Doctor: mediamtx ports available ─────────────────────────────────────
 
     #[test]
-    fn parse_listening_sockets_extracts_port_and_owner() {
+    fn parse_listening_sockets_extracts_port_protocol_and_owner() {
+        // Finding I: the Netid (tcp/udp) column is parsed onto each socket.
         let ss = "\
 tcp   LISTEN 0 128  0.0.0.0:8888  0.0.0.0:*  users:((\"mediamtx\",pid=10,fd=5))
 tcp   LISTEN 0 128  [::]:22       [::]:*     users:((\"sshd\",pid=5,fd=3))
 udp   UNCONN 0 0    *:8189        *:*
+sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 ";
         let sockets = parse_listening_sockets(ss);
-        assert!(sockets.contains(&(8888, Some("mediamtx".to_owned()))));
-        assert!(sockets.contains(&(22, Some("sshd".to_owned()))));
-        // The UDP row has no `users:` column → unattributable owner.
-        assert!(sockets.contains(&(8189, None)));
+        assert!(sockets.iter().any(|s| s.port == 8888
+            && s.protocol == Protocol::Tcp
+            && s.owner.as_deref() == Some("mediamtx")));
+        assert!(sockets.iter().any(|s| s.port == 22
+            && s.protocol == Protocol::Tcp
+            && s.owner.as_deref() == Some("sshd")));
+        // The UDP row has no `users:` column → unattributable owner, protocol UDP.
+        assert!(
+            sockets
+                .iter()
+                .any(|s| s.port == 8189 && s.protocol == Protocol::Udp && s.owner.is_none())
+        );
+        // A non-tcp/udp Netid (e.g. `sctp`) is skipped entirely.
         assert_eq!(sockets.len(), 3);
     }
 
@@ -1520,8 +1740,10 @@ udp   UNCONN 0 0    *:8189        *:*
             "detail: {}",
             check.detail
         );
-        // No is-active gate anymore: only the single `ss` scan runs.
-        assert_eq!(exec.labels(), vec!["media-ports"]);
+        // Finding J: because MediaMTX-owned ports were found, the is-active gate
+        // runs exactly once after the `ss` scan (the fake reports the unit active
+        // by default), so the same-port redeploy passes.
+        assert_eq!(exec.labels(), vec!["media-ports", "media-unit-active"]);
     }
 
     #[test]
@@ -1545,6 +1767,95 @@ udp   UNCONN 0 0    *:8189        *:*
         let check = mediamtx_ports_available(&exec, &cfg);
         assert!(!check.passed, "detail: {}", check.detail);
         assert!(check.detail.contains("8080"), "detail: {}", check.detail);
+    }
+
+    #[test]
+    fn ports_available_ignores_same_port_different_protocol_listener() {
+        // Finding I: the WebRTC local port 8189 is UDP-only. A TCP service on 8189
+        // is a DIFFERENT protocol, so it must NOT be flagged as a conflict.
+        let exec = RecordingExecutor::new().with_stdout(
+            "media-ports",
+            "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n\
+             tcp LISTEN 0 128 0.0.0.0:8189 0.0.0.0:* users:((\"someapp\",pid=77,fd=9))\n",
+        );
+        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
+        assert!(check.passed, "detail: {}", check.detail);
+        assert!(check.detail.contains("free"), "detail: {}", check.detail);
+
+        // The mirror case: a UDP service on a TCP MediaMTX port (8888 is TCP) is
+        // also a different protocol and not a conflict.
+        let exec = RecordingExecutor::new().with_stdout(
+            "media-ports",
+            "udp UNCONN 0 0 0.0.0.0:8888 0.0.0.0:* users:((\"someapp\",pid=88,fd=4))\n",
+        );
+        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
+        assert!(check.passed, "detail: {}", check.detail);
+    }
+
+    #[test]
+    fn ports_available_fails_on_same_protocol_foreign_listener() {
+        // Finding I: a TCP listener on the TCP HLS port (8888), owned by a foreign
+        // process, IS a same-protocol conflict.
+        let exec = RecordingExecutor::new().with_stdout(
+            "media-ports",
+            "tcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:* users:((\"nginx\",pid=99,fd=6))\n",
+        );
+        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
+        assert!(!check.passed, "detail: {}", check.detail);
+        assert!(check.detail.contains("8888"), "detail: {}", check.detail);
+        assert!(check.detail.contains("another service"));
+    }
+
+    #[test]
+    fn ports_available_fails_on_udp_foreign_listener_on_udp_target() {
+        // Finding I: a UDP foreign listener on the UDP-target 8189 IS a conflict.
+        let exec = RecordingExecutor::new().with_stdout(
+            "media-ports",
+            "udp UNCONN 0 0 0.0.0.0:8189 0.0.0.0:* users:((\"coturn\",pid=42,fd=8))\n",
+        );
+        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
+        assert!(!check.passed, "detail: {}", check.detail);
+        assert!(check.detail.contains("8189"), "detail: {}", check.detail);
+    }
+
+    #[test]
+    fn ports_available_fails_closed_when_mediamtx_owns_ports_but_unit_inactive() {
+        // Finding J: the ports are held by a `mediamtx` process, but OUR configured
+        // unit is NOT active (manual run / differently-named service / crashed).
+        // Starting our unit would launch a second instance over them → fail-closed.
+        let exec = RecordingExecutor::new()
+            .with_stdout(
+                "media-ports",
+                "tcp LISTEN 0 128 0.0.0.0:9997 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=3))\n\
+                 tcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=5))\n",
+            )
+            // `systemctl is-active --quiet` exits non-zero → transport error →
+            // read as NOT active.
+            .failing("media-unit-active");
+        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
+        assert!(!check.passed, "detail: {}", check.detail);
+        assert!(check.detail.contains("8888"), "detail: {}", check.detail);
+        assert!(
+            check.detail.contains("not active"),
+            "detail: {}",
+            check.detail
+        );
+        // The is-active gate ran exactly once, after the single ss scan.
+        assert_eq!(exec.labels(), vec!["media-ports", "media-unit-active"]);
+    }
+
+    #[test]
+    fn ports_available_does_not_query_is_active_when_no_mediamtx_port_held() {
+        // Finding J: the is-active gate runs at most once, and only when a
+        // MediaMTX-owned port is actually found. A foreign-only conflict (or a
+        // free host) never queries it.
+        let exec = RecordingExecutor::new().with_stdout(
+            "media-ports",
+            "tcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:* users:((\"nginx\",pid=99,fd=6))\n",
+        );
+        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
+        assert!(!check.passed);
+        assert_eq!(exec.labels(), vec!["media-ports"]);
     }
 
     #[test]
