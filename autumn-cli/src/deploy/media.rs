@@ -26,15 +26,19 @@
 //!   [`DeployExecutor`](super::exec::DeployExecutor), so the remote command
 //!   sequence is assertable against a recording fake with no live host. It
 //!   no-ops (empty op vector) when the section is not `enabled`.
-//! - Four fail-closed doctor checks — [`ffmpeg_preflight`],
-//!   [`mediamtx_binary_preflight`], [`recordings_dir_writable`], and
-//!   [`mediamtx_ports_available`] — run over the same executor and return the
-//!   shared [`PreflightCheck`] type, so a media host can be graded the same way
-//!   `autumn deploy check` grades the app host. The binary preflight runs before
-//!   cutover so a host missing the (deferred-provisioned) `MediaMTX` binary fails
-//!   fast instead of committing the app and then failing the post-cutover
-//!   restart. An unverifiable result (transport error, unparseable output)
-//!   reports a clear failure — never a silent pass.
+//! - Five fail-closed doctor checks — [`mediamtx_ports_distinct`],
+//!   [`ffmpeg_preflight`], [`mediamtx_binary_preflight`],
+//!   [`recordings_dir_writable`], and [`mediamtx_ports_available`] — most run over
+//!   the same executor and all return the shared [`PreflightCheck`] type, so a
+//!   media host can be graded the same way `autumn deploy check` grades the app
+//!   host. [`mediamtx_ports_distinct`] is a **pure config** check (issue #2051,
+//!   Finding P): it rejects a config that binds two same-protocol listeners to one
+//!   port before provisioning, so `systemctl restart` cannot fail after cutover on
+//!   a config that a fresh-host `ss` scan would pass. The binary preflight runs
+//!   before cutover so a host missing the (deferred-provisioned) `MediaMTX` binary
+//!   fails fast instead of committing the app and then failing the post-cutover
+//!   restart. An unverifiable result (transport error, unparseable output) reports
+//!   a clear failure — never a silent pass.
 //!
 //! ## `FFmpeg` path verification (concrete literals only)
 //!
@@ -187,7 +191,7 @@ fn default_ffmpeg_bin() -> String {
 /// Every field has a serde default (via the struct-level `#[serde(default)]` +
 /// the [`Default`] impl), so a bare `[media.mediamtx]` table — or none at all —
 /// yields the localhost dev shape with the controller disabled. Deserialized
-/// out of the raw `autumn.toml` string via [`MediaMtxHostConfig::from_toml_str`]
+/// out of the merged `autumn.toml` value via [`media_host_config_from_value`]
 /// (mirroring how the plugin reads `[media]`), so it never touches
 /// `autumn-web`'s strict `AutumnConfig` schema — no `autumn-media-plugin`
 /// dependency and no change to the app config type.
@@ -277,39 +281,7 @@ impl Default for FfmpegSection {
     }
 }
 
-/// Read the `[media.ffmpeg] bin` path out of a raw `autumn.toml` string,
-/// defaulting to [`DEFAULT_FFMPEG_BIN`] when the section (or the whole file) is
-/// absent. Companion to [`MediaMtxHostConfig::from_toml_str`] so the deploy
-/// `FFmpeg` preflight checks the same binary the app resolves.
-///
-/// # Errors
-///
-/// Returns the [`toml::de::Error`] when the string does not parse.
-pub fn ffmpeg_bin_from_toml_str(toml_str: &str) -> Result<String, toml::de::Error> {
-    let root: MediaTomlRoot = toml::from_str(toml_str)?;
-    Ok(root.media.ffmpeg.bin)
-}
-
 impl MediaMtxHostConfig {
-    /// Deserialize the `[media.mediamtx]` section out of a raw `autumn.toml`
-    /// string. A file with no `[media.mediamtx]` table yields
-    /// [`MediaMtxHostConfig::default`] (disabled), so a non-media project reads
-    /// as "controller off".
-    ///
-    /// Fail-closed contract: an *absent* table maps to `Ok(default)`, but a table
-    /// that is *present with an ill-typed value* is a hard `Err` — the caller
-    /// must abort rather than fall back to the disabled default, otherwise a
-    /// media-enabled app would deploy WITHOUT provisioning `MediaMTX`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`toml::de::Error`] when the string does not parse or a
-    /// present `[media.mediamtx]` / `[media.ffmpeg]` value has the wrong type.
-    pub fn from_toml_str(toml_str: &str) -> Result<Self, toml::de::Error> {
-        let root: MediaTomlRoot = toml::from_str(toml_str)?;
-        Ok(root.media.mediamtx)
-    }
-
     /// The `MediaMTX` origins an embedding app must allow in its
     /// `connect-src`/`media-src` (and `frame-src` for WebRTC) CSP directives, in
     /// the local `http://127.0.0.1:<port>` shape.
@@ -329,6 +301,37 @@ impl MediaMtxHostConfig {
             format!("http://127.0.0.1:{}", self.playback_port),
         ]
     }
+}
+
+/// Deserialize the `[media]` host config out of an **already-merged**
+/// `autumn.toml` root [`toml::Value`] — base ← inline `[profile.<name>]` ←
+/// `autumn-<profile>.toml` — returning both the [`MediaMtxHostConfig`] and the
+/// `[media.ffmpeg] bin` path (issue #2051, Finding O).
+///
+/// The deploy-side loader resolves the media config under the **target deploy
+/// profile** using the SAME base+profile TOML layering `AutumnConfig::load()`
+/// applies to the app config, so a profiled deploy (`prod`/`staging`) sees the
+/// profile's `[media.mediamtx]` / `[media.ffmpeg]` (from
+/// `[profile.<name>.media.*]` or `autumn-<profile>.toml`) instead of the base
+/// default. Rather than round-tripping the merged value back through a string
+/// (which can panic on `toml::to_string` table-ordering), the caller merges raw
+/// `toml::Value`s and deserializes the `[media]` subtree here.
+///
+/// Fail-closed: an *absent*
+/// `[media]` subtree maps to the disabled default, but a subtree present with an
+/// **ill-typed value in any contributing layer** is a hard [`Err`] (the merged
+/// value carries the bad type), so the caller aborts `deploy plan`/`up` rather
+/// than deploying a media-enabled app WITHOUT provisioning `MediaMTX`.
+///
+/// # Errors
+///
+/// Returns the [`toml::de::Error`] when the merged `[media.mediamtx]` /
+/// `[media.ffmpeg]` subtree has a wrong-typed value.
+pub fn media_host_config_from_value(
+    root: toml::Value,
+) -> Result<(MediaMtxHostConfig, String), toml::de::Error> {
+    let parsed: MediaTomlRoot = root.try_into()?;
+    Ok((parsed.media.mediamtx, parsed.media.ffmpeg.bin))
 }
 
 /// Render the `MediaMTX` `mediamtx.yml`, parameterized by [`MediaMtxHostConfig`].
@@ -620,6 +623,8 @@ pub const CHECK_RECORDINGS_DIR_WRITABLE: &str = "media_recordings_dir_writable";
 pub const CHECK_MEDIAMTX_PORTS_AVAILABLE: &str = "media_mediamtx_ports_available";
 /// The check name for the `MediaMTX` binary-executable preflight.
 pub const CHECK_MEDIAMTX_BINARY: &str = "media_mediamtx_binary";
+/// The check name for the `MediaMTX` distinct-listener-port config preflight.
+pub const CHECK_MEDIAMTX_PORTS_DISTINCT: &str = "media_mediamtx_ports_distinct";
 
 /// Remediation hint shown when `FFmpeg` does not resolve.
 const FFMPEG_HINT: &str =
@@ -630,6 +635,10 @@ const RECORDINGS_HINT: &str =
 /// Remediation hint shown when a `MediaMTX` port is occupied or unverifiable.
 const PORTS_HINT: &str =
     "Free the conflicting MediaMTX ports on the host (or stop the service already bound to them)";
+/// Remediation hint shown when two same-protocol `MediaMTX` listeners are
+/// configured onto one port.
+const PORTS_DISTINCT_HINT: &str = "Give each MediaMTX TCP listener (`rtmp_port`/`hls_port`/`webrtc_port`/`playback_port`/`api_port`) \
+     a distinct port in `[media.mediamtx]`";
 /// Remediation hint shown when the `MediaMTX` binary is missing / not executable.
 const MEDIAMTX_BINARY_HINT: &str = "Install the MediaMTX binary at `[media.mediamtx] binary_path` on the host — a host-bootstrap \
      prerequisite (download/version-pin the Go binary, exactly as autumn does for kamal-proxy)";
@@ -1063,14 +1072,78 @@ pub fn mediamtx_binary_preflight(
     }
 }
 
-/// Collect the four `MediaMTX` host doctor checks against a live executor.
+/// Grade that the configured `MediaMTX` **TCP listener ports are all distinct**
+/// (issue #2051, Finding P) — a **pure config** check, no executor, no host I/O.
 ///
-/// Runs the `FFmpeg` preflight (against `ffmpeg_bin`), the `MediaMTX`
-/// binary-executable preflight, the recordings-dir probe, and the
-/// port-availability probe — returning the shared [`PreflightCheck`] results so a
-/// caller that already holds a [`DeployExecutor`] can grade a media host the same
-/// way `autumn deploy check` grades the app host. `ffmpeg_bin` is the resolved
-/// `[media.ffmpeg] bin` (the plugin's default is `/usr/bin/ffmpeg`).
+/// `MediaMTX` runs a separate server per protocol, each binding its own TCP
+/// socket: RTMP (`rtmp_port`), HLS (`hls_port`), WebRTC/WHEP (`webrtc_port`),
+/// recording-playback (`playback_port`), and the control API (`api_port`). If two
+/// of those are configured to the same value, the rendered `mediamtx.yml` asks two
+/// servers to bind one port. [`mediamtx_ports_available`]'s `ss` scan can still
+/// pass on a fresh host (nothing is listening yet), so the conflict would only
+/// surface as a failed **deferred** `systemctl restart` AFTER app cutover — the
+/// worst time. This check catches it up front and fails closed.
+///
+/// The WebRTC local **UDP** port (`webrtc_local_udp`) is a *separate protocol
+/// namespace*, so it may legitimately equal a TCP port and is deliberately not
+/// compared against the TCP set (mirroring [`mediamtx_required_ports`]'s
+/// protocol-aware conflict rule). Fail-closed message names the duplicated value
+/// and every field bound to it.
+#[must_use]
+pub fn mediamtx_ports_distinct(cfg: &MediaMtxHostConfig) -> PreflightCheck {
+    // The five TCP listeners MediaMTX binds — each its own server, so all must be
+    // distinct. `webrtc_local_udp` is UDP and intentionally excluded.
+    let tcp: [(u16, &str); 5] = [
+        (cfg.rtmp_port, "rtmp_port"),
+        (cfg.hls_port, "hls_port"),
+        (cfg.webrtc_port, "webrtc_port"),
+        (cfg.playback_port, "playback_port"),
+        (cfg.api_port, "api_port"),
+    ];
+    // Group fields by port (BTreeMap → deterministic ascending-port ordering) and
+    // report every port claimed by more than one field.
+    let mut by_port: std::collections::BTreeMap<u16, Vec<&str>> = std::collections::BTreeMap::new();
+    for (port, field) in tcp {
+        by_port.entry(port).or_default().push(field);
+    }
+    let conflicts: Vec<String> = by_port
+        .iter()
+        .filter(|(_, fields)| fields.len() > 1)
+        .map(|(port, fields)| format!("TCP port {port} is bound by {}", fields.join(", ")))
+        .collect();
+
+    if conflicts.is_empty() {
+        PreflightCheck {
+            name: CHECK_MEDIAMTX_PORTS_DISTINCT,
+            passed: true,
+            detail: "all MediaMTX TCP listener ports are distinct".to_owned(),
+            hint: None,
+        }
+    } else {
+        PreflightCheck {
+            name: CHECK_MEDIAMTX_PORTS_DISTINCT,
+            passed: false,
+            detail: format!(
+                "MediaMTX listener ports must be unique per protocol, but {} — two servers \
+                 cannot bind the same TCP port, so `systemctl restart mediamtx` would fail after \
+                 cutover",
+                conflicts.join("; ")
+            ),
+            hint: Some(PORTS_DISTINCT_HINT),
+        }
+    }
+}
+
+/// Collect the five `MediaMTX` host doctor checks against a live executor.
+///
+/// Runs the distinct-listener-port **config** check first (pure — no host I/O, so
+/// a duplicated-port config aborts before any probe), then the `FFmpeg` preflight
+/// (against `ffmpeg_bin`), the `MediaMTX` binary-executable preflight, the
+/// recordings-dir probe, and the port-availability probe — returning the shared
+/// [`PreflightCheck`] results so a caller that already holds a [`DeployExecutor`]
+/// can grade a media host the same way `autumn deploy check` grades the app host.
+/// `ffmpeg_bin` is the resolved `[media.ffmpeg] bin` (the plugin's default is
+/// `/usr/bin/ffmpeg`).
 #[must_use]
 pub fn collect_media_doctor_checks(
     exec: &impl DeployExecutor,
@@ -1078,6 +1151,7 @@ pub fn collect_media_doctor_checks(
     ffmpeg_bin: &str,
 ) -> Vec<PreflightCheck> {
     vec![
+        mediamtx_ports_distinct(cfg),
         ffmpeg_preflight(exec, ffmpeg_bin),
         mediamtx_binary_preflight(exec, cfg),
         recordings_dir_writable(exec, cfg),
@@ -1186,11 +1260,20 @@ mod tests {
         assert!(cfg.webrtc_additional_hosts.is_empty());
     }
 
+    /// Parse a raw `autumn.toml` string and deserialize its `[media]` subtree via
+    /// the production [`media_host_config_from_value`] path — the deploy loader
+    /// merges raw `toml::Value`s and calls that fn, so tests exercise the same
+    /// deserializer over a single (unmerged) document.
+    fn host_cfg_from_toml_str(s: &str) -> Result<(MediaMtxHostConfig, String), toml::de::Error> {
+        media_host_config_from_value(toml::from_str(s)?)
+    }
+
     #[test]
     fn empty_toml_yields_disabled_defaults() {
-        let cfg = MediaMtxHostConfig::from_toml_str("").expect("empty toml parses");
+        let (cfg, bin) = host_cfg_from_toml_str("").expect("empty toml parses");
         assert!(!cfg.enabled);
         assert_eq!(cfg.api_port, MEDIAMTX_API_PORT);
+        assert_eq!(bin, DEFAULT_FFMPEG_BIN);
     }
 
     #[test]
@@ -1203,7 +1286,7 @@ record_delete_after = \"48h\"
 webrtc_additional_hosts = [\"stream.example.com\", \"203.0.113.7\"]
 unit_name = \"mediamtx-prod\"
 ";
-        let cfg = MediaMtxHostConfig::from_toml_str(toml).expect("parses");
+        let (cfg, _) = host_cfg_from_toml_str(toml).expect("parses");
         assert!(cfg.enabled);
         assert_eq!(cfg.recordings_dir, "/srv/recordings");
         assert_eq!(cfg.record_delete_after, "48h");
@@ -1218,43 +1301,38 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn toml_without_media_table_is_default() {
-        let cfg = MediaMtxHostConfig::from_toml_str("[deploy]\nhost = \"h\"\n").expect("parses");
+        let (cfg, _) = host_cfg_from_toml_str("[deploy]\nhost = \"h\"\n").expect("parses");
         assert!(!cfg.enabled);
     }
 
     #[test]
     fn ffmpeg_bin_defaults_and_reads_from_media_ffmpeg() {
         assert_eq!(
-            ffmpeg_bin_from_toml_str("").expect("empty parses"),
+            host_cfg_from_toml_str("").expect("empty parses").1,
             DEFAULT_FFMPEG_BIN
         );
-        let bin =
-            ffmpeg_bin_from_toml_str("[media.ffmpeg]\nbin = \"/opt/ffmpeg\"\n").expect("parses");
+        let (_, bin) =
+            host_cfg_from_toml_str("[media.ffmpeg]\nbin = \"/opt/ffmpeg\"\n").expect("parses");
         assert_eq!(bin, "/opt/ffmpeg");
     }
 
     #[test]
-    fn from_toml_str_fails_closed_on_malformed_mediamtx_section() {
+    fn media_config_fails_closed_on_malformed_mediamtx_section() {
         // Finding C: a PRESENT `[media.mediamtx]` with an ill-typed value is a hard
         // error, so the caller must abort rather than silently disable provisioning.
         // `enabled` as a string, not a bool:
-        assert!(
-            MediaMtxHostConfig::from_toml_str("[media.mediamtx]\nenabled = \"yes\"\n").is_err()
-        );
+        assert!(host_cfg_from_toml_str("[media.mediamtx]\nenabled = \"yes\"\n").is_err());
         // A port field as a non-number:
-        assert!(
-            MediaMtxHostConfig::from_toml_str("[media.mediamtx]\napi_port = \"nope\"\n").is_err()
-        );
+        assert!(host_cfg_from_toml_str("[media.mediamtx]\napi_port = \"nope\"\n").is_err());
     }
 
     #[test]
     fn media_config_fails_closed_on_malformed_ffmpeg_section() {
-        // Finding C: a malformed `[media.ffmpeg]` is also a hard error — both
-        // deploy-side parsers deserialize the whole `[media]` subtree, so neither
-        // can be tricked into the disabled default by a broken ffmpeg table.
+        // Finding C: a malformed `[media.ffmpeg]` is also a hard error — the deploy
+        // deserializer reads the whole `[media]` subtree, so a broken ffmpeg table
+        // cannot be tricked into the disabled default.
         let toml = "[media.ffmpeg]\nbin = 123\n";
-        assert!(ffmpeg_bin_from_toml_str(toml).is_err());
-        assert!(MediaMtxHostConfig::from_toml_str(toml).is_err());
+        assert!(host_cfg_from_toml_str(toml).is_err());
     }
 
     // ── mediamtx.yml rendering ───────────────────────────────────────────────
@@ -2025,7 +2103,7 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
     }
 
     #[test]
-    fn collect_runs_all_four_checks_in_order() {
+    fn collect_runs_all_five_checks_in_order() {
         let exec = RecordingExecutor::new()
             .with_stdout("media-ffmpeg-preflight", "ffmpeg version 6.1")
             .with_stdout(
@@ -2034,8 +2112,12 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
             );
         let checks =
             collect_media_doctor_checks(&exec, &MediaMtxHostConfig::default(), "/usr/bin/ffmpeg");
-        assert_eq!(checks.len(), 4);
+        assert_eq!(checks.len(), 5);
         assert!(checks.iter().all(|c| c.passed), "all should pass");
+        // The pure ports-distinct config check (Finding P) leads and runs NO
+        // command, so the recorded command order is unchanged from the four
+        // executor-driven checks.
+        assert_eq!(checks[0].name, CHECK_MEDIAMTX_PORTS_DISTINCT);
         assert_eq!(
             exec.labels(),
             vec![
@@ -2050,6 +2132,91 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
                 "media-ports"
             ]
         );
+    }
+
+    // ── Distinct listener ports (Finding P) ──────────────────────────────────
+
+    #[test]
+    fn ports_distinct_passes_for_default_config() {
+        let check = mediamtx_ports_distinct(&MediaMtxHostConfig::default());
+        assert!(
+            check.passed,
+            "default ports are all distinct: {}",
+            check.detail
+        );
+        assert_eq!(check.name, CHECK_MEDIAMTX_PORTS_DISTINCT);
+    }
+
+    #[test]
+    fn ports_distinct_fails_when_two_tcp_listeners_share_a_port() {
+        // hls_port == playback_port: two MediaMTX servers asked to bind one TCP
+        // port. `ss` passes on a fresh host, but the deferred restart fails.
+        let cfg = MediaMtxHostConfig {
+            hls_port: 8888,
+            playback_port: 8888,
+            ..MediaMtxHostConfig::default()
+        };
+        let check = mediamtx_ports_distinct(&cfg);
+        assert!(!check.passed);
+        // Names the duplicated value and BOTH conflicting fields.
+        assert!(check.detail.contains("8888"), "detail: {}", check.detail);
+        assert!(
+            check.detail.contains("hls_port"),
+            "detail: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("playback_port"),
+            "detail: {}",
+            check.detail
+        );
+        assert!(check.hint.is_some());
+    }
+
+    #[test]
+    fn ports_distinct_allows_tcp_port_equal_to_udp_port() {
+        // The WebRTC local UDP port (8189) is a separate protocol namespace, so a
+        // TCP listener numerically equal to it is NOT a conflict.
+        let cfg = MediaMtxHostConfig {
+            rtmp_port: MEDIAMTX_WEBRTC_LOCAL_UDP_PORT,
+            ..MediaMtxHostConfig::default()
+        };
+        assert_eq!(cfg.rtmp_port, cfg.webrtc_local_udp);
+        let check = mediamtx_ports_distinct(&cfg);
+        assert!(
+            check.passed,
+            "a TCP port equal to the UDP port is not a same-protocol conflict: {}",
+            check.detail
+        );
+    }
+
+    // ── media_host_config_from_value (Finding O merge target) ────────────────
+
+    #[test]
+    fn media_host_config_from_value_reads_merged_media_subtree() {
+        let root: toml::Value = toml::from_str(
+            "[media.mediamtx]\nenabled = true\napi_port = 19997\n[media.ffmpeg]\nbin = \"/opt/ff\"\n",
+        )
+        .expect("parses");
+        let (cfg, bin) = media_host_config_from_value(root).expect("deserializes");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.api_port, 19997);
+        assert_eq!(bin, "/opt/ff");
+    }
+
+    #[test]
+    fn media_host_config_from_value_absent_media_is_disabled_default() {
+        let root: toml::Value = toml::from_str("[deploy]\nhost = \"h\"\n").expect("parses");
+        let (cfg, bin) = media_host_config_from_value(root).expect("deserializes");
+        assert!(!cfg.enabled);
+        assert_eq!(bin, DEFAULT_FFMPEG_BIN);
+    }
+
+    #[test]
+    fn media_host_config_from_value_fails_closed_on_ill_typed_value() {
+        let root: toml::Value =
+            toml::from_str("[media.mediamtx]\nenabled = \"yes\"\n").expect("parses");
+        assert!(media_host_config_from_value(root).is_err());
     }
 
     // ── CSP origins ──────────────────────────────────────────────────────────

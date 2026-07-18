@@ -858,7 +858,7 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
         // `plan` is a pure dry-run over `resolved` alone — it never grades or
         // uploads runtime VALUES, so it needs no reload under the target profile.
         DeployAction::Plan => {
-            let (media_cfg, _ffmpeg_bin) = load_media_host_config()?;
+            let (media_cfg, _ffmpeg_bin) = load_media_host_config(&resolved)?;
             print_plan(&resolved, &media_cfg);
             Ok(())
         }
@@ -869,7 +869,7 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
         DeployAction::Check => run_check(&load_runtime_config(&resolved)?, &resolved),
         DeployAction::Rollback => run_rollback(&load_runtime_config(&resolved)?, &resolved),
         DeployAction::Up => {
-            let (media_cfg, ffmpeg_bin) = load_media_host_config()?;
+            let (media_cfg, ffmpeg_bin) = load_media_host_config(&resolved)?;
             run_up(
                 &load_runtime_config(&resolved)?,
                 &resolved,
@@ -881,49 +881,172 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
 }
 
 /// Load the `[media.mediamtx]` host-provisioning config and the `[media.ffmpeg]
-/// bin` path from the project `autumn.toml` (issue #1974, Slice 7).
+/// bin` path from the project config, resolved **under the target deploy profile**
+/// (issue #1974, Slice 7; issue #2051, Finding O).
 ///
-/// Reads the raw `autumn.toml` string and deserializes only the `[media]`
-/// subtree (mirroring how `autumn-media-plugin` reads its own config), so it
-/// bypasses `autumn-web`'s strict `AutumnConfig` schema and adds no dependency on
-/// the plugin. A missing file (or one that cannot be read) yields the disabled
-/// default plus the default `FFmpeg` path, so a project that does not use
-/// autumn-media is unaffected.
+/// Reads the raw project TOML and deserializes only the `[media]` subtree
+/// (mirroring how `autumn-media-plugin` reads its own config), so it bypasses
+/// `autumn-web`'s strict `AutumnConfig` schema and adds no dependency on the
+/// plugin. Crucially it applies the **same base+profile TOML layering
+/// `AutumnConfig::load()` applies to the app config** — base `autumn.toml`, then
+/// the inline `[profile.<name>]` sections, then `autumn-<profile>.toml` — so a
+/// profiled deploy (`prod`/`staging`) provisions `MediaMTX` from the profile's
+/// `[media.mediamtx]` / `[media.ffmpeg]` (`[profile.<name>.media.*]` or
+/// `autumn-<profile>.toml`) instead of the base default. Without this a
+/// prod-enabled `[profile.prod.media.mediamtx]` (or `autumn-prod.toml`) would be
+/// ignored and `plan`/`up` would see the disabled base config, so the release
+/// boots under the target profile with no media daemon provisioned. The env-var
+/// override layer (`AUTUMN_MEDIA__*`) is deliberately NOT applied here — an
+/// env/interpolation-indirected value is resolved from the SERVICE'S OWN
+/// environment at runtime (see [`media::ffmpeg_preflight`]'s fail-closed-honest
+/// deferral), which the CLI neither has nor may guess.
+///
+/// A missing file (or one that cannot be read) yields the disabled default plus
+/// the default `FFmpeg` path, so a project that does not use autumn-media is
+/// unaffected.
 ///
 /// **Fails closed on invalid media config.** A `[media.mediamtx]` /
 /// `[media.ffmpeg]` table that is *present but does not deserialize* (a
-/// wrong-typed value) is an error, not a silent fallback: it returns
-/// [`DeployError::Config`] so `deploy plan`/`deploy up` abort with a clear
-/// message instead of proceeding WITHOUT provisioning a media-enabled app's
-/// `MediaMTX` daemon. The disabled default is reserved for the genuinely *absent*
-/// case — `from_toml_str` / `ffmpeg_bin_from_toml_str` map a missing table to
-/// `Ok(default)` and a present-but-invalid table to `Err`, so a non-media
-/// project stays unaffected while a broken media config can never be swallowed.
-fn load_media_host_config() -> Result<(media::MediaMtxHostConfig, String), DeployError> {
+/// wrong-typed value) **in any contributing layer** is an error, not a silent
+/// fallback: the merged value carries the bad type and
+/// [`media::media_host_config_from_value`] returns [`DeployError::Config`] so
+/// `deploy plan`/`deploy up` abort with a clear message instead of proceeding
+/// WITHOUT provisioning a media-enabled app's `MediaMTX` daemon. The disabled
+/// default is reserved for the genuinely *absent* case.
+fn load_media_host_config(
+    resolved: &ResolvedDeployConfig,
+) -> Result<(media::MediaMtxHostConfig, String), DeployError> {
+    load_media_host_config_in(&manifest_project_dirs(), &resolved.profile)
+}
+
+/// Pure core of [`load_media_host_config`] over an explicit ordered search path
+/// and RAW deploy-profile spelling, so the base+profile media layering is
+/// unit-testable against temp dirs (mirrors [`manifest_uploads_in`]).
+///
+/// Builds a merged `[media]` subtree exactly as `AutumnConfig::load_with_env`
+/// builds the app config (minus the env-override layer, see the caller docs):
+/// base `autumn.toml` ← inline `[profile.<name>]` sections ←
+/// `autumn-<profile>.toml`. A base file that is absent/unreadable yields the
+/// disabled default; a base or profile file that does not parse, or a merged
+/// `[media]` subtree with a wrong-typed value, is a fail-closed
+/// [`DeployError::Config`].
+fn load_media_host_config_in(
+    dirs: &[PathBuf],
+    profile_raw: &str,
+) -> Result<(media::MediaMtxHostConfig, String), DeployError> {
     let disabled = || {
         (
             media::MediaMtxHostConfig::default(),
             media::DEFAULT_FFMPEG_BIN.to_owned(),
         )
     };
-    let Some(path) = first_dir_with_file(&manifest_project_dirs(), "autumn.toml") else {
+    let Some(base_path) = first_dir_with_file(dirs, "autumn.toml") else {
         return Ok(disabled());
     };
-    let Ok(contents) = std::fs::read_to_string(&path) else {
+    let Ok(base_str) = std::fs::read_to_string(&base_path) else {
         return Ok(disabled());
     };
-    // `from_toml_str` parses the whole `[media]` subtree (both `mediamtx` and the
-    // sibling `ffmpeg` table), so a type error in *either* surfaces here — the
-    // second `ffmpeg_bin_from_toml_str` parse is a defensive companion. Propagate
-    // rather than `.unwrap_or_default()` so a malformed media config aborts the
-    // deploy instead of silently disabling MediaMTX provisioning.
-    let cfg = media::MediaMtxHostConfig::from_toml_str(&contents).map_err(|e| {
-        DeployError::Config(format!("invalid [media] config in {}: {e}", path.display()))
+    // Layer 3: base autumn.toml (a malformed base is fail-closed).
+    let base: toml::Value = toml::from_str(&base_str).map_err(|e| {
+        DeployError::Config(format!("invalid config in {}: {e}", base_path.display()))
     })?;
-    let bin = media::ffmpeg_bin_from_toml_str(&contents).map_err(|e| {
-        DeployError::Config(format!("invalid [media] config in {}: {e}", path.display()))
-    })?;
-    Ok((cfg, bin))
+    let mut merged = base.clone();
+
+    // Layer 4: inline `[profile.<name>]` sections in the base autumn.toml, in the
+    // runtime's alias-then-canonical merge order (`production` then `prod`), so a
+    // `[profile.prod.media.mediamtx]` wins over the base — matching
+    // `AutumnConfig::load_with_env`.
+    let canonical = canonicalize_deploy_profile(profile_raw);
+    for name in profile_inline_lookup_names(&canonical) {
+        if let Some(section) = profile_section_from_base_toml(&base, name) {
+            deep_merge_toml(&mut merged, section);
+        }
+    }
+
+    // Layer 5: `autumn-<profile>.toml` (first existing in the ordered lookup wins,
+    // reusing the runtime's own pure override-file name resolver so the deploy
+    // reads the SAME profile file the host runtime loads).
+    for name in autumn_web::config::profile_override_file_lookup_names(&canonical, profile_raw) {
+        let basename = format!("autumn-{name}.toml");
+        if let Some(path) = first_dir_with_file(dirs, &basename) {
+            let overlay_str = std::fs::read_to_string(&path).map_err(|e| {
+                DeployError::Config(format!("could not read {}: {e}", path.display()))
+            })?;
+            let overlay: toml::Value = toml::from_str(&overlay_str).map_err(|e| {
+                DeployError::Config(format!("invalid config in {}: {e}", path.display()))
+            })?;
+            deep_merge_toml(&mut merged, overlay);
+            break;
+        }
+    }
+
+    // Deserialize the merged `[media]` subtree — fail-closed on an ill-typed value
+    // in any contributing layer.
+    media::media_host_config_from_value(merged).map_err(|e| {
+        DeployError::Config(format!(
+            "invalid [media] config for deploy profile `{profile_raw}`: {e}"
+        ))
+    })
+}
+
+/// Inline `[profile.<name>]` lookup names for the canonical profile, mirroring
+/// `autumn-web`'s private `profile_lookup_names`: canonical profiles also pull
+/// their legacy alias (`prod`→`production`,`prod`; `dev`→`development`,`dev`) so
+/// a `[profile.production.media.mediamtx]` is honored for a `prod` deploy, while a
+/// custom profile is looked up verbatim. Merged in list order (alias first) so the
+/// canonical spelling wins — identical to the runtime. Kept a local mirror (like
+/// [`canonicalize_deploy_profile`] mirrors `normalize_profile_name`) because the
+/// runtime helper is private.
+fn profile_inline_lookup_names(canonical: &str) -> Vec<&str> {
+    match canonical {
+        "prod" => vec!["production", "prod"],
+        "dev" => vec!["development", "dev"],
+        other => vec![other],
+    }
+}
+
+/// Extract a `[profile.<name>]` table from a parsed `autumn.toml` value as a
+/// standalone TOML value (mirrors `autumn-web`'s private
+/// `profile_section_from_base_toml`). `None` when the section is absent.
+fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<toml::Value> {
+    base.get("profile")
+        .and_then(toml::Value::as_table)
+        .and_then(|profiles| profiles.get(profile))
+        .and_then(toml::Value::as_table)
+        .map(|table| toml::Value::Table(table.clone()))
+}
+
+/// Deep-merge two TOML values — tables merged recursively, non-table `overlay`
+/// values replace `base` (a faithful copy of `autumn-web`'s private `deep_merge`,
+/// so the deploy-side media layering matches the runtime's app-config layering
+/// exactly). Bounded recursion mirrors the runtime's `MAX_MERGE_DEPTH`.
+fn deep_merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    deep_merge_toml_depth(base, overlay, 0);
+}
+
+fn deep_merge_toml_depth(base: &mut toml::Value, overlay: toml::Value, depth: usize) {
+    /// Matches `autumn-web`'s `MAX_MERGE_DEPTH`.
+    const MAX_MERGE_DEPTH: usize = 16;
+    if depth > MAX_MERGE_DEPTH {
+        return;
+    }
+    let toml::Value::Table(overlay_table) = overlay else {
+        return;
+    };
+    let Some(base_table) = base.as_table_mut() else {
+        return;
+    };
+    for (key, overlay_val) in overlay_table {
+        let is_recursive_merge =
+            overlay_val.is_table() && base_table.get(&key).is_some_and(toml::Value::is_table);
+        if is_recursive_merge {
+            if let Some(base_val) = base_table.get_mut(&key) {
+                deep_merge_toml_depth(base_val, overlay_val, depth + 1);
+            }
+        } else {
+            base_table.insert(key, overlay_val);
+        }
+    }
 }
 
 /// An [`Env`] that forces `AUTUMN_ENV` to a specific deploy profile while
@@ -1227,8 +1350,10 @@ fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
         println!("  {}. [{}]", i + 1, op.label());
     }
     println!(
-        "\nMediaMTX doctor checks at `deploy up`: {}, {}, {}",
+        "\nMediaMTX doctor checks at `deploy up`: {}, {}, {}, {}, {}",
+        media::CHECK_MEDIAMTX_PORTS_DISTINCT,
         media::CHECK_FFMPEG_PREFLIGHT,
+        media::CHECK_MEDIAMTX_BINARY,
         media::CHECK_RECORDINGS_DIR_WRITABLE,
         media::CHECK_MEDIAMTX_PORTS_AVAILABLE,
     );
@@ -2474,6 +2599,130 @@ mod tests {
         assert!(uploads.is_empty(), "no autumn.toml → nothing to upload");
     }
 
+    // ── Media config resolves under the deploy profile (Finding O) ───────────
+
+    #[test]
+    fn media_config_no_manifest_is_disabled_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dirs = vec![dir.path().to_path_buf()];
+        let (cfg, bin) = load_media_host_config_in(&dirs, "prod").expect("loads");
+        assert!(!cfg.enabled, "no autumn.toml → controller disabled");
+        assert_eq!(bin, media::DEFAULT_FFMPEG_BIN);
+    }
+
+    #[test]
+    fn media_config_honors_inline_profile_section() {
+        // `[profile.prod.media.mediamtx]` enables media over a base that omits it —
+        // a profiled deploy must see the profile's config, not the base default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[media.ffmpeg]\nbin = \"/usr/bin/ffmpeg\"\n\
+             [profile.prod.media.mediamtx]\nenabled = true\napi_port = 19997\n",
+        )
+        .expect("write base");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        // prod: the inline profile section is layered on.
+        let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
+        assert!(prod.enabled, "prod profile enables media");
+        assert_eq!(prod.api_port, 19997);
+
+        // dev: no matching profile section → base default (media disabled).
+        let (dev, _) = load_media_host_config_in(&dirs, "dev").expect("loads dev");
+        assert!(
+            !dev.enabled,
+            "dev has no profile media section → base default"
+        );
+    }
+
+    #[test]
+    fn media_config_honors_profile_override_file() {
+        // The `autumn-prod.toml` override file enables media over a base that omits
+        // it, matching the runtime's Layer-5 override.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\nport = 3000\n")
+            .expect("write base");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[media.mediamtx]\nenabled = true\nrtmp_port = 11935\n",
+        )
+        .expect("write prod override");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
+        assert!(prod.enabled, "autumn-prod.toml enables media");
+        assert_eq!(prod.rtmp_port, 11935);
+    }
+
+    #[test]
+    fn media_config_profile_layer_overrides_base_value() {
+        // Base enables media on one api_port; the profile override wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[media.mediamtx]\nenabled = true\napi_port = 9997\n",
+        )
+        .expect("write base");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[media.mediamtx]\napi_port = 29997\n",
+        )
+        .expect("write prod override");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
+        assert!(
+            prod.enabled,
+            "base enablement is preserved under deep merge"
+        );
+        assert_eq!(
+            prod.api_port, 29997,
+            "profile override wins over the base value"
+        );
+    }
+
+    #[test]
+    fn media_config_base_only_when_profile_has_no_media_layer() {
+        // No inline `[profile.prod]` and no autumn-prod.toml → the base config is
+        // read verbatim under the profile.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[media.mediamtx]\nenabled = true\napi_port = 9001\n",
+        )
+        .expect("write base");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let (prod, _) = load_media_host_config_in(&dirs, "prod").expect("loads prod");
+        assert!(prod.enabled);
+        assert_eq!(prod.api_port, 9001);
+    }
+
+    #[test]
+    fn media_config_fails_closed_on_invalid_value_in_active_profile_layer() {
+        // A present-but-ill-typed value in the ACTIVE profile layer aborts, even
+        // though the base is valid — the fail-closed rule spans every layer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[media.mediamtx]\nenabled = true\n",
+        )
+        .expect("write base");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[media.mediamtx]\napi_port = \"nope\"\n",
+        )
+        .expect("write bad prod override");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let err = load_media_host_config_in(&dirs, "prod").expect_err("must fail closed");
+        assert!(
+            matches!(err, DeployError::Config(_)),
+            "invalid profile-layer media config aborts the deploy: {err:?}"
+        );
+    }
+
     #[test]
     fn manifest_notice_warns_loudly_when_no_manifest() {
         let notice = manifest_preflight_notice(&[]);
@@ -3015,8 +3264,9 @@ mod tests {
         // Plan and Up match arms, never in Check/Rollback.
         let src = include_str!("deploy.rs");
         // Build the needle at runtime so this test's own source text (which mentions
-        // the fn name) can never be miscounted as a call site.
-        let needle = ["load_media_host_config", "()?"].concat();
+        // the fn name) can never be miscounted as a call site. The loader now takes
+        // the resolved deploy config (Finding O), so match the call shape, not `()`.
+        let needle = ["load_media_host_config", "(&resolved)?"].concat();
         let call_sites = src.matches(needle.as_str()).count();
         assert_eq!(
             call_sites, 2,
