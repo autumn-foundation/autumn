@@ -26,6 +26,22 @@ pub enum MediaError {
     )]
     PartialS3Credentials,
 
+    /// The S3 backend was selected without an explicit `public_base_url`, and
+    /// the configured endpoint is not Tigris — so the
+    /// `https://{bucket}.t3.tigrisfiles.io/…` public-base convention does not
+    /// apply. Deriving a public URL from an arbitrary private S3 endpoint is
+    /// unreliable, so a generic (non-Tigris) S3 backend must set
+    /// `media.storage.public_base_url` explicitly. `bucket` is a caller
+    /// configuration value (not a secret).
+    #[error(
+        "media.storage.public_base_url is required for a generic (non-Tigris) \
+         S3 backend (bucket `{bucket}`): set it to the bucket's public base URL"
+    )]
+    MissingPublicBaseUrl {
+        /// The S3 bucket configured without a resolvable public base.
+        bucket: String,
+    },
+
     /// A caller-supplied storage key contained a dot-only (`.`/`..`) or empty
     /// path segment.
     ///
