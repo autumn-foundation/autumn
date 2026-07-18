@@ -168,17 +168,9 @@ fn migrate_status_under_sqlite_is_a_clear_provider_error() {
     );
 }
 
-/// A `SQLite` control/primary URL together with `[[database.shards]]` entries is a
-/// topology the runtime validator (`database_backend_consistency`) rejects at
-/// boot — horizontal sharding is Postgres-only. `autumn migrate` must fail closed
-/// with that provider-appropriate message BEFORE applying anything, rather than
-/// migrating the control file and every shard file for an app that cannot boot
-/// (issue #2058, codex).
-#[test]
-fn migrate_sqlite_control_with_shards_is_rejected_before_applying() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let root = tmp.path();
-
+/// Write a throwaway `migrations/` dir so the guard is proven to fire BEFORE the
+/// apply path (if it didn't, a real migration would create + mutate db files).
+fn write_posts_migration(root: &Path) {
     let migration = root.join("migrations/20990101000000_create_posts");
     std::fs::create_dir_all(&migration).expect("mkdir migrations");
     std::fs::write(
@@ -187,6 +179,20 @@ fn migrate_sqlite_control_with_shards_is_rejected_before_applying() {
     )
     .expect("write up.sql");
     std::fs::write(migration.join("down.sql"), "DROP TABLE posts;\n").expect("write down.sql");
+}
+
+/// `SQLite` anywhere in a sharded topology is boot-invalid (horizontal sharding is
+/// Postgres-only; the runtime `sqlite_sharding_unsupported_guard` rejects it).
+/// `autumn migrate` must fail closed with that provider-appropriate `#1614`
+/// message BEFORE applying anything, rather than creating + migrating the control
+/// and/or shard file for an app that cannot boot (issue #2058, codex). Covers
+/// both branches: a `SQLite` control with shards, and a Postgres control with a
+/// `SQLite` shard.
+#[test]
+fn migrate_sqlite_control_with_shards_is_rejected_before_applying() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_posts_migration(root);
 
     let control_db = root.join("app.db");
     let shard_db = root.join("shard0.db");
@@ -208,7 +214,7 @@ fn migrate_sqlite_control_with_shards_is_rejected_before_applying() {
         "sqlite control + shards exits non-zero: {err}"
     );
     assert!(
-        err.contains("database shards require the postgres backend"),
+        err.contains("do not support sharding") && err.contains("#1614"),
         "clear provider-appropriate rejection: {err}"
     );
     // Fail-closed: NOTHING was applied to any file — neither db exists.
@@ -219,5 +225,47 @@ fn migrate_sqlite_control_with_shards_is_rejected_before_applying() {
     assert!(
         !shard_db.exists(),
         "shard sqlite file must not be created/migrated"
+    );
+}
+
+/// Sibling case: a Postgres control with a `SQLite` shard target. The shard loop
+/// would route the `sqlite://` shard through the harness and create + migrate the
+/// shard file; the guard must reject it before any apply (and never touch the
+/// Postgres control either).
+#[test]
+fn migrate_postgres_control_with_sqlite_shard_is_rejected_before_applying() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_posts_migration(root);
+
+    let shard_db = root.join("shard0.db");
+    let shard_url = format!("sqlite://{}", shard_db.display());
+    let envs = [
+        // A Postgres control URL (never connected to — the guard fires first).
+        (
+            "AUTUMN_DATABASE__URL",
+            "postgres://user@127.0.0.1:1/does_not_exist",
+        ),
+        ("AUTUMN_DATABASE__SHARDS__0__NAME", "shard0"),
+        (
+            "AUTUMN_DATABASE__SHARDS__0__PRIMARY_URL",
+            shard_url.as_str(),
+        ),
+    ];
+
+    let (_out, err, code) = run_autumn(root, &["migrate"], &envs);
+    assert_eq!(
+        code,
+        Some(1),
+        "postgres control + sqlite shard exits non-zero: {err}"
+    );
+    assert!(
+        err.contains("do not support sharding") && err.contains("shard") && err.contains("#1614"),
+        "clear provider-appropriate rejection naming the sqlite shard: {err}"
+    );
+    // Fail-closed: the sqlite shard file must never be created.
+    assert!(
+        !shard_db.exists(),
+        "sqlite shard file must not be created/migrated"
     );
 }

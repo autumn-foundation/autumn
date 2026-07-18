@@ -352,14 +352,15 @@ fn resolve_targets(
         resolve_primary_database_url_from_sources(|key| env.var(key), config_table.as_ref());
     let shards =
         resolve_shard_database_urls_from_sources(|key| env.var(key), config_table.as_ref());
-    // Fail closed BEFORE building targets or applying anything: a SQLite
-    // primary/control target with `[[database.shards]]` entries is a topology the
-    // runtime validator (`autumn_web::config::database_backend_consistency`)
-    // rejects at boot — horizontal sharding is Postgres-only. Without this guard
-    // the new per-target SQLite apply/revert path would migrate the control file
-    // AND every shard file and report success for an app that cannot boot (issue
-    // #2058). Mirror the validator's wording.
-    if let Err(message) = reject_sqlite_primary_with_shards(control.as_deref(), &shards) {
+    // Fail closed BEFORE building targets or applying anything: SQLite anywhere
+    // in a sharded topology is rejected at boot by the runtime guards
+    // (`autumn/src/config.rs` `database_backend_consistency` + shard-URL
+    // Postgres-only validation, and `autumn/src/app.rs`
+    // `sqlite_sharding_unsupported_guard`). Without this the new per-target
+    // SQLite apply/revert path would create + migrate the control file and/or a
+    // SQLite shard file and report success for an app that cannot boot (issue
+    // #2058). Mirror the runtime guard's wording.
+    if let Err(message) = reject_sqlite_sharding_topology(control.as_deref(), &shards) {
         eprintln!("{message}");
         std::process::exit(1);
     }
@@ -376,25 +377,43 @@ fn resolve_targets(
     }
 }
 
-/// Reject a `SQLite` primary/control target when `[[database.shards]]` entries are
-/// configured — horizontal sharding is Postgres-only.
+/// Reject any `SQLite` target within a sharded topology — horizontal sharding is
+/// Postgres-only.
 ///
-/// Mirrors the runtime validator `autumn_web::config::database_backend_consistency`
-/// (which rejects this topology at boot with the same wording), so
-/// `autumn migrate` fails closed BEFORE touching any database rather than
-/// applying migrations to the control file and every shard file for an app that
-/// cannot boot. Pure so the decision is unit-testable; `resolve_targets` prints
-/// the message and exits on `Err`. A `None` control (no primary role) or a
-/// non-SQLite control is `Ok` — matching the validator, which only guards a
-/// detected `SQLite` primary.
-fn reject_sqlite_primary_with_shards(
+/// Mirrors the runtime guard `autumn_web`'s `sqlite_sharding_unsupported_guard`
+/// (and the `database_backend_consistency` / shard-URL Postgres-only validators)
+/// so `autumn migrate` fails closed BEFORE touching any database, rather than
+/// creating + migrating a `SQLite` control or shard file for an app that cannot
+/// boot. Two branches, matching the runtime guard:
+///
+/// * a detected-`SQLite` **control** with shard entries present, and
+/// * **any shard** whose resolved `primary_url` is a detected `SQLite` backend
+///   (regardless of the control backend — the shard loop would otherwise route it
+///   through the Postgres-only harness).
+///
+/// A non-`SQLite` control with all-Postgres shards (the intended sharded
+/// topology), and a control-less non-sharded deployment, both pass. Pure so the
+/// decision is unit-testable; `resolve_targets` prints the message and exits on
+/// `Err`.
+fn reject_sqlite_sharding_topology(
     control: Option<&str>,
     shards: &[(String, String)],
 ) -> Result<(), String> {
     if !shards.is_empty() && control.is_some_and(is_sqlite_target) {
         return Err(
-            "\u{2717} database.shards are configured but the primary target is SQLite; \
-             database shards require the postgres backend."
+            "\u{2717} SQLite deployments do not support sharding. The configured sqlite:// \
+             control target has shard entries configured, which is a Postgres-only capability \
+             \u{2014} remove the shard configuration to run on SQLite, or use a Postgres control \
+             database. Tracking: #1614."
+                .to_owned(),
+        );
+    }
+    if shards.iter().any(|(_, url)| is_sqlite_target(url)) {
+        return Err(
+            "\u{2717} SQLite deployments do not support sharding. A configured shard targets a \
+             SQLite database, and per-shard migration is a Postgres-only capability \u{2014} \
+             remove the SQLite shard configuration to run on SQLite, or use Postgres shard \
+             targets. Tracking: #1614."
                 .to_owned(),
         );
     }
@@ -3138,44 +3157,71 @@ replica_url = "postgres://replica:5432/app"
         assert!(error.contains("No database URL"));
     }
 
+    fn sqlite_shard() -> Vec<(String, String)> {
+        vec![("shard0".to_owned(), "sqlite:///tmp/shard0.db".to_owned())]
+    }
+
     #[test]
-    fn reject_sqlite_primary_with_shards_rejects_sqlite_control_and_shards() {
-        // SQLite primary + shard entries is a boot-invalid topology (sharding is
-        // Postgres-only); the guard must reject with the runtime validator's wording.
-        let err = reject_sqlite_primary_with_shards(Some("sqlite:///tmp/app.db"), &two_shards())
+    fn reject_sqlite_sharding_rejects_sqlite_control_and_shards() {
+        // SQLite control + shard entries is a boot-invalid topology (sharding is
+        // Postgres-only); the guard mirrors the runtime guard's wording (#1614).
+        let err = reject_sqlite_sharding_topology(Some("sqlite:///tmp/app.db"), &two_shards())
             .unwrap_err();
         assert!(
-            err.contains("database shards require the postgres backend"),
-            "guard mirrors the runtime validator wording: {err}"
+            err.contains("do not support sharding") && err.contains("#1614"),
+            "guard names the SQLite sharding situation clearly: {err}"
         );
     }
 
     #[test]
-    fn reject_sqlite_primary_with_shards_allows_sqlite_without_shards() {
+    fn reject_sqlite_sharding_rejects_postgres_control_with_sqlite_shard() {
+        // The sibling case: a Postgres (or any non-sqlite) control with a shard
+        // whose primary_url is sqlite:// — the shard loop would migrate that
+        // sqlite file. Must be rejected regardless of the control backend.
+        let err = reject_sqlite_sharding_topology(Some("postgres://control/app"), &sqlite_shard())
+            .unwrap_err();
+        assert!(
+            err.contains("do not support sharding")
+                && err.contains("shard")
+                && err.contains("#1614"),
+            "guard rejects a sqlite shard target: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_sqlite_sharding_rejects_no_control_with_sqlite_shard() {
+        // No control role, but a sqlite shard target: still rejected (the shard
+        // loop would route it through the Postgres-only harness).
+        let err = reject_sqlite_sharding_topology(None, &sqlite_shard()).unwrap_err();
+        assert!(
+            err.contains("do not support sharding") && err.contains("#1614"),
+            "guard rejects a sqlite shard even without a control: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_sqlite_sharding_allows_sqlite_without_shards() {
         // A plain SQLite deployment (no shards) is the normal, supported case.
         assert_eq!(
-            reject_sqlite_primary_with_shards(Some("sqlite:///tmp/app.db"), &[]),
+            reject_sqlite_sharding_topology(Some("sqlite:///tmp/app.db"), &[]),
             Ok(())
         );
     }
 
     #[test]
-    fn reject_sqlite_primary_with_shards_allows_postgres_with_shards() {
-        // Postgres primary + shards is the intended sharded topology — never rejected.
+    fn reject_sqlite_sharding_allows_postgres_with_postgres_shards() {
+        // Postgres control + all-Postgres shards is the intended sharded topology
+        // — never rejected.
         assert_eq!(
-            reject_sqlite_primary_with_shards(Some("postgres://control/app"), &two_shards()),
+            reject_sqlite_sharding_topology(Some("postgres://control/app"), &two_shards()),
             Ok(())
         );
     }
 
     #[test]
-    fn reject_sqlite_primary_with_shards_allows_no_control() {
-        // No primary role resolved: the runtime validator returns Ok when the
-        // primary backend is undetected, so the guard must too.
-        assert_eq!(
-            reject_sqlite_primary_with_shards(None, &two_shards()),
-            Ok(())
-        );
+    fn reject_sqlite_sharding_allows_no_control_no_shards() {
+        // No primary role and no shards: nothing to reject.
+        assert_eq!(reject_sqlite_sharding_topology(None, &[]), Ok(()));
     }
 
     #[test]
