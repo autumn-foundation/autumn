@@ -22,6 +22,8 @@ mod schema_migrate;
 #[cfg(feature = "sqlite")]
 mod schema_migrate_sqlite;
 mod schema_pull;
+#[cfg(feature = "sqlite")]
+mod schema_pull_sqlite;
 mod seed_model_linking;
 #[cfg(unix)]
 mod serve;

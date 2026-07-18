@@ -1734,9 +1734,199 @@ async fn schema_pull_preserves_check_constraints() {
     assert_no_secret_leak(&doc_out, &doc_err);
 }
 
-/// `SQLite` introspection is a future slice: `schema pull` against a `SQLite` URL
-/// is refused loudly (no Docker needed — the refusal happens before any
-/// connection), names `SQLite`, and writes no snapshot.
+/// Parse a pulled snapshot's tables into `(table_name -> table JSON)` for precise
+/// per-column IR assertions.
+fn snapshot_columns(snap: &str) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let doc: serde_json::Value = serde_json::from_str(snap).expect("snapshot is valid JSON");
+    let mut out = std::collections::BTreeMap::new();
+    for table in doc["tables"].as_array().expect("tables array") {
+        let name = table["name"].as_str().expect("table name").to_owned();
+        out.insert(name, table.clone());
+    }
+    out
+}
+
+/// Locate a column's JSON object within a pulled table's `columns` array.
+fn column_json<'a>(table: &'a serde_json::Value, column: &str) -> &'a serde_json::Value {
+    table["columns"]
+        .as_array()
+        .expect("columns array")
+        .iter()
+        .find(|c| c["name"].as_str() == Some(column))
+        .unwrap_or_else(|| panic!("column `{column}` not found in table"))
+}
+
+/// FIDELITY (#1975): the IR now distinguishes a plain, manually-assigned `BIGINT
+/// PRIMARY KEY` (no owned sequence) from an owned-sequence `BIGSERIAL` id — both of
+/// which previously collapsed to an indistinguishable `Int64` PK with no default. A
+/// pulled `BIGSERIAL` carries `serial: BigSerial`; a plain `BIGINT PK` carries no
+/// serial marker. Consequently a model (whose `#[id]` is always `BigSerial`)
+/// round-trips clean against the `BIGSERIAL` table but shows a refused primary-key
+/// change against the plain `BIGINT PK` table.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_distinguishes_plain_bigint_pk_from_bigserial() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_serial_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_serial_shapes",
+        "CREATE TABLE serial_ids (id BIGSERIAL PRIMARY KEY, label TEXT NOT NULL, \
+         created_at TIMESTAMP NOT NULL DEFAULT now());\n\
+         CREATE TABLE plain_ids (id BIGINT PRIMARY KEY, label TEXT NOT NULL, \
+         created_at TIMESTAMP NOT NULL DEFAULT now());\n",
+        "DROP TABLE plain_ids;\nDROP TABLE serial_ids;\n",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    let (pull_out, pull_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull_out, &pull_err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    let tables = snapshot_columns(&snap);
+
+    // THE CRUX: the pulled IR distinguishes the two id shapes.
+    let serial_id = column_json(&tables["serial_ids"], "id");
+    assert_eq!(
+        serial_id["serial"].as_str(),
+        Some("BigSerial"),
+        "a BIGSERIAL id must carry the serial marker: {serial_id}"
+    );
+    let plain_id = column_json(&tables["plain_ids"], "id");
+    assert!(
+        plain_id.get("serial").is_none(),
+        "a plain BIGINT PRIMARY KEY must carry NO serial marker: {plain_id}"
+    );
+
+    // A re-pull is byte-for-byte stable (the markers round-trip).
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("second pull");
+    assert_eq!(snap, snap_after, "a re-pull must be byte-for-byte stable");
+
+    // A matching model for each table: SerialId round-trips CLEAN against the
+    // BIGSERIAL table, while PlainId (whose id is a convention BigSerial) shows a
+    // refused primary-key change against the plain BIGINT PK table.
+    write_models(
+        &project,
+        "#[autumn_web::model(managed)]\npub struct SerialId {\n    #[id]\n    pub id: i64,\n    \
+         pub label: String,\n    #[default]\n    pub created_at: chrono::NaiveDateTime,\n}\n\n\
+         #[autumn_web::model(managed)]\npub struct PlainId {\n    #[id]\n    pub id: i64,\n    \
+         pub label: String,\n    #[default]\n    pub created_at: chrono::NaiveDateTime,\n}\n",
+    );
+    let (diff_out, diff_err, code) = run_autumn(&project, &["schema", "diff"], &envs);
+    let combined = format!("{diff_out}{diff_err}");
+    assert_ne!(
+        code,
+        Some(0),
+        "a plain-BIGINT-PK vs BigSerial model must drift:\n{combined}"
+    );
+    assert!(
+        combined.contains("primary-key change") && combined.contains("plain_ids"),
+        "the drift is the plain_ids primary-key change (serial_ids matches):\n{combined}"
+    );
+    assert!(
+        !combined.contains("serial_ids"),
+        "the BIGSERIAL table round-trips clean — only plain_ids drifts:\n{combined}"
+    );
+    assert_no_secret_leak(&diff_out, &diff_err);
+}
+
+/// FIDELITY (#1975): a `GENERATED ALWAYS AS IDENTITY` column is preserved through a
+/// pull (its identity generation clause is recorded on the IR) instead of flattening
+/// to a plain integer column, so it round-trips byte-stably.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_preserves_generated_as_identity() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_identity_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_identity",
+        "CREATE TABLE identity_rows (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+         label TEXT NOT NULL);\n",
+        "DROP TABLE identity_rows;\n",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    let (pull_out, pull_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull_out, &pull_err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    let tables = snapshot_columns(&snap);
+    let id = column_json(&tables["identity_rows"], "id");
+    assert_eq!(
+        id["identity"].as_str(),
+        Some("ALWAYS"),
+        "the identity generation clause is preserved verbatim: {id}"
+    );
+    // An identity column is not a serial (it has no owned nextval default).
+    assert!(
+        id.get("serial").is_none(),
+        "an identity column is not a serial: {id}"
+    );
+
+    // A re-pull is byte-for-byte stable (the identity marker round-trips).
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("second pull");
+    assert_eq!(snap, snap_after, "a re-pull must be byte-for-byte stable");
+}
+
+/// FIDELITY (#1975): a PG15+ `NULLS NOT DISTINCT` unique index is retained verbatim
+/// via its `definition` (detected in the version-safe `pg_get_indexdef` text, never a
+/// PG15-only catalog column), so the clause round-trips instead of collapsing to an
+/// ordinary unique index. (Requires `PostgreSQL` ≥ 15; `start_postgres` pins
+/// `16-alpine`, so the clause is always available here.)
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_retains_nulls_not_distinct_unique_index() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_nnd_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_nnd",
+        "CREATE TABLE nnd (id BIGSERIAL PRIMARY KEY, code TEXT);\n\
+         CREATE UNIQUE INDEX nnd_code_uniq ON nnd (code) NULLS NOT DISTINCT;\n",
+        "DROP TABLE nnd;\n",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    let (pull_out, pull_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull_out, &pull_err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("NULLS NOT DISTINCT"),
+        "the NULLS NOT DISTINCT clause is retained verbatim in the index definition: {snap}"
+    );
+
+    // A re-pull is byte-for-byte stable.
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("second pull");
+    assert_eq!(snap, snap_after, "a re-pull must be byte-for-byte stable");
+}
+
+/// On a **default (Postgres-only) build**, `schema pull` against a `SQLite` URL is
+/// refused loudly (no Docker needed — the refusal happens before any connection),
+/// names `SQLite`, and writes no snapshot. On a `--features sqlite` build the pull
+/// instead introspects the `SQLite` database (covered by
+/// `schema_pull_sqlite::schema_pull_round_trips_models_through_a_sqlite_file`), so
+/// this refusal test is compiled only off the sqlite lane.
+#[cfg(not(feature = "sqlite"))]
 #[test]
 fn schema_pull_refuses_sqlite_backend() {
     let (_tmp, project) = fresh_project("pull_sqlite_refusal_app");
