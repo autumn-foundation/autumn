@@ -53,6 +53,20 @@ jobs:
         # job on any real product finding.
         run: cargo run -p autumn-cli --bin autumn -- a11y verify .
 
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - name: cargo-deny check
+        run: cargo deny check advisories licenses sources
+      - name: cargo-deny check (sqlite backend graph)
+        run: cargo deny --config deny-sqlite.toml check advisories licenses sources
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, meta]

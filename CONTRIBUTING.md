@@ -241,3 +241,28 @@ Reviewers should treat a new request-path parser with neither as incomplete.
 
 [cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
 [issue-1611]: https://github.com/madmax983/autumn/issues/1611
+
+## Supply chain (cargo-deny)
+
+The `supply-chain` CI job (`.github/workflows/ci.yml`) runs `cargo deny check
+advisories licenses sources` **twice** against a pinned cargo-deny (0.20.2):
+once on the checked-in `deny.toml` (the default + Postgres + additive CI feature
+graph) and once on `deny-sqlite.toml` (the mutually-exclusive sqlite backend
+graph). The two configs share the same advisories/licenses/sources policy — keep
+them in sync — and differ only in their `[graph]` features. All three checks —
+advisories (RustSec), licenses (allow-list, including dev- and build-dependency
+licenses), and sources (crate registries) — are **blocking** in both passes, so
+a PR that introduces a new advisory, an un-allowed license, or an unknown source
+registry will fail CI. The step-by-step for triaging a failing advisory (prefer
+a minimal fix; document an ignore with a reason and a review-by date only when
+no fix exists) lives in the header comment of `deny.toml`.
+
+**Scope.** The gate covers the shipped root workspace — the default plus
+additive Postgres feature graph (`deny.toml`) and the mutually-exclusive sqlite
+backend graph (`deny-sqlite.toml`), including dev- and build-dependency
+licenses. The repository's separate *excluded* sub-workspaces — `fuzz/` and
+`examples/island-flock`, which each declare their own `[workspace]` and are
+excluded from the root `Cargo.toml` — are non-shipped harnesses/examples and are
+not gated here. Adding a per-sub-workspace cargo-deny pass (each needs its own
+config, and `fuzz/Cargo.lock` is currently out of sync with its manifest) is a
+possible follow-up.
