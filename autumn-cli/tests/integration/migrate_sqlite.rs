@@ -167,3 +167,57 @@ fn migrate_status_under_sqlite_is_a_clear_provider_error() {
         "status under sqlite must not invoke the diesel subprocess: {err}"
     );
 }
+
+/// A `SQLite` control/primary URL together with `[[database.shards]]` entries is a
+/// topology the runtime validator (`database_backend_consistency`) rejects at
+/// boot — horizontal sharding is Postgres-only. `autumn migrate` must fail closed
+/// with that provider-appropriate message BEFORE applying anything, rather than
+/// migrating the control file and every shard file for an app that cannot boot
+/// (issue #2058, codex).
+#[test]
+fn migrate_sqlite_control_with_shards_is_rejected_before_applying() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let migration = root.join("migrations/20990101000000_create_posts");
+    std::fs::create_dir_all(&migration).expect("mkdir migrations");
+    std::fs::write(
+        migration.join("up.sql"),
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL);\n",
+    )
+    .expect("write up.sql");
+    std::fs::write(migration.join("down.sql"), "DROP TABLE posts;\n").expect("write down.sql");
+
+    let control_db = root.join("app.db");
+    let shard_db = root.join("shard0.db");
+    let control_url = format!("sqlite://{}", control_db.display());
+    let shard_url = format!("sqlite://{}", shard_db.display());
+    let envs = [
+        ("AUTUMN_DATABASE__URL", control_url.as_str()),
+        ("AUTUMN_DATABASE__SHARDS__0__NAME", "shard0"),
+        (
+            "AUTUMN_DATABASE__SHARDS__0__PRIMARY_URL",
+            shard_url.as_str(),
+        ),
+    ];
+
+    let (_out, err, code) = run_autumn(root, &["migrate"], &envs);
+    assert_eq!(
+        code,
+        Some(1),
+        "sqlite control + shards exits non-zero: {err}"
+    );
+    assert!(
+        err.contains("database shards require the postgres backend"),
+        "clear provider-appropriate rejection: {err}"
+    );
+    // Fail-closed: NOTHING was applied to any file — neither db exists.
+    assert!(
+        !control_db.exists(),
+        "control sqlite file must not be created/migrated"
+    );
+    assert!(
+        !shard_db.exists(),
+        "shard sqlite file must not be created/migrated"
+    );
+}
