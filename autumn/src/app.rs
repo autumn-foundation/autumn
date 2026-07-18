@@ -3711,6 +3711,30 @@ impl AppBuilder {
                 );
             }
         }
+        // SQLite durable commit-hook worker (#1996 item 5): the runtime pool is a
+        // single-node SQLite pool the Postgres queue worker cannot drive, so the
+        // SQLite worker (BEGIN IMMEDIATE claim + in-process Notify kick + poll
+        // fallback) is spawned instead — same `role.runs_workers()` gate and same
+        // `server_shutdown.child_token()` graceful-drain wiring as the Postgres tier.
+        #[cfg(all(feature = "db", feature = "sqlite"))]
+        if role.runs_workers()
+            && let Some(pool) = state.pool().cloned()
+        {
+            #[cfg(feature = "ws")]
+            {
+                let channels = state.channels().clone();
+                crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                    pool,
+                    Some(channels),
+                    server_shutdown.child_token(),
+                );
+            }
+            #[cfg(not(feature = "ws"))]
+            crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                pool,
+                server_shutdown.child_token(),
+            );
+        }
 
         #[cfg(feature = "presence")]
         {
@@ -5290,6 +5314,25 @@ impl AppBuilder {
                     task_shutdown.child_token(),
                 );
             }
+        }
+        // SQLite durable commit-hook worker on the one-off task-runner path
+        // (#1996 item 5); see the server-path spawn above for the rationale.
+        #[cfg(all(feature = "db", feature = "sqlite"))]
+        if let Some(pool) = state.pool().cloned() {
+            #[cfg(feature = "ws")]
+            {
+                let channels = state.channels().clone();
+                crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                    pool,
+                    Some(channels),
+                    task_shutdown.child_token(),
+                );
+            }
+            #[cfg(not(feature = "ws"))]
+            crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                pool,
+                task_shutdown.child_token(),
+            );
         }
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {

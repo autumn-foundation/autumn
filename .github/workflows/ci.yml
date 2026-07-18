@@ -322,7 +322,8 @@ jobs:
             --test sqlite_statement_timeout_fail_closed \
             --test sqlite_crud_basic \
             --test sqlite_upsert_isolation \
-            --test sqlite_dependent_destroy
+            --test sqlite_dependent_destroy \
+            --test sqlite_commit_hook_worker
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings

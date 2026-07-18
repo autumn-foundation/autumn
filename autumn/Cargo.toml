@@ -493,6 +493,22 @@ path = "tests/sqlite_upsert_isolation.rs"
 name = "sqlite_version_history"
 path = "tests/sqlite_version_history.rs"
 
+# SQLite durable commit-hook worker end-to-end proof (issue #1996 item 5). Drives
+# the ported worker (BEGIN IMMEDIATE claim + in-process Notify kick + retry/backoff
+# + dead-letter + graceful drain) and the real enqueue surface against an in-memory
+# SQLite pool: a queued hook survives a simulated restart and is delivered exactly
+# once (idempotency dedup), transient failures retry then succeed, a permanent
+# failure is dead-lettered after max_attempts, a graceful shutdown settles the
+# in-flight leased entry, and — the adversarial assertion — a hook enqueued under
+# tenant A executes with tenant A's scope and never touches tenant B's data while
+# tenant B has its own queued hook, and a hook with no tenant fails closed. Only
+# meaningful under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]`
+# so a default `cargo test` compiles it to an empty (passing) binary. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_commit_hook_worker`.
+[[test]]
+name = "sqlite_commit_hook_worker"
+path = "tests/sqlite_commit_hook_worker.rs"
+
 # SQLite searchable-repository fallback proof (issue #1996). Drives
 # `#[repository(searchable)]` against an in-memory SQLite pool: substring matches
 # are found case-insensitively, non-matches excluded, LIKE metacharacters (`%`,
