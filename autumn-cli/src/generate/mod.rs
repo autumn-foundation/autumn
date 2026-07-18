@@ -94,25 +94,6 @@ fn format_collisions(paths: &[PathBuf]) -> String {
     out
 }
 
-/// The generate-time rejection for Postgres full-text search (`--search` /
-/// `#[searchable]`) on a `SQLite`-backed app (`SQLite` foundation, issue #1614).
-///
-/// Postgres FTS is emitted as a `tsvector` generated column plus a GIN index,
-/// neither of which `SQLite` has. `SQLite`'s own full-text search (FTS5) is a
-/// later slice tracked in issue #1910, so rather than emit Postgres-only DDL
-/// that would break on `SQLite`, generation fails here with an actionable
-/// message (AC #4).
-#[must_use]
-pub fn sqlite_search_unsupported_error() -> GenerateError {
-    GenerateError::Config(
-        "full-text search (--search / #[searchable]) is not yet supported on SQLite apps; \
-         Postgres FTS uses a tsvector generated column and a GIN index, which SQLite lacks. \
-         SQLite FTS5 support is tracked in https://github.com/madmax983/autumn/issues/1910 — \
-         re-run without the search flag, or target a Postgres database."
-            .to_owned(),
-    )
-}
-
 /// The generate-time rejection for a UUID primary key (`--id uuid`) on a
 /// `SQLite`-backed app (`SQLite` foundation, issue #1614 AC #4).
 ///
@@ -147,9 +128,10 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
 /// `ShardedDb` routes and shard-aware migrations, all of which require a
 /// `[[database.shards]]` topology. But `DatabaseConfig::validate_backend_consistency`
 /// rejects *any* `database.shards` against a `SQLite` primary, so no valid
-/// `SQLite` config can ever use a generated sharded resource. Unlike FTS
-/// (#1910), UUID ids (#1905), or the unsupported field kinds (#1924), this is
-/// **not** a deferred slice: `SQLite` is single-host / single-writer, so
+/// `SQLite` config can ever use a generated sharded resource. Unlike UUID ids
+/// (#1905) or the unsupported field kinds (#1924) — and unlike FTS, now
+/// supported on `SQLite` via FTS5 (#1910) — this is **not** a deferred slice:
+/// `SQLite` is single-host / single-writer, so
 /// horizontal sharding is Postgres-only and permanently out of scope for
 /// `SQLite` (see `docs/guide/sqlite-in-production.md`). Rather than emit a
 /// resource that no `SQLite` app can boot, generation fails here with an

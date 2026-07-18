@@ -13737,37 +13737,41 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        // #1996 SQLite full-text-search fallback. Postgres uses tsvector ranked
+        // #1910 SQLite FTS5 full-text search. Postgres uses tsvector ranked
         // search (`websearch_to_tsquery`/`ts_rank_cd`); SQLite has no tsvector, so
-        // the `backend_select!` sqlite arm below matches each `SEARCH_FIELDS`
-        // column with a case-insensitive `lower(col) LIKE '%term%'` substring test,
-        // ORed together, ordered `id DESC` (unranked — FTS5 ranking is deferred to
-        // #1910). Case-insensitivity here is ASCII-only: SQLite's built-in `lower()`
-        // folds only ASCII A–Z, so the query side is folded with the matching
-        // `to_ascii_lowercase()` (NOT Rust's full-Unicode `to_lowercase()`) to keep
-        // both sides consistent — a non-ASCII term (e.g. `Äpfel`) matches only with
-        // matching case. Full-Unicode/ICU case folding is deferred to #1910 (with
-        // FTS5 ranking). This fragment builds the shared `__autumn_like_where`
-        // OR-clause (positional `$1` pattern, reused across every column — SQLite
-        // collapses a repeated `$1` to one bind) and the `__autumn_pattern` search
-        // term with LIKE metacharacters (`\`, `%`, `_`) escaped so they match
-        // literally and a query can never become a match-everything wildcard. It is
-        // spliced into each sqlite arm (never the pg arm), so the pattern/where are
-        // only built where they are used.
-        let sqlite_like_setup = quote! {
-            let mut __autumn_like_clauses: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
-            for (__autumn_field, _) in <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS {
-                __autumn_like_clauses.push(::std::format!("lower(\"{__autumn_field}\") LIKE $1 ESCAPE '\\'"));
+        // the `backend_select!` sqlite arm below queries an external-content FTS5
+        // virtual table (`"<table>__fts"`, tokenized with `unicode61`) that the
+        // `AddSearch` migration creates and keeps in sync with triggers. The id
+        // SELECT joins that FTS table to the base table (so the tenant /
+        // soft-delete / owner predicates still filter the BASE table exactly as
+        // the pg arm does), matches with `WHERE "<table>__fts" MATCH ?`, and ranks
+        // with `ORDER BY bm25("<table>__fts", <weights>)` — per-column weights
+        // derived from the `#[searchable(weight=...)]` priorities (A→10, B→5, C→2,
+        // else 1), so a higher-priority field sorts first (bm25 returns lower =
+        // better, so a larger weight yields a more-negative score). `unicode61`
+        // folds case for the full Unicode range (fixing the old ASCII-only `lower`
+        // limitation — e.g. `äpfel` now matches `Äpfel`). This fragment builds the
+        // trusted `__autumn_bm25_weights` literal list and the fail-closed
+        // `__autumn_fts_match_opt` (see `sqlite_fts5_match_query`); it is spliced
+        // into each sqlite arm (never the pg arm), so it is only built where used.
+        let sqlite_fts_setup = quote! {
+            // Trusted per-column bm25 weights from the developer-declared
+            // SEARCH_FIELDS priorities — never request input, so spliced as SQL
+            // literals rather than bound.
+            let mut __autumn_bm25_weights: ::std::vec::Vec<&'static str> = ::std::vec::Vec::new();
+            for (_, __autumn_weight) in <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS {
+                __autumn_bm25_weights.push(match *__autumn_weight {
+                    'A' => "10.0",
+                    'B' => "5.0",
+                    'C' => "2.0",
+                    _ => "1.0",
+                });
             }
-            let __autumn_like_where = __autumn_like_clauses.join(" OR ");
-            let mut __autumn_escaped = ::std::string::String::new();
-            for __autumn_ch in query.to_ascii_lowercase().chars() {
-                if ::core::matches!(__autumn_ch, '\\' | '%' | '_') {
-                    __autumn_escaped.push('\\');
-                }
-                __autumn_escaped.push(__autumn_ch);
-            }
-            let __autumn_pattern = ::std::format!("%{__autumn_escaped}%");
+            let __autumn_bm25_weights = __autumn_bm25_weights.join(", ");
+            // Fail-closed FTS5 MATCH sanitization: `None` ⇒ no usable tokens ⇒ the
+            // arm yields an empty result and runs NO query (never a full scan).
+            let __autumn_fts_match_opt =
+                ::autumn_web::repository::sqlite_fts5_match_query(query);
         };
 
         // §1d: under across_tenants on a sharded repo the `Vec`-returning
@@ -13867,38 +13871,47 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                     }},
                     sqlite => {{
-                        #sqlite_like_setup
+                        #sqlite_fts_setup
 
-                        let mut sql = ::std::format!(
-                            "SELECT id FROM \"{}\" WHERE ({})",
-                            #table_name, __autumn_like_where
-                        );
-                        if #config_soft_delete {
-                            sql.push_str(" AND deleted_at IS NULL");
-                        }
-                        if let ::core::option::Option::Some(ref _t) = tenant_id {
-                            sql.push_str(" AND tenant_id = $2");
-                        }
-                        sql.push_str(" ORDER BY id DESC");
+                        match __autumn_fts_match_opt {
+                            // Fail-closed: no usable tokens ⇒ empty result, no query.
+                            ::core::option::Option::None => ::std::vec::Vec::<SearchId>::new(),
+                            ::core::option::Option::Some(__autumn_match) => {
+                                let mut sql = ::std::format!(
+                                    "SELECT \"{tbl}\".id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    tbl = #table_name
+                                );
+                                if #config_soft_delete {
+                                    sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
+                                }
+                                if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                    sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
+                                }
+                                sql.push_str(&::std::format!(
+                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), \"{tbl}\".id DESC",
+                                    tbl = #table_name, weights = __autumn_bm25_weights
+                                ));
 
-                        if #config_tenant_scoped {
-                            if let ::core::option::Option::Some(ref t) = tenant_id {
-                                ::autumn_web::reexports::diesel::sql_query(sql)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                                    .load::<SearchId>(&mut conn)
-                                    .await?
-                            } else {
-                                ::autumn_web::reexports::diesel::sql_query(sql)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                    .load::<SearchId>(&mut conn)
-                                    .await?
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        ::autumn_web::reexports::diesel::sql_query(sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    } else {
+                                        ::autumn_web::reexports::diesel::sql_query(sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    }
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(sql)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                        .load::<SearchId>(&mut conn)
+                                        .await?
+                                }
                             }
-                        } else {
-                            ::autumn_web::reexports::diesel::sql_query(sql)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                .load::<SearchId>(&mut conn)
-                                .await?
                         }
                     }},
                 };
@@ -14026,39 +14039,45 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                     }},
                     sqlite => {{
-                        #sqlite_like_setup
-                        let mut count_sql = ::std::format!(
-                            "SELECT COUNT(*) AS count FROM \"{}\" WHERE ({})",
-                            #table_name, __autumn_like_where
-                        );
-                        if #config_soft_delete {
-                            count_sql.push_str(" AND deleted_at IS NULL");
-                        }
-                        if let ::core::option::Option::Some(ref _t) = tenant_id {
-                            count_sql.push_str(" AND tenant_id = $2");
-                        }
+                        #sqlite_fts_setup
+                        match __autumn_fts_match_opt {
+                            // Fail-closed: no usable tokens ⇒ zero total, no query.
+                            ::core::option::Option::None => 0_i64,
+                            ::core::option::Option::Some(__autumn_match) => {
+                                let mut count_sql = ::std::format!(
+                                    "SELECT COUNT(*) AS count FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    tbl = #table_name
+                                );
+                                if #config_soft_delete {
+                                    count_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
+                                }
+                                if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                    count_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
+                                }
 
-                        if #config_tenant_scoped {
-                            if let ::core::option::Option::Some(ref t) = tenant_id {
-                                ::autumn_web::reexports::diesel::sql_query(count_sql)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                                    .get_result::<SearchCount>(&mut conn)
-                                    .await?
-                                    .count
-                            } else {
-                                ::autumn_web::reexports::diesel::sql_query(count_sql)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                    .get_result::<SearchCount>(&mut conn)
-                                    .await?
-                                    .count
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                            .get_result::<SearchCount>(&mut conn)
+                                            .await?
+                                            .count
+                                    } else {
+                                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .get_result::<SearchCount>(&mut conn)
+                                            .await?
+                                            .count
+                                    }
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                        .get_result::<SearchCount>(&mut conn)
+                                        .await?
+                                        .count
+                                }
                             }
-                        } else {
-                            ::autumn_web::reexports::diesel::sql_query(count_sql)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                .get_result::<SearchCount>(&mut conn)
-                                .await?
-                                .count
                         }
                     }},
                 };
@@ -14112,47 +14131,57 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                     }},
                     sqlite => {{
-                        #sqlite_like_setup
-                        let mut select_sql = ::std::format!(
-                            "SELECT id FROM \"{}\" WHERE ({})",
-                            #table_name, __autumn_like_where
-                        );
-                        if #config_soft_delete {
-                            select_sql.push_str(" AND deleted_at IS NULL");
-                        }
-                        if let ::core::option::Option::Some(ref _t) = tenant_id {
-                            select_sql.push_str(" AND tenant_id = $2");
-                            select_sql.push_str(" ORDER BY id DESC");
-                            select_sql.push_str(" LIMIT $3 OFFSET $4");
-                        } else {
-                            select_sql.push_str(" ORDER BY id DESC");
-                            select_sql.push_str(" LIMIT $2 OFFSET $3");
-                        }
+                        #sqlite_fts_setup
+                        match __autumn_fts_match_opt {
+                            // Fail-closed: no usable tokens ⇒ empty page, no query.
+                            ::core::option::Option::None => ::std::vec::Vec::<SearchId>::new(),
+                            ::core::option::Option::Some(__autumn_match) => {
+                                let mut select_sql = ::std::format!(
+                                    "SELECT \"{tbl}\".id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    tbl = #table_name
+                                );
+                                if #config_soft_delete {
+                                    select_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
+                                }
+                                let __autumn_order = ::std::format!(
+                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), \"{tbl}\".id DESC",
+                                    tbl = #table_name, weights = __autumn_bm25_weights
+                                );
+                                if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                    select_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
+                                    select_sql.push_str(&__autumn_order);
+                                    select_sql.push_str(" LIMIT $3 OFFSET $4");
+                                } else {
+                                    select_sql.push_str(&__autumn_order);
+                                    select_sql.push_str(" LIMIT $2 OFFSET $3");
+                                }
 
-                        if #config_tenant_scoped {
-                            if let ::core::option::Option::Some(ref t) = tenant_id {
-                                ::autumn_web::reexports::diesel::sql_query(select_sql)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                                    .load::<SearchId>(&mut conn)
-                                    .await?
-                            } else {
-                                ::autumn_web::reexports::diesel::sql_query(select_sql)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                                    .load::<SearchId>(&mut conn)
-                                    .await?
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    } else {
+                                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    }
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                        .load::<SearchId>(&mut conn)
+                                        .await?
+                                }
                             }
-                        } else {
-                            ::autumn_web::reexports::diesel::sql_query(select_sql)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                                .load::<SearchId>(&mut conn)
-                                .await?
                         }
                     }},
                 };
@@ -14216,13 +14245,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let owner_and_p3 = format!(" AND {owner_col_name} = $3");
         let owner_and_p4 = format!(" AND {owner_col_name} = $4");
 
-        // #1996 SQLite owner clause literals. The sqlite arm renumbers positional
-        // slots from `$1` (the LIKE pattern replaces Postgres's `$1`/`$2`
+        // #1910 SQLite owner clause literals. The sqlite arm renumbers positional
+        // slots from `$1` (the FTS5 MATCH string replaces Postgres's `$1`/`$2`
         // language+query pair), so the owner filter lands on `$2` (no tenant) or
         // `$3` (tenant occupies `$2`). Same trusted developer-declared identifier
         // as the pg literals — never request input.
-        let owner_sqlite_p2 = format!(" AND \"{owner_col_name}\" = $2");
-        let owner_sqlite_p3 = format!(" AND \"{owner_col_name}\" = $3");
+        let owner_sqlite_p2 = format!(" AND \"{table_name}\".\"{owner_col_name}\" = $2");
+        let owner_sqlite_p3 = format!(" AND \"{table_name}\".\"{owner_col_name}\" = $3");
 
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
@@ -14239,26 +14268,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let tenant_id = ::core::option::Option::None::<::std::string::String>;
             }
         };
-        // #1996 SQLite LIKE-substring fallback for the owner-scoped search (see the
-        // sibling `sqlite_like_setup` in the unscoped searchable block for the full
-        // rationale, including the ASCII-only case-folding note — the query side is
-        // `to_ascii_lowercase()` to match SQLite's ASCII-only `lower()`). Recomputed
-        // locally here because the scoped block is a separate `if let` and cannot
-        // see the unscoped block's binding.
-        let sqlite_like_setup = quote! {
-            let mut __autumn_like_clauses: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
-            for (__autumn_field, _) in <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS {
-                __autumn_like_clauses.push(::std::format!("lower(\"{__autumn_field}\") LIKE $1 ESCAPE '\\'"));
+        // #1910 SQLite FTS5 setup for the owner-scoped search (see the sibling
+        // `sqlite_fts_setup` in the unscoped searchable block for the full
+        // rationale — external-content FTS5 vtable, unicode61 tokenizer, bm25
+        // ranking, and the fail-closed `sqlite_fts5_match_query` sanitizer).
+        // Recomputed locally here because the scoped block is a separate `if let`
+        // and cannot see the unscoped block's binding.
+        let sqlite_fts_setup = quote! {
+            let mut __autumn_bm25_weights: ::std::vec::Vec<&'static str> = ::std::vec::Vec::new();
+            for (_, __autumn_weight) in <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS {
+                __autumn_bm25_weights.push(match *__autumn_weight {
+                    'A' => "10.0",
+                    'B' => "5.0",
+                    'C' => "2.0",
+                    _ => "1.0",
+                });
             }
-            let __autumn_like_where = __autumn_like_clauses.join(" OR ");
-            let mut __autumn_escaped = ::std::string::String::new();
-            for __autumn_ch in query.to_ascii_lowercase().chars() {
-                if ::core::matches!(__autumn_ch, '\\' | '%' | '_') {
-                    __autumn_escaped.push('\\');
-                }
-                __autumn_escaped.push(__autumn_ch);
-            }
-            let __autumn_pattern = ::std::format!("%{__autumn_escaped}%");
+            let __autumn_bm25_weights = __autumn_bm25_weights.join(", ");
+            let __autumn_fts_match_opt =
+                ::autumn_web::repository::sqlite_fts5_match_query(query);
         };
         let search_page_cross_shard_guard = if config.sharded && config.tenant_scoped {
             quote! {
@@ -14378,49 +14406,55 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                     }},
                     sqlite => {{
-                        #sqlite_like_setup
-                        let mut count_sql = ::std::format!(
-                            "SELECT COUNT(*) AS count FROM \"{}\" WHERE ({})",
-                            #table_name, __autumn_like_where
-                        );
-                        if #config_soft_delete {
-                            count_sql.push_str(" AND deleted_at IS NULL");
-                        }
-                        if #config_tenant_scoped {
-                            if let ::core::option::Option::Some(ref _t) = tenant_id {
-                                count_sql.push_str(" AND tenant_id = $2");
-                                count_sql.push_str(#owner_sqlite_p3);
-                            } else {
-                                count_sql.push_str(#owner_sqlite_p2);
-                            }
-                        } else {
-                            count_sql.push_str(#owner_sqlite_p2);
-                        }
+                        #sqlite_fts_setup
+                        match __autumn_fts_match_opt {
+                            // Fail-closed: no usable tokens ⇒ zero total, no query.
+                            ::core::option::Option::None => 0_i64,
+                            ::core::option::Option::Some(__autumn_match) => {
+                                let mut count_sql = ::std::format!(
+                                    "SELECT COUNT(*) AS count FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    tbl = #table_name
+                                );
+                                if #config_soft_delete {
+                                    count_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
+                                }
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                        count_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
+                                        count_sql.push_str(#owner_sqlite_p3);
+                                    } else {
+                                        count_sql.push_str(#owner_sqlite_p2);
+                                    }
+                                } else {
+                                    count_sql.push_str(#owner_sqlite_p2);
+                                }
 
-                        if #config_tenant_scoped {
-                            if let ::core::option::Option::Some(ref t) = tenant_id {
-                                ::autumn_web::reexports::diesel::sql_query(count_sql)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                                    .get_result::<SearchCount>(&mut conn)
-                                    .await?
-                                    .count
-                            } else {
-                                ::autumn_web::reexports::diesel::sql_query(count_sql)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                                    .get_result::<SearchCount>(&mut conn)
-                                    .await?
-                                    .count
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                            .get_result::<SearchCount>(&mut conn)
+                                            .await?
+                                            .count
+                                    } else {
+                                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                            .get_result::<SearchCount>(&mut conn)
+                                            .await?
+                                            .count
+                                    }
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                        .get_result::<SearchCount>(&mut conn)
+                                        .await?
+                                        .count
+                                }
                             }
-                        } else {
-                            ::autumn_web::reexports::diesel::sql_query(count_sql)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                                .get_result::<SearchCount>(&mut conn)
-                                .await?
-                                .count
                         }
                     }},
                 };
@@ -14486,58 +14520,68 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                     }},
                     sqlite => {{
-                        #sqlite_like_setup
-                        let mut select_sql = ::std::format!(
-                            "SELECT id FROM \"{}\" WHERE ({})",
-                            #table_name, __autumn_like_where
-                        );
-                        if #config_soft_delete {
-                            select_sql.push_str(" AND deleted_at IS NULL");
-                        }
-                        if #config_tenant_scoped {
-                            if let ::core::option::Option::Some(ref _t) = tenant_id {
-                                select_sql.push_str(" AND tenant_id = $2");
-                                select_sql.push_str(#owner_sqlite_p3);
-                                select_sql.push_str(" ORDER BY id DESC");
-                                select_sql.push_str(" LIMIT $4 OFFSET $5");
-                            } else {
-                                select_sql.push_str(#owner_sqlite_p2);
-                                select_sql.push_str(" ORDER BY id DESC");
-                                select_sql.push_str(" LIMIT $3 OFFSET $4");
-                            }
-                        } else {
-                            select_sql.push_str(#owner_sqlite_p2);
-                            select_sql.push_str(" ORDER BY id DESC");
-                            select_sql.push_str(" LIMIT $3 OFFSET $4");
-                        }
+                        #sqlite_fts_setup
+                        match __autumn_fts_match_opt {
+                            // Fail-closed: no usable tokens ⇒ empty page, no query.
+                            ::core::option::Option::None => ::std::vec::Vec::<SearchId>::new(),
+                            ::core::option::Option::Some(__autumn_match) => {
+                                let mut select_sql = ::std::format!(
+                                    "SELECT \"{tbl}\".id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    tbl = #table_name
+                                );
+                                if #config_soft_delete {
+                                    select_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
+                                }
+                                let __autumn_order = ::std::format!(
+                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), \"{tbl}\".id DESC",
+                                    tbl = #table_name, weights = __autumn_bm25_weights
+                                );
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                        select_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
+                                        select_sql.push_str(#owner_sqlite_p3);
+                                        select_sql.push_str(&__autumn_order);
+                                        select_sql.push_str(" LIMIT $4 OFFSET $5");
+                                    } else {
+                                        select_sql.push_str(#owner_sqlite_p2);
+                                        select_sql.push_str(&__autumn_order);
+                                        select_sql.push_str(" LIMIT $3 OFFSET $4");
+                                    }
+                                } else {
+                                    select_sql.push_str(#owner_sqlite_p2);
+                                    select_sql.push_str(&__autumn_order);
+                                    select_sql.push_str(" LIMIT $3 OFFSET $4");
+                                }
 
-                        if #config_tenant_scoped {
-                            if let ::core::option::Option::Some(ref t) = tenant_id {
-                                ::autumn_web::reexports::diesel::sql_query(select_sql)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                                    .load::<SearchId>(&mut conn)
-                                    .await?
-                            } else {
-                                ::autumn_web::reexports::diesel::sql_query(select_sql)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                                    .load::<SearchId>(&mut conn)
-                                    .await?
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    } else {
+                                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    }
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                        .load::<SearchId>(&mut conn)
+                                        .await?
+                                }
                             }
-                        } else {
-                            ::autumn_web::reexports::diesel::sql_query(select_sql)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                                .load::<SearchId>(&mut conn)
-                                .await?
                         }
                     }},
                 };
@@ -19423,11 +19467,11 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_searchable_forks_sqlite_like_fallback() {
-        // #1996: the full-text search codegen must fork into pg/sqlite
+    fn repository_macro_searchable_forks_sqlite_fts5() {
+        // #1910: the full-text search codegen must fork into pg/sqlite
         // `backend_select!` arms. Postgres keeps tsvector ranked search; SQLite
-        // falls back to case-insensitive `lower(col) LIKE '%term%'` substring
-        // matching over SEARCH_FIELDS, ordered `id DESC` (no rank function).
+        // queries an external-content FTS5 virtual table (`"<table>__fts"`),
+        // MATCH-filtered and bm25-ranked over SEARCH_FIELDS.
         let generated = repository_macro(
             quote! { Post, searchable },
             quote! { pub trait PostRepository {} },
@@ -19440,22 +19484,39 @@ mod tests {
             "a searchable repository must emit a backend_select! fork: {generated}"
         );
 
-        // ── SQLite arm: LIKE substring fallback, no tsvector functions ──
+        // ── SQLite arm: FTS5 MATCH + bm25, no LIKE / tsvector functions ──
         assert!(
-            generated.contains("LIKE $1 ESCAPE"),
-            "the SQLite search arm must emit a LIKE substring predicate: {generated}"
+            generated.contains("{tbl}__fts") && generated.contains("MATCH $1"),
+            "the SQLite search arm must MATCH against the FTS5 virtual table: {generated}"
         );
         assert!(
-            generated.contains("lower(\\\"{__autumn_field}\\\")"),
-            "the SQLite search arm must lower() each SEARCH_FIELD column: {generated}"
+            generated.contains("bm25(\\\"{tbl}__fts\\\""),
+            "the SQLite search arm must rank with bm25 over the FTS5 table: {generated}"
+        );
+        // Codex P2 (#1910): every base-table column referenced across the FTS
+        // JOIN must be qualified with the base table (`"{tbl}".<col>`), or a
+        // model that marks a base column (e.g. `tenant_id`) `#[searchable]`
+        // would make SQLite raise `ambiguous column name`. The selected id and
+        // the bm25 tiebreak id are both base-table-qualified.
+        assert!(
+            generated.contains("SELECT \\\"{tbl}\\\".id FROM \\\"{tbl}\\\""),
+            "the SQLite search select must qualify id against the base table: {generated}"
+        );
+        assert!(
+            generated.contains("\\\"{tbl}\\\".id DESC"),
+            "the SQLite bm25 tiebreak must qualify id against the base table: {generated}"
         );
         assert!(
             generated.contains("SEARCH_FIELDS"),
-            "the SQLite search arm must build its predicate from SEARCH_FIELDS: {generated}"
+            "the SQLite search arm must derive its bm25 weights from SEARCH_FIELDS: {generated}"
         );
         assert!(
-            generated.contains("ORDER BY id DESC"),
-            "the SQLite search arm must order by id DESC (unranked): {generated}"
+            generated.contains("sqlite_fts5_match_query"),
+            "the SQLite search arm must sanitize the MATCH query (fail-closed): {generated}"
+        );
+        assert!(
+            !generated.contains("LIKE $1 ESCAPE"),
+            "the SQLite search arm must NOT keep the old LIKE fallback: {generated}"
         );
 
         // ── Postgres arm: tsvector ranked search preserved (no regression) ──
@@ -19471,10 +19532,10 @@ mod tests {
 
     #[test]
     fn repository_macro_tenant_scoped_searchable_filters_tenant_in_both_arms() {
-        // #1996: tenant isolation is load-bearing — BOTH the pg (tsvector) and
-        // sqlite (LIKE) arms must carry the `tenant_id = $n` predicate so a search
+        // #1910: tenant isolation is load-bearing — BOTH the pg (tsvector) and
+        // sqlite (FTS5) arms must carry the `tenant_id = $n` predicate so a search
         // never crosses tenants on either backend. The pg arm binds tenant at $3;
-        // the sqlite arm renumbers to $2 (the LIKE pattern is $1).
+        // the sqlite arm renumbers to $2 (the FTS5 MATCH string is $1).
         let generated = repository_macro(
             quote! { Post, tenant_scoped, searchable },
             quote! { pub trait PostRepository {} },
@@ -19485,23 +19546,27 @@ mod tests {
             generated.contains("AND tenant_id = $3"),
             "the Postgres search arm must filter tenant_id = $3: {generated}"
         );
+        // Codex P2 (#1910): the SQLite tenant predicate must be base-table-
+        // qualified (`"{tbl}".tenant_id`) so a searchable `tenant_id` column
+        // (which also lands on `<table>__fts`) doesn't make it ambiguous under
+        // the FTS JOIN. The predicate survives — only the qualification changes.
         assert!(
-            generated.contains("AND tenant_id = $2"),
-            "the SQLite search arm must filter tenant_id = $2: {generated}"
+            generated.contains("AND \\\"{tbl}\\\".tenant_id = $2"),
+            "the SQLite search arm must filter \"{{tbl}}\".tenant_id = $2: {generated}"
         );
-        // The pg arm still ranks; the sqlite arm still substring-matches.
+        // The pg arm still ranks with tsvector; the sqlite arm still MATCHes FTS5.
         assert!(
-            generated.contains("websearch_to_tsquery") && generated.contains("LIKE $1 ESCAPE"),
+            generated.contains("websearch_to_tsquery") && generated.contains("MATCH $1"),
             "both search arms must survive tenant scoping: {generated}"
         );
     }
 
     #[test]
-    fn repository_macro_owner_scoped_searchable_forks_sqlite_like_fallback() {
-        // #1996: the owner-scoped search_page_scoped (#1841) path must fork too,
+    fn repository_macro_owner_scoped_searchable_forks_sqlite_fts5() {
+        // #1910: the owner-scoped search_page_scoped (#1841) path must fork too,
         // and the owner filter must survive in BOTH arms so an owner-scoped search
         // never leaks another user's rows. pg binds owner at $3; sqlite renumbers
-        // the owner filter to $2 (LIKE pattern is $1).
+        // the owner filter to $2 (FTS5 MATCH string is $1).
         let generated = repository_macro(
             quote! { Post, owner = user_id, searchable },
             quote! { pub trait PostRepository {} },
@@ -19512,17 +19577,21 @@ mod tests {
             generated.contains("search_page_scoped"),
             "an owner-scoped searchable repository must emit search_page_scoped: {generated}"
         );
-        // Postgres owner filter (ranked) and SQLite owner filter (LIKE).
+        // Postgres owner filter (ranked) and SQLite owner filter (FTS5 MATCH).
         assert!(
             generated.contains("AND user_id = $3"),
             "the Postgres owner-scoped arm must filter user_id = $3: {generated}"
         );
+        // Codex P2 (#1910): the SQLite owner predicate must be base-table-
+        // qualified (`"posts"."user_id"`) so a searchable owner column doesn't
+        // collide with the `<table>__fts` side of the JOIN. The owner filter
+        // survives — only the qualification changes.
         assert!(
-            generated.contains("AND \\\"user_id\\\" = $2"),
-            "the SQLite owner-scoped arm must filter \"user_id\" = $2: {generated}"
+            generated.contains("AND \\\"posts\\\".\\\"user_id\\\" = $2"),
+            "the SQLite owner-scoped arm must filter \"posts\".\"user_id\" = $2: {generated}"
         );
         assert!(
-            generated.contains("websearch_to_tsquery") && generated.contains("LIKE $1 ESCAPE"),
+            generated.contains("websearch_to_tsquery") && generated.contains("MATCH $1"),
             "both owner-scoped search arms must be present: {generated}"
         );
     }

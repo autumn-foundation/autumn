@@ -11,10 +11,10 @@ use super::dsl::parse_fields;
 use super::emit::Plan;
 use super::naming::pascal_to_snake;
 use super::schema_edit::{
-    MigrationShape, add_columns_down_sql_for, add_columns_up_sql_for, add_search_down_sql,
-    add_search_up_sql, detect_migration_shape, encrypt_columns_down_sql, encrypt_columns_up_sql,
-    parse_model_search_config_for_table, remove_columns_down_sql_for, remove_columns_up_sql_for,
-    singularize,
+    MigrationShape, add_columns_down_sql_for, add_columns_up_sql_for, add_search_down_sql_for,
+    add_search_up_sql_for, detect_migration_shape, encrypt_columns_down_sql,
+    encrypt_columns_up_sql, parse_model_search_config_for_table, remove_columns_down_sql_for,
+    remove_columns_up_sql_for, singularize,
 };
 use super::{GenerateError, detect_backend, ensure_project_root};
 
@@ -147,12 +147,11 @@ pub fn plan_migration_with_options(
             encrypt_columns_down_sql(table, columns),
         ),
         MigrationShape::AddSearch { ref table } => {
-            // Postgres FTS (`tsvector` + GIN) has no SQLite equivalent in this
-            // slice; reject at generate time citing #1910 (issue #1614 AC #4)
-            // rather than emit Postgres-only DDL that breaks on SQLite.
-            if backend == autumn_web::config::DatabaseBackend::Sqlite {
-                return Err(super::sqlite_search_unsupported_error());
-            }
+            // Full-text search is backend-aware (issue #1910): Postgres emits a
+            // `tsvector` generated column + GIN index; SQLite emits an
+            // external-content FTS5 virtual table + maintenance triggers (see
+            // `add_search_up_sql_for`). Neither leaks DDL that breaks the other
+            // backend, so `--search` now works on both.
             let singular = singularize(table);
 
             // Collect all potential model file candidates in order of preference
@@ -213,8 +212,8 @@ pub fn plan_migration_with_options(
             };
 
             (
-                add_search_up_sql(table, &language, &fts_fields),
-                add_search_down_sql(table),
+                add_search_up_sql_for(backend, table, &language, &fts_fields)?,
+                add_search_down_sql_for(backend, table),
             )
         }
         _ => (String::new(), String::new()),
@@ -627,24 +626,66 @@ pub struct Post {
         tmp
     }
 
-    /// `AddSearchTo…` on a `SQLite` app is rejected at generate time citing #1910
-    /// (Postgres `tsvector` FTS has no `SQLite` equivalent in this slice, AC #4).
+    /// `AddSearchTo…` on a `SQLite` app now emits an FTS5 external-content virtual
+    /// table + maintenance triggers (issue #1910) instead of being rejected, and
+    /// no Postgres-only `tsvector`/GIN DDL leaks into the `SQLite` migration.
     #[test]
-    fn add_search_migration_on_sqlite_is_rejected_citing_1910() {
+    fn add_search_migration_on_sqlite_emits_fts5() {
         with_no_db_env(|| {
             let tmp = sqlite_project();
-            let err =
-                plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap_err();
-            let msg = err.to_string();
+            // The AddSearch shape reads the model's #[searchable] config from a
+            // model file to know which columns to index.
+            fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+            fs::write(
+                tmp.path().join("src/models/post.rs"),
+                "#[autumn_web::model(table = \"posts\")]\n\
+                 #[searchable(language = \"english\")]\n\
+                 pub struct Post {\n\
+                 \x20   #[id]\n\
+                 \x20   pub id: i64,\n\
+                 \x20   #[searchable(weight = \"A\")]\n\
+                 \x20   pub title: String,\n\
+                 \x20   #[searchable(weight = \"B\")]\n\
+                 \x20   pub body: String,\n\
+                 }\n",
+            )
+            .unwrap();
+
+            let plan =
+                plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
+            plan.execute(Flags::default()).unwrap();
+
+            let dir = tmp
+                .path()
+                .join("migrations/20260427000000_add_search_to_posts");
+            let up = fs::read_to_string(dir.join("up.sql")).unwrap();
+            let down = fs::read_to_string(dir.join("down.sql")).unwrap();
+
             assert!(
-                matches!(err, GenerateError::Config(_)),
-                "expected Config error, got: {err:?}"
+                up.contains(
+                    "CREATE VIRTUAL TABLE \"posts__fts\" USING fts5(\"title\", \"body\", \
+                     content='posts', content_rowid='id', tokenize='unicode61');"
+                ),
+                "up.sql must create the FTS5 vtable: {up}"
             );
-            assert!(msg.contains("1910"), "must cite issue #1910: {msg}");
             assert!(
-                msg.contains("SQLite") && msg.contains("full-text search"),
-                "message must be actionable: {msg}"
+                up.contains("INSERT INTO \"posts__fts\"(\"posts__fts\") VALUES('rebuild');"),
+                "up.sql must backfill via 'rebuild': {up}"
             );
+            for trig in ["posts__fts_ai", "posts__fts_ad", "posts__fts_au"] {
+                assert!(up.contains(trig), "up.sql must create trigger {trig}: {up}");
+                assert!(
+                    down.contains(&format!("DROP TRIGGER IF EXISTS \"{trig}\";")),
+                    "down.sql must drop trigger {trig}: {down}"
+                );
+            }
+            assert!(
+                down.contains("DROP TABLE IF EXISTS \"posts__fts\";"),
+                "down.sql must drop the FTS table: {down}"
+            );
+            for leak in ["tsvector", "to_tsvector", "USING gin", "search_vector"] {
+                assert!(!up.contains(leak), "SQLite up.sql leaked `{leak}`: {up}");
+            }
         });
     }
 

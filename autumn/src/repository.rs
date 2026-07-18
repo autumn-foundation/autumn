@@ -543,6 +543,49 @@ pub trait AutumnSearchableModel {
     const SEARCH_FIELDS: &'static [(&'static str, char)];
 }
 
+/// Build a fail-closed `SQLite` FTS5 `MATCH` query string from raw user input
+/// (issue #1910).
+///
+/// `SQLite` FTS5's `MATCH` right-hand operand is a query *language*, not a plain
+/// string: bare words are terms, but `AND` / `OR` / `NOT` / `NEAR`, a `col:`
+/// prefix, `*` (prefix), `^` (initial-token), `(`/`)` grouping, `"` phrases and
+/// a leading `-` are all operators. Passing raw user input straight to `MATCH`
+/// would let a caller inject FTS5 query syntax — or, more commonly, trigger a
+/// hard syntax error on innocuous punctuation. This helper neutralizes all of
+/// it: the input is split on Unicode whitespace and each token is emitted as a
+/// quoted FTS5 string literal (a `"..."` phrase), with any embedded `"` doubled
+/// (`""`) per FTS5's own string escaping. The quoted tokens are joined with a
+/// single space, which FTS5 reads as an implicit AND of literal phrases. Every
+/// operator character therefore becomes part of a literal term and can never
+/// change the query's structure (the analogue of the Postgres path's
+/// `websearch_to_tsquery` and the old LIKE path's metacharacter escaping).
+///
+/// Returns `None` when the input yields no tokens (empty or whitespace-only).
+/// The caller MUST treat `None` as an empty result set and run **no** query —
+/// never an unfiltered scan.
+#[must_use]
+pub fn sqlite_fts5_match_query(input: &str) -> Option<String> {
+    // Worst case (no embedded quotes to double): every byte kept plus the two
+    // surrounding quotes of a single token — pre-size to avoid reallocation.
+    let mut out = String::with_capacity(input.len() + 2);
+    for token in input.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push('"');
+        for ch in token.chars() {
+            if ch == '"' {
+                // FTS5 escapes a literal double-quote inside a "..." string by
+                // doubling it.
+                out.push('"');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// Derive a stable signed 64-bit advisory lock key for repository upserts.
 ///
 /// Generated versioned repositories use this before pre-reading rows for
@@ -652,6 +695,60 @@ impl<T: DisplayTopicField> DisplayTopicField for Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fts5_match_quotes_plain_terms_and_ands_them() {
+        // A plain multi-word query becomes an implicit-AND of quoted phrases.
+        assert_eq!(
+            sqlite_fts5_match_query("rust web").as_deref(),
+            Some("\"rust\" \"web\"")
+        );
+        assert_eq!(
+            sqlite_fts5_match_query("hello").as_deref(),
+            Some("\"hello\"")
+        );
+    }
+
+    #[test]
+    fn fts5_match_neutralizes_operators_as_literals() {
+        // FTS5 operators are quoted into literal terms — never parsed as syntax.
+        assert_eq!(
+            sqlite_fts5_match_query("foo OR bar").as_deref(),
+            Some("\"foo\" \"OR\" \"bar\"")
+        );
+        assert_eq!(
+            sqlite_fts5_match_query("title:secret").as_deref(),
+            Some("\"title:secret\"")
+        );
+        assert_eq!(sqlite_fts5_match_query("pre*").as_deref(), Some("\"pre*\""));
+        assert_eq!(
+            sqlite_fts5_match_query("NEAR(a b)").as_deref(),
+            Some("\"NEAR(a\" \"b)\"")
+        );
+    }
+
+    #[test]
+    fn fts5_match_doubles_embedded_quotes() {
+        // An embedded double-quote is escaped by doubling, so it can never close
+        // the phrase early and inject trailing syntax.
+        assert_eq!(
+            sqlite_fts5_match_query("a\"b").as_deref(),
+            Some("\"a\"\"b\"")
+        );
+        assert_eq!(
+            sqlite_fts5_match_query("\" OR x").as_deref(),
+            Some("\"\"\"\" \"OR\" \"x\"")
+        );
+    }
+
+    #[test]
+    fn fts5_match_empty_input_is_none() {
+        // Empty / whitespace-only / no-token input yields None so the caller
+        // returns an empty page WITHOUT running any query (fail-closed).
+        assert_eq!(sqlite_fts5_match_query(""), None);
+        assert_eq!(sqlite_fts5_match_query("   "), None);
+        assert_eq!(sqlite_fts5_match_query("\t\n  \r"), None);
+    }
 
     #[test]
     fn conflict_variant_stores_all_fields() {

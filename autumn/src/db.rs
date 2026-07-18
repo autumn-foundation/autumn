@@ -1354,6 +1354,36 @@ fn build_sqlite_pool(
             conn.batch_execute(pragmas)
                 .await
                 .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
+            // #1910 FTS5 capability probe. Searchable repositories emit FTS5
+            // virtual tables + `bm25()` ranking, and the `AddSearch` migration's
+            // `CREATE VIRTUAL TABLE ... USING fts5(...)` is the hard stop that
+            // fails loudly at boot if the linked SQLite lacks FTS5. Probe it here
+            // (create + drop a throwaway FTS5 table in the always-writable `temp`
+            // database — harmless on read-only main targets) so the failure is a
+            // clear, actionable diagnostic naming FTS5 and the fix, instead of a
+            // bare "no such module: fts5" surfacing from a migration. There is NO
+            // silent fallback to LIKE — full-text search requires FTS5.
+            if let Err(e) = conn
+                .batch_execute(
+                    "CREATE VIRTUAL TABLE temp.__autumn_fts5_probe USING fts5(x); \
+                     DROP TABLE temp.__autumn_fts5_probe;",
+                )
+                .await
+            {
+                return Err(diesel::ConnectionError::CouldntSetupConfiguration(
+                    diesel::result::Error::QueryBuilderError(
+                        format!(
+                            "SQLite FTS5 is not available in the linked SQLite library, but \
+                             autumn-web full-text search (searchable repositories / the \
+                             `--search` scaffold, issue #1910) requires it. Build with the \
+                             bundled, FTS5-enabled SQLite by enabling autumn-web's `sqlite` \
+                             feature (it turns on `libsqlite3-sys/bundled`, whose amalgamation \
+                             defines SQLITE_ENABLE_FTS5). Underlying probe error: {e}"
+                        )
+                        .into(),
+                    ),
+                ));
+            }
             Ok(conn)
         }
         .boxed()
