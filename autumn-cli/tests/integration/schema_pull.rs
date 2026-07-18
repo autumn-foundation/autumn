@@ -1218,6 +1218,73 @@ async fn schema_pull_preserves_int4_serial_primary_key() {
     assert_no_secret_leak(&doc_out, &doc_err);
 }
 
+/// A brownfield single-column **UUID** primary key whose default is NOT the Autumn
+/// convention `gen_random_uuid()` — here a UUID PK with **no** default at all — must
+/// pull back preserving "no default", NOT the convention `gen_random_uuid()`. The
+/// no-default case is used deliberately so the test needs no `uuid-ossp` extension:
+/// `schema pull` records the id column with no default, a re-pull is byte-stable, and
+/// `schema doctor` reports no drift. This guards the emitter fix that gates the
+/// `IdKind::Uuid` shape on the stored default (see `diff::pk_kind_for`) so recreation
+/// never silently invents a `gen_random_uuid()` default the database never had.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_preserves_uuid_pk_without_convention_default() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_uuid_no_default_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // A brownfield table whose primary key is a bare `uuid` with NO default — the
+    // application supplies the id, so Postgres records no column default. Authored via
+    // a raw migration (needs no `uuid-ossp` / `pgcrypto` extension).
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_tokens",
+        "CREATE TABLE tokens (id uuid PRIMARY KEY, label TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT NOW());",
+        "DROP TABLE tokens;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the UUID id is captured, but with NO `gen_random_uuid()` default invented.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("tokens"),
+        "the brownfield table is captured: {snap}"
+    );
+    assert!(
+        snap.contains("\"Uuid\""),
+        "the UUID PK type is preserved: {snap}"
+    );
+    assert!(
+        !snap.contains("gen_random_uuid()"),
+        "a non-convention UUID PK must NOT gain a gen_random_uuid() default on pull: {snap}"
+    );
+
+    // A re-pull of the same database is byte-for-byte stable (no UUID-default drift).
+    let snap_before = snap;
+    let (pull2_out, pull2_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull2_out, &pull2_err);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("snapshot after second pull");
+    assert_eq!(
+        snap_before, snap_after,
+        "a re-pull of the same database must be byte-for-byte stable (UUID-no-default faithful)"
+    );
+
+    // doctor agrees the database still matches the pulled baseline (no drift from the
+    // preserved default-less UUID primary key).
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports the DB matches the snapshot with the default-less UUID PK:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
 /// A **partial** unique index (`… ON accounts(email) WHERE …`) enforces uniqueness
 /// only for rows matching its predicate, so it must NOT be treated as satisfying a
 /// model `#[unique] email` (which demands table-wide uniqueness). Unlike a full

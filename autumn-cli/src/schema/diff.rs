@@ -3137,9 +3137,9 @@ fn single_pk_column(table: &Table) -> Option<(&Column, IdKind)> {
 }
 
 /// Derive the id-generation strategy for a single-column PK:
-///   `Int64` PK, no default            → `BigSerial`
-///   `Int32` PK, `nextval(...)` default → `Serial` (a brownfield `SERIAL` id)
-///   `Uuid`  PK                        → `Uuid`
+///   `Int64` PK, no default                      → `BigSerial`
+///   `Int32` PK, `nextval(...)` default           → `Serial` (a brownfield `SERIAL` id)
+///   `Uuid`  PK, `gen_random_uuid()` default      → `Uuid`
 /// Any other PK column → `None` (rendered normally with a table-level clause).
 ///
 /// The `Int32`/`Serial` case only ever arises for a **brownfield-introspected**
@@ -3149,13 +3149,39 @@ fn single_pk_column(table: &Table) -> Option<(&Column, IdKind)> {
 /// recognized here and recreated as `SERIAL PRIMARY KEY` (auto-increment) rather
 /// than a plain `INTEGER PRIMARY KEY`. An int4 PK with NO default falls through to
 /// `None` → a plain integer PK (no auto-increment), which is correct.
+///
+/// The `Uuid` convention is likewise **default-gated**: the `IdKind::Uuid` shape
+/// renders `UUID PRIMARY KEY DEFAULT gen_random_uuid()`, so it is only applied when
+/// the pulled column's stored default is *exactly* that convention (the value the
+/// model parser records — see `parse::convention_default` — so the round-trip stays
+/// clean). A brownfield UUID PK whose default is a different expression (e.g.
+/// `uuid_generate_v4()`) or is absent entirely falls through to `None`: it renders
+/// as an ordinary `UUID` column preserving its real default (or lack of one), with
+/// its primary key expressed via the trailing table-level `PRIMARY KEY (col)` clause
+/// — so recreation (e.g. the down migration for a dropped table) never silently
+/// swaps its UUID-generation behavior for `gen_random_uuid()` or adds a default
+/// where none existed.
 fn pk_kind_for(column: &Column) -> Option<IdKind> {
     match &column.ty {
         ColumnType::Int64 if column.default.is_none() => Some(IdKind::BigSerial),
         ColumnType::Int32 if is_nextval_default(column) => Some(IdKind::Serial),
-        ColumnType::Uuid => Some(IdKind::Uuid),
+        ColumnType::Uuid if is_convention_uuid_default(column) => Some(IdKind::Uuid),
         _ => None,
     }
+}
+
+/// Whether a UUID primary-key column's stored default is *exactly* the Autumn model
+/// convention `gen_random_uuid()` — the value `parse::convention_default` records for
+/// a Postgres UUID `#[id]` and the string introspection preserves verbatim
+/// (`normalize_default` keeps it as-is). Only then may the DDL emitter collapse the
+/// column into the `IdKind::Uuid` shape (`UUID PRIMARY KEY DEFAULT
+/// gen_random_uuid()`); a UUID PK with any other default — or none — is rendered as an
+/// ordinary column so its true generation behavior is never silently rewritten.
+fn is_convention_uuid_default(column: &Column) -> bool {
+    matches!(
+        &column.default,
+        Some(ColumnDefault::Sql(sql)) if sql.trim() == "gen_random_uuid()"
+    )
 }
 
 /// Whether a column's default is a `nextval(...)` sequence default (a `SERIAL`
@@ -4978,6 +5004,10 @@ mod tests {
         let mut t = Table::new("posts", Backend::Postgres);
         let mut id = col("id", ColumnType::Uuid);
         id.primary_key = true;
+        // The model convention default — the exact string `parse::convention_default`
+        // records and introspection preserves — is required for the `IdKind::Uuid`
+        // shape to render.
+        id.default = Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()));
         t.primary_key.push("id".to_owned());
         t.columns.push(id);
         let plan = MigrationPlan {
@@ -4988,6 +5018,108 @@ mod tests {
         assert!(
             up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
             "uuid PK: {up}"
+        );
+    }
+
+    #[test]
+    fn pk_kind_for_uuid_is_gated_on_the_convention_default() {
+        // Convention `gen_random_uuid()` default → the `IdKind::Uuid` shape.
+        let mut conv = col("id", ColumnType::Uuid);
+        conv.primary_key = true;
+        conv.default = Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()));
+        assert_eq!(pk_kind_for(&conv), Some(IdKind::Uuid));
+        // A leading/trailing whitespace variant still resolves (trim-tolerant).
+        let mut conv_ws = col("id", ColumnType::Uuid);
+        conv_ws.primary_key = true;
+        conv_ws.default = Some(ColumnDefault::Sql("  gen_random_uuid()  ".to_owned()));
+        assert_eq!(pk_kind_for(&conv_ws), Some(IdKind::Uuid));
+
+        // A non-convention default (`uuid_generate_v4()`) → None (ordinary column).
+        let mut v4 = col("id", ColumnType::Uuid);
+        v4.primary_key = true;
+        v4.default = Some(ColumnDefault::Sql("uuid_generate_v4()".to_owned()));
+        assert_eq!(pk_kind_for(&v4), None);
+
+        // No default → None (ordinary column; the PK is expressed table-level).
+        let mut none = col("id", ColumnType::Uuid);
+        none.primary_key = true;
+        assert_eq!(pk_kind_for(&none), None);
+    }
+
+    /// A convention UUID PK (`DEFAULT gen_random_uuid()`) renders the `IdKind::Uuid`
+    /// shape verbatim — the `gen_random_uuid()` default is not double-emitted.
+    #[test]
+    fn create_table_convention_uuid_pk_renders_id_kind_shape() {
+        let mut t = Table::new("sessions", Backend::Postgres);
+        let mut id = col("id", ColumnType::Uuid);
+        id.primary_key = true;
+        id.default = Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()));
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        let body = render_create_table_body("sessions", &t, Backend::Postgres);
+        assert!(
+            body.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
+            "convention UUID PK renders the IdKind::Uuid shape: {body}"
+        );
+        // Exactly one `gen_random_uuid()` — the explicit column default is not also
+        // appended alongside the `IdKind::Uuid` shape's own default.
+        assert_eq!(
+            body.matches("gen_random_uuid()").count(),
+            1,
+            "the convention default is emitted exactly once: {body}"
+        );
+    }
+
+    /// A UUID PK with NO default must NOT gain a `gen_random_uuid()` default on
+    /// recreation: it renders as an ordinary `UUID` column plus a table-level
+    /// `PRIMARY KEY (id)` clause, preserving "no default".
+    #[test]
+    fn create_table_uuid_pk_without_default_renders_ordinary_column_with_pk() {
+        let mut t = Table::new("tokens", Backend::Postgres);
+        let mut id = col("id", ColumnType::Uuid);
+        id.primary_key = true;
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        t.columns.push(col("label", ColumnType::Text));
+        let body = render_create_table_body("tokens", &t, Backend::Postgres);
+        assert!(
+            body.contains("id UUID NOT NULL"),
+            "no-default UUID PK renders as an ordinary UUID column: {body}"
+        );
+        assert!(
+            !body.contains("gen_random_uuid()"),
+            "no default must be invented on recreation: {body}"
+        );
+        assert!(
+            body.contains("PRIMARY KEY (id)"),
+            "the PK is still expressed via the table-level clause: {body}"
+        );
+    }
+
+    /// A brownfield UUID PK whose default is a NON-convention expression
+    /// (`uuid_generate_v4()`) renders that default verbatim — recreation preserves the
+    /// real UUID-generation behavior rather than silently swapping it for
+    /// `gen_random_uuid()`.
+    #[test]
+    fn create_table_uuid_pk_with_non_convention_default_renders_it_verbatim() {
+        let mut t = Table::new("tokens", Backend::Postgres);
+        let mut id = col("id", ColumnType::Uuid);
+        id.primary_key = true;
+        id.default = Some(ColumnDefault::Sql("uuid_generate_v4()".to_owned()));
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        let body = render_create_table_body("tokens", &t, Backend::Postgres);
+        assert!(
+            body.contains("id UUID NOT NULL DEFAULT uuid_generate_v4()"),
+            "the real non-convention default renders verbatim: {body}"
+        );
+        assert!(
+            !body.contains("gen_random_uuid()"),
+            "the convention default is never substituted: {body}"
+        );
+        assert!(
+            body.contains("PRIMARY KEY (id)"),
+            "the PK is still expressed via the table-level clause: {body}"
         );
     }
 
@@ -6344,9 +6476,13 @@ PRAGMA foreign_keys=ON;
         };
         let baseline = uuid_table("posts");
         let desired = uuid_table("posts");
+        // A default-less UUID PK is no longer the `IdKind::Uuid` convention shape
+        // (that is gated on the `gen_random_uuid()` default): it resolves to `None`
+        // and is rendered as an ordinary column with a table-level PK. Either way it
+        // is not an autoincrement PK, so no sequence preservation is emitted.
         assert!(
-            matches!(single_pk_column(&desired), Some((_, IdKind::Uuid))),
-            "the fixture PK resolves to Uuid"
+            single_pk_column(&desired).is_none(),
+            "a default-less UUID PK is not the IdKind::Uuid convention shape"
         );
         for leg in [RebuildLeg::Up, RebuildLeg::Down] {
             let sql = render_sqlite_rebuild("posts", &desired, &baseline, leg, &[]);

@@ -72,6 +72,15 @@
 //! - **Enum `CHECK` constraints**: enum recovery from `CHECK` expressions is a
 //!   later slice; a `TEXT`-with-`CHECK` column pulls back as plain
 //!   [`Text`](ColumnType::Text).
+//! - **Non-PK `SERIAL`/`BIGSERIAL` owned sequences**: a non-primary-key
+//!   `SERIAL`/`BIGSERIAL` column is preserved with its raw
+//!   `nextval('..._seq'::regclass)` default so the pulled snapshot and `doctor`
+//!   drift are faithful, but its owned sequence is not modeled; on rollback of a
+//!   dropped table/column the down migration would fail with a missing-relation
+//!   error rather than recreate the sequence. Owned-sequence / serial-identity
+//!   modeling is deferred to a later slice (alongside views/triggers). The forward
+//!   pull/doctor path is unaffected — it already round-trips the raw default
+//!   verbatim; only the down-migration recreation of the sequence is out of scope.
 //! - **Constraint-vs-index reconciliation for constraint-owned indexes**: an
 //!   **EXCLUDE** constraint (`pg_constraint.contype = 'x'`) IS preserved as the real
 //!   constraint: its retained `definition` is the
