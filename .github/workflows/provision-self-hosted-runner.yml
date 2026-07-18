@@ -14,10 +14,10 @@ on:
   workflow_dispatch:
     inputs:
       server_type:
-        description: "Hetzner type (cpx31=4 vCPU/8 GB, cpx41=8 vCPU/16 GB)"
+        description: "Hetzner type (cpx32=4 vCPU/8 GB, cpx42=8 vCPU/16 GB)"
         type: choice
-        options: [cpx41, cpx31]
-        default: cpx41
+        options: [cpx42, cpx32]
+        default: cpx42
       location:
         description: "Hetzner location"
         default: nbg1
