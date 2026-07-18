@@ -11,6 +11,8 @@ mod i18n_check;
 mod lifecycle_check;
 mod manifest_posture;
 mod migrate_down;
+#[cfg(feature = "sqlite")]
+mod migrate_sqlite;
 mod offsite_backup;
 mod repo_hygiene;
 mod scaffold_belongs_to;

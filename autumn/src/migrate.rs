@@ -638,11 +638,25 @@ pub struct AppliedUserMigration {
 /// `down.sql`, so without this exclusion `autumn migrate down --shard` would
 /// plan one of them as a user migration and fail.
 fn framework_migration_versions() -> Result<std::collections::BTreeSet<String>, MigrationError> {
+    framework_migration_versions_for::<Pg>()
+}
+
+/// Backend-generic core of [`framework_migration_versions`]. The version strings
+/// are identical across backends (they come from the same embedded directory
+/// names), so the `SQLite` rollback path (issue #2058) can enumerate the same
+/// framework-owned set through the `Sqlite` `MigrationSource` impl without
+/// duplicating the list.
+fn framework_migration_versions_for<DB>()
+-> Result<std::collections::BTreeSet<String>, MigrationError>
+where
+    DB: diesel::backend::Backend,
+    EmbeddedMigrations: diesel::migration::MigrationSource<DB>,
+{
     let mut versions = std::collections::BTreeSet::new();
     for migrations in [
-        MigrationSource::<Pg>::migrations(&FRAMEWORK_MIGRATIONS),
-        MigrationSource::<Pg>::migrations(&crate::version_history::VERSION_HISTORY_MIGRATIONS),
-        MigrationSource::<Pg>::migrations(
+        MigrationSource::<DB>::migrations(&FRAMEWORK_MIGRATIONS),
+        MigrationSource::<DB>::migrations(&crate::version_history::VERSION_HISTORY_MIGRATIONS),
+        MigrationSource::<DB>::migrations(
             &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
         ),
     ] {
@@ -1684,6 +1698,151 @@ where
 
         result
     })
+}
+
+// ── SQLite migrate up/down (issue #2058) ─────────────────────────────────────
+
+/// Backend-generic core of [`resolve_applied_user_migrations`], parameterized
+/// over the diesel backend so the Postgres and `SQLite` `MigrationHarness`
+/// connections share one classification path.
+///
+/// The version normalisation, framework-exclusion, and local-directory
+/// resolution are backend-independent; only the connection's `applied_migrations`
+/// call and the migration boxes' backend differ. The pure
+/// [`classify_applied_user_migrations`] does the rest.
+#[cfg(feature = "sqlite")]
+fn resolve_applied_user_migrations_sqlite<C>(
+    conn: &mut C,
+    all_migrations: &[Box<dyn Migration<diesel::sqlite::Sqlite>>],
+    migrations_dir: &Path,
+) -> Result<Vec<AppliedUserMigration>, MigrationError>
+where
+    C: MigrationHarness<diesel::sqlite::Sqlite>,
+{
+    let by_version: std::collections::BTreeMap<String, String> = all_migrations
+        .iter()
+        .map(|m| (m.name().version().to_string(), m.name().to_string()))
+        .collect();
+
+    // The framework version strings are backend-independent; enumerate them via
+    // the `Sqlite` source so a framework version that somehow landed in
+    // `__diesel_schema_migrations` is still excluded from user rollback planning.
+    let framework = framework_migration_versions_for::<diesel::sqlite::Sqlite>()?;
+
+    let applied: Vec<String> = conn
+        .applied_migrations()
+        .map_err(|e| MigrationError::Migration(e.to_string()))?
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
+    Ok(classify_applied_user_migrations(
+        &applied,
+        &by_version,
+        &framework,
+        migrations_dir,
+    ))
+}
+
+/// `SQLite` counterpart to [`applied_user_migrations`]: return the applied
+/// **user** migrations (ascending by version), each resolved to its local
+/// directory, from a `SQLite` database.
+///
+/// `SQLite` is a single-writer local database, so — unlike the Postgres path —
+/// there is **no advisory lock** (issue #1999 / #2036 precedent); the read runs
+/// directly on a synchronous `SqliteConnection`. Read-only status listing used by
+/// the `autumn migrate down` preflight on a `sqlite://` target.
+///
+/// # Errors
+///
+/// - [`MigrationError::Connection`] if the database cannot be opened.
+/// - [`MigrationError::Migration`] if `migrations_dir` cannot be read or querying
+///   applied versions fails.
+#[cfg(feature = "sqlite")]
+pub fn applied_user_migrations_sqlite(
+    database_url: &str,
+    migrations_dir: &Path,
+) -> Result<Vec<AppliedUserMigration>, MigrationError> {
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let source = FileBasedMigrations::from_path(migrations_dir)
+        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
+    let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> = source
+        .migrations()
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    resolve_applied_user_migrations_sqlite(&mut conn, &all_migrations, migrations_dir)
+}
+
+/// `SQLite` counterpart to [`revert_user_migrations_locked`]: plan and execute a
+/// user-migration rollback against a `SQLite` database.
+///
+/// `SQLite` is a single-writer local database, so there is **no advisory lock**
+/// (issue #1999 / #2036 precedent): the applied set is listed, `plan` chooses the
+/// newest-first versions to revert, and each is reverted through diesel's
+/// `MigrationHarness`. There is likewise **no content-checksum bookkeeping** — the
+/// `SQLite` `autumn migrate up` path applies through the unlocked harness and
+/// records no `autumn_migration_checksums` rows (that table's DDL is
+/// Postgres-specific), so there is nothing to delete on revert.
+///
+/// `plan` may inspect each [`AppliedUserMigration`] and return an error (or
+/// terminate the process) to refuse the rollback; `on_reverted` streams
+/// per-migration UX. Returns the number reverted.
+///
+/// # Errors
+///
+/// - [`MigrationError::Connection`] if the database cannot be opened.
+/// - [`MigrationError::Migration`] if `plan` returns an error, a revert fails, or
+///   a planned version is not present in `migrations_dir`.
+#[cfg(feature = "sqlite")]
+pub fn revert_user_migrations_sqlite<P, F>(
+    database_url: &str,
+    migrations_dir: &Path,
+    plan: P,
+    mut on_reverted: F,
+) -> Result<usize, MigrationError>
+where
+    P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, MigrationError>,
+    F: FnMut(&RevertedMigration),
+{
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let source = FileBasedMigrations::from_path(migrations_dir)
+        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
+    let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> = source
+        .migrations()
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+
+    let applied_user =
+        resolve_applied_user_migrations_sqlite(&mut conn, &all_migrations, migrations_dir)?;
+    let versions = plan(&applied_user)?;
+
+    let mut count = 0;
+    for version in &versions {
+        let target = diesel::migration::MigrationVersion::from(version.as_str());
+        let migration = all_migrations
+            .iter()
+            .find(|m| m.name().version() == target)
+            .ok_or_else(|| {
+                MigrationError::Migration(format!(
+                    "migration version {version} is applied but not present in {} — \
+                     cannot revert (its down.sql is unavailable)",
+                    migrations_dir.display()
+                ))
+            })?;
+
+        let started = std::time::Instant::now();
+        conn.revert_migration(migration.as_ref())
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
+        let duration = started.elapsed();
+
+        on_reverted(&RevertedMigration {
+            version: version.clone(),
+            name: migration.name().to_string(),
+            duration,
+        });
+        count += 1;
+    }
+    Ok(count)
 }
 
 // ── Startup wait-for-database ─────────────────────────────────────────────────

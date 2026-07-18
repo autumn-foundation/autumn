@@ -40,6 +40,101 @@ use autumn_web::migrate::{
 /// Default directory containing Diesel migration files.
 const DEFAULT_MIGRATIONS_DIR: &str = "migrations";
 
+/// Seam message shown when a `sqlite://` database URL is resolved but this CLI
+/// build targets Postgres only. The `sqlite` backend-flip is a separate,
+/// non-default cargo feature that must never be co-built with the default
+/// Postgres backend (see `autumn-cli/Cargo.toml`).
+///
+/// Only referenced by the `#[cfg(not(feature = "sqlite"))]` seams, so it is gated
+/// off the `sqlite` build to avoid a dead-code warning there.
+#[cfg(not(feature = "sqlite"))]
+const SQLITE_FEATURE_MSG: &str = "`autumn migrate` detected a SQLite database URL, but this CLI build targets Postgres only. \
+     Rebuild with `--no-default-features --features sqlite` to run migrations against a \
+     `sqlite://` database (the sqlite backend-flip must never be co-built with the default \
+     Postgres backend).";
+
+/// Whether `database_url` names a `SQLite` target (`sqlite:` / `file:` scheme).
+///
+/// A Postgres URL, a libpq keyword/value string, or any unrecognized target is
+/// treated as Postgres — i.e. it keeps the historical advisory-locked apply/
+/// rollback path — so only an explicit `sqlite://` (or `sqlite:` / `file:`) URL
+/// routes to the unlocked `SQLite` harness path (issue #2058). This is
+/// backend-detection, independent of the compiled feature: under the default
+/// build a detected `SQLite` URL still routes here and then hits the
+/// [`SQLITE_FEATURE_MSG`] seam.
+fn is_sqlite_target(database_url: &str) -> bool {
+    matches!(
+        autumn_web::config::DatabaseBackend::detect(database_url),
+        Some(autumn_web::config::DatabaseBackend::Sqlite)
+    )
+}
+
+/// Whether every resolved target is a `SQLite` URL, used to skip the Postgres-only
+/// `diesel` CLI preflight (`check_diesel_cli`) — the `SQLite` apply path uses the
+/// in-process harness, never the `diesel` subprocess.
+fn all_targets_sqlite(targets: &[(String, String)]) -> bool {
+    !targets.is_empty() && targets.iter().all(|(_, url)| is_sqlite_target(url))
+}
+
+/// Apply pending user migrations against a `SQLite` database through the unlocked
+/// diesel harness (no advisory lock, no `diesel` subprocess — issue #1999/#2036
+/// precedent). Real only under the `sqlite` feature; the default build returns
+/// the [`SQLITE_FEATURE_MSG`] seam.
+#[cfg(feature = "sqlite")]
+fn apply_pending_sqlite_cli(
+    database_url: &str,
+    migrations_dir: &Path,
+) -> Result<MigrationResult, MigrationError> {
+    let migrations =
+        diesel_migrations::FileBasedMigrations::from_path(migrations_dir).map_err(|e| {
+            MigrationError::Migration(format!(
+                "failed to read migrations directory {}: {e}",
+                migrations_dir.display()
+            ))
+        })?;
+    autumn_web::migrate::run_pending_sqlite(database_url, migrations)
+}
+
+/// `SQLite` apply seam in the default (Postgres-only) build — references no
+/// `SQLite` symbol and points the operator at the backend-flip feature.
+#[cfg(not(feature = "sqlite"))]
+fn apply_pending_sqlite_cli(
+    _database_url: &str,
+    _migrations_dir: &Path,
+) -> Result<MigrationResult, MigrationError> {
+    Err(MigrationError::Migration(SQLITE_FEATURE_MSG.to_owned()))
+}
+
+/// Return the applied user migrations for a target, routing an explicit
+/// `sqlite://` URL to the unlocked `SQLite` harness path and everything else to
+/// the historical Postgres path.
+fn applied_user_migrations_for_target(
+    database_url: &str,
+    migrations_dir: &Path,
+) -> Result<Vec<AppliedUserMigration>, MigrationError> {
+    if is_sqlite_target(database_url) {
+        applied_user_migrations_sqlite_cli(database_url, migrations_dir)
+    } else {
+        autumn_web::migrate::applied_user_migrations(database_url, migrations_dir)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn applied_user_migrations_sqlite_cli(
+    database_url: &str,
+    migrations_dir: &Path,
+) -> Result<Vec<AppliedUserMigration>, MigrationError> {
+    autumn_web::migrate::applied_user_migrations_sqlite(database_url, migrations_dir)
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn applied_user_migrations_sqlite_cli(
+    _database_url: &str,
+    _migrations_dir: &Path,
+) -> Result<Vec<AppliedUserMigration>, MigrationError> {
+    Err(MigrationError::Migration(SQLITE_FEATURE_MSG.to_owned()))
+}
+
 /// Arguments for `autumn migrate down`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownArgs {
@@ -154,8 +249,13 @@ pub fn run(
     // 2. Resolve migrations directory
     let migrations_dir = resolve_migrations_dir();
 
-    // 3. Check that diesel CLI is available
-    check_diesel_cli();
+    // 3. Check that diesel CLI is available — but only when a target actually
+    //    needs the `diesel` subprocess. The SQLite apply path uses the in-process
+    //    harness (issue #2058), so an all-SQLite run must not demand a
+    //    Postgres-oriented `diesel` CLI on PATH.
+    if !all_targets_sqlite(&targets) {
+        check_diesel_cli();
+    }
 
     // 4. Enable maintenance mode if requested
     if with_maintenance && *action == MigrateAction::Run {
@@ -170,14 +270,36 @@ pub fn run(
             run_all_targets(&targets, &migrations_dir, with_maintenance, wait);
         }
         MigrateAction::Status => {
+            // `show_status` shells out to `diesel migration list`, and the
+            // rollback/framework status readers use the Postgres migration
+            // connection — none of which is wired for the SQLite backend (the
+            // #2058 port covers `migrate` up/down only). A `sqlite://` target
+            // therefore gets a clear provider-appropriate message here instead of
+            // reaching the `diesel` subprocess and dying with a raw OS error (the
+            // `diesel` CLI preflight was deliberately skipped for all-SQLite runs).
+            let mut sqlite_unsupported = false;
             for (label, url) in &targets {
                 eprintln!("\u{2500}\u{2500} {label} \u{2500}\u{2500}");
+                if is_sqlite_target(url) {
+                    eprintln!(
+                        "  \u{2717} `autumn migrate status` is not supported under the SQLite \
+                         backend. The #2058 port covers `autumn migrate` (up) and \
+                         `autumn migrate down` only \u{2014} run those to apply or roll back a \
+                         `sqlite://` database."
+                    );
+                    eprintln!();
+                    sqlite_unsupported = true;
+                    continue;
+                }
                 show_status(url, &migrations_dir);
                 show_rollback_availability(url, &migrations_dir);
                 // Shard targets only require the shard framework migrations, so
                 // report against that set instead of the full control-plane one.
                 show_framework_status(url, label.starts_with("shard:"));
                 eprintln!();
+            }
+            if sqlite_unsupported {
+                std::process::exit(1);
             }
         }
         MigrateAction::Check | MigrateAction::Down(_) | MigrateAction::Baseline(_) => {
@@ -230,6 +352,18 @@ fn resolve_targets(
         resolve_primary_database_url_from_sources(|key| env.var(key), config_table.as_ref());
     let shards =
         resolve_shard_database_urls_from_sources(|key| env.var(key), config_table.as_ref());
+    // Fail closed BEFORE building targets or applying anything: SQLite anywhere
+    // in a sharded topology is rejected at boot by the runtime guards
+    // (`autumn/src/config.rs` `database_backend_consistency` + shard-URL
+    // Postgres-only validation, and `autumn/src/app.rs`
+    // `sqlite_sharding_unsupported_guard`). Without this the new per-target
+    // SQLite apply/revert path would create + migrate the control file and/or a
+    // SQLite shard file and report success for an app that cannot boot (issue
+    // #2058). Mirror the runtime guard's wording.
+    if let Err(message) = reject_sqlite_sharding_topology(control.as_deref(), &shards) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
     match build_targets(control, shards, target) {
         Ok(targets) => (targets, config_table),
         Err(message) => {
@@ -241,6 +375,49 @@ fn resolve_targets(
             std::process::exit(1);
         }
     }
+}
+
+/// Reject any `SQLite` target within a sharded topology — horizontal sharding is
+/// Postgres-only.
+///
+/// Mirrors the runtime guard `autumn_web`'s `sqlite_sharding_unsupported_guard`
+/// (and the `database_backend_consistency` / shard-URL Postgres-only validators)
+/// so `autumn migrate` fails closed BEFORE touching any database, rather than
+/// creating + migrating a `SQLite` control or shard file for an app that cannot
+/// boot. Two branches, matching the runtime guard:
+///
+/// * a detected-`SQLite` **control** with shard entries present, and
+/// * **any shard** whose resolved `primary_url` is a detected `SQLite` backend
+///   (regardless of the control backend — the shard loop would otherwise route it
+///   through the Postgres-only harness).
+///
+/// A non-`SQLite` control with all-Postgres shards (the intended sharded
+/// topology), and a control-less non-sharded deployment, both pass. Pure so the
+/// decision is unit-testable; `resolve_targets` prints the message and exits on
+/// `Err`.
+fn reject_sqlite_sharding_topology(
+    control: Option<&str>,
+    shards: &[(String, String)],
+) -> Result<(), String> {
+    if !shards.is_empty() && control.is_some_and(is_sqlite_target) {
+        return Err(
+            "\u{2717} SQLite deployments do not support sharding. The configured sqlite:// \
+             control target has shard entries configured, which is a Postgres-only capability \
+             \u{2014} remove the shard configuration to run on SQLite, or use a Postgres control \
+             database. Tracking: #1614."
+                .to_owned(),
+        );
+    }
+    if shards.iter().any(|(_, url)| is_sqlite_target(url)) {
+        return Err(
+            "\u{2717} SQLite deployments do not support sharding. A configured shard targets a \
+             SQLite database, and per-shard migration is a Postgres-only capability \u{2014} \
+             remove the SQLite shard configuration to run on SQLite, or use Postgres shard \
+             targets. Tracking: #1614."
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Pure target-selection logic behind [`resolve_targets`], separated so
@@ -401,6 +578,15 @@ fn run_single_target(
 ) -> bool {
     use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, hold_migration_lock, wait_for_database};
 
+    // SQLite (issue #2058): a single-writer local database has no advisory lock,
+    // no `diesel` subprocess, no Postgres content-checksum table, and no
+    // control-plane framework migrations — the unlocked harness applies the user
+    // migrations directly (mirrors `autumn schema migrate`, #1999/#2036). The
+    // Postgres path below is unchanged.
+    if is_sqlite_target(database_url) {
+        return run_single_target_sqlite(database_url, migrations_dir);
+    }
+
     // Startup wait — only when enabled (startup_wait_secs > 0 or --wait N).
     // When wait == Duration::ZERO we skip entirely so the existing fail-fast
     // path is preserved byte-for-byte (AC #6).
@@ -509,6 +695,36 @@ fn run_single_target(
     }
 
     true
+}
+
+/// Apply pending user migrations to a single `SQLite` target through the unlocked
+/// harness (issue #2058). Returns whether it succeeded.
+///
+/// Deliberately mirrors `autumn schema migrate`'s `SQLite` path: no advisory lock
+/// (`SQLite` is single-writer, #1999), no `diesel` subprocess, no Postgres
+/// content-checksum bookkeeping, and no control-plane / shard framework
+/// migrations (their DDL is Postgres-specific and is never applied to a `SQLite`
+/// database). Only the project's `migrations/` user set is applied.
+fn run_single_target_sqlite(database_url: &str, migrations_dir: &str) -> bool {
+    let dir = std::path::Path::new(migrations_dir);
+    eprintln!("  Running pending migrations (SQLite, unlocked harness)...\n");
+    match apply_pending_sqlite_cli(database_url, dir) {
+        Ok(result) if result.applied.is_empty() => {
+            eprintln!("\u{2713} Migrations are already up to date.");
+            true
+        }
+        Ok(result) => {
+            for migration in &result.applied {
+                eprintln!("  Applied {migration}");
+            }
+            eprintln!("\n\u{2713} Migrations applied successfully.");
+            true
+        }
+        Err(e) => {
+            eprintln!("\u{2717} {e}");
+            false
+        }
+    }
 }
 
 /// Fail-fast validation of every applied migration's checksum against its
@@ -1604,9 +1820,7 @@ fn preflight_rollback_target(
     dir: &Path,
     label: &str,
 ) -> Vec<String> {
-    use autumn_web::migrate::applied_user_migrations;
-
-    let applied = applied_user_migrations(database_url, dir).unwrap_or_else(|e| {
+    let applied = applied_user_migrations_for_target(database_url, dir).unwrap_or_else(|e| {
         eprintln!("\u{2717} Could not preflight rollback for {label}: {e}");
         std::process::exit(1);
     });
@@ -1660,12 +1874,15 @@ fn reject_divergent_rollback_plans(plans: &[(String, Vec<String>)]) {
     std::process::exit(1);
 }
 
-/// Roll back the planned user migrations on a single target database, under the
-/// migration advisory lock. Returns the number of migrations reverted.
+/// Roll back the planned user migrations on a single target database. Returns the
+/// number of migrations reverted.
 ///
-/// Listing applied migrations, building the plan, and preflighting `down.sql`
-/// all happen inside the `plan` closure (under the lock) so the plan cannot go
-/// stale between read and execute (e.g. two concurrent `down` runs).
+/// Postgres runs under the migration advisory lock; a `sqlite://` target uses the
+/// unlocked harness (`SQLite` is single-writer — no cross-process serialization is
+/// needed, issue #2058). Listing applied migrations, building the plan, and
+/// preflighting `down.sql` all happen inside the `plan` closure (on the same
+/// connection) so the plan cannot go stale between read and execute (e.g. two
+/// concurrent Postgres `down` runs).
 /// `maintenance_enabled` is shared across targets so maintenance mode is
 /// enabled at most once, the first time any target has work to do.
 ///
@@ -1684,59 +1901,108 @@ fn run_down_target(
     maintenance_enabled: &mut bool,
     preflighted_plan: &[String],
 ) -> Result<usize, autumn_web::migrate::MigrationError> {
-    use autumn_web::migrate::{MigrationError, revert_user_migrations_locked};
+    use autumn_web::migrate::MigrationError;
 
-    revert_user_migrations_locked(
-        database_url,
-        dir,
-        None,
-        |applied| {
-            let plan = build_rollback_plan(args, applied);
+    // The plan/execute closures are backend-agnostic; only the revert engine
+    // differs — Postgres runs under the advisory lock, SQLite through the
+    // unlocked harness (issue #2058, single-writer #1999). The plan is still
+    // rebuilt and re-validated under the same connection in both.
+    let plan = |applied: &[AppliedUserMigration]| -> Result<Vec<String>, MigrationError> {
+        let plan = build_rollback_plan(args, applied);
 
-            // Recheck under the lock that this target's plan still matches what
-            // preflight saw (and verified uniform across targets). A concurrent
-            // migrate/down may have changed the applied history in the window
-            // between preflight and acquiring this lock; rolling back a now-
-            // different version list would diverge this target from the ones
-            // already reverted.
-            if plan != preflighted_plan {
-                return Err(MigrationError::Migration(format!(
-                    "rollback plan for this target changed under the lock since preflight \
+        // Recheck under the lock that this target's plan still matches what
+        // preflight saw (and verified uniform across targets). A concurrent
+        // migrate/down may have changed the applied history in the window
+        // between preflight and acquiring this lock; rolling back a now-
+        // different version list would diverge this target from the ones
+        // already reverted.
+        if plan != preflighted_plan {
+            return Err(MigrationError::Migration(format!(
+                "rollback plan for this target changed under the lock since preflight \
                      (a concurrent migrate/down likely altered its applied history). \
                      Preflighted [{}] but now [{}]. Aborting before mutating this target; \
                      re-run `autumn migrate down` once migrations are quiesced.",
-                    preflighted_plan.join(", "),
-                    plan.join(", "),
-                )));
-            }
+                preflighted_plan.join(", "),
+                plan.join(", "),
+            )));
+        }
 
-            if plan.is_empty() {
-                eprintln!("  \u{2713} Nothing to roll back.");
-                return Ok(plan);
-            }
+        if plan.is_empty() {
+            eprintln!("  \u{2713} Nothing to roll back.");
+            return Ok(plan);
+        }
 
-            // Re-validate under the lock (defense-in-depth against the plan
-            // going stale between the up-front preflight and here).
-            check_rollback_plan_revertable(applied, &plan);
+        // Re-validate under the lock (defense-in-depth against the plan
+        // going stale between the up-front preflight and here).
+        check_rollback_plan_revertable(applied, &plan);
 
-            // Preflight passed: enable maintenance mode (if requested and not
-            // already enabled for an earlier target) before we mutate schema,
-            // then stream the rollback.
-            if with_maintenance && !*maintenance_enabled {
-                enable_maintenance_for_migrate();
-                *maintenance_enabled = true;
-            }
-            eprintln!("  Rolling back {} migration(s)...\n", plan.len());
-            Ok(plan)
-        },
-        |r| {
-            eprintln!(
-                "  \u{2713} Rolled back {}  ({}ms)",
-                r.name,
-                r.duration.as_millis()
-            );
-        },
+        // Preflight passed: enable maintenance mode (if requested and not
+        // already enabled for an earlier target) before we mutate schema,
+        // then stream the rollback.
+        if with_maintenance && !*maintenance_enabled {
+            enable_maintenance_for_migrate();
+            *maintenance_enabled = true;
+        }
+        eprintln!("  Rolling back {} migration(s)...\n", plan.len());
+        Ok(plan)
+    };
+    let on_reverted = |r: &autumn_web::migrate::RevertedMigration| {
+        eprintln!(
+            "  \u{2713} Rolled back {}  ({}ms)",
+            r.name,
+            r.duration.as_millis()
+        );
+    };
+
+    if is_sqlite_target(database_url) {
+        revert_user_migrations_sqlite_cli(database_url, dir, plan, on_reverted)
+    } else {
+        autumn_web::migrate::revert_user_migrations_locked(
+            database_url,
+            dir,
+            None,
+            plan,
+            on_reverted,
+        )
+    }
+}
+
+/// Revert user migrations on a `SQLite` target through the unlocked harness
+/// (issue #2058). Real only under the `sqlite` feature; the default build returns
+/// the [`SQLITE_FEATURE_MSG`] seam.
+#[cfg(feature = "sqlite")]
+fn revert_user_migrations_sqlite_cli<P, F>(
+    database_url: &str,
+    migrations_dir: &Path,
+    plan: P,
+    on_reverted: F,
+) -> Result<usize, autumn_web::migrate::MigrationError>
+where
+    P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, autumn_web::migrate::MigrationError>,
+    F: FnMut(&autumn_web::migrate::RevertedMigration),
+{
+    autumn_web::migrate::revert_user_migrations_sqlite(
+        database_url,
+        migrations_dir,
+        plan,
+        on_reverted,
     )
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn revert_user_migrations_sqlite_cli<P, F>(
+    _database_url: &str,
+    _migrations_dir: &Path,
+    _plan: P,
+    _on_reverted: F,
+) -> Result<usize, autumn_web::migrate::MigrationError>
+where
+    P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, autumn_web::migrate::MigrationError>,
+    F: FnMut(&autumn_web::migrate::RevertedMigration),
+{
+    Err(autumn_web::migrate::MigrationError::Migration(
+        SQLITE_FEATURE_MSG.to_owned(),
+    ))
 }
 
 /// Show rollback availability for all applied user migrations.
@@ -2889,6 +3155,73 @@ replica_url = "postgres://replica:5432/app"
     fn build_targets_all_errors_with_no_databases_at_all() {
         let error = build_targets(None, Vec::new(), &MigrateTarget::All).unwrap_err();
         assert!(error.contains("No database URL"));
+    }
+
+    fn sqlite_shard() -> Vec<(String, String)> {
+        vec![("shard0".to_owned(), "sqlite:///tmp/shard0.db".to_owned())]
+    }
+
+    #[test]
+    fn reject_sqlite_sharding_rejects_sqlite_control_and_shards() {
+        // SQLite control + shard entries is a boot-invalid topology (sharding is
+        // Postgres-only); the guard mirrors the runtime guard's wording (#1614).
+        let err = reject_sqlite_sharding_topology(Some("sqlite:///tmp/app.db"), &two_shards())
+            .unwrap_err();
+        assert!(
+            err.contains("do not support sharding") && err.contains("#1614"),
+            "guard names the SQLite sharding situation clearly: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_sqlite_sharding_rejects_postgres_control_with_sqlite_shard() {
+        // The sibling case: a Postgres (or any non-sqlite) control with a shard
+        // whose primary_url is sqlite:// — the shard loop would migrate that
+        // sqlite file. Must be rejected regardless of the control backend.
+        let err = reject_sqlite_sharding_topology(Some("postgres://control/app"), &sqlite_shard())
+            .unwrap_err();
+        assert!(
+            err.contains("do not support sharding")
+                && err.contains("shard")
+                && err.contains("#1614"),
+            "guard rejects a sqlite shard target: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_sqlite_sharding_rejects_no_control_with_sqlite_shard() {
+        // No control role, but a sqlite shard target: still rejected (the shard
+        // loop would route it through the Postgres-only harness).
+        let err = reject_sqlite_sharding_topology(None, &sqlite_shard()).unwrap_err();
+        assert!(
+            err.contains("do not support sharding") && err.contains("#1614"),
+            "guard rejects a sqlite shard even without a control: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_sqlite_sharding_allows_sqlite_without_shards() {
+        // A plain SQLite deployment (no shards) is the normal, supported case.
+        assert_eq!(
+            reject_sqlite_sharding_topology(Some("sqlite:///tmp/app.db"), &[]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reject_sqlite_sharding_allows_postgres_with_postgres_shards() {
+        // Postgres control + all-Postgres shards is the intended sharded topology
+        // — never rejected.
+        assert_eq!(
+            reject_sqlite_sharding_topology(Some("postgres://control/app"), &two_shards()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reject_sqlite_sharding_allows_no_control_no_shards() {
+        // No primary role and no shards: nothing to reject.
+        assert_eq!(reject_sqlite_sharding_topology(None, &[]), Ok(()));
     }
 
     #[test]
