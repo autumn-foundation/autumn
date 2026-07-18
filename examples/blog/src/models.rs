@@ -116,6 +116,13 @@ pub struct UpdatePost {
     /// unchecking the checkbox actually unpublishes the post.
     #[serde(default)]
     pub published: Option<bool>,
+    /// Bumped to the current time on every save. Postgres has no `ON UPDATE`
+    /// trigger, so without this the `updated_at` column would keep its
+    /// insert-time value — which would freeze the `post_card` fragment-cache
+    /// key (see `routes::posts::post_card`) and serve a stale card forever.
+    /// Never deserialized from form/JSON input; the handler always sets it.
+    #[serde(skip)]
+    pub updated_at: Option<chrono::NaiveDateTime>,
 }
 
 /// Convert a string into a URL-safe slug.

@@ -8,6 +8,8 @@
 //! Users do not construct `Route` values directly -- they use the
 //! proc macros and the `routes![]` collection macro.
 
+use std::time::Duration;
+
 use axum::routing::MethodRouter;
 use http::Method;
 
@@ -83,6 +85,38 @@ pub enum RouteIdempotency {
     ReplayThroughInner,
 }
 
+/// Per-route override for the global inbound request timeout
+/// (`[server.timeouts] request_timeout_ms`).
+///
+/// Emitted by the route macros from the `timeout_ms = ...` / `timeout = "off"`
+/// attributes and consulted by the timeout middleware (keyed by the matched
+/// route template). The default, [`RouteTimeout::Inherit`], applies the global
+/// deadline.
+///
+/// WebSocket routes also default to [`RouteTimeout::Inherit`]: the deadline
+/// bounds a hung pre-upgrade handshake (async auth/setup) but never reaches the
+/// established socket, whose future runs on a separate task via `on_upgrade`
+/// and is unbounded by design. SSE and other streaming responses need no
+/// override either — they are exempt *by construction*, because the deadline
+/// only bounds production of the response head, never the body stream. The
+/// [`RouteTimeout::Disabled`] variant is reached solely via `timeout = "off"`,
+/// for routes that intentionally block *before* producing the head (long-poll).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteTimeout {
+    /// Use the global `request_timeout_ms` deadline (or none if disabled).
+    #[default]
+    Inherit,
+    /// Override the global deadline with a route-specific wall-clock budget,
+    /// for known-slow endpoints (report exports, large uploads).
+    Override(Duration),
+    /// Exempt this route from the global deadline entirely. Emitted by
+    /// `timeout = "off"` for routes that intentionally block before producing
+    /// the response head, such as long-poll handlers. (SSE/streaming bodies are
+    /// already exempt by construction, and WebSocket handshakes inherit the
+    /// deadline — neither uses this variant by default.)
+    Disabled,
+}
+
 /// A single route binding an HTTP method + path to an Axum handler.
 ///
 /// Created by the `__autumn_route_info_{name}()` companion functions
@@ -135,4 +169,76 @@ pub struct Route {
 
     /// Idempotency replay behavior for this route.
     pub idempotency: RouteIdempotency,
+
+    /// Per-route override for the global inbound request timeout.
+    pub timeout: RouteTimeout,
+}
+
+impl Route {
+    /// Opt this route in as an MCP tool, equivalent to tagging the handler
+    /// with `#[api_doc(mcp)]`.
+    ///
+    /// This is the registration-time escape hatch for code that can't (or
+    /// shouldn't) carry the attribute — most notably plugins, which can offer
+    /// a fluent `expose_mcp()` switch and let the *host* decide at install
+    /// time whether the plugin's routes become tools:
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::Route;
+    /// use autumn_web::app::AppBuilder;
+    /// use autumn_web::plugin::Plugin;
+    /// use autumn_web::prelude::*;
+    ///
+    /// # #[get("/harvest/runs")]
+    /// # async fn list_runs() -> Json<Vec<String>> { Json(vec![]) }
+    /// pub struct HarvestPlugin {
+    ///     expose_mcp: bool,
+    /// }
+    ///
+    /// impl Plugin for HarvestPlugin {
+    ///     fn build(self, app: AppBuilder) -> AppBuilder {
+    ///         let mut rs = routes![list_runs];
+    ///         if self.expose_mcp {
+    ///             rs = rs.into_iter().map(Route::mcp).collect();
+    ///         }
+    ///         app.routes(rs)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Like the attribute form, an explicit opt-in exposes any verb (not just
+    /// reads) and the usual eligibility rules still apply: the handler must
+    /// return `Json<T>`, declare an empty-body status (204/205), or use
+    /// [`mcp_stream()`](Self::mcp_stream) for an `Sse` handler — a schema-less
+    /// route opted in with plain `mcp()` derives no tool. The flag is inert
+    /// unless the host enables the `mcp` feature and calls `mount_mcp`.
+    #[must_use]
+    pub const fn mcp(mut self) -> Self {
+        self.api_doc.mcp_tool = true;
+        self
+    }
+
+    /// Exclude this route from MCP exposure, equivalent to
+    /// `#[api_doc(mcp = false)]`.
+    ///
+    /// Exclusion always wins — even over the whole-API
+    /// `expose_all_as_mcp()` hatch and a prior [`mcp()`](Self::mcp) call.
+    #[must_use]
+    pub const fn mcp_exclude(mut self) -> Self {
+        self.api_doc.mcp_exclude = true;
+        self
+    }
+
+    /// Opt this route in as a *streaming* MCP tool, equivalent to
+    /// `#[api_doc(mcp, stream)]` on an [`Sse`](crate::sse::Sse) handler.
+    ///
+    /// Implies [`mcp()`](Self::mcp) — `stream` alone is never exposed — and
+    /// exempts the route from the JSON-response eligibility gate, since an
+    /// SSE handler has no JSON response schema by nature.
+    #[must_use]
+    pub const fn mcp_stream(mut self) -> Self {
+        self.api_doc.mcp_tool = true;
+        self.api_doc.mcp_stream = true;
+        self
+    }
 }

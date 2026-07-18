@@ -1,0 +1,5 @@
+error: shard_key field `nope` not found on model
+  --> tests/compile-fail/model_shard_key_unknown.rs:11:1
+   |
+11 | #[shard_key = "nope"]
+   | ^^^^^^^^^^^^^^^^^^^^^

@@ -6,6 +6,9 @@ subscribed to a given topic across all replicas. It is the Rust equivalent of
 membership, automatic join/leave broadcasting, TTL-based lease eviction — exposed
 as a single **request extractor** with no extra client-side dependencies.
 
+For automatic per-record OOB broadcasts and the `--live` scaffold CLI flag,
+see the [Realtime guide](realtime.md#auto-broadcast-with-livefragment).
+
 ## Why Presence?
 
 Implementing "live viewers", "typing indicators", or "who is editing this record"

@@ -6,15 +6,83 @@
 
 use crate::config::{LogConfig, LogFormat, TelemetryConfig, TelemetryProtocol};
 use http::Uri;
+use std::sync::Arc;
 use thiserror::Error;
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt};
 
 #[cfg(feature = "telemetry-otlp")]
 use opentelemetry::{KeyValue, trace::TracerProvider as _};
 #[cfg(feature = "telemetry-otlp")]
 use opentelemetry_otlp::WithExportConfig as _;
 #[cfg(feature = "telemetry-otlp")]
+use opentelemetry_otlp::WithTonicConfig as _;
+#[cfg(feature = "telemetry-otlp")]
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+#[cfg(feature = "telemetry-otlp")]
 use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
+
+/// Type-erased handle for pushing a new [`EnvFilter`] directive to the live
+/// `tracing` subscriber at runtime.
+///
+/// The default telemetry initializer installs a
+/// [`tracing_subscriber::reload::Layer`] wrapping the process `EnvFilter` and
+/// hands this handle to
+/// [`LogLevels`](crate::actuator::LogLevels). That makes
+/// `PUT /actuator/loggers/{name}` raise or lower log verbosity on the running
+/// process without a restart — the change reaches the live subscriber, not just
+/// an in-memory map. See issue #1044.
+#[derive(Clone)]
+pub struct FilterReloadHandle {
+    reload: Arc<dyn Fn(EnvFilter) -> Result<(), String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for FilterReloadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilterReloadHandle").finish_non_exhaustive()
+    }
+}
+
+impl FilterReloadHandle {
+    /// Wrap a concrete `tracing_subscriber` reload handle, erasing its
+    /// subscriber type parameter so it can be stored on
+    /// [`TelemetryGuard`] and [`LogLevels`](crate::actuator::LogLevels).
+    fn from_handle<S>(handle: reload::Handle<EnvFilter, S>) -> Self
+    where
+        S: tracing::Subscriber + 'static,
+    {
+        Self {
+            reload: Arc::new(move |filter| {
+                handle.reload(filter).map_err(|error| error.to_string())
+            }),
+        }
+    }
+
+    /// Parse `directive` as an [`EnvFilter`] and push it to the live subscriber.
+    ///
+    /// The directive follows the standard `EnvFilter` syntax, e.g.
+    /// `"info,my_app::module=trace"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when the directive fails to parse or the
+    /// underlying subscriber has already been dropped.
+    pub fn apply_directive(&self, directive: &str) -> Result<(), String> {
+        let filter = EnvFilter::try_new(directive).map_err(|error| error.to_string())?;
+        (self.reload)(filter)
+    }
+
+    /// Test-only handle that accepts any directive `EnvFilter::try_new` parses,
+    /// standing in for a live subscriber without installing the process-global
+    /// tracing subscriber. Lets HTTP-level tests exercise the `applied: true`
+    /// path (issue #1044 AC7).
+    #[cfg(test)]
+    #[must_use]
+    pub fn accept_all_for_test() -> Self {
+        Self {
+            reload: Arc::new(|_filter| Ok(())),
+        }
+    }
+}
 
 /// Concrete log formatting chosen for the running process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +186,15 @@ pub struct TelemetryGuard {
     /// In-memory log buffer installed by the capture layer, or `None` when
     /// `log.capture.enabled = false`.
     pub log_buffer: Option<crate::log::capture::LogBuffer>,
+    /// Handle for pushing runtime log-level changes to the live subscriber.
+    ///
+    /// Present whenever the default `tracing-subscriber` initializer installed
+    /// the reload layer (i.e. every path through [`init`]). `None` for custom
+    /// [`TelemetryProvider`] impls that build their own subscriber and for
+    /// [`TelemetryGuard::disabled`]. `AppBuilder` wires this into
+    /// [`LogLevels`](crate::actuator::LogLevels) so
+    /// `PUT /actuator/loggers/{name}` affects the live subscriber.
+    pub filter_reload: Option<FilterReloadHandle>,
 }
 
 impl TelemetryGuard {
@@ -132,19 +209,26 @@ impl TelemetryGuard {
             #[cfg(feature = "telemetry-otlp")]
             provider: None,
             log_buffer: None,
+            filter_reload: None,
         }
     }
 
     #[cfg(feature = "telemetry-otlp")]
-    fn with_provider(provider: SdkTracerProvider) -> Self {
+    const fn with_provider(provider: SdkTracerProvider) -> Self {
         Self {
             provider: Some(provider),
             log_buffer: None,
+            filter_reload: None,
         }
     }
 
     fn with_log_buffer(mut self, buffer: crate::log::capture::LogBuffer) -> Self {
         self.log_buffer = Some(buffer);
+        self
+    }
+
+    fn with_filter_reload(mut self, handle: FilterReloadHandle) -> Self {
+        self.filter_reload = Some(handle);
         self
     }
 }
@@ -297,6 +381,16 @@ fn is_production_env() -> bool {
     std::env::var("AUTUMN_ENV").is_ok_and(|value| value.eq_ignore_ascii_case("production"))
 }
 
+/// Returns `true` when the OTLP endpoint uses the `https` scheme.
+#[cfg(feature = "telemetry-otlp")]
+fn is_https_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .parse::<Uri>()
+        .ok()
+        .and_then(|uri| uri.scheme_str().map(|scheme| scheme == "https"))
+        .unwrap_or(false)
+}
+
 fn validate_otlp_endpoint(endpoint: &str) -> Result<(), TelemetryInitError> {
     let uri: Uri = endpoint.parse().map_err(|error: http::uri::InvalidUri| {
         TelemetryInitError::InvalidEndpoint {
@@ -359,22 +453,32 @@ fn init_logging_only(
     let capture = build_capture_layer(log);
     let capture_layer = capture.as_ref().map(|(layer, _)| layer.clone());
 
-    match log_format {
-        ResolvedLogFormat::Json => tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer().json())
-            .with(capture_layer)
-            .try_init()
-            .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?,
-        ResolvedLogFormat::Pretty => tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer().pretty())
-            .with(capture_layer)
-            .try_init()
-            .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?,
-    }
+    // Wrap the process filter in a reload layer so `/actuator/loggers` can
+    // adjust log levels on the live subscriber at runtime (issue #1044).
+    let reload_handle = match log_format {
+        ResolvedLogFormat::Json => {
+            let (filter_layer, handle) = reload::Layer::new(filter);
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(fmt::layer().json())
+                .with(capture_layer)
+                .try_init()
+                .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?;
+            FilterReloadHandle::from_handle(handle)
+        }
+        ResolvedLogFormat::Pretty => {
+            let (filter_layer, handle) = reload::Layer::new(filter);
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(fmt::layer().pretty())
+                .with(capture_layer)
+                .try_init()
+                .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?;
+            FilterReloadHandle::from_handle(handle)
+        }
+    };
 
-    let guard = TelemetryGuard::disabled();
+    let guard = TelemetryGuard::disabled().with_filter_reload(reload_handle);
     if let Some((_, buffer)) = capture {
         Ok(guard.with_log_buffer(buffer))
     } else {
@@ -405,24 +509,34 @@ fn init_otlp_runtime(
     let capture = build_capture_layer(log);
     let capture_layer = capture.as_ref().map(|(layer, _)| layer.clone());
 
-    match log_format {
-        ResolvedLogFormat::Json => tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer().json())
-            .with(tracing_opentelemetry::layer().with_tracer(tracer))
-            .with(capture_layer)
-            .try_init()
-            .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?,
-        ResolvedLogFormat::Pretty => tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer().pretty())
-            .with(tracing_opentelemetry::layer().with_tracer(tracer))
-            .with(capture_layer)
-            .try_init()
-            .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?,
-    }
+    // Wrap the process filter in a reload layer so `/actuator/loggers` can
+    // adjust log levels on the live subscriber at runtime (issue #1044).
+    let reload_handle = match log_format {
+        ResolvedLogFormat::Json => {
+            let (filter_layer, handle) = reload::Layer::new(filter);
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(fmt::layer().json())
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .with(capture_layer)
+                .try_init()
+                .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?;
+            FilterReloadHandle::from_handle(handle)
+        }
+        ResolvedLogFormat::Pretty => {
+            let (filter_layer, handle) = reload::Layer::new(filter);
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(fmt::layer().pretty())
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .with(capture_layer)
+                .try_init()
+                .map_err(|error| TelemetryInitError::SubscriberInit(error.to_string()))?;
+            FilterReloadHandle::from_handle(handle)
+        }
+    };
 
-    let guard = TelemetryGuard::with_provider(provider);
+    let guard = TelemetryGuard::with_provider(provider).with_filter_reload(reload_handle);
     if let Some((_, buffer)) = capture {
         Ok(guard.with_log_buffer(buffer))
     } else {
@@ -453,10 +567,24 @@ fn build_tracer_provider(otlp: &OtlpTraceRuntime) -> Result<SdkTracerProvider, T
         .build();
 
     let exporter = match otlp.protocol {
-        TelemetryProtocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(otlp.endpoint.clone())
-            .build(),
+        TelemetryProtocol::Grpc => {
+            let builder = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(otlp.endpoint.clone());
+            // For `https` endpoints opentelemetry-otlp installs a default
+            // `ClientTlsConfig::new()`, which carries an *empty* trust-root
+            // store: the roots supplied by tonic's `tls-native-roots`
+            // feature (via the `tls-roots` otlp feature) are only loaded
+            // when `with_enabled_roots()` is called. Without this, every
+            // TLS handshake to a publicly-trusted collector fails with an
+            // unknown-issuer error.
+            let builder = if is_https_endpoint(&otlp.endpoint) {
+                builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots())
+            } else {
+                builder
+            };
+            builder.build()
+        }
         TelemetryProtocol::HttpProtobuf => opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .with_endpoint(otlp.endpoint.clone())
@@ -603,6 +731,15 @@ mod tests {
         // Sanity: the disabled guard must be droppable without panic.
         drop(guard);
     }
+    #[cfg(feature = "telemetry-otlp")]
+    #[test]
+    fn is_https_endpoint_detects_scheme() {
+        assert!(is_https_endpoint("https://collector.example.com:4317"));
+        assert!(!is_https_endpoint("http://localhost:4317"));
+        assert!(!is_https_endpoint("localhost:4317"));
+        assert!(!is_https_endpoint("not a uri"));
+    }
+
     #[test]
     fn build_capture_layer_returns_none_when_disabled() {
         let log = LogConfig::default(); // capture.enabled = false

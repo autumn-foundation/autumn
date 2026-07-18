@@ -1,0 +1,20 @@
+[starter]
+name = "saas"
+description = "Multi-tenant SaaS: session auth + row-level tenancy + tenant-scoped dashboard"
+
+# No verbatim/binary assets: htmx is served by the framework at HTMX_JS_PATH,
+# so this starter ships only text templates.
+verbatim = []
+
+post_scaffold_notes = """
+Created a multi-tenant SaaS app in `{{project_name}}/`.
+
+Next steps:
+  cd {{project_name}}
+  docker compose up -d        # start Postgres (or point [database].url at your own)
+  autumn migrate              # create the users + projects tables
+  autumn dev                  # run the app
+
+Then open http://localhost:3000, sign up an organisation, and you land on a
+tenant-scoped dashboard. Each organisation only ever sees its own projects.
+"""

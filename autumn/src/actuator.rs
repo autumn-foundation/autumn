@@ -295,7 +295,14 @@ pub trait ProvideActuatorState {
     #[cfg(feature = "db")]
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>;
+
+    /// Returns the configured shard set, used to expose per-shard pool
+    /// metrics in the `/actuator/metrics` endpoint. Defaults to `None`.
+    #[cfg(feature = "db")]
+    fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        None
+    }
 
     /// Returns the scaffold-level accessibility posture reported by `/actuator/a11y`.
     ///
@@ -375,18 +382,125 @@ struct LogLevelsInner {
     current_level: String,
     /// Per-logger level overrides applied at runtime.
     logger_overrides: HashMap<String, String>,
+    /// Handle for pushing level changes to the live `tracing` subscriber.
+    ///
+    /// `Some` once `AppBuilder` wires in the reload handle from the telemetry
+    /// guard; `None` in bare `LogLevels` (e.g. unit tests) where no
+    /// reload-capable subscriber is installed. When `None`, a level change is
+    /// recorded but cannot affect emission — the endpoint reports this honestly
+    /// rather than returning a false-positive `ok` (issue #1044).
+    reload_handle: Option<crate::telemetry::FilterReloadHandle>,
+}
+
+impl LogLevelsInner {
+    /// Build a combined `EnvFilter` directive from the global level plus every
+    /// per-target override, e.g. `"info,my_app::module=trace"`. Targets are
+    /// sorted for deterministic output.
+    fn build_directive(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.current_level.is_empty() {
+            parts.push(self.current_level.clone());
+        }
+        let mut targets: Vec<String> = self
+            .logger_overrides
+            .iter()
+            .filter(|(name, _)| name.as_str() != "root" && !name.is_empty())
+            .map(|(name, level)| format!("{name}={level}"))
+            .collect();
+        targets.sort();
+        parts.extend(targets);
+        parts.join(",")
+    }
+}
+
+/// Split a startup `log.level` value — which may be a full `EnvFilter`
+/// directive such as `"info,tower_http=warn,my_app=debug"` — into a bare
+/// global level plus per-target overrides.
+///
+/// Seeding the overrides map at construction ensures that a later
+/// `PUT /actuator/loggers/root` (which replaces only the global level) does
+/// not silently drop the module-specific directives configured at startup.
+///
+/// Classification follows `EnvFilter` semantics:
+/// - A segment containing `=` is a per-target override (keyed on the part
+///   before the final `=`, so span-field directives round-trip). `root=<level>`
+///   and `=<level>` fold into the global level.
+/// - A bare segment that IS a tracing level (`trace|debug|info|warn|error|off`,
+///   case-insensitive) updates the global level, last one winning to match
+///   `EnvFilter` precedence.
+/// - A bare segment that is NOT a level is a *target directive at trace* (e.g.
+///   `my_app` means "enable target `my_app` at trace"), so it is stored as a
+///   per-target override with the implicit level `trace`.
+fn parse_initial_directive(directive: &str) -> (String, HashMap<String, String>) {
+    let mut global = String::new();
+    let mut overrides = HashMap::new();
+    for segment in directive.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if let Some((target, level)) = segment.rsplit_once('=') {
+            let target = target.trim();
+            let level = level.trim();
+            // `root=<level>` / `=<level>` are just the global level in disguise.
+            if target.is_empty() || target == "root" {
+                global = level.to_string();
+            } else {
+                overrides.insert(target.to_string(), level.to_string());
+            }
+        } else if is_tracing_level(segment) {
+            // A bare level sets the global level (last-level-wins).
+            global = segment.to_string();
+        } else {
+            // A bare non-level segment is a target enabled at trace.
+            overrides.insert(segment.to_string(), "trace".to_string());
+        }
+    }
+    (global, overrides)
+}
+
+/// Returns `true` when `segment` is a bare `tracing` level keyword
+/// (case-insensitive), i.e. a global-level directive rather than a target.
+fn is_tracing_level(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "trace" | "debug" | "info" | "warn" | "error" | "off"
+    )
 }
 
 impl LogLevels {
     /// Create a new `LogLevels` with the given initial level.
     #[must_use]
     pub fn new(initial_level: &str) -> Self {
+        let (current_level, logger_overrides) = parse_initial_directive(initial_level);
         Self {
             inner: Arc::new(RwLock::new(LogLevelsInner {
-                current_level: initial_level.to_string(),
-                logger_overrides: HashMap::new(),
+                current_level,
+                logger_overrides,
+                reload_handle: None,
             })),
         }
+    }
+
+    /// Attach the live-subscriber reload handle produced by telemetry init.
+    ///
+    /// Called once by `AppBuilder` after the tracing subscriber is installed so
+    /// subsequent [`Self::set_logger_level`] calls take effect on the running
+    /// process (issue #1044).
+    pub fn attach_reload_handle(&self, handle: crate::telemetry::FilterReloadHandle) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.reload_handle = Some(handle);
+        }
+    }
+
+    /// Returns `true` when a reload-capable subscriber is installed, i.e. level
+    /// changes made via [`Self::set_logger_level`] actually reach the live
+    /// `tracing` subscriber.
+    #[must_use]
+    pub fn reload_available(&self) -> bool {
+        self.inner
+            .read()
+            .is_ok_and(|guard| guard.reload_handle.is_some())
     }
 
     /// Get the current global log level.
@@ -406,28 +520,126 @@ impl LogLevels {
             .unwrap_or_default()
     }
 
-    /// Set the level for a specific logger. Returns the previous level if any.
-    #[must_use]
-    pub fn set_logger_level(&self, name: &str, level: &str) -> Option<String> {
+    /// The combined `EnvFilter` directive currently pushed to the live
+    /// subscriber (global level plus per-target overrides). Test-only.
+    #[cfg(test)]
+    fn rebuilt_directive_for_test(&self) -> String {
+        self.inner
+            .read()
+            .map(|guard| guard.build_directive())
+            .unwrap_or_default()
+    }
+
+    /// Set the level for a specific logger.
+    ///
+    /// When a reload-capable subscriber is installed (see
+    /// [`Self::attach_reload_handle`]), the rebuilt filter directive is pushed
+    /// to the live `tracing` subscriber so the change takes effect immediately
+    /// on the next event (issue #1044). Overrides remain ephemeral — they live
+    /// only in this in-memory state and reset on process restart.
+    ///
+    /// The returned [`LogLevelChange`] reflects the **actual** outcome, not
+    /// merely handle presence:
+    /// - [`LogLevelChange::Applied`] — pushed to a live subscriber.
+    /// - [`LogLevelChange::Recorded`] — stored, but no reload-capable subscriber
+    ///   is installed (bare state / tests).
+    /// - [`LogLevelChange::Rejected`] — the map is at capacity, or the directive
+    ///   failed to apply and the override was **rolled back** so the map never
+    ///   claims a live override that isn't (issue #1044).
+    ///
+    /// The directive is applied while the write lock is held so that concurrent
+    /// callers apply directives in the same order they mutate the map — the live
+    /// subscriber can never disagree with `GET /loggers` (issue #1044 AC4).
+    /// `reload`/`apply` never re-enters `LogLevels`, so this is deadlock-free.
+    pub fn set_logger_level(&self, name: &str, level: &str) -> LogLevelChange {
         let Ok(mut guard) = self.inner.write() else {
-            return None;
+            return LogLevelChange::Rejected {
+                reason: "log level state lock poisoned".to_string(),
+            };
         };
         // Prevent unbounded memory growth from arbitrary logger names
         if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
-            return None;
+            return LogLevelChange::Rejected {
+                reason: "too many logger overrides".to_string(),
+            };
         }
 
-        let previous = guard.logger_overrides.get(name).cloned();
+        let is_root = name == "root" || name.is_empty();
+        let previous_override = guard.logger_overrides.get(name).cloned();
+        let previous_current = guard.current_level.clone();
+
         guard
             .logger_overrides
             .insert(name.to_string(), level.to_string());
-        // If setting the root level, update current_level too
-        if name == "root" || name.is_empty() {
-            let prev = Some(guard.current_level.clone());
+        // If setting the root level, update current_level too.
+        let returned = if is_root {
             guard.current_level = level.to_string();
-            return prev;
+            Some(previous_current.clone())
+        } else {
+            previous_override.clone()
+        };
+
+        let directive = guard.build_directive();
+        // Clone the handle out so the rollback path below can mutate `guard`
+        // without holding a borrow of `guard.reload_handle`.
+        let Some(handle) = guard.reload_handle.clone() else {
+            return LogLevelChange::Recorded { previous: returned };
+        };
+
+        match handle.apply_directive(&directive) {
+            Ok(()) => LogLevelChange::Applied { previous: returned },
+            Err(error) => {
+                // Roll back so `GET /loggers` never advertises an override that
+                // failed to reach the live subscriber.
+                match previous_override {
+                    Some(prev) => {
+                        guard.logger_overrides.insert(name.to_string(), prev);
+                    }
+                    None => {
+                        guard.logger_overrides.remove(name);
+                    }
+                }
+                if is_root {
+                    guard.current_level = previous_current;
+                }
+                LogLevelChange::Rejected { reason: error }
+            }
         }
-        previous
+    }
+}
+
+/// Outcome of [`LogLevels::set_logger_level`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum LogLevelChange {
+    /// The change was pushed to a live, reload-capable subscriber. Carries the
+    /// previous level for that target, if any.
+    Applied {
+        /// Previous level for the target, if it had one.
+        previous: Option<String>,
+    },
+    /// The change was stored in the in-memory map, but no reload-capable
+    /// subscriber is installed, so it does not affect emission.
+    Recorded {
+        /// Previous level for the target, if it had one.
+        previous: Option<String>,
+    },
+    /// The change was not stored: the map was at capacity, or applying the
+    /// directive to the live subscriber failed and the override was rolled back.
+    Rejected {
+        /// Human-readable reason.
+        reason: String,
+    },
+}
+
+impl LogLevelChange {
+    /// The previous level for the target, if the change was stored.
+    #[must_use]
+    pub fn previous(&self) -> Option<&str> {
+        match self {
+            Self::Applied { previous } | Self::Recorded { previous } => previous.as_deref(),
+            Self::Rejected { .. } => None,
+        }
     }
 }
 
@@ -525,10 +737,58 @@ impl JobStatus {
     }
 }
 
+/// Per-queue observability gauges for the actuator jobs endpoint (issue #1623,
+/// AC7): queue depth and the age of the oldest still-waiting job.
+///
+/// On the **local** backend (single process, single registry) these reflect
+/// enqueue/start events observed in this process via the `record_*` marks.
+/// On the **durable** backends (Postgres/Redis) they are backend-derived and
+/// authoritative (issue #1752): a periodic survey of the durable store
+/// wholesale-replaces this snapshot each tick, so an enqueue-only web replica
+/// reports the true shared backlog rather than its own local enqueue marks.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueStatus {
+    /// Jobs waiting to run on this queue.
+    pub depth: u64,
+    /// Age in milliseconds of the oldest still-waiting job on this queue
+    /// (`0` when the queue is empty).
+    pub oldest_waiting_age_ms: u64,
+}
+
+/// Per-queue depth/age bookkeeping backing [`QueueStatus`].
+#[derive(Default)]
+struct QueueGaugeState {
+    /// Job name → the queue it drains from.
+    name_to_queue: HashMap<String, String>,
+    /// Queue → ready-at timestamps (epoch ms) of jobs still waiting to start.
+    /// A mark whose ready-at is in the future belongs to a scheduled (delayed)
+    /// job that is not yet claimable, so it is excluded from ready depth/age
+    /// until its ready-at time passes.
+    ///
+    /// Only authoritative on the local backend. On the durable backends this
+    /// still records marks (harmless) but [`Self::surveyed`] overrides them.
+    waiting: HashMap<String, std::collections::VecDeque<u64>>,
+    /// Backend-derived per-queue gauges from the durable survey (issue #1752).
+    /// When `Some`, this authoritative snapshot — refreshed each survey tick
+    /// from the durable store — backs [`JobRegistry::queue_snapshot`] instead
+    /// of the per-process `waiting` marks. `None` on the local backend, which
+    /// keeps the in-memory mark path. Each value is `(ready depth, oldest
+    /// ready-at epoch ms)`; the reported age is derived from the timestamp at
+    /// snapshot time so it stays fresh between surveys.
+    surveyed: Option<HashMap<String, (u64, Option<u64>)>>,
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Registry of ad-hoc jobs and their runtime status.
 #[derive(Clone)]
 pub struct JobRegistry {
     inner: Arc<RwLock<HashMap<String, JobStatus>>>,
+    queues: Arc<RwLock<QueueGaugeState>>,
 }
 
 impl JobRegistry {
@@ -537,6 +797,7 @@ impl JobRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            queues: Arc::new(RwLock::new(QueueGaugeState::default())),
         }
     }
 
@@ -547,11 +808,125 @@ impl JobRegistry {
         }
     }
 
-    /// Record that a new job instance was enqueued.
+    /// Register a job name and the queue it drains from, so per-queue depth and
+    /// oldest-waiting-age gauges (AC7) can be attributed to the right queue.
+    pub fn register_on_queue(&self, name: &str, queue: &str) {
+        self.register(name);
+        if let Ok(mut guard) = self.queues.write() {
+            guard
+                .name_to_queue
+                .insert(name.to_string(), queue.to_string());
+            guard.waiting.entry(queue.to_string()).or_default();
+        }
+    }
+
+    /// The queue a job name drains from (defaults to `default`).
+    fn queue_for(&self, name: &str) -> String {
+        self.queues
+            .read()
+            .ok()
+            .and_then(|g| g.name_to_queue.get(name).cloned())
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Snapshot per-queue depth and oldest-waiting-job age.
+    ///
+    /// On the durable backends a periodic survey has populated an authoritative
+    /// snapshot (via [`Self::set_queue_depth_gauges`]); it takes precedence over
+    /// the per-process `waiting` marks so an enqueue-only replica reports the
+    /// true shared backlog. On the local backend the survey is absent and the
+    /// in-memory marks drive the gauges.
+    #[must_use]
+    pub fn queue_snapshot(&self) -> HashMap<String, QueueStatus> {
+        let now = now_epoch_ms();
+        self.queues
+            .read()
+            .map(|g| {
+                if let Some(surveyed) = &g.surveyed {
+                    // Durable backend: the survey is authoritative. Report every
+                    // known queue (registered locally or seen in the survey);
+                    // queues absent from the latest survey reset to depth 0 so
+                    // stale backlog never leaks between ticks.
+                    return g
+                        .waiting
+                        .keys()
+                        .chain(surveyed.keys())
+                        .cloned()
+                        .collect::<std::collections::HashSet<String>>()
+                        .into_iter()
+                        .map(|queue| {
+                            let (depth, oldest_ready_at) =
+                                surveyed.get(&queue).copied().unwrap_or((0, None));
+                            let oldest_waiting_age_ms =
+                                oldest_ready_at.map_or(0, |ts| now.saturating_sub(ts));
+                            (
+                                queue,
+                                QueueStatus {
+                                    depth,
+                                    oldest_waiting_age_ms,
+                                },
+                            )
+                        })
+                        .collect();
+                }
+                g.waiting
+                    .iter()
+                    .map(|(queue, waiting)| {
+                        // Count only marks whose ready-at time has arrived; a
+                        // future ready-at is a scheduled job that is not yet
+                        // claimable and must not read as ready backlog.
+                        let mut depth = 0u64;
+                        let mut oldest_ready_at: Option<u64> = None;
+                        for ready_at in waiting {
+                            if *ready_at <= now {
+                                depth += 1;
+                                oldest_ready_at =
+                                    Some(oldest_ready_at.map_or(*ready_at, |o| o.min(*ready_at)));
+                            }
+                        }
+                        let oldest_waiting_age_ms =
+                            oldest_ready_at.map_or(0, |ts| now.saturating_sub(ts));
+                        (
+                            queue.clone(),
+                            QueueStatus {
+                                depth,
+                                oldest_waiting_age_ms,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Record that a new job instance was enqueued and is immediately runnable.
     pub fn record_enqueue(&self, name: &str) {
+        self.record_enqueue_at(name, now_epoch_ms());
+    }
+
+    /// Record a delayed enqueue whose job only becomes claimable at
+    /// `ready_at_ms` (epoch ms). Until that instant the job is tracked as
+    /// scheduled rather than ready queue depth, so future-dated jobs enqueued
+    /// via `enqueue_in`/`enqueue_at` do not inflate `queues.<name>.depth` or
+    /// `oldest_waiting_age_ms` (which would fire false backlog alerts).
+    pub fn record_enqueue_scheduled(&self, name: &str, ready_at_ms: u64) {
+        self.record_enqueue_at(name, ready_at_ms);
+    }
+
+    /// Shared enqueue bookkeeping: bump the per-name `queued` counter and push a
+    /// per-queue waiting mark stamped with the job's ready-at time.
+    fn record_enqueue_at(&self, name: &str, ready_at_ms: u64) {
         if let Ok(mut guard) = self.inner.write() {
             let status = guard.entry(name.to_string()).or_insert(JobStatus::empty());
             status.queued = status.queued.saturating_add(1);
+        }
+        let queue = self.queue_for(name);
+        if let Ok(mut guard) = self.queues.write() {
+            guard
+                .waiting
+                .entry(queue)
+                .or_default()
+                .push_back(ready_at_ms);
         }
     }
 
@@ -559,13 +934,36 @@ impl JobRegistry {
     ///
     /// Reverses the `record_enqueue` bookkeeping for the coalesced instance
     /// and bumps the deduplication counter.
-    pub fn record_deduplicated(&self, name: &str) {
+    ///
+    /// `had_enqueue_mark` says whether this coalesced job previously pushed a
+    /// per-queue waiting mark (via `record_enqueue`/`record_enqueue_scheduled`).
+    /// Only then is a mark popped: retry-dedup paths coalesce a job that already
+    /// left the ready set at start time and never re-recorded an enqueue, so
+    /// popping there would steal a *different* waiting job's mark and under-report
+    /// that queue's depth. Every pop must correspond to a prior push.
+    ///
+    /// `was_scheduled` says which category the coalesced enqueue recorded: a
+    /// delayed enqueue (`record_enqueue_scheduled`, future ready-at) pushed a
+    /// *scheduled* mark, an immediate one (`record_enqueue`) a *ready* mark. The
+    /// removal must target that same category — otherwise a delayed duplicate's
+    /// dedup could pop a co-queued *ready* job's mark, reporting queue depth 0
+    /// while ready work is still waiting (and vice versa). Mirrors the
+    /// category-aware cancel path (`record_cancel`/`record_cancel_scheduled`).
+    /// Ignored when `had_enqueue_mark` is false (no mark is popped).
+    pub fn record_deduplicated(&self, name: &str, had_enqueue_mark: bool, was_scheduled: bool) {
         if let Ok(mut guard) = self.inner.write()
             && let Some(status) = guard.get_mut(name)
         {
             status.queued = status.queued.saturating_sub(1);
             status.total_deduplicated = status.total_deduplicated.saturating_add(1);
         }
+        if !had_enqueue_mark {
+            return;
+        }
+        // The coalesced enqueue never runs; drop its waiting mark from the SAME
+        // ready/scheduled category it recorded (prefer_ready = !was_scheduled),
+        // so it cannot steal a co-queued mark from the other category.
+        self.pop_waiting(name, !was_scheduled);
     }
 
     /// Record that a job is parked waiting on a free concurrency slot.
@@ -599,6 +997,40 @@ impl JobRegistry {
         }
     }
 
+    /// Replace the per-queue depth/oldest-age gauges from a backend-wide survey
+    /// (issue #1752).
+    ///
+    /// On the durable backends (Postgres/Redis) a queue is drained by other
+    /// processes, so the authoritative ready depth and oldest-waiting age come
+    /// from a periodic survey of the durable store rather than this process's
+    /// local enqueue marks. This wholesale-replaces the snapshot each tick:
+    /// queues absent from `per_queue` reset to depth 0 (no leaks). Each value
+    /// is `(ready depth, oldest ready-at epoch ms)`; the reported age is
+    /// derived from the timestamp at [`Self::queue_snapshot`] time so it stays
+    /// fresh between surveys. Once called, the survey overrides the in-memory
+    /// `record_*` marks for the `queues` gauge family.
+    pub fn set_queue_depth_gauges(&self, per_queue: &HashMap<String, (u64, Option<u64>)>) {
+        if let Ok(mut guard) = self.queues.write() {
+            guard.surveyed = Some(per_queue.clone());
+        }
+    }
+
+    /// Replace the per-job-type `queued` gauge from a backend-wide survey
+    /// (issue #1752).
+    ///
+    /// Names absent from `counts` reset to zero, mirroring
+    /// [`Self::set_concurrency_blocked_counts`]. Used by the durable backends
+    /// whose ready depth is observed periodically rather than tracked per
+    /// enqueue/start event, so the reported `jobs.<name>.queued` reflects the
+    /// shared durable backlog instead of this process's local enqueue marks.
+    pub fn set_queued_counts(&self, counts: &HashMap<String, u64>) {
+        if let Ok(mut guard) = self.inner.write() {
+            for (name, status) in guard.iter_mut() {
+                status.queued = counts.get(name).copied().unwrap_or(0);
+            }
+        }
+    }
+
     /// Record that a queued job started execution.
     pub fn record_start(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write()
@@ -607,6 +1039,7 @@ impl JobRegistry {
             status.queued = status.queued.saturating_sub(1);
             status.in_flight = status.in_flight.saturating_add(1);
         }
+        self.pop_waiting(name, true);
     }
 
     /// Record that a queued job was canceled before execution.
@@ -615,6 +1048,44 @@ impl JobRegistry {
             && let Some(status) = guard.get_mut(name)
         {
             status.queued = status.queued.saturating_sub(1);
+        }
+        self.pop_waiting(name, true);
+    }
+
+    /// Record that a scheduled (delayed) job was canceled before its ready time.
+    ///
+    /// Unlike [`Self::record_cancel`], this removes a *scheduled* waiting mark
+    /// (ready-at still in the future) so canceling a not-yet-runnable job does
+    /// not consume a ready job's mark and under-report queue depth.
+    pub fn record_cancel_scheduled(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+        }
+        self.pop_waiting(name, false);
+    }
+
+    /// Drop one waiting mark for this job's queue (its wait is over).
+    ///
+    /// `prefer_ready` picks which mark to remove when the queue holds a mix of
+    /// ready and still-scheduled marks: a starting/canceled ready job removes an
+    /// already-claimable mark, while a canceled scheduled job removes a future
+    /// one. If no mark in the preferred category exists we fall back to the
+    /// oldest mark so every enqueue still has a matching removal (no leak).
+    fn pop_waiting(&self, name: &str, prefer_ready: bool) {
+        let queue = self.queue_for(name);
+        let now = now_epoch_ms();
+        if let Ok(mut guard) = self.queues.write()
+            && let Some(waiting) = guard.waiting.get_mut(&queue)
+        {
+            let idx = waiting
+                .iter()
+                .position(|ready_at| (*ready_at <= now) == prefer_ready)
+                .or(if waiting.is_empty() { None } else { Some(0) });
+            if let Some(idx) = idx {
+                waiting.remove(idx);
+            }
         }
     }
 
@@ -1602,6 +2073,12 @@ struct ActuatorHealth {
     uptime: String,
     #[cfg(feature = "db")]
     autumn_after_commit_failures_total: u64,
+    /// Total transaction retries triggered by a `40001`/`40P01` (issue #1202).
+    #[cfg(feature = "db")]
+    autumn_tx_retries_total: u64,
+    /// Total transactions that exhausted their retry budget (issue #1202).
+    #[cfg(feature = "db")]
+    autumn_tx_retry_exhausted_total: u64,
     /// Per-component health, keyed by indicator name.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     components: HashMap<String, ComponentHealth>,
@@ -1756,6 +2233,12 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
         #[cfg(feature = "db")]
         autumn_after_commit_failures_total: crate::db::AFTER_COMMIT_FAILURES_TOTAL
             .load(std::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "db")]
+        autumn_tx_retries_total: crate::db::TX_RETRIES_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "db")]
+        autumn_tx_retry_exhausted_total: crate::db::TX_RETRY_EXHAUSTED_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
         components,
         checks,
     };
@@ -1776,6 +2259,8 @@ pub(crate) struct ActuatorInfo {
     app: AppInfo,
     autumn: FrameworkInfo,
     runtime: RuntimeInfo,
+    /// Build + git provenance baked into the running binary (issue #1242).
+    build: crate::build_info::BuildProvenance,
 }
 
 #[derive(Serialize)]
@@ -1801,8 +2286,11 @@ pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
 ) -> Json<ActuatorInfo> {
     Json(ActuatorInfo {
         app: AppInfo {
-            name: std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "unknown".into()),
-            version: std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".into()),
+            // Read the consuming app's compile-time name/version (baked in by
+            // `#[autumn_web::main]`), not a runtime `std::env::var` lookup that
+            // always failed in a released binary (issue #1242).
+            name: crate::build_info::app_name(),
+            version: crate::build_info::app_version(),
         },
         autumn: FrameworkInfo {
             version: env!("CARGO_PKG_VERSION"),
@@ -1811,6 +2299,7 @@ pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
         runtime: RuntimeInfo {
             uptime: state.uptime_display(),
         },
+        build: crate::build_info::build_provenance(),
     })
 }
 
@@ -1865,17 +2354,64 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
     let snapshot = state.metrics().snapshot();
     let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
 
+    // Include read-through cache stampede-protection counters (always
+    // present; the read-through API works standalone without app state).
+    if let serde_json::Value::Object(ref mut map) = result {
+        map.insert(
+            "cache".to_string(),
+            serde_json::to_value(crate::cache::read_through_metrics().snapshot())
+                .unwrap_or_default(),
+        );
+    }
+
     // Include DB pool stats if available
     #[cfg(feature = "db")]
     if let Some(pool) = state.pool() {
         let status = pool.status();
         let db_stats = serde_json::json!({
             "pool_size": status.max_size,
-            "active_connections": (status.max_size as u64).saturating_sub(status.available as u64),
+            "active_connections": (status.size as u64).saturating_sub(status.available as u64),
             "idle_connections": status.available,
         });
         if let serde_json::Value::Object(ref mut map) = result {
             map.insert("database".to_string(), db_stats);
+        }
+    }
+
+    // Include per-shard pool stats keyed by shard name
+    #[cfg(feature = "db")]
+    if let Some(shards) = state.shards() {
+        let mut shard_stats = serde_json::Map::new();
+        for shard in shards.iter() {
+            let status = shard.primary_pool().status();
+            let mut entry = serde_json::json!({
+                "pool_size": status.max_size,
+                "active_connections":
+                    (status.size as u64).saturating_sub(status.available as u64),
+                "idle_connections": status.available,
+                "slots": shard.slots().len(),
+            });
+            if let Some(replica) = shard.replica_pool() {
+                let replica_status = replica.status();
+                if let serde_json::Value::Object(ref mut entry_map) = entry {
+                    entry_map.insert(
+                        "replica".to_string(),
+                        serde_json::json!({
+                            "pool_size": replica_status.max_size,
+                            "active_connections": (replica_status.size as u64)
+                                .saturating_sub(replica_status.available as u64),
+                            "idle_connections": replica_status.available,
+                        }),
+                    );
+                }
+            }
+            shard_stats.insert(shard.name().to_owned(), entry);
+        }
+        if let serde_json::Value::Object(ref mut map) = result {
+            map.insert(
+                "database_shards".to_string(),
+                serde_json::Value::Object(shard_stats),
+            );
         }
     }
 
@@ -2225,6 +2761,30 @@ fn write_builtin_http_metrics(
         snapshot.http.request_timeouts_total
     );
 
+    // autumn_read_your_writes_pins_total
+    out.push_str(
+        "# HELP autumn_read_your_writes_pins_total \
+         Replica reads redirected to the primary by the read-your-own-writes pin\n",
+    );
+    out.push_str("# TYPE autumn_read_your_writes_pins_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_read_your_writes_pins_total{{version=\"{version}\"}} {}",
+        snapshot.read_your_writes_pins_total
+    );
+
+    // autumn_requests_shed_total
+    out.push_str(
+        "# HELP autumn_requests_shed_total \
+         HTTP requests rejected by admission control because server.max_concurrent_requests was at its ceiling\n",
+    );
+    out.push_str("# TYPE autumn_requests_shed_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_requests_shed_total{{version=\"{version}\"}} {}",
+        snapshot.http.requests_shed_total
+    );
+
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
@@ -2245,6 +2805,67 @@ fn write_builtin_http_metrics(
     }
 }
 
+/// Render the built-in `autumn_cache_*` read-through stampede-protection
+/// counters into `out`, tagged with the replica's deploy `version` label.
+/// These counters are process-wide (the read-through API works standalone
+/// without app state), unlike the HTTP metrics which come from per-app state.
+fn write_builtin_cache_metrics(
+    out: &mut String,
+    version: &str,
+    snapshot: &crate::cache::ReadThroughMetricsSnapshot,
+) {
+    use std::fmt::Write;
+
+    for (name, help, value) in [
+        (
+            "autumn_cache_read_through_hits_total",
+            "Read-through cache reads served from a fresh cached value",
+            snapshot.hits,
+        ),
+        (
+            "autumn_cache_read_through_misses_total",
+            "Read-through cache reads that found no fresh cached value",
+            snapshot.misses,
+        ),
+        (
+            "autumn_cache_read_through_coalesced_waits_total",
+            "Read-through callers that awaited a concurrent in-process fill instead of \
+             computing their own (single-flight coalescing)",
+            snapshot.coalesced_waits,
+        ),
+        (
+            "autumn_cache_read_through_fills_total",
+            "Read-through fill closures that completed successfully",
+            snapshot.fills,
+        ),
+        (
+            "autumn_cache_read_through_fill_failures_total",
+            "Read-through fill closures that returned an error",
+            snapshot.fill_failures,
+        ),
+        (
+            "autumn_cache_read_through_stale_serves_total",
+            "Stale-while-revalidate reads that served a stale value while a background \
+             refresh ran",
+            snapshot.stale_serves,
+        ),
+        (
+            "autumn_cache_fill_lock_acquires_total",
+            "Distributed cache fill locks acquired by this process",
+            snapshot.fill_lock_acquires,
+        ),
+        (
+            "autumn_cache_fill_lock_contended_total",
+            "Distributed cache fill lock attempts that found the lock held by another replica",
+            snapshot.fill_lock_contended,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(out, "{name}{{version=\"{version}\"}} {value}");
+    }
+}
+
 /// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
 pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -2257,6 +2878,11 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     let mut out = String::with_capacity(2048);
 
     write_builtin_http_metrics(&mut out, &version, &snapshot);
+    write_builtin_cache_metrics(
+        &mut out,
+        &version,
+        &crate::cache::read_through_metrics().snapshot(),
+    );
 
     // Plugin-contributed metric families — seed with built-in names so
     // plugins cannot shadow or duplicate them.
@@ -2268,8 +2894,18 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             "autumn_http_request_duration_seconds",
             "autumn_shutdown_aborted_requests_total",
             "autumn_request_timeouts_total",
+            "autumn_read_your_writes_pins_total",
+            "autumn_requests_shed_total",
             "autumn_http_route_requests_total",
             "autumn_metrics_source_errors_total",
+            "autumn_cache_read_through_hits_total",
+            "autumn_cache_read_through_misses_total",
+            "autumn_cache_read_through_coalesced_waits_total",
+            "autumn_cache_read_through_fills_total",
+            "autumn_cache_read_through_fill_failures_total",
+            "autumn_cache_read_through_stale_serves_total",
+            "autumn_cache_fill_lock_acquires_total",
+            "autumn_cache_fill_lock_contended_total",
         ]
         .iter()
         .map(|s| (*s).to_string())
@@ -2330,6 +2966,24 @@ pub(crate) struct SetLoggerRequest {
     level: String,
 }
 
+/// Whether `name` is a valid `tracing` directive target.
+///
+/// A directive target is a module path: ASCII alphanumerics plus `_`, `:`, `.`
+/// and `-` (e.g. `my_app::module`, `tower-http`, `my.custom.target`). `root`
+/// (and the empty string, treated as root) are special-cased. `.` and `-` are
+/// valid inside a `tracing` target and are *not* `EnvFilter` directive
+/// metacharacters. Anything carrying an `EnvFilter` metacharacter — `=`, `,`,
+/// whitespace, `[`, `]`, `{`, `}` — is rejected so a malformed target never
+/// reaches the subscriber and the endpoint cannot lie about applying it
+/// (issue #1044).
+fn is_valid_logger_name(name: &str) -> bool {
+    if name.is_empty() || name == "root" {
+        return true;
+    }
+    name.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '.' || ch == '-')
+}
+
 /// `PUT <actuator-prefix>/loggers/{name}` -- change a logger's level at runtime.
 pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -2353,16 +3007,54 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
         );
     }
 
-    let previous = state.log_levels().set_logger_level(&name, &level);
+    // Validate the target name the same way, so a name carrying an `EnvFilter`
+    // metacharacter is rejected before it can reach the subscriber (issue #1044).
+    if !is_valid_logger_name(&name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!(
+                    "Invalid logger name '{name}'. Names may contain only \
+                     alphanumerics, '_', ':', '.' and '-' (or 'root')."
+                ),
+            })),
+        );
+    }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "message": format!("Logger '{}' set to '{}'", name, level),
-            "previous": previous,
-        })),
-    )
+    // Base the response on the *actual* apply outcome, never on handle presence:
+    // a change that failed to reach the live subscriber must not report `ok`
+    // (issue #1044).
+    match state.log_levels().set_logger_level(&name, &level) {
+        LogLevelChange::Applied { previous } => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "message": format!("Logger '{name}' set to '{level}'"),
+                "previous": previous,
+                "applied": true,
+            })),
+        ),
+        LogLevelChange::Recorded { previous } => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "recorded",
+                "message": format!(
+                    "Logger '{name}' recorded as '{level}' but not applied: no reload-capable subscriber is installed"
+                ),
+                "previous": previous,
+                "applied": false,
+            })),
+        ),
+        LogLevelChange::Rejected { reason } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Logger '{name}' could not be set to '{level}': {reason}"),
+                "applied": false,
+            })),
+        ),
+    }
 }
 
 // ── Logfile (sensitive) ────────────────────────────────────────
@@ -2459,7 +3151,8 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
     let jobs = state.job_registry().snapshot();
-    Json(serde_json::json!({ "jobs": jobs }))
+    let queues = state.job_registry().queue_snapshot();
+    Json(serde_json::json!({ "jobs": jobs, "queues": queues }))
 }
 
 #[cfg(feature = "http-client")]
@@ -2822,9 +3515,22 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
+        #[cfg(feature = "system-info")]
+        {
+            paths.push(actuator_route_path(prefix, "/system"));
+        }
         #[cfg(feature = "http-client")]
         {
             paths.push(actuator_route_path(prefix, "/webhooks/dlq"));
+            // `/webhooks/replay` is mounted as `POST` (see
+            // `actuator_mutating_routes`), not `GET`, but it is included in this
+            // path set because the runtime startup barrier seeds its actuator
+            // allow-list from this helper (`StartupBarrierState::from_config`).
+            // Without it, the `POST {prefix}/webhooks/replay` mount would no
+            // longer bypass the startup barrier. The GET-only route listing
+            // (`append_framework_routes`) excludes any path also produced by
+            // `actuator_mutating_routes`, so this does not surface as a phantom
+            // GET there.
             paths.push(actuator_route_path(prefix, "/webhooks/replay"));
         }
         #[cfg(feature = "ws")]
@@ -2835,6 +3541,31 @@ pub(crate) fn actuator_endpoint_paths(
     }
 
     paths
+}
+
+/// Enumerate the actuator's mutating (non-`GET`) framework routes, gated to
+/// match the mounts in [`actuator_router_with_prefix`].
+///
+/// Kept separate from [`actuator_endpoint_paths`] (which is `GET`-only and
+/// paths-only) so the route listing can classify these with their real HTTP
+/// method. Returns `(method, path)` pairs using the same
+/// [`actuator_route_path`] helper as the mounting code so paths match
+/// byte-for-byte.
+pub(crate) fn actuator_mutating_routes(
+    prefix: &str,
+    sensitive: bool,
+) -> Vec<(&'static str, String)> {
+    let mut routes: Vec<(&'static str, String)> = Vec::new();
+
+    if sensitive {
+        routes.push(("PUT", actuator_route_path(prefix, "/loggers/{name}")));
+        #[cfg(feature = "http-client")]
+        {
+            routes.push(("POST", actuator_route_path(prefix, "/webhooks/replay")));
+        }
+    }
+
+    routes
 }
 
 /// Build the actuator router with profile-aware endpoint exposure.
@@ -3085,6 +3816,347 @@ mod tests {
         let snap8 = registry2.snapshot();
         assert!(snap8.is_empty());
     }
+
+    #[test]
+    fn job_registry_tracks_per_queue_depth_and_oldest_age() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("reset_email", "critical");
+        registry.register_on_queue("reindex", "bulk");
+
+        // Enqueue two on `critical`, one on `bulk`.
+        registry.record_enqueue("reset_email");
+        registry.record_enqueue("reset_email");
+        registry.record_enqueue("reindex");
+
+        let queues = registry.queue_snapshot();
+        assert_eq!(queues.get("critical").unwrap().depth, 2);
+        assert_eq!(queues.get("bulk").unwrap().depth, 1);
+        // After a real (small) interval, the oldest waiting job's age is
+        // strictly positive — the snapshot measures elapsed wait time.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            registry
+                .queue_snapshot()
+                .get("critical")
+                .unwrap()
+                .oldest_waiting_age_ms
+                > 0,
+            "a job waiting for ~5ms must report a positive age"
+        );
+
+        // Starting a critical job drops the queue depth.
+        registry.record_start("reset_email");
+        assert_eq!(registry.queue_snapshot().get("critical").unwrap().depth, 1);
+
+        // Draining everything leaves depth 0 and age 0.
+        registry.record_start("reset_email");
+        registry.record_start("reindex");
+        let drained = registry.queue_snapshot();
+        assert_eq!(drained.get("critical").unwrap().depth, 0);
+        assert_eq!(drained.get("critical").unwrap().oldest_waiting_age_ms, 0);
+        assert_eq!(drained.get("bulk").unwrap().depth, 0);
+    }
+
+    #[test]
+    fn survey_setter_overwrites_queue_gauges_and_resets_absent_queues() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("reset_email", "critical");
+        registry.register_on_queue("reindex", "bulk");
+
+        // Local marks exist, but once a survey is published it is authoritative:
+        // the durable backend, not this process's enqueue marks, drives the
+        // reported depth/age (issue #1752).
+        registry.record_enqueue("reset_email");
+
+        let now = now_epoch_ms();
+        let mut survey = HashMap::new();
+        // `critical` has 4 ready jobs; oldest became ready 5s ago.
+        survey.insert(
+            "critical".to_string(),
+            (4_u64, Some(now.saturating_sub(5_000))),
+        );
+        // `bulk` is empty in the survey (absent oldest → age 0).
+        survey.insert("bulk".to_string(), (0_u64, None));
+        registry.set_queue_depth_gauges(&survey);
+
+        let snap = registry.queue_snapshot();
+        assert_eq!(
+            snap.get("critical").unwrap().depth,
+            4,
+            "survey depth overrides the local enqueue mark"
+        );
+        let age = snap.get("critical").unwrap().oldest_waiting_age_ms;
+        assert!(
+            (5_000..=6_000).contains(&age),
+            "age is derived from the surveyed oldest ready-at timestamp, got {age}"
+        );
+        assert_eq!(snap.get("bulk").unwrap().depth, 0);
+        assert_eq!(snap.get("bulk").unwrap().oldest_waiting_age_ms, 0);
+
+        // A later survey that omits `critical` resets it to 0 (no leak), even
+        // though a known/registered queue keeps appearing in the snapshot.
+        let mut survey2 = HashMap::new();
+        survey2.insert("bulk".to_string(), (2_u64, Some(now)));
+        registry.set_queue_depth_gauges(&survey2);
+        let snap2 = registry.queue_snapshot();
+        assert_eq!(
+            snap2.get("critical").unwrap().depth,
+            0,
+            "a queue absent from the newest survey resets to 0"
+        );
+        assert_eq!(snap2.get("bulk").unwrap().depth, 2);
+    }
+
+    #[test]
+    fn survey_setter_overwrites_per_job_queued_and_resets_absent_names() {
+        let registry = JobRegistry::new();
+        registry.register("reset_email");
+        registry.register("reindex");
+
+        registry.record_enqueue("reset_email");
+        registry.record_enqueue("reset_email");
+
+        let mut counts = HashMap::new();
+        counts.insert("reset_email".to_string(), 7_u64);
+        registry.set_queued_counts(&counts);
+        assert_eq!(
+            registry.snapshot()["reset_email"].queued,
+            7,
+            "survey overwrites the local enqueue-driven queued count"
+        );
+        assert_eq!(
+            registry.snapshot()["reindex"].queued,
+            0,
+            "a name absent from the survey resets to 0"
+        );
+
+        registry.set_queued_counts(&HashMap::new());
+        assert_eq!(registry.snapshot()["reset_email"].queued, 0);
+    }
+
+    #[test]
+    fn future_scheduled_jobs_do_not_inflate_ready_queue_depth() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("nightly_report", "reports");
+        registry.register_on_queue("send_email", "reports");
+
+        // A job scheduled for the future is not yet claimable, so it must not
+        // count toward ready queue depth or age the queue: future-dated jobs
+        // enqueued via enqueue_in/enqueue_at were reporting phantom backlog and
+        // could trip false autoscaling/alerting on /actuator/jobs.
+        let far_future = now_epoch_ms() + 60_000;
+        registry.record_enqueue_scheduled("nightly_report", far_future);
+
+        let scheduled_only = registry.queue_snapshot();
+        let reports = scheduled_only
+            .get("reports")
+            .expect("reports queue tracked");
+        assert_eq!(
+            reports.depth, 0,
+            "a future-scheduled job is not ready backlog"
+        );
+        assert_eq!(
+            reports.oldest_waiting_age_ms, 0,
+            "a future-scheduled job must not age the ready queue"
+        );
+
+        // A due-now enqueue on the same queue still counts immediately.
+        registry.record_enqueue("send_email");
+        assert_eq!(
+            registry.queue_snapshot().get("reports").unwrap().depth,
+            1,
+            "an immediately-runnable job still counts toward ready depth"
+        );
+
+        // Once a scheduled job's ready time has passed it joins ready depth and
+        // contributes to oldest-waiting age.
+        let already_ready = now_epoch_ms().saturating_sub(5);
+        registry.record_enqueue_scheduled("nightly_report", already_ready);
+        let promoted = registry.queue_snapshot();
+        assert_eq!(
+            promoted.get("reports").unwrap().depth,
+            2,
+            "a scheduled job counts once its ready time has passed"
+        );
+        assert!(
+            promoted.get("reports").unwrap().oldest_waiting_age_ms > 0,
+            "a job whose ready time has passed contributes to oldest-waiting age"
+        );
+
+        // Starting the two ready jobs leaves only the still-future scheduled
+        // mark, which reports as no ready backlog.
+        registry.record_start("send_email");
+        registry.record_start("nightly_report");
+        let drained = registry.queue_snapshot();
+        assert_eq!(
+            drained.get("reports").unwrap().depth,
+            0,
+            "with both ready jobs started only the future mark remains, counting as 0"
+        );
+        assert_eq!(
+            drained.get("reports").unwrap().oldest_waiting_age_ms,
+            0,
+            "a lone future-scheduled mark ages nothing"
+        );
+    }
+
+    #[test]
+    fn canceling_a_scheduled_job_preserves_a_coqueued_ready_mark() {
+        // Reproduces the durable admin-cancel gap: when an operator cancels a
+        // still-scheduled (delayed) job that shares a queue with a ready job,
+        // the cancel must remove the *scheduled* waiting mark, not the ready
+        // one. Popping the ready mark (via the ready removal path) would report
+        // the queue depth one too low while the ready job is still waiting.
+        let registry = JobRegistry::new();
+        registry.register_on_queue("nightly_report", "reports");
+        registry.register_on_queue("send_email", "reports");
+
+        // One ready job and one future-scheduled job share the queue; only the
+        // ready job counts toward ready depth.
+        registry.record_enqueue("send_email");
+        let far_future = now_epoch_ms() + 60_000;
+        registry.record_enqueue_scheduled("nightly_report", far_future);
+        assert_eq!(
+            registry.queue_snapshot().get("reports").unwrap().depth,
+            1,
+            "only the ready job counts toward ready depth"
+        );
+
+        // Cancel the scheduled job (the durable backend signals this because it
+        // removed the job from its delayed set). The scheduled removal path must
+        // consume the future mark and leave the ready job's mark intact.
+        registry.record_cancel_scheduled("nightly_report");
+        assert_eq!(
+            registry.queue_snapshot().get("reports").unwrap().depth,
+            1,
+            "canceling the scheduled job must not steal the co-queued ready job's mark"
+        );
+
+        // The surviving ready job still drains to zero — exactly one mark left,
+        // so no scheduled mark leaked.
+        registry.record_start("send_email");
+        assert_eq!(
+            registry.queue_snapshot().get("reports").unwrap().depth,
+            0,
+            "starting the ready job drains the queue; the scheduled mark was the one removed"
+        );
+    }
+
+    #[test]
+    fn canceling_a_ready_job_removes_a_ready_mark() {
+        // No-regression companion: canceling a ready (immediately-runnable) job
+        // removes a ready mark, so the queue depth drops by exactly one.
+        let registry = JobRegistry::new();
+        registry.register_on_queue("send_email", "mail");
+
+        registry.record_enqueue("send_email");
+        registry.record_enqueue("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 2);
+
+        registry.record_cancel("send_email");
+        assert_eq!(
+            registry.queue_snapshot().get("mail").unwrap().depth,
+            1,
+            "canceling a ready job removes exactly one ready mark"
+        );
+
+        registry.record_start("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 0);
+    }
+
+    #[test]
+    fn retry_dedup_without_enqueue_mark_keeps_real_duplicate_waiting() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("send_email", "mail");
+
+        // A real duplicate is enqueued and waiting: its per-queue mark is present.
+        registry.record_enqueue("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 1);
+
+        // A retry that failed and coalesced into that duplicate never re-recorded
+        // an enqueue mark, so its dedup must NOT pop the real duplicate's waiting
+        // mark (doing so would report depth 0 while work is still waiting).
+        registry.record_deduplicated("send_email", false, false);
+        assert_eq!(
+            registry.queue_snapshot().get("mail").unwrap().depth,
+            1,
+            "retry-dedup with no prior enqueue mark must not steal a waiting duplicate's mark"
+        );
+
+        // A normal enqueue→dedup pair (the coalesced job DID record an enqueue
+        // mark) still nets to zero: its own mark is removed, no leak.
+        registry.record_enqueue("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 2);
+        registry.record_deduplicated("send_email", true, false);
+        assert_eq!(
+            registry.queue_snapshot().get("mail").unwrap().depth,
+            1,
+            "a normal coalesced enqueue removes exactly its own mark (no leak)"
+        );
+
+        // The surviving real duplicate still drains normally.
+        registry.record_start("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 0);
+    }
+
+    #[test]
+    fn deduplicating_a_scheduled_duplicate_preserves_a_coqueued_ready_mark() {
+        // Reproduces the dedup category gap (sibling of the #965 cancel fix):
+        // when a delayed (scheduled) duplicate coalesces on a queue that also
+        // holds a ready job, the dedup must remove the *scheduled* waiting mark,
+        // not the ready one. The failing order is "delayed duplicate enqueued
+        // first, ready job second": the old unconditional `pop_back` removed the
+        // most-recent (ready) mark, reporting ready depth 0 while ready work was
+        // still waiting.
+        let registry = JobRegistry::new();
+        registry.register_on_queue("nightly_report", "reports");
+        registry.register_on_queue("send_email", "reports");
+
+        // The delayed duplicate records a future (scheduled) mark FIRST...
+        let far_future = now_epoch_ms() + 60_000;
+        registry.record_enqueue_scheduled("nightly_report", far_future);
+        // ...then a ready job enqueues on the same queue (its mark is the most
+        // recent). Recorded a few ms in the past so it deterministically ages.
+        let already_ready = now_epoch_ms().saturating_sub(5);
+        registry.record_enqueue_scheduled("send_email", already_ready);
+
+        let before = registry.queue_snapshot();
+        assert_eq!(
+            before.get("reports").unwrap().depth,
+            1,
+            "only the ready job counts toward ready depth"
+        );
+        assert!(
+            before.get("reports").unwrap().oldest_waiting_age_ms > 0,
+            "the ready job ages the queue before the dedup"
+        );
+
+        // The delayed duplicate coalesces: it recorded a scheduled enqueue mark
+        // (had_enqueue_mark = true, was_scheduled = true), so the removal must
+        // consume the future mark and leave the ready job's mark intact. Under
+        // the old `pop_back` this stole the ready mark (depth 0) — the RED case.
+        registry.record_deduplicated("nightly_report", true, true);
+        let after = registry.queue_snapshot();
+        assert_eq!(
+            after.get("reports").unwrap().depth,
+            1,
+            "deduplicating the scheduled duplicate must not steal the ready job's mark"
+        );
+        assert!(
+            after.get("reports").unwrap().oldest_waiting_age_ms > 0,
+            "the ready job's mark is preserved, so it still ages the queue"
+        );
+
+        // The surviving ready job drains to zero — exactly one mark remained, so
+        // the scheduled mark was the one removed (no leak).
+        registry.record_start("send_email");
+        assert_eq!(
+            registry.queue_snapshot().get("reports").unwrap().depth,
+            0,
+            "starting the ready job drains the queue; the scheduled mark was removed"
+        );
+    }
+
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -3105,9 +4177,9 @@ mod tests {
         #[cfg(feature = "http-client")]
         webhook_outbound: Option<crate::webhook_outbound::WebhookOutboundManager>,
         #[cfg(feature = "db")]
-        pool: Option<
-            diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
-        >,
+        pool: Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
+        #[cfg(feature = "db")]
+        shards: Option<crate::sharding::ShardSet>,
         #[cfg(feature = "ws")]
         channels: crate::channels::Channels,
         #[cfg(feature = "ws")]
@@ -3149,9 +4221,13 @@ mod tests {
         #[cfg(feature = "db")]
         fn pool(
             &self,
-        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
         {
             self.pool.as_ref()
+        }
+        #[cfg(feature = "db")]
+        fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+            self.shards.as_ref()
         }
         #[cfg(feature = "ws")]
         fn channels(&self) -> &crate::channels::Channels {
@@ -3193,6 +4269,8 @@ mod tests {
             webhook_outbound: None,
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
@@ -3386,9 +4464,11 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         crate::job::start_runtime(
             vec![crate::job::JobInfo {
+                version: 1,
                 name: "autumn_webhook_delivery".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -3396,6 +4476,7 @@ mod tests {
             &runtime_state,
             &shutdown,
             &crate::config::JobConfig::default(),
+            true,
         )
         .expect("job runtime should start");
 
@@ -3460,9 +4541,11 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         crate::job::start_runtime(
             vec![crate::job::JobInfo {
+                version: 1,
                 name: "autumn_webhook_delivery".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -3470,6 +4553,7 @@ mod tests {
             &runtime_state,
             &shutdown,
             &crate::config::JobConfig::default(),
+            true,
         )
         .expect("job runtime should start");
 
@@ -3770,6 +4854,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_info_reports_build_and_git_provenance() {
+        // This is the only test in the lib test binary that touches the
+        // process-global build context (`__set_build_context` is first-wins),
+        // so the injected values below are guaranteed to be the ones rendered.
+        fn leak(value: String) -> &'static str {
+            Box::leak(value.into_boxed_str())
+        }
+
+        // Use the repo's real HEAD so this exercises AC #2's contract: the
+        // reported commit equals `git rev-parse HEAD` of the source tree.
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|out| out.trim().to_owned())
+            .expect("git rev-parse HEAD should succeed in the repo");
+        let short: String = head.chars().take(7).collect();
+
+        crate::build_info::__set_build_context(
+            "provenance_probe_app",
+            "9.9.9",
+            Some(leak(head.clone())),
+            Some(leak(short.clone())),
+            Some("provenance-branch"),
+            Some("false"),
+            Some("2026-07-09T00:00:00Z"),
+        );
+
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // AC #3: app.name/version reflect the consuming app's compile-time
+        // values, not "unknown".
+        assert_eq!(json["app"]["name"], "provenance_probe_app");
+        assert_eq!(json["app"]["version"], "9.9.9");
+        assert_ne!(json["app"]["version"], "unknown");
+
+        // AC #1/#2: build object carries full + short SHA, branch, dirty bool,
+        // and an ISO-8601 UTC build timestamp; commit equals real HEAD.
+        assert_eq!(json["build"]["git"]["commit"], head);
+        assert_eq!(json["build"]["git"]["commit_short"], short);
+        assert_eq!(json["build"]["git"]["branch"], "provenance-branch");
+        assert_eq!(json["build"]["git"]["dirty"], false);
+        assert_eq!(json["build"]["timestamp"], "2026-07-09T00:00:00Z");
+        assert_eq!(json["build"]["version"], "9.9.9");
+    }
+
+    #[tokio::test]
     async fn actuator_env_available_in_sensitive_mode() {
         let config = AutumnConfig {
             profile: Some("prod".into()),
@@ -3896,14 +5043,75 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "db")]
+    async fn actuator_metrics_returns_per_shard_stats_when_sharded() {
+        let mut state = test_state();
+        let config = crate::config::DatabaseConfig {
+            shards: vec![
+                crate::config::ShardConfig {
+                    name: "alpha".to_owned(),
+                    primary_url: "postgres://localhost/alpha".to_owned(),
+                    slots: None,
+                    replica_url: None,
+                    primary_pool_size: Some(4),
+                    replica_pool_size: None,
+                    replica_fallback: None,
+                },
+                crate::config::ShardConfig {
+                    name: "beta".to_owned(),
+                    primary_url: "postgres://localhost/beta".to_owned(),
+                    slots: None,
+                    replica_url: Some("postgres://localhost/beta_ro".to_owned()),
+                    primary_pool_size: None,
+                    replica_pool_size: Some(2),
+                    replica_fallback: None,
+                },
+            ],
+            ..Default::default()
+        };
+        state.shards = crate::sharding::create_shard_set(
+            &config,
+            std::sync::Arc::new(crate::sharding::HashShardRouter),
+        )
+        .expect("lazy pools build");
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let shards = json
+            .get("database_shards")
+            .expect("sharded state exposes database_shards");
+        assert_eq!(shards["alpha"]["pool_size"], 4);
+        assert_eq!(shards["alpha"]["slots"], 8192);
+        assert_eq!(shards["beta"]["replica"]["pool_size"], 2);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "db")]
     async fn actuator_metrics_returns_db_stats_when_pool_present() {
-        use diesel_async::AsyncPgConnection;
         use diesel_async::pooled_connection::AsyncDieselConnectionManager;
         use diesel_async::pooled_connection::deadpool::Pool;
 
         let mut state = test_state();
 
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        // `RuntimeConnection` is `AsyncPgConnection` in the default build and a
+        // SQLite connection under `--features sqlite`; using the alias keeps this
+        // test compiling on both (it only exercises pool metrics, and is not run
+        // under the sqlite feature).
+        let manager = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
             "postgres://postgres:postgres@localhost:5432/postgres",
         );
         let pool = Pool::builder(manager).build().unwrap();
@@ -4042,8 +5250,13 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "ok");
-        assert_eq!(json["message"], "Logger 'autumn_web' set to 'debug'");
+        // `test_state()` has no reload-capable subscriber wired in, so the
+        // endpoint honestly reports the change was recorded but not applied
+        // rather than a false-positive `ok` (issue #1044). A live-subscriber
+        // integration test (`actuator_loggers_live_reload`) covers the `ok`
+        // path with a real reloadable subscriber.
+        assert_eq!(json["status"], "recorded");
+        assert_eq!(json["applied"], false);
 
         let overrides = state.log_levels().logger_overrides();
         assert_eq!(
@@ -4076,6 +5289,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_loggers_put_rejects_invalid_name() {
+        // A logger name carrying an `EnvFilter` metacharacter (`=`) must be
+        // rejected up front (400) — never applied, never recorded — so the
+        // endpoint cannot claim success for a directive the subscriber would
+        // reject (issue #1044). Other metacharacters (`,`, whitespace) too.
+        // `has%20space` is percent-encoded whitespace: axum's `Path` extractor
+        // decodes it back to a space, which the validator must still reject.
+        let state = test_state();
+        for bogus in ["a=b", "a,b", "has%20space", "a::b=trace"] {
+            let app = actuator_router(true).with_state(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/actuator/loggers/{bogus}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"level": "debug"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "logger name {bogus:?} should be rejected"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["status"], "error");
+        }
+
+        // And GET /loggers must NOT then list any of the bogus overrides.
+        let app = actuator_router(true).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/loggers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let loggers = json["loggers"].as_object().unwrap();
+        assert!(
+            loggers.is_empty(),
+            "no bogus override should be recorded, got {loggers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn actuator_loggers_put_accepts_dotted_and_hyphenated_names() {
+        // Real-world `tracing` targets from third-party crates and custom
+        // targets carry `.` and `-` (e.g. `tower-http`, `my.custom.target`,
+        // `h2::proto`). These are valid inside a target and are *not*
+        // `EnvFilter` directive metacharacters, so a PUT to such a name must
+        // NOT be rejected as invalid (400) — it reaches the normal
+        // apply/record path (200) and is recorded as an override.
+        let state = test_state();
+        for name in ["tower-http", "my.custom.target", "h2::proto"] {
+            let app = actuator_router(true).with_state(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/actuator/loggers/{name}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"level": "debug"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "logger name {name:?} should be accepted, not rejected as invalid"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            // No live subscriber is attached in `test_state()`, so a valid name
+            // takes the "recorded" path — the point is it is not the invalid
+            // "error" path.
+            assert_ne!(
+                json["status"], "error",
+                "valid name {name:?} must not hit the invalid-name error path"
+            );
+        }
+
+        // GET /loggers must now list the accepted overrides.
+        let app = actuator_router(true).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/loggers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let loggers = json["loggers"].as_object().unwrap();
+        for name in ["tower-http", "my.custom.target", "h2::proto"] {
+            assert!(
+                loggers.contains_key(name),
+                "accepted override {name:?} should be recorded, got {loggers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn actuator_loggers_put_applied_ok_with_live_subscriber() {
+        // Positive path: with a reload-capable subscriber installed, a valid
+        // change reports `{"status":"ok","applied":true}` end-to-end (issue
+        // #1044 AC7). Uses a no-op reload handle that accepts any valid
+        // directive, standing in for a live subscriber.
+        let state = test_state();
+        state
+            .log_levels()
+            .attach_reload_handle(crate::telemetry::FilterReloadHandle::accept_all_for_test());
+
+        let app = actuator_router(true).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/actuator/loggers/autumn_web")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"level": "debug"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["applied"], true);
+
+        let overrides = state.log_levels().logger_overrides();
+        assert_eq!(
+            overrides.get("autumn_web").map(String::as_str),
+            Some("debug")
+        );
+    }
+
+    #[tokio::test]
     async fn actuator_loggers_hidden_in_nonsensitive_mode() {
         let app = actuator_router(false).with_state(test_state());
         let resp = app
@@ -4103,9 +5477,113 @@ mod tests {
     #[test]
     fn log_levels_root_updates_current() {
         let levels = LogLevels::new("info");
-        let prev = levels.set_logger_level("root", "trace");
-        assert_eq!(prev, Some("info".to_string()));
+        let change = levels.set_logger_level("root", "trace");
+        assert_eq!(change.previous(), Some("info"));
         assert_eq!(levels.current_level(), "trace");
+    }
+
+    #[test]
+    fn root_level_change_preserves_startup_per_target_directives() {
+        // Regression: an app configured with a full `EnvFilter` directive at
+        // startup must not lose its per-target directives when
+        // `PUT /actuator/loggers/root` replaces only the global level.
+        let levels = LogLevels::new("info,tower_http=warn,my_app=debug");
+        levels.attach_reload_handle(crate::telemetry::FilterReloadHandle::accept_all_for_test());
+
+        // The startup per-target directives are seeded as overrides, leaving
+        // only the bare global level in `current_level`.
+        let seeded = levels.logger_overrides();
+        assert_eq!(seeded.get("tower_http").map(String::as_str), Some("warn"));
+        assert_eq!(seeded.get("my_app").map(String::as_str), Some("debug"));
+        assert_eq!(levels.current_level(), "info");
+
+        // Raising the root level must NOT wipe the module-specific directives.
+        let change = levels.set_logger_level("root", "warn");
+        assert!(matches!(change, LogLevelChange::Applied { .. }));
+        assert_eq!(levels.current_level(), "warn");
+
+        let overrides = levels.logger_overrides();
+        assert_eq!(
+            overrides.get("tower_http").map(String::as_str),
+            Some("warn"),
+            "tower_http directive must survive a root-level change"
+        );
+        assert_eq!(
+            overrides.get("my_app").map(String::as_str),
+            Some("debug"),
+            "my_app directive must survive a root-level change"
+        );
+
+        // The rebuilt live directive still carries both per-target directives.
+        let directive = levels.rebuilt_directive_for_test();
+        assert!(
+            directive.contains("tower_http=warn"),
+            "rebuilt directive dropped tower_http: {directive}"
+        );
+        assert!(
+            directive.contains("my_app=debug"),
+            "rebuilt directive dropped my_app: {directive}"
+        );
+    }
+
+    #[test]
+    fn bare_non_level_segment_is_a_trace_target_not_the_global_level() {
+        // `EnvFilter` semantics: in `info,my_app`, `info` is the global level
+        // and the bare `my_app` is a *target directive at trace*, NOT the global
+        // level. The old code took the last bare segment as the global level,
+        // which both lost `info` and set an invalid global of `my_app`.
+        let levels = LogLevels::new("info,my_app");
+        assert_eq!(levels.current_level(), "info");
+        let overrides = levels.logger_overrides();
+        assert_eq!(
+            overrides.get("my_app").map(String::as_str),
+            Some("trace"),
+            "bare non-level segment must become a trace target"
+        );
+
+        // The rebuilt directive is equivalent to `info,my_app=trace`.
+        assert_eq!(levels.rebuilt_directive_for_test(), "info,my_app=trace");
+
+        // A subsequent root PUT to `warn` keeps `my_app` as a target.
+        levels.attach_reload_handle(crate::telemetry::FilterReloadHandle::accept_all_for_test());
+        let change = levels.set_logger_level("root", "warn");
+        assert!(matches!(change, LogLevelChange::Applied { .. }));
+        assert_eq!(levels.current_level(), "warn");
+        assert_eq!(
+            levels.logger_overrides().get("my_app").map(String::as_str),
+            Some("trace"),
+            "my_app target must survive a root-level change"
+        );
+    }
+
+    #[test]
+    fn mixed_bare_level_explicit_target_and_bare_target() {
+        // `debug,tower_http=warn,my_app`: global=debug, explicit tower_http=warn,
+        // and the bare `my_app` becomes a trace target.
+        let levels = LogLevels::new("debug,tower_http=warn,my_app");
+        assert_eq!(levels.current_level(), "debug");
+        let overrides = levels.logger_overrides();
+        assert_eq!(
+            overrides.get("tower_http").map(String::as_str),
+            Some("warn")
+        );
+        assert_eq!(overrides.get("my_app").map(String::as_str), Some("trace"));
+
+        // Targets are emitted sorted after the global level.
+        assert_eq!(
+            levels.rebuilt_directive_for_test(),
+            "debug,my_app=trace,tower_http=warn"
+        );
+    }
+
+    #[test]
+    fn purely_bare_level_config_has_no_target_overrides() {
+        // Regression guard: a plain level stays the global level with no
+        // spurious target overrides.
+        let levels = LogLevels::new("info");
+        assert_eq!(levels.current_level(), "info");
+        assert!(levels.logger_overrides().is_empty());
+        assert_eq!(levels.rebuilt_directive_for_test(), "info");
     }
 
     // ── Prometheus endpoint tests ──────────────────────────────
@@ -4162,6 +5640,113 @@ mod tests {
         assert!(text.contains("# HELP autumn_request_timeouts_total"));
         assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
         assert!(text.contains("autumn_request_timeouts_total{version=\"stable\"} 0"));
+
+        assert!(text.contains("# HELP autumn_read_your_writes_pins_total"));
+        assert!(text.contains("# TYPE autumn_read_your_writes_pins_total counter"));
+        assert!(text.contains("autumn_read_your_writes_pins_total{version=\"stable\"} 0"));
+
+        assert!(text.contains("# HELP autumn_requests_shed_total"));
+        assert!(text.contains("# TYPE autumn_requests_shed_total counter"));
+        assert!(text.contains("autumn_requests_shed_total{version=\"stable\"} 0"));
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[tokio::test]
+    async fn prometheus_includes_cache_read_through_counters() {
+        // read_through_metrics() is a process-wide singleton shared with other
+        // tests in this crate; assert presence and a monotonic delta rather
+        // than an absolute value.
+        let before = crate::cache::read_through_metrics().snapshot();
+        let cache: std::sync::Arc<dyn crate::cache::Cache> =
+            std::sync::Arc::new(crate::cache::MokaCache::new(10, None));
+        let key = format!("actuator-prometheus-cache-test-{before:?}");
+        let _: i32 =
+            crate::cache::get_or_compute(
+                &cache,
+                &key,
+                None,
+                || async move { Ok::<i32, String>(1) },
+            )
+            .await
+            .unwrap();
+        let after = crate::cache::read_through_metrics().snapshot();
+        assert!(after.fills > before.fills, "fills counter must increase");
+
+        let state = test_state();
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        for name in [
+            "autumn_cache_read_through_hits_total",
+            "autumn_cache_read_through_misses_total",
+            "autumn_cache_read_through_coalesced_waits_total",
+            "autumn_cache_read_through_fills_total",
+            "autumn_cache_read_through_fill_failures_total",
+            "autumn_cache_read_through_stale_serves_total",
+            "autumn_cache_fill_lock_acquires_total",
+            "autumn_cache_fill_lock_contended_total",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {name} counter")),
+                "missing TYPE line for {name} in:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("{name}{{version=\"stable\"}}")),
+                "missing value line for {name} in:\n{text}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[tokio::test]
+    async fn metrics_json_includes_cache_section() {
+        let cache: std::sync::Arc<dyn crate::cache::Cache> =
+            std::sync::Arc::new(crate::cache::MokaCache::new(10, None));
+        let key = "actuator-metrics-json-cache-test";
+        let _: i32 =
+            crate::cache::get_or_compute(&cache, key, None, || async move { Ok::<i32, String>(1) })
+                .await
+                .unwrap();
+
+        let state = test_state();
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["cache"]["fills"].as_u64().unwrap() >= 1);
+        assert!(json["cache"]["hits"].is_u64());
+        assert!(json["cache"]["misses"].is_u64());
+        assert!(json["cache"]["coalesced_waits"].is_u64());
+        assert!(json["cache"]["fill_failures"].is_u64());
+        assert!(json["cache"]["stale_serves"].is_u64());
+        assert!(json["cache"]["fill_lock_acquires"].is_u64());
+        assert!(json["cache"]["fill_lock_contended"].is_u64());
     }
 
     #[tokio::test]
@@ -4469,7 +6054,7 @@ mod tests {
 
         // Try to add a new key, should be rejected
         let result = levels.set_logger_level("logger_1000", "warn");
-        assert_eq!(result, None);
+        assert!(matches!(result, LogLevelChange::Rejected { .. }));
         assert_eq!(levels.logger_overrides().len(), 1000);
         assert_eq!(levels.logger_overrides().get("logger_1000"), None);
     }
@@ -4483,8 +6068,8 @@ mod tests {
         }
 
         // Try to update an existing key, should succeed
-        let prev = levels.set_logger_level("logger_999", "warn");
-        assert_eq!(prev.as_deref(), Some("debug"));
+        let change = levels.set_logger_level("logger_999", "warn");
+        assert_eq!(change.previous(), Some("debug"));
         assert_eq!(levels.logger_overrides().len(), 1000);
         assert_eq!(
             levels

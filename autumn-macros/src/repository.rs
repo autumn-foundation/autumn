@@ -9,7 +9,7 @@
 //! Uses `diesel-async` `RunQueryDsl` for async queries - no sync `interact()`.
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{Ident, ItemTrait, LitStr, TraitItem};
 
@@ -70,6 +70,98 @@ fn to_snake_case(name: &str) -> String {
     result
 }
 
+fn generate_topic_format(topic: &str, record_ident: &TokenStream) -> syn::Result<TokenStream> {
+    let mut format_str = String::new();
+    let mut args = Vec::new();
+    let mut chars = topic.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            let mut field = String::new();
+            let mut closed = false;
+            while let Some(&next_ch) = chars.peek() {
+                if next_ch == '}' {
+                    chars.next();
+                    closed = true;
+                    break;
+                }
+                field.push(chars.next().unwrap());
+            }
+            if closed {
+                let trimmed = field.trim();
+                if trimmed.is_empty() {
+                    return Err(syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        "empty topic placeholder '{}' is not allowed",
+                    ));
+                }
+                let field_ident = syn::parse_str::<syn::Ident>(trimmed).map_err(|e| {
+                    syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        format!("invalid field name '{trimmed}' in topic placeholder: {e}"),
+                    )
+                })?;
+                format_str.push_str("{}");
+                args.push(quote! { ::autumn_web::repository::DisplayTopicField::to_topic_string(&#record_ident.#field_ident) });
+            } else {
+                format_str.push('{');
+                format_str.push_str(&field);
+            }
+        } else {
+            format_str.push(ch);
+        }
+    }
+    let output = if args.is_empty() {
+        quote! { ::std::string::ToString::to_string(#format_str) }
+    } else {
+        quote! { ::std::format!(#format_str, #(#args),*) }
+    };
+    Ok(output)
+}
+
+/// Which of the generated CRUD routes the `mcp` key opts in as MCP tools.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum McpExpose {
+    /// Bare `mcp`: all five CRUD routes (list/get/create/update/delete).
+    All,
+    /// `mcp = "read"`: only the read routes (list/get).
+    Read,
+}
+
+/// The `on_delete` action for a `dependent(...)` association (issue #1369).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DependentAction {
+    Destroy,
+    DeleteAll,
+    Nullify,
+    Restrict,
+}
+
+impl DependentAction {
+    /// The `::autumn_web::repository::DependentAction` variant token.
+    fn variant_ident(self) -> proc_macro2::Ident {
+        let name = match self {
+            Self::Destroy => "Destroy",
+            Self::DeleteAll => "DeleteAll",
+            Self::Nullify => "Nullify",
+            Self::Restrict => "Restrict",
+        };
+        format_ident!("{name}")
+    }
+}
+
+/// One `dependent(ChildRepository, fk = "col", on_delete = action)` clause on a
+/// `#[repository]`. Threads the cascade action from the parent repository's
+/// `delete_by_id` into the child repository's delete path.
+#[derive(Clone)]
+struct DependentSpec {
+    /// The child repository struct type (e.g. `PgCommentRepository`).
+    child_repo: syn::Path,
+    /// The foreign-key column on the child table referencing the parent id.
+    fk: String,
+    /// What to do with the children when the parent is deleted.
+    action: DependentAction,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct RepoConfig {
     model_name: Ident,
@@ -77,6 +169,9 @@ struct RepoConfig {
     hooks_type: Option<Ident>,
     commit_hooks: bool,
     api_path: Option<String>,
+    /// Expose the generated CRUD routes as MCP tools (`mcp` / `mcp = "read"`).
+    /// `None` = not opted in. Requires `api = "/path"`.
+    mcp_expose: Option<McpExpose>,
     policy_type: Option<Ident>,
     scope_type: Option<Ident>,
     cursor_key: Option<String>,
@@ -108,6 +203,37 @@ struct RepoConfig {
     /// replica is configured (#971). Use for read-after-write-sensitive
     /// aggregates that cannot tolerate replication lag.
     primary_reads: bool,
+    /// When `true`, the generated `FromRequestParts` resolves the tenant → shard
+    /// automatically so handlers can extract the repository directly without a
+    /// [`ShardedDb`] extractor. Requires shards to be configured in `[[database.shards]]`.
+    /// Works with `tenant_scoped` for per-tenant routing and `across_tenants` for
+    /// cross-shard fan-out reads. (issue #1209)
+    sharded: bool,
+    broadcasts: bool,
+    broadcast_topic: Option<String>,
+    broadcast_render: Option<syn::Path>,
+    broadcast_container: Option<String>,
+    generated_internal_hooks: bool,
+    /// `dependent(...)` association clauses (issue #1369). When non-empty,
+    /// `delete_by_id` runs a transactional, soft-delete-aware, hook-firing
+    /// cascade over these child associations before deleting the parent.
+    dependents: Vec<DependentSpec>,
+    /// Opt-in (`validate_on_update = fetch`) merged-model validation on the
+    /// no-hooks blind update path (issue #1801). When `true`, the generated
+    /// `update` validates the effective merged model (existing row ∪ patch)
+    /// via `from_patch` in every branch, loading the current row first on the
+    /// otherwise-blind no-lock sub-branches. When `false` (default) the blind
+    /// path stays byte-for-byte as before: no extra SELECT, no validation.
+    validate_on_update_fetch: bool,
+    /// Name of the per-record owner column (a `users` foreign key such as
+    /// `user_id`/`author_id`) when the repository is owner-scoped (issue #1841).
+    /// `None` (the default) emits nothing extra: every existing `#[repository]`
+    /// is unaffected. `Some(col)` additionally emits owner-filtered
+    /// `list_scoped(owner_id, ..)` and (when `searchable`) `search_page_scoped(
+    /// owner_id, ..)` methods so an owner-scoped index/search never returns other
+    /// users' rows. The column may be `BigInt` or `Nullable<BigInt>`; a nullable
+    /// owner never matches NULL (unowned) rows, which is the intended semantics.
+    owner_column: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -117,6 +243,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut hooks_type: Option<Ident> = None;
     let mut commit_hooks = false;
     let mut api_path: Option<String> = None;
+    let mut mcp_expose: Option<McpExpose> = None;
+    let mut mcp_span: Option<proc_macro2::Span> = None;
     let mut policy_type: Option<Ident> = None;
     let mut scope_type: Option<Ident> = None;
     let mut cursor_key: Option<String> = None;
@@ -128,6 +256,14 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut versioned = false;
     let mut no_versioned_record_impl = false;
     let mut primary_reads = false;
+    let mut sharded = false;
+    let mut broadcasts = false;
+    let mut broadcast_topic: Option<String> = None;
+    let mut broadcast_render: Option<syn::Path> = None;
+    let mut broadcast_container: Option<String> = None;
+    let mut dependents: Vec<DependentSpec> = Vec::new();
+    let mut validate_on_update_fetch = false;
+    let mut owner_column: Option<String> = None;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -140,6 +276,22 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: syn::LitBool = meta.value()?.parse()?;
             commit_hooks = value.value;
             Ok(())
+        } else if meta.path.is_ident("broadcasts") {
+            let value: syn::LitBool = meta.value()?.parse()?;
+            broadcasts = value.value;
+            Ok(())
+        } else if meta.path.is_ident("topic") {
+            let value: LitStr = meta.value()?.parse()?;
+            broadcast_topic = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("render") {
+            let value: syn::Path = meta.value()?.parse()?;
+            broadcast_render = Some(value);
+            Ok(())
+        } else if meta.path.is_ident("container") {
+            let value: LitStr = meta.value()?.parse()?;
+            broadcast_container = Some(value.value());
+            Ok(())
         } else if meta.path.is_ident("table") {
             let value: LitStr = meta.value()?.parse()?;
             table_name = Some(value.value());
@@ -148,6 +300,45 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: LitStr = meta.value()?.parse()?;
             api_path = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("mcp") {
+            if mcp_expose.is_some() {
+                return Err(meta.error(
+                    "duplicate `mcp` key: specify `mcp` or `mcp = \"read\"` exactly once \
+                     (they don't compose — the last one would silently win)",
+                ));
+            }
+            mcp_span = Some(meta.path.segments[0].ident.span());
+            if meta.input.peek(syn::Token![=]) {
+                let lit: syn::Lit = meta.value()?.parse()?;
+                match &lit {
+                    syn::Lit::Str(value) => match value.value().as_str() {
+                        "read" => mcp_expose = Some(McpExpose::Read),
+                        other => {
+                            return Err(syn::Error::new(
+                                value.span(),
+                                format!(
+                                    "unknown mcp mode `{other}`; expected bare `mcp` (expose \
+                                     all five CRUD routes as MCP tools) or `mcp = \"read\"` \
+                                     (list/get only)"
+                                ),
+                            ));
+                        }
+                    },
+                    other => {
+                        return Err(syn::Error::new(
+                            // `mcp = false`/`true` is the natural guess coming from
+                            // `#[api_doc(mcp = false)]`; name the forms that exist here.
+                            other.span(),
+                            "mcp takes no boolean: use bare `mcp` (expose all five CRUD \
+                             routes as MCP tools), `mcp = \"read\"` (list/get only), or omit \
+                             the key to keep MCP exposure off (the default)",
+                        ));
+                    }
+                }
+            } else {
+                mcp_expose = Some(McpExpose::All);
+            }
+            Ok(())
         } else if meta.path.is_ident("policy") {
             let value: Ident = meta.value()?.parse()?;
             policy_type = Some(value);
@@ -155,6 +346,13 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("scope") {
             let value: Ident = meta.value()?.parse()?;
             scope_type = Some(value);
+            Ok(())
+        } else if meta.path.is_ident("owner") {
+            // `owner = <column ident>` (issue #1841): opts the repository into
+            // owner-scoped list/search codegen. The value is a bare column ident
+            // (e.g. `user_id`, `author_id`) matching a `users` foreign key.
+            let value: Ident = meta.value()?.parse()?;
+            owner_column = Some(value.to_string());
             Ok(())
         } else if meta.path.is_ident("cursor_key") {
             let value: Ident = meta.value()?.parse()?;
@@ -186,12 +384,95 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("primary_reads") {
             primary_reads = true;
             Ok(())
+        } else if meta.path.is_ident("sharded") {
+            sharded = true;
+            Ok(())
+        } else if meta.path.is_ident("validate_on_update") {
+            // `validate_on_update = fetch` (issue #1801): opt into merged-model
+            // validation on the no-hooks blind update path. Only the bare ident
+            // `fetch` is accepted as the value (it fetches the current row when
+            // the blind path would otherwise skip the SELECT).
+            let value: Ident = meta.value()?.parse()?;
+            if value == "fetch" {
+                validate_on_update_fetch = true;
+                Ok(())
+            } else {
+                Err(syn::Error::new(
+                    value.span(),
+                    format!(
+                        "unknown validate_on_update mode `{value}`; expected \
+                         `validate_on_update = fetch`"
+                    ),
+                ))
+            }
+        } else if meta.path.is_ident("dependent") {
+            // `dependent(ChildRepository, fk = "col", on_delete = <action>)`
+            let mut child_repo: Option<syn::Path> = None;
+            let mut fk: Option<String> = None;
+            let mut action: Option<DependentAction> = None;
+            meta.parse_nested_meta(|nested| {
+                if nested.path.is_ident("fk") {
+                    let value: LitStr = nested.value()?.parse()?;
+                    fk = Some(value.value());
+                    Ok(())
+                } else if nested.path.is_ident("on_delete") || nested.path.is_ident("action") {
+                    let value: Ident = nested.value()?.parse()?;
+                    let parsed = match value.to_string().as_str() {
+                        "destroy" => DependentAction::Destroy,
+                        "delete_all" => DependentAction::DeleteAll,
+                        "nullify" => DependentAction::Nullify,
+                        "restrict" => DependentAction::Restrict,
+                        other => {
+                            return Err(syn::Error::new(
+                                value.span(),
+                                format!(
+                                    "unknown dependent action `{other}`; expected one of \
+                                     `destroy`, `delete_all`, `nullify`, `restrict`"
+                                ),
+                            ));
+                        }
+                    };
+                    action = Some(parsed);
+                    Ok(())
+                } else if child_repo.is_none()
+                    && (nested.input.peek(syn::Token![,]) || nested.input.is_empty())
+                {
+                    // The first bare path (no `= value`) is the child repository type.
+                    child_repo = Some(nested.path);
+                    Ok(())
+                } else {
+                    Err(nested.error(
+                        "expected `dependent(ChildRepository, fk = \"column\", \
+                         on_delete = destroy|delete_all|nullify|restrict)`",
+                    ))
+                }
+            })?;
+            let child_repo = child_repo.ok_or_else(|| {
+                meta.error(
+                    "dependent(...) requires a child repository type as its first argument, \
+                     e.g. dependent(PgCommentRepository, fk = \"post_id\", on_delete = destroy)",
+                )
+            })?;
+            let fk = fk.ok_or_else(|| {
+                meta.error("dependent(...) requires `fk = \"<child_fk_column>\"`")
+            })?;
+            let action = action.ok_or_else(|| {
+                meta.error(
+                    "dependent(...) requires `on_delete = destroy|delete_all|nullify|restrict`",
+                )
+            })?;
+            dependents.push(DependentSpec {
+                child_repo,
+                fk,
+                action,
+            });
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, or primary_reads",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -203,13 +484,27 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "expected model name: #[repository(ModelName)]",
         )
     })?;
-    if commit_hooks && hooks_type.is_none() {
+    if commit_hooks && hooks_type.is_none() && !broadcasts {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "commit_hooks = true requires hooks = Type",
         ));
     }
+    if mcp_expose.is_some() && api_path.is_none() {
+        return Err(syn::Error::new(
+            mcp_span.unwrap_or_else(proc_macro2::Span::call_site),
+            "mcp requires api = \"/path\": MCP tools are derived from the generated CRUD routes",
+        ));
+    }
+    if validate_on_update_fetch && no_upsert_trait {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "validate_on_update = fetch requires the generated update draft (from_patch), \
+             which no_upsert_trait repositories do not have; remove one of the two",
+        ));
+    }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
+    let generated_internal_hooks = false;
 
     Ok(RepoConfig {
         model_name: model,
@@ -217,6 +512,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         hooks_type,
         commit_hooks,
         api_path,
+        mcp_expose,
         policy_type,
         scope_type,
         cursor_key,
@@ -228,6 +524,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         versioned,
         no_versioned_record_impl,
         primary_reads,
+        sharded,
+        broadcasts,
+        broadcast_topic,
+        broadcast_render,
+        broadcast_container,
+        generated_internal_hooks,
+        dependents,
+        validate_on_update_fetch,
+        owner_column,
     })
 }
 
@@ -267,6 +572,239 @@ fn parse_query_name(name: &str) -> Option<DerivedQuery> {
     })
 }
 
+/// The aggregate function a grouped-aggregate method computes (#1364).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AggKind {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggKind {
+    /// The bare aggregate keyword for diagnostics (`"count"`, `"sum"`, …).
+    const fn keyword(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Avg => "avg",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Parse a grouped-aggregate method name into `(kind, numeric_col, group_col)`.
+///
+/// Recognized shapes (issue #1364):
+/// - `count_grouped_by_<group_col>` → `(Count, None, group_col)`
+/// - `sum_<col>_grouped_by_<group_col>` → `(Sum, Some(col), group_col)`
+/// - `avg_<col>_grouped_by_<group_col>` → likewise for avg/min/max
+///
+/// Returns `None` when the name has no `_grouped_by_` segment at all (so the
+/// caller can fall through to the ordinary derived-query surface). A name that
+/// *does* contain `_grouped_by_` but is otherwise malformed returns
+/// `Some((_, _, group_col))` only when well formed; malformedness is reported
+/// separately by the caller via [`parse_grouped_aggregate_name`]'s companion
+/// error path.
+fn parse_grouped_aggregate_name(name: &str) -> Option<(AggKind, Option<String>, String)> {
+    let (left, group_col) = name.split_once("_grouped_by_")?;
+    if group_col.is_empty() || group_col.contains("_grouped_by_") {
+        return None;
+    }
+    if left == "count" {
+        return Some((AggKind::Count, None, group_col.to_string()));
+    }
+    for (prefix, kind) in [
+        ("sum_", AggKind::Sum),
+        ("avg_", AggKind::Avg),
+        ("min_", AggKind::Min),
+        ("max_", AggKind::Max),
+    ] {
+        if let Some(col) = left.strip_prefix(prefix)
+            && !col.is_empty()
+        {
+            return Some((kind, Some(col.to_string()), group_col.to_string()));
+        }
+    }
+    None
+}
+
+/// Extract `(K, V)` from a declared `Vec<(K, V)>` return type.
+fn parse_vec_pair_type(ty: &syn::Type) -> Option<(syn::Type, syn::Type)> {
+    let syn::Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Vec" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    let syn::GenericArgument::Type(syn::Type::Tuple(tuple)) = args.args.first()? else {
+        return None;
+    };
+    if tuple.elems.len() != 2 {
+        return None;
+    }
+    let mut it = tuple.elems.iter();
+    let k = it.next()?.clone();
+    let v = it.next()?.clone();
+    Some((k, v))
+}
+
+/// If `ty` is `Option<T>`, return the inner `T`.
+fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+/// True if `ty` is exactly the bare path identifier `ident` (e.g. `i64`), with
+/// no generic arguments — used to enforce the exact width a `count`/`avg`
+/// aggregate deserializes into (#1364 review).
+fn type_is_bare_ident(ty: &syn::Type, ident: &str) -> bool {
+    let syn::Type::Path(p) = ty else { return false };
+    if p.qself.is_some() {
+        return false;
+    }
+    p.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == ident && s.arguments.is_empty())
+}
+
+/// True if `ty` is exactly `Option<inner>` where `inner` is the bare ident
+/// `inner_ident` (e.g. `Option<f64>`).
+fn type_is_option_of(ty: &syn::Type, inner_ident: &str) -> bool {
+    option_inner_type(ty).is_some_and(|inner| type_is_bare_ident(inner, inner_ident))
+}
+
+/// True if `ty`'s final path segment identifier is `ident`, ignoring any
+/// generic arguments — so it matches both `DateTime` and `DateTime<Utc>`. Used
+/// to detect a `timestamptz` group key (`DateTime<Utc>`) so `.bucket()`
+/// truncation can be pinned to UTC (#1364).
+fn type_last_segment_is(ty: &syn::Type, ident: &str) -> bool {
+    let syn::Type::Path(p) = ty else {
+        return false;
+    };
+    p.path.segments.last().is_some_and(|s| s.ident == ident)
+}
+
+/// Map a supported Rust type to its diesel `sql_types` path token, threading
+/// `Option<T>` to `Nullable<…>`. Returns `None` for unsupported types.
+fn diesel_sql_type_for(ty: &syn::Type) -> Option<TokenStream> {
+    match ty {
+        syn::Type::Reference(r) => diesel_sql_type_for(&r.elem),
+        syn::Type::Path(p) => {
+            let seg = p.path.segments.last()?;
+            let name = seg.ident.to_string();
+            let d = quote! { ::autumn_web::reexports::diesel::sql_types };
+            if name == "Option" {
+                let inner = option_inner_type(ty)?;
+                let inner_st = diesel_sql_type_for(inner)?;
+                return Some(quote! { #d::Nullable<#inner_st> });
+            }
+            let st = match name.as_str() {
+                "i16" => quote! { #d::SmallInt },
+                "i32" => quote! { #d::Integer },
+                "i64" => quote! { #d::BigInt },
+                "f32" => quote! { #d::Float },
+                "f64" => quote! { #d::Double },
+                "bool" => quote! { #d::Bool },
+                "String" | "str" => quote! { #d::Text },
+                "Uuid" => quote! { #d::Uuid },
+                "NaiveDate" => quote! { #d::Date },
+                "NaiveDateTime" => quote! { #d::Timestamp },
+                "NaiveTime" => quote! { #d::Time },
+                "DateTime" => quote! { #d::Timestamptz },
+                _ => return None,
+            };
+            Some(st)
+        }
+        _ => None,
+    }
+}
+
+/// Map a supported numeric Rust type to the Postgres type name used to `CAST`
+/// an aggregate result so it deserializes back into the declared value type
+/// (Postgres widens `SUM`/`AVG`, so an explicit cast keeps the round-trip
+/// exact). Returns `None` for unsupported types.
+fn pg_cast_type_for(ty: &syn::Type) -> Option<&'static str> {
+    let syn::Type::Path(p) = ty else { return None };
+    let name = p.path.segments.last()?.ident.to_string();
+    let pg = match name.as_str() {
+        "i16" => "smallint",
+        "i32" => "integer",
+        "i64" => "bigint",
+        "f32" => "real",
+        "f64" => "double precision",
+        _ => return None,
+    };
+    Some(pg)
+}
+
+/// A parsed grouped-aggregate declaration (#1364).
+///
+/// Like [`FindOrCreateSpec`], this is emitted as an inherent method on the
+/// `Pg*` struct — it returns a lazy `GroupedAggregate<'_, K, V>` builder rather
+/// than a trait finder — so it lives in its own spec list.
+struct GroupedAggregateSpec {
+    /// The declared method identifier, e.g. `sum_amount_grouped_by_user_id`.
+    fn_ident: Ident,
+    /// The declared key type `K` (the group column's Rust type).
+    key_type: syn::Type,
+    /// The declared value type `V`.
+    value_type: syn::Type,
+    /// Diesel `sql_type` for the group-column key.
+    key_sql_type: TokenStream,
+    /// Diesel `sql_type` for the aggregated value.
+    value_sql_type: TokenStream,
+    /// The SQL aggregate expression, e.g. `COUNT(*)` or
+    /// `CAST(SUM("amount") AS bigint)`.
+    agg_sql_expr: String,
+    /// The group column name (quoted-identifier-safe bare name).
+    group_col: String,
+    /// The aggregated numeric column name, if any (`None` for `count`). Guarded
+    /// against at-rest encryption alongside the group column (#1364).
+    value_col: Option<String>,
+    /// When set, generation emits a `compile_error!` with this message instead
+    /// of a method.
+    error: Option<String>,
+}
+
+/// A parsed `find_or_create_by_<field>[_and_<field>...]` declaration (#1382).
+///
+/// Unlike the [`DerivedQuery`] finders, this is emitted as an inherent async
+/// method on the `Pg*` struct (it returns `(Model, bool)` and takes an extra
+/// `new` insert value), so it lives in its own spec list rather than the trait
+/// method surface.
+struct FindOrCreateSpec {
+    /// The declared method identifier, e.g. `find_or_create_by_slug`.
+    fn_ident: Ident,
+    /// Lookup fields in declaration order, paired with the parameter type the
+    /// user declared for each field.
+    lookup_params: Vec<(Ident, syn::Type)>,
+    /// Subset of lookup fields whose parameter type is a string — routed
+    /// through the encrypted-column registry encoder at runtime, matching the
+    /// `find_by` derived-query surface (#805).
+    string_fields: std::collections::HashSet<String>,
+    /// When set, generation emits a `compile_error!` with this message instead
+    /// of a method (e.g. `_or_` was used, or a field lacks a matching
+    /// parameter). Race-safety requires a single unique constraint, so `_or_`
+    /// (which spans constraints) is rejected.
+    error: Option<String>,
+}
+
 #[allow(clippy::too_many_lines)]
 fn generate_derived_query_for_source(
     query: &DerivedQuery,
@@ -295,9 +833,26 @@ fn generate_derived_query_for_source(
             if string_fields.contains(&field.to_string()) {
                 let field_str = field.to_string();
                 let enc_ident = format_ident!("__autumn_q_{field}");
+                let norm_ident = format_ident!("__autumn_qn_{field}");
+                // #1379 AC3: canonicalize the lookup argument for `#[normalize]`
+                // columns so `find_by_email("  FOO@X.com ")` matches the stored
+                // `foo@x.com` row. Dispatches through the autoref-specialization
+                // probe, so it returns the raw value for non-normalized columns
+                // and for hand-written models that don't implement
+                // `NormalizedModel`. Runs *before* the encrypted-column encoder
+                // (a normalized + deterministic-encrypted column matches on the
+                // canonical form).
                 encode_lets.push(quote! {
+                    let #norm_ident = {
+                        #[allow(unused_imports)]
+                        use ::autumn_web::normalize::{SpezLookupNo as _, SpezLookupYes as _};
+                        ::autumn_web::normalize::SpezLookup::<#model_name>(
+                            ::core::marker::PhantomData, #field_str, &#param,
+                        )
+                        .spez_lookup()
+                    };
                     let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
-                        #table_name_str, #field_str, &#param,
+                        #table_name_str, #field_str, &#norm_ident,
                     )
                     .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
                         __e.to_string(),
@@ -471,11 +1026,17 @@ fn is_string_param_type(ty: &syn::Type) -> bool {
 /// - `op` — `"insert"`, `"update"`, or `"delete"`
 /// - `with_ctx` — when `true` a `MutationContext` variable named `ctx`
 ///   is in scope; actor / `request_id` are taken from it.
-///   When `false` the actor is hard-coded to `"system"` and `request_id` is `NULL`.
+///   When `false` the actor is read from the ambient current-actor scope
+///   (`Current::actor()`), falling back to `SYSTEM_ACTOR`, and `request_id` is
+///   `NULL`.
 /// - `record_expr` — token stream for the record value (implements `Serialize`)
 /// - `before_expr` — token stream for the "before" record value for updates
 ///   (same type; ignored for inserts/deletes).
 /// - `conn_ident` — identifier of the `&mut AsyncPgConnection`-like variable
+// #1996: the write path forks into pg / sqlite `backend_select!` arms (drop the
+// `$7::jsonb` cast, bind `recorded_at` explicitly on SQLite), which pushes this
+// token builder just past the line lint.
+#[allow(clippy::too_many_lines)]
 fn vh_insert_ts(
     table_name_str: &str,
     op: &str,
@@ -485,10 +1046,22 @@ fn vh_insert_ts(
     conn_ident: &TokenStream,
     model_ident: &proc_macro2::Ident,
 ) -> TokenStream {
+    // Choose the version-history actor. Hooked repos read the per-record
+    // `MutationContext` (already seeded from the ambient current actor, and
+    // overridable by a `before_*` hook). Non-hooked repos have no `ctx`, so they
+    // read the ambient current actor directly. Both fall back to the canonical
+    // `SYSTEM_ACTOR` when no actor is in scope.
     let actor_ts = if with_ctx {
-        quote! { ctx.actor.as_deref().unwrap_or("system") }
+        quote! {
+            ctx.actor
+                .clone()
+                .unwrap_or_else(|| ::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR.to_string())
+        }
     } else {
-        quote! { "system" }
+        quote! {
+            ::autumn_web::current::Current::actor()
+                .unwrap_or_else(|| ::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR.to_string())
+        }
     };
     let request_id_ts = if with_ctx {
         quote! { ctx.request_id.as_deref() }
@@ -544,23 +1117,54 @@ fn vh_insert_ts(
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_tenant_id()
             };
-            let __vh_actor: &str = #actor_ts;
+            let __vh_actor: ::std::string::String = #actor_ts;
             let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
-            ::autumn_web::reexports::diesel::sql_query(
-                "INSERT INTO _autumn_version_history \
-                 (table_name, tenant_id, record_id, op, actor, request_id, changes) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)"
-            )
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
-            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
-            .execute(#conn_ident)
-            .await
-            .map_err(::autumn_web::AutumnError::from)?;
+            // #1996: the Postgres arm keeps the `$7::jsonb` cast (`changes` is a
+            // JSONB column). The SQLite arm drops the cast (JSON is stored as
+            // TEXT) and additionally binds `recorded_at` explicitly: the DDL
+            // `DEFAULT CURRENT_TIMESTAMP` yields `YYYY-MM-DD HH:MM:SS` (no
+            // offset), which is not lexicographically comparable with the
+            // offset-bearing encoding diesel produces for a bound `DateTime<Utc>`
+            // filter value — binding the timestamp here makes stored and filter
+            // values share one encoding so the `recorded_at >= / <=` TEXT
+            // comparisons in `version_history()` stay monotonic.
+            ::autumn_web::backend_select! {
+                pg => {
+                    ::autumn_web::reexports::diesel::sql_query(
+                        "INSERT INTO _autumn_version_history \
+                         (table_name, tenant_id, record_id, op, actor, request_id, changes) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)"
+                    )
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
+                    .execute(#conn_ident)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                },
+                sqlite => {
+                    ::autumn_web::reexports::diesel::sql_query(
+                        "INSERT INTO _autumn_version_history \
+                         (table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+                    )
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, _>(::autumn_web::reexports::chrono::Utc::now())
+                    .execute(#conn_ident)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                },
+            }
         }
     }
 }
@@ -572,7 +1176,7 @@ fn vh_insert_ts(
 )]
 #[allow(clippy::cognitive_complexity)]
 pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let config = match parse_repo_args(attr) {
+    let mut config = match parse_repo_args(attr) {
         Ok(c) => c,
         Err(err) => return err.to_compile_error(),
     };
@@ -581,6 +1185,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(t) => t,
         Err(err) => return err.to_compile_error(),
     };
+
+    if config.broadcasts && config.hooks_type.is_none() {
+        config.hooks_type = Some(format_ident!("Pg{}InternalHooks", trait_def.ident));
+        config.generated_internal_hooks = true;
+    }
 
     let model_name = &config.model_name;
     let table_name = &config.table_name;
@@ -600,13 +1209,1350 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // #1841 owner-scoping: when the repository declares `owner = <column>`, we
+    // emit owner-filtered `list_scoped` / `search_page_scoped` methods so the
+    // generated `#[secured]` index/search never returns other users' rows. The
+    // column ident is bound here once; `owner_column.is_some()` gates every scoped
+    // emission below so an ordinary `#[repository]` (no `owner =`) is unaffected.
+    let owner_col_ident = config.owner_column.as_ref().map(|c| format_ident!("{c}"));
+
+    // ── #1369 dependent destroy/nullify ─────────────────────────────
+    //
+    // Every generated repository exposes an internal, connection-taking helper
+    // that applies a `DependentAction` to *this* model's rows selected by an
+    // arbitrary foreign-key column. It runs on the caller's connection (and
+    // therefore inside the caller's transaction), so a parent repository's
+    // `delete_by_id` can cascade to its children transactionally. The helper is
+    // generated for every repository (cheap, no callers when unused) so the
+    // parent side only needs the child repository *type* — it never has to know
+    // the child's Diesel schema module.
+    let dependent_child_helper = {
+        // Per-row DESTROY: mirror the repository delete path for one child id
+        // (`__cid`) on the caller's connection — load for-update (soft-delete
+        // aware), fire `before_delete`, apply the soft/hard delete mutation,
+        // record version history, and enqueue the durable commit hook. This is
+        // what makes `dependent = destroy` soft-delete-aware and hook-firing.
+        let destroy_before_delete = if config.hooks_type.is_some() {
+            quote! { self.hooks.before_delete(&mut ctx, &__record).await?; }
+        } else {
+            quote! {}
+        };
+        // #1369 AC4: a child declared `broadcasts = true` WITHOUT `commit_hooks`
+        // (the scaffolded live path) publishes its OOB delete fragment inline in
+        // the normal `delete_by_id` wrapper. The cascade helper bypasses that
+        // wrapper, so it must emit the same inline delete broadcast per cascaded
+        // child — otherwise live clients keep a stale fragment for a destroyed
+        // child. Commit-hook children enqueue the broadcast durably as before
+        // (unchanged), so only the broadcasts-only case needs the inline emit.
+        let dep_needs_broadcast = config.broadcasts && !commit_hooks_enabled;
+        // Version history / commit-hook enqueue / inline broadcast only run when a
+        // row was actually mutated; bind the affected-row count only when that
+        // gate is needed so hook-free, unversioned, non-broadcasting repos emit no
+        // unused binding.
+        let dep_needs_post = config.versioned || commit_hooks_enabled || dep_needs_broadcast;
+        let destroy_count_bind = if dep_needs_post {
+            quote! { let __n }
+        } else {
+            quote! { let _ }
+        };
+        // #1369 P1: the child destroy cascade follows the *parent's* delete kind.
+        // A child is soft-deleted only when it is a `#[soft_delete]` model AND the
+        // parent is being soft-deleted (`__parent_soft`) — leaving the parent row
+        // present so the child FK stays valid. When the parent is hard-deleted, a
+        // soft-delete child must be hard-deleted too: a soft-deleted child left
+        // pointing at a hard-deleted parent is both FK-invalid (NOT NULL FK) and a
+        // semantic orphan. Non-soft-delete children are always hard-deleted.
+        let destroy_mutation = if config.soft_delete {
+            quote! {
+                #destroy_count_bind = if __parent_soft {
+                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
+                    )
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                } else {
+                    ::autumn_web::reexports::diesel::delete(#table_ident::table.find(__cid))
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                };
+            }
+        } else {
+            quote! {
+                #destroy_count_bind = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(__cid))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+            }
+        };
+        let destroy_vh = if config.versioned {
+            vh_insert_ts(
+                table_name,
+                "delete",
+                true,
+                &quote! { __record },
+                None,
+                &quote! { conn },
+                model_name,
+            )
+        } else {
+            quote! {}
+        };
+        let destroy_commit_enqueue = if commit_hooks_enabled {
+            quote! {
+                let __autumn_commit_hook_record = __record.__autumn_commit_hook_to_value()?;
+                ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
+                    conn,
+                    Self::__autumn_repository_commit_hook_key(),
+                    "delete",
+                    ctx.idempotency_key.as_deref(),
+                    ::core::option::Option::None,
+                    &ctx,
+                    &__autumn_commit_hook_record,
+                )
+                .await?;
+            }
+        } else {
+            quote! {}
+        };
+        let destroy_register = if commit_hooks_enabled {
+            quote! { Self::__autumn_register_repository_commit_hooks(); }
+        } else {
+            quote! {}
+        };
+        // Live-child filter (`AND deleted_at IS NULL`), gated on the PARENT's
+        // delete kind at runtime (#1369). The filter applies only when the parent
+        // is being soft-deleted: the parent row survives, so an already
+        // soft-deleted child is logically gone and would cause no FK problem, and
+        // a live-only selection is correct. When the parent is HARD-deleted the
+        // filter is dropped so the cascade (and the restrict EXISTS probe) operate
+        // on EVERY physically-present child row — otherwise a pre-soft-deleted
+        // child whose NOT NULL FK still points at the parent would survive the
+        // filter and make the subsequent hard parent DELETE fail (destroy) or slip
+        // past the existence check as a raw DB 500 instead of a 409 (restrict).
+        // Non-soft-delete children have no `deleted_at` column, so no filter ever.
+        let destroy_live_filter = if config.soft_delete {
+            quote! { if __parent_soft { " AND \"deleted_at\" IS NULL" } else { "" } }
+        } else {
+            quote! { "" }
+        };
+        // The mutation context (`ctx`) is referenced by the before_delete hook,
+        // the version-history writer, and the commit-hook enqueue. Declare it —
+        // and import the hooks types — only when at least one of those is
+        // present, mirroring the no-hooks delete path so hook-free, unversioned
+        // repos emit no unused imports/bindings. `mut` is only required when a
+        // hook mutates it (before_delete); version-history reads it immutably.
+        let dep_ctx_needed = config.hooks_type.is_some() || dep_needs_post;
+        let dep_hooks_use = if config.hooks_type.is_some() {
+            quote! { use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks}; }
+        } else if dep_ctx_needed {
+            quote! { use ::autumn_web::hooks::{MutationContext, MutationOp}; }
+        } else {
+            quote! {}
+        };
+        let destroy_ctx_decl = if config.hooks_type.is_some() {
+            quote! { let mut ctx = MutationContext::new(MutationOp::Delete); }
+        } else if dep_ctx_needed {
+            quote! { let ctx = MutationContext::new(MutationOp::Delete); }
+        } else {
+            quote! {}
+        };
+        // #1369 AC4: inline OOB delete broadcast for a broadcasts-only child,
+        // built from the child record we already hold (`__record`) so no
+        // pre-fetch is needed. Mirrors the inline delete broadcast the normal
+        // `delete_by_id` wrapper emits (static/dynamic topic, tenant scoping,
+        // custom `broadcast_render`), keyed on the destroyed child record.
+        // #1369 broadcast timing: do NOT publish the cascaded child's OOB delete
+        // mid-transaction. If a later dependent action or the parent mutation
+        // fails and the tx rolls back, a mid-tx publish can't be retracted and
+        // clients would drop a fragment for a child that still exists. Instead,
+        // accumulate (topic, dom_id) into `__ret_broadcasts` and hand them back to
+        // the parent, which publishes them only AFTER the tx commits (mirroring
+        // the normal inline delete broadcast, which effectively fires post-commit
+        // for that single op). Commit-hook children defer via the durable outbox
+        // and are unaffected (they never accumulate here — no double publish).
+        let destroy_broadcast = if dep_needs_broadcast {
+            let base_topic = match generate_topic_format(
+                config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name),
+                &quote! { __broadcast_rec },
+            ) {
+                Ok(expr) => expr,
+                Err(err) => return err.to_compile_error(),
+            };
+            let topic_expr = if config.tenant_scoped {
+                quote! {
+                    ::std::format!(
+                        "tenant:{}:{}",
+                        ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
+                            &__broadcast_rec.tenant_id
+                        ),
+                        #base_topic
+                    )
+                }
+            } else {
+                base_topic
+            };
+            let model_prefix = to_snake_case(&config.model_name.to_string());
+            let dom_id_expr = if let Some(ref render_path) = config.broadcast_render {
+                quote! {
+                    ::autumn_web::htmx::extract_html_id(
+                        &{ #render_path(__broadcast_rec) }.into_string()
+                    )
+                    .unwrap_or_else(|| ::std::format!(
+                        "{}-{}",
+                        #model_prefix,
+                        ::autumn_web::repository::ModelPrimaryKey::primary_key_value(
+                            __broadcast_rec
+                        )
+                    ))
+                }
+            } else {
+                quote! {
+                    <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__broadcast_rec)
+                }
+            };
+            quote! {
+                {
+                    let __broadcast_rec: &#model_name = &__record;
+                    let __del_topic: ::std::string::String =
+                        ::std::string::ToString::to_string(&#topic_expr);
+                    let __del_id: ::std::string::String =
+                        ::std::string::ToString::to_string(&#dom_id_expr);
+                    __ret_broadcasts.push((__del_topic, __del_id));
+                }
+            }
+        } else {
+            quote! {}
+        };
+        // #1739 grandchild recursion: within the Destroy arm, after selecting a
+        // child row but before removing it, recurse into THIS model's own
+        // `dependent(...)` cascade keyed on the child's id, so grandchildren (and
+        // deeper) are destroyed/nullified inside the SAME transaction. Only
+        // `destroy` recurses: `delete_all` stays single-level (#1739 scope), and
+        // `nullify`/`restrict` remove no rows that could themselves own children.
+        // Restrict grandchildren are probed before mutating ones (mirroring the
+        // single-record restrict-first ordering); a restrict 409 anywhere in the
+        // tree rolls the whole transaction back. Cycle guard: `__visited` holds
+        // every (table, id) already on the destroy path; an already-seen row is
+        // skipped (see the per-row guard in the loop), so self-/mutual-referential
+        // graphs terminate rather than looping forever.
+        let has_dependents = !config.dependents.is_empty();
+        // The grandchildren follow this child's delete kind: a soft-delete child
+        // is only soft-deleted when its parent is (`__parent_soft`), so its own
+        // children inherit `__parent_soft`; a non-soft-delete child is always hard
+        // deleted, so its children cascade as a hard delete (`false`).
+        let child_soft_for_grandchildren = if config.soft_delete {
+            quote! { __parent_soft }
+        } else {
+            quote! { false }
+        };
+        let emit_grandchild_call = |dep: &DependentSpec| {
+            let child_repo = &dep.child_repo;
+            let fk = &dep.fk;
+            let action_variant = dep.action.variant_ident();
+            quote! {
+                {
+                    let __autumn_gc_repo = #child_repo::with_pool_untracked(
+                        ::core::clone::Clone::clone(&self.pool)
+                    );
+                    // The helper already returns a boxed `dyn Future` (see its
+                    // definition), so the recursive edge is type-erased and this
+                    // call needs no further boxing. The connection and visited set
+                    // are reborrowed; the future is awaited immediately so it never
+                    // outlives `__autumn_gc_repo`.
+                    __ret_broadcasts.extend(
+                        __autumn_gc_repo.__autumn_apply_dependent_on_conn(
+                            conn,
+                            #fk,
+                            __cid,
+                            ::autumn_web::repository::DependentAction::#action_variant,
+                            #child_soft_for_grandchildren,
+                            __path,
+                            __deleted,
+                            __physical,
+                        ).await?
+                    );
+                }
+            }
+        };
+        let grandchild_restrict_calls: ::std::vec::Vec<_> = config
+            .dependents
+            .iter()
+            .filter(|dep| dep.action == DependentAction::Restrict)
+            .map(&emit_grandchild_call)
+            .collect();
+        let grandchild_mutating_calls: ::std::vec::Vec<_> = config
+            .dependents
+            .iter()
+            .filter(|dep| dep.action != DependentAction::Restrict)
+            .map(&emit_grandchild_call)
+            .collect();
+        // #1739 (repo-attribute deps): compile-time recursion over
+        // `config.dependents`. Emitted ONLY when this repo declares
+        // `dependent(...)`. Codex round-5-A: the restrict PROBE and the mutating
+        // cascade are split into two token blocks so the caller can run the
+        // read-only restrict probe BEFORE the child's `before_delete` hook and
+        // the mutating (destroy/nullify) grandchildren AFTER it — see the Destroy
+        // arm below.
+        let compiletime_grandchild_restrict = quote! {
+            #(#grandchild_restrict_calls)*
+        };
+        let compiletime_grandchild_mutating = quote! {
+            #(#grandchild_mutating_calls)*
+        };
+        // Codex P1 (model-side deps): when this repo has NO repository-attribute
+        // `dependent(...)`, its grandchildren may be declared ONLY on the child
+        // model (via `#[has_many(..., dependent = ...)]`), which populates the
+        // runtime `Model::dependents()` slice but leaves `config.dependents`
+        // empty. The #1739 compile-time recursion above is then empty, so without
+        // this the child row would be deleted while its own children still
+        // FK-reference it (FK failure on a hard delete, or silent orphans). So
+        // consult THIS model's runtime specs and recurse into each grandchild,
+        // mirroring the top-level model-side dispatch: restrict-probe first (a
+        // 409 rolls the whole tx back), then mutating. Reuses the existing
+        // `__visited` (table, id) cycle-guard set, the boxed-future `fn`
+        // recursion (the `Send` edge stays erased through the fn-pointer), and
+        // the `__ret_broadcasts` deferred-broadcast buffer for grandchild
+        // broadcasts. For a model with no dependents this is a cheap no-op that
+        // iterates an empty `&[]`, so the plain path stays behavior-equivalent.
+        // Codex round-5-A: same restrict/mutating split as the compile-time path,
+        // for the model-declared runtime walk. #1800 case 2: the two blocks are now
+        // emitted in SEPARATE loops (the restrict probe pre-scans every selected
+        // child id before any child hook), so each block re-binds
+        // `__autumn_gc_rt_deps` independently rather than sharing one binding.
+        let runtime_grandchild_restrict = quote! {
+            // Inherent `dependents()` (real specs) shadows the blanket trait
+            // method (empty); unqualified so the shadow wins, `&[]` otherwise.
+            let __autumn_gc_rt_deps = #model_name::dependents();
+            for __autumn_gc_spec in __autumn_gc_rt_deps.iter().filter(|__s|
+                __s.action == ::autumn_web::repository::DependentAction::Restrict
+            ) {
+                __ret_broadcasts.extend(
+                    (__autumn_gc_spec.cascade)(
+                        &self.pool,
+                        conn,
+                        __cid,
+                        #child_soft_for_grandchildren,
+                        __path,
+                        __deleted,
+                        __physical,
+                    ).await?
+                );
+            }
+        };
+        let runtime_grandchild_mutating = quote! {
+            let __autumn_gc_rt_deps = #model_name::dependents();
+            for __autumn_gc_spec in __autumn_gc_rt_deps.iter().filter(|__s|
+                __s.action != ::autumn_web::repository::DependentAction::Restrict
+            ) {
+                __ret_broadcasts.extend(
+                    (__autumn_gc_spec.cascade)(
+                        &self.pool,
+                        conn,
+                        __cid,
+                        #child_soft_for_grandchildren,
+                        __path,
+                        __deleted,
+                        __physical,
+                    ).await?
+                );
+            }
+        };
+        // Precedence (mirrors the top-level rule exactly to avoid double-cascade):
+        // repository-attribute `config.dependents` WINS when present. So with
+        // repo-attribute deps we emit the #1739 compile-time recursion ONLY; with
+        // none we walk the runtime `Model::dependents()` ONLY. A grandchild is
+        // therefore never processed by both paths. Codex round-5-A: the restrict
+        // probe and mutating cascade are chosen as a matching pair so the Destroy
+        // arm can bracket the child `before_delete` hook between them.
+        let grandchild_restrict_cascade = if has_dependents {
+            compiletime_grandchild_restrict
+        } else {
+            runtime_grandchild_restrict
+        };
+        let grandchild_mutating_cascade = if has_dependents {
+            compiletime_grandchild_mutating
+        } else {
+            runtime_grandchild_mutating
+        };
+        // `use AutumnDependents` brings the blanket `dependents()` fallback into
+        // scope for the runtime walk (models without dependents), matching the
+        // top-level dispatch. Emitted only where the runtime walk is.
+        let dep_autumn_dependents_use = if has_dependents {
+            quote! {}
+        } else {
+            quote! { use ::autumn_web::repository::AutumnDependents as _; }
+        };
+
+        // Declaration + return of the deferred-broadcast buffer for the Destroy
+        // arm. A broadcasts-only child accumulates its own OOB delete fragments;
+        // additionally, when this repo has dependents (#1739), grandchild cascades
+        // return their broadcasts here to propagate up to the top-level parent for
+        // post-commit publishing. Repos with neither return an empty buffer.
+        // The Destroy arm always declares `__ret_broadcasts` now (hence `true`):
+        // with repo-attribute deps for the #1739 compile-time grandchild
+        // broadcasts (`has_dependents`), and without them for the Codex-P1
+        // runtime model-side grandchild walk, which always emits its
+        // `__ret_broadcasts.extend(...)` even though the loop is a no-op for a
+        // model with no dependents. `dep_needs_broadcast` still additionally
+        // drives this repo's own broadcasts-only child accumulation.
+        let needs_ret_buffer = true;
+        let destroy_ret_decl = if needs_ret_buffer {
+            quote! {
+                let mut __ret_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                    ::std::vec::Vec::new();
+            }
+        } else {
+            quote! {}
+        };
+        let destroy_ret_value = if needs_ret_buffer {
+            quote! { __ret_broadcasts }
+        } else {
+            quote! { ::std::vec::Vec::new() }
+        };
+        let destroy_post_mutation = if dep_needs_post {
+            quote! {
+                if __n != 0 {
+                    #destroy_vh
+                    #destroy_commit_enqueue
+                    #destroy_broadcast
+                }
+            }
+        } else {
+            quote! {}
+        };
+        // #1800 case 1: record every HANDLED row in the monotonic `__deleted` set
+        // (soft OR physical) so the bulk `delete_many` root dedup / hook
+        // double-fire guard skips a root already processed as another root's
+        // descendant — a soft-deleted descendant MUST land here or its
+        // `before_delete` fires a second time in the bulk root loop. Separately
+        // record ONLY physically-removed rows in `__physical`: a soft delete
+        // (`SET deleted_at`, when this is a `#[soft_delete]` child AND the parent is
+        // soft-deleted) leaves the row physically present, so the diamond
+        // revisit-skip (which consults `__physical`, not `__deleted`) must NOT see
+        // it — otherwise a LATER hard-delete path (reached through a hard-deleted
+        // sibling/parent in a mixed soft/hard diamond) would skip it, leaving a
+        // dangling FK or FK-failing the hard delete. A non-soft child, or a soft
+        // child under a HARD parent, is always physically deleted, so it is recorded
+        // in BOTH sets.
+        let destroy_deleted_mark = if config.soft_delete {
+            quote! {
+                __deleted.insert((#table_name, __cid));
+                if !__parent_soft {
+                    __physical.insert((#table_name, __cid));
+                }
+            }
+        } else {
+            quote! {
+                __deleted.insert((#table_name, __cid));
+                __physical.insert((#table_name, __cid));
+            }
+        };
+        // #1800 case 1 (companion guard): because a soft-deleted row is deliberately
+        // NOT recorded in `__physical` (only in the "all handled" `__deleted`), the
+        // Phase-2 revisit-skip — which consults `__physical` so the diamond's hard
+        // branch can still reach it — does NOT suppress a later SOFT re-visit of the
+        // SAME row (a pure-soft diamond), which would otherwise re-fire its
+        // `before_delete` hook and re-issue a no-op UPDATE. Skip it here instead: if
+        // this visit would soft-delete (`__parent_soft`) and the row is already
+        // soft-deleted, it is logically gone and nothing more is owed. A HARD
+        // re-visit (`!__parent_soft`) still proceeds to physically delete the row
+        // (the diamond's hard branch).
+        let destroy_soft_revisit_skip = if config.soft_delete {
+            quote! {
+                if __parent_soft && __record.deleted_at.is_some() {
+                    __path.remove(&(#table_name, __cid));
+                    continue;
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        quote! {
+            /// Apply a [`DependentAction`](::autumn_web::repository::DependentAction)
+            /// to this model's rows whose `__fk_column` equals `__parent_id`,
+            /// on the caller's connection/transaction. Framework plumbing for
+            /// `#[repository(..., dependent(...))]` (#1369); not a public API.
+            ///
+            /// `__parent_soft` is the parent repository's delete kind: `true`
+            /// when the parent is being soft-deleted, `false` when hard-deleted.
+            /// The `Destroy` action follows it so a soft-delete child is only
+            /// soft-deleted alongside a soft-deleted parent (see below).
+            ///
+            /// Returns the `(topic, dom_id)` OOB delete broadcasts accumulated for
+            /// `broadcasts = true` (non-commit-hook) children — the parent
+            /// publishes them only AFTER its transaction commits, so a rolled-back
+            /// cascade broadcasts nothing. Grandchild cascades (#1739) propagate
+            /// their broadcasts up through this same buffer. Empty for a repo with
+            /// no dependents and no broadcasting children.
+            ///
+            /// #1739: the `Destroy` cascade is recursive — for each destroyed
+            /// child it invokes the child's OWN `dependent(...)` cascade against
+            /// the same connection, so grandchildren (and deeper) are handled in
+            /// one transaction. `__visited` carries the (table, id) rows already on
+            /// the destroy path; an already-seen row is skipped, so self- and
+            /// mutual-referential graphs terminate. `delete_all` remains
+            /// single-level by design (#1739 scope).
+            // #1739: returns an explicitly boxed `dyn Future` rather than being an
+            // `async fn`. The Destroy cascade is recursive and, for a self- or
+            // mutual-referential `dependent(...)` graph, calls back into an
+            // `__autumn_apply_dependent_on_conn` of this same type. An `async fn`'s
+            // anonymous future cannot then be proven `Send` (the auto-trait check
+            // is circular: the future's `Send`-ness depends on itself), so the
+            // whole cascade — and every `delete_by_id` that drives it — would fail
+            // its `+ Send` bound. Returning a `Pin<Box<dyn Future + Send>>` erases
+            // the recursive edge behind a trait object whose `Send` is axiomatic,
+            // breaking the cycle while keeping the cascade `Send`.
+            #[doc(hidden)]
+            // Codex round-5-B split the single cycle set into an active-path stack
+            // plus a monotonic handled set; #1800 case 1 added the physical-delete
+            // subset, taking this framework-internal helper to 9 parameters; the
+            // extra guards are intentional (see the doc above).
+            #[allow(clippy::too_many_arguments)]
+            pub fn __autumn_apply_dependent_on_conn<'__dep>(
+                &'__dep self,
+                conn: &'__dep mut ::autumn_web::RuntimeConnection,
+                __fk_column: &'__dep str,
+                __parent_id: i64,
+                __action: ::autumn_web::repository::DependentAction,
+                __parent_soft: bool,
+                // Codex round-5-B + #1800 case 1: THREE guard sets threaded through
+                // the recursion.
+                // `__path` is the ACTIVE recursion stack — a (table, id) is pushed
+                // before descending into its children and popped once its subtree
+                // completes; it breaks self-/mutual-referential cycles ONLY.
+                // `__deleted` is a MONOTONIC set of every row HANDLED by the cascade
+                // — soft OR physical. The bulk `delete_many` root dedup / hook
+                // double-fire guard consults it so a root already processed as
+                // another root's descendant is neither re-cascaded nor re-hooked
+                // (this is why a soft-handled row MUST be recorded here — #1800).
+                // `__physical` is the subset of rows PHYSICALLY removed; the diamond
+                // traversal revisit-skip consults ONLY it, so a hard-delete path can
+                // still physically remove a row a soft-delete path merely marked
+                // `deleted_at` on (a mixed soft/hard diamond) without the "all
+                // handled" set suppressing it.
+                // Separating `__path` from the others is what lets a batch process a
+                // descendant root before its ancestor without the ancestor's cascade
+                // pre-skipping a still-referenced intermediate (the removed
+                // monotonic-preseed's immediate-FK bug). See the Destroy arm's
+                // guards below.
+                __path: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
+                __deleted: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
+                __physical: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
+            ) -> ::std::pin::Pin<::std::boxed::Box<
+                dyn ::std::future::Future<
+                    Output = ::autumn_web::AutumnResult<
+                        ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+                    >,
+                > + ::core::marker::Send + '__dep,
+            >> {
+                ::std::boxed::Box::pin(async move {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                #dep_hooks_use
+                #dep_autumn_dependents_use
+                let __table: &str = #table_name;
+                match __action {
+                    ::autumn_web::repository::DependentAction::Restrict => {
+                        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                        struct __AutumnDepExists {
+                            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Bool)]
+                            dep_present: bool,
+                        }
+                        // `AS dep_present` (not `AS exists`): `exists` is a
+                        // Postgres reserved word and would need quoting.
+                        // The live filter makes `restrict` soft-delete-aware: an
+                        // already-soft-deleted child must not block the parent
+                        // with a 409 (it is no longer a live orphan).
+                        let __q = format!(
+                            "SELECT EXISTS(SELECT 1 FROM \"{}\" WHERE \"{}\" = $1{}) AS dep_present",
+                            __table, __fk_column, #destroy_live_filter
+                        );
+                        let __row: __AutumnDepExists =
+                            ::autumn_web::reexports::diesel::sql_query(__q)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                                .get_result::<__AutumnDepExists>(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                        if __row.dep_present {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::conflict_msg(format!(
+                                    "cannot delete: dependent {} row(s) referencing this record \
+                                     via \"{}\".\"{}\" still exist (dependent = restrict)",
+                                    stringify!(#model_name), __table, __fk_column
+                                ))
+                            );
+                        }
+                        ::core::result::Result::Ok(::std::vec::Vec::new())
+                    }
+                    ::autumn_web::repository::DependentAction::Nullify => {
+                        let __q = format!(
+                            "UPDATE \"{}\" SET \"{}\" = NULL WHERE \"{}\" = $1",
+                            __table, __fk_column, __fk_column
+                        );
+                        ::autumn_web::reexports::diesel::sql_query(__q)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        ::core::result::Result::Ok(::std::vec::Vec::new())
+                    }
+                    ::autumn_web::repository::DependentAction::DeleteAll => {
+                        let __q = format!(
+                            "DELETE FROM \"{}\" WHERE \"{}\" = $1",
+                            __table, __fk_column
+                        );
+                        ::autumn_web::reexports::diesel::sql_query(__q)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        ::core::result::Result::Ok(::std::vec::Vec::new())
+                    }
+                    ::autumn_web::repository::DependentAction::Destroy => {
+                        // Recursive cascade (#1739): each child row's mutation is
+                        // applied inline, and BEFORE that mutation this repo's own
+                        // `dependent(...)` cascade is invoked against the child id,
+                        // so grandchildren (and deeper) are destroyed/nullified
+                        // within the same transaction. A `__visited` (table, id)
+                        // set breaks self-/mutual-referential cycles.
+                        #destroy_register
+                        #destroy_ret_decl
+                        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                        struct __AutumnDepId {
+                            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                            id: i64,
+                        }
+                        // Codex P2 ("Lock children before the restrict pre-scan"):
+                        // this id selection acquires `FOR UPDATE` on every selected
+                        // child row BEFORE the read-only restrict pre-scan below runs
+                        // its `EXISTS` probes. Under READ COMMITTED an FK insert of a
+                        // `restrict` grandchild takes a `FOR KEY SHARE` lock on the
+                        // referenced child row; holding `FOR UPDATE` on that row here
+                        // blocks such an insert until this transaction commits/rolls
+                        // back, so a concurrent grandchild cannot slip in between the
+                        // pre-scan `EXISTS` probe and either the Phase-2 child reload /
+                        // `before_delete` hook or the child delete. The Phase-2 reload
+                        // still calls `.for_update()`, but that is now a re-lock of a
+                        // row already held (a no-op) rather than the FIRST lock — the
+                        // TOCTOU window between probe and hook/delete is closed. The
+                        // lock is hoisted from Phase 2 to here (same parent -> child
+                        // order, same rows), so it introduces no new lock-ordering /
+                        // deadlock class. `ORDER BY id` also makes the lock acquisition
+                        // order deterministic across concurrent cascades. This covers
+                        // the single `delete_by_id` path and both `delete_many` bulk
+                        // paths (they all reach this shared helper), and both soft and
+                        // hard child deletes (the `#destroy_live_filter` gate is applied
+                        // BEFORE `FOR UPDATE`, so the locked row set matches the rows
+                        // the pre-scan + mutating pass operate on).
+                        // The `FOR UPDATE` locking clause is emitted only on
+                        // Postgres. `SQLite` rejects `SELECT … FOR UPDATE`
+                        // outright, and it needs no such clause: its single-writer
+                        // database-level lock already serializes concurrent
+                        // cascades (the same rationale that degrades the DSL
+                        // `maybe_for_update!` seam to a plain read on `SQLite`).
+                        // The suffix is selected in autumn-web's compilation via
+                        // `backend_select!`, so the Postgres SQL is byte-identical
+                        // to before and the `SQLite` form simply drops the clause.
+                        let __for_update: &str = ::autumn_web::backend_select! {
+                            pg => { " FOR UPDATE" },
+                            sqlite => { "" },
+                        };
+                        let __q = format!(
+                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id{}",
+                            __table, __fk_column, #destroy_live_filter, __for_update
+                        );
+                        let __ids: ::std::vec::Vec<__AutumnDepId> =
+                            ::autumn_web::reexports::diesel::sql_query(__q)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                                .load::<__AutumnDepId>(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                        // #1800 case 2: PRE-SCAN pass. Probe the `restrict`
+                        // grandchildren of EVERY selected child id BEFORE any child
+                        // `before_delete` hook fires. Codex round-5-A already ordered
+                        // a child's own grandchild restrict ahead of that SAME child's
+                        // hook, but the probe was still inside the per-child mutating
+                        // loop — so with multiple siblings an EARLIER sibling's
+                        // before_delete fired and only THEN a LATER sibling's restrict
+                        // grandchild returned the 409. The transaction rolls back, but
+                        // a non-transactional hook side effect does not. Hoisting the
+                        // read-only probe into its own pass over all ids closes that
+                        // window; the probe mutates neither `__path` nor `__deleted`
+                        // (a `restrict` action is a pure `SELECT EXISTS`), so it is
+                        // safe to run ahead of — and without re-running in — the
+                        // mutating pass below.
+                        for __row in &__ids {
+                            let __cid = __row.id;
+                            // #1800 (Codex "Re-probe restricts on hard revisits"):
+                            // skip a row already PHYSICALLY removed elsewhere (its
+                            // restrict grandchildren, if any, were probed on that
+                            // path). This consults `__physical`, NOT the "all handled"
+                            // `__deleted`, to stay consistent with the Phase-2 diamond
+                            // revisit-skip below: a row merely SOFT-deleted on an
+                            // earlier path is still in `__deleted` but NOT in
+                            // `__physical`, so a later HARD-delete revisit (mixed
+                            // soft/hard diamond) still re-runs this restrict pre-scan.
+                            // If the pre-scan keyed on `__deleted` it would skip the
+                            // probe while Phase-2 (keyed on `__physical`) still hard-
+                            // deletes the row — firing the child hook and falling
+                            // through to a raw FK failure instead of the typed 409
+                            // when the row has a soft-deleted restrict dependent. The
+                            // hard-path probe drops the live filter (`__parent_soft`
+                            // is false on that path), so it INCLUDES the soft-deleted
+                            // dependent and returns the 409 before any hook. The probe
+                            // body may be empty (no restrict grandchildren), so this is
+                            // written as a positive guard rather than an early
+                            // `continue` (which clippy flags as redundant when it is
+                            // the loop's last statement).
+                            if !__physical.contains(&(#table_name, __cid)) {
+                                #grandchild_restrict_cascade
+                            }
+                        }
+                        // Phase 2: now that every sibling's restrict grandchildren
+                        // have passed, fire hooks and mutate.
+                        for __row in __ids {
+                            let __cid = __row.id;
+                            // Codex round-5-B + #1800 case 1: the diamond traversal
+                            // revisit-skip. Skip a row already PHYSICALLY removed
+                            // (genuinely gone) — dedup across independent batch roots
+                            // / branches. This consults `__physical`, NOT the "all
+                            // handled" `__deleted`: a row soft-deleted on an earlier
+                            // path is NOT physically gone, so a later HARD path (mixed
+                            // soft/hard diamond) must still reach and physically remove
+                            // it. A redundant SOFT re-visit is instead caught by the
+                            // `__record.deleted_at` guard below (once reloaded), so a
+                            // soft-handled row is not re-hooked either.
+                            if __physical.contains(&(#table_name, __cid)) {
+                                continue;
+                            }
+                            // #1739 cycle guard (now the ACTIVE-path stack): skip a
+                            // (table, id) already on the current destroy path. `insert`
+                            // returns false when the row is already present, so a self-
+                            // or mutual-reference (e.g. a grandchild pointing back at an
+                            // ancestor) is not re-entered and the traversal terminates.
+                            // Pushed here before descending; popped after this row's
+                            // subtree completes (see the `__path.remove` below), so a
+                            // completed sibling/root never suppresses a later cascade.
+                            if !__path.insert((#table_name, __cid)) {
+                                continue;
+                            }
+                            // #1369: reload the EXACT id the (parent-soft-gated)
+                            // selection returned — do NOT re-apply `#sd_filter`
+                            // (`deleted_at IS NULL`) here. On a hard parent delete
+                            // the selection intentionally includes already
+                            // soft-deleted children (their FK still references the
+                            // parent), so a live-only reload would return `None`,
+                            // skip the hard delete, and leave the row to FK-fail
+                            // the parent DELETE. The id set is authoritative for
+                            // the parent kind; the row is locked with `for_update`.
+                            let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid))
+
+                                .first::<#model_name>(conn)
+                                .await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            if let ::core::option::Option::Some(__record) = __record {
+                                // #1800 case 1: skip a redundant SOFT re-visit of an
+                                // already-soft-deleted row (it is not in `__deleted`).
+                                #destroy_soft_revisit_skip
+                                #destroy_ctx_decl
+                                // #1800 case 2: this child's own `restrict`
+                                // grandchildren were already probed in the pre-scan
+                                // pass above (read-only 409), so the child
+                                // `before_delete` hook only ever fires once every
+                                // reachable sibling restrict has passed.
+                                #destroy_before_delete
+                                // #1739: mutate this child's OWN dependents
+                                // (grandchildren) before removing the child row, so
+                                // a hard delete never leaves an FK-dangling
+                                // grandchild and never FK-fails the child delete.
+                                #grandchild_mutating_cascade
+                                #destroy_mutation
+                                // #1800 case 1: record the row as gone ONLY when it
+                                // was physically deleted (a soft-deleted row stays
+                                // reachable for a later hard-delete path).
+                                #destroy_deleted_mark
+                                #destroy_post_mutation
+                            }
+                            // Codex round-5-B: pop this row off the ACTIVE path once
+                            // its whole subtree is processed, so it only ever blocks
+                            // re-entry WHILE on the recursion stack (cycle-break), never
+                            // afterwards. Runs whether or not the row was still present.
+                            __path.remove(&(#table_name, __cid));
+                        }
+                        ::core::result::Result::Ok(#destroy_ret_value)
+                    }
+                }
+                })
+            }
+        }
+    };
+
+    // #1740 + Codex P1: bulk `delete_many` dependent cascade. `delete_many`
+    // historically bypassed `dependent(...)` entirely (a plain bulk parent
+    // delete), silently orphaning children. These tokens splice the SAME cascade
+    // the single-record delete path runs into both `delete_many_body` codegen
+    // branches (hooks and no-hooks). A repository-attribute `dependent(...)`
+    // drives it at compile time; a model-declared `#[has_many(dependent = ...)]`
+    // drives it at run time via `Model::dependents()` (Codex P1). A model with no
+    // dependents at all keeps its exact prior bulk codegen (byte-identical plain
+    // path, `()` tx return). Correctness over raw throughput: children are
+    // cascaded per parent row via the shared `__autumn_apply_dependent_on_conn`
+    // helper (so `destroy` recurses into grandchildren for free, #1739), which is
+    // the "per row" tradeoff called out in the issue.
+    //
+    // The parent's delete kind drives the child `destroy` cascade: soft when the
+    // parent repo is `#[soft_delete]` (its bulk path soft-deletes), hard otherwise.
+    let delete_many_parent_soft_lit = if config.soft_delete {
+        quote! { true }
+    } else {
+        quote! { false }
+    };
+    let emit_delete_many_cascade_call = |dep: &DependentSpec| {
+        let child_repo = &dep.child_repo;
+        let fk = &dep.fk;
+        let action_variant = dep.action.variant_ident();
+        quote! {
+            let __autumn_dep_repo = #child_repo::with_pool_untracked(
+                ::core::clone::Clone::clone(&self.pool)
+            );
+            __autumn_dep_broadcasts.extend(
+                __autumn_dep_repo
+                    .__autumn_apply_dependent_on_conn(
+                        conn,
+                        #fk,
+                        __autumn_pid,
+                        ::autumn_web::repository::DependentAction::#action_variant,
+                        #delete_many_parent_soft_lit,
+                        &mut __autumn_path,
+                        &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
+                    )
+                    .await?
+            );
+        }
+    };
+    let delete_many_restrict_calls: ::std::vec::Vec<_> = config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action == DependentAction::Restrict)
+        .map(&emit_delete_many_cascade_call)
+        .collect();
+    let delete_many_mutating_calls: ::std::vec::Vec<_> = config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action != DependentAction::Restrict)
+        .map(&emit_delete_many_cascade_call)
+        .collect();
+    // The affected parents are (re)loaded, tenant- and live-filtered and
+    // row-locked, exactly as the single-record path locks its parent, so the
+    // cascade runs only for rows this call actually deletes (never for a
+    // wrong-tenant or already-soft-deleted id present in the input slice).
+    let delete_many_live_filter = if config.soft_delete {
+        quote! { .filter(#table_ident::deleted_at.is_null()) }
+    } else {
+        quote! {}
+    };
+    let delete_many_preload_chunk = if config.tenant_scoped {
+        quote! {
+            let __autumn_dep_q = #table_ident::table
+                .filter(#table_ident::id.eq_any(chunk))
+                #delete_many_live_filter;
+            let __autumn_dep_rows: ::std::vec::Vec<#model_name> =
+                if let ::core::option::Option::Some(t) = tenant_id {
+                    ::autumn_web::maybe_for_update!(__autumn_dep_q.filter(#table_ident::tenant_id.eq(t)))
+                        .load::<#model_name>(conn).await
+                } else {
+                    ::autumn_web::maybe_for_update!(__autumn_dep_q).load::<#model_name>(conn).await
+                }
+                .map_err(::autumn_web::AutumnError::from)?;
+        }
+    } else {
+        quote! {
+            let __autumn_dep_rows: ::std::vec::Vec<#model_name> =
+                ::autumn_web::maybe_for_update!(#table_ident::table
+                    .filter(#table_ident::id.eq_any(chunk))
+                    #delete_many_live_filter)
+
+                    .load::<#model_name>(conn).await
+                    .map_err(::autumn_web::AutumnError::from)?;
+        }
+    };
+    // Shared preamble: preload the affected (tenant/live-filtered, row-locked)
+    // parents and collect their ids, and declare the two cascade-guard sets +
+    // deferred-broadcast buffer. Used by BOTH the compile-time (repo-attribute)
+    // and runtime (Codex P1, model-declared) cascade blocks.
+    //
+    // Codex round-5-B: the bulk cascade threads TWO guard sets, NOT one monotonic
+    // visited set. `__autumn_path` is the ACTIVE recursion stack (pushed before a
+    // node's own cascade, popped right after — cycle-break ONLY); `__autumn_deleted`
+    // is the monotonic set of rows actually removed. The removed round-2/round-4
+    // monotonic pre-seed marked a batch root visited BEFORE it was deleted, so a
+    // self-referential `dependent = destroy` batch that happened to process a
+    // descendant root before its ancestor made the ancestor's cascade skip that
+    // descendant while deleting the intermediate it still references — tripping an
+    // IMMEDIATE foreign-key constraint. With the split, a descendant root's own
+    // Phase-2 iteration pushes then pops itself on `__autumn_path`, so it is NOT on
+    // the path (and not yet in `__autumn_deleted`) when the ancestor's cascade later
+    // reaches it: the ancestor cascades it deepest-first (no FK), and once it is
+    // truly removed `__autumn_deleted` skips it everywhere after (no double delete,
+    // no double hook — including the bulk-root hook loop, which consults it too).
+    // Cycles still terminate via `__autumn_path`.
+    let delete_many_collect_parents = quote! {
+        let mut __autumn_path: ::std::collections::HashSet<(&'static str, i64)> =
+            ::std::collections::HashSet::new();
+        let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+            ::std::collections::HashSet::new();
+        // #1800 case 1: the physical-delete subset, consulted only by the diamond
+        // revisit-skip inside the leaf executor (not by the bulk root dedup, which
+        // uses the "all handled" `__autumn_deleted`).
+        let mut __autumn_physically_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+            ::std::collections::HashSet::new();
+        let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+            ::std::vec::Vec::new();
+        let mut __autumn_dep_parent_ids: ::std::vec::Vec<i64> = ::std::vec::Vec::new();
+        for chunk in ids.chunks(1000) {
+            #delete_many_preload_chunk
+            __autumn_dep_parent_ids.extend(__autumn_dep_rows.iter().map(|__r| __r.id));
+        }
+    };
+    // Compile-time (repository-attribute `dependent(...)`) bulk cascade, spliced
+    // inside the transaction BEFORE the bulk parent delete. Restrict probes for
+    // every parent run first (a 409 rolls the whole transaction back before any
+    // mutating action), then the mutating dependents.
+    let delete_many_compiletime_cascade = quote! {
+        #delete_many_collect_parents
+        // Phase 1: probe all `restrict` dependents for every parent first.
+        for &__autumn_pid in &__autumn_dep_parent_ids {
+            #(#delete_many_restrict_calls)*
+        }
+        // Phase 2: mutating dependents per parent, in declaration order.
+        for &__autumn_pid in &__autumn_dep_parent_ids {
+            // Codex round-5-B: a root already cascade-deleted as ANOTHER root's
+            // descendant is genuinely gone — skip it (its whole subtree was already
+            // handled deepest-first by that ancestor). Do NOT monotonically pre-seed
+            // it; instead push it onto the ACTIVE path only for the span of its own
+            // cascade (cycle-break for a self-referential child pointing back at it),
+            // then pop. A later ancestor can then still cascade this root deepest-first
+            // instead of pre-skipping a still-referenced intermediate (immediate-FK).
+            if __autumn_deleted.contains(&(#table_name, __autumn_pid)) {
+                continue;
+            }
+            __autumn_path.insert((#table_name, __autumn_pid));
+            #(#delete_many_mutating_calls)*
+            __autumn_path.remove(&(#table_name, __autumn_pid));
+        }
+    };
+    // Runtime (model-declared `#[has_many(dependent = ...)]`) bulk cascade
+    // (Codex P1). When the repository declares NO `dependent(...)`, `delete_many`
+    // must mirror the single-record `delete_by_id` runtime dispatch: walk the
+    // model's `Model::dependents()` specs per parent — restrict-probe first, then
+    // mutating — reusing the SAME leaf executor / boxed-future recursion /
+    // deferred-broadcast buffer as the compile-time path. Requires `__autumn_rt_deps`
+    // (the `Model::dependents()` slice) to be bound in the enclosing scope.
+    let delete_many_runtime_cascade = quote! {
+        #delete_many_collect_parents
+        // Phase 1: probe every parent's `restrict` dependents first.
+        for &__autumn_pid in &__autumn_dep_parent_ids {
+            for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
+                __s.action == ::autumn_web::repository::DependentAction::Restrict
+            ) {
+                __autumn_dep_broadcasts.extend(
+                    (__autumn_spec.cascade)(
+                        &self.pool,
+                        conn,
+                        __autumn_pid,
+                        #delete_many_parent_soft_lit,
+                        &mut __autumn_path,
+                        &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
+                    )
+                    .await?
+                );
+            }
+        }
+        // Phase 2: mutating dependents per parent, in declaration order.
+        for &__autumn_pid in &__autumn_dep_parent_ids {
+            // Codex round-5-B (mirrors the compile-time block): skip a root already
+            // cascade-deleted as another root's descendant; otherwise bracket its own
+            // cascade with an ACTIVE-path push/pop (cycle-break only), NOT a monotonic
+            // pre-seed — so a later ancestor can still cascade it deepest-first without
+            // pre-skipping a still-referenced intermediate (immediate-FK).
+            if __autumn_deleted.contains(&(#table_name, __autumn_pid)) {
+                continue;
+            }
+            __autumn_path.insert((#table_name, __autumn_pid));
+            for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
+                __s.action != ::autumn_web::repository::DependentAction::Restrict
+            ) {
+                __autumn_dep_broadcasts.extend(
+                    (__autumn_spec.cascade)(
+                        &self.pool,
+                        conn,
+                        __autumn_pid,
+                        #delete_many_parent_soft_lit,
+                        &mut __autumn_path,
+                        &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
+                    )
+                    .await?
+                );
+            }
+            __autumn_path.remove(&(#table_name, __autumn_pid));
+        }
+    };
+    // When a cascade runs, the transaction returns the deferred child broadcasts
+    // so they can be published post-commit (a rolled-back cascade publishes
+    // nothing). These "cascade" variants of the tx bind / return / publish / tail
+    // tokens are shared by the compile-time and runtime cascade forms; the "plain"
+    // (no-cascade) forms return `()` exactly as before (byte-identical bulk
+    // codegen for a model with no dependents at all).
+    let delete_many_cascade_tx_bind = quote! { let __autumn_dep_broadcasts = };
+    let delete_many_cascade_tx_ok = quote! { Ok(__autumn_dep_broadcasts) };
+    let delete_many_cascade_post_publish = quote! {
+        ::autumn_web::repository::publish_deferred_dependent_broadcasts(__autumn_dep_broadcasts);
+        // A cascaded `destroy` child may have enqueued a commit hook in the
+        // same transaction; kick the durable dispatcher (idempotent).
+        ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+    };
+    // The no-hooks `delete_many` body ends with the transaction as its tail
+    // expression (`... .await`). With a cascade it must instead await-and-bind,
+    // then publish the deferred broadcasts after commit; the plain form keeps the
+    // exact prior `.await` tail (returning the transaction's Result).
+    let delete_many_cascade_no_hooks_tail = quote! {
+        ?;
+        ::core::mem::drop(conn);
+        #delete_many_cascade_post_publish
+        Ok(())
+    };
+
     // Parse derived query methods from trait body
     let mut derived_trait_methods = Vec::new();
     let mut derived_impl_methods = Vec::new();
+    // §1382: race-safe `find_or_create_by_*` declarations. Collected here and
+    // codegen'd near the batch-feature bindings (once `tenant_query_filter`
+    // is in scope), then spliced into the inherent `impl Pg*` block.
+    let mut find_or_create_specs: Vec<FindOrCreateSpec> = Vec::new();
+    // §1364: typed grouped aggregate declarations. Collected here and codegen'd
+    // near the batch-feature bindings (once `tenant_query_filter` is in scope),
+    // then spliced into the inherent `impl Pg*` block as lazy builder methods.
+    let mut grouped_aggregate_specs: Vec<GroupedAggregateSpec> = Vec::new();
+    // §1d: per-shard helpers for derived read methods that fan out under
+    // across_tenants. Emitted into the inherent impl (a trait impl cannot hold
+    // non-trait members), so kept in a separate list.
+    let mut derived_one_shard_helpers = Vec::new();
+
+    // §1d: cross-shard reject for derived *write* methods (delete_by_*). Writes
+    // cannot be fanned out (no cross-shard transaction), so reject under
+    // across_tenants on a sharded repo instead of silently hitting one shard.
+    // Empty (zero-cost) unless sharded.
+    let derived_cross_shard_write_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants && self.__autumn_shards.is_some() {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard derived writes are not supported: across_tenants() cannot be \
+                         used for mutation on a sharded repository"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     for item in &trait_def.items {
         if let TraitItem::Fn(method) = item {
             let method_name = method.sig.ident.to_string();
+
+            // §1364: `<agg>_[<col>_]grouped_by_<group_col>`. Parsed and
+            // codegen'd separately as an inherent method returning a lazy
+            // `GroupedAggregate<'_, K, V>` builder (like find_or_create_by, not
+            // a trait finder). Intercepted before the derived-query surface so
+            // `count_grouped_by_x` is never mistaken for a `count_by_` finder.
+            if method_name.contains("_grouped_by_") {
+                let fn_ident = method.sig.ident.clone();
+
+                // Every grouped-aggregate method must declare its pair type as
+                // the return type so the macro can bake concrete SQL types.
+                let declared_pair = match &method.sig.output {
+                    syn::ReturnType::Type(_, ty) => parse_vec_pair_type(ty),
+                    syn::ReturnType::Default => None,
+                };
+                let parsed = parse_grouped_aggregate_name(&method_name);
+
+                // Sensible fallbacks used only on the error path (so the spec is
+                // still well-formed for `compile_error!` emission).
+                let unit_ty: syn::Type = syn::parse_quote!(());
+                let mut error: Option<String>;
+                let mut key_type = unit_ty.clone();
+                let mut value_type = unit_ty.clone();
+                let mut key_sql_type = quote! { () };
+                let mut value_sql_type = quote! { () };
+                let mut agg_sql_expr = String::new();
+                let mut group_col = String::new();
+                let mut value_col: Option<String> = None;
+
+                match (parsed, declared_pair) {
+                    (None, _) => {
+                        error = Some(format!(
+                            "`{method_name}` is not a valid grouped-aggregate name: use \
+                             `count_grouped_by_<group_col>` or \
+                             `<sum|avg|min|max>_<num_col>_grouped_by_<group_col>`"
+                        ));
+                    }
+                    (Some(_), None) => {
+                        error = Some(format!(
+                            "`{method_name}` must declare its result type as `-> Vec<(K, V)>` \
+                             so the aggregate's key/value SQL types are known, e.g. \
+                             `fn {method_name}() -> Vec<(i64, Option<i64>)>;`"
+                        ));
+                    }
+                    (Some((kind, num_col, gcol)), Some((k, v))) => {
+                        group_col = gcol;
+                        value_col.clone_from(&num_col);
+                        let value_inner = option_inner_type(&v).unwrap_or(&v).clone();
+
+                        // Numeric-column presence must match the aggregate, and
+                        // sum/min/max/avg need a numeric value type to cast to.
+                        error = match (kind, &num_col) {
+                            (AggKind::Count, Some(_)) => Some(format!(
+                                "`{method_name}`: count takes no numeric column — use \
+                                 `count_grouped_by_<group_col>`"
+                            )),
+                            (_, None) if !matches!(kind, AggKind::Count) => Some(format!(
+                                "`{method_name}`: {kw} needs a numeric column — use \
+                                 `{kw}_<num_col>_grouped_by_<group_col>`",
+                                kw = kind.keyword()
+                            )),
+                            _ => None,
+                        };
+
+                        // Nullable group keys are unsupported (#1364 review): a
+                        // `K = Option<T>` makes `key_sql_type` `Nullable<T>`, and
+                        // then filter binds wrap it again into
+                        // `Nullable<Nullable<T>>`, producing an opaque diesel
+                        // type error. The group column must be NOT NULL.
+                        if error.is_none() && option_inner_type(&k).is_some() {
+                            error = Some(format!(
+                                "`{method_name}`: nullable group keys are unsupported — \
+                                 the group column must be NOT NULL, so declare `K` as `T`, \
+                                 not `Option<T>`"
+                            ));
+                        }
+
+                        // The declared value type must EXACTLY match the type the
+                        // aggregate casts to (#1364 review). `count` always
+                        // produces `bigint` (i64) and `avg` always produces
+                        // `double precision` (f64); QueryableByName does not check
+                        // column OIDs, so a mismatched width silently reinterprets
+                        // the raw bytes as garbage (e.g. float bytes read as i64).
+                        if error.is_none() {
+                            match kind {
+                                AggKind::Count if !type_is_bare_ident(&v, "i64") => {
+                                    error = Some(format!(
+                                        "`{method_name}`: count must declare its value type as \
+                                         `i64` (it produces `COUNT(*)` → bigint); a different \
+                                         width silently misreads the result, e.g. \
+                                         `fn {method_name}() -> Vec<(K, i64)>;`"
+                                    ));
+                                }
+                                AggKind::Avg if !type_is_option_of(&v, "f64") => {
+                                    error = Some(format!(
+                                        "`{method_name}`: avg must declare its value type as \
+                                         `Option<f64>` (it always casts to double precision); a \
+                                         different width silently reinterprets the float bytes as \
+                                         garbage, e.g. `fn {method_name}() -> Vec<(K, Option<f64>)>;`"
+                                    ));
+                                }
+                                AggKind::Sum | AggKind::Min | AggKind::Max
+                                    if option_inner_type(&v).is_none() =>
+                                {
+                                    // SUM/MIN/MAX over an empty or all-NULL group
+                                    // returns SQL NULL, which QueryableByName
+                                    // cannot deserialize into a non-nullable
+                                    // value — it would fail at runtime. Force the
+                                    // declaration to be nullable (#1364 review).
+                                    error = Some(format!(
+                                        "`{method_name}`: {kw} must declare its value type as \
+                                         `Option<T>` for a numeric `T` (it returns SQL NULL over \
+                                         an empty or all-NULL group), e.g. \
+                                         `fn {method_name}() -> Vec<(K, Option<T>)>;`",
+                                        kw = kind.keyword()
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // Build the aggregate SQL, casting so the result
+                        // deserializes back into the declared value type
+                        // (Postgres widens SUM/AVG).
+                        if error.is_none() {
+                            agg_sql_expr = match kind {
+                                AggKind::Count => "COUNT(*)".to_string(),
+                                AggKind::Avg => {
+                                    format!(
+                                        "CAST(AVG(\"{}\") AS double precision)",
+                                        num_col.as_ref().unwrap()
+                                    )
+                                }
+                                AggKind::Sum | AggKind::Min | AggKind::Max => {
+                                    if let Some(pg) = pg_cast_type_for(&value_inner) {
+                                        let f = match kind {
+                                            AggKind::Sum => "SUM",
+                                            AggKind::Min => "MIN",
+                                            _ => "MAX",
+                                        };
+                                        format!(
+                                            "CAST({f}(\"{}\") AS {pg})",
+                                            num_col.as_ref().unwrap()
+                                        )
+                                    } else {
+                                        error = Some(format!(
+                                            "`{method_name}`: unsupported {kw} value type — \
+                                             the value must be `Option<T>` for a numeric `T` \
+                                             (i16/i32/i64/f32/f64)",
+                                            kw = kind.keyword()
+                                        ));
+                                        String::new()
+                                    }
+                                }
+                            };
+                        }
+
+                        // Resolve concrete diesel SQL types for key + value.
+                        if error.is_none() {
+                            match diesel_sql_type_for(&k) {
+                                Some(st) => key_sql_type = st,
+                                None => {
+                                    error = Some(format!(
+                                        "`{method_name}`: unsupported group-column key type `{}`",
+                                        k.to_token_stream()
+                                    ));
+                                }
+                            }
+                        }
+                        if error.is_none() {
+                            match diesel_sql_type_for(&v) {
+                                Some(st) => value_sql_type = st,
+                                None => {
+                                    error = Some(format!(
+                                        "`{method_name}`: unsupported aggregate value type `{}`",
+                                        v.to_token_stream()
+                                    ));
+                                }
+                            }
+                        }
+
+                        key_type = k;
+                        value_type = v;
+                    }
+                }
+
+                grouped_aggregate_specs.push(GroupedAggregateSpec {
+                    fn_ident,
+                    key_type,
+                    value_type,
+                    key_sql_type,
+                    value_sql_type,
+                    agg_sql_expr,
+                    group_col,
+                    value_col,
+                    error,
+                });
+                continue;
+            }
+
+            // §1382: `find_or_create_by_<field>[_and_<field>...]`. Parsed and
+            // codegen'd separately from the `find_by`/`count`/… derived-query
+            // surface: it is an inherent method returning `(Model, bool)`, not
+            // a trait finder. `parse_query_name` never matches these names
+            // (`find_or_create_by_slug` → strip `find` → `_or_create_by_slug`,
+            // which is not `_by_`-prefixed), but we handle them first and
+            // `continue` to keep the two paths cleanly separated.
+            if let Some(rest) = method_name.strip_prefix("find_or_create_by_") {
+                let fn_ident = method.sig.ident.clone();
+
+                // Map each declared parameter name to its type.
+                let param_map: Vec<(String, syn::Type)> = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| {
+                        let syn::FnArg::Typed(pat_type) = arg else {
+                            return None;
+                        };
+                        let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                            return None;
+                        };
+                        Some((pat_ident.ident.to_string(), (*pat_type.ty).clone()))
+                    })
+                    .collect();
+
+                // Determine the lookup fields (and reject `_or_`, which would
+                // span multiple unique constraints and defeat race-safety).
+                let mut error: Option<String> = if rest.is_empty() {
+                    Some(format!(
+                        "`{method_name}` has no lookup field: name it \
+                         `find_or_create_by_<field>` (optionally `_and_<field>`)"
+                    ))
+                } else if rest.contains("_or_") {
+                    Some(format!(
+                        "`{method_name}`: find_or_create_by does not support `_or_`. \
+                         Race-safety requires a single unique constraint, so only a \
+                         single field or an `_and_`-composite (matching one composite \
+                         unique index) is allowed."
+                    ))
+                } else {
+                    None
+                };
+
+                let field_names: Vec<String> = if error.is_some() {
+                    Vec::new()
+                } else {
+                    rest.split("_and_").map(String::from).collect()
+                };
+
+                let mut lookup_params: Vec<(Ident, syn::Type)> = Vec::new();
+                if error.is_none() {
+                    for fname in &field_names {
+                        if let Some((_, ty)) = param_map.iter().find(|(n, _)| n == fname) {
+                            lookup_params.push((format_ident!("{fname}"), ty.clone()));
+                        } else {
+                            error = Some(format!(
+                                "`{method_name}`: no parameter named `{fname}` was \
+                                 declared. Declare each lookup field as a parameter, \
+                                 e.g. `fn {method_name}({fname}: String, new: {new_name});`"
+                            ));
+                            break;
+                        }
+                    }
+                }
+
+                let string_fields: std::collections::HashSet<String> = lookup_params
+                    .iter()
+                    .filter(|(_, ty)| is_string_param_type(ty))
+                    .map(|(ident, _)| ident.to_string())
+                    .collect();
+
+                find_or_create_specs.push(FindOrCreateSpec {
+                    fn_ident,
+                    lookup_params,
+                    string_fields,
+                    error,
+                });
+                continue;
+            }
+
             if let Some(query) = parse_query_name(&method_name) {
                 let fn_ident = &method.sig.ident;
 
@@ -656,6 +2602,35 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 let params = &user_params;
 
+                // Bare parameter names, for forwarding to the per-shard helper.
+                let param_idents: Vec<Ident> = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| {
+                        let syn::FnArg::Typed(pat_type) = arg else {
+                            return None;
+                        };
+                        let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                            return None;
+                        };
+                        Some(pat_ident.ident.clone())
+                    })
+                    .collect();
+
+                // A borrowed (reference) parameter can't be cloned into an owned,
+                // `'static` value for the per-shard fan-out futures (cloning a
+                // `&str` yields a `&str`), so cross-shard fan-out of such a derived
+                // read would not compile. Reject it instead, with guidance to use
+                // an owned parameter type.
+                let has_borrowed_param = method.sig.inputs.iter().any(|arg| {
+                    matches!(
+                        arg,
+                        syn::FnArg::Typed(pat_type)
+                            if matches!(pat_type.ty.as_ref(), syn::Type::Reference(_))
+                    )
+                });
+
                 let body = generate_derived_query(
                     &query,
                     &table_ident,
@@ -669,13 +2644,111 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     fn #fn_ident(&self, #(#params),*) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<#return_type>> + Send;
                 });
 
-                derived_impl_methods.push(quote! {
-                    async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
-                        use ::autumn_web::reexports::diesel::prelude::*;
-                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                        #body
-                    }
-                });
+                // §1d: under across_tenants on a sharded repo, fan out read-prefix
+                // derived methods (find/count/exists) across all shards and merge;
+                // reject write-prefix ones (delete). Non-sharded repos keep the
+                // plain body (zero-cost).
+                let is_read_prefix = matches!(query.prefix.as_str(), "find" | "count" | "exists");
+                if config.sharded && config.tenant_scoped && is_read_prefix && has_borrowed_param {
+                    // Borrowed-param derived read on a sharded repo: can't fan out
+                    // ('static futures need owned params), so reject cross-shard.
+                    let method_name = fn_ident.to_string();
+                    let msg = format!(
+                        "cross-shard {method_name} is not supported: across_tenants() cannot fan \
+                         out a derived query with a borrowed parameter; declare the parameter as \
+                         an owned type (e.g. String) to enable fan-out, or query a specific shard"
+                    );
+                    // Same no-shard-set rejection the owned-param branch and the
+                    // count guard emit: without a shard set, an across-tenant read
+                    // would bind a NULL tenant predicate and silently return a
+                    // PARTIAL single-pool result, so reject rather than fall
+                    // through to `#body` (#1692, #1741).
+                    let no_shard_set_msg = format!(
+                        "cross-shard {fn_ident} requires a configured shard set: across_tenants() \
+                         cannot fan a derived query out across shards without a shard set (the \
+                         repository was built without shard context, e.g. via with_pool_untracked); \
+                         build it with shard context instead"
+                    );
+                    derived_impl_methods.push(quote! {
+                        async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            if self.across_tenants {
+                                // No shard set → would fall through to a partial
+                                // single-pool read; reject like the owned-param
+                                // branch and the count guard (#1741).
+                                if self.__autumn_shards.is_none() {
+                                    return ::core::result::Result::Err(
+                                        ::autumn_web::AutumnError::bad_request_msg(#no_shard_set_msg)
+                                    );
+                                }
+                                // Shard set present, but a borrowed parameter can't
+                                // fan out across shards.
+                                return ::core::result::Result::Err(
+                                    ::autumn_web::AutumnError::bad_request_msg(#msg)
+                                );
+                            }
+                            #body
+                        }
+                    });
+                } else if config.sharded && config.tenant_scoped && is_read_prefix {
+                    let one_shard_ident = format_ident!("__autumn_{}_one_shard", fn_ident);
+                    let merge = match query.prefix.as_str() {
+                        "find" => quote! { __results.into_iter().flatten().collect() },
+                        "count" => quote! { __results.into_iter().sum() },
+                        // "exists"
+                        _ => quote! { __results.into_iter().any(|__b| __b) },
+                    };
+                    derived_one_shard_helpers.push(quote! {
+                        #[doc(hidden)]
+                        async fn #one_shard_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            #body
+                        }
+                    });
+                    let no_shard_set_msg = format!(
+                        "cross-shard {fn_ident} requires a configured shard set: across_tenants() \
+                         cannot fan a derived query out across shards without a shard set (the \
+                         repository was built without shard context, e.g. via with_pool_untracked); \
+                         build it with shard context instead"
+                    );
+                    derived_impl_methods.push(quote! {
+                        async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            // Without a shard set, an across-tenant read would bind a NULL tenant
+                            // predicate and silently return a PARTIAL result over only the current
+                            // pool, so we reject rather than fall through (#1692, #1741).
+                            if self.across_tenants {
+                                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                                    return ::core::result::Result::Err(
+                                        ::autumn_web::AutumnError::bad_request_msg(#no_shard_set_msg)
+                                    );
+                                };
+                                // Params are cloned once per shard (the fan-out closure is
+                                // `Fn`); allow it for `Copy` params too (e.g. an i64 filter).
+                                #[allow(clippy::clone_on_copy)]
+                                let __results = __shards.fan_out_shards(|__shard| {
+                                    let __sub = self.__autumn_for_shard(__shard);
+                                    #(let #param_idents = ::core::clone::Clone::clone(&#param_idents);)*
+                                    async move { __sub.#one_shard_ident(#(#param_idents),*).await }
+                                }).await?;
+                                return ::core::result::Result::Ok(#merge);
+                            }
+                            #body
+                        }
+                    });
+                } else {
+                    derived_impl_methods.push(quote! {
+                        async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            #derived_cross_shard_write_guard
+                            #body
+                        }
+                    });
+                }
             }
         }
     }
@@ -708,6 +2781,82 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // `__autumn_shards` carries the full ShardSet for cross-shard fan-out
+    // under `across_tenants()`. Only present when `sharded = true`; `None`
+    // in constructors that lack request context (from_shard, with_pool_untracked).
+    let shards_struct_field = if config.sharded {
+        quote! {
+            #[doc(hidden)]
+            __autumn_shards: ::core::option::Option<::autumn_web::sharding::ShardSet>,
+        }
+    } else {
+        quote! {}
+    };
+
+    let shards_clone_field = if config.sharded {
+        quote! { __autumn_shards: self.__autumn_shards.clone(), }
+    } else {
+        quote! {}
+    };
+
+    // The non-sharded extractor and shard-unaware constructors always use None.
+    let shards_none_field = if config.sharded {
+        quote! { __autumn_shards: ::core::option::Option::None, }
+    } else {
+        quote! {}
+    };
+
+    // The self-routing sharded extractor populates this from the resolved ShardSet.
+    let shards_some_field = if config.sharded {
+        quote! { __autumn_shards: ::core::option::Option::Some(__shard_set), }
+    } else {
+        quote! {}
+    };
+
+    // `from_shard(&ShardedDb)` carries the ShardSet from the ShardedDb so that
+    // `across_tenants()` on a from_shard-built repo fans out / guards writes
+    // exactly like the extractor path (it is the standard sharded constructor).
+    let shards_from_db_field = if config.sharded {
+        quote! {
+            __autumn_shards: ::core::option::Option::Some(
+                ::core::clone::Clone::clone(db.__autumn_shard_set()),
+            ),
+        }
+    } else {
+        quote! {}
+    };
+
+    // Broadcast field tokens — defined here so they are in scope for both
+    // `across_tenants_method` (below) and the main struct/constructor block
+    // (further down).  The full doc-comment version `bcast_struct_field` is
+    // used only in the struct definition; the clone/none/state variants are
+    // used in every constructor that builds a `Self { .. }` literal.
+    let has_broadcasts = config.broadcasts;
+    let bcast_struct_field = if has_broadcasts {
+        quote! {
+            /// Broadcast handle for live OOB fragment publishing (`broadcasts = "topic"`).
+            /// `None` when the repository was built without an `AppState` (e.g. `with_pool_untracked`).
+            __autumn_broadcast: ::std::option::Option<::autumn_web::channels::Broadcast>,
+        }
+    } else {
+        quote! {}
+    };
+    let bcast_clone_field = if has_broadcasts {
+        quote! { __autumn_broadcast: self.__autumn_broadcast.clone(), }
+    } else {
+        quote! {}
+    };
+    let bcast_field_none = if has_broadcasts {
+        quote! { __autumn_broadcast: ::core::option::Option::None, }
+    } else {
+        quote! {}
+    };
+    let bcast_field_some_state = if has_broadcasts {
+        quote! { __autumn_broadcast: ::std::option::Option::Some(state.broadcast()), }
+    } else {
+        quote! {}
+    };
+
     let across_tenants_method = if config.tenant_scoped {
         if let Some(hooks_ident) = &config.hooks_type {
             let idempotency_clone_field = if commit_hooks_enabled {
@@ -727,6 +2876,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
                         across_tenants: true,
+                        #shards_clone_field
+                        #bcast_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -743,6 +2894,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         across_tenants: true,
+                        #shards_clone_field
+                        #bcast_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -753,6 +2906,294 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {}
+    };
+
+    // §1d: build a per-shard sub-repo for cross-shard read fan-out. Mirrors
+    // `across_tenants()` but routes to a specific shard: pool = that shard's
+    // primary, read route = that shard's `read_route()` (so replica routing /
+    // fail-closed is honored, not silently forced to primary), and
+    // `__autumn_shards = None` to stop recursion. The parent's statement timeout
+    // and slow-query threshold are preserved so a fan-out scan respects the same
+    // limits as an ordinary generated read. Only emitted for sharded +
+    // tenant_scoped repos (the only ones that fan out).
+    let for_shard_method = if config.sharded && config.tenant_scoped {
+        let hooks_field = config.hooks_type.as_ref().map(|hooks_ident| {
+            quote! {
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
+            }
+        });
+        let idempotency_field = if commit_hooks_enabled {
+            quote! { idempotency: self.idempotency.clone(), }
+        } else {
+            quote! {}
+        };
+        quote! {
+            #[doc(hidden)]
+            fn __autumn_for_shard(&self, __shard: &::autumn_web::sharding::Shard) -> Self {
+                Self {
+                    pool: ::core::clone::Clone::clone(__shard.primary_pool()),
+                    #hooks_field
+                    #idempotency_field
+                    across_tenants: true,
+                    __autumn_shards: ::core::option::Option::None,
+                    // Honor the shard's read routing (replica / fail-closed),
+                    // but preserve an explicit parent primary-read override
+                    // (`primary_reads` or `on_primary()`) so cross-shard
+                    // read-your-writes is not silently sent to replicas (#1d).
+                    __autumn_read_route: match self.__autumn_read_route {
+                        ::autumn_web::repository::ReadRoute::Primary =>
+                            ::autumn_web::repository::ReadRoute::Primary,
+                        _ => __shard.read_route(),
+                    },
+                    __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
+                    __autumn_slow_threshold: self.__autumn_slow_threshold,
+                    // Re-tag the route label with this shard so per-shard DB
+                    // metrics and slow-query logs attribute fan-out work to the
+                    // shard executing it, not the originally-routed shard.
+                    __autumn_route: ::autumn_web::sharding::reshard_route_label(
+                        self.__autumn_route.as_deref(),
+                        __shard.name(),
+                    ),
+                    // Shard sub-repos are used for read fan-out only; mutations
+                    // broadcast from the parent, not the per-shard instance.
+                    #bcast_field_none
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // Bridge the repository's tenant/soft-delete config to the target model's
+    // `__autumn_preload_retain` (generated by `#[model]`, which cannot see
+    // `#[repository]` flags). Emitted as inherent associated fns that override
+    // the default-`false` `AutumnPreloadScopeExt` blanket impl. Only the
+    // enabled flags are emitted, so a non-scoped repository adds nothing and
+    // preload scoping then matches finder behavior exactly.
+    let preload_scope_impl = {
+        let mut scope_fns: Vec<proc_macro2::TokenStream> = Vec::new();
+        if config.soft_delete {
+            scope_fns.push(quote! {
+                #[doc(hidden)]
+                #[must_use]
+                pub fn __autumn_repo_soft_delete_scope() -> bool {
+                    true
+                }
+            });
+        }
+        if config.tenant_scoped {
+            scope_fns.push(quote! {
+                #[doc(hidden)]
+                #[must_use]
+                pub fn __autumn_repo_tenant_scope() -> bool {
+                    true
+                }
+            });
+        }
+        if scope_fns.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                impl #model_name {
+                    #(#scope_fns)*
+                }
+            }
+        }
+    };
+
+    // Bridge this repository to the many-to-many mutation traits `#[model]`
+    // generates for `#[has_many(Target, through = ...)]` associations on
+    // `#model_name` (see `M2mConnSource`). Emitted unconditionally — cheap
+    // when the model has no `through =` associations (nothing calls it) —
+    // so it doesn't need to know which associations exist, only its own
+    // model and write-connection helper.
+    let m2m_conn_source_impl = quote! {
+        impl ::autumn_web::repository::M2mConnSource for #pg_name {
+            type Model = #model_name;
+
+            async fn __autumn_m2m_write_conn(
+                &self,
+            ) -> ::autumn_web::AutumnResult<
+                ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
+                    ::autumn_web::RuntimeConnection,
+                >,
+            > {
+                self.__autumn_acquire_conn().await
+            }
+        }
+    };
+
+    // `preload` publishes this as an ambient task-local so a tenant-scoped
+    // repository's `across_tenants()` choice reaches the (recursive) target
+    // retains and skips the tenant predicate there too — matching finders.
+    let preload_across_expr = if config.tenant_scoped {
+        quote! { self.across_tenants }
+    } else {
+        quote! { false }
+    };
+
+    // §1d: cross-shard reject for preload. Empty unless sharded + tenant_scoped.
+    let preload_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants && self.__autumn_shards.is_some() {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard preload is not supported: \
+                         associations cannot be loaded from a single routed \
+                         connection across shards; preload per shard instead"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let with_pool_method = {
+        let hooks_field = config.hooks_type.as_ref().map_or_else(
+            || quote! {},
+            |hooks_ident| {
+                quote! {
+                    hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+                }
+            },
+        );
+        let idempotency_field = if commit_hooks_enabled {
+            quote! { idempotency: ::core::option::Option::None, }
+        } else {
+            quote! {}
+        };
+        let register_hooks = if commit_hooks_enabled {
+            quote! { Self::__autumn_register_repository_commit_hooks(); }
+        } else {
+            quote! {}
+        };
+        // #1274: snapshot the shard's read route so read-only methods reach
+        // the shard's replica when one is healthy, mirroring the non-shard
+        // `read_route_init` below. `primary_reads` still pins reads to the
+        // shard primary at compile time.
+        let from_shard_read_route = if config.primary_reads {
+            quote! { ::autumn_web::repository::ReadRoute::Primary }
+        } else {
+            quote! { ::core::clone::Clone::clone(&__seed.read_route) }
+        };
+        let from_shard_reads_doc = if config.primary_reads {
+            quote! {
+                #[doc = "This repository is declared `primary_reads`, so reads stay on the shard's primary pool."]
+            }
+        } else {
+            quote! {
+                #[doc = "Read-only methods route to the shard's read replica when one is configured and healthy (honoring the shard's `replica_fallback` policy); mutating methods always use the shard's primary. Pin a single call chain to the primary with [`on_primary`](Self::on_primary)."]
+            }
+        };
+        // When `broadcasts` is configured the test-helper constructor must be
+        let test_ctor_method = if has_broadcasts {
+            quote! {
+                /// Construct this repository with an explicit broadcast handle.
+                ///
+                /// For use in tests only — simulates what `FromRequestParts<AppState>` does
+                /// when building a repository that can publish OOB live fragments.
+                #[doc(hidden)]
+                #[must_use]
+                pub fn __autumn_test_with_broadcast(
+                    pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                        ::autumn_web::RuntimeConnection,
+                    >,
+                    broadcast: ::autumn_web::channels::Broadcast,
+                ) -> Self {
+                    #register_hooks
+                    Self {
+                        pool,
+                        #hooks_field
+                        #idempotency_field
+                        #tenant_init_field
+                        #shards_none_field
+                        __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
+                        __autumn_statement_timeout_ms: 0,
+                        __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
+                        __autumn_route: ::core::option::Option::None,
+                        __autumn_broadcast: ::core::option::Option::Some(broadcast),
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+        quote! {
+            /// Construct this repository from a [`ShardedDb`](::autumn_web::sharding::ShardedDb)
+            /// extractor, preserving the full request instrumentation — statement
+            /// timeout, slow-query threshold, and route metric label — from the
+            /// shard context:
+            ///
+            /// ```rust,ignore
+            /// #[post("/bookmarks")]
+            /// async fn create(db: ShardedDb, Json(body): Json<Body>) -> AutumnResult<Json<Bookmark>> {
+            ///     let repo = BookmarkRepository::from_shard(&db);
+            ///     // repo carries the same timeout / slow-query / route label as `db`
+            ///     let bookmark = repo.save(&body.into()).await?;
+            ///     Ok(Json(bookmark))
+            /// }
+            /// ```
+            ///
+            #from_shard_reads_doc
+            ///
+            /// Use this constructor as the standard way to build a repository on
+            /// a shard; prefer [`with_pool_untracked`](Self::with_pool_untracked)
+            /// only when you intentionally want to bypass request instrumentation.
+            #[must_use]
+            pub fn from_shard(db: &::autumn_web::sharding::ShardedDb) -> Self {
+                #register_hooks
+                let __seed = db.__autumn_repository_seed();
+                Self {
+                    pool: ::core::clone::Clone::clone(&__seed.pool),
+                    #hooks_field
+                    #idempotency_field
+                    #tenant_init_field
+                    #shards_from_db_field
+                    __autumn_read_route: #from_shard_read_route,
+                    __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
+                    __autumn_slow_threshold: __seed.slow_query_threshold,
+                    __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                    #bcast_field_none
+                }
+            }
+
+            /// Construct this repository over an explicit pool, **bypassing**
+            /// request instrumentation.
+            ///
+            /// Statement timeout, slow-query threshold, and route metric labels
+            /// are reset to framework defaults (no timeout, 500 ms threshold,
+            /// no route label).  Prefer [`from_shard`](Self::from_shard) when
+            /// you have a [`ShardedDb`](::autumn_web::sharding::ShardedDb)
+            /// available; use this constructor only when you need an explicit
+            /// pool without any request context:
+            ///
+            /// ```rust,ignore
+            /// let repo = BookmarkRepository::with_pool_untracked(pool.clone());
+            /// ```
+            #[must_use]
+            pub fn with_pool_untracked(
+                pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::RuntimeConnection,
+                >,
+            ) -> Self {
+                #register_hooks
+                Self {
+                    pool,
+                    #hooks_field
+                    #idempotency_field
+                    #tenant_init_field
+                    #shards_none_field
+                    __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
+                    __autumn_statement_timeout_ms: 0,
+                    __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
+                    __autumn_route: ::core::option::Option::None,
+                    #bcast_field_none
+                }
+            }
+
+            #test_ctor_method
+        }
     };
 
     // #971: snapshot the read-routing decision once per extraction. The
@@ -804,11 +3245,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let struct_fields = quote! {
             pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             hooks: #hooks_ident,
             #idempotency_struct_field
             #tenant_struct_field
+            #shards_struct_field
             /// Read-routing snapshot for generated read-only methods (#971).
             __autumn_read_route: ::autumn_web::repository::ReadRoute,
             /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
@@ -817,6 +3259,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_slow_threshold: ::std::time::Duration,
             /// Route path from `MatchedPath` for metrics labels.
             __autumn_route: ::std::option::Option<::std::string::String>,
+            #bcast_struct_field
         };
 
         let clone_impl = quote! {
@@ -827,10 +3270,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
                         #tenant_clone_field
+                        #shards_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
+                        #bcast_clone_field
                     }
                 }
             }
@@ -867,10 +3312,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .get::<::autumn_web::idempotency::IdempotencyContext>()
                         .cloned(),
                     #tenant_init_field
+                    #shards_none_field
                     __autumn_read_route,
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
                     __autumn_route,
+                    #bcast_field_some_state
                 })
             }
         } else {
@@ -880,12 +3327,269 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
                     #tenant_init_field
+                    #shards_none_field
                     __autumn_read_route,
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
                     __autumn_route,
+                    #bcast_field_some_state
                 })
             }
+        };
+
+        let (broadcast_create, broadcast_update, broadcast_delete) = if config.broadcasts {
+            let base_topic_expr = match generate_topic_format(
+                config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name),
+                &quote! { __record_ref },
+            ) {
+                Ok(expr) => expr,
+                Err(err) => {
+                    let compile_err = err.to_compile_error();
+                    return quote! { #compile_err };
+                }
+            };
+
+            let topic_expr = if config.tenant_scoped {
+                quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record_ref.tenant_id), #base_topic_expr) }
+            } else {
+                base_topic_expr
+            };
+
+            let default_container = format!("{}-list", config.table_name);
+            let container_expr = config
+                .broadcast_container
+                .as_deref()
+                .unwrap_or(&default_container);
+            let model_prefix = to_snake_case(&config.model_name.to_string());
+
+            let (render_expr, create_swap_id, create_swap_strategy, update_id_expr, delete_id_expr) =
+                if let Some(ref render_path) = config.broadcast_render {
+                    let extract_id = quote! {
+                        ::autumn_web::htmx::extract_html_id(&{#render_path(__record_ref)}.into_string())
+                            .unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
+                    };
+                    (
+                        quote! { #render_path(__record_ref) },
+                        quote! { #container_expr.to_string() },
+                        quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
+                        extract_id.clone(),
+                        extract_id,
+                    )
+                } else {
+                    let dom_id = quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) };
+                    (
+                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__record_ref) },
+                        quote! { #container_expr.to_string() },
+                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::insert_swap() },
+                        dom_id.clone(),
+                        dom_id,
+                    )
+                };
+
+            let create = quote! {
+                {
+                    let __record_ref = &__record;
+                    if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
+                        let __topic = #topic_expr;
+                        let __fragment = #render_expr;
+                        let __create_id = #create_swap_id;
+                        let __create_swap = #create_swap_strategy;
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                        {
+                            ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
+                        }
+                    }
+                }
+            };
+
+            let update = quote! {
+                {
+                    let __record_ref = &__record;
+                    if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
+                        let __topic = #topic_expr;
+                        let __fragment = #render_expr;
+                        let __id = #update_id_expr;
+
+                        let __prev_id = __ctx_val
+                            .get("__autumn_previous_id")
+                            .and_then(|__v| __v.as_str());
+
+                        let __topic_changed = __ctx_val
+                            .get("__autumn_previous_topic")
+                            .and_then(|__v| __v.as_str())
+                            .map_or(false, |__prev_topic| __prev_topic != __topic);
+
+                        if __topic_changed {
+                            if let ::core::option::Option::Some(__prev_topic) = __ctx_val
+                                .get("__autumn_previous_topic")
+                                .and_then(|__v| __v.as_str())
+                            {
+                                let __delete_id = __prev_id.unwrap_or(&__id);
+                                let __delete_fragment = ::autumn_web::html! {};
+                                if let ::core::result::Result::Err(__err) = __channels
+                                    .broadcast()
+                                    .publish_oob(__prev_topic, __delete_id, &::autumn_web::htmx::OobSwap::Delete, &__delete_fragment)
+                                {
+                                    ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast delete of old topic failed");
+                                }
+                            }
+                        }
+
+                        let (__target_id, __swap_strategy) = if __topic_changed {
+                            (#container_expr, <#model_name as ::autumn_web::live::LiveFragment>::insert_swap())
+                        } else {
+                            let __strategy = if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
+                                if __prev_id_val != &__id {
+                                    ::autumn_web::htmx::OobSwap::Target(
+                                        ::autumn_web::htmx::OobMethod::OuterHTML,
+                                        ::std::format!("#{}", __prev_id_val),
+                                    )
+                                } else {
+                                    ::autumn_web::htmx::OobSwap::OuterHTML
+                                }
+                            } else {
+                                ::autumn_web::htmx::OobSwap::OuterHTML
+                            };
+                            (__id.as_str(), __strategy)
+                        };
+
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(&__topic, __target_id, &__swap_strategy, &__fragment)
+                        {
+                            ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
+                        }
+                    }
+                }
+            };
+
+            let delete = quote! {
+                {
+                    let __record_ref = &__record;
+                    if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
+                        let __topic = #topic_expr;
+                        let __id = #delete_id_expr;
+                        let __fragment = ::autumn_web::html! {};
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(&__topic, &__id, &::autumn_web::htmx::OobSwap::Delete, &__fragment)
+                        {
+                            ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
+                        }
+                    }
+                }
+            };
+
+            (create, update, delete)
+        } else {
+            (quote! {}, quote! {}, quote! {})
+        };
+
+        let (
+            enqueue_context_setup,
+            enqueue_context_ref,
+            finalize_context_setup,
+            finalize_context_ref,
+        ) = if config.broadcasts {
+            let base_topic_expr = match generate_topic_format(
+                config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name),
+                &quote! { __record_ref },
+            ) {
+                Ok(expr) => expr,
+                Err(err) => {
+                    let compile_err = err.to_compile_error();
+                    return quote! { #compile_err };
+                }
+            };
+
+            let topic_expr = if config.tenant_scoped {
+                quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record_ref.tenant_id), #base_topic_expr) }
+            } else {
+                base_topic_expr
+            };
+
+            let prev_id_expr = if let Some(ref render_path) = config.broadcast_render {
+                quote! { {
+                    let __prev_fragment = #render_path(__record_ref);
+                    ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string())
+                } }
+            } else {
+                quote! { ::core::option::Option::Some(<#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)) }
+            };
+
+            (
+                quote! {
+                    let (__autumn_previous_topic, __autumn_previous_id) = if let ::core::option::Option::Some(__record_val) = &__vh_before {
+                        let __record_ref = __record_val;
+                        let __prev_topic = #topic_expr;
+                        let __prev_id = #prev_id_expr;
+                        (::core::option::Option::Some(__prev_topic), __prev_id)
+                    } else {
+                        (::core::option::Option::None, ::core::option::Option::None)
+                    };
+
+                    let mut __autumn_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
+                        .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
+
+                    if let ::core::option::Option::Some(ref __prev_topic) = __autumn_previous_topic {
+                        if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_topic".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_topic.clone()),
+                            );
+                        }
+                    }
+
+                    if let ::core::option::Option::Some(ref __prev_id_val) = __autumn_previous_id {
+                        if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_id".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_id_val.clone()),
+                            );
+                        }
+                    }
+                },
+                quote! { &__autumn_ctx_val },
+                quote! {
+                    let mut __autumn_finalized_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
+                        .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize finalized context: {e}")))?;
+                    if let ::core::option::Option::Some(ref __prev_topic) = __autumn_previous_topic {
+                        if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_topic".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_topic.clone()),
+                            );
+                        }
+                    }
+                    if let ::core::option::Option::Some(ref __prev_id) = __autumn_previous_id {
+                        if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_id".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_id.clone()),
+                            );
+                        }
+                    }
+                },
+                quote! { &__autumn_finalized_ctx_val },
+            )
+        } else {
+            (
+                quote! {
+                    let __autumn_previous_topic: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
+                    let __autumn_previous_id: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
+                },
+                quote! { &ctx },
+                quote! {},
+                quote! { &ctx },
+            )
         };
 
         let hook_support_methods = if commit_hooks_enabled {
@@ -921,18 +3625,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     })?;
                             let __record: #model_name =
                                 #model_name::__autumn_commit_hook_from_value(__record)?;
-                                let __hooks =
-                                    <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
-                                <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_create_commit(
-                                    &__hooks,
-                                    &mut __ctx,
-                                    &__record,
-                                )
-                                .await
+                            let __hooks =
+                                <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
+                            <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_create_commit(
+                                &__hooks,
+                                &mut __ctx,
+                                &__record,
+                            )
+                            .await?;
+                            #broadcast_create
+                            Ok(())
                         },
-                        |__ctx, __record| async move {
+                        |__ctx_val, __record| async move {
                             let mut __ctx: ::autumn_web::hooks::MutationContext =
-                                ::autumn_web::reexports::serde_json::from_value(__ctx)
+                                ::autumn_web::reexports::serde_json::from_value(__ctx_val.clone())
                                     .map_err(|__error| {
                                         ::autumn_web::AutumnError::internal_server_error_msg(
                                             format!("deserialize repository update hook context: {__error}")
@@ -940,14 +3646,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     })?;
                             let __record: #model_name =
                                 #model_name::__autumn_commit_hook_from_value(__record)?;
-                                let __hooks =
-                                    <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
-                                <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_update_commit(
-                                    &__hooks,
-                                    &mut __ctx,
-                                    &__record,
-                                )
-                                .await
+                            let __hooks =
+                                <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
+                            <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_update_commit(
+                                &__hooks,
+                                &mut __ctx,
+                                &__record,
+                            )
+                            .await?;
+                            #broadcast_update
+                            Ok(())
                         },
                         |__ctx, __record| async move {
                             let mut __ctx: ::autumn_web::hooks::MutationContext =
@@ -959,14 +3667,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     })?;
                             let __record: #model_name =
                                 #model_name::__autumn_commit_hook_from_value(__record)?;
-                                let __hooks =
-                                    <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
-                                <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_delete_commit(
-                                    &__hooks,
-                                    &mut __ctx,
-                                    &__record,
-                                )
-                                .await
+                            let __hooks =
+                                <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
+                            <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_delete_commit(
+                                &__hooks,
+                                &mut __ctx,
+                                &__record,
+                            )
+                            .await?;
+                            #broadcast_delete
+                            Ok(())
                         },
                     );
                 });
@@ -1024,8 +3734,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -1161,8 +3870,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::option::Option::Some(t)
                     };
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -1206,8 +3914,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -1338,8 +4045,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -1373,8 +4079,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -1438,8 +4143,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -1454,9 +4158,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 {
                                     let load_query = #table_ident::table.find(id);
                                     let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                     } else {
-                                        load_query.for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                     }
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -1506,9 +4210,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 } else {
                                     let load_query = #table_ident::table.find(id);
                                     let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                     } else {
-                                        load_query.for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                     }
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -1547,6 +4251,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     #vh_update_in_hooks
                                 }
 
+                                #enqueue_context_setup
                                 let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
                                 let (__autumn_commit_hook_id, __autumn_commit_hook_owner) = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
                                     conn,
@@ -1554,12 +4259,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     "update",
                                     ctx.idempotency_key.as_deref(),
                                     __autumn_commit_hook_discriminator.as_deref(),
-                                    &ctx,
+                                    #enqueue_context_ref,
                                     &__autumn_commit_hook_record,
                                 )
                                 .await?;
 
-                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record))
+                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id))
                             }
                             .scope_boxed()
                         })
@@ -1610,11 +4315,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::std::panic::resume_unwind(__autumn_panic);
                         }
                     }
+                    #finalize_context_setup
                     let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
                         &self.pool,
                         &__autumn_commit_hook_id,
                         &__autumn_commit_hook_owner,
-                        &ctx,
+                        #finalize_context_ref,
                         &__autumn_commit_hook_record,
                     )
                     .await;
@@ -1655,8 +4361,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let (record, __vh_before): (#model_name, ::core::option::Option<#model_name>) = if let ::core::option::Option::Some(expected_version) =
@@ -1664,9 +4369,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 {
                                     let load_query = #table_ident::table.find(id);
                                     let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                     } else {
-                                        load_query.for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                     }
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -1716,9 +4421,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 } else {
                                     let load_query = #table_ident::table.find(id);
                                     let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                     } else {
-                                        load_query.for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                     }
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -1780,8 +4485,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -1797,9 +4501,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     // SELECT FOR UPDATE grabs an exclusive row lock so
                                     // no concurrent writer can commit between our
                                     // version check and the UPDATE below.
-                                    let current = #table_ident::table
-                                        .find(id)
-                                        .for_update()
+                                    let current = ::autumn_web::maybe_for_update!(#table_ident::table
+                                        .find(id))
+
                                         .first::<#model_name>(conn)
                                         .await
                                         .optional()
@@ -1835,9 +4539,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     (updated, ::core::option::Option::Some(__vh_before_inner))
                                 } else {
                                     // Load current record
-                                    let current = #table_ident::table
-                                        .find(id)
-                                        .for_update()
+                                    let current = ::autumn_web::maybe_for_update!(#table_ident::table
+                                        .find(id))
+
                                         .first::<#model_name>(conn)
                                         .await
                                         .optional()
@@ -1863,6 +4567,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     #vh_update_in_hooks
                                 }
 
+                                #enqueue_context_setup
                                 let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
                                 let (__autumn_commit_hook_id, __autumn_commit_hook_owner) = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
                                     conn,
@@ -1870,12 +4575,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     "update",
                                     ctx.idempotency_key.as_deref(),
                                     __autumn_commit_hook_discriminator.as_deref(),
-                                    &ctx,
+                                    #enqueue_context_ref,
                                     &__autumn_commit_hook_record,
                                 )
                                 .await?;
 
-                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record))
+                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id))
                             }
                             .scope_boxed()
                         })
@@ -1926,11 +4631,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::std::panic::resume_unwind(__autumn_panic);
                         }
                     }
+                    #finalize_context_setup
                     let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
                         &self.pool,
                         &__autumn_commit_hook_id,
                         &__autumn_commit_hook_owner,
-                        &ctx,
+                        #finalize_context_ref,
                         &__autumn_commit_hook_record,
                     )
                     .await;
@@ -1972,16 +4678,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let (record, __vh_before): (#model_name, #model_name) = if let ::core::option::Option::Some(expected_version) =
                                     changes.__autumn_lock_version_expected()
                                 {
-                                    let current = #table_ident::table
-                                        .find(id)
-                                        .for_update()
+                                    let current = ::autumn_web::maybe_for_update!(#table_ident::table
+                                        .find(id))
+
                                         .first::<#model_name>(conn)
                                         .await
                                         .optional()
@@ -2061,16 +4766,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let record: #model_name = if let ::core::option::Option::Some(expected_version) =
                                     changes.__autumn_lock_version_expected()
                                 {
-                                    let current = #table_ident::table
-                                        .find(id)
-                                        .for_update()
+                                    let current = ::autumn_web::maybe_for_update!(#table_ident::table
+                                        .find(id))
+
                                         .first::<#model_name>(conn)
                                         .await
                                         .optional()
@@ -2210,8 +4914,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #tenant_id_setup
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    conn
-                        .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -2227,9 +4930,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 // hooks only run when the row is actually deletable.
                                 let load_query = #table_ident::table.find(id) #sd_filter;
                                 let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                    load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                 } else {
-                                    load_query.for_update().first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                 }
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
@@ -2275,16 +4978,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    conn
-                        .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
 
                                 let load_query = #table_ident::table.find(id);
                                 let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                    load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                 } else {
-                                    load_query.for_update().first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                 }
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
@@ -2318,8 +5020,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 Self::__autumn_register_repository_commit_hooks();
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn
-                    .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
                             let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -2332,7 +5033,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                             // Load current record for before_delete context.
                             let load_query = #table_ident::table.find(id) #sd_filter;
-                            let record = load_query.for_update().first::<#model_name>(conn).await
+                            let record = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
                             .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -2385,13 +5086,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn
-                    .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
                             let load_query = #table_ident::table.find(id);
-                            let record = load_query.for_update().first::<#model_name>(conn).await
+                            let record = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
                             .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -2422,13 +5122,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn
-                    .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
                             let load_query = #table_ident::table.find(id);
-                            let record = load_query.for_update().first::<#model_name>(conn).await
+                            let record = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
                             .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -2471,25 +5170,85 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     {
                         if let ::core::option::Option::Some(t) = tenant_id {
                             let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
+                            ::autumn_web::backend_select! {
+                        pg => {
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(values)
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                         } else {
+                            ::autumn_web::backend_select! {
+                        pg => {
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(chunk.to_vec())
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                         }
                     }
                 }
             } else {
                 quote! {
                     {
-                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
-                            .await
+                        ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(chunk.to_vec())
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                     }
                 }
             };
@@ -2548,14 +5307,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let contexts_ref = &contexts;
-                    let (inserted_records, hook_infos, global_indices) = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    let (inserted_records, hook_infos, global_indices) = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut inserted_records = Vec::new();
                             let mut hook_infos = Vec::new();
                             let mut global_indices = Vec::new();
                             let mut offset = 0;
                             let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                            let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                            let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                             for chunk in inputs.chunks(chunk_size) {
                                 let chunk_inserted = (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -2733,12 +5492,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let contexts_ref = &contexts;
                     let inputs_ref = &inputs;
-                    let inserted_records = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    let inserted_records = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut inserted = Vec::new();
                             let mut offset = 0;
                             let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                            let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                            let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                             for chunk in inputs_ref.chunks(chunk_size) {
                                 let chunk_inserted = (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -2797,16 +5556,56 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     {
                         if let ::core::option::Option::Some(t) = tenant_id {
                             let values: Vec<_> = chunk.iter().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item.0.clone(), t)).collect();
+                            ::autumn_web::backend_select! {
+                        pg => {
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(values)
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                         } else {
                             let values: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
+                            ::autumn_web::backend_select! {
+                        pg => {
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(values)
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                         }
                     }
                 }
@@ -2814,10 +5613,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {
                     {
                         let values: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
-                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(values)
-                            .get_results::<#model_name>(conn)
-                            .await
+                        ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(values)
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                     }
                 }
             };
@@ -2868,10 +5687,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         return Ok((successes, failures));
                     }
                     let cols = (&valid_items[0].0).__autumn_column_count() + #tenant_extra;
-                    let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                    let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                     let mut offset = 0;
                     for chunk in valid_items.chunks(chunk_size) {
-                        let batch_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                        let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let chunk_inserted = (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -3020,7 +5839,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
 
                                 for item in chunk {
-                                    let row_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                                    let row_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                         async move {
                                             let record = #row_insert_expr
                                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -3137,9 +5956,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         return Ok((successes, failures));
                     }
                     let cols = (&valid_items[0].0).__autumn_column_count() + #tenant_extra;
-                    let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                    let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                     for chunk in valid_items.chunks(chunk_size) {
-                        let batch_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                        let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)
@@ -3202,7 +6021,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
 
                                 for item in chunk {
-                                    let row_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                                    let row_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                         async move {
                                             #row_insert_expr
                                                 .map_err(::autumn_web::AutumnError::from)
@@ -3312,14 +6131,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let load_expr = if config.tenant_scoped {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
-                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
                     } else {
-                        load_query.for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                     }
                 }
             } else {
                 quote! {
-                    load_query.for_update().load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                 }
             };
 
@@ -3367,41 +6186,153 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let commit_hooks_enqueue_block = if commit_hooks_enabled {
-                quote! {
-                    let mut hook_records = Vec::new();
-                    for record in &chunk_updated {
-                        let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
-                            ::core::option::Option::None;
-                        if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
-                            __autumn_commit_hook_discriminator =
-                                ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                if config.broadcasts {
+                    let base_topic_expr = match generate_topic_format(
+                        config
+                            .broadcast_topic
+                            .as_deref()
+                            .unwrap_or(&config.table_name),
+                        &quote! { __record_ref },
+                    ) {
+                        Ok(expr) => expr,
+                        Err(err) => {
+                            let compile_err = err.to_compile_error();
+                            return quote! { #compile_err };
                         }
-                        let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
-                        hook_records.push((__autumn_commit_hook_record, __autumn_commit_hook_discriminator));
-                    }
+                    };
 
-                    let hook_inputs: Vec<_> = chunk_updated.iter().enumerate().map(|(idx, _)| {
-                        let global_idx = offset + idx;
-                        let ctx = &contexts[global_idx];
-                        let (ref record_val, ref discriminator) = hook_records[idx];
-                        (
-                            ctx.idempotency_key.clone(),
-                            discriminator.clone(),
-                            ctx,
-                            record_val,
+                    let topic_expr = if config.tenant_scoped {
+                        quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record_ref.tenant_id), #base_topic_expr) }
+                    } else {
+                        base_topic_expr
+                    };
+
+                    let prev_id_expr_bulk = if let Some(ref render_path) = config.broadcast_render {
+                        quote! { ::autumn_web::htmx::extract_html_id(&{#render_path(__record_ref)}.into_string()) }
+                    } else {
+                        quote! { ::core::option::Option::Some(<#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)) }
+                    };
+
+                    quote! {
+                        let mut hook_records = Vec::new();
+                        for record in &chunk_updated {
+                            let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                                ::core::option::Option::None;
+                            if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                                __autumn_commit_hook_discriminator =
+                                    ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                            }
+                            let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
+                            hook_records.push((__autumn_commit_hook_record, __autumn_commit_hook_discriminator));
+                        }
+
+                        let mut serialized_contexts = Vec::new();
+                        let mut chunk_previous_topics = Vec::new();
+                        let mut chunk_previous_ids = Vec::new();
+                        for (idx, _record) in chunk_updated.iter().enumerate() {
+                            let global_idx = offset + idx;
+                            let ctx = &contexts[global_idx];
+                            let mut ctx_val = ::autumn_web::reexports::serde_json::to_value(ctx)
+                                .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
+
+                            let __record_val = &current_rows[global_idx];
+                            let __record_ref = __record_val;
+                            let __prev_topic = #topic_expr;
+                            chunk_previous_topics.push(::core::option::Option::Some(__prev_topic.clone()));
+
+                            let __prev_id = #prev_id_expr_bulk;
+                            chunk_previous_ids.push(__prev_id.clone());
+
+                            if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
+                                if let ::core::option::Option::Some(__map) = ctx_val.as_object_mut() {
+                                    __map.insert(
+                                        "__autumn_previous_id".to_string(),
+                                        ::autumn_web::reexports::serde_json::Value::String(__prev_id_val),
+                                    );
+                                }
+                            }
+
+                            if let ::core::option::Option::Some(__map) = ctx_val.as_object_mut() {
+                                __map.insert(
+                                    "__autumn_previous_topic".to_string(),
+                                    ::autumn_web::reexports::serde_json::Value::String(__prev_topic),
+                                );
+                            }
+                            serialized_contexts.push(ctx_val);
+                        }
+
+                        let hook_inputs: Vec<_> = chunk_updated.iter().enumerate().map(|(idx, _)| {
+                            let global_idx = offset + idx;
+                            let (ref record_val, ref discriminator) = hook_records[idx];
+                            (
+                                contexts[global_idx].idempotency_key.clone(),
+                                discriminator.clone(),
+                                &serialized_contexts[idx],
+                                record_val,
+                            )
+                        }).collect();
+
+                        let chunk_hook_infos = ::autumn_web::__private::enqueue_repository_commit_hooks_pending_bulk_on_conn(
+                            conn,
+                            Self::__autumn_repository_commit_hook_key(),
+                            "update",
+                            &hook_inputs,
                         )
-                    }).collect();
+                        .await?;
 
-                    let chunk_hook_infos = ::autumn_web::__private::enqueue_repository_commit_hooks_pending_bulk_on_conn(
-                        conn,
-                        Self::__autumn_repository_commit_hook_key(),
-                        "update",
-                        &hook_inputs,
-                    )
-                    .await?;
+                        for (idx, info) in chunk_hook_infos.into_iter().enumerate() {
+                            hook_infos.push((
+                                info.0,
+                                info.1,
+                                hook_records[idx].0.clone(),
+                                chunk_previous_topics[idx].clone(),
+                                chunk_previous_ids[idx].clone(),
+                            ));
+                        }
+                    }
+                } else {
+                    quote! {
+                        let mut hook_records = Vec::new();
+                        for record in &chunk_updated {
+                            let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                                ::core::option::Option::None;
+                            if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                                __autumn_commit_hook_discriminator =
+                                    ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                            }
+                            let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
+                            hook_records.push((__autumn_commit_hook_record, __autumn_commit_hook_discriminator));
+                        }
 
-                    for (idx, info) in chunk_hook_infos.into_iter().enumerate() {
-                        hook_infos.push((info.0, info.1, hook_records[idx].0.clone()));
+                        let hook_inputs: Vec<_> = chunk_updated.iter().enumerate().map(|(idx, _)| {
+                            let global_idx = offset + idx;
+                            let ctx = &contexts[global_idx];
+                            let (ref record_val, ref discriminator) = hook_records[idx];
+                            (
+                                ctx.idempotency_key.clone(),
+                                discriminator.clone(),
+                                ctx,
+                                record_val,
+                            )
+                        }).collect();
+
+                        let chunk_hook_infos = ::autumn_web::__private::enqueue_repository_commit_hooks_pending_bulk_on_conn(
+                            conn,
+                            Self::__autumn_repository_commit_hook_key(),
+                            "update",
+                            &hook_inputs,
+                        )
+                        .await?;
+
+                        for (idx, info) in chunk_hook_infos.into_iter().enumerate() {
+                            hook_infos.push((
+                                info.0,
+                                info.1,
+                                hook_records[idx].0.clone(),
+                                ::core::option::Option::None,
+                                ::core::option::Option::None,
+                            ));
+                        }
                     }
                 }
             } else {
@@ -3409,8 +6340,38 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let after_update_hook_block = if commit_hooks_enabled {
+                let finalize_setup = if config.broadcasts {
+                    quote! {
+                        let mut __autumn_finalized_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
+                            .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize finalized context: {e}")))?;
+                        if let ::core::option::Option::Some(__prev_topic) = __autumn_previous_topic {
+                            if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
+                                __map.insert(
+                                    "__autumn_previous_topic".to_string(),
+                                    ::autumn_web::reexports::serde_json::Value::String(__prev_topic.clone()),
+                                );
+                            }
+                        }
+                        if let ::core::option::Option::Some(__prev_id) = __autumn_previous_id {
+                            if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
+                                __map.insert(
+                                    "__autumn_previous_id".to_string(),
+                                    ::autumn_web::reexports::serde_json::Value::String(__prev_id.clone()),
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    quote! {}
+                };
+                let finalize_ref = if config.broadcasts {
+                    quote! { &__autumn_finalized_ctx_val }
+                } else {
+                    quote! { &ctx }
+                };
+
                 quote! {
-                    let (hook_id, hook_owner, hook_record) = &hook_infos[idx];
+                    let (hook_id, hook_owner, hook_record, __autumn_previous_topic, __autumn_previous_id) = &hook_infos[idx];
                     let __autumn_pending_heartbeat =
                         ::autumn_web::__private::start_repository_commit_hook_pending_finalizer_heartbeat(
                             self.pool.clone(),
@@ -3424,11 +6385,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     match __autumn_after_update {
                         ::core::result::Result::Ok(::core::result::Result::Ok(())) => {
+                            #finalize_setup
                             let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
                                 &self.pool,
                                 hook_id,
                                 hook_owner,
-                                &ctx,
+                                #finalize_ref,
                                 hook_record,
                             )
                             .await;
@@ -3521,7 +6483,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 #tenant_id_setup
                 let mut conn = self.__autumn_acquire_conn().await?;
-                let (updated_records, contexts, hook_infos) = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                let (updated_records, contexts, hook_infos) = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut current_rows = Vec::new();
                         for chunk in ids.chunks(1000) {
@@ -3569,7 +6531,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
 
                         let mut updated_records = Vec::new();
-                        let mut hook_infos: ::std::vec::Vec<(::std::string::String, ::std::string::String, ::serde_json::Value)> = ::std::vec::Vec::new();
+                        let mut hook_infos: ::std::vec::Vec<(::std::string::String, ::std::string::String, ::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>)> = ::std::vec::Vec::new();
                         let mut offset = 0;
                         for chunk in proposed_rows.chunks(1000) {
                             let mut chunk_updated = Vec::new();
@@ -3637,28 +6599,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if config.soft_delete {
                     quote! {
                         if let ::core::option::Option::Some(t) = tenant_id {
-                            load_query.filter(#table_ident::tenant_id.eq(t)).filter(#table_ident::deleted_at.is_null()).for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).filter(#table_ident::deleted_at.is_null())).load::<#model_name>(conn).await
                         } else {
-                            load_query.filter(#table_ident::deleted_at.is_null()).for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::deleted_at.is_null())).load::<#model_name>(conn).await
                         }
                     }
                 } else {
                     quote! {
                         if let ::core::option::Option::Some(t) = tenant_id {
-                            load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
                         } else {
-                            load_query.for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                         }
                     }
                 }
             } else {
                 if config.soft_delete {
                     quote! {
-                        load_query.filter(#table_ident::deleted_at.is_null()).for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::deleted_at.is_null())).load::<#model_name>(conn).await
                     }
                 } else {
                     quote! {
-                        load_query.for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                     }
                 }
             };
@@ -3712,20 +6674,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let delete_returning_expr = if config.soft_delete {
                 if config.tenant_scoped {
+                    // Braces required: this fragment is assigned with
+                    // `let chunk_deleted_ids = #delete_returning_expr` in the
+                    // versioned path, so the leading `let query` must be inside
+                    // a block expression.
                     quote! {
-                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null());
-                        if let ::core::option::Option::Some(t) = tenant_id {
-                            ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
-                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
-                        } else {
-                            ::autumn_web::reexports::diesel::update(query)
-                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
+                        {
+                            let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null());
+                            if let ::core::option::Option::Some(t) = tenant_id {
+                                ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            } else {
+                                ::autumn_web::reexports::diesel::update(query)
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            }
                         }
                     }
                 } else {
@@ -3740,17 +6708,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 if config.tenant_scoped {
                     quote! {
-                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
-                        if let ::core::option::Option::Some(t) = tenant_id {
-                            ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
-                        } else {
-                            ::autumn_web::reexports::diesel::delete(query)
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
+                        {
+                            let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                            if let ::core::option::Option::Some(t) = tenant_id {
+                                ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            } else {
+                                ::autumn_web::reexports::diesel::delete(query)
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            }
                         }
                     }
                 } else {
@@ -3846,51 +6816,125 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {}
             };
 
-            quote! {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                use ::autumn_web::reexports::diesel_async::AsyncConnection;
-                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+            // The bulk delete body is parameterized on its cascade tokens so it
+            // can be emitted twice under runtime dispatch (Codex P1): a plain
+            // no-cascade form (tx returns `()`) and a runtime-cascade form (tx
+            // returns the deferred broadcasts). A repository-attribute
+            // `dependent(...)` instead emits it once with the compile-time cascade.
+            let build_delete_many_body =
+                |delete_many_cascade: &proc_macro2::TokenStream,
+                 delete_many_tx_bind: &proc_macro2::TokenStream,
+                 delete_many_tx_ok: &proc_macro2::TokenStream,
+                 delete_many_post_publish: &proc_macro2::TokenStream,
+                 delete_many_root_skip: &proc_macro2::TokenStream| {
+                    quote! {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                        use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
-                if ids.is_empty() {
-                    return Ok(());
-                }
-
-                #tenant_id_setup
-                let mut conn = self.__autumn_acquire_conn().await?;
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
-
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
-                    async move {
-                        let mut current_rows = Vec::new();
-                        for chunk in ids.chunks(1000) {
-                            let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
-                                .order(#table_ident::id.asc());
-                            let chunk_rows = #load_expr
-                                .map_err(::autumn_web::AutumnError::from)?;
-                            current_rows.extend(chunk_rows);
+                        if ids.is_empty() {
+                            return Ok(());
                         }
 
-                        for record in &current_rows {
-                            let mut ctx = MutationContext::new(MutationOp::Delete);
-                            #idempotency_setup
-                            self.hooks.before_delete(&mut ctx, record).await?;
-                            #delete_commit_hook_setup
-                        }
+                        #tenant_id_setup
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
-                        #delete_execution
+                        #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                            async move {
+                                let mut current_rows = Vec::new();
+                                for chunk in ids.chunks(1000) {
+                                    let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
+                                        .order(#table_ident::id.asc());
+                                    let chunk_rows = #load_expr
+                                        .map_err(::autumn_web::AutumnError::from)?;
+                                    current_rows.extend(chunk_rows);
+                                }
+
+                                // #1740: cascade dependent actions for every parent BEFORE
+                                // the bulk parent delete, so no child is orphaned and the
+                                // parent delete never trips a foreign-key constraint.
+                                // Codex round-5-B: the cascade runs FIRST so a batch root
+                                // that is also another root's descendant is deleted (and
+                                // recorded in `__autumn_deleted`) here — its `before_delete`
+                                // fires exactly once as that descendant; the root hook loop
+                                // below then skips it (`#delete_many_root_skip`), avoiding a
+                                // second firing, and the tolerant bulk `id = ANY` delete no
+                                // longer touches it.
+                                #delete_many_cascade
+
+                                for record in &current_rows {
+                                    #delete_many_root_skip
+                                    let mut ctx = MutationContext::new(MutationOp::Delete);
+                                    #idempotency_setup
+                                    self.hooks.before_delete(&mut ctx, record).await?;
+                                    #delete_commit_hook_setup
+                                }
+
+                                #delete_execution
+
+                                #delete_many_tx_ok
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+
+                        ::core::mem::drop(conn);
+                        #kick_dispatcher
+                        #delete_many_post_publish
 
                         Ok(())
                     }
-                    .scope_boxed()
-                })
-                .await?;
-
-                ::core::mem::drop(conn);
-                #kick_dispatcher
-
-                Ok(())
+                };
+            // Codex round-5-B: in the cascade forms, a batch root already deleted as
+            // another root's cascaded descendant must be skipped by the root hook
+            // loop (its `before_delete`/commit-hook already fired during the cascade).
+            // The plain (no-cascade) form has no `__autumn_deleted` set, so its skip
+            // token is empty and the loop is byte-identical to the prior codegen.
+            let delete_many_cascade_root_skip = quote! {
+                if __autumn_deleted.contains(&(#table_name, record.id)) { continue; }
+            };
+            // Codex P1: with no repository-attribute `dependent(...)`, dispatch the
+            // bulk cascade at run time via the model's `Model::dependents()` — empty
+            // (blanket) for a model with no dependents, so the byte-identical plain
+            // path runs and the tx still returns `()`; non-empty for a model-declared
+            // `#[has_many(dependent = ...)]`, so the runtime cascade runs. A
+            // repository-attribute `dependent(...)` keeps its authoritative
+            // compile-time cascade (precedence, mirroring `delete_by_id`).
+            if config.dependents.is_empty() {
+                let __plain = build_delete_many_body(
+                    &quote! {},
+                    &quote! {},
+                    &quote! { Ok(()) },
+                    &quote! {},
+                    &quote! {},
+                );
+                let __runtime = build_delete_many_body(
+                    &delete_many_runtime_cascade,
+                    &delete_many_cascade_tx_bind,
+                    &delete_many_cascade_tx_ok,
+                    &delete_many_cascade_post_publish,
+                    &delete_many_cascade_root_skip,
+                );
+                quote! {
+                    use ::autumn_web::repository::AutumnDependents as _;
+                    let __autumn_rt_deps = #model_name::dependents();
+                    if __autumn_rt_deps.is_empty() {
+                        #__plain
+                    } else {
+                        #__runtime
+                    }
+                }
+            } else {
+                build_delete_many_body(
+                    &delete_many_compiletime_cascade,
+                    &delete_many_cascade_tx_bind,
+                    &delete_many_cascade_tx_ok,
+                    &delete_many_cascade_post_publish,
+                    &delete_many_cascade_root_skip,
+                )
             }
         };
 
@@ -3918,9 +6962,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let struct_fields = quote! {
             pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             #tenant_struct_field
+            #shards_struct_field
             /// Read-routing snapshot for generated read-only methods (#971).
             __autumn_read_route: ::autumn_web::repository::ReadRoute,
             /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
@@ -3929,6 +6974,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_slow_threshold: ::std::time::Duration,
             /// Route path from `MatchedPath` for metrics labels.
             __autumn_route: ::std::option::Option<::std::string::String>,
+            #bcast_struct_field
         };
 
         let clone_impl = quote! {
@@ -3937,10 +6983,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         #tenant_clone_field
+                        #shards_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
+                        #bcast_clone_field
                     }
                 }
             }
@@ -3970,10 +7018,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             Ok(#pg_name {
                 pool,
                 #tenant_init_field
+                #shards_none_field
                 __autumn_read_route,
                 __autumn_statement_timeout_ms: __autumn_timeout_ms,
                 __autumn_slow_threshold,
                 __autumn_route,
+                #bcast_field_some_state
             })
         };
 
@@ -4000,7 +7050,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::core::option::Option::Some(t)
                 };
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                     let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(::autumn_web::tenancy::TenantInsertable::tenant_values(new.clone(), t))
@@ -4059,7 +7109,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                     let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(new.clone())
                         .get_result::<#model_name>(conn)
@@ -4081,6 +7131,88 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .await
                     .map_err(::autumn_web::AutumnError::from)
             }
+        };
+
+        // #1801: opt-in merged-model validation on the no-hooks update path.
+        // `#knob_validate_current` is spliced into branches where `current`
+        // (the loaded row) is already in scope — it borrows the row, validates
+        // the merged model via `from_patch`, and discards the draft (we only
+        // want its 422 side-effect; the blind write below is unchanged).
+        // `#knob_load_and_validate` (plain, no tenant filter) and
+        // `#knob_load_and_validate_tenant` (tenant-filtered) are spliced into the
+        // otherwise-blind no-lock sub-branches: each first SELECTs the current row
+        // (only when the knob is set — no unconditional extra query), then
+        // validates. The tenant variant is used in the tenant_scoped blind branch
+        // so its SELECT matches that branch's own tenant-filtered UPDATE and the
+        // sibling version-checked load — otherwise a cross-tenant `id` would load a
+        // foreign row and surface 422 instead of the correct 404. All expand to
+        // nothing when the knob is off, keeping the blind path byte-for-byte.
+        //
+        // Note (normalize-vs-persist asymmetry): `from_patch` normalizes the merged
+        // model before validating, but the blind path deliberately persists the
+        // un-normalized `changes.__to_changeset()` (the validation here is
+        // side-effect-only — we keep only its 422). So a value that passes only
+        // because normalization cleaned it up is stored raw. This is a known,
+        // deliberate limitation of the opt-in blind path; the hooked/#1804 path
+        // persists the normalized draft instead.
+        //
+        // Concurrency (known, deliberate): this merged validation is point-in-time
+        // against a non-locked snapshot (a plain SELECT, no `FOR UPDATE`). It
+        // reliably rejects a single request that is invalid once merged (the #1801
+        // acceptance criterion), but does not provide a serializable cross-field
+        // invariant under concurrent partial writes to different fields — two
+        // concurrent requests can each validate against the same old row and then
+        // persist a combination the validator would reject. This matches the blind
+        // path's intentionally non-transactional, last-write-wins-per-column
+        // semantics; callers needing atomic cross-field enforcement should use a
+        // versioned or `hooks = ...` repository, whose update runs
+        // `SELECT ... FOR UPDATE` inside the mutation transaction.
+        let draft_ext_trait = format_ident!("{}DraftExt", model_name);
+        let knob_validate_current = if config.validate_on_update_fetch {
+            quote! {
+                { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?; }
+            }
+        } else {
+            quote! {}
+        };
+        // Shared not-found→404 tail spliced into both merged-validation knobs
+        // (non-tenant and tenant): map any load error to an `AutumnError` and
+        // turn a missing row into the correct 404 rather than a foreign-row 422.
+        // `#model_name` and `id` are in scope here (same fn), so the interpolated
+        // tokens match what was previously inlined identically in both knobs.
+        let not_found_to_404 = quote! {
+            .optional()
+            .map_err(::autumn_web::AutumnError::from)?
+            .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                format!("{} with id {} not found", stringify!(#model_name), id)
+            ))
+        };
+        let knob_load_and_validate = if config.validate_on_update_fetch {
+            quote! {
+                let __merged_current = #table_ident::table.find(id)
+                    .first::<#model_name>(&mut conn)
+                    .await
+                    #not_found_to_404 ?;
+                { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
+            }
+        } else {
+            quote! {}
+        };
+        // Tenant-scoped variant: mirror the branch's own UPDATE and sibling load,
+        // which filter by `#table_ident::tenant_id.eq(t)` when a tenant is in scope
+        // and fall back to the bare PK lookup only for across-tenants queries.
+        let knob_load_and_validate_tenant = if config.validate_on_update_fetch {
+            quote! {
+                let __merged_current = if let ::core::option::Option::Some(ref t) = tenant_id {
+                    #table_ident::table.find(id).filter(#table_ident::tenant_id.eq(t)).first::<#model_name>(&mut conn).await
+                } else {
+                    #table_ident::table.find(id).first::<#model_name>(&mut conn).await
+                }
+                #not_found_to_404 ?;
+                { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
+            }
+        } else {
+            quote! {}
         };
 
         let update_body = if config.tenant_scoped && config.versioned {
@@ -4107,16 +7239,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::core::option::Option::Some(t)
                 };
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                     async move {
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(expected_version) =
                             changes.__autumn_lock_version_expected()
                         {
                             let c = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                             } else {
-                                load_query.for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             }
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
@@ -4137,9 +7269,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             c
                         } else {
                             if let ::core::option::Option::Some(ref t) = tenant_id {
-                                load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                             } else {
-                                load_query.for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             }
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
@@ -4147,6 +7279,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 format!("{} with id {} not found", stringify!(#model_name), id)
                             ))?
                         };
+                        #knob_validate_current
                         let mut diesel_changeset = changes.__to_changeset();
                         if let ::core::option::Option::Some(ref t) = tenant_id {
                             diesel_changeset.set_tenant_id(t.clone());
@@ -4191,16 +7324,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
                             // SELECT FOR UPDATE grabs an exclusive row lock so
                             // no concurrent writer can commit between our
                             // version check and the UPDATE below.
                             let load_query = #table_ident::table.find(id);
                             let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                             } else {
-                                load_query.for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             }
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
@@ -4222,6 +7355,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
 
+                            #knob_validate_current
                             let mut diesel_changeset = changes.__to_changeset();
                             if let ::core::option::Option::Some(ref t) = tenant_id {
                                 use ::autumn_web::repository::CanSetTenantId as _;
@@ -4245,6 +7379,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                     .await
                 } else {
+                    #knob_load_and_validate_tenant
                     let mut diesel_changeset = changes.__to_changeset();
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         use ::autumn_web::repository::CanSetTenantId as _;
@@ -4283,13 +7418,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                     async move {
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(expected_version) =
                             changes.__autumn_lock_version_expected()
                         {
-                            let c = load_query.for_update().first::<#model_name>(conn).await
+                            let c = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
                                 .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -4310,13 +7445,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                             c
                         } else {
-                            load_query.for_update().first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
                                 .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
                                     format!("{} with id {} not found", stringify!(#model_name), id)
                                 ))?
                         };
+                        #knob_validate_current
                         let diesel_changeset = changes.__to_changeset();
                         let update_target = #table_ident::table.find(id);
                         let record = ::autumn_web::reexports::diesel::update(update_target)
@@ -4344,10 +7480,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
                             let load_query = #table_ident::table.find(id);
-                            let current = load_query.for_update().first::<#model_name>(conn).await
+                            let current = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
                             .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -4368,6 +7504,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
 
+                            #knob_validate_current
                             let diesel_changeset = changes.__to_changeset();
                             let update_target = #table_ident::table.find(id);
                             ::autumn_web::reexports::diesel::update(update_target)
@@ -4380,6 +7517,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                     .await
                 } else {
+                    #knob_load_and_validate
                     let diesel_changeset = changes.__to_changeset();
                     let update_target = #table_ident::table.find(id);
                     ::autumn_web::reexports::diesel::update(update_target)
@@ -4419,12 +7557,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #tenant_id_setup
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
                         let load_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                            load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                         } else {
-                            load_query.for_update().first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                         }
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
@@ -4498,12 +7636,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
                         let load_query = #table_ident::table.find(id);
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                            load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                         } else {
-                            load_query.for_update().first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                         }
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
@@ -4574,10 +7712,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
-                        let record = #table_ident::table.find(id)
-                            .filter(#table_ident::deleted_at.is_null())
-                            .for_update()
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
+                        let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id)
+                            .filter(#table_ident::deleted_at.is_null()))
+
                             .first::<#model_name>(conn)
                             .await
                             .optional()
@@ -4638,9 +7776,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
-                    let record = #table_ident::table.find(id)
-                        .for_update()
+                ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
+                    let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id))
+
                         .first::<#model_name>(conn)
                         .await
                         .optional()
@@ -4711,23 +7849,63 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let tenant_id = tenant_id.as_ref();
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                         for chunk in new.chunks(chunk_size) {
                             let chunk_inserted = if let ::core::option::Option::Some(t) = tenant_id {
                                 let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
-                                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(values)
-                                    .get_results::<#model_name>(conn)
+                                ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(values)
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
                                     .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                             } else {
-                                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(chunk.to_vec())
-                                    .get_results::<#model_name>(conn)
+                                ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(chunk.to_vec())
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
                                     .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                             }
                             .map_err(::autumn_web::AutumnError::from)?;
                             for r in &chunk_inserted {
@@ -4762,23 +7940,63 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let tenant_id = tenant_id.as_ref();
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                         for chunk in new.chunks(chunk_size) {
                             let chunk_inserted = if let ::core::option::Option::Some(t) = tenant_id {
                                 let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
-                                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(values)
-                                    .get_results::<#model_name>(conn)
+                                ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(values)
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
                                     .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                             } else {
-                                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(chunk.to_vec())
-                                    .get_results::<#model_name>(conn)
+                                ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(chunk.to_vec())
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
                                     .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                             }
                             .map_err(::autumn_web::AutumnError::from)?;
                             inserted.extend(chunk_inserted);
@@ -4811,16 +8029,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                         for chunk in new.chunks(chunk_size) {
-                            let chunk_inserted = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            let chunk_inserted = ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(chunk.to_vec())
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                                 .map_err(::autumn_web::AutumnError::from)?;
                             for r in &chunk_inserted {
                                 #vh_r
@@ -4846,16 +8084,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                         for chunk in new.chunks(chunk_size) {
-                            let chunk_inserted = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            let chunk_inserted = ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(chunk.to_vec())
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                                 .map_err(::autumn_web::AutumnError::from)?;
                             inserted.extend(chunk_inserted);
                         }
@@ -4916,23 +8174,83 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
                         let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
-                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(values)
-                            .get_results::<#model_name>(conn)
-                            .await
+                        ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(values)
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                     } else {
-                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
-                            .await
+                        ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(chunk.to_vec())
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                     }
                 }
             } else {
                 quote! {
-                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(chunk.to_vec())
-                        .get_results::<#model_name>(conn)
-                        .await
+                    ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(chunk.to_vec())
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                 }
             };
 
@@ -4979,9 +8297,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 let mut offset = 0;
                 let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                 for chunk in new.chunks(chunk_size) {
-                    let batch_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let results = (#insert_expr_conn)
                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -5021,7 +8339,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             // Fallback to row-by-row insertion for this chunk
                             for (idx, item) in chunk.iter().enumerate() {
                                 let global_idx = offset + idx;
-                                let res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                                let res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                     async move {
                                         let model = (#row_insert_expr_conn)
                                             .map_err(::autumn_web::AutumnError::from)?;
@@ -5076,14 +8394,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let vh_load_before_map_no_lock_expr = if config.tenant_scoped {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
-                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
                     } else {
-                        load_query.for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                     }
                 }
             } else {
                 quote! {
-                    load_query.for_update().load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                 }
             };
             let vh_load_before_map_no_lock = if config.versioned {
@@ -5128,14 +8446,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let load_expr = if config.tenant_scoped {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
-                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
                     } else {
-                        load_query.for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                     }
                 }
             } else {
                 quote! {
-                    load_query.for_update().load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                 }
             };
 
@@ -5191,7 +8509,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
 
                 if let ::core::option::Option::Some(expected_version) = changes.__autumn_lock_version_expected() {
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             // Load existing to verify versions
                             let mut current_rows = Vec::new();
@@ -5232,7 +8550,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                     .await
                 } else {
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             #vh_load_before_map_no_lock
 
@@ -5267,9 +8585,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .filter(#table_ident::id.eq_any(chunk))
                             #soft_delete_filter;
                         let chunk_rows = if let ::core::option::Option::Some(t) = tenant_id {
-                            load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
                         } else {
-                            load_query.for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                         }
                         .map_err(::autumn_web::AutumnError::from)?;
                     }
@@ -5278,7 +8596,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let load_query = #table_ident::table
                             .filter(#table_ident::id.eq_any(chunk))
                             #soft_delete_filter;
-                        let chunk_rows = load_query.for_update().load::<#model_name>(conn).await
+                        let chunk_rows = ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                             .map_err(::autumn_web::AutumnError::from)?;
                     }
                 };
@@ -5456,31 +8774,79 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 (loop_ts, quote! {})
             };
 
-            quote! {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                use ::autumn_web::reexports::diesel_async::AsyncConnection;
-                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+            // Parameterized on its cascade tokens so it can be emitted twice under
+            // runtime dispatch (Codex P1): a plain no-cascade form whose tx tail
+            // returns `()`, and a runtime-cascade form that binds/publishes the
+            // deferred broadcasts. A repository-attribute `dependent(...)` emits it
+            // once with the compile-time cascade.
+            let build_delete_many_body =
+                |delete_many_cascade: &proc_macro2::TokenStream,
+                 delete_many_tx_bind: &proc_macro2::TokenStream,
+                 delete_many_tx_ok: &proc_macro2::TokenStream,
+                 delete_many_no_hooks_tail: &proc_macro2::TokenStream| {
+                    quote! {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                if ids.is_empty() {
-                    return Ok(());
-                }
+                        if ids.is_empty() {
+                            return Ok(());
+                        }
 
-                #tenant_id_setup
-                let mut conn = self.__autumn_acquire_conn().await?;
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                        #tenant_id_setup
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
-                    async move {
-                        #vh_delete_load_before
-                        #delete_loop
-                        #vh_delete_filter
-                        #vh_delete_write
-                        Ok(())
+                        #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                            async move {
+                                // #1740: cascade dependent actions for every parent BEFORE
+                                // the bulk parent delete (empty for repos with no
+                                // dependents, preserving the prior bulk codegen).
+                                #delete_many_cascade
+                                #vh_delete_load_before
+                                #delete_loop
+                                #vh_delete_filter
+                                #vh_delete_write
+                                #delete_many_tx_ok
+                            }
+                            .scope_boxed()
+                        })
+                        .await #delete_many_no_hooks_tail
                     }
-                    .scope_boxed()
-                })
-                .await
+                };
+            // Codex P1: with no repository-attribute `dependent(...)`, dispatch the
+            // bulk cascade at run time via `Model::dependents()` — empty (blanket)
+            // for a model with no dependents, so the byte-identical plain path runs
+            // (tx returns `()` as before); non-empty for a model-declared
+            // `#[has_many(dependent = ...)]`, so the runtime cascade runs. A
+            // repository-attribute `dependent(...)` keeps its authoritative
+            // compile-time cascade (precedence, mirroring `delete_by_id`).
+            if config.dependents.is_empty() {
+                let __plain =
+                    build_delete_many_body(&quote! {}, &quote! {}, &quote! { Ok(()) }, &quote! {});
+                let __runtime = build_delete_many_body(
+                    &delete_many_runtime_cascade,
+                    &delete_many_cascade_tx_bind,
+                    &delete_many_cascade_tx_ok,
+                    &delete_many_cascade_no_hooks_tail,
+                );
+                quote! {
+                    use ::autumn_web::repository::AutumnDependents as _;
+                    let __autumn_rt_deps = #model_name::dependents();
+                    if __autumn_rt_deps.is_empty() {
+                        #__plain
+                    } else {
+                        #__runtime
+                    }
+                }
+            } else {
+                build_delete_many_body(
+                    &delete_many_compiletime_cascade,
+                    &delete_many_cascade_tx_bind,
+                    &delete_many_cascade_tx_ok,
+                    &delete_many_cascade_no_hooks_tail,
+                )
             }
         };
 
@@ -5526,24 +8892,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
             let vh_upsert_lock_keys = if config.versioned {
                 let table_name = table_name.clone();
+                // `pg_advisory_xact_lock` is a Postgres-only function; SQLite has
+                // no equivalent and would fail at runtime. Cfg-gate the advisory
+                // lock to Postgres via `backend_select!` and skip it on SQLite:
+                // SQLite is single-writer (a write transaction locks the whole
+                // database), so the cross-connection serialization the advisory
+                // lock provides on Postgres is already guaranteed there — nothing
+                // to acquire (issue #1996, PR #2021).
                 quote! {
-                    let mut __autumn_upsert_lock_ids: Vec<_> =
-                        records.iter().map(|r| r.id).collect();
-                    __autumn_upsert_lock_ids.sort_unstable();
-                    __autumn_upsert_lock_ids.dedup();
-                    for __autumn_upsert_lock_id in __autumn_upsert_lock_ids {
-                        let __autumn_upsert_lock_key =
-                            ::autumn_web::repository::repository_upsert_advisory_lock_key(
-                                #table_name,
-                                __autumn_upsert_lock_id,
-                            );
-                        ::autumn_web::reexports::diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(
-                                __autumn_upsert_lock_key,
-                            )
-                            .execute(conn)
-                            .await
-                            .map_err(::autumn_web::AutumnError::from)?;
+                    ::autumn_web::backend_select! {
+                        pg => {
+                            let mut __autumn_upsert_lock_ids: Vec<_> =
+                                records.iter().map(|r| r.id).collect();
+                            __autumn_upsert_lock_ids.sort_unstable();
+                            __autumn_upsert_lock_ids.dedup();
+                            for __autumn_upsert_lock_id in __autumn_upsert_lock_ids {
+                                let __autumn_upsert_lock_key =
+                                    ::autumn_web::repository::repository_upsert_advisory_lock_key(
+                                        #table_name,
+                                        __autumn_upsert_lock_id,
+                                    );
+                                ::autumn_web::reexports::diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(
+                                        __autumn_upsert_lock_key,
+                                    )
+                                    .execute(conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                            }
+                        },
+                        sqlite => {},
                     }
                 }
             } else {
@@ -5578,25 +8956,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let load_expr = if config.tenant_scoped {
                 quote! {
                     if let ::core::option::Option::Some(ref t) = tenant_id {
-                        #table_ident::table
+                        ::autumn_web::maybe_for_update!(#table_ident::table
                             .filter(#table_ident::id.eq_any(&chunk_ids))
-                            .filter(#table_ident::tenant_id.eq(t.clone()))
-                            .for_update()
+                            .filter(#table_ident::tenant_id.eq(t.clone())))
+
                             .load::<#model_name>(conn)
                             .await
                     } else {
-                        #table_ident::table
-                            .filter(#table_ident::id.eq_any(&chunk_ids))
-                            .for_update()
+                        ::autumn_web::maybe_for_update!(#table_ident::table
+                            .filter(#table_ident::id.eq_any(&chunk_ids)))
+
                             .load::<#model_name>(conn)
                             .await
                     }
                 }
             } else {
                 quote! {
-                    #table_ident::table
-                        .filter(#table_ident::id.eq_any(&chunk_ids))
-                        .for_update()
+                    ::autumn_web::maybe_for_update!(#table_ident::table
+                        .filter(#table_ident::id.eq_any(&chunk_ids)))
+
                         .load::<#model_name>(conn)
                         .await
                 }
@@ -5613,23 +8991,91 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let size_check = if config.tenant_scoped {
+                // Tenant-scoped path: replace the old coarse post-upsert size check
+                // with a drop-triggered, tenant-scoped RECONCILIATION (ref #1963 +
+                // the Codex P2 fail-closed follow-up).
+                //
+                // The versioned tenant-scoped upsert SQL is
+                //   INSERT ... ON CONFLICT (id) DO UPDATE SET ..., lock_version = lock_version + 1
+                //   WHERE lock_version = excluded.lock_version AND tenant_id = $t RETURNING *
+                // so a row can be silently dropped (not RETURNed) for EITHER of two
+                // reasons: (1) a tenant_id mismatch — a cross-tenant row we must NOT
+                // touch and must stay SILENT about (this is exactly the #1963
+                // false-positive we are avoiding); or (2) a lock_version mismatch — a
+                // genuine SAME-tenant optimistic-lock conflict that must be LOUD (409).
+                //
+                // The pre-upsert per-row lock check above only sees rows present in
+                // `existing_rows` at load time. A row inserted by a DIFFERENT write
+                // path (raw insert / save / save_many / another repo — none of which
+                // take this upsert's `pg_advisory_xact_lock`, which only versioned
+                // `upsert_many` acquires) BETWEEN our FOR UPDATE snapshot and the
+                // upsert is invisible to it. With the old size check gone entirely, a
+                // real same-tenant lock conflict on such a raced-in row was returned
+                // as `Ok` instead of a 409 — the Codex P2 bug.
+                //
+                // The fix is fail-closed AND cannot reintroduce the #1963 false
+                // positive: only when a drop actually happened do we re-select the
+                // dropped ids UNDER THE CURRENT TENANT SCOPE (mirroring `load_expr`).
+                // If a dropped id is STILL PRESENT under this tenant, its tenant_id
+                // matched, so the only reason it was dropped is a lock_version
+                // mismatch (reason 2) → we fail closed with the SAME `Conflict` shape
+                // the pre-upsert detector emits. If NONE of the dropped ids are
+                // present under this tenant, every drop was cross-tenant/absent
+                // (reason 1) → we stay SILENT (`Ok`), preserving the #1963 behavior.
+                // Because it fires ONLY when a dropped id still exists under the
+                // current tenant, a cross-tenant row — filtered out of this re-select
+                // by construction — can never trip it.
+                //
+                // Gated at runtime by `has_lock` (mirroring the pre-upsert detector):
+                // a non-versioned tenant-scoped model has no `lock_version`, so its
+                // drops are ALWAYS cross-tenant and this reconciliation never fires,
+                // leaving that path a silent no-op exactly as #1963 requires.
                 quote! {
                     if has_lock && upserted.len() != records.len() {
-                        return Err(::autumn_web::AutumnError::conflict_msg(
-                            format!(
-                                "Conflict: only {} of {} records were upserted (potential lock-version/optimistic lock or tenant conflict)",
-                                upserted.len(),
-                                records.len()
-                            )
-                        ));
-                    } else if !has_lock && upserted.len() != records.len() {
-                        return Err(::autumn_web::AutumnError::bad_request_msg(
-                            format!(
-                                "Tenant conflict: only {} of {} records were upserted (potential cross-tenant conflict)",
-                                upserted.len(),
-                                records.len()
-                            )
-                        ));
+                        let __autumn_done: ::std::collections::HashSet<_> =
+                            upserted.iter().map(|r| r.id).collect();
+                        let __autumn_dropped_ids: Vec<_> = records
+                            .iter()
+                            .map(|r| r.id)
+                            .filter(|id| !__autumn_done.contains(id))
+                            .collect();
+                        let __autumn_still_present: Vec<#model_name> =
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::maybe_for_update!(#table_ident::table
+                                    .filter(#table_ident::id.eq_any(&__autumn_dropped_ids))
+                                    .filter(#table_ident::tenant_id.eq(t.clone())))
+
+                                    .load::<#model_name>(conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                            } else {
+                                ::autumn_web::maybe_for_update!(#table_ident::table
+                                    .filter(#table_ident::id.eq_any(&__autumn_dropped_ids)))
+
+                                    .load::<#model_name>(conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                            };
+                        // NOTE: `.iter().next()` (not `.first()`) — the generated
+                        // block imports `diesel_async::RunQueryDsl`, whose `first`
+                        // trait method matches on the `&Vec<_>` receiver before the
+                        // slice inherent `first`, which would resolve to the diesel
+                        // query builder and blow up trait resolution (`LimitDsl`).
+                        if let ::core::option::Option::Some(existing) = __autumn_still_present.iter().next() {
+                            if let ::core::option::Option::Some(db_lock) = existing.__autumn_lock_version_actual() {
+                                if let ::core::option::Option::Some(incoming) = records.iter().find(|r| r.id == existing.id) {
+                                    if let ::core::option::Option::Some(incoming_lock) = incoming.__autumn_lock_version_actual() {
+                                        return Err(::autumn_web::AutumnError::conflict(
+                                            ::autumn_web::RepositoryError::Conflict {
+                                                id: existing.id,
+                                                expected_version: incoming_lock,
+                                                actual_version: ::core::option::Option::Some(db_lock),
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -5681,11 +9127,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #tenant_id_setup
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut upserted = Vec::new();
                         let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                         #vh_upsert_lock_keys
                         for chunk in records.chunks(chunk_size) {
                             let chunk_ids: Vec<_> = chunk.iter().map(|r| r.id).collect();
@@ -5746,6 +9192,1177 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         )
     };
 
+    // §1d: cross-shard write guard.  When `sharded + tenant_scoped`, writes
+    // that arrive with `across_tenants = true` AND `__autumn_shards.is_some()`
+    // cannot be safely fanned-out (no cross-shard transaction semantics), so we
+    // return a clear error instead of silently hitting only one shard. Shared
+    // by the core write bodies below and the `upsert_many` body further down.
+    let cross_shard_write_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                if self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard writes are not supported: \
+                             across_tenants() cannot be used for mutation \
+                             on a sharded repository"
+                        )
+                    );
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // ── #1369: transactional dependent cascade for delete_by_id ──────
+    //
+    // When the repository declares `dependent(...)` associations, override the
+    // default `delete_body` with one that (1) always opens a transaction, (2)
+    // loads and locks the parent, (3) applies every declared dependent action
+    // to the children on that same connection *before* deleting the parent, and
+    // (4) deletes the parent. Any error rolls the whole graph back. Children are
+    // removed/nullified before the parent delete so no FK/orphan can occur.
+    //
+    // This override is computed before the `cross_shard_write_guard` tuple below
+    // so the guard is prepended here too: on a sharded + tenant_scoped repo an
+    // `across_tenants()` delete is rejected rather than cascading across shards
+    // from a single routed connection (honoring the #1592/#1664/#1687 guards; a
+    // cascade cannot silently skip children living on other shards).
+    let delete_body = {
+        // #1738: the parent-side cascade body is shared between the
+        // repository-attribute (compile-time `dependent(...)`) form and the
+        // model-declared `#[has_many(dependent = ...)]` form (dispatched at run
+        // time via `Model::dependents()`). The parent load/mutation/hook/version
+        // tokens below are identical for both; only the per-child cascade calls
+        // differ (a compile-time list vs a runtime `RuntimeDependentSpec` slice),
+        // so those are passed into `assemble_cascade_body`.
+        //
+        // The parent's own delete kind (soft vs hard) drives the child `destroy`
+        // cascade (#1369 P1): a soft-delete child is only soft-deleted alongside
+        // a soft-deleted parent; a hard-deleted parent hard-deletes its children.
+        let parent_soft_lit = if config.soft_delete {
+            quote! { true }
+        } else {
+            quote! { false }
+        };
+
+        let tenant_id_setup = if config.tenant_scoped {
+            quote! {
+                let tenant_id = if self.across_tenants {
+                    ::core::option::Option::None
+                } else {
+                    let t = ::autumn_web::tenancy::CURRENT_TENANT
+                        .try_with(|t| t.clone()).ok().flatten()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
+                            "Query scoped to tenant, but no tenant context was established"
+                        ))?;
+                    ::core::option::Option::Some(t)
+                };
+            }
+        } else {
+            quote! {}
+        };
+
+        // The parent record is loaded (and row-locked via `for_update`) to run
+        // the not-found check and to feed the before_delete hook / version
+        // history / commit-hook payload. When the parent has none of those, the
+        // load still runs (lock + not-found) but the binding is discarded so a
+        // hook-free parent emits no unused binding.
+        let parent_needs_record =
+            config.hooks_type.is_some() || config.versioned || commit_hooks_enabled;
+        let parent_record_bind = if parent_needs_record {
+            quote! { record }
+        } else {
+            quote! { _record }
+        };
+        let parent_load = if config.tenant_scoped {
+            quote! {
+                let __load_query = #table_ident::table.find(id) #sd_filter;
+                let #parent_record_bind = if let ::core::option::Option::Some(ref t) = tenant_id {
+                    ::autumn_web::maybe_for_update!(__load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                } else {
+                    ::autumn_web::maybe_for_update!(__load_query).first::<#model_name>(conn).await
+                }
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?
+                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                    format!("{} with id {} not found", stringify!(#model_name), id)
+                ))?;
+            }
+        } else {
+            quote! {
+                let #parent_record_bind = ::autumn_web::maybe_for_update!(#table_ident::table.find(id) #sd_filter)
+
+                    .first::<#model_name>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?
+                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ))?;
+            }
+        };
+
+        let parent_mutation = if config.soft_delete {
+            let tenant_scoped_update = if config.tenant_scoped {
+                quote! {
+                    let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
+                        ::autumn_web::reexports::diesel::update(
+                            #table_ident::table.find(id)
+                                .filter(#table_ident::deleted_at.is_null())
+                                .filter(#table_ident::tenant_id.eq(t))
+                        )
+                            .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                            .execute(conn).await
+                    } else {
+                        ::autumn_web::reexports::diesel::update(
+                            #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
+                        )
+                            .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                            .execute(conn).await
+                    }
+                    .map_err(::autumn_web::AutumnError::from)?;
+                }
+            } else {
+                quote! {
+                    let __count = ::autumn_web::reexports::diesel::update(
+                        #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
+                    )
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(conn).await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                }
+            };
+            quote! {
+                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                #tenant_scoped_update
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+            }
+        } else {
+            let delete_stmt = if config.tenant_scoped {
+                quote! {
+                    let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
+                        ::autumn_web::reexports::diesel::delete(
+                            #table_ident::table.find(id).filter(#table_ident::tenant_id.eq(t))
+                        ).execute(conn).await
+                    } else {
+                        ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                            .execute(conn).await
+                    }
+                    .map_err(::autumn_web::AutumnError::from)?;
+                }
+            } else {
+                quote! {
+                    let __count = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                        .execute(conn).await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                }
+            };
+            quote! {
+                #delete_stmt
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+            }
+        };
+
+        let parent_before_delete = if config.hooks_type.is_some() {
+            quote! { self.hooks.before_delete(&mut ctx, &record).await?; }
+        } else {
+            quote! {}
+        };
+        let parent_vh = if config.versioned {
+            vh_insert_ts(
+                table_name,
+                "delete",
+                true,
+                &quote! { record },
+                None,
+                &quote! { conn },
+                model_name,
+            )
+        } else {
+            quote! {}
+        };
+        let (parent_register, parent_idempotency_setup, parent_commit_enqueue, _parent_kick) =
+            if commit_hooks_enabled {
+                (
+                    quote! { Self::__autumn_register_repository_commit_hooks(); },
+                    quote! {
+                        let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                            ::core::option::Option::None;
+                        if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                            ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                            __autumn_commit_hook_discriminator =
+                                ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                        }
+                    },
+                    quote! {
+                        let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
+                        ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
+                            conn,
+                            Self::__autumn_repository_commit_hook_key(),
+                            "delete",
+                            ctx.idempotency_key.as_deref(),
+                            __autumn_commit_hook_discriminator.as_deref(),
+                            &ctx,
+                            &__autumn_commit_hook_record,
+                        )
+                        .await?;
+                    },
+                    quote! { ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool); },
+                )
+            } else {
+                (quote! {}, quote! {}, quote! {}, quote! {})
+            };
+
+        // `ctx` is referenced by the before_delete hook, the version-history
+        // writer, and the commit-hook enqueue/idempotency setup — declare it and
+        // import the hooks types only when at least one is present, so a
+        // hook-free, unversioned parent (dependents only) emits no unused
+        // import/binding. `mut` is only required when it is written (hook or
+        // idempotency setup); version-history reads it immutably.
+        let parent_ctx_needed = parent_needs_record;
+        let parent_ctx_mut = config.hooks_type.is_some() || commit_hooks_enabled;
+        let parent_hooks_use = if config.hooks_type.is_some() {
+            quote! { use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks}; }
+        } else if parent_ctx_needed {
+            quote! { use ::autumn_web::hooks::{MutationContext, MutationOp}; }
+        } else {
+            quote! {}
+        };
+        let parent_ctx_decl = if parent_ctx_needed {
+            if parent_ctx_mut {
+                quote! { let mut ctx = MutationContext::new(MutationOp::Delete); }
+            } else {
+                quote! { let ctx = MutationContext::new(MutationOp::Delete); }
+            }
+        } else {
+            quote! {}
+        };
+        // Assemble the full transactional delete body around a given cascade,
+        // split into its read-only `restrict` PROBE block and its mutating block.
+        // Shared by the repository-attribute and model-declared (#1738) cascade
+        // forms. #1800 case 3: the parent's `restrict` dependents are probed
+        // BEFORE the parent's own `before_delete` hook fires (mirroring the
+        // child-tier ordering) — a `restrict` 409 must not leave a
+        // non-transactional parent hook side effect behind on a doomed
+        // transaction. The mutating dependents still run AFTER the hook (so a
+        // hook that vetoes the delete short-circuits them) and BEFORE the parent
+        // row mutation (so no FK dangles).
+        let assemble_cascade_body =
+            |cascade_restrict_calls: proc_macro2::TokenStream,
+             cascade_mutating_calls: proc_macro2::TokenStream| {
+                quote! {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    #parent_hooks_use
+
+                    #parent_register
+                    #tenant_id_setup
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    // Deferred OOB delete broadcasts for broadcasts-only cascaded children
+                    // (#1369). Accumulated inside the tx and returned on commit, so a
+                    // rollback drops them and no spurious client deletes are published.
+                    let __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                        ::autumn_web::__private::scoped_immediate_transaction::<
+                            ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+                            ::autumn_web::AutumnError, _,
+                        >(
+                            &mut *conn,
+                            |conn| {
+                                async move {
+                                    let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                                        ::std::vec::Vec::new();
+                                    #parent_ctx_decl
+                                    #parent_idempotency_setup
+
+                                    #parent_load
+
+                                    // #1800 case 3: probe the parent's `restrict`
+                                    // dependents (read-only 409) BEFORE the parent
+                                    // `before_delete` hook — a blocked delete then never
+                                    // leaves a non-transactional parent hook side effect
+                                    // behind on a rolled-back transaction. Declares the
+                                    // cascade cycle-guard sets, which the mutating block
+                                    // below reuses.
+                                    #cascade_restrict_calls
+
+                                    #parent_before_delete
+
+                                    // Cascade the mutating dependents (destroy/nullify/
+                                    // delete_all) AFTER the hook but BEFORE the parent row
+                                    // is removed, so the parent delete never trips a
+                                    // foreign-key constraint and no orphan can survive.
+                                    #cascade_mutating_calls
+
+                                    #parent_mutation
+
+                                    #parent_vh
+
+                                    #parent_commit_enqueue
+
+                                    Ok(__autumn_dep_broadcasts)
+                                }
+                                .scope_boxed()
+                            },
+                        )
+                        .await?;
+                    ::core::mem::drop(conn);
+                    // Publish the cascaded children's OOB delete broadcasts only now that
+                    // the transaction has committed (a rolled-back cascade published
+                    // nothing). No-op when the buffer is empty / live channels are off.
+                    ::autumn_web::repository::publish_deferred_dependent_broadcasts(__autumn_dep_broadcasts);
+                    // Always kick the durable commit-hook dispatcher after a dependent
+                    // delete: even when this parent has no commit hooks, a cascaded
+                    // `dependent = destroy` child may have enqueued one in the same
+                    // transaction. The kick is idempotent.
+                    ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+
+                    Ok(())
+                }
+            };
+
+        if config.dependents.is_empty() {
+            // ── #1738: model-declared `#[has_many(dependent = ...)]` cascade ──
+            //
+            // No repository-attribute `dependent(...)` was declared, so consult
+            // the model's runtime `Model::dependents()` (an inherent shadow of
+            // `AutumnDependents::dependents`, emitted by `#[model]` only when the
+            // struct declares dependent associations; otherwise the blanket impl
+            // yields an empty slice). When empty this is exactly the prior plain
+            // delete body; when non-empty it drives the SAME transactional
+            // cascade as the repository-attribute form, resolving each child
+            // repository through the `Pg{Child}Repository` convention baked into
+            // the spec's `cascade` thunk.
+            let runtime_cascade_restrict = quote! {
+                // Codex round-5-B cycle guard: the ACTIVE recursion path, seeded
+                // with this parent row so a grandchild that references an ancestor
+                // is skipped (cycle) instead of looping, plus a monotonic deleted
+                // set. The parent itself is deleted by `#parent_mutation` below, so
+                // it stays on the path for the whole cascade (never popped here).
+                let mut __autumn_path: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                // #1800 case 1: physical-delete subset for the diamond revisit-skip.
+                let mut __autumn_physically_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                __autumn_path.insert((#table_name, id));
+                // #1800 case 3 / Phase 1: probe all `restrict` dependents first —
+                // a 409 here rolls back before the parent `before_delete` hook (and
+                // any mutating action's child hook) fires.
+                for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
+                    __s.action == ::autumn_web::repository::DependentAction::Restrict
+                ) {
+                    __autumn_dep_broadcasts.extend(
+                        (__autumn_spec.cascade)(
+                            &self.pool,
+                            conn,
+                            id,
+                            #parent_soft_lit,
+                            &mut __autumn_path,
+                            &mut __autumn_deleted,
+                            &mut __autumn_physically_deleted,
+                        )
+                        .await?
+                    );
+                }
+            };
+            let runtime_cascade_mutating = quote! {
+                // Phase 2: mutating dependents in declaration order. Reuses the
+                // cycle-guard sets declared by the restrict block above.
+                for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
+                    __s.action != ::autumn_web::repository::DependentAction::Restrict
+                ) {
+                    __autumn_dep_broadcasts.extend(
+                        (__autumn_spec.cascade)(
+                            &self.pool,
+                            conn,
+                            id,
+                            #parent_soft_lit,
+                            &mut __autumn_path,
+                            &mut __autumn_deleted,
+                            &mut __autumn_physically_deleted,
+                        )
+                        .await?
+                    );
+                }
+            };
+            let runtime_body =
+                assemble_cascade_body(runtime_cascade_restrict, runtime_cascade_mutating);
+            let plain_delete_body = delete_body;
+            quote! {
+                use ::autumn_web::repository::AutumnDependents as _;
+                // Inherent `dependents()` (real specs) shadows the blanket trait
+                // method (empty) when the model declares dependents; unqualified
+                // call so the shadow wins. Cheap `&[]` for models without any.
+                let __autumn_rt_deps = #model_name::dependents();
+                if __autumn_rt_deps.is_empty() {
+                    #plain_delete_body
+                } else {
+                    #runtime_body
+                }
+            }
+        } else {
+            // ── #1369 repository-attribute `dependent(...)` cascade ──────────
+            //
+            // Precedence (#1738): a repository that declares `dependent(...)` is
+            // the explicit escape hatch (for children whose repository does not
+            // follow the `Pg{Child}Repository` convention, or lives in another
+            // crate). Its compile-time specs are authoritative; any model-side
+            // `#[has_many(dependent = ...)]` is ignored here.
+            //
+            // #1369 restrict ordering: probe every `restrict` dependent BEFORE
+            // running any mutating dependent (`destroy`/`delete_all`/`nullify`).
+            // Mutating actions fire child `before_delete` hooks (counters, cache
+            // invalidation, external calls) that are NOT commit hooks — a later
+            // `restrict` 409 rolls back the DB but cannot retract those side
+            // effects. Hoisting all restrict probes ahead of the mutating pass
+            // means a blocked delete never touches a child hook.
+            let emit_cascade_call = |dep: &DependentSpec| {
+                let child_repo = &dep.child_repo;
+                let fk = &dep.fk;
+                let action_variant = dep.action.variant_ident();
+                quote! {
+                    let __autumn_dep_repo = #child_repo::with_pool_untracked(
+                        ::core::clone::Clone::clone(&self.pool)
+                    );
+                    // Deferred delete broadcasts accumulate here; published only
+                    // after the tx commits (see the post-commit region above).
+                    __autumn_dep_broadcasts.extend(
+                        __autumn_dep_repo
+                            .__autumn_apply_dependent_on_conn(
+                                conn,
+                                #fk,
+                                id,
+                                ::autumn_web::repository::DependentAction::#action_variant,
+                                #parent_soft_lit,
+                                &mut __autumn_path,
+                                &mut __autumn_deleted,
+                                &mut __autumn_physically_deleted,
+                            )
+                            .await?
+                    );
+                }
+            };
+            let restrict_calls: ::std::vec::Vec<_> = config
+                .dependents
+                .iter()
+                .filter(|dep| dep.action == DependentAction::Restrict)
+                .map(&emit_cascade_call)
+                .collect();
+            let mutating_calls: ::std::vec::Vec<_> = config
+                .dependents
+                .iter()
+                .filter(|dep| dep.action != DependentAction::Restrict)
+                .map(&emit_cascade_call)
+                .collect();
+            let cascade_restrict_calls = quote! {
+                // ── #1788: both-sites override diagnostic ────────────────────
+                //
+                // The repository-attribute `dependent(...)` above is authoritative
+                // and drives this cascade. But the model MAY ALSO declare
+                // `#[has_many(..., dependent = ...)]`; if so, that model-side
+                // declaration is silently overridden (repo-attr wins, see the
+                // precedence note above) and is inert. Emit a debug-only warn so a
+                // user does not wrongly believe the model-side `dependent` is
+                // active. Mirrors the `across_tenants()` debug-warn template
+                // (`cfg!(debug_assertions)`-gated `tracing::warn!`): zero-cost in
+                // release builds. The unqualified `#model_name::dependents()` call
+                // resolves to the model's inherent shadow (real specs) when present
+                // and to the blanket `AutumnDependents` fallback (empty slice)
+                // otherwise, so the `use` is required for the fallback to resolve.
+                // Runs at the very top of the restrict (Phase 1) block, before any
+                // restrict probe or the parent `before_delete` hook fires.
+                if ::core::cfg!(debug_assertions) {
+                    use ::autumn_web::repository::AutumnDependents as _;
+                    if !#model_name::dependents().is_empty() {
+                        ::autumn_web::reexports::tracing::warn!(
+                            "{}: both repository-attribute `dependent(...)` and \
+                             model-declared `#[has_many(..., dependent = ...)]` are \
+                             present for the same delete; the model-side dependents \
+                             are overridden and inert (repository-attribute wins)",
+                            ::core::stringify!(#model_name)
+                        );
+                    }
+                }
+                // Codex round-5-B cycle guard: the ACTIVE recursion path (seeded
+                // with this parent row so a grandchild referencing an ancestor is
+                // skipped as a cycle, not looped) plus a monotonic deleted set,
+                // both threaded by-ref into every `__autumn_apply_dependent_on_conn`
+                // call. The parent is deleted by `#parent_mutation`, so it stays on
+                // the path for the whole cascade (not popped here).
+                let mut __autumn_path: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                // #1800 case 1: physical-delete subset for the diamond revisit-skip.
+                let mut __autumn_physically_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                __autumn_path.insert((#table_name, id));
+                // #1800 case 3 / Phase 1: probe all `restrict` dependents first —
+                // a 409 here rolls back before the parent `before_delete` hook (and
+                // any mutating action's child hook) fires.
+                #(#restrict_calls)*
+            };
+            let cascade_mutating_calls = quote! {
+                // Phase 2: mutating dependents in declaration order. Reuses the
+                // cycle-guard sets declared by the restrict block above.
+                #(#mutating_calls)*
+            };
+            assemble_cascade_body(cascade_restrict_calls, cascade_mutating_calls)
+        }
+    };
+
+    let (
+        save_body,
+        update_body,
+        delete_body,
+        save_many_body,
+        save_many_skip_invalid_body,
+        update_many_body,
+        delete_many_body,
+    ) = if config.sharded && config.tenant_scoped {
+        let write_guard = &cross_shard_write_guard;
+        (
+            quote! { #write_guard #save_body },
+            quote! { #write_guard #update_body },
+            quote! { #write_guard #delete_body },
+            quote! { #write_guard #save_many_body },
+            quote! { #write_guard #save_many_skip_invalid_body },
+            quote! { #write_guard #update_many_body },
+            quote! { #write_guard #delete_many_body },
+        )
+    } else {
+        (
+            save_body,
+            update_body,
+            delete_body,
+            save_many_body,
+            save_many_skip_invalid_body,
+            update_many_body,
+            delete_many_body,
+        )
+    };
+
+    // Compute inline broadcast tokens for broadcasts-only repos (no commit_hooks).
+    // These mirror the commit-hook broadcast tokens but use the result value from
+    // the wrapped async block (`__autumn_result` / `__autumn_record`) instead of
+    // the deserialized commit-hook payload.
+    let (
+        inline_broadcast_create,
+        inline_broadcast_update,
+        inline_broadcast_delete,
+        inline_update_prefetch,
+        inline_delete_prefetch,
+        inline_broadcast_update_many,
+        inline_delete_many_prefetch,
+        inline_broadcast_delete_many,
+    ) = if config.broadcasts && !commit_hooks_enabled {
+        let base_topic_expr_outer = match generate_topic_format(
+            config
+                .broadcast_topic
+                .as_deref()
+                .unwrap_or(&config.table_name),
+            &quote! { __record_ref },
+        ) {
+            Ok(expr) => expr,
+            Err(err) => {
+                let compile_err = err.to_compile_error();
+                return quote! { #compile_err };
+            }
+        };
+
+        let topic_expr_outer = if config.tenant_scoped {
+            quote! {
+                ::std::format!(
+                    "tenant:{}:{}",
+                    ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
+                        &__record_ref.tenant_id
+                    ),
+                    #base_topic_expr_outer
+                )
+            }
+        } else {
+            base_topic_expr_outer
+        };
+
+        let model_prefix_outer = to_snake_case(&config.model_name.to_string());
+        let default_container_outer = format!("{}-list", config.table_name);
+        let container_expr_outer = config
+            .broadcast_container
+            .as_deref()
+            .unwrap_or(&default_container_outer);
+
+        let (render_expr_outer, create_swap_id_outer, create_swap_outer, update_id_outer) =
+            if let Some(ref render_path) = config.broadcast_render {
+                let extract_id = quote! {
+                    ::autumn_web::htmx::extract_html_id(
+                        &{#render_path(__record_ref)}.into_string()
+                    )
+                    .unwrap_or_else(|| ::std::format!(
+                        "{}-{}",
+                        #model_prefix_outer,
+                        ::autumn_web::repository::ModelPrimaryKey::primary_key_value(
+                            __record_ref
+                        )
+                    ))
+                };
+                (
+                    quote! { #render_path(__record_ref) },
+                    quote! { #container_expr_outer.to_string() },
+                    quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
+                    extract_id,
+                )
+            } else {
+                (
+                    quote! {
+                        <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(
+                            __record_ref
+                        )
+                    },
+                    quote! { #container_expr_outer.to_string() },
+                    quote! {
+                        <#model_name as ::autumn_web::live::LiveFragment>::insert_swap()
+                    },
+                    quote! {
+                        <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)
+                    },
+                )
+            };
+
+        // Determine whether a pre-fetch is needed before the delete/update body.
+        // Pre-fetch is required when:
+        //  - the topic is dynamic (contains a field placeholder like "{category}"),
+        //    because after deletion the record is gone and the topic cannot be
+        //    interpolated; and for updates we need the pre-mutation topic to detect
+        //    topic changes and publish a delete on the old channel.
+        //  - broadcast_render is configured, because the custom render fn must run
+        //    on the live record to extract the real DOM id for delete broadcasts.
+        //
+        // The simple case (static topic, no broadcast_render — what `--live`
+        // scaffolds) keeps the existing fast, zero-extra-query path.
+        let raw_topic_outer = config
+            .broadcast_topic
+            .as_deref()
+            .unwrap_or(&config.table_name);
+        let topic_is_dynamic_outer = raw_topic_outer.contains('{');
+        // Tenant-scoped repos also need a prefetch on delete: the topic includes the
+        // record's tenant_id (`"tenant:{id}:table"`), which is only available from the
+        // live row, so we must read it before the DELETE.
+        let delete_needs_prefetch =
+            topic_is_dynamic_outer || config.broadcast_render.is_some() || config.tenant_scoped;
+        // broadcast_render is included: when a custom render fn encodes a mutable field
+        // in the element id, the pre-mutation id may differ from the post-mutation id.
+        // Capturing __autumn_prev_id lets the update broadcast target the old element
+        // even after its id has changed (OobSwap::Target(OuterHTML, "#old-id")).
+        let update_needs_prefetch = topic_is_dynamic_outer || config.broadcast_render.is_some();
+
+        // Static fallbacks retained for the non-prefetch path and as the
+        // graceful-degradation fallback when the pre-fetch returns None.
+        let static_delete_topic_outer: String = {
+            if topic_is_dynamic_outer {
+                config.table_name.clone()
+            } else {
+                raw_topic_outer.to_owned()
+            }
+        };
+        // Always fall back to dom_id_for: it uses the user's defined id scheme
+        // (e.g. "live-pf-post-{id}" with dashes) rather than the snake_case
+        // model_prefix approximation ("live_pf_post-{id}") which would miss its target.
+        let inline_delete_id_outer =
+            quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id_for(id) };
+
+        let ic = quote! {
+            if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                let __record_ref = __autumn_record;
+                if let ::core::option::Option::Some(__channels) =
+                    ::autumn_web::__private::get_global_channels()
+                {
+                    let __topic = #topic_expr_outer;
+                    let __fragment = #render_expr_outer;
+                    let __create_id = #create_swap_id_outer;
+                    let __create_swap = #create_swap_outer;
+                    if let ::core::result::Result::Err(__err) = __channels
+                        .broadcast()
+                        .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                    {
+                        ::autumn_web::reexports::tracing::warn!(
+                            error = %__err,
+                            "auto-broadcast create failed"
+                        );
+                    }
+                }
+            }
+        };
+
+        // ── Update broadcast ─────────────────────────────────────────────
+        // When the topic is dynamic, a pre-fetch captures the pre-mutation topic
+        // (via `inline_update_prefetch` below) so we can detect topic changes and
+        // publish a delete on the old channel before inserting on the new one —
+        // mirroring the commit-hook `__autumn_previous_topic` logic.
+        let inline_update_prefetch = if update_needs_prefetch {
+            quote! {
+                let (__autumn_prev_topic, __autumn_prev_id):
+                    (::core::option::Option<::std::string::String>,
+                     ::core::option::Option<::std::string::String>) =
+                    match self.find_by_id(id).await {
+                        ::core::result::Result::Ok(
+                            ::core::option::Option::Some(ref __record_ref),
+                        ) => (
+                            ::core::option::Option::Some(#topic_expr_outer),
+                            ::core::option::Option::Some(#update_id_outer),
+                        ),
+                        ::core::result::Result::Ok(::core::option::Option::None) => {
+                            (::core::option::Option::None, ::core::option::Option::None)
+                        }
+                        ::core::result::Result::Err(ref __pf_err) => {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__pf_err,
+                                "auto-broadcast update pre-fetch failed; \
+                                 topic-change detection skipped"
+                            );
+                            (::core::option::Option::None, ::core::option::Option::None)
+                        }
+                    };
+            }
+        } else {
+            quote! {}
+        };
+
+        let iu = if update_needs_prefetch {
+            quote! {
+                if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                    let __record_ref = __autumn_record;
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __topic = #topic_expr_outer;
+                        let __fragment = #render_expr_outer;
+                        let __id = #update_id_outer;
+
+                        let __topic_changed = __autumn_prev_topic
+                            .as_deref()
+                            .map_or(false, |__prev| __prev != __topic);
+
+                        if __topic_changed {
+                            if let ::core::option::Option::Some(ref __prev_topic) =
+                                __autumn_prev_topic
+                            {
+                                let __delete_id =
+                                    __autumn_prev_id.as_deref().unwrap_or(&__id);
+                                let __delete_fragment = ::autumn_web::html! {};
+                                if let ::core::result::Result::Err(__err) = __channels
+                                    .broadcast()
+                                    .publish_oob(
+                                        __prev_topic,
+                                        __delete_id,
+                                        &::autumn_web::htmx::OobSwap::Delete,
+                                        &__delete_fragment,
+                                    )
+                                {
+                                    ::autumn_web::reexports::tracing::warn!(
+                                        error = %__err,
+                                        "auto-broadcast delete of old topic failed"
+                                    );
+                                }
+                            }
+                        }
+
+                        let (__target_id, __swap_strategy): (
+                            ::std::string::String,
+                            ::autumn_web::htmx::OobSwap,
+                        ) = if __topic_changed {
+                            (
+                                #container_expr_outer.to_string(),
+                                <#model_name as ::autumn_web::live::LiveFragment>::insert_swap(),
+                            )
+                        } else {
+                            let __strategy = if let ::core::option::Option::Some(
+                                ref __prev_id_val,
+                            ) = __autumn_prev_id
+                            {
+                                if __prev_id_val != &__id {
+                                    ::autumn_web::htmx::OobSwap::Target(
+                                        ::autumn_web::htmx::OobMethod::OuterHTML,
+                                        ::std::format!("#{}", __prev_id_val),
+                                    )
+                                } else {
+                                    ::autumn_web::htmx::OobSwap::OuterHTML
+                                }
+                            } else {
+                                ::autumn_web::htmx::OobSwap::OuterHTML
+                            };
+                            (__id.clone(), __strategy)
+                        };
+
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                &__topic,
+                                &__target_id,
+                                &__swap_strategy,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast update failed"
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                    let __record_ref = __autumn_record;
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __topic = #topic_expr_outer;
+                        let __fragment = #render_expr_outer;
+                        let __id = #update_id_outer;
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                &__topic,
+                                &__id,
+                                &::autumn_web::htmx::OobSwap::OuterHTML,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast update failed"
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── Delete broadcast ─────────────────────────────────────────────
+        // When the topic is dynamic or broadcast_render is set, a pre-fetch loads
+        // the record before the DELETE so that the correct topic and DOM id are
+        // available even after the row is gone.  The `inline_delete_prefetch` token
+        // stream (below) populates `__autumn_prefetched` before the body runs.
+        let inline_delete_prefetch = if delete_needs_prefetch {
+            quote! {
+                let __autumn_prefetched: ::core::option::Option<#model_name> =
+                    match self.find_by_id(id).await {
+                        ::core::result::Result::Ok(v) => v,
+                        ::core::result::Result::Err(ref __pf_err) => {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__pf_err,
+                                "auto-broadcast delete pre-fetch failed; \
+                                 static-topic fallback used"
+                            );
+                            ::core::option::Option::None
+                        }
+                    };
+            }
+        } else {
+            quote! {}
+        };
+
+        let id_ = if delete_needs_prefetch {
+            quote! {
+                if let ::core::result::Result::Ok(()) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let (__del_topic, __del_id): (
+                            ::std::string::String,
+                            ::std::string::String,
+                        ) = if let ::core::option::Option::Some(ref __record_ref) =
+                            __autumn_prefetched
+                        {
+                            (#topic_expr_outer, #update_id_outer)
+                        } else {
+                            (
+                                #static_delete_topic_outer.to_string(),
+                                #inline_delete_id_outer,
+                            )
+                        };
+                        let __fragment = ::autumn_web::html! {};
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                &__del_topic,
+                                &__del_id,
+                                &::autumn_web::htmx::OobSwap::Delete,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast delete failed"
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if let ::core::result::Result::Ok(()) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __del_id = #inline_delete_id_outer;
+                        let __fragment = ::autumn_web::html! {};
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                #static_delete_topic_outer,
+                                &__del_id,
+                                &::autumn_web::htmx::OobSwap::Delete,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast delete failed"
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        // ── update_many broadcast ─────────────────────────────────────────
+        // Only broadcast OuterHTML for the simplest case: static topic + default render.
+        // Skipped when update_needs_prefetch (dynamic topic OR custom render) because:
+        // - dynamic topic: OuterHTML sent to the post-update topic leaves old-topic
+        //   subscribers with stale elements and new-topic clients with a failed swap.
+        // - custom render: the rendered element id may encode a mutable field; clients
+        //   hold the element under the pre-update id, so a swap keyed by the post-update
+        //   id misses its target.
+        // Both cases require N pre-fetches to handle correctly; use commit_hooks = true.
+        let ium = if update_needs_prefetch {
+            quote! {}
+        } else {
+            quote! {
+                if let ::core::result::Result::Ok(ref __autumn_result_vec) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        for __autumn_record in __autumn_result_vec {
+                            let __record_ref = __autumn_record;
+                            let __topic = #topic_expr_outer;
+                            let __fragment = #render_expr_outer;
+                            let __id = #update_id_outer;
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    &__topic,
+                                    &__id,
+                                    &::autumn_web::htmx::OobSwap::OuterHTML,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast update_many failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }; // end if topic_is_dynamic_outer else branch
+
+        // ── delete_many broadcast ─────────────────────────────────────────
+        // When the topic is dynamic or broadcast_render is set, each record is
+        // pre-fetched (via find_by_id) before the bulk DELETE so the correct
+        // topic and DOM id are available after the rows are gone.
+        // NOTE: this is N sequential queries for N ids.  Use commit_hooks = true
+        // for better performance on large bulk deletes with dynamic topics.
+        let inline_delete_many_prefetch = if delete_needs_prefetch {
+            quote! {
+                let __autumn_dm_pf: ::std::vec::Vec<(
+                    ::std::string::String,
+                    ::std::string::String,
+                )> = {
+                    let mut __pf_results = ::std::vec::Vec::new();
+                    if ::autumn_web::__private::get_global_channels().is_some() {
+                        for &id in ids {
+                            match self.find_by_id(id).await {
+                                ::core::result::Result::Ok(
+                                    ::core::option::Option::Some(ref __record_ref),
+                                ) => {
+                                    __pf_results.push((#topic_expr_outer, #update_id_outer));
+                                }
+                                ::core::result::Result::Ok(
+                                    ::core::option::Option::None,
+                                ) => {}
+                                ::core::result::Result::Err(ref __pf_err) => {
+                                    ::autumn_web::reexports::tracing::warn!(
+                                        error = %__pf_err,
+                                        id,
+                                        "auto-broadcast delete_many pre-fetch failed for id; \
+                                         static-topic fallback used"
+                                    );
+                                    __pf_results.push((
+                                        #static_delete_topic_outer.to_string(),
+                                        <#model_name as ::autumn_web::live::LiveFragment>
+                                            ::dom_id_for(id),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    __pf_results
+                };
+            }
+        } else {
+            quote! {}
+        };
+
+        let idm = if delete_needs_prefetch {
+            quote! {
+                if let ::core::result::Result::Ok(()) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __fragment = ::autumn_web::html! {};
+                        for (__del_topic, __del_id) in &__autumn_dm_pf {
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    __del_topic,
+                                    __del_id,
+                                    &::autumn_web::htmx::OobSwap::Delete,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast delete_many failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if let ::core::result::Result::Ok(()) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __fragment = ::autumn_web::html! {};
+                        for &id in ids {
+                            let __del_id = <#model_name as ::autumn_web::live::LiveFragment>
+                                ::dom_id_for(id);
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    #static_delete_topic_outer,
+                                    &__del_id,
+                                    &::autumn_web::htmx::OobSwap::Delete,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast delete_many failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        (
+            ic,
+            iu,
+            id_,
+            inline_update_prefetch,
+            inline_delete_prefetch,
+            ium,
+            inline_delete_many_prefetch,
+            idm,
+        )
+    } else {
+        (
+            quote! {},
+            quote! {},
+            quote! {},
+            quote! {},
+            quote! {},
+            quote! {},
+            quote! {},
+            quote! {},
+        )
+    };
+
+    // For repos that declare `broadcasts = true` but have no commit_hooks, wire
+    // inline broadcasts directly into the save / update / delete method bodies.
+    // The commit-hook path already includes the broadcasts in the durable worker;
+    // this path fires them synchronously after each mutation instead.
+    //
+    // When the topic is dynamic or broadcast_render is set, a pre-fetch step runs
+    // before the mutation body so that topic interpolation and DOM-id extraction can
+    // operate on the live record (delete) or detect topic changes (update).
+    let (save_body, update_body, delete_body, update_many_body, delete_many_body) =
+        if config.broadcasts && !commit_hooks_enabled {
+            (
+                quote! {
+                    let __autumn_result: ::autumn_web::AutumnResult<#model_name> =
+                        async { #save_body }.await;
+                    #inline_broadcast_create
+                    __autumn_result
+                },
+                quote! {
+                    #inline_update_prefetch
+                    let __autumn_result: ::autumn_web::AutumnResult<#model_name> =
+                        async { #update_body }.await;
+                    #inline_broadcast_update
+                    __autumn_result
+                },
+                quote! {
+                    #inline_delete_prefetch
+                    let __autumn_result: ::autumn_web::AutumnResult<()> =
+                        async { #delete_body }.await;
+                    #inline_broadcast_delete
+                    __autumn_result
+                },
+                quote! {
+                    let __autumn_result: ::autumn_web::AutumnResult<
+                        ::std::vec::Vec<#model_name>,
+                    > = async { #update_many_body }.await;
+                    #inline_broadcast_update_many
+                    __autumn_result
+                },
+                quote! {
+                    #inline_delete_many_prefetch
+                    let __autumn_result: ::autumn_web::AutumnResult<()> =
+                        async { #delete_many_body }.await;
+                    #inline_broadcast_delete_many
+                    __autumn_result
+                },
+            )
+        } else {
+            (
+                save_body,
+                update_body,
+                delete_body,
+                update_many_body,
+                delete_many_body,
+            )
+        };
+
     let route_hook_registration = if commit_hooks_enabled {
         quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
     } else {
@@ -5780,12 +10397,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
     };
 
+    // §1d: cross-shard paginate guard token stream (empty when not sharded).
+    let page_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                if self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard pagination is not supported: \
+                             use find_all() with across_tenants() on a \
+                             sharded repository instead"
+                        )
+                    );
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let pagination_impl_method = if config.tenant_scoped {
         quote! {
             async fn page(
                 &self,
                 req: &::autumn_web::pagination::PageRequest,
             ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                #page_cross_shard_guard
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let tenant_id = if self.across_tenants {
@@ -5866,6 +10503,228 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── #1126: allowlisted sort/filter list method ──────────────────────
+    //
+    // `list()` is `page()` plus allowlisted ordering + equality filtering. The
+    // ordering/filtering DSL is *typed* — the `#[model]` macro generated
+    // `__autumn_list_apply_filters` / `__autumn_list_apply_order` over a boxed
+    // Diesel query, matching requested keys against the model's own columns.
+    // An unknown `sort`/`filter[..]` key hits the default arm and is ignored,
+    // so a request like `?sort=id;DROP TABLE` can never reach SQL. Filters are
+    // applied to both the COUNT and the page query so `total` is consistent.
+    let list_trait_method = quote! {
+        /// Fetch one page of records applying **allowlisted** sort + equality
+        /// filters from a [`::autumn_web::pagination::ListQuery`], with offset
+        /// pagination from a [`::autumn_web::pagination::PageRequest`].
+        ///
+        /// Only the model's own columns are sortable, and only its non-null
+        /// `String`/integer/`bool` columns are filterable; any other requested
+        /// key is silently ignored (never interpolated into SQL). An empty or
+        /// unknown `sort` falls back to primary-key-descending order.
+        fn list(
+            &self,
+            query: &::autumn_web::pagination::ListQuery,
+            req: &::autumn_web::pagination::PageRequest,
+        ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
+    };
+
+    let list_impl_method = if config.tenant_scoped {
+        quote! {
+            async fn list(
+                &self,
+                query: &::autumn_web::pagination::ListQuery,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                #page_cross_shard_guard
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                // Fallback no-ops for hand-written models; the `#[model]`-generated
+                // inherent methods take precedence when present.
+                #[allow(unused_imports)]
+                use ::autumn_web::pagination::AutumnListable as _;
+                let __tenant = if self.across_tenants {
+                    ::core::option::Option::None
+                } else {
+                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                    ::core::option::Option::Some(t)
+                };
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+
+                let mut __count_q = #table_ident::table.into_boxed() #sd_filter;
+                if let ::core::option::Option::Some(ref t) = __tenant {
+                    __count_q = __count_q.filter(#table_ident::tenant_id.eq(t.clone()));
+                }
+                let __count_q = #model_name::__autumn_list_apply_filters(__count_q, query);
+                let total: i64 = __count_q
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                let mut __page_q = #table_ident::table.into_boxed() #sd_filter;
+                if let ::core::option::Option::Some(ref t) = __tenant {
+                    __page_q = __page_q.filter(#table_ident::tenant_id.eq(t.clone()));
+                }
+                let __page_q = #model_name::__autumn_list_apply_filters(__page_q, query);
+                let __page_q = #model_name::__autumn_list_apply_order(__page_q, query);
+                let items: ::std::vec::Vec<#model_name> = __page_q
+                    .limit(req.limit())
+                    .offset(req.offset())
+                    .select(#model_name::as_select())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                ::core::result::Result::Ok(::autumn_web::pagination::Page::new(items, total, req))
+            }
+        }
+    } else {
+        quote! {
+            async fn list(
+                &self,
+                query: &::autumn_web::pagination::ListQuery,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                // Fallback no-ops for hand-written models; the `#[model]`-generated
+                // inherent methods take precedence when present.
+                #[allow(unused_imports)]
+                use ::autumn_web::pagination::AutumnListable as _;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+
+                let __count_q = #table_ident::table.into_boxed() #sd_filter;
+                let __count_q = #model_name::__autumn_list_apply_filters(__count_q, query);
+                let total: i64 = __count_q
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                let __page_q = #table_ident::table.into_boxed() #sd_filter;
+                let __page_q = #model_name::__autumn_list_apply_filters(__page_q, query);
+                let __page_q = #model_name::__autumn_list_apply_order(__page_q, query);
+                let items: ::std::vec::Vec<#model_name> = __page_q
+                    .limit(req.limit())
+                    .offset(req.offset())
+                    .select(#model_name::as_select())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                ::core::result::Result::Ok(::autumn_web::pagination::Page::new(items, total, req))
+            }
+        }
+    };
+
+    // ── #1841: owner-scoped list method ─────────────────────────────────
+    //
+    // `list_scoped(owner_id, ..)` is `list(..)` with an unconditional
+    // `owner_column = owner_id` filter applied to BOTH the COUNT and the page
+    // query *before* the allowlisted sort/filter helpers run, so `total` and the
+    // returned rows agree and neither can be widened by a request-supplied
+    // filter. Emitted only when `owner =` is declared; otherwise both fragments
+    // are empty and every existing `#[repository]` is byte-for-byte unchanged.
+    // The owner filter composes with tenant scoping (both are `.filter(..)` on
+    // the boxed query) so a repository that is both tenant- and owner-scoped
+    // narrows by tenant AND owner.
+    let (list_scoped_trait_method, list_scoped_impl_method) = if let Some(ref owner_col) =
+        owner_col_ident
+    {
+        let trait_method = quote! {
+            /// Fetch one page of records **owned by `owner_id`** applying the same
+            /// allowlisted sort + equality filters as [`list`](Self::list).
+            ///
+            /// The `owner_id` filter is applied to both the COUNT and the page
+            /// query and cannot be overridden by a request-supplied `filter[..]`
+            /// key, so an owner-scoped index/search can never return another
+            /// user's rows (issue #1841). A nullable owner column never matches
+            /// NULL (unowned) rows.
+            fn list_scoped(
+                &self,
+                owner_id: i64,
+                query: &::autumn_web::pagination::ListQuery,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
+        };
+        // Optional tenant setup + per-query tenant filters, mirroring `list`.
+        let scoped_tenant_setup = if config.tenant_scoped {
+            quote! {
+                let __tenant = if self.across_tenants {
+                    ::core::option::Option::None
+                } else {
+                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                    ::core::option::Option::Some(t)
+                };
+            }
+        } else {
+            quote! {}
+        };
+        let scoped_tenant_count_filter = if config.tenant_scoped {
+            quote! {
+                if let ::core::option::Option::Some(ref t) = __tenant {
+                    __count_q = __count_q.filter(#table_ident::tenant_id.eq(t.clone()));
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let scoped_tenant_page_filter = if config.tenant_scoped {
+            quote! {
+                if let ::core::option::Option::Some(ref t) = __tenant {
+                    __page_q = __page_q.filter(#table_ident::tenant_id.eq(t.clone()));
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let impl_method = quote! {
+            async fn list_scoped(
+                &self,
+                owner_id: i64,
+                query: &::autumn_web::pagination::ListQuery,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                #page_cross_shard_guard
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                #[allow(unused_imports)]
+                use ::autumn_web::pagination::AutumnListable as _;
+                #scoped_tenant_setup
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+
+                let mut __count_q = #table_ident::table.into_boxed() #sd_filter;
+                #scoped_tenant_count_filter
+                // #1841: owner filter applied BEFORE the allowlisted helpers so a
+                // request `filter[..]` can only narrow, never widen, the owner set.
+                __count_q = __count_q.filter(#table_ident::#owner_col.eq(owner_id));
+                let __count_q = #model_name::__autumn_list_apply_filters(__count_q, query);
+                let total: i64 = __count_q
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                let mut __page_q = #table_ident::table.into_boxed() #sd_filter;
+                #scoped_tenant_page_filter
+                __page_q = __page_q.filter(#table_ident::#owner_col.eq(owner_id));
+                let __page_q = #model_name::__autumn_list_apply_filters(__page_q, query);
+                let __page_q = #model_name::__autumn_list_apply_order(__page_q, query);
+                let items: ::std::vec::Vec<#model_name> = __page_q
+                    .limit(req.limit())
+                    .offset(req.offset())
+                    .select(#model_name::as_select())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                ::core::result::Result::Ok(::autumn_web::pagination::Page::new(items, total, req))
+            }
+        };
+        (trait_method, impl_method)
+    } else {
+        (quote! {}, quote! {})
+    };
+
     // `cursor_page` is only generated when the user declares `cursor_key = field`.
     //
     // Two modes depending on whether `cursor_key_type` is also declared:
@@ -5912,6 +10771,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn cursor_page(&self, req: &::autumn_web::pagination::CursorRequest)
                 -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>>> + Send;
         };
+        // §1d: cross-shard cursor_page guard (empty when not sharded).
+        let cursor_cross_shard_guard = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants {
+                    if self.__autumn_shards.is_some() {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::bad_request_msg(
+                                "cross-shard cursor pagination is not supported: \
+                                 use find_all() with across_tenants() on a \
+                                 sharded repository instead"
+                            )
+                        );
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+
         let impl_method = if let Some(ref key_type) = config.cursor_key_type {
             // Full two-part keyset filter ΓÇö always correct regardless of whether
             // cursor_key and id are monotonically correlated.
@@ -5920,6 +10798,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     let mut conn = self.__autumn_acquire_read_conn().await?;
@@ -5963,6 +10842,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     let mut conn = self.__autumn_acquire_read_conn().await?;
@@ -5994,6 +10874,877 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (trait_method, impl_method)
     } else {
         (quote! {}, quote! {})
+    };
+
+    // ── Batched iteration (find_in_batches / find_each), issue #1395 ─────────
+    //
+    // Generated for EVERY repository (not gated on cursor_key): a primary-key
+    // ascending keyset walk that streams the whole table in bounded-memory
+    // chunks. Each batch is `WHERE id > last ORDER BY id ASC LIMIT batch_size`
+    // (no id predicate on the first batch), reusing the same soft-delete
+    // filter, tenant scoping and read-routing as `find_all`/`cursor_page`, so
+    // those semantics come for free.
+    //
+    // The generic driver + handle types live in `autumn_web::batches`; the
+    // macro only emits a thin per-repo `BatchSource` impl (the keyset query)
+    // plus two inherent constructors. Sharded repos mirror `cursor_page`:
+    // cross-shard `across_tenants` iteration is rejected (shard fan-out is out
+    // of scope per #1395); a single routed shard iterates normally.
+    let batch_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            // Reject on the runtime `across_tenants` flag alone — independent of
+            // whether a live shard set (`__autumn_shards`) is loaded. Gating on
+            // `__autumn_shards.is_some()` missed the no-shard-set case (e.g. a
+            // repo built via `with_pool_untracked`, where `__autumn_shards` is
+            // `None`), which slipped past the guard and silently streamed a
+            // PARTIAL result over only the current pool (#1692).
+            if self.across_tenants {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard batched iteration is not supported: \
+                         across_tenants() cannot fan find_in_batches/\
+                         find_each out across shards; iterate each shard \
+                         separately via from_shard(...) instead"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let batch_source_impl = quote! {
+        impl ::autumn_web::batches::BatchSource for #pg_name {
+            type Model = #model_name;
+
+            async fn fetch_batch_after(
+                &self,
+                after_id: ::core::option::Option<i64>,
+                limit: i64,
+            ) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                #batch_cross_shard_guard
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                let mut query = #table_ident::table.into_boxed();
+                #tenant_query_filter
+                if let ::core::option::Option::Some(after) = after_id {
+                    query = query.filter(#table_ident::id.gt(after));
+                }
+                // Apply soft-delete filter when enabled.
+                #[allow(unused_mut)]
+                let mut query = query #sd_filter;
+                query
+                    .order(#table_ident::id.asc())
+                    .limit(limit)
+                    .select(#model_name::as_select())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)
+            }
+
+            fn batch_key(model: &#model_name) -> i64 {
+                model.id
+            }
+        }
+    };
+
+    let find_in_batches_methods = quote! {
+        /// Iterate the whole table in bounded-memory chunks of at most
+        /// `batch_size` rows, using a primary-key keyset cursor (not
+        /// `LIMIT`/`OFFSET`), so deep iteration stays flat and is stable under
+        /// concurrent inserts of rows ordered after the current position.
+        ///
+        /// Soft-delete filtering, tenant scoping and read routing match
+        /// `find_all`. Drive the returned handle with `next_batch()` in a
+        /// `while let` loop; drop each chunk before requesting the next to hold
+        /// at most `batch_size` models at a time.
+        ///
+        /// Iteration ends at the first short batch; rows inserted after that
+        /// point require a new iteration. Errors are retryable: the cursor
+        /// only advances on success, so calling `next_batch()` again after an
+        /// `Err` retries the same batch (`Ok(None)` always means completion).
+        /// A `batch_size` of `0` yields an error on every `next_batch()`.
+        ///
+        /// ```rust,ignore
+        /// let mut batches = repo.find_in_batches(1_000);
+        /// while let Some(chunk) = batches.next_batch().await? {
+        ///     repo.upsert_many(&recompute(chunk)).await?;
+        /// }
+        /// ```
+        ///
+        /// (`upsert_many` is not generated on repositories with hooks
+        /// configured; use per-row `update` there.)
+        #[must_use]
+        pub fn find_in_batches(
+            &self,
+            batch_size: usize,
+        ) -> ::autumn_web::batches::FindInBatches<'_, Self> {
+            ::autumn_web::batches::FindInBatches::new(self, batch_size)
+        }
+
+        /// Iterate the whole table one model at a time while still fetching in
+        /// bounded `batch_size` chunks — a convenience over
+        /// [`find_in_batches`](Self::find_in_batches).
+        ///
+        /// ```rust,ignore
+        /// let mut each = repo.find_each(500);
+        /// while let Some(row) = each.next().await? {
+        ///     repo.update(row.id, &patch).await?;
+        /// }
+        /// ```
+        #[must_use]
+        pub fn find_each(
+            &self,
+            batch_size: usize,
+        ) -> ::autumn_web::batches::FindEach<'_, Self> {
+            ::autumn_web::batches::FindEach::new(self, batch_size)
+        }
+    };
+
+    // ── Typed grouped aggregate queries (issue #1364) ───────────────────────
+    //
+    // Emitted as inherent methods on the Pg* struct (parallel to
+    // find_in_batches / find_or_create_by): each returns a lazy
+    // `GroupedAggregate<'_, K, V>` builder. Under the hood a parameterized
+    // `diesel::sql_query` with a QueryableByName row (concrete SQL types baked
+    // from the declared `Vec<(K, V)>`), routed through the read-role helper and
+    // composing the same soft-delete + tenant predicates as `count`. Filter
+    // values are bound (never interpolated). sum/avg/min/max cannot be merged
+    // across shards, so across_tenants() on a sharded repo is rejected.
+    let grouped_aggregate_methods = {
+        // Baked literals shared by every generated method.
+        let table_q = format!("\"{table_name}\"");
+        let config_soft_delete = config.soft_delete;
+        let config_tenant_scoped = config.tenant_scoped;
+        let config_sharded = config.sharded;
+
+        let soft_delete_cond = if config_soft_delete {
+            quote! { __conds.push(::std::string::String::from("deleted_at IS NULL")); }
+        } else {
+            quote! {}
+        };
+
+        let (tenant_resolve, tenant_cond, tenant_bind) = if config_tenant_scoped {
+            (
+                quote! {
+                    let __tenant: ::core::option::Option<::std::string::String> =
+                        if __repo.across_tenants {
+                            ::core::option::Option::None
+                        } else {
+                            ::core::option::Option::Some(
+                                ::autumn_web::tenancy::CURRENT_TENANT
+                                    .try_with(|t| t.clone())
+                                    .ok()
+                                    .flatten()
+                                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
+                                        "Query scoped to tenant, but no tenant context was established"
+                                    ))?,
+                            )
+                        };
+                },
+                quote! {
+                    let __tenant_n = { __n += 1; __n };
+                    __conds.push(format!("(${n} IS NULL OR tenant_id = ${n})", n = __tenant_n));
+                },
+                quote! {
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<
+                        ::autumn_web::reexports::diesel::sql_types::Text
+                    >, _>(__tenant)
+                },
+            )
+        } else {
+            (quote! {}, quote! {}, quote! {})
+        };
+
+        // Reject cross-shard aggregates whenever the repo is (compile-time)
+        // sharded + tenant-scoped AND the runtime `across_tenants` flag is set —
+        // independent of whether a live shard set (`__autumn_shards`) is loaded.
+        // sum/avg/min/max cannot be merged across shards, and an across-tenant
+        // scan without a shard set (e.g. built via `with_pool_untracked`, where
+        // `__autumn_shards` is `None`) would bind a NULL tenant predicate and
+        // silently return a PARTIAL result over only the current pool. Gating on
+        // `__autumn_shards.is_some()` missed exactly that no-shard-set case, so
+        // the guard fires purely on the sharded config + the `across_tenants`
+        // flag (#1364).
+        let cross_shard_guard = if config_sharded && config_tenant_scoped {
+            quote! {
+                if __repo.across_tenants {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard grouped aggregates are not supported: \
+                             sum/avg/min/max cannot be merged across shards; run the \
+                             aggregate per shard via from_shard(...) instead"
+                        )
+                    );
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        let mut __methods: Vec<TokenStream> = Vec::new();
+        for spec in &grouped_aggregate_specs {
+            let fn_ident = &spec.fn_ident;
+            if let Some(msg) = &spec.error {
+                __methods.push(quote! { ::core::compile_error!(#msg); });
+                continue;
+            }
+
+            let key_type = &spec.key_type;
+            let value_type = &spec.value_type;
+            let key_sql_type = &spec.key_sql_type;
+            let value_sql_type = &spec.value_sql_type;
+            let agg_expr = &spec.agg_sql_expr;
+            let group_col_q = format!("\"{}\"", spec.group_col);
+
+            // #1364 encryption correctness: grouped aggregates cannot operate on
+            // an at-rest `#[encrypted(...)]` column. The stored value is
+            // ciphertext, so grouping would return ciphertext keys deserialized
+            // into the declared key type, and `.filter_eq(plaintext)` would bind
+            // plaintext against a ciphertext column and match nothing (the
+            // `find_by` path avoids this by routing string params through the
+            // registry encoder; this raw-SQL path cannot). Whether a column is
+            // encrypted is only known at runtime — the mode is declared on the
+            // model, which the repository macro cannot see (see
+            // `encode_derived_query_param`) — so this is a runtime guard against
+            // the SAME registry the `find_by` surface consults, not a
+            // `compile_error!`. It rejects only columns that are actually
+            // encrypted, so non-encrypted grouping (e.g. `count_grouped_by_kind`
+            // on a plain `String`) is unchanged. The escape hatch is a raw query.
+            let enc_guard = {
+                let fn_name_str = spec.fn_ident.to_string();
+                let group_col_raw = spec.group_col.as_str();
+                let mut checks: Vec<TokenStream> = vec![quote! {
+                    if ::autumn_web::encryption::is_encrypted_column(#table_name, #group_col_raw) {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::internal_server_error_msg(
+                                ::std::format!(
+                                    "`{m}`: grouped aggregates are not supported on the encrypted \
+                                     column `{c}` (its stored value is ciphertext; grouping/filtering \
+                                     would compare or return ciphertext). Use a raw query, or group on \
+                                     a non-encrypted column.",
+                                    m = #fn_name_str, c = #group_col_raw,
+                                )
+                            )
+                        );
+                    }
+                }];
+                if let Some(value_col_raw) = spec.value_col.as_deref() {
+                    checks.push(quote! {
+                        if ::autumn_web::encryption::is_encrypted_column(#table_name, #value_col_raw) {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::internal_server_error_msg(
+                                    ::std::format!(
+                                        "`{m}`: grouped aggregates are not supported on the encrypted \
+                                         column `{c}` (its stored value is ciphertext; grouping/filtering \
+                                         would compare or return ciphertext). Use a raw query, or group on \
+                                         a non-encrypted column.",
+                                        m = #fn_name_str, c = #value_col_raw,
+                                    )
+                                )
+                            );
+                        }
+                    });
+                }
+                quote! { #(#checks)* }
+            };
+            // #1364 timezone correctness: only a `timestamptz` (`DateTime<Utc>`)
+            // bucket key gets the UTC-pinning 3-arg `date_trunc` zone argument.
+            // A `NaiveDateTime` (`timestamp`) key keeps the plain 2-arg form
+            // (deterministic field truncation, session-tz independent).
+            let bucket_zone_arg: &str = if type_last_segment_is(key_type, "DateTime") {
+                ", 'UTC'"
+            } else {
+                ""
+            };
+            let doc = format!(
+                "Grouped aggregate `{fn_ident}` → lazy `GroupedAggregate<'_, K, V>` builder (issue #1364).\n\n\
+                 Chain `.order_by_aggregate_desc()`/`.limit(n)` for top-N, \
+                 `.filter_eq(..)`/`.filter_range(lo, hi)` to scope before grouping, \
+                 or `.bucket(DateBucket::Day)` for a time series, then `.load().await`."
+            );
+
+            __methods.push(quote! {
+                #[doc = #doc]
+                #[must_use]
+                pub fn #fn_ident<'__agg>(
+                    &'__agg self,
+                ) -> ::autumn_web::aggregate::GroupedAggregate<'__agg, #key_type, #value_type> {
+                    let __repo = self;
+                    ::autumn_web::aggregate::GroupedAggregate::new(::std::boxed::Box::new(
+                        move |__opts: ::autumn_web::aggregate::AggregateOptions<#key_type>| {
+                            ::std::boxed::Box::pin(async move {
+                                use ::autumn_web::reexports::diesel::prelude::*;
+                                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                                #enc_guard
+                                #cross_shard_guard
+                                #tenant_resolve
+
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnAggRow {
+                                    #[diesel(sql_type = #key_sql_type)]
+                                    agg_key: #key_type,
+                                    #[diesel(sql_type = #value_sql_type)]
+                                    agg_val: #value_type,
+                                }
+
+                                // Group expression: bucketed (date_trunc) or the raw column.
+                                // For a `timestamptz` (`DateTime<Utc>`) key, `#bucket_zone_arg`
+                                // is `, 'UTC'` so the 3-arg `date_trunc('unit', col, 'UTC')`
+                                // (Postgres 12+) truncates in UTC — otherwise the 2-arg form
+                                // would truncate in the DB session `TimeZone`, drifting bucket
+                                // boundaries across deployments (#1364). For a `NaiveDateTime`
+                                // (`timestamp`) key it is empty, keeping the deterministic
+                                // 2-arg field truncation. SELECT and GROUP BY reuse this same
+                                // string, so the bucket expression always matches exactly.
+                                let __group_expr: ::std::string::String = match __opts.bucket {
+                                    ::core::option::Option::Some(__b) => format!(
+                                        "date_trunc('{unit}', {col}{zone})",
+                                        unit = __b.as_trunc_unit(),
+                                        col = #group_col_q,
+                                        zone = #bucket_zone_arg,
+                                    ),
+                                    ::core::option::Option::None => ::std::string::String::from(#group_col_q),
+                                };
+
+                                // Fixed bind layout — [tenant?], eq, range_low, range_high —
+                                // all bound Nullable so an unset filter is a NULL no-op and the
+                                // bind chain stays constant regardless of which filters are set.
+                                let mut __conds: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+                                let mut __n: i32 = 0;
+                                #soft_delete_cond
+                                #tenant_cond
+                                // A non-nullable declared key type cannot represent a
+                                // NULL group (and `Option<K>` is rejected at compile
+                                // time), so exclude rows whose raw group column is NULL —
+                                // otherwise `GROUP BY` would emit a NULL-key group that
+                                // fails to deserialize at runtime (#1364). Guarding the
+                                // raw column also drops null-timestamp rows under
+                                // `.bucket()` (date_trunc of NULL is NULL). No bind param,
+                                // so the `$n` numbering below is unaffected. Harmless
+                                // no-op when the column is already NOT NULL.
+                                __conds.push(format!("{col} IS NOT NULL", col = #group_col_q));
+                                let __eq_n = { __n += 1; __n };
+                                __conds.push(format!("(${n} IS NULL OR {col} = ${n})", n = __eq_n, col = #group_col_q));
+                                let __low_n = { __n += 1; __n };
+                                __conds.push(format!("(${n} IS NULL OR {col} >= ${n})", n = __low_n, col = #group_col_q));
+                                let __high_n = { __n += 1; __n };
+                                __conds.push(format!("(${n} IS NULL OR {col} <= ${n})", n = __high_n, col = #group_col_q));
+
+                                let mut __sql = format!(
+                                    "SELECT {ge} AS agg_key, {ae} AS agg_val FROM {tbl}",
+                                    ge = __group_expr, ae = #agg_expr, tbl = #table_q,
+                                );
+                                __sql.push_str(" WHERE ");
+                                __sql.push_str(&__conds.join(" AND "));
+                                __sql.push_str(&format!(" GROUP BY {}", __group_expr));
+                                match __opts.order {
+                                    ::autumn_web::aggregate::AggregateOrder::Desc =>
+                                        __sql.push_str(" ORDER BY agg_val DESC NULLS LAST, agg_key ASC"),
+                                    ::autumn_web::aggregate::AggregateOrder::Asc =>
+                                        __sql.push_str(" ORDER BY agg_val ASC NULLS LAST, agg_key ASC"),
+                                    ::autumn_web::aggregate::AggregateOrder::Unordered => {}
+                                }
+                                if let ::core::option::Option::Some(__lim) = __opts.limit {
+                                    __sql.push_str(&format!(" LIMIT {}", __lim));
+                                }
+
+                                let (__low, __high) = match __opts.range {
+                                    ::core::option::Option::Some((__l, __h)) => (
+                                        ::core::option::Option::Some(__l),
+                                        ::core::option::Option::Some(__h),
+                                    ),
+                                    ::core::option::Option::None => (
+                                        ::core::option::Option::None,
+                                        ::core::option::Option::None,
+                                    ),
+                                };
+                                let __eq = __opts.eq;
+
+                                let mut __conn = __repo.__autumn_acquire_read_conn().await?;
+                                let __rows: ::std::vec::Vec<__AutumnAggRow> =
+                                    ::autumn_web::reexports::diesel::sql_query(__sql)
+                                        #tenant_bind
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__eq)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__low)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__high)
+                                        .load::<__AutumnAggRow>(&mut __conn)
+                                        .await
+                                        .map_err(::autumn_web::AutumnError::from)?;
+
+                                ::core::result::Result::Ok(
+                                    __rows
+                                        .into_iter()
+                                        .map(|__r| (__r.agg_key, __r.agg_val))
+                                        .collect::<::std::vec::Vec<(#key_type, #value_type)>>(),
+                                )
+                            }) as ::std::pin::Pin<::std::boxed::Box<
+                                dyn ::std::future::Future<
+                                    Output = ::autumn_web::AutumnResult<::std::vec::Vec<(#key_type, #value_type)>>,
+                                > + ::core::marker::Send + '__agg,
+                            >>
+                        },
+                    ))
+                }
+            });
+        }
+        quote! { #(#__methods)* }
+    };
+
+    // ── Race-safe get-or-insert (find_or_create_by_*, issue #1382) ──────────
+    //
+    // Emitted as inherent async methods on the Pg* struct (parallel to
+    // find_in_batches) — they return `(Model, bool)` and take an extra `new`
+    // insert value, so they don't fit the trait finder surface. Recipe:
+    //   1. Preliminary lookup on the READ path (replica-eligible), honoring
+    //      tenant scoping + soft-delete. Found → `(row, false)`, no hooks.
+    //   2. Else INSERT on the PRIMARY with `ON CONFLICT DO NOTHING`, which
+    //      avoids the Postgres 23505 transaction abort entirely — no
+    //      unique-violation error ever escapes to a caller.
+    //        - Some(row) → a real insert happened → `(row, true)`; the same
+    //          before_create / after_create / commit-hook weaving as `save`
+    //          runs (only on this created path).
+    //        - None → a concurrent caller won the race → re-lookup on the
+    //          PRIMARY (read-your-writes) → `(row, false)`, no hooks.
+    // Unlike `upsert_many`, this is generated even on hooked repositories.
+    let foc_sd_boxed = if config.soft_delete {
+        quote! { query = query.filter(#table_ident::deleted_at.is_null()); }
+    } else {
+        quote! {}
+    };
+    let foc_tenant_id_let = if config.tenant_scoped {
+        quote! {
+            let tenant_id = if self.across_tenants {
+                ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+            } else {
+                let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
+                        "Query scoped to tenant, but no tenant context was established"
+                    ))?;
+                ::core::option::Option::Some(t)
+            };
+        }
+    } else {
+        quote! {}
+    };
+    // The `ON CONFLICT DO NOTHING` insert, returning `Option<Model>` (None on a
+    // conflict). `#values` is the insert value binding, `#conn` a `&mut`/owned
+    // connection expression matching the diesel-async surface at the call site.
+    let foc_insert_opt = |values: &TokenStream, conn: &TokenStream| -> TokenStream {
+        if config.tenant_scoped {
+            quote! {
+                if let ::core::option::Option::Some(ref __t) = tenant_id {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(::autumn_web::tenancy::TenantInsertable::tenant_values(#values.clone(), __t))
+                        .on_conflict_do_nothing()
+                        .get_result::<#model_name>(#conn)
+                        .await
+                } else {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(#values.clone())
+                        .on_conflict_do_nothing()
+                        .get_result::<#model_name>(#conn)
+                        .await
+                }
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?
+            }
+        } else {
+            quote! {
+                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                    .values(#values.clone())
+                    .on_conflict_do_nothing()
+                    .get_result::<#model_name>(#conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?
+            }
+        }
+    };
+    // Version-history INSERT snippets (empty unless `versioned`). `__record` is
+    // the freshly-inserted row; `conn` is the in-transaction connection.
+    let foc_vh_ctx = if config.versioned {
+        vh_insert_ts(
+            table_name,
+            "insert",
+            true,
+            &quote! { __record },
+            None,
+            &quote! { conn },
+            model_name,
+        )
+    } else {
+        quote! {}
+    };
+    let foc_vh_noctx = if config.versioned {
+        vh_insert_ts(
+            table_name,
+            "insert",
+            false,
+            &quote! { __record },
+            None,
+            &quote! { conn },
+            model_name,
+        )
+    } else {
+        quote! {}
+    };
+    // Post-commit hook machinery for the commit_hooks path (mirrors `save`):
+    // fires after_create, then finalizes the durable commit-hook row. Only
+    // reached on the created path. Ends by returning `(record, true)`.
+    let foc_commit_after_machinery = quote! {
+        let __autumn_pending_heartbeat =
+            ::autumn_web::__private::start_repository_commit_hook_pending_finalizer_heartbeat(
+                self.pool.clone(),
+                __autumn_commit_hook_id.clone(),
+                __autumn_commit_hook_owner.clone(),
+            );
+        let __autumn_after_create = ::autumn_web::__private::catch_repository_after_hook_unwind(
+            self.hooks.after_create(&mut ctx, &record)
+        )
+        .await;
+        match __autumn_after_create {
+            ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
+            ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
+                let __autumn_error_message = ::std::format!("{__autumn_error}");
+                ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
+                    &self.pool,
+                    &__autumn_commit_hook_id,
+                    &__autumn_commit_hook_owner,
+                    __autumn_error_message,
+                )
+                .await;
+                __autumn_pending_heartbeat.cancel();
+                return ::core::result::Result::Err(
+                    ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                );
+            }
+            ::core::result::Result::Err(__autumn_panic) => {
+                ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
+                    &self.pool,
+                    &__autumn_commit_hook_id,
+                    &__autumn_commit_hook_owner,
+                    "after_create panicked",
+                )
+                .await;
+                __autumn_pending_heartbeat.cancel();
+                if self.idempotency.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::idempotency::__cache_committed_error_response(
+                            ::autumn_web::AutumnError::internal_server_error_msg("after_create panicked")
+                        )
+                    );
+                }
+                ::std::panic::resume_unwind(__autumn_panic);
+            }
+        }
+        let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
+            &self.pool,
+            &__autumn_commit_hook_id,
+            &__autumn_commit_hook_owner,
+            &ctx,
+            &__autumn_commit_hook_record,
+        )
+        .await;
+        __autumn_pending_heartbeat.cancel();
+        match __autumn_finalize_result {
+            ::core::result::Result::Ok(()) => {
+                ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+            }
+            ::core::result::Result::Err(__autumn_error) => {
+                ::autumn_web::reexports::tracing::warn!(
+                    hook_id = %__autumn_commit_hook_id,
+                    error = %__autumn_error,
+                    "failed to finalize repository create commit hook after mutation commit; failing request closed"
+                );
+                return ::core::result::Result::Err(
+                    ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                );
+            }
+        }
+        ::core::result::Result::Ok((record, true))
+    };
+
+    let find_or_create_by_methods = {
+        let mut __methods: Vec<TokenStream> = Vec::new();
+        for spec in &find_or_create_specs {
+            let fn_ident = &spec.fn_ident;
+            if let Some(msg) = &spec.error {
+                __methods.push(quote! { ::core::compile_error!(#msg); });
+                continue;
+            }
+
+            let sig_params: Vec<TokenStream> = spec
+                .lookup_params
+                .iter()
+                .map(|(name, ty)| quote! { #name: #ty })
+                .collect();
+
+            // Encrypted-column encoding (string fields) + boxed-query filters,
+            // matching the `find_by` derived-query surface (#805).
+            let table_name_str = table_ident.to_string();
+            let mut encode_lets: Vec<TokenStream> = Vec::new();
+            let mut filter_assigns: Vec<TokenStream> = Vec::new();
+            for (name, _ty) in &spec.lookup_params {
+                let fname = name.to_string();
+                if spec.string_fields.contains(&fname) {
+                    let enc_ident = format_ident!("__autumn_foc_{name}");
+                    encode_lets.push(quote! {
+                        let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
+                            #table_name_str, #fname, &#name,
+                        )
+                        .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
+                            __e.to_string(),
+                        ))?;
+                    });
+                    filter_assigns.push(quote! {
+                        query = query.filter(#table_ident::#name.eq(&#enc_ident));
+                    });
+                } else {
+                    filter_assigns.push(quote! {
+                        query = query.filter(#table_ident::#name.eq(&#name));
+                    });
+                }
+            }
+
+            // A boxed lookup honoring tenant scoping, the eq-filters and
+            // soft-delete, returning `Option<Model>`. `#conn` is a `&mut` conn.
+            let make_lookup = |conn: TokenStream| -> TokenStream {
+                let filter_assigns = &filter_assigns;
+                quote! {
+                    {
+                        let mut query = #table_ident::table.into_boxed();
+                        #tenant_query_filter
+                        #(#filter_assigns)*
+                        #foc_sd_boxed
+                        query
+                            .select(#model_name::as_select())
+                            .first::<#model_name>(#conn)
+                            .await
+                            .optional()
+                            .map_err(::autumn_web::AutumnError::from)?
+                    }
+                }
+            };
+
+            let step1_lookup = make_lookup(quote! { &mut __rconn });
+            let relookup = make_lookup(quote! { &mut conn });
+            let none_branch_msg = if config.soft_delete {
+                "find_or_create_by: the insert hit a unique conflict but no matching \
+                 row was found on re-lookup. Two causes are possible: (1) the lookup \
+                 columns are not the ones backed by the unique constraint that fired \
+                 — find_or_create_by is only race-safe when its lookup columns match \
+                 a unique constraint; or (2) this is a soft_delete repository and the \
+                 unique index is a plain (non-partial) index, so a soft-deleted row is \
+                 still occupying the unique slot: the insert conflicts with it while \
+                 the `deleted_at IS NULL` lookup cannot see it. For soft_delete \
+                 repositories the unique index must be partial \
+                 (`... WHERE deleted_at IS NULL`) so soft-deleted rows free the slot."
+            } else {
+                "find_or_create_by: the insert hit a unique conflict but no matching \
+                 row was found on re-lookup. The lookup columns are likely not the \
+                 ones backed by the unique constraint that fired — find_or_create_by \
+                 is only race-safe when its lookup columns match a unique constraint."
+            };
+            let none_branch = quote! {
+                let __row: ::core::option::Option<#model_name> = #relookup;
+                match __row {
+                    ::core::option::Option::Some(__r) => ::core::result::Result::Ok((__r, false)),
+                    ::core::option::Option::None => ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::internal_server_error_msg(
+                            #none_branch_msg
+                        )
+                    ),
+                }
+            };
+
+            let insert_new_conn = foc_insert_opt(&quote! { new }, &quote! { &mut conn });
+            let insert_input_txconn = foc_insert_opt(&quote! { input }, &quote! { conn });
+            let insert_new_txconn = foc_insert_opt(&quote! { new }, &quote! { conn });
+
+            // Step 2 varies by hook configuration (mirrors `save`).
+            let step2 = if commit_hooks_enabled {
+                quote! {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+                    #foc_tenant_id_let
+                    Self::__autumn_register_repository_commit_hooks();
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __outcome: ::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)> =
+                        ::autumn_web::__private::scoped_immediate_transaction::<::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)>, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
+                            async move {
+                                let mut input = new.clone();
+                                let mut ctx = MutationContext::new(MutationOp::Create);
+                                let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                                    ::core::option::Option::None;
+                                if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                                    ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                                    __autumn_commit_hook_discriminator =
+                                        ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                                }
+                                self.hooks.before_create(&mut ctx, &mut input).await?;
+                                let __rec_opt: ::core::option::Option<#model_name> = #insert_input_txconn;
+                                match __rec_opt {
+                                    ::core::option::Option::Some(__record) => {
+                                        #foc_vh_ctx
+                                        let __autumn_commit_hook_record = __record.__autumn_commit_hook_to_value()?;
+                                        let (__autumn_commit_hook_id, __autumn_commit_hook_owner) = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
+                                            conn,
+                                            Self::__autumn_repository_commit_hook_key(),
+                                            "create",
+                                            ctx.idempotency_key.as_deref(),
+                                            __autumn_commit_hook_discriminator.as_deref(),
+                                            &ctx,
+                                            &__autumn_commit_hook_record,
+                                        )
+                                        .await?;
+                                        ::core::result::Result::Ok(::core::option::Option::Some((
+                                            __record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record,
+                                        )))
+                                    }
+                                    ::core::option::Option::None => ::core::result::Result::Ok(::core::option::Option::None),
+                                }
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    match __outcome {
+                        ::core::option::Option::Some((record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record)) => {
+                            ::core::mem::drop(conn);
+                            #foc_commit_after_machinery
+                        }
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            } else if config.hooks_type.is_some() {
+                quote! {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+                    #foc_tenant_id_let
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __outcome: ::core::option::Option<(#model_name, MutationContext)> =
+                        ::autumn_web::__private::scoped_immediate_transaction::<::core::option::Option<(#model_name, MutationContext)>, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
+                            async move {
+                                let mut input = new.clone();
+                                let mut ctx = MutationContext::new(MutationOp::Create);
+                                self.hooks.before_create(&mut ctx, &mut input).await?;
+                                let __rec_opt: ::core::option::Option<#model_name> = #insert_input_txconn;
+                                match __rec_opt {
+                                    ::core::option::Option::Some(__record) => {
+                                        #foc_vh_ctx
+                                        ::core::result::Result::Ok(::core::option::Option::Some((__record, ctx)))
+                                    }
+                                    ::core::option::Option::None => ::core::result::Result::Ok(::core::option::Option::None),
+                                }
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    match __outcome {
+                        ::core::option::Option::Some((__record, mut ctx)) => {
+                            ::core::mem::drop(conn);
+                            self.hooks.after_create(&mut ctx, &__record).await?;
+                            ::core::result::Result::Ok((__record, true))
+                        }
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            } else if config.versioned {
+                quote! {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    #foc_tenant_id_let
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __inserted: ::core::option::Option<#model_name> =
+                        ::autumn_web::__private::scoped_immediate_transaction::<::core::option::Option<#model_name>, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
+                            async move {
+                                let __rec_opt: ::core::option::Option<#model_name> = #insert_new_txconn;
+                                if let ::core::option::Option::Some(ref __record) = __rec_opt {
+                                    #foc_vh_noctx
+                                }
+                                ::core::result::Result::Ok(__rec_opt)
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    match __inserted {
+                        ::core::option::Option::Some(__record) => ::core::result::Result::Ok((__record, true)),
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            } else {
+                quote! {
+                    #foc_tenant_id_let
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __inserted: ::core::option::Option<#model_name> = #insert_new_conn;
+                    match __inserted {
+                        ::core::option::Option::Some(__record) => ::core::result::Result::Ok((__record, true)),
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            };
+
+            __methods.push(quote! {
+                /// Race-safe get-or-insert keyed on the lookup column(s).
+                ///
+                /// Returns `(model, created)`: `created == true` only when this
+                /// call actually inserted the row. When a matching row already
+                /// exists (or a concurrent caller wins the insert race), the
+                /// existing row is returned with `created == false`.
+                ///
+                /// Only the `after_create` and `after_create_commit` (commit)
+                /// hooks are guaranteed to fire **exclusively** on the created
+                /// path — they run only when a row is actually inserted
+                /// (`created == true`). `before_create` is different: it runs
+                /// *before* the `ON CONFLICT DO NOTHING` insert, so when a
+                /// concurrent caller loses the insert race the method returns
+                /// `created == false` yet that caller's `before_create` has
+                /// already executed — and any side effects (including DB writes
+                /// made inside the transaction) still occur. Keep
+                /// `before_create` side effects idempotent, or move create-only
+                /// work into `after_create`; do not rely on the found-path
+                /// semantics to suppress `before_create`.
+                ///
+                /// Race-safety relies on a unique constraint covering the lookup
+                /// column(s): the insert uses `ON CONFLICT DO NOTHING`, so under
+                /// concurrent callers exactly one row is created, exactly one
+                /// caller observes `created == true`, and no unique-violation
+                /// error is surfaced. Without such a constraint the method is
+                /// NOT race-safe (concurrent callers may each insert a row).
+                #[allow(clippy::let_and_return, unused_variables, clippy::used_underscore_binding)]
+                pub async fn #fn_ident(
+                    &self,
+                    #(#sig_params,)*
+                    new: &#new_name,
+                ) -> ::autumn_web::AutumnResult<(#model_name, bool)> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // Cross-shard write guard: reject a get-or-insert issued via
+                    // across_tenants() on a sharded, tenant-scoped repository. The
+                    // lookup+insert cannot be fanned out safely across shards, so we
+                    // reject rather than silently write to a single shard while
+                    // matching rows on other shards go unseen. Same guard used by
+                    // save/update/delete; a no-op token on non-sharded repos.
+                    #cross_shard_write_guard
+                    #(#encode_lets)*
+                    // Step 1: preliminary lookup on the read path (replica-eligible).
+                    {
+                        let mut __rconn = self.__autumn_acquire_read_conn().await?;
+                        let __found: ::core::option::Option<#model_name> = #step1_lookup;
+                        if let ::core::option::Option::Some(__row) = __found {
+                            return ::core::result::Result::Ok((__row, false));
+                        }
+                    }
+                    // Step 2: create on the primary with ON CONFLICT DO NOTHING.
+                    #step2
+                }
+            });
+        }
+        quote! { #(#__methods)* }
     };
 
     let tenant_scoped_traits = if config.tenant_scoped {
@@ -6057,12 +11808,49 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let id_path = format!("{api_path}/{{id}}");
 
+        // MCP opt-in classified by each generated route's verb (mirroring the
+        // runtime read-only rule), not hand-placed per site — a future
+        // generated route picks up the right classification from the same
+        // `method:` literal it declares.
+        let mcp_for = |method: &str| match config.mcp_expose {
+            None => false,
+            Some(McpExpose::Read) => matches!(method, "GET" | "HEAD"),
+            Some(McpExpose::All) => true,
+        };
+        let mcp_list_op = mcp_for("GET");
+        let mcp_get_op = mcp_for("GET");
+        let mcp_create_op = mcp_for("POST");
+        let mcp_update_op = mcp_for("PUT");
+        let mcp_delete_op = mcp_for("DELETE");
+
         let has_policy = config.policy_type.is_some();
+
+        // #1237: the generated JSON list endpoint paginates by default instead
+        // of streaming the whole table via `find_all()`. Offset pagination
+        // (`?page`/`?size` → `Page`) is the default; declaring `cursor_key`
+        // opts the endpoint into keyset/cursor mode (`?cursor`/`?size` →
+        // `CursorPage`) for large/append-only tables. Cursor mode only replaces
+        // the *plain* list path — a `scope`/`policy` list still paginates by
+        // offset so its per-row authorization filter (which must run in Rust)
+        // stays correct.
+        let use_cursor = config.cursor_key.is_some() && config.scope_type.is_none() && !has_policy;
+        let list_return_type = if use_cursor {
+            quote! { ::autumn_web::pagination::CursorPage<#model_name> }
+        } else {
+            quote! { ::autumn_web::pagination::Page<#model_name> }
+        };
+        let list_pager_arg = if use_cursor {
+            quote! { __autumn_cursor_req: ::autumn_web::pagination::CursorRequest, }
+        } else {
+            quote! { __autumn_page_req: ::autumn_web::pagination::PageRequest, }
+        };
+
         let policy_check_show = if has_policy {
             quote! {
-                ::autumn_web::authorization::__check_policy::<#model_name>(
+                ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                     "show",
                     &record,
                 )
@@ -6077,9 +11865,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // leaving the data behind.
         let policy_check_create_pre = if has_policy {
             quote! {
-                ::autumn_web::authorization::__check_policy_create_payload::<#model_name>(
+                ::autumn_web::authorization::__check_policy_create_payload_scoped::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                     &__autumn_new_payload,
                 )
                 .await?;
@@ -6116,9 +11905,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 let __existing = repo.on_primary().find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
-                ::autumn_web::authorization::__check_policy::<#model_name>(
+                ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                     "update",
                     &__existing,
                 )
@@ -6131,9 +11921,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 let __existing = repo.on_primary().find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
-                ::autumn_web::authorization::__check_policy::<#model_name>(
+                ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                     "delete",
                     &__existing,
                 )
@@ -6147,6 +11938,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::axum::extract::State(__autumn_state):
                     ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>,
                 __autumn_session: ::autumn_web::session::Session,
+                __autumn_token_scopes: ::core::option::Option<
+                    ::autumn_web::reexports::axum::extract::Extension<
+                        ::autumn_web::auth::ApiTokenScopes
+                    >
+                >,
                 __autumn_idempotency_replay: ::core::option::Option<
                     ::autumn_web::reexports::axum::extract::Extension<
                         ::autumn_web::idempotency::IdempotencyReplayResponse
@@ -6169,30 +11965,38 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         //    perf should also set `scope = SomeScope`.
         // 3. Neither: plain `repo.find_all()` (public list).
         let scope_list_body = if config.scope_type.is_some() {
+            // Scope filters at the SQL level, but the filtered set is still
+            // returned in full — window it in memory so the response stays
+            // bounded and carries the `Page` envelope + `Link` headers.
             quote! {
                 let __scope = __autumn_state
                     .scope::<#model_name>()
                     .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
                         "missing scope registration"
                     ))?;
-                let __ctx = ::autumn_web::authorization::PolicyContext::from_request(
+                let __ctx = ::autumn_web::authorization::PolicyContext::from_request_parts(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                 ).await;
                 let mut __conn = repo.__autumn_acquire_read_conn().await?;
                 let records = __scope.list(&__ctx, &mut __conn).await?;
-                Ok(::autumn_web::prelude::Json(records))
+                Ok(::autumn_web::pagination::Page::paginate_in_memory(records, &__autumn_page_req))
             }
         } else if has_policy {
+            // Per-row policy checks must run in Rust, so every candidate row is
+            // loaded and filtered before the page window is applied. The
+            // response is still bounded to one page and self-describing.
             quote! {
                 let __policy = __autumn_state
                     .policy::<#model_name>()
                     .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
                         "missing policy registration"
                     ))?;
-                let __ctx = ::autumn_web::authorization::PolicyContext::from_request(
+                let __ctx = ::autumn_web::authorization::PolicyContext::from_request_parts(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                 ).await;
                 let __all = repo.find_all().await?;
                 let mut __filtered = ::std::vec::Vec::with_capacity(__all.len());
@@ -6201,11 +12005,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __filtered.push(__record);
                     }
                 }
-                Ok(::autumn_web::prelude::Json(__filtered))
+                Ok(::autumn_web::pagination::Page::paginate_in_memory(__filtered, &__autumn_page_req))
+            }
+        } else if use_cursor {
+            // Keyset/cursor mode (opted in via `cursor_key`): reuse the
+            // generated `cursor_page()` for O(1) page depth on append-only
+            // tables. Emits a cursor `Link: rel="next"`.
+            quote! {
+                repo.cursor_page(&__autumn_cursor_req).await
             }
         } else {
+            // Default: offset pagination via the generated `page()` — a single
+            // bounded `LIMIT/OFFSET` + `COUNT(*)`, never `find_all()`.
             quote! {
-                Ok(::autumn_web::prelude::Json(repo.find_all().await?))
+                repo.page(&__autumn_page_req).await
             }
         };
         // Inject session + state extractors when *either* a scope
@@ -6216,12 +12029,95 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::axum::extract::State(__autumn_state):
                     ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>,
                 __autumn_session: ::autumn_web::session::Session,
+                __autumn_token_scopes: ::core::option::Option<
+                    ::autumn_web::reexports::axum::extract::Extension<
+                        ::autumn_web::auth::ApiTokenScopes
+                    >
+                >,
             }
         } else {
             quote! {}
         };
         let resource_type_name_lit = model_name.to_string();
         let api_path_lit = api_path.clone();
+
+        // #1237: OpenAPI for the paginated list operation — document the
+        // `page`/`size` (or `cursor`/`size`) query params and the `Page`
+        // (or `CursorPage`) response envelope, replacing the old bare array.
+        let list_schema_fn = format_ident!("__autumn_openapi_schemas_{prefix}_api_list");
+        let list_query_schema_name = if use_cursor {
+            "CursorRequest"
+        } else {
+            "PageRequest"
+        };
+        let list_response_schema_name = if use_cursor {
+            format!("{model_name}CursorPage")
+        } else {
+            format!("{model_name}Page")
+        };
+        let model_component_ref = format!("#/components/schemas/{model_name}");
+        // Runtime-inserted component schemas: the pagination request query
+        // object and the response envelope wrapping an array of the model.
+        let list_query_schema_json = if use_cursor {
+            quote! {
+                ::autumn_web::reexports::serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "cursor": { "type": "string", "description": "Opaque keyset cursor for the next page" },
+                        "size": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                    }
+                })
+            }
+        } else {
+            quote! {
+                ::autumn_web::reexports::serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "page": { "type": "integer", "minimum": 1, "default": 1 },
+                        "size": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                    }
+                })
+            }
+        };
+        let list_response_schema_json = if use_cursor {
+            quote! {
+                ::autumn_web::reexports::serde_json::json!({
+                    "type": "object",
+                    "required": ["content", "size", "has_next"],
+                    "properties": {
+                        "content": { "type": "array", "items": { "$ref": #model_component_ref } },
+                        "size": { "type": "integer" },
+                        "next_cursor": { "type": ["string", "null"] },
+                        "has_next": { "type": "boolean" }
+                    }
+                })
+            }
+        } else {
+            quote! {
+                ::autumn_web::reexports::serde_json::json!({
+                    "type": "object",
+                    "required": ["content", "page", "size", "total_elements", "total_pages", "has_next", "has_previous"],
+                    "properties": {
+                        "content": { "type": "array", "items": { "$ref": #model_component_ref } },
+                        "page": { "type": "integer" },
+                        "size": { "type": "integer" },
+                        "total_elements": { "type": "integer" },
+                        "total_pages": { "type": "integer" },
+                        "has_next": { "type": "boolean" },
+                        "has_previous": { "type": "boolean" }
+                    }
+                })
+            }
+        };
+        let list_schema_registration = quote! {
+            #[doc(hidden)]
+            #vis fn #list_schema_fn(
+                __autumn_reg: &mut ::autumn_web::openapi::SchemaRegistry,
+            ) {
+                __autumn_reg.insert(#list_query_schema_name, #list_query_schema_json);
+                __autumn_reg.insert(#list_response_schema_name, #list_response_schema_json);
+            }
+        };
 
         // Compile-time assertion: when the user writes
         // `policy = SomePolicy`, the generated code references the
@@ -6288,6 +12184,78 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
 
+        // #1253: run the model's `#[validate(...)]` rules on the decoded write
+        // payload before it reaches the DB, returning a 422 Problem Details
+        // with the per-field `errors` map on failure. Uses autoref
+        // specialization (`MaybeValidate`) so a payload type that does not
+        // implement `validator::Validate` (e.g. a `NewModel` with no
+        // `#[validate]` fields, or a hand-written insert type) compiles to a
+        // no-op — no migration burden for existing repositories.
+        //
+        // `?`-flavoured for the plain `AutumnResult` handlers; the policy-backed
+        // handlers return `IdempotencyReplayOr`, so they get an explicit
+        // early-return that wraps the error in `Inner`.
+        let validate_new = quote! {
+            {
+                // Both traits must be in scope for autoref resolution to
+                // choose between them; exactly one is used for any concrete
+                // payload type, so the other is (correctly) unused.
+                #[allow(unused_imports)]
+                use ::autumn_web::validation::{
+                    MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+                };
+                (&::autumn_web::validation::MaybeValidate(&new)).autumn_maybe_validate()?;
+            }
+        };
+        let validate_patch = quote! {
+            {
+                // Both traits must be in scope for autoref resolution to
+                // choose between them; exactly one is used for any concrete
+                // payload type, so the other is (correctly) unused.
+                #[allow(unused_imports)]
+                use ::autumn_web::validation::{
+                    MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+                };
+                (&::autumn_web::validation::MaybeValidate(&patch)).autumn_maybe_validate()?;
+            }
+        };
+        let validate_new_idempotency = quote! {
+            {
+                // Both traits must be in scope for autoref resolution to
+                // choose between them; exactly one is used for any concrete
+                // payload type, so the other is (correctly) unused.
+                #[allow(unused_imports)]
+                use ::autumn_web::validation::{
+                    MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+                };
+                if let ::core::result::Result::Err(err) =
+                    (&::autumn_web::validation::MaybeValidate(&new)).autumn_maybe_validate()
+                {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                        ::core::result::Result::Err(err)
+                    );
+                }
+            }
+        };
+        let validate_patch_idempotency = quote! {
+            {
+                // Both traits must be in scope for autoref resolution to
+                // choose between them; exactly one is used for any concrete
+                // payload type, so the other is (correctly) unused.
+                #[allow(unused_imports)]
+                use ::autumn_web::validation::{
+                    MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+                };
+                if let ::core::result::Result::Err(err) =
+                    (&::autumn_web::validation::MaybeValidate(&patch)).autumn_maybe_validate()
+                {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                        ::core::result::Result::Err(err)
+                    );
+                }
+            }
+        };
+
         let create_return_type = if has_policy {
             quote! {
                 ::autumn_web::idempotency::IdempotencyReplayOr<
@@ -6319,10 +12287,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         );
                     }
                 };
+                #validate_new_idempotency
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy_create_payload::<#model_name>(
+                    ::autumn_web::authorization::__check_policy_create_payload_scoped::<#model_name>(
                         &__autumn_state,
                         &__autumn_session,
+                        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                         &__autumn_new_payload,
                     )
                     .await
@@ -6352,6 +12322,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {
                 #decode_create_payload
+                #validate_new
                 #policy_check_create_pre
                 let record = repo.save(&new).await?;
                 Ok((::autumn_web::reexports::http::StatusCode::CREATED, ::autumn_web::prelude::Json(record)))
@@ -6369,6 +12340,44 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
         let update_body = if has_policy {
+            // #1801: merged-model validation via `from_patch` structurally needs
+            // the `#[model]`-generated `<Model>DraftExt` trait (and `Model:
+            // Clone`, required by `UpdateDraft`). Hand-written models opt out of
+            // the generated DTO scaffolding with `no_upsert_trait` and supply
+            // their own changeset, so they have no `DraftExt`; skip the merged
+            // check for them (the patch-level `#validate_patch_idempotency` above
+            // still runs). Regression: repository_policy_non_serialize_new.rs.
+            let merged_validate = if config.no_upsert_trait {
+                quote! {}
+            } else {
+                let draft_ext_trait = format_ident!("{}DraftExt", model_name);
+                quote! {
+                    // #1801: also validate the effective merged model (existing
+                    // row ∪ patch) so the full validator set runs against
+                    // concrete values, matching the hooked-repo precedent
+                    // (#1804). Runs after 404/403/patch-422 and reuses the
+                    // already-loaded `__existing` (no extra query). We only want
+                    // the 422 side-effect, so the draft is discarded and the
+                    // blind `repo.update` below is unchanged. Wrapped (not `?`)
+                    // because this handler returns `IdempotencyReplayOr`; sits
+                    // with the other pure pre-replay checks so it cannot affect
+                    // idempotency replay semantics.
+                    //
+                    // Concurrency (known, deliberate): this is point-in-time —
+                    // it validates against the `__existing` snapshot loaded for
+                    // the 404/policy gate, not under a row lock held through
+                    // `repo.update`, so it is best-effort under concurrent writes
+                    // for the same reason as the blind path above (deliberate,
+                    // given the always-on zero-extra-query design).
+                    if let ::core::result::Result::Err(err) =
+                        <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__existing, &patch)
+                    {
+                        return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                            ::core::result::Result::Err(err)
+                        );
+                    }
+                }
+            };
             quote! {
                 let __existing = match repo.on_primary().find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
@@ -6384,9 +12393,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy::<#model_name>(
+                    ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                         &__autumn_state,
                         &__autumn_session,
+                        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                         "update",
                         &__existing,
                     )
@@ -6396,6 +12406,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Err(err)
                     );
                 }
+                // #1719 follow-up (Codex P2): validate the patch only after the
+                // existence load (404) and the `__check_policy_scoped` gate
+                // (403), so a policy-gated PUT/PATCH with an invalid body still
+                // reports missing/unauthorized before unprocessable. Validation
+                // is a pure check on the already-decoded `patch` and, like the
+                // policy gate above, sits before the pure `__replay_response`
+                // read, so it cannot affect idempotency replay semantics.
+                #validate_patch_idempotency
+                #merged_validate
                 if let ::core::option::Option::Some(response) =
                     ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
                 {
@@ -6415,6 +12434,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         } else {
             quote! {
+                #validate_patch
                 #policy_check_update_pre
                 let record = repo.update(id, &patch).await?;
                 Ok(::autumn_web::prelude::Json(record))
@@ -6467,9 +12487,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy::<#model_name>(
+                    ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                         &__autumn_state,
                         &__autumn_session,
+                        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                         "delete",
                         &__existing,
                     )
@@ -6558,10 +12579,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             #vis async fn #list_fn(
                 #list_session_state_args
+                #list_pager_arg
                 repo: #pg_name,
-            ) -> ::autumn_web::AutumnResult<::autumn_web::prelude::Json<Vec<#model_name>>> {
+            ) -> ::autumn_web::AutumnResult<#list_return_type> {
                 #scope_list_body
             }
+
+            #list_schema_registration
 
             #[doc(hidden)]
             #vis fn #list_info() -> ::autumn_web::Route {
@@ -6581,17 +12605,27 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         path: #api_path,
                         operation_id: ::core::stringify!(#list_fn),
                         success_status: 200,
-                        response: ::core::option::Option::Some(
+                        // The pagination query/response envelopes are synthetic,
+                        // runtime-inserted component schemas (`PageRequest` /
+                        // `CursorRequest` / `<Model>Page` / `<Model>CursorPage`)
+                        // with no addressable Rust type, so they carry no
+                        // `type_name` identity and key off their short name.
+                        query_schema: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
-                                name: "array",
-                                kind: ::autumn_web::openapi::SchemaKind::Array(
-                                    &::autumn_web::openapi::SchemaEntry {
-                                        name: ::core::stringify!(#model_name),
-                                        kind: ::autumn_web::openapi::SchemaKind::Ref,
-                                    }
-                                ),
+                                name: #list_query_schema_name,
+                                kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
                             }
                         ),
+                        response: ::core::option::Option::Some(
+                            ::autumn_web::openapi::SchemaEntry {
+                                name: #list_response_schema_name,
+                                kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
+                            }
+                        ),
+                        register_schemas: ::core::option::Option::Some(#list_schema_fn),
+                        mcp_tool: #mcp_list_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -6602,6 +12636,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #list_scope_check_fn,
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                    timeout: ::autumn_web::RouteTimeout::Inherit,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -6641,8 +12676,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#model_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::Some(
+                                    ::autumn_web::openapi::type_name_of::<#model_name>
+                                ),
                             }
                         ),
+                        mcp_tool: #mcp_get_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -6653,6 +12692,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #non_list_scope_check_fn,
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                    timeout: ::autumn_web::RouteTimeout::Inherit,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -6683,14 +12723,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#new_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::Some(
+                                    ::autumn_web::openapi::type_name_of::<#new_name>
+                                ),
                             }
                         ),
                         response: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#model_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::Some(
+                                    ::autumn_web::openapi::type_name_of::<#model_name>
+                                ),
                             }
                         ),
+                        mcp_tool: #mcp_create_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -6701,6 +12748,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #non_list_scope_check_fn,
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                    timeout: ::autumn_web::RouteTimeout::Inherit,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -6733,14 +12781,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#update_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::Some(
+                                    ::autumn_web::openapi::type_name_of::<#update_name>
+                                ),
                             }
                         ),
                         response: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#model_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::Some(
+                                    ::autumn_web::openapi::type_name_of::<#model_name>
+                                ),
                             }
                         ),
+                        mcp_tool: #mcp_update_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -6751,6 +12806,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #non_list_scope_check_fn,
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                    timeout: ::autumn_web::RouteTimeout::Inherit,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -6778,6 +12834,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         operation_id: ::core::stringify!(#delete_fn),
                         path_params: &["id"],
                         success_status: 204,
+                        mcp_tool: #mcp_delete_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -6788,6 +12845,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #non_list_scope_check_fn,
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                    timeout: ::autumn_web::RouteTimeout::Inherit,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -6837,6 +12895,111 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // §1d: cross-shard fan-out / reject fragments for the soft-delete readers.
+    // `with_deleted` / `only_deleted` are unpaginated `Vec`-returning reads, so
+    // under `across_tenants()` on a sharded repo they fan out across every shard
+    // and concatenate the per-shard results (via inherent one-shard helpers, the
+    // same pattern as `find_all`). `page_only_deleted` is paginated and a naive
+    // fan-out would produce wrong page boundaries / totals, so it rejects (like
+    // `page`). All fragments are empty (zero-cost) unless sharded + tenant_scoped.
+    let mut soft_delete_one_shard_helpers: Vec<proc_macro2::TokenStream> = Vec::new();
+    let (with_deleted_fan_out, only_deleted_fan_out, page_only_deleted_cross_shard_guard) =
+        if config.soft_delete && config.sharded && config.tenant_scoped {
+            // Without a shard set, an across-tenant read would bind a NULL tenant
+            // predicate and silently return a PARTIAL result over only the current
+            // pool, so we reject rather than fall through (#1692, #1741).
+            let with_deleted_fan_out = quote! {
+                if self.across_tenants {
+                    let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::bad_request_msg(
+                                "cross-shard with_deleted requires a configured shard set: \
+                                 across_tenants() cannot fan with_deleted out across shards \
+                                 without a shard set (the repository was built without \
+                                 shard context, e.g. via with_pool_untracked); build it \
+                                 with shard context instead"
+                            )
+                        );
+                    };
+                    let __vecs = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_with_deleted_one_shard().await }
+                    }).await?;
+                    return ::core::result::Result::Ok(
+                        __vecs.into_iter().flatten().collect()
+                    );
+                }
+            };
+            let only_deleted_fan_out = quote! {
+                if self.across_tenants {
+                    let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::bad_request_msg(
+                                "cross-shard only_deleted requires a configured shard set: \
+                                 across_tenants() cannot fan only_deleted out across shards \
+                                 without a shard set (the repository was built without \
+                                 shard context, e.g. via with_pool_untracked); build it \
+                                 with shard context instead"
+                            )
+                        );
+                    };
+                    let __vecs = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_only_deleted_one_shard().await }
+                    }).await?;
+                    return ::core::result::Result::Ok(
+                        __vecs.into_iter().flatten().collect()
+                    );
+                }
+            };
+            let page_only_deleted_cross_shard_guard = quote! {
+                if self.across_tenants && self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard page_only_deleted is not supported: \
+                             across_tenants() fans out unpaginated reads only; \
+                             page a specific shard instead"
+                        )
+                    );
+                }
+            };
+            // The per-shard helpers re-run the single-shard body. The
+            // sub-repo built by `__autumn_for_shard` has across_tenants = true
+            // and __autumn_shards = None, so its tenant_id resolves to None and
+            // the body loads every (deleted) row on that shard.
+            soft_delete_one_shard_helpers.push(quote! {
+                #[doc(hidden)]
+                async fn __autumn_with_deleted_one_shard(&self) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    #table_ident::table
+                        .load::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)
+                }
+
+                #[doc(hidden)]
+                async fn __autumn_only_deleted_one_shard(&self) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    #table_ident::table
+                        .filter(#table_ident::deleted_at.is_not_null())
+                        .load::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)
+                }
+            });
+            (
+                with_deleted_fan_out,
+                only_deleted_fan_out,
+                page_only_deleted_cross_shard_guard,
+            )
+        } else {
+            (quote! {}, quote! {}, quote! {})
+        };
+
     let soft_delete_impl_methods = if config.soft_delete {
         if config.tenant_scoped {
             let tenant_id_setup = quote! {
@@ -6853,6 +13016,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: restore is a write; reject cross-shard across_tenants
+                    // (per-shard ids are ambiguous, like delete/purge).
+                    #cross_shard_write_guard
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.find(id);
@@ -6879,6 +13045,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn purge(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: purge is a hard delete; reject cross-shard across_tenants
+                    // (per-shard ids are ambiguous and could purge another tenant's row).
+                    #cross_shard_write_guard
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.find(id);
@@ -6903,6 +13072,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn with_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: fan out across all shards under across_tenants. The
+                    // dispatch runs before acquiring a routed connection so no
+                    // drop is needed (see the find_all deadlock rule).
+                    #with_deleted_fan_out
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table;
@@ -6921,6 +13094,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn only_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: fan out across all shards under across_tenants.
+                    #only_deleted_fan_out
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
@@ -6942,6 +13117,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: paginated reads cannot fan out (page/total would be
+                    // wrong across shards); reject under cross-shard access.
+                    #page_only_deleted_cross_shard_guard
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
@@ -7140,6 +13318,128 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // §1d: when sharded + tenant_scoped, fan out across all shards concurrently
+    // for across_tenants reads.  Uses ShardSet::fan_out_shards for concurrent
+    // execution.  The sub-repo is built with `__autumn_for_shard`, which honors
+    // each shard's read routing and the parent request context and sets
+    // `__autumn_shards = None`, preventing recursion.
+    // §1d: fan out `find_all` across all shards for `across_tenants()`. The
+    // per-shard work runs through the inherent `__autumn_find_all_one_shard`
+    // helper (emitted below) rather than the trait method, so `find_all`'s
+    // RPITIT future never transitively names its own opaque type — which would
+    // make its `Send` auto-trait unprovable once hooks/versioning add captured
+    // state to the future.
+    let (find_all_impl, find_all_one_shard_helper) = if config.sharded && config.tenant_scoped {
+        let base = find_all_impl;
+        let dispatch = quote! {
+            // Dispatch the cross-shard fan-out BEFORE acquiring any connection:
+            // no routed-shard connection is held here, so a dead parent replica
+            // or exhausted parent pool can't fail the fan-out. Each shard's own
+            // read route/fallback is chosen by `__autumn_for_shard` (#1d).
+            //
+            // Without a shard set (e.g. a repo built via `with_pool_untracked`,
+            // where `__autumn_shards` is `None`), an across-tenant read would
+            // bind a NULL tenant predicate and silently return a PARTIAL result
+            // over only the current pool, so we reject rather than fall through
+            // to the single-pool query — mirroring the `count` guard (#1692,
+            // #1741).
+            if self.across_tenants {
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard find_all requires a configured shard set: \
+                             across_tenants() cannot fan find_all out across shards \
+                             without a shard set (the repository was built without \
+                             shard context, e.g. via with_pool_untracked); build it \
+                             with shard context instead"
+                        )
+                    );
+                };
+                let __vecs = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_find_all_one_shard().await }
+                }).await?;
+                return ::core::result::Result::Ok(
+                    __vecs.into_iter().flatten().collect()
+                );
+            }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_find_all_one_shard(&self) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
+    } else {
+        (find_all_impl, quote! {})
+    };
+
+    // §1d: fan out `find_by_id` across all shards for `across_tenants()`,
+    // returning the first shard that has the row (ids are unique within a
+    // shard). Without this, a cross-tenant `find_by_id` would only consult the
+    // originally-routed shard and report rows on other shards as missing.
+    let (find_by_id_impl, find_by_id_one_shard_helper) = if config.sharded && config.tenant_scoped {
+        let base = find_by_id_impl;
+        let dispatch = quote! {
+            // Fan out before acquiring a parent-shard connection (see find_all).
+            // Without a shard set, an across-tenant read would bind a NULL tenant
+            // predicate and silently return a PARTIAL result over only the current
+            // pool, so we reject rather than fall through (#1692, #1741).
+            if self.across_tenants {
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard find_by_id requires a configured shard set: \
+                             across_tenants() cannot fan find_by_id out across shards \
+                             without a shard set (the repository was built without \
+                             shard context, e.g. via with_pool_untracked); build it \
+                             with shard context instead"
+                        )
+                    );
+                };
+                let __found = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_find_by_id_one_shard(id).await }
+                }).await?;
+                // Ids are unique only within a shard: with per-shard
+                // sequences two shards can hold the same id, so a match on
+                // more than one shard is ambiguous. Reject rather than
+                // silently returning whichever shard sorts first (#1d).
+                let mut __hits = __found.into_iter().flatten();
+                let __first = __hits.next();
+                if __hits.next().is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::internal_server_error_msg(
+                            "ambiguous cross-shard find_by_id: id matched rows on \
+                             multiple shards; query a specific shard instead"
+                        )
+                    );
+                }
+                return ::core::result::Result::Ok(__first);
+            }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_find_by_id_one_shard(&self, id: i64) -> ::autumn_web::AutumnResult<::core::option::Option<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
+    } else {
+        (find_by_id_impl, quote! {})
+    };
+
     let count_impl = if config.tenant_scoped {
         quote! {
             let tenant_id = if self.across_tenants {
@@ -7175,6 +13475,52 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .await
                 .map_err(::autumn_web::AutumnError::from)
         }
+    };
+
+    let (count_impl, count_one_shard_helper) = if config.sharded && config.tenant_scoped {
+        let base = count_impl;
+        let dispatch = quote! {
+            // Fan out before acquiring a parent-shard connection (see find_all).
+            // count is legitimately mergeable across shards, so with a shard set
+            // present we sum per-shard counts. Without one (e.g. a repo built via
+            // `with_pool_untracked`, where `__autumn_shards` is `None`), an
+            // across-tenant count would bind a NULL tenant predicate and silently
+            // return a PARTIAL result over only the current pool, so we reject
+            // rather than fall through to the single-pool count (#1692).
+            if self.across_tenants {
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard count requires a configured shard set: \
+                             across_tenants() cannot fan count out across shards \
+                             without a shard set (the repository was built \
+                             without shard context, e.g. via \
+                             with_pool_untracked); build it with shard context \
+                             instead"
+                        )
+                    );
+                };
+                let __counts = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_count_one_shard().await }
+                }).await?;
+                return ::core::result::Result::Ok(__counts.into_iter().sum());
+            }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_count_one_shard(&self) -> ::autumn_web::AutumnResult<i64> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
+    } else {
+        (count_impl, quote! {})
     };
 
     let exists_by_id_impl = if config.tenant_scoped {
@@ -7220,6 +13566,50 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let (exists_by_id_impl, exists_by_id_one_shard_helper) = if config.sharded
+        && config.tenant_scoped
+    {
+        let base = exists_by_id_impl;
+        let dispatch = quote! {
+            // Fan out before acquiring a parent-shard connection (see find_all).
+            // Without a shard set, an across-tenant read would bind a NULL tenant
+            // predicate and silently return a PARTIAL result over only the current
+            // pool, so we reject rather than fall through (#1692, #1741).
+            if self.across_tenants {
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard exists_by_id requires a configured shard set: \
+                             across_tenants() cannot fan exists_by_id out across shards \
+                             without a shard set (the repository was built without \
+                             shard context, e.g. via with_pool_untracked); build it \
+                             with shard context instead"
+                        )
+                    );
+                };
+                let __results = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_exists_by_id_one_shard(id).await }
+                }).await?;
+                return ::core::result::Result::Ok(__results.into_iter().any(|b| b));
+            }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_exists_by_id_one_shard(&self, id: i64) -> ::autumn_web::AutumnResult<bool> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
+    } else {
+        (exists_by_id_impl, quote! {})
+    };
+
     let upsert_many_trait_method = if config.hooks_type.is_none() && !config.no_upsert_trait {
         quote! {
             fn upsert_many(&self, records: &[#model_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send
@@ -7234,6 +13624,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn save_many(&self, new: &[#new_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
         fn save_many_skip_invalid(&self, new: &[#new_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)>> + Send;
         fn update_many(&self, ids: &[i64], changes: &#update_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+        /// Bulk-delete the given ids in one statement.
+        ///
+        /// #1740: `dependent(...)` cascade actions DO apply on this bulk path. On
+        /// a repository that declares `dependent(...)`, `delete_many` runs the same
+        /// destroy/delete_all/nullify/restrict cascade the single-record
+        /// `delete_by_id`/`destroy` runs — restrict probes first (a typed 409 rolls
+        /// the whole transaction back), then children, then the bulk parent delete,
+        /// all in one transaction — so no child is orphaned. Children are cascaded
+        /// per affected parent row (so `destroy` recurses into grandchildren,
+        /// #1739); set-based bulk child mutations are a possible future refinement.
+        /// Repositories with no dependents keep the plain bulk delete unchanged.
         fn delete_many(&self, ids: &[i64]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
         #upsert_many_trait_method
     };
@@ -7244,6 +13645,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             where
                 #model_name: ::autumn_web::reexports::diesel::Insertable<#table_ident::table>
             {
+                #cross_shard_write_guard
                 #upsert_many_body
             }
         }
@@ -7302,7 +13704,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    let search_impl_methods = if config.searchable {
+    let internal_hooks_defn = if config.generated_internal_hooks {
+        let hooks_ident = config.hooks_type.as_ref().unwrap();
+        quote! {
+            #[derive(Default, Clone)]
+            pub struct #hooks_ident;
+
+            impl ::autumn_web::hooks::MutationHooks for #hooks_ident {
+                type Model = #model_name;
+                type NewModel = #new_name;
+                type UpdateModel = #update_name;
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let (search_impl_methods, search_one_shard_helpers) = if config.searchable {
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
                 let tenant_id = if self.across_tenants {
@@ -7319,11 +13737,87 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        quote! {
-            async fn search(&self, query: &str) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+        // #1910 SQLite FTS5 full-text search. Postgres uses tsvector ranked
+        // search (`websearch_to_tsquery`/`ts_rank_cd`); SQLite has no tsvector, so
+        // the `backend_select!` sqlite arm below queries an external-content FTS5
+        // virtual table (`"<table>__fts"`, tokenized with `unicode61`) that the
+        // `AddSearch` migration creates and keeps in sync with triggers. The id
+        // SELECT joins that FTS table to the base table (so the tenant /
+        // soft-delete / owner predicates still filter the BASE table exactly as
+        // the pg arm does), matches with `WHERE "<table>__fts" MATCH ?`, and ranks
+        // with `ORDER BY bm25("<table>__fts", <weights>)` — per-column weights
+        // derived from the `#[searchable(weight=...)]` priorities (A→10, B→5, C→2,
+        // else 1), so a higher-priority field sorts first (bm25 returns lower =
+        // better, so a larger weight yields a more-negative score). `unicode61`
+        // folds case for the full Unicode range (fixing the old ASCII-only `lower`
+        // limitation — e.g. `äpfel` now matches `Äpfel`). This fragment builds the
+        // trusted `__autumn_bm25_weights` literal list and the fail-closed
+        // `__autumn_fts_match_opt` (see `sqlite_fts5_match_query`); it is spliced
+        // into each sqlite arm (never the pg arm), so it is only built where used.
+        let sqlite_fts_setup = quote! {
+            // Trusted per-column bm25 weights from the developer-declared
+            // SEARCH_FIELDS priorities — never request input, so spliced as SQL
+            // literals rather than bound.
+            let mut __autumn_bm25_weights: ::std::vec::Vec<&'static str> = ::std::vec::Vec::new();
+            for (_, __autumn_weight) in <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS {
+                __autumn_bm25_weights.push(match *__autumn_weight {
+                    'A' => "10.0",
+                    'B' => "5.0",
+                    'C' => "2.0",
+                    _ => "1.0",
+                });
+            }
+            let __autumn_bm25_weights = __autumn_bm25_weights.join(", ");
+            // Fail-closed FTS5 MATCH sanitization: `None` ⇒ no usable tokens ⇒ the
+            // arm yields an empty result and runs NO query (never a full scan).
+            let __autumn_fts_match_opt =
+                ::autumn_web::repository::sqlite_fts5_match_query(query);
+        };
 
+        // §1d: under across_tenants on a sharded repo the `Vec`-returning
+        // `search` fans out across every shard and concatenates results (ranking
+        // is per-shard; the merged order is the per-shard ranking concatenated).
+        // The paginated `search_page` rejects, since merging ranked pages across
+        // shards would produce wrong page boundaries / totals.
+        let search_fan_out = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants {
+                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                        let __q = ::std::string::ToString::to_string(query);
+                        let __vecs = __shards.fan_out_shards(|__shard| {
+                            let __sub = self.__autumn_for_shard(__shard);
+                            let __q = ::core::clone::Clone::clone(&__q);
+                            async move { __sub.__autumn_search_one_shard(&__q).await }
+                        }).await?;
+                        return ::core::result::Result::Ok(
+                            __vecs.into_iter().flatten().collect()
+                        );
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let search_page_cross_shard_guard = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants && self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard search_page is not supported: \
+                             across_tenants() fans out unpaginated reads only; \
+                             page a specific shard instead"
+                        )
+                    );
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        // The single-shard `search` body, shared by the trait method (as the
+        // fan-out fallthrough) and the inherent `__autumn_search_one_shard`
+        // helper, so the SQL is defined exactly once.
+        let search_body = quote! {
                 if query.trim().is_empty() {
                     return Ok(Vec::new());
                 }
@@ -7336,41 +13830,90 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 #tenant_id_setup
                 let mut conn = self.__autumn_acquire_read_conn().await?;
-                let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
 
-                let mut sql = format!(
-                    "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
-                    #table_name
-                );
-                if #config_soft_delete {
-                    sql.push_str(" AND deleted_at IS NULL");
-                }
-                if let ::core::option::Option::Some(ref _t) = tenant_id {
-                    sql.push_str(" AND tenant_id = $3");
-                }
-                sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                let ids = ::autumn_web::backend_select! {
+                    pg => {{
+                        let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
 
-                let ids = if #config_tenant_scoped {
-                    if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::sql_query(sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                            .load::<SearchId>(&mut conn)
-                            .await?
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .load::<SearchId>(&mut conn)
-                            .await?
-                    }
-                } else {
-                    ::autumn_web::reexports::diesel::sql_query(sql)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                        .load::<SearchId>(&mut conn)
-                        .await?
+                        let mut sql = format!(
+                            "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                            #table_name
+                        );
+                        if #config_soft_delete {
+                            sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if let ::core::option::Option::Some(ref _t) = tenant_id {
+                            sql.push_str(" AND tenant_id = $3");
+                        }
+                        sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                .load::<SearchId>(&mut conn)
+                                .await?
+                        }
+                    }},
+                    sqlite => {{
+                        #sqlite_fts_setup
+
+                        match __autumn_fts_match_opt {
+                            // Fail-closed: no usable tokens ⇒ empty result, no query.
+                            ::core::option::Option::None => ::std::vec::Vec::<SearchId>::new(),
+                            ::core::option::Option::Some(__autumn_match) => {
+                                let mut sql = ::std::format!(
+                                    "SELECT \"{tbl}\".id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    tbl = #table_name
+                                );
+                                if #config_soft_delete {
+                                    sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
+                                }
+                                if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                    sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
+                                }
+                                sql.push_str(&::std::format!(
+                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), \"{tbl}\".id DESC",
+                                    tbl = #table_name, weights = __autumn_bm25_weights
+                                ));
+
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        ::autumn_web::reexports::diesel::sql_query(sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    } else {
+                                        ::autumn_web::reexports::diesel::sql_query(sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    }
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(sql)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                        .load::<SearchId>(&mut conn)
+                                        .await?
+                                }
+                            }
+                        }
+                    }},
                 };
 
                 let id_list: Vec<i64> = ids.into_iter().map(|s| s.id).collect();
@@ -7398,6 +13941,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .collect();
 
                 Ok(sorted_records)
+        };
+
+        // The inherent per-shard helper for `search`, emitted into the inherent
+        // impl block (a trait impl cannot hold non-trait methods).
+        let search_one_shard_helpers = if config.sharded && config.tenant_scoped {
+            quote! {
+                #[doc(hidden)]
+                async fn __autumn_search_one_shard(&self, query: &str) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    #search_body
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        let search_methods = quote! {
+            async fn search(&self, query: &str) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                // §1d: fan out across all shards under across_tenants.
+                #search_fan_out
+                #search_body
             }
 
             async fn search_page(
@@ -7407,6 +13974,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                // §1d: paginated search cannot fan out; reject cross-shard.
+                #search_page_cross_shard_guard
 
                 if query.trim().is_empty() {
                     return Ok(::autumn_web::pagination::Page::new(Vec::new(), 0, req));
@@ -7426,90 +13995,195 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 #tenant_id_setup
                 let mut conn = self.__autumn_acquire_read_conn().await?;
-                let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
                 let limit = req.limit();
                 let offset = req.offset();
 
-                let mut count_sql = format!(
-                    "SELECT COUNT(*) AS count FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
-                    #table_name
-                );
-                if #config_soft_delete {
-                    count_sql.push_str(" AND deleted_at IS NULL");
-                }
-                if let ::core::option::Option::Some(ref _t) = tenant_id {
-                    count_sql.push_str(" AND tenant_id = $3");
-                }
+                let total = ::autumn_web::backend_select! {
+                    pg => {{
+                        let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+                        let mut count_sql = format!(
+                            "SELECT COUNT(*) AS count FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                            #table_name
+                        );
+                        if #config_soft_delete {
+                            count_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if let ::core::option::Option::Some(ref _t) = tenant_id {
+                            count_sql.push_str(" AND tenant_id = $3");
+                        }
 
-                let total = if #config_tenant_scoped {
-                    if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::sql_query(count_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                            .get_result::<SearchCount>(&mut conn)
-                            .await?
-                            .count
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(count_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .get_result::<SearchCount>(&mut conn)
-                            .await?
-                            .count
-                    }
-                } else {
-                    ::autumn_web::reexports::diesel::sql_query(count_sql)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                        .get_result::<SearchCount>(&mut conn)
-                        .await?
-                        .count
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                .get_result::<SearchCount>(&mut conn)
+                                .await?
+                                .count
+                        }
+                    }},
+                    sqlite => {{
+                        #sqlite_fts_setup
+                        match __autumn_fts_match_opt {
+                            // Fail-closed: no usable tokens ⇒ zero total, no query.
+                            ::core::option::Option::None => 0_i64,
+                            ::core::option::Option::Some(__autumn_match) => {
+                                let mut count_sql = ::std::format!(
+                                    "SELECT COUNT(*) AS count FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    tbl = #table_name
+                                );
+                                if #config_soft_delete {
+                                    count_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
+                                }
+                                if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                    count_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
+                                }
+
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                            .get_result::<SearchCount>(&mut conn)
+                                            .await?
+                                            .count
+                                    } else {
+                                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .get_result::<SearchCount>(&mut conn)
+                                            .await?
+                                            .count
+                                    }
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                        .get_result::<SearchCount>(&mut conn)
+                                        .await?
+                                        .count
+                                }
+                            }
+                        }
+                    }},
                 };
 
-                let mut select_sql = format!(
-                    "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
-                    #table_name
-                );
-                if #config_soft_delete {
-                    select_sql.push_str(" AND deleted_at IS NULL");
-                }
-                if let ::core::option::Option::Some(ref _t) = tenant_id {
-                    select_sql.push_str(" AND tenant_id = $3");
-                    select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
-                    select_sql.push_str(" LIMIT $4 OFFSET $5");
-                } else {
-                    select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
-                    select_sql.push_str(" LIMIT $3 OFFSET $4");
-                }
+                let ids = ::autumn_web::backend_select! {
+                    pg => {{
+                        let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+                        let mut select_sql = format!(
+                            "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                            #table_name
+                        );
+                        if #config_soft_delete {
+                            select_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if let ::core::option::Option::Some(ref _t) = tenant_id {
+                            select_sql.push_str(" AND tenant_id = $3");
+                            select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                            select_sql.push_str(" LIMIT $4 OFFSET $5");
+                        } else {
+                            select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                            select_sql.push_str(" LIMIT $3 OFFSET $4");
+                        }
 
-                let ids = if #config_tenant_scoped {
-                    if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::sql_query(select_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                            .load::<SearchId>(&mut conn)
-                            .await?
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(select_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                            .load::<SearchId>(&mut conn)
-                            .await?
-                    }
-                } else {
-                    ::autumn_web::reexports::diesel::sql_query(select_sql)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                        .load::<SearchId>(&mut conn)
-                        .await?
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                .load::<SearchId>(&mut conn)
+                                .await?
+                        }
+                    }},
+                    sqlite => {{
+                        #sqlite_fts_setup
+                        match __autumn_fts_match_opt {
+                            // Fail-closed: no usable tokens ⇒ empty page, no query.
+                            ::core::option::Option::None => ::std::vec::Vec::<SearchId>::new(),
+                            ::core::option::Option::Some(__autumn_match) => {
+                                let mut select_sql = ::std::format!(
+                                    "SELECT \"{tbl}\".id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    tbl = #table_name
+                                );
+                                if #config_soft_delete {
+                                    select_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
+                                }
+                                let __autumn_order = ::std::format!(
+                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), \"{tbl}\".id DESC",
+                                    tbl = #table_name, weights = __autumn_bm25_weights
+                                );
+                                if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                    select_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
+                                    select_sql.push_str(&__autumn_order);
+                                    select_sql.push_str(" LIMIT $3 OFFSET $4");
+                                } else {
+                                    select_sql.push_str(&__autumn_order);
+                                    select_sql.push_str(" LIMIT $2 OFFSET $3");
+                                }
+
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    } else {
+                                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    }
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                        .load::<SearchId>(&mut conn)
+                                        .await?
+                                }
+                            }
+                        }
+                    }},
                 };
 
                 let id_list: Vec<i64> = ids.into_iter().map(|s| s.id).collect();
@@ -7538,9 +14212,412 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 Ok(::autumn_web::pagination::Page::new(sorted_records, total, req))
             }
-        }
+        };
+        (search_methods, search_one_shard_helpers)
     } else {
-        quote! {}
+        (quote! {}, quote! {})
+    };
+
+    // ── #1841: owner-scoped full-text search (`search_page_scoped`) ──────
+    //
+    // Emitted only when the repository is BOTH `searchable` AND `owner =`
+    // scoped. It clones `search_page` and adds the owner filter to ALL THREE
+    // query phases — the COUNT raw SQL, the id-SELECT raw SQL, and the typed
+    // hydration query — so `total`, the paged id set, and the hydrated rows all
+    // agree and none can leak another user's rows. The owner id is bound as a
+    // positional parameter (never string-interpolated); the parameter index
+    // shifts by one when tenant scoping already occupies `$3`, mirroring the
+    // tenant code's `$3/$4/$5` arity handling.
+    let (search_page_scoped_trait_method, search_page_scoped_impl_method) = if let (
+        true,
+        ::core::option::Option::Some(owner_col),
+        ::core::option::Option::Some(owner_col_name),
+    ) = (
+        config.searchable,
+        owner_col_ident.as_ref(),
+        config.owner_column.as_deref(),
+    ) {
+        // Owner clause literals for the two positional slots the runtime SQL
+        // builder can land the owner filter on: `$3` (no tenant param) or
+        // `$4` (tenant occupies `$3`). Built at macro-expansion time from the
+        // trusted column ident, so the runtime string only ever concatenates
+        // a fixed, developer-declared identifier — never request input.
+        let owner_and_p3 = format!(" AND {owner_col_name} = $3");
+        let owner_and_p4 = format!(" AND {owner_col_name} = $4");
+
+        // #1910 SQLite owner clause literals. The sqlite arm renumbers positional
+        // slots from `$1` (the FTS5 MATCH string replaces Postgres's `$1`/`$2`
+        // language+query pair), so the owner filter lands on `$2` (no tenant) or
+        // `$3` (tenant occupies `$2`). Same trusted developer-declared identifier
+        // as the pg literals — never request input.
+        let owner_sqlite_p2 = format!(" AND \"{table_name}\".\"{owner_col_name}\" = $2");
+        let owner_sqlite_p3 = format!(" AND \"{table_name}\".\"{owner_col_name}\" = $3");
+
+        let tenant_id_setup = if config.tenant_scoped {
+            quote! {
+                let tenant_id = if self.across_tenants {
+                    ::core::option::Option::None
+                } else {
+                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                    ::core::option::Option::Some(t)
+                };
+            }
+        } else {
+            quote! {
+                let tenant_id = ::core::option::Option::None::<::std::string::String>;
+            }
+        };
+        // #1910 SQLite FTS5 setup for the owner-scoped search (see the sibling
+        // `sqlite_fts_setup` in the unscoped searchable block for the full
+        // rationale — external-content FTS5 vtable, unicode61 tokenizer, bm25
+        // ranking, and the fail-closed `sqlite_fts5_match_query` sanitizer).
+        // Recomputed locally here because the scoped block is a separate `if let`
+        // and cannot see the unscoped block's binding.
+        let sqlite_fts_setup = quote! {
+            let mut __autumn_bm25_weights: ::std::vec::Vec<&'static str> = ::std::vec::Vec::new();
+            for (_, __autumn_weight) in <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS {
+                __autumn_bm25_weights.push(match *__autumn_weight {
+                    'A' => "10.0",
+                    'B' => "5.0",
+                    'C' => "2.0",
+                    _ => "1.0",
+                });
+            }
+            let __autumn_bm25_weights = __autumn_bm25_weights.join(", ");
+            let __autumn_fts_match_opt =
+                ::autumn_web::repository::sqlite_fts5_match_query(query);
+        };
+        let search_page_cross_shard_guard = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants && self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard search_page is not supported: \
+                             across_tenants() fans out unpaginated reads only; \
+                             page a specific shard instead"
+                        )
+                    );
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let second_stage_owner_filter = quote! {
+            records_query = records_query.filter(#table_ident::#owner_col.eq(owner_id));
+        };
+
+        let trait_method = quote! {
+            /// Owner-scoped full-text search: like [`search_page`](Self::search_page)
+            /// but every phase (`COUNT`, the ranked id `SELECT`, and the typed
+            /// hydration) is filtered to rows owned by `owner_id`, so an
+            /// owner-scoped `/search` endpoint can never return another user's
+            /// rows (issue #1841). A nullable owner column never matches NULL
+            /// (unowned) rows.
+            fn search_page_scoped(
+                &self,
+                owner_id: i64,
+                query: &str,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
+        };
+
+        let impl_method = quote! {
+            async fn search_page_scoped(
+                &self,
+                owner_id: i64,
+                query: &str,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                #search_page_cross_shard_guard
+
+                if query.trim().is_empty() {
+                    return Ok(::autumn_web::pagination::Page::new(Vec::new(), 0, req));
+                }
+
+                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                struct SearchId {
+                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                    id: i64,
+                }
+
+                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                struct SearchCount {
+                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                    count: i64,
+                }
+
+                #tenant_id_setup
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                let limit = req.limit();
+                let offset = req.offset();
+
+                // ── COUNT (owner-filtered) ──
+                let total = ::autumn_web::backend_select! {
+                    pg => {{
+                        let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+                        let mut count_sql = format!(
+                            "SELECT COUNT(*) AS count FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                            #table_name
+                        );
+                        if #config_soft_delete {
+                            count_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                count_sql.push_str(" AND tenant_id = $3");
+                                count_sql.push_str(#owner_and_p4);
+                            } else {
+                                count_sql.push_str(#owner_and_p3);
+                            }
+                        } else {
+                            count_sql.push_str(#owner_and_p3);
+                        }
+
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                .get_result::<SearchCount>(&mut conn)
+                                .await?
+                                .count
+                        }
+                    }},
+                    sqlite => {{
+                        #sqlite_fts_setup
+                        match __autumn_fts_match_opt {
+                            // Fail-closed: no usable tokens ⇒ zero total, no query.
+                            ::core::option::Option::None => 0_i64,
+                            ::core::option::Option::Some(__autumn_match) => {
+                                let mut count_sql = ::std::format!(
+                                    "SELECT COUNT(*) AS count FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    tbl = #table_name
+                                );
+                                if #config_soft_delete {
+                                    count_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
+                                }
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                        count_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
+                                        count_sql.push_str(#owner_sqlite_p3);
+                                    } else {
+                                        count_sql.push_str(#owner_sqlite_p2);
+                                    }
+                                } else {
+                                    count_sql.push_str(#owner_sqlite_p2);
+                                }
+
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                            .get_result::<SearchCount>(&mut conn)
+                                            .await?
+                                            .count
+                                    } else {
+                                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                            .get_result::<SearchCount>(&mut conn)
+                                            .await?
+                                            .count
+                                    }
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                        .get_result::<SearchCount>(&mut conn)
+                                        .await?
+                                        .count
+                                }
+                            }
+                        }
+                    }},
+                };
+
+                // ── ranked id SELECT (owner-filtered) ──
+                let ids = ::autumn_web::backend_select! {
+                    pg => {{
+                        let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+                        let mut select_sql = format!(
+                            "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                            #table_name
+                        );
+                        if #config_soft_delete {
+                            select_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                select_sql.push_str(" AND tenant_id = $3");
+                                select_sql.push_str(#owner_and_p4);
+                                select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                                select_sql.push_str(" LIMIT $5 OFFSET $6");
+                            } else {
+                                select_sql.push_str(#owner_and_p3);
+                                select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                                select_sql.push_str(" LIMIT $4 OFFSET $5");
+                            }
+                        } else {
+                            select_sql.push_str(#owner_and_p3);
+                            select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                            select_sql.push_str(" LIMIT $4 OFFSET $5");
+                        }
+
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                .load::<SearchId>(&mut conn)
+                                .await?
+                        }
+                    }},
+                    sqlite => {{
+                        #sqlite_fts_setup
+                        match __autumn_fts_match_opt {
+                            // Fail-closed: no usable tokens ⇒ empty page, no query.
+                            ::core::option::Option::None => ::std::vec::Vec::<SearchId>::new(),
+                            ::core::option::Option::Some(__autumn_match) => {
+                                let mut select_sql = ::std::format!(
+                                    "SELECT \"{tbl}\".id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    tbl = #table_name
+                                );
+                                if #config_soft_delete {
+                                    select_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
+                                }
+                                let __autumn_order = ::std::format!(
+                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), \"{tbl}\".id DESC",
+                                    tbl = #table_name, weights = __autumn_bm25_weights
+                                );
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                        select_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
+                                        select_sql.push_str(#owner_sqlite_p3);
+                                        select_sql.push_str(&__autumn_order);
+                                        select_sql.push_str(" LIMIT $4 OFFSET $5");
+                                    } else {
+                                        select_sql.push_str(#owner_sqlite_p2);
+                                        select_sql.push_str(&__autumn_order);
+                                        select_sql.push_str(" LIMIT $3 OFFSET $4");
+                                    }
+                                } else {
+                                    select_sql.push_str(#owner_sqlite_p2);
+                                    select_sql.push_str(&__autumn_order);
+                                    select_sql.push_str(" LIMIT $3 OFFSET $4");
+                                }
+
+                                if #config_tenant_scoped {
+                                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    } else {
+                                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                            .load::<SearchId>(&mut conn)
+                                            .await?
+                                    }
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_match)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                        .load::<SearchId>(&mut conn)
+                                        .await?
+                                }
+                            }
+                        }
+                    }},
+                };
+
+                let id_list: Vec<i64> = ids.into_iter().map(|s| s.id).collect();
+                if id_list.is_empty() {
+                    return Ok(::autumn_web::pagination::Page::new(Vec::new(), total, req));
+                }
+
+                // ── typed hydration (owner-filtered) ──
+                let mut records_query = #table_ident::table
+                    .filter(#table_ident::id.eq_any(&id_list))
+                    .into_boxed();
+                #second_stage_soft_delete_filter
+                #second_stage_tenant_filter
+                #second_stage_owner_filter
+                let records = records_query
+                    .load::<#model_name>(&mut conn)
+                    .await?;
+
+                let mut record_map: ::std::collections::HashMap<i64, #model_name> = records
+                    .into_iter()
+                    .map(|r| (r.id, r))
+                    .collect();
+
+                let sorted_records: Vec<#model_name> = id_list
+                    .iter()
+                    .filter_map(|id| record_map.remove(id))
+                    .collect();
+
+                Ok(::autumn_web::pagination::Page::new(sorted_records, total, req))
+            }
+        };
+        (trait_method, impl_method)
+    } else {
+        (quote! {}, quote! {})
     };
 
     let upsert_set_ext_impl = quote! {};
@@ -7634,6 +14711,69 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // §1d: cross-shard reject for version_history (keyed by a single, per-shard
+    // -ambiguous record_id and paginated). Empty unless sharded + tenant_scoped.
+    let version_history_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants && self.__autumn_shards.is_some() {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard version_history is not supported: \
+                         record ids are unique only within a shard; \
+                         query a specific shard instead"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // #1996: version-history read fork. The Postgres and SQLite arms differ in
+    // three ways that must be forked through `backend_select!` (each arm names
+    // its own diesel types / SQL so the unselected arm is never type-checked):
+    //   1. the `recorded_at` column type — Postgres `Timestamptz` has no
+    //      `FromSql<_, Sqlite>`; SQLite must use `TimestamptzSqlite`;
+    //   2. the raw SQL casts — `COUNT(*)::bigint`, `$n::text`, `$n::timestamptz`
+    //      and `changes::text` are Postgres-only and SQLite rejects them;
+    //   3. the timestamp-filter bind types (`Nullable<Timestamptz>` vs
+    //      `Nullable<TimestamptzSqlite>`).
+    // The count row struct and the row→`VersionEntry` mapping are backend-agnostic
+    // (the SQLite `recorded_at` still deserializes into `DateTime<Utc>`), so they
+    // are built once here and spliced into both arms.
+    let vh_count_struct = quote! {
+        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+        struct __AutumnVersionHistoryCount {
+            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+            count: i64,
+        }
+    };
+    let vh_map_rows = quote! {
+        raw_rows
+            .into_iter()
+            .map(|row| {
+                let op = match row.op.as_str() {
+                    "insert" => ::autumn_web::version_history::VersionOp::Insert,
+                    "delete" => ::autumn_web::version_history::VersionOp::Delete,
+                    _ => ::autumn_web::version_history::VersionOp::Update,
+                };
+                let changes: Vec<::autumn_web::version_history::ColumnChange> =
+                    ::autumn_web::reexports::serde_json::from_str(&row.changes)
+                        .unwrap_or_default();
+                ::autumn_web::version_history::VersionEntry {
+                    id: row.id,
+                    table_name: row.table_name,
+                    record_id: row.record_id,
+                    op,
+                    actor: row.actor,
+                    request_id: row.request_id,
+                    changes,
+                    recorded_at: row.recorded_at,
+                }
+            })
+            .collect::<Vec<::autumn_web::version_history::VersionEntry>>()
+    };
+
     let versioned_history_impl = if config.versioned {
         quote! {
             impl #pg_name {
@@ -7652,32 +14792,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::version_history::VersionPage> {
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
 
-                    // Private helper struct that can be deserialized from a raw SQL row.
-                    #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-                    struct __AutumnVersionHistoryRow {
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                        id: i64,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        table_name: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                        record_id: i64,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        op: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        actor: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
-                        request_id: ::core::option::Option<::std::string::String>,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        changes: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
-                        recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-                    }
-
-                    #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-                    struct __AutumnVersionHistoryCount {
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                        count: i64,
-                    }
+                    // §1d: version_history is keyed by a single `record_id` and
+                    // is paginated; per-shard ids are ambiguous (per-shard
+                    // sequences can mint the same id on multiple shards) and a
+                    // naive page merge would be wrong. Reject under cross-shard
+                    // access rather than silently consulting one shard.
+                    #version_history_cross_shard_guard
 
                     let __table_name: &str = #table_name;
                     let (limit, offset) = filter.limit_offset();
@@ -7687,108 +14807,218 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     let mut conn = self.__autumn_acquire_read_conn().await?;
 
-                    // Execute count query, optionally filtered by timestamp range.
-                    let total: u64 = if filter.from.is_some() || filter.to.is_some() {
-                        let rows = ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT COUNT(*)::bigint AS count \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3) \
-                             AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
-                             AND ($5::timestamptz IS NULL OR recorded_at <= $5)"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
-                        .get_results::<__AutumnVersionHistoryCount>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                        rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
-                    } else {
-                        let rows = ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT COUNT(*)::bigint AS count \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3)"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .get_results::<__AutumnVersionHistoryCount>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                        rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
-                    };
+                    // #1996: the whole count + fetch + map is backend-forked. The
+                    // Postgres arm keeps the `::bigint` / `::text` / `::timestamptz`
+                    // / `changes::text` casts and the `Timestamptz` row/bind types;
+                    // the SQLite arm drops every cast and uses `TimestamptzSqlite`
+                    // (there is no `FromSql<Timestamptz, Sqlite>`), while producing
+                    // the identical `(total, entries)` pair. The row struct + queries
+                    // live inside each arm so only the selected arm is type-checked.
+                    let (total, entries): (u64, Vec<::autumn_web::version_history::VersionEntry>) =
+                        ::autumn_web::backend_select! {
+                            pg => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnVersionHistoryRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    changes: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                }
+                                #vh_count_struct
 
-                    // Execute the entries query.
-                    let raw_rows: Vec<__AutumnVersionHistoryRow> = if filter.from.is_some() || filter.to.is_some() {
-                        ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT id, table_name, record_id, op, actor, request_id, \
-                             changes::text AS changes, recorded_at \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3) \
-                             AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
-                             AND ($5::timestamptz IS NULL OR recorded_at <= $5) \
-                             ORDER BY recorded_at ASC, id ASC \
-                             LIMIT $6 OFFSET $7"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                        .get_results::<__AutumnVersionHistoryRow>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT id, table_name, record_id, op, actor, request_id, \
-                             changes::text AS changes, recorded_at \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3) \
-                             ORDER BY recorded_at ASC, id ASC \
-                             LIMIT $4 OFFSET $5"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                        .get_results::<__AutumnVersionHistoryRow>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?
-                    };
+                                let total: u64 = if filter.from.is_some() || filter.to.is_some() {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*)::bigint AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
+                                         AND ($5::timestamptz IS NULL OR recorded_at <= $5)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                } else {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*)::bigint AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                };
 
-                    // Map raw rows to VersionEntry.
-                    let entries: Vec<::autumn_web::version_history::VersionEntry> = raw_rows
-                        .into_iter()
-                        .map(|row| {
-                            let op = match row.op.as_str() {
-                                "insert" => ::autumn_web::version_history::VersionOp::Insert,
-                                "delete" => ::autumn_web::version_history::VersionOp::Delete,
-                                _ => ::autumn_web::version_history::VersionOp::Update,
-                            };
-                            let changes: Vec<::autumn_web::version_history::ColumnChange> =
-                                ::autumn_web::reexports::serde_json::from_str(&row.changes)
-                                    .unwrap_or_default();
-                            ::autumn_web::version_history::VersionEntry {
-                                id: row.id,
-                                table_name: row.table_name,
-                                record_id: row.record_id,
-                                op,
-                                actor: row.actor,
-                                request_id: row.request_id,
-                                changes,
-                                recorded_at: row.recorded_at,
-                            }
-                        })
-                        .collect();
+                                let raw_rows: Vec<__AutumnVersionHistoryRow> = if filter.from.is_some() || filter.to.is_some() {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes::text AS changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
+                                         AND ($5::timestamptz IS NULL OR recorded_at <= $5) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $6 OFFSET $7"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes::text AS changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $4 OFFSET $5"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                };
+
+                                let entries = #vh_map_rows;
+                                (total, entries)
+                            }},
+                            sqlite => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnVersionHistoryRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    changes: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                }
+                                #vh_count_struct
+
+                                let total: u64 = if filter.from.is_some() || filter.to.is_some() {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*) AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         AND ($4 IS NULL OR recorded_at >= $4) \
+                                         AND ($5 IS NULL OR recorded_at <= $5)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.to)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                } else {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*) AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                };
+
+                                let raw_rows: Vec<__AutumnVersionHistoryRow> = if filter.from.is_some() || filter.to.is_some() {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         AND ($4 IS NULL OR recorded_at >= $4) \
+                                         AND ($5 IS NULL OR recorded_at <= $5) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $6 OFFSET $7"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.to)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $4 OFFSET $5"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                };
+
+                                let entries = #vh_map_rows;
+                                (total, entries)
+                            }},
+                        };
 
                     Ok(::autumn_web::version_history::VersionPage {
                         entries,
@@ -7811,6 +15041,149 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // - Uses diesel-async RunQueryDsl for async .load()/.first() etc.
     // - Table/New/Update types must be in scope where the macro is invoked
     //   (the user brings them in via `use crate::models::*` or similar)
+
+    // §1209: when `sharded`, the extractor resolves tenant → shard via the
+    // framework's __autumn_resolve_repo_seed helper instead of pulling the
+    // control pool from AppState. The sharded extractor requires `mut parts`
+    // so it can call resolve_shard_key (which may extract from request headers).
+    let from_request_parts_impl = if config.sharded {
+        // Build the idempotency init for the sharded path (reads from `_parts`
+        // directly, since the seed doesn't carry it).
+        let sharded_idempotency_init = if commit_hooks_enabled {
+            quote! {
+                idempotency: _parts
+                    .extensions
+                    .get::<::autumn_web::idempotency::IdempotencyContext>()
+                    .cloned(),
+            }
+        } else {
+            quote! {}
+        };
+        let sharded_hooks_init = config.hooks_type.as_ref().map_or_else(
+            || quote! {},
+            |hooks_ident| quote! {
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+            },
+        );
+        let sharded_register_hooks = if commit_hooks_enabled {
+            quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
+        } else {
+            quote! {}
+        };
+        let sharded_read_route = if config.primary_reads {
+            quote! { ::autumn_web::repository::ReadRoute::Primary }
+        } else {
+            quote! { ::core::clone::Clone::clone(&__seed.read_route) }
+        };
+        quote! {
+            impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
+                type Rejection = ::autumn_web::AutumnError;
+
+                async fn from_request_parts(
+                    _parts: &mut ::autumn_web::reexports::http::request::Parts,
+                    state: &::autumn_web::AppState,
+                ) -> Result<Self, Self::Rejection> {
+                    #sharded_register_hooks
+                    let (__seed, __shard_set) =
+                        ::autumn_web::sharding::__autumn_resolve_repo_seed(_parts, state).await?;
+                    ::core::result::Result::Ok(Self {
+                        pool: ::core::clone::Clone::clone(&__seed.pool),
+                        #sharded_hooks_init
+                        #sharded_idempotency_init
+                        #tenant_init_field
+                        #shards_some_field
+                        __autumn_read_route: #sharded_read_route,
+                        __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
+                        __autumn_slow_threshold: __seed.slow_query_threshold,
+                        __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                        #bcast_field_some_state
+                    })
+                }
+            }
+        }
+    } else {
+        quote! {
+            // Extractor: pull pool from AppState (same pattern as Db extractor)
+            impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
+                type Rejection = ::autumn_web::AutumnError;
+
+                async fn from_request_parts(
+                    _parts: &mut ::autumn_web::reexports::http::request::Parts,
+                    state: &::autumn_web::AppState,
+                ) -> Result<Self, Self::Rejection> {
+                    let pool = state.pool()
+                        .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
+                        .clone();
+                    #extractor_init
+                }
+            }
+        }
+    };
+
+    // For tenant-scoped sharded repos, implement `CrossShardRepository` so the
+    // `CrossShard<Self>` extractor can build an across_tenants() fan-out repo
+    // for admin endpoints that have no tenant to route on. Mirrors the routed
+    // extractor's field init, but seeds tenant-free (across_tenants: true, no
+    // idempotency context — cross-shard writes are rejected anyway).
+    let cross_shard_repository_impl = if config.sharded && config.tenant_scoped {
+        let register_hooks = if commit_hooks_enabled {
+            quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
+        } else {
+            quote! {}
+        };
+        let hooks_init = config.hooks_type.as_ref().map_or_else(
+            || quote! {},
+            |hooks_ident| quote! {
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+            },
+        );
+        let idempotency_init = if commit_hooks_enabled {
+            quote! { idempotency: ::core::option::Option::None, }
+        } else {
+            quote! {}
+        };
+        let cross_read_route = if config.primary_reads {
+            quote! { ::autumn_web::repository::ReadRoute::Primary }
+        } else {
+            quote! { ::core::clone::Clone::clone(&__seed.read_route) }
+        };
+        quote! {
+            impl ::autumn_web::sharding::CrossShardRepository for #pg_name {
+                fn __autumn_from_cross_shard(
+                    __seed: ::autumn_web::sharding::ShardRepositorySeed,
+                    __set: ::autumn_web::sharding::ShardSet,
+                ) -> Self {
+                    #register_hooks
+                    Self {
+                        pool: ::core::clone::Clone::clone(&__seed.pool),
+                        #hooks_init
+                        #idempotency_init
+                        across_tenants: true,
+                        __autumn_shards: ::core::option::Option::Some(__set),
+                        __autumn_read_route: #cross_read_route,
+                        __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
+                        __autumn_slow_threshold: __seed.slow_query_threshold,
+                        __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                        #bcast_field_none
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // For sharded + tenant_scoped repos, the cross-shard read dispatch acquires
+    // its own read connection lazily inside the single-shard branch, so a dead
+    // parent replica or exhausted parent pool can't fail the fan-out before
+    // per-shard routing chooses each shard's own read route/fallback. Other
+    // configs acquire up front in the trait method as before.
+    let read_conn_acquire = if config.sharded && config.tenant_scoped {
+        quote! {}
+    } else {
+        quote! { let mut conn = self.__autumn_acquire_read_conn().await?; }
+    };
+
     quote! {
         /// Generated repository trait with CRUD + derived queries.
         #vis trait #trait_name: Send + Sync {
@@ -7822,51 +15195,70 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn count(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<i64>> + Send;
             fn exists_by_id(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<bool>> + Send;
             #pagination_trait_method
+            #list_trait_method
+            #list_scoped_trait_method
             #cursor_page_trait_method
             #(#derived_trait_methods)*
             #soft_delete_trait_methods
             #bulk_trait_methods
             #search_trait_methods
+            #search_page_scoped_trait_method
         }
+
+        // Bridges this repository's tenant/soft-delete config to the model's
+        // generated `preload` retain (see `preload_scope_impl`).
+        #preload_scope_impl
+
+        // Bridges this repository to `#model_name`'s many-to-many mutation
+        // traits (see `M2mConnSource`).
+        #m2m_conn_source_impl
 
         /// Postgres implementation of the repository.
         #vis struct #pg_name {
             #struct_fields
         }
 
-        // Extractor: pull pool from AppState (same pattern as Db extractor)
-        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
-            type Rejection = ::autumn_web::AutumnError;
+        #from_request_parts_impl
 
-            async fn from_request_parts(
-                _parts: &mut ::autumn_web::reexports::http::request::Parts,
-                state: &::autumn_web::AppState,
-            ) -> Result<Self, Self::Rejection> {
-                let pool = state.pool()
-                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
-                    .clone();
-                #extractor_init
-            }
-        }
+        #cross_shard_repository_impl
 
         #clone_impl
 
+        // Bounded-memory batched iteration (find_in_batches / find_each, #1395).
+        #batch_source_impl
+
+        #[allow(clippy::useless_let_if_seq)]
         impl #trait_name for #pg_name {
             async fn find_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<Option<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #find_by_id_impl
             }
 
             async fn find_all(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #find_all_impl
             }
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
+                // #1379: normalize `#[normalize]` columns on the insert path,
+                // before the `before_create` hook and the DB write, so
+                // validators and the database observe the canonical value.
+                // Dispatches through the autoref-specialization probe: the `Yes`
+                // arm clones and canonicalizes only for models whose `New*`
+                // implements `Normalize`; the `No` arm hands back the caller's
+                // borrow unchanged, so models with no `#[normalize]` columns (and
+                // hand-written `New*` types that don't implement `Normalize`) pay
+                // no clone. `Borrow` unifies the owned/borrowed arms to `&#new_name`.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                let new: &#new_name = __autumn_normalized.borrow();
                 #save_body
             }
 
@@ -7881,23 +15273,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn count(&self) -> ::autumn_web::AutumnResult<i64> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #count_impl
             }
 
             async fn exists_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<bool> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #exists_by_id_impl
             }
 
             #pagination_impl_method
+            #list_impl_method
+            #list_scoped_impl_method
             #cursor_page_impl_method
             #(#derived_impl_methods)*
             #soft_delete_impl_methods
 
             async fn save_many(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                // #1379: normalize each `#[normalize]` column before the bulk
+                // insert path (mirrors `save`). The `Yes` arm clones+canonicalizes
+                // only for `Normalize` `New*` types; the `No` arm hands back the
+                // caller's slice unchanged (no clone) for everything else.
+                // `Borrow` unifies the owned `Vec`/borrowed slice arms.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_body
             }
 
@@ -7915,11 +15320,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             #upsert_many_impl_method
             #search_impl_methods
+            #search_page_scoped_impl_method
         }
 
+        #[allow(clippy::useless_let_if_seq)]
         impl #pg_name {
             #across_tenants_method
+            #for_shard_method
+            #find_all_one_shard_helper
+            #find_by_id_one_shard_helper
+            #count_one_shard_helper
+            #exists_by_id_one_shard_helper
+            #(#derived_one_shard_helpers)*
+            #(#soft_delete_one_shard_helpers)*
+            #search_one_shard_helpers
+            #with_pool_method
             #hook_support_methods
+            #dependent_child_helper
 
             /// Returns a clone of this repository whose generated read
             /// methods are pinned to the primary pool for the rest of the
@@ -7942,6 +15359,89 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 repo
             }
 
+            #find_in_batches_methods
+
+            // Typed grouped aggregate queries (issue #1364).
+            #grouped_aggregate_methods
+
+            // Race-safe get-or-insert (find_or_create_by_*, issue #1382).
+            #find_or_create_by_methods
+
+            /// Eager-load associations for records returned by a finder.
+            ///
+            /// Wraps each record in [`Preloaded`](::autumn_web::preload::Preloaded)
+            /// and loads every association named in `spec` with at most one
+            /// batched `WHERE ... IN (...)` query per association level (plus
+            /// one per nested level). No per-row fetches, and no implicit lazy
+            /// loading — an un-preloaded association accessor returns
+            /// [`NotLoaded`](::autumn_web::preload::NotLoaded).
+            ///
+            /// Preload SQL runs on the same read role as the finder (the
+            /// repository's snapshotted [`ReadRoute`](::autumn_web::repository::ReadRoute)),
+            /// so a replica-routed list keeps its preloads on the replica.
+            ///
+            /// ```rust,ignore
+            /// let posts = repo.find_by_subreddit_id(id).await?;
+            /// let posts = repo
+            ///     .preload(posts, Post::preload().author().comments_with(Comment::preload().author()))
+            ///     .await?;
+            /// for post in &posts {
+            ///     let author = post.author()?;        // typed accessor
+            ///     for comment in post.comments()? { /* ... */ }
+            /// }
+            /// ```
+            // Generic over the record + spec types so the `Preloadable` bound
+            // rests on a *generic* parameter, not the concrete model. A bound
+            // on a concrete type that has no `Preloadable` impl is rejected
+            // eagerly; a bound on a generic type parameter is only checked at
+            // call sites. This keeps the method available on repositories whose
+            // model is hand-written (not via `#[model]`, e.g. zero-column test
+            // models) — they simply never call `preload`. In normal use the
+            // record type is inferred from the finder result, i.e. this
+            // repository's model.
+            pub async fn preload<__Model, __Spec>(
+                &self,
+                records: ::std::vec::Vec<__Model>,
+                spec: __Spec,
+            ) -> ::autumn_web::AutumnResult<
+                ::std::vec::Vec<::autumn_web::preload::Preloaded<__Model>>
+            >
+            where
+                __Model: ::autumn_web::preload::Preloadable<Spec = __Spec>,
+                // `Sync` (in addition to `Send`): the preload future borrows
+                // `&spec` across an `.await`, so the future is only `Send` when
+                // `__Spec: Sync`. `Preloadable::Spec` already requires `Sync`,
+                // so this is always satisfied at call sites.
+                __Spec: ::core::marker::Send + ::core::marker::Sync,
+            {
+                // Nothing to preload: skip acquiring a connection entirely.
+                if records.is_empty() {
+                    return ::core::result::Result::Ok(::std::vec::Vec::new());
+                }
+                // §1d: a cross-shard result set cannot be preloaded from a
+                // single routed connection (associations may live on any
+                // shard). Reject under across_tenants on a sharded repo.
+                #preload_cross_shard_guard
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                let mut wrapped: ::std::vec::Vec<
+                    ::autumn_web::preload::Preloaded<__Model>
+                > = records
+                    .into_iter()
+                    .map(::autumn_web::preload::Preloaded::new)
+                    .collect();
+                // Publish the cross-tenant choice ambiently so every target's
+                // tenant retain (including nested levels) honors it, the way
+                // `across_tenants()` makes finders skip the tenant predicate.
+                ::autumn_web::preload::PRELOAD_ACROSS_TENANTS
+                    .scope(#preload_across_expr, async {
+                        <__Model as ::autumn_web::preload::Preloadable>::load_associations(
+                            &mut wrapped, &spec, &mut *conn,
+                        ).await
+                    })
+                    .await?;
+                ::core::result::Result::Ok(wrapped)
+            }
+
             /// The read route this repository snapshot uses for generated
             /// read-only methods. Exposed for tests; not a public API.
             #[doc(hidden)]
@@ -7949,14 +15449,51 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self.__autumn_read_route
             }
 
+            /// The effective read route for the current request, applying any
+            /// read-your-own-writes pin from the task-local context.
+            ///
+            /// When the snapshot is `ReadPool(_)` and the RYWW task-local is
+            /// pinned (a primary write occurred earlier in this request or the
+            /// incoming session cookie is fresh), returns `Primary` and records
+            /// a pin-redirect metric/trace event. All other cases return the
+            /// snapshot unchanged.
+            ///
+            /// Exposed for tests; not a public API.
+            #[doc(hidden)]
+            pub fn __autumn_effective_read_route(&self) -> ::autumn_web::repository::ReadRoute {
+                match &self.__autumn_read_route {
+                    ::autumn_web::repository::ReadRoute::ReadPool(_)
+                        if ::autumn_web::read_your_writes::is_pinned() =>
+                    {
+                        ::autumn_web::read_your_writes::note_pin_redirect();
+                        ::autumn_web::repository::ReadRoute::Primary
+                    }
+                    other => ::core::clone::Clone::clone(other),
+                }
+            }
+
             /// The primary/write pool. Exposed for tests; not a public API.
             #[doc(hidden)]
             pub fn __autumn_write_pool(
                 &self,
             ) -> &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             > {
                 &self.pool
+            }
+
+            /// Statement timeout in milliseconds (`0` = no limit).
+            /// Exposed for tests; not a public API.
+            #[doc(hidden)]
+            pub fn __autumn_statement_timeout_ms(&self) -> u64 {
+                self.__autumn_statement_timeout_ms
+            }
+
+            /// Slow-query logging threshold.
+            /// Exposed for tests; not a public API.
+            #[doc(hidden)]
+            pub fn __autumn_slow_threshold(&self) -> ::std::time::Duration {
+                self.__autumn_slow_threshold
             }
 
             /// Acquire a primary-pool connection for mutating methods and
@@ -7967,23 +15504,44 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
-                self.__autumn_acquire_from(&self.pool).await
+                let result = self.__autumn_acquire_from(&self.pool).await;
+                // Mark write only after a successful primary checkout, mirroring
+                // the guard in `Db::from_request_parts`. A failed acquire (pool
+                // exhausted, timeout) must not pin subsequent reads to primary.
+                if result.is_ok() {
+                    ::autumn_web::read_your_writes::mark_write();
+                }
+                result
             }
 
             /// Acquire a connection for a generated read-only method,
-            /// following the repository's read route: the replica pool when
-            /// one is configured and healthy, otherwise the primary (#971).
+            /// following the repository's effective read route: the replica pool
+            /// when one is configured and healthy (and no RYWW pin is active),
+            /// otherwise the primary (#971, #1201).
             #[doc(hidden)]
             pub async fn __autumn_acquire_read_conn(
                 &self,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
+                // Match by reference to avoid cloning `ReadRoute` on the common
+                // (non-pinned) path. The pin check is inlined here so that
+                // `__autumn_effective_read_route` (the test accessor) retains its
+                // own clone-based return without adding overhead to the hot path.
+                if ::autumn_web::read_your_writes::is_pinned() {
+                    if matches!(
+                        &self.__autumn_read_route,
+                        ::autumn_web::repository::ReadRoute::ReadPool(_)
+                    ) {
+                        ::autumn_web::read_your_writes::note_pin_redirect();
+                        return self.__autumn_acquire_from(&self.pool).await;
+                    }
+                }
                 match &self.__autumn_read_route {
                     ::autumn_web::repository::ReadRoute::Primary => {
                         self.__autumn_acquire_from(&self.pool).await
@@ -8005,11 +15563,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn __autumn_acquire_from(
                 &self,
                 pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
@@ -8025,26 +15583,52 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Postgres statement_timeout is a signed 32-bit integer; cap to be safe.
                 let timeout_ms = timeout_ms.min(i32::MAX as u64);
 
-                ::autumn_web::reexports::diesel::sql_query(
-                    ::std::format!("SET statement_timeout = {timeout_ms}")
-                )
-                .execute(&mut conn)
-                .await
-                .map_err(|e| {
-                    ::autumn_web::reexports::tracing::error!(
-                        "repository: failed to set statement_timeout to {timeout_ms}ms: {e}"
-                    );
-                    ::autumn_web::AutumnError::service_unavailable_msg(
-                        ::std::format!("Database initialization error: {e}")
-                    )
-                })?;
+                // `SET statement_timeout` is Postgres session syntax; SQLite
+                // rejects it ("near \"SET\": syntax error"). SQLite also cannot
+                // enforce a per-statement wall-clock timeout at all through the
+                // async connection wrapper (diesel's SqliteConnection exposes no
+                // interrupt/progress-handler hook), so this arm CANNOT honor a
+                // configured `database.statement_timeout`. Rather than silently
+                // ignore it here, autumn-web fails the boot fast whenever a
+                // non-zero `statement_timeout` is configured under the sqlite
+                // backend (`reject_sqlite_statement_timeout`, called from
+                // `create_pool` / `create_topology` / `create_shard_topology` in
+                // db.rs). That boot guard guarantees `timeout_ms` is always 0 by
+                // the time it reaches this arm, so the no-op below is correct and
+                // reachable-with-a-real-timeout never happens — not a silent gap.
+                // `busy_timeout` (installed at connection setup) still bounds lock
+                // waits; a real statement timeout is tracked by #1996/#1910.
+                ::autumn_web::backend_select! {
+                    pg => {{
+                        ::autumn_web::reexports::diesel::sql_query(
+                            ::std::format!("SET statement_timeout = {timeout_ms}")
+                        )
+                        .execute(&mut conn)
+                        .await
+                        .map_err(|e| {
+                            ::autumn_web::reexports::tracing::error!(
+                                "repository: failed to set statement_timeout to {timeout_ms}ms: {e}"
+                            );
+                            ::autumn_web::AutumnError::service_unavailable_msg(
+                                ::std::format!("Database initialization error: {e}")
+                            )
+                        })?;
+                    }},
+                    sqlite => {{
+                        // Unreachable with a non-zero value: the boot guard
+                        // `db::reject_sqlite_statement_timeout` fail-closes before
+                        // any pool is built when `statement_timeout` is set.
+                        let _ = timeout_ms;
+                    }},
+                }
                 ::core::result::Result::Ok(conn)
             }
 
             /// Returns the route label for metrics, e.g. `"GET /users"`.
+            /// Exposed for tests; not a public API.
             #[doc(hidden)]
             #[inline]
-            fn __autumn_route_label(&self) -> &str {
+            pub fn __autumn_route_label(&self) -> &str {
                 self.__autumn_route.as_deref().unwrap_or("unknown")
             }
 
@@ -8057,7 +15641,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             where
                 F: for<'c> ::core::ops::FnOnce(
                     #model_name,
-                    &'c mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    &'c mut ::autumn_web::RuntimeConnection,
                 ) -> ::autumn_web::reexports::scoped_futures::ScopedBoxFuture<'c, 'c, ::autumn_web::AutumnResult<T>>
                     + ::core::marker::Send + 'static,
                 T: ::core::marker::Send + 'static,
@@ -8067,12 +15651,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
+                // with_lock is a write (SELECT ... FOR UPDATE + mutation): reject
+                // cross-shard across_tenants(). It locks only the routed shard and
+                // drops tenant scoping, so a per-shard-reused id could lock/mutate
+                // another tenant's row.
+                #cross_shard_write_guard
+
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn.transaction::<T, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<T, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                     async move {
-                        let row = #table_ident::table
-                            .find(id)
-                            .for_update()
+                        let row = ::autumn_web::maybe_for_update!(#table_ident::table
+                            .find(id))
+
                             .first::<#model_name>(conn)
                             .await
                             .optional()
@@ -8106,6 +15696,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #versioned_history_impl
 
         #search_compile_check
+
+        #internal_hooks_defn
     }
 }
 
@@ -8200,6 +15792,545 @@ mod tests {
     }
 
     #[test]
+    fn repository_macro_generates_grouped_sum_method() {
+        // §1364: a `sum_<col>_grouped_by_<group>` declaration becomes an
+        // inherent method returning a lazy `GroupedAggregate` builder, backed
+        // by a parameterized `sql_query` with a `QueryableByName` row. Postgres
+        // widens `SUM`, so the aggregate is `CAST` to the declared value type
+        // (`Option<i64>` → `bigint`) to keep the round-trip exact.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_score_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn sum_score_grouped_by_post_id"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        assert!(
+            generated.contains(":: autumn_web :: aggregate :: GroupedAggregate"),
+            "method must return the runtime GroupedAggregate builder: {generated}"
+        );
+        assert!(
+            generated.contains("QueryableByName"),
+            "aggregate must load through a typed QueryableByName row: {generated}"
+        );
+        assert!(
+            generated.contains("AS bigint"),
+            "SUM must be CAST to the declared value type (bigint): {generated}"
+        );
+        // Filter values are bound as Nullable parameters, never interpolated.
+        assert!(
+            generated.contains("Nullable"),
+            "filter/tenant values must be bound as Nullable parameters: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_avg_casts_to_double_precision() {
+        // AVG rolls up to `Option<f64>` via an explicit double-precision cast.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn avg_score_grouped_by_post_id() -> Vec<(i64, Option<f64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn avg_score_grouped_by_post_id"),
+            "avg grouped-aggregate method must be generated: {generated}"
+        );
+        assert!(
+            generated.contains("AS double precision"),
+            "AVG must be cast to double precision: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_count_tenant_scoped_predicate() {
+        // A tenant-scoped grouped COUNT composes the same `tenant_id` predicate
+        // as `count`, resolving the active tenant before the query.
+        let generated = repository_macro(
+            quote! { Event, table = "events", tenant_scoped },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_kind() -> Vec<(String, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn count_grouped_by_kind"),
+            "count grouped-aggregate method must be generated: {generated}"
+        );
+        assert!(
+            generated.contains("COUNT(*)"),
+            "count aggregate must use COUNT(*): {generated}"
+        );
+        assert!(
+            generated.contains("tenant_id ="),
+            "tenant-scoped aggregate must filter by tenant_id: {generated}"
+        );
+        assert!(
+            generated.contains("CURRENT_TENANT"),
+            "tenant-scoped aggregate must resolve the active tenant: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_rejects_across_tenants_without_shard_set() {
+        // §1364 tenant-isolation: a sharded + tenant-scoped grouped aggregate
+        // must reject `across_tenants()` cross-shard queries (sum/avg/min/max
+        // cannot be merged across shards). The guard must fire purely on the
+        // runtime `across_tenants` flag, NOT on a live shard set being present —
+        // otherwise a repo built without shard context (e.g. `with_pool_untracked`,
+        // where `__autumn_shards` is `None`) would slip past and silently return a
+        // PARTIAL result over only the current pool.
+        let generated = repository_macro(
+            quote! { Event, table = "events", tenant_scoped, sharded },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_score_grouped_by_kind() -> Vec<(String, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        // Isolate the generated aggregate method body so the assertions below
+        // target the aggregate guard specifically (not some other cross-shard
+        // surface on the same repo).
+        let pos = generated
+            .find("pub fn sum_score_grouped_by_kind")
+            .expect("sharded+tenant_scoped grouped aggregate method must be generated");
+        let section = &generated[pos..];
+
+        // The rejection guard must be present in the aggregate body.
+        assert!(
+            section.contains("cross-shard grouped aggregates are not supported"),
+            "sharded+tenant_scoped grouped aggregate must reject across_tenants: {section}"
+        );
+        // The guard must key off the runtime `across_tenants` flag.
+        assert!(
+            section.contains("across_tenants"),
+            "aggregate guard must reference the across_tenants flag: {section}"
+        );
+        // The guard condition must NOT depend on a shard set being loaded —
+        // `__autumn_shards.is_some()` gating is exactly the no-shard-set hole
+        // this fix closes. Check the tokens up to the rejection so we assert on
+        // the guard condition, not on unrelated fan-out code elsewhere.
+        let guard_end = section
+            .find("cross-shard grouped aggregates are not supported")
+            .expect("rejection message must be present");
+        let guard_cond = &section[..guard_end];
+        assert!(
+            !guard_cond.contains("__autumn_shards . is_some")
+                && !guard_cond.contains("__autumn_shards.is_some"),
+            "aggregate guard condition must not depend on __autumn_shards being Some: {guard_cond}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_find_in_batches_rejects_across_tenants_without_shard_set() {
+        // §1692: a sharded + tenant-scoped `find_in_batches`/`find_each` must
+        // reject `across_tenants()` batched iteration purely on the runtime
+        // `across_tenants` flag — NOT on a live shard set being present. Gating on
+        // `__autumn_shards.is_some()` missed the no-shard-set case (e.g. a repo
+        // built via `with_pool_untracked`, where `__autumn_shards` is `None`),
+        // which slipped past the guard and silently streamed a PARTIAL result over
+        // only the current pool instead of rejecting.
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // Isolate the generated `fetch_batch_after` body so the assertions below
+        // target the batch guard specifically.
+        let pos = generated
+            .find("async fn fetch_batch_after")
+            .expect("sharded+tenant_scoped batched iteration must be generated");
+        let section = &generated[pos..];
+
+        // The rejection guard must be present in the batch body.
+        assert!(
+            section.contains("cross-shard batched iteration is not supported"),
+            "sharded+tenant_scoped find_in_batches must reject across_tenants: {section}"
+        );
+        // The guard must key off the runtime `across_tenants` flag.
+        assert!(
+            section.contains("across_tenants"),
+            "batch guard must reference the across_tenants flag: {section}"
+        );
+        // The guard condition must NOT depend on a shard set being loaded —
+        // `__autumn_shards.is_some()` gating is exactly the no-shard-set hole this
+        // fix closes. Check the tokens up to the rejection so we assert on the
+        // guard condition, not on unrelated fan-out code elsewhere.
+        let guard_end = section
+            .find("cross-shard batched iteration is not supported")
+            .expect("rejection message must be present");
+        let guard_cond = &section[..guard_end];
+        assert!(
+            !guard_cond.contains("__autumn_shards . is_some")
+                && !guard_cond.contains("__autumn_shards.is_some"),
+            "batch guard condition must not depend on __autumn_shards being Some: {guard_cond}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_count_rejects_across_tenants_without_shard_set() {
+        // §1692: a sharded + tenant-scoped `count` fans out across shards when a
+        // shard set is loaded (count is legitimately mergeable). But when
+        // `across_tenants()` is set and NO shard set is configured (e.g. a repo
+        // built via `with_pool_untracked`, where `__autumn_shards` is `None`), the
+        // old `if let Some(..)` gate fell through to a single-pool count and
+        // silently returned a PARTIAL result. It must instead reject.
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // Isolate the generated `count` dispatch body.
+        let pos = generated
+            .find("async fn count")
+            .expect("sharded+tenant_scoped count must be generated");
+        let section = &generated[pos..pos + 900];
+
+        // The fan-out path (shard set present) must be preserved.
+        assert!(
+            section.contains("fan_out_shards"),
+            "sharded+tenant_scoped count must still fan out across shards: {section}"
+        );
+        // The no-shard-set case must reject rather than fall through to a
+        // single-pool count.
+        assert!(
+            section.contains("cross-shard count requires a configured shard set"),
+            "sharded+tenant_scoped count must reject across_tenants without a shard set: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_excludes_null_group_keys() {
+        // §1364: because the declared key type is non-nullable (and `Option<K>`
+        // is a compile error), a NULL group would fail to deserialize at
+        // runtime. The generated SQL must always guard the raw group column
+        // with `IS NOT NULL` so NULL-key rows are silently excluded — safe even
+        // when the column is already NOT NULL (the planner drops the predicate).
+        let generated = repository_macro(
+            quote! { Vote, table = "votes" },
+            quote! {
+                pub trait VoteRepository {
+                    fn sum_value_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn sum_value_grouped_by_post_id"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        assert_eq!(
+            generated.matches("IS NOT NULL").count(),
+            1,
+            "grouped aggregate must emit exactly one `IS NOT NULL` group-key guard: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_bucket_timestamptz_key_truncates_in_utc() {
+        // §1364 timezone correctness: a `DateTime<Utc>` (Postgres `timestamptz`)
+        // bucket key must truncate in an explicit UTC zone via the 3-arg
+        // `date_trunc('unit', col, 'UTC')` form (Postgres 12+). The 2-arg form
+        // would truncate in the DB session `TimeZone`, drifting bucket
+        // boundaries across deployments even though the API exposes UTC.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_created_at() -> Vec<(::chrono::DateTime<::chrono::Utc>, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn count_grouped_by_created_at"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        // The emitted bucket expression pins truncation to UTC.
+        assert!(
+            generated.contains("date_trunc('{unit}', {col}{zone})"),
+            "bucket expression must be built from the parameterized template: {generated}"
+        );
+        assert!(
+            generated.contains("\", 'UTC'\""),
+            "timestamptz bucket key must supply the UTC zone argument so \
+             date_trunc truncates in UTC (#1364): {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_bucket_timestamp_key_has_no_zone() {
+        // A `NaiveDateTime` (Postgres `timestamp WITHOUT time zone`) bucket key
+        // is a deterministic field truncation, so it keeps the plain 2-arg
+        // `date_trunc('unit', col)` with an EMPTY zone argument — no `'UTC'`.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_created_at() -> Vec<(::chrono::NaiveDateTime, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn count_grouped_by_created_at"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        // Still built from the same parameterized bucket template …
+        assert!(
+            generated.contains("date_trunc('{unit}', {col}{zone})"),
+            "bucket expression must be built from the parameterized template: {generated}"
+        );
+        // … but with an empty zone argument, so no `'UTC'` is ever added.
+        assert!(
+            !generated.contains("'UTC'"),
+            "timestamp bucket key must NOT pin truncation to UTC — it is a \
+             deterministic field truncation (#1364): {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_requires_return_type() {
+        // Omitting the `-> Vec<(K, V)>` return type is a compile error with a
+        // helpful message (the macro can't infer the key/value SQL types).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_post_id();
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "missing return type must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("must declare its result type"),
+            "compile_error must explain the missing `-> Vec<(K, V)>`: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_avg_wrong_value_type_is_error() {
+        // §1364 review: `avg` always casts to double precision, so declaring a
+        // non-`Option<f64>` value type must be a compile error (QueryableByName
+        // would otherwise silently reinterpret the float bytes).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn avg_score_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "avg with a non-Option<f64> value must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("avg must declare its value type as"),
+            "compile_error must name the avg value-type rule: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_count_wrong_value_type_is_error() {
+        // §1364 review: `count` always produces bigint (i64); a mis-declared
+        // width is a compile error rather than a runtime width mismatch.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_kind() -> Vec<(String, i32)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "count with a non-i64 value must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("count must declare its value type as"),
+            "compile_error must name the count value-type rule: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_sum_wrong_value_type_is_error() {
+        // §1364 review: `sum`/`min`/`max` return SQL NULL over an empty or
+        // all-NULL group, so a non-`Option<T>` value type must be a compile
+        // error (QueryableByName cannot deserialize NULL into a non-nullable
+        // value — it would fail at runtime).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_value_grouped_by_post_id() -> Vec<(i64, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "sum with a non-Option value must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("must declare its value type as"),
+            "compile_error must name the sum value-type rule: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_nullable_key_is_error() {
+        // §1364 review: a nullable group key (`K = Option<T>`) is unsupported —
+        // it would nest into `Nullable<Nullable<T>>` on filter binds.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_post_id() -> Vec<(Option<i64>, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "nullable group key must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("nullable group keys are unsupported"),
+            "compile_error must explain nullable group keys are unsupported: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_guards_encrypted_columns() {
+        // §1364 encryption correctness: whether a column is `#[encrypted(...)]`
+        // is declared on the model and is only known at runtime (the repository
+        // macro sees the trait, not the model's fields — see
+        // `encode_derived_query_param`), so a `compile_error!` cannot name the
+        // encrypted column. Instead the generated grouped-aggregate method emits
+        // a runtime guard against the SAME `is_encrypted_column` registry the
+        // `find_by` surface consults, rejecting both the group column and the
+        // aggregated numeric column before running any SQL. It fires only for
+        // columns that are actually encrypted, so non-encrypted grouping is
+        // unchanged (asserted separately by the other grouped-aggregate tests,
+        // whose generated bodies never early-return).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_secret_grouped_by_email() -> Vec<(String, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("is_encrypted_column"),
+            "grouped aggregate must guard against encrypted columns at runtime: {generated}"
+        );
+        // Both the group column and the aggregated value column are guarded.
+        assert!(
+            generated.contains("\"email\""),
+            "guard must check the group column `email`: {generated}"
+        );
+        assert!(
+            generated.contains("\"secret\""),
+            "guard must check the aggregated value column `secret`: {generated}"
+        );
+        assert!(
+            generated.contains("not supported on the encrypted"),
+            "guard message must name the encrypted-column restriction: {generated}"
+        );
+        assert!(
+            generated.contains("Use a raw query"),
+            "guard message must point to the raw-SQL escape hatch: {generated}"
+        );
+    }
+
+    #[test]
+    fn parse_grouped_aggregate_name_shapes() {
+        assert_eq!(
+            parse_grouped_aggregate_name("count_grouped_by_post_id"),
+            Some((AggKind::Count, None, "post_id".to_string()))
+        );
+        assert_eq!(
+            parse_grouped_aggregate_name("sum_amount_grouped_by_user_id"),
+            Some((
+                AggKind::Sum,
+                Some("amount".to_string()),
+                "user_id".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_grouped_aggregate_name("avg_score_grouped_by_day"),
+            Some((AggKind::Avg, Some("score".to_string()), "day".to_string()))
+        );
+        // Not a grouped-aggregate name → None (falls through to derived queries).
+        assert_eq!(parse_grouped_aggregate_name("find_by_post_id"), None);
+    }
+
+    #[test]
+    fn repository_macro_implements_m2m_conn_source() {
+        // The many-to-many mutation traits generated by `#[model]`
+        // (`#[has_many(Tag, through = post_tags)]`) are blanket-implemented
+        // for `M2mConnSource<Model = Post>`; `#[repository(Post, ...)]` must
+        // emit exactly that impl on the generated `PgPostRepository`, wired
+        // to the same primary-pool connection helper mutating methods use.
+        let generated = repository_macro(
+            quote! { Post, table = "posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated
+                .contains("impl :: autumn_web :: repository :: M2mConnSource for PgPostRepository"),
+            "expected an M2mConnSource impl for the generated repository struct: {generated}"
+        );
+        assert!(
+            generated.contains("type Model = Post ;"),
+            "expected the M2mConnSource::Model associated type to be the repository's model: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_m2m_write_conn"),
+            "expected the M2mConnSource method to be generated"
+        );
+    }
+
+    #[test]
     fn repository_macro_api_mutation_prechecks_pin_reads_to_primary() {
         let generated = repository_macro(
             quote! { Post, api = "/api/posts", policy = PostPolicy },
@@ -8238,6 +16369,343 @@ mod tests {
         );
     }
 
+    /// Extract the generated `<prefix>_api_list` handler function body from the
+    /// full macro output — bounded by the following generated item so
+    /// assertions don't accidentally match the always-present `find_all` trait
+    /// method or the sibling CRUD handlers.
+    fn list_handler_section(generated: &str) -> &str {
+        let start = generated
+            .find("async fn post_api_list")
+            .expect("list handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_openapi_schemas_post_api_list")
+            .expect("list schema registration must follow the list handler");
+        &rest[..end]
+    }
+
+    #[test]
+    fn repository_macro_api_list_paginates_by_default() {
+        // #1237: the default JSON list endpoint paginates via `page()` instead
+        // of streaming the whole table with `find_all()`.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let section = list_handler_section(&generated);
+        assert!(
+            section.contains("__autumn_page_req : :: autumn_web :: pagination :: PageRequest"),
+            "list handler must accept a PageRequest: {section}"
+        );
+        assert!(
+            section.contains("repo . page (& __autumn_page_req)"),
+            "list handler must call repo.page(): {section}"
+        );
+        assert!(
+            section.contains(":: autumn_web :: pagination :: Page < Post >"),
+            "list handler must return a Page envelope: {section}"
+        );
+        assert!(
+            !section.contains("find_all"),
+            "default list handler must not call find_all(): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_list_cursor_mode_uses_cursor_page() {
+        // #1237: declaring `cursor_key` opts the list endpoint into keyset mode,
+        // reusing the generated `cursor_page()` + `CursorPage`.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", cursor_key = created_at },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let section = list_handler_section(&generated);
+        assert!(
+            section.contains("__autumn_cursor_req : :: autumn_web :: pagination :: CursorRequest"),
+            "cursor list handler must accept a CursorRequest: {section}"
+        );
+        assert!(
+            section.contains("repo . cursor_page (& __autumn_cursor_req)"),
+            "cursor list handler must call repo.cursor_page(): {section}"
+        );
+        assert!(
+            section.contains(":: autumn_web :: pagination :: CursorPage < Post >"),
+            "cursor list handler must return a CursorPage envelope: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_list_documents_pagination_in_openapi() {
+        // #1237: OpenAPI describes the page/size query params and the Page
+        // response envelope for the list operation.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("fn __autumn_openapi_schemas_post_api_list"),
+            "a register_schemas hook must be emitted for the list route"
+        );
+        assert!(
+            generated.contains("\"PostPage\""),
+            "list response must reference the PostPage envelope schema"
+        );
+        assert!(
+            generated.contains("\"total_pages\""),
+            "the Page envelope schema must document total_pages"
+        );
+        assert!(
+            generated.contains("\"page\"") && generated.contains("\"size\""),
+            "the query schema must document page and size params"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_create_validates_before_save() {
+        // #1253: create runs `#[validate]` rules (via autoref `MaybeValidate`)
+        // before the insert, returning 422 on failure.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_create")
+            .expect("create handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_create")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+
+        let validate_at = section
+            .find("MaybeValidate")
+            .expect("create handler must validate the payload");
+        let save_at = section
+            .find("repo . save")
+            .expect("create handler must save");
+        assert!(
+            validate_at < save_at,
+            "validation must run before the insert: {section}"
+        );
+        assert!(
+            section.contains("autumn_maybe_validate"),
+            "create handler must call autumn_maybe_validate: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_update_validates() {
+        // #1253: the update path applies the same validate-then-422 wiring.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_update")
+            .expect("update handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_update")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+        assert!(
+            section.contains("MaybeValidate (& patch)"),
+            "update handler must validate the patch payload: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_policy_update_validates_after_policy_check() {
+        // #1719 follow-up: on the policy-backed update handler, payload
+        // validation (422) must run *after* the existence load (404) and the
+        // `__check_policy_scoped` authorization gate (403), so a policy-gated
+        // PUT/PATCH with an invalid body still returns 404/403 before 422.
+        // Validation-first here regressed the ordering (Codex P2).
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", policy = PostPolicy },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_update")
+            .expect("policy update handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_update")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+
+        let policy_at = section
+            .find("__check_policy_scoped")
+            .expect("policy update handler must run the scoped policy check");
+        let validate_at = section
+            .find("autumn_maybe_validate")
+            .expect("policy update handler must validate the patch payload");
+        assert!(
+            policy_at < validate_at,
+            "policy check (403) and existence load (404) must run before \
+             patch validation (422): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_no_hooks_validate_on_update_emits_from_patch() {
+        // #1801: with `validate_on_update = fetch` on a plain no-hooks repo, the
+        // generated single-record `update` body validates the effective merged
+        // model via `from_patch` (existing row ∪ patch), surfacing the standard
+        // 422 for a patch that only becomes invalid once merged.
+        let generated = repository_macro(
+            quote! { Post, validate_on_update = fetch },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = update_section(&generated);
+        assert!(
+            section.contains("from_patch"),
+            "validate_on_update = fetch must emit a from_patch merged-model check \
+             on the no-hooks update path: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_tenant_scoped_validate_on_update_tenant_filters_load() {
+        // #1801 follow-up: on a `tenant_scoped` no-hooks repo WITH the knob, the
+        // blind (no version-check) sub-branch must load the current row for
+        // merged validation through the SAME tenant filter its own blind UPDATE
+        // uses — otherwise a cross-tenant `id` would load a foreign row and
+        // surface 422 instead of the correct 404. Assert the update body both
+        // emits the `from_patch` merged check and tenant-filters the load.
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, validate_on_update = fetch },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = update_section(&generated);
+        assert!(
+            section.contains("from_patch"),
+            "tenant_scoped + validate_on_update = fetch must emit a from_patch \
+             merged-model check: {section}"
+        );
+        assert!(
+            section.contains("tenant_id . eq"),
+            "the tenant_scoped blind merged-validation load must be tenant-filtered \
+             (tenant_id.eq), matching its own blind UPDATE: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_validate_on_update_emits_from_patch() {
+        // #1801 follow-up: a `versioned` no-hooks repo WITH the knob emits the
+        // merged-model `from_patch` check on its update body too.
+        let generated = repository_macro(
+            quote! { Post, versioned = true, validate_on_update = fetch },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = update_section(&generated);
+        assert!(
+            section.contains("from_patch"),
+            "versioned + validate_on_update = fetch must emit a from_patch \
+             merged-model check: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_no_hooks_without_knob_has_no_from_patch() {
+        // #1801 AC #2: without the opt-in knob, the blind no-hooks update path
+        // stays byte-for-byte as before — no `from_patch` call, so no
+        // unconditional extra SELECT or merged validation.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = update_section(&generated);
+        assert!(
+            !section.contains("from_patch"),
+            "a no-hooks repo without validate_on_update must not emit a from_patch \
+             merged-model check on the update path: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_policy_update_validates_merged_model() {
+        // #1801 sub-case 1: the policy `--api` update handler unconditionally
+        // validates the effective merged model via `from_patch` on the already
+        // loaded `__existing` row (zero extra query), independent of the knob.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", policy = PostPolicy },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_update")
+            .expect("policy update handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_update")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+
+        assert!(
+            section.contains("from_patch (& __existing"),
+            "policy update handler must validate the merged model via from_patch on \
+             the loaded __existing row (zero extra query): {section}"
+        );
+        let from_patch_at = section
+            .find("from_patch")
+            .expect("policy update handler must validate the merged model via from_patch");
+        // The merged validation must run after the policy gate (403) so ordering
+        // stays 404 -> 403 -> patch-422 -> merged-422.
+        let policy_at = section
+            .find("__check_policy_scoped")
+            .expect("policy update handler must run the scoped policy check");
+        assert!(
+            policy_at < from_patch_at,
+            "merged-model validation must run after the policy check: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_policy_create_validates_before_persist() {
+        // #1253 AC: the policy-backed create branch validates before persisting
+        // so authorization and validation both run.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", policy = PostPolicy },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_create")
+            .expect("create handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_create")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+
+        let validate_at = section
+            .find("MaybeValidate")
+            .expect("policy create handler must validate the payload");
+        let save_at = section
+            .find("repo . save")
+            .expect("policy create handler must save");
+        assert!(
+            validate_at < save_at,
+            "policy create must validate before persisting: {section}"
+        );
+    }
+
     #[test]
     fn parse_repo_args_with_primary_reads() {
         let tokens: proc_macro2::TokenStream = "Post, primary_reads".parse().unwrap();
@@ -8256,6 +16724,60 @@ mod tests {
         assert!(
             !config.primary_reads,
             "reads route to the replica by default"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_validate_on_update_fetch() {
+        // #1801: `validate_on_update = fetch` opts the no-hooks blind update
+        // path into merged-model validation.
+        let tokens: proc_macro2::TokenStream = "Post, validate_on_update = fetch".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(
+            config.validate_on_update_fetch,
+            "validate_on_update = fetch must set validate_on_update_fetch"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_validate_on_update_defaults_off() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(
+            !config.validate_on_update_fetch,
+            "the blind update path skips merged validation by default"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_validate_on_update_rejects_unknown_mode() {
+        // Only the bare ident `fetch` is a valid value.
+        let tokens: proc_macro2::TokenStream = "Post, validate_on_update = eager".parse().unwrap();
+        let err = parse_repo_args(tokens)
+            .err()
+            .expect("unknown mode must be rejected");
+        assert!(
+            err.to_string().contains("validate_on_update"),
+            "error must name the knob: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_validate_on_update_fetch_with_no_upsert_trait() {
+        // #1801: `validate_on_update = fetch` emits `from_patch` on the generated
+        // update draft, but `no_upsert_trait` repositories have no such scaffold.
+        // The combination must be rejected at parse time rather than producing a
+        // downstream compile error.
+        let tokens: proc_macro2::TokenStream = "Post, validate_on_update = fetch, no_upsert_trait"
+            .parse()
+            .unwrap();
+        let err = parse_repo_args(tokens)
+            .err()
+            .expect("fetch validation with no_upsert_trait must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("validate_on_update") && msg.contains("no_upsert_trait"),
+            "error must name both knobs: {err}"
         );
     }
 
@@ -8289,6 +16811,140 @@ mod tests {
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(config.api_path.as_deref(), Some("/api/posts"));
+    }
+
+    #[test]
+    fn parse_repo_args_with_mcp() {
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts", mcp"#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(
+            config.mcp_expose,
+            Some(McpExpose::All),
+            "bare `mcp` exposes all five CRUD routes"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_with_mcp_read() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp = "read""#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(
+            config.mcp_expose,
+            Some(McpExpose::Read),
+            "`mcp = \"read\"` exposes only list/get"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_mcp_defaults_off() {
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts""#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.mcp_expose, None, "no `mcp` key => no MCP exposure");
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_unknown_mcp_mode() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp = "write""#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("unknown mcp mode must be rejected");
+        };
+        assert!(
+            err.to_string().contains("read"),
+            "error must name the accepted forms: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_duplicate_mcp() {
+        // `mcp = "read", mcp` must not silently escalate a read-only opt-in
+        // to full write exposure via last-write-wins (nor silently narrow in
+        // the reverse order).
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp = "read", mcp"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("duplicate mcp keys must be rejected");
+        };
+        assert!(
+            err.to_string().contains("duplicate"),
+            "error must call out the duplicate key: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_mcp_bool_gets_tailored_error() {
+        // The natural guess coming from `#[api_doc(mcp = false)]` — the error
+        // must name the forms that exist instead of syn's generic
+        // "expected string literal".
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp = false"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("mcp = false must be rejected");
+        };
+        assert!(
+            err.to_string().contains("mcp takes no boolean"),
+            "error must name the accepted forms: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_mcp_requires_api() {
+        let tokens: proc_macro2::TokenStream = "Post, mcp".parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("mcp without api = \"/path\" generates no routes and must be rejected");
+        };
+        assert!(
+            err.to_string().contains("api"),
+            "error must point at the missing api key: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_mcp_flags_all_five_crud_api_docs() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(
+            generated.matches("mcp_tool : true").count(),
+            5,
+            "bare `mcp` must flag list/get/create/update/delete"
+        );
+    }
+
+    #[test]
+    fn repository_macro_mcp_read_flags_only_reads() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp = "read" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(
+            generated.matches("mcp_tool : true").count(),
+            2,
+            "`mcp = \"read\"` must flag only list/get"
+        );
+        assert_eq!(
+            generated.matches("mcp_tool : false").count(),
+            3,
+            "create/update/delete must be explicitly off in read mode"
+        );
+    }
+
+    #[test]
+    fn repository_macro_without_mcp_emits_no_flags() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(
+            generated.matches("mcp_tool : true").count(),
+            0,
+            "no `mcp` key => nothing opted in"
+        );
     }
 
     #[test]
@@ -8556,9 +17212,15 @@ mod tests {
             .find("MutationOp :: Delete")
             .expect("delete path should still be generated");
         let delete_generated = &generated[delete_start..];
+        // The delete path now locks the row through the `maybe_for_update!`
+        // backend seam (`FOR UPDATE` on Postgres, a plain read on `SQLite`)
+        // instead of a bare `.for_update()` chain. The lock must still be
+        // applied to the load that precedes `before_delete`.
         let delete_lock = delete_generated
-            .find(". for_update ()")
-            .expect("delete path should lock the row before before_delete");
+            .find("maybe_for_update ! (load_query)")
+            .expect(
+                "delete path should lock the row (maybe_for_update! seam) before before_delete",
+            );
         let before_delete = delete_generated
             .find("before_delete")
             .expect("before_delete hook should still be generated");
@@ -8600,7 +17262,7 @@ mod tests {
             "hooked versioned save_many must record history for each inserted record before moving chunk results: {section}"
         );
         assert!(
-            section.contains("ctx . actor . as_deref"),
+            section.contains("ctx . actor . clone"),
             "hooked versioned save_many history should use the per-record MutationContext: {section}"
         );
     }
@@ -8658,6 +17320,1401 @@ mod tests {
         assert!(
             delete_pos < history_pos,
             "hooked versioned delete_many must record history after database deletion/update: {section}"
+        );
+    }
+
+    // ── #1369: dependent destroy/nullify ───────────────────────────
+
+    /// Helper: slice the generated `delete_by_id` trait-impl body (up to the
+    /// next `async fn`) so assertions target the parent delete path, not the
+    /// always-generated `__autumn_apply_dependent_on_conn` helper.
+    fn delete_by_id_section(generated: &str) -> &str {
+        let start = generated
+            .find("async fn delete_by_id")
+            .expect("repository must generate delete_by_id");
+        let rest = &generated[start + "async fn delete_by_id".len()..];
+        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        &rest[..end]
+    }
+
+    /// Helper: slice the generated `delete_many` trait-impl body (up to the next
+    /// `async fn`) so assertions target the bulk delete path.
+    fn delete_many_section(generated: &str) -> &str {
+        let start = generated
+            .find("async fn delete_many")
+            .expect("repository must generate delete_many");
+        let rest = &generated[start + "async fn delete_many".len()..];
+        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        &rest[..end]
+    }
+
+    /// Helper: slice the generated `update` trait-impl body (up to the next
+    /// `async fn`) so assertions target the single-record update path. Anchors
+    /// on `async fn update (` so it does not match `async fn update_many (`.
+    fn update_section(generated: &str) -> &str {
+        let needle = "async fn update (";
+        let start = generated
+            .find(needle)
+            .expect("repository must generate update");
+        let rest = &generated[start + needle.len()..];
+        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        &rest[..end]
+    }
+
+    #[test]
+    fn repository_macro_write_rmw_uses_immediate_transaction_and_reads_stay_deferred() {
+        // #1996 item 3: the write read-modify-write paths (with_lock, update,
+        // delete_by_id) open the write lock up front through
+        // `scoped_immediate_transaction` (BEGIN IMMEDIATE on SQLite; the
+        // unchanged deferred `scoped_transaction` on Postgres). Read paths never
+        // take a write transaction, and the deferred primitive is still used by
+        // non-RMW writes (save/bulk), so the seam is not a blanket swap.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        // with_lock is the canonical pessimistic write RMW.
+        let wl_start = generated
+            .find("pub async fn with_lock")
+            .expect("repository must generate with_lock");
+        let with_lock = &generated[wl_start..];
+        assert!(
+            with_lock.contains("scoped_immediate_transaction"),
+            "with_lock must route through the immediate write transaction: {with_lock}"
+        );
+
+        // update is an RMW write (load + mutate) → immediate.
+        let update = update_section(&generated);
+        assert!(
+            update.contains("scoped_immediate_transaction"),
+            "update must route through the immediate write transaction: {update}"
+        );
+
+        // A dependent-cascade delete_by_id opens a write transaction (load →
+        // cascade children → parent DELETE); it must be immediate too. (A plain
+        // delete is a single atomic DELETE with no transaction, so there is
+        // nothing to make immediate there.)
+        let dep = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let delete = delete_by_id_section(&dep);
+        assert!(
+            delete.contains("scoped_immediate_transaction"),
+            "dependent delete_by_id must route through the immediate write transaction: {delete}"
+        );
+
+        // Read path stays off the write-lock primitive: find_by_id opens no
+        // immediate transaction.
+        let find_start = generated
+            .find("async fn find_by_id")
+            .expect("repository must generate find_by_id");
+        let rest = &generated[find_start + "async fn find_by_id".len()..];
+        let find_by_id = &rest[..rest.find("async fn ").map_or(rest.len(), |p| p)];
+        assert!(
+            !find_by_id.contains("scoped_immediate_transaction"),
+            "find_by_id (read) must not open an immediate write transaction: {find_by_id}"
+        );
+
+        // The deferred primitive is still present (save/bulk insert paths keep
+        // it) — the write-RMW adoption is targeted, not a blanket rename.
+        assert!(
+            generated.contains(":: scoped_transaction"),
+            "non-RMW write paths (save/bulk) must keep the deferred scoped_transaction"
+        );
+    }
+
+    /// Helper: slice the `Destroy` match arm of the generated
+    /// `__autumn_apply_dependent_on_conn` helper, bounded to the helper method
+    /// (which ends right before the always-generated `pub fn on_primary`), so
+    /// assertions don't accidentally match the repository's OWN broadcast /
+    /// commit-hook codegen emitted elsewhere in the output.
+    fn dependent_helper_body(generated: &str) -> &str {
+        // Anchor on the method *definition* — the bare name also appears at the
+        // parent's cascade *call* site inside `delete_by_id`. Bound to the method
+        // (it ends right before the always-generated `pub fn on_primary`).
+        let hstart = generated
+            .find("pub fn __autumn_apply_dependent_on_conn")
+            .expect("dependent-apply helper definition present");
+        let hrest = &generated[hstart..];
+        let hend = hrest.find("pub fn on_primary").unwrap_or(hrest.len());
+        &hrest[..hend]
+    }
+
+    fn dependent_destroy_arm(generated: &str) -> &str {
+        let helper = dependent_helper_body(generated);
+        let destroy_at = helper
+            .find("DependentAction :: Destroy")
+            .expect("destroy arm present");
+        &helper[destroy_at..]
+    }
+
+    /// The `Restrict` match arm, bounded to before the `Nullify` arm so
+    /// assertions don't leak into the other arms.
+    fn dependent_restrict_arm(generated: &str) -> &str {
+        let helper = dependent_helper_body(generated);
+        let start = helper
+            .find("DependentAction :: Restrict")
+            .expect("restrict arm present");
+        let arm = &helper[start..];
+        let end = arm.find("DependentAction :: Nullify").unwrap_or(arm.len());
+        &arm[..end]
+    }
+
+    #[test]
+    fn parse_repo_args_parses_dependent_destroy() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy)"#
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.dependents.len(), 1, "one dependent spec expected");
+        let dep = &config.dependents[0];
+        assert_eq!(dep.fk, "post_id");
+        assert_eq!(dep.action, DependentAction::Destroy);
+        let child_repo = &dep.child_repo;
+        assert_eq!(
+            quote! { #child_repo }.to_string(),
+            "PgCommentRepository",
+            "child repo path must be captured"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_parses_all_dependent_actions_and_multiple_specs() {
+        let tokens: proc_macro2::TokenStream = r#"Post,
+            dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+            dependent(PgVoteRepository, fk = "post_id", on_delete = delete_all),
+            dependent(PgBookmarkRepository, fk = "post_id", on_delete = nullify),
+            dependent(PgAwardRepository, fk = "post_id", on_delete = restrict)"#
+            .parse()
+            .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let actions: Vec<DependentAction> = config.dependents.iter().map(|d| d.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                DependentAction::Destroy,
+                DependentAction::DeleteAll,
+                DependentAction::Nullify,
+                DependentAction::Restrict,
+            ],
+            "all four actions parse and preserve declared order"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_unknown_dependent_action() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, dependent(PgCommentRepository, fk = "post_id", on_delete = explode)"#
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("unknown action must be rejected");
+        };
+        assert!(
+            err.to_string().contains("unknown dependent action"),
+            "error should name the bad action: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_dependent_requires_fk() {
+        let tokens: proc_macro2::TokenStream =
+            r"Post, dependent(PgCommentRepository, on_delete = destroy)"
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("missing fk must be rejected");
+        };
+        assert!(
+            err.to_string().contains("fk"),
+            "error should mention fk: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_dependents_default_empty() {
+        let config = parse_repo_args("Post".parse().unwrap()).unwrap();
+        assert!(
+            config.dependents.is_empty(),
+            "no dependents unless declared (AC7: default unchanged)"
+        );
+    }
+
+    #[test]
+    fn repository_macro_always_generates_dependent_helper() {
+        // The connection-taking helper is generated for every repository so the
+        // parent side only needs the child repository *type*.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(
+            generated.contains("__autumn_apply_dependent_on_conn"),
+            "every repository must expose the dependent-apply helper"
+        );
+        assert!(
+            generated.contains("DependentAction"),
+            "helper must match on the DependentAction enum"
+        );
+    }
+
+    #[test]
+    fn repository_macro_without_dependents_delete_by_id_dispatches_at_runtime() {
+        // #1738: with no repository-attribute `dependent(...)`, delete_by_id no
+        // longer calls the cascade helper directly at compile time; instead it
+        // consults the model's runtime `dependents()` (empty for a model with no
+        // `#[has_many(dependent = ...)]`, so the plain delete path runs). The
+        // compile-time `__autumn_apply_dependent_on_conn` call site is gone.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = delete_by_id_section(&generated);
+        assert!(
+            !section.contains("__autumn_apply_dependent_on_conn"),
+            "delete_by_id must not emit a compile-time cascade call when no \
+             dependent(...) is declared: {section}"
+        );
+        assert!(
+            section.contains("dependents") && section.contains("AutumnDependents"),
+            "delete_by_id must consult the model's runtime dependents() for the \
+             model-declared cascade (#1738): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_with_dependents_delete_by_id_does_not_runtime_dispatch() {
+        // Precedence (#1738): a repository-attribute `dependent(...)` is the
+        // authoritative escape hatch. Its delete_by_id uses the compile-time
+        // cascade and must NOT runtime-DRIVE the cascade from the model's
+        // `dependents()`. #1788: it MAY reference `dependents()` behind a
+        // `cfg!(debug_assertions)` guard purely for the override diagnostic, but
+        // it must never bind `__autumn_rt_deps` to drive the cascade (that is the
+        // no-repo-attr runtime path only).
+        let generated = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&generated);
+        assert!(
+            section.contains("__autumn_apply_dependent_on_conn"),
+            "repository-attribute delete_by_id must emit the compile-time cascade: {section}"
+        );
+        assert!(
+            !section.contains("__autumn_rt_deps"),
+            "repository-attribute delete_by_id must not runtime-DRIVE the cascade \
+             from the model's dependents() (repo-attr wins): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_with_dependents_delete_by_id_emits_both_sites_diagnostic() {
+        // #1788: when a repository declares `dependent(...)` the repo-attribute
+        // cascade is authoritative and any model-side `#[has_many(dependent = ...)]`
+        // is silently overridden. Compile-time detection is impossible (the
+        // repository macro cannot see the model struct's attributes), so the
+        // repo-attr `delete_by_id` branch must splice a debug-only diagnostic: a
+        // `cfg!(debug_assertions)`-gated `tracing::warn!` that fires when the model
+        // ALSO declared dependents (`Model::dependents()` non-empty). Mirrors the
+        // `across_tenants()` debug-warn template; zero-cost in release builds.
+        let generated = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&generated);
+        assert!(
+            section.contains("debug_assertions"),
+            "both-sites diagnostic must be gated on cfg!(debug_assertions): {section}"
+        );
+        assert!(
+            section.contains("AutumnDependents") && section.contains("dependents"),
+            "both-sites diagnostic must consult the model's dependents() via the \
+             AutumnDependents trait: {section}"
+        );
+        assert!(
+            section.contains("tracing :: warn"),
+            "both-sites diagnostic must emit a tracing::warn! for the override: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_without_dependents_delete_many_dispatches_at_runtime() {
+        // Codex P1: with no repository-attribute `dependent(...)`, the bulk
+        // `delete_many` path must consult the model's runtime `dependents()`
+        // (empty for a model with no `#[has_many(dependent = ...)]`, so the plain
+        // bulk path runs) instead of emitting a compile-time cascade call. This
+        // mirrors the single-record `delete_by_id` runtime dispatch.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = delete_many_section(&generated);
+        assert!(
+            !section.contains("__autumn_apply_dependent_on_conn"),
+            "delete_many must not emit a compile-time cascade call when no \
+             dependent(...) is declared: {section}"
+        );
+        assert!(
+            section.contains("dependents") && section.contains("AutumnDependents"),
+            "delete_many must consult the model's runtime dependents() for the \
+             model-declared bulk cascade (Codex P1): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_with_dependents_delete_many_does_not_runtime_dispatch() {
+        // Precedence (Codex P1): a repository-attribute `dependent(...)` is the
+        // authoritative escape hatch. Its delete_many uses the compile-time
+        // cascade and must NOT also consult the model's runtime dependents().
+        let generated = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_many_section(&generated);
+        assert!(
+            section.contains("__autumn_apply_dependent_on_conn"),
+            "repository-attribute delete_many must emit the compile-time cascade: {section}"
+        );
+        assert!(
+            !section.contains("AutumnDependents"),
+            "repository-attribute delete_many must not runtime-dispatch (repo-attr wins): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_delete_many_uses_path_and_deleted_not_monotonic_preseed() {
+        // Codex round-5-B: the bulk `delete_many` cascade must NOT use a single
+        // monotonic visited set that pre-seeds a batch root before it is deleted
+        // (that made an ancestor's cascade skip a still-referenced descendant batch
+        // root and trip an IMMEDIATE FK). The old `__autumn_visited` set is gone,
+        // replaced by TWO structures: an ACTIVE-path stack (`__autumn_path`, pushed
+        // then popped around each root's own cascade — cycle-break only) and a
+        // monotonic `__autumn_deleted` set of rows actually removed. Phase 2 must
+        // (a) push the current root onto the path before its mutating cascade,
+        // (b) pop it right after, and (c) skip a root already in `__autumn_deleted`
+        // (cascade-deleted as another root's descendant) — never a pre-seed.
+        let generated = repository_macro(
+            quote! { Node, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
+            quote! { pub trait NodeRepository {} },
+        )
+        .to_string();
+        let section = delete_many_section(&generated);
+        assert!(
+            section.contains("__autumn_apply_dependent_on_conn"),
+            "the bulk delete_many path must cascade dependents: {section}"
+        );
+        assert!(
+            !section.contains("__autumn_visited"),
+            "round-5-B: the monotonic pre-seeded visited set must be gone: {section}"
+        );
+        // Phase 2 brackets each root's own cascade with a path push/pop (cycle-break
+        // only) — NOT a monotonic pre-seed.
+        assert!(
+            section.contains(
+                "if __autumn_deleted . contains (& (\"nodes\" , __autumn_pid)) { continue ; } \
+                 __autumn_path . insert ((\"nodes\" , __autumn_pid)) ;"
+            ),
+            "round-5-B: Phase 2 must skip an already-cascade-deleted root, then push \
+             the current root onto the ACTIVE path before its cascade: {section}"
+        );
+        assert!(
+            section.contains("__autumn_path . remove (& (\"nodes\" , __autumn_pid))"),
+            "round-5-B: the current bulk root must be popped off the ACTIVE path after \
+             its own cascade completes (so it never suppresses a later ancestor): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_delete_many_hooked_root_loop_skips_already_deleted_roots() {
+        // Codex round-5-B: for a HOOKED bulk parent, the root `before_delete` loop
+        // must run AFTER the cascade and skip any root already cascade-deleted as
+        // another root's descendant (present in `__autumn_deleted`) — otherwise that
+        // root's `before_delete` would fire twice (once as the cascaded descendant,
+        // once as the batch root). A `destroy` self-reference exercises the case.
+        let generated = repository_macro(
+            quote! { Node, hooks = NodeHooks, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
+            quote! { pub trait NodeRepository {} },
+        )
+        .to_string();
+        let section = delete_many_section(&generated);
+        assert!(
+            section.contains(
+                "if __autumn_deleted . contains (& (\"nodes\" , record . id)) { continue ; }"
+            ),
+            "round-5-B: the hooked bulk-root loop must skip a root already \
+             cascade-deleted before firing its before_delete: {section}"
+        );
+        // The skip guard must sit at the TOP of the root loop, before before_delete.
+        let skip_pos = section
+            .find("if __autumn_deleted . contains (& (\"nodes\" , record . id))")
+            .expect("root skip guard present");
+        let before_delete_pos = section
+            .find("before_delete")
+            .expect("root loop fires before_delete");
+        assert!(
+            skip_pos < before_delete_pos,
+            "round-5-B: the __autumn_deleted skip must precede the root before_delete: {section}"
+        );
+        // And the cascade must precede that loop so `__autumn_deleted` is populated.
+        let cascade_pos = section
+            .find("__autumn_apply_dependent_on_conn")
+            .expect("cascade present");
+        assert!(
+            cascade_pos < before_delete_pos,
+            "round-5-B: the cascade must run before the root before_delete loop so a \
+             cascade-deleted root is already recorded: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_delete_cascades_inside_transaction_before_parent_delete() {
+        // AC2 + AC6: cascade runs inside a single (immediate, per #1996) write
+        // transaction and before the parent DELETE (children removed first → no
+        // FK/orphan).
+        let generated = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&generated);
+        assert!(
+            section.contains("scoped_immediate_transaction"),
+            "dependent delete_by_id must open an immediate write transaction (#1996): {section}"
+        );
+        let cascade_pos = section
+            .find("__autumn_apply_dependent_on_conn")
+            .expect("dependent delete_by_id must call the cascade helper");
+        let parent_delete_pos = section
+            .find("diesel :: delete")
+            .expect("dependent delete_by_id must issue the parent DELETE");
+        assert!(
+            cascade_pos < parent_delete_pos,
+            "children must be cascaded before the parent DELETE: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_restrict_probes_before_mutating_actions() {
+        // #1369 restrict ordering: even when a mutating dependent (destroy) is
+        // declared BEFORE a `restrict` dependent, the generated delete_by_id must
+        // run ALL restrict probes before ANY mutating apply call — so a 409 rolls
+        // back before a child `before_delete` side effect ever fires.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgVoteRepository, fk = "post_id", on_delete = delete_all),
+                dependent(PgAwardRepository, fk = "post_id", on_delete = restrict),
+                dependent(PgBadgeRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&generated);
+        // Every restrict apply call must precede every mutating apply call. The
+        // apply calls pass the action as `DependentAction :: <Variant>`.
+        let last_restrict = section
+            .rfind("DependentAction :: Restrict")
+            .expect("restrict apply calls must be emitted");
+        let first_mutating = section
+            .find("DependentAction :: Destroy")
+            .into_iter()
+            .chain(section.find("DependentAction :: DeleteAll"))
+            .chain(section.find("DependentAction :: Nullify"))
+            .min()
+            .expect("mutating apply calls must be emitted");
+        assert!(
+            last_restrict < first_mutating,
+            "all restrict probes must be hoisted ahead of the first mutating apply call: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_helper_restrict_uses_conflict_error() {
+        // AC1 + AC5: restrict surfaces a typed 409 Conflict, not a 500.
+        let generated = repository_macro(
+            quote! { Post, dependent(PgAwardRepository, fk = "post_id", on_delete = restrict) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("conflict_msg"),
+            "restrict must produce a typed conflict error"
+        );
+        assert!(
+            generated.contains("SELECT EXISTS"),
+            "restrict must probe for existing children"
+        );
+        // Non-soft-delete child: the EXISTS probe carries no live filter
+        // (a non-soft-delete repository references `deleted_at` nowhere).
+        assert!(
+            !generated.contains("deleted_at"),
+            "a non-soft-delete restrict probe must not filter on deleted_at"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_restrict_live_filter_gated_on_parent_soft() {
+        // For a soft-delete child, the restrict EXISTS probe's live filter is
+        // gated on the PARENT's delete kind (`__parent_soft`): a soft parent
+        // keeps the filter (a logically-gone child shouldn't spuriously 409),
+        // but a HARD parent drops it so any physically-present FK-referencing
+        // child yields a clean 409 rather than a raw DB 500 on the parent DELETE.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let restrict_arm = dependent_restrict_arm(&generated);
+        assert!(
+            restrict_arm.contains("SELECT EXISTS"),
+            "restrict must probe for existing children: {restrict_arm}"
+        );
+        // The live filter is a runtime `if __parent_soft { \" AND ...deleted_at.. IS NULL\" } else { \"\" }`.
+        assert!(
+            restrict_arm.contains("if __parent_soft"),
+            "soft-delete restrict probe's live filter must be gated on __parent_soft: {restrict_arm}"
+        );
+        assert!(
+            restrict_arm.contains("deleted_at") && restrict_arm.contains("IS NULL"),
+            "the soft-parent branch of the restrict probe must carry the live filter: {restrict_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_helper_nullify_sets_fk_null() {
+        let generated = repository_macro(
+            quote! { Post, dependent(PgBookmarkRepository, fk = "post_id", on_delete = nullify) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("= NULL WHERE"),
+            "nullify must UPDATE the child FK column to NULL"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_helper_delete_all_bulk_deletes() {
+        let generated = repository_macro(
+            quote! { Post, dependent(PgVoteRepository, fk = "post_id", on_delete = delete_all) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("DELETE FROM"),
+            "delete_all must issue a bulk DELETE"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_helper_is_soft_delete_aware() {
+        // AC3: a soft_delete child soft-deletes its rows on cascade. The
+        // child-selection live filter is gated on the parent's delete kind
+        // (`__parent_soft`): kept for a soft parent, dropped for a hard parent so
+        // even a pre-soft-deleted child is hard-deleted (no surviving FK row).
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("deleted_at"),
+            "soft_delete repo's destroy path must soft-delete (touch deleted_at): {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("if __parent_soft"),
+            "the child-selection live filter must be gated on __parent_soft: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("IS NULL"),
+            "the soft-parent branch must select only live children: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_live_filter_is_parent_soft_gated_not_child_only() {
+        // The live filter (`deleted_at IS NULL`) must be a RUNTIME choice keyed on
+        // `__parent_soft`, not baked in unconditionally for a soft_delete child.
+        // Both the destroy child-selection and the restrict EXISTS probe carry the
+        // gated form `if __parent_soft { \" AND ..deleted_at.. IS NULL\" } else { \"\" }`,
+        // so a hard parent delete operates on ALL physically-present children.
+        let generated = repository_macro(
+            quote! {
+                Comment, soft_delete,
+                dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy),
+                dependent(PgFlagRepository, fk = "comment_id", on_delete = restrict)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        let restrict_arm = dependent_restrict_arm(&generated);
+        // Gated form present in both arms.
+        assert!(
+            destroy_arm.contains("if __parent_soft") && destroy_arm.contains("else { \"\" }"),
+            "destroy live filter must be parent-soft-gated with an empty else: {destroy_arm}"
+        );
+        assert!(
+            restrict_arm.contains("if __parent_soft") && restrict_arm.contains("else { \"\" }"),
+            "restrict live filter must be parent-soft-gated with an empty else: {restrict_arm}"
+        );
+        // Sanity: a non-soft-delete child carries no live filter at all.
+        let non_soft = repository_macro(
+            quote! { Post, dependent(PgAwardRepository, fk = "post_id", on_delete = restrict) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            !non_soft.contains("deleted_at"),
+            "a non-soft-delete child must have no live filter"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_follows_parent_delete_kind() {
+        // #1369 P1: a soft_delete child's destroy branch must branch on
+        // `__parent_soft` — soft-deleting only when the parent is soft-deleted,
+        // and hard-deleting (a real `diesel::delete`) when the parent is
+        // hard-deleted, so a soft child never dangles off a hard-deleted parent.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let start = generated
+            .find("__autumn_apply_dependent_on_conn")
+            .expect("helper present");
+        let helper = &generated[start..];
+        // The helper takes the parent delete-kind flag and branches on it.
+        assert!(
+            helper.contains("__parent_soft"),
+            "destroy must thread the parent's delete kind (__parent_soft): {helper}"
+        );
+        assert!(
+            helper.contains("if __parent_soft"),
+            "soft_delete child destroy must branch on __parent_soft: {helper}"
+        );
+        // Both a soft mutation (UPDATE deleted_at) and a hard delete must be
+        // present in the destroy branch (one per parent-delete-kind arm).
+        let destroy_at = helper
+            .find("DependentAction :: Destroy")
+            .expect("destroy arm present");
+        let destroy_arm = &helper[destroy_at..];
+        assert!(
+            destroy_arm.contains("diesel :: update") && destroy_arm.contains("deleted_at"),
+            "destroy soft arm must UPDATE deleted_at: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("diesel :: delete"),
+            "destroy hard arm (parent hard-deleted) must issue a real DELETE even for a soft_delete child: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_reload_does_not_filter_deleted_at() {
+        // #1369 (second live-filter site): the per-ID reload that fetches each
+        // selected child must NOT re-apply `deleted_at IS NULL`. The id-selection
+        // is already parent-soft-gated, so on a HARD parent delete it returns
+        // already-soft-deleted children too; a live-only reload would return
+        // `None`, skip the hard delete, and leave the FK to fail the parent
+        // DELETE. Assert the reload loads the selected id straight into the
+        // `maybe_for_update!` lock seam (`FOR UPDATE` on Postgres, a plain read
+        // on `SQLite`) with no intervening `deleted_at` filter, even for a
+        // soft_delete child.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("maybe_for_update ! (comments :: table . find (__cid))"),
+            "the per-ID reload must load the selected id straight into the \
+             maybe_for_update! lock wrapper, with no deleted_at filter that could \
+             drop a pre-soft-deleted child: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_cascade_passes_parent_soft_flag() {
+        // The soft-delete parent passes `true`; a hard-delete parent passes
+        // `false`, so the child cascade can follow the parent's delete kind.
+        let soft_parent = repository_macro(
+            quote! { Post, soft_delete, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let soft_section = delete_by_id_section(&soft_parent);
+        assert!(
+            soft_section.contains("__autumn_apply_dependent_on_conn")
+                && soft_section.contains(", true ,"),
+            "a soft-delete parent must pass __parent_soft = true to the cascade: {soft_section}"
+        );
+        let hard_parent = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let hard_section = delete_by_id_section(&hard_parent);
+        assert!(
+            hard_section.contains("__autumn_apply_dependent_on_conn")
+                && hard_section.contains(", false ,"),
+            "a hard-delete parent must pass __parent_soft = false to the cascade: {hard_section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_helper_destroy_arm_runtime_dispatches_grandchildren_without_repo_attr_deps()
+    {
+        // Codex P1: a repository with NO repository-attribute `dependent(...)`
+        // must, in its `__autumn_apply_dependent_on_conn` Destroy arm, consult
+        // the child model's runtime `dependents()` and recurse into each
+        // grandchild spec — so a FULLY model-declared `Post -> Comment -> Reply`
+        // graph cascades all the way down. Without this the arm would delete the
+        // child while its own children still FK-reference it (FK failure /
+        // orphans), because `config.dependents` is empty and the #1739
+        // compile-time recursion is a no-op.
+        let generated = repository_macro(
+            quote! { Comment },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        // The `AutumnDependents` fallback is `use`d in the helper prelude (above
+        // the match); the runtime walk itself lives in the Destroy arm.
+        let helper = dependent_helper_body(&generated);
+        assert!(
+            helper.contains("AutumnDependents"),
+            "the helper must bring the AutumnDependents fallback into scope: {helper}"
+        );
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("dependents ()"),
+            "no-repo-attr destroy arm must runtime-dispatch grandchildren via Model::dependents(): {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains(". cascade"),
+            "the runtime grandchild walk must invoke each spec's cascade thunk: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_arm_probes_grandchild_restrict_before_child_hook() {
+        // Codex round-5-A: in the shared Destroy arm, a child's own `restrict`
+        // grandchild must be probed (read-only 409) BEFORE the child's
+        // `before_delete` hook fires, and its mutating (`destroy`) grandchildren
+        // AFTER it. Otherwise deleting a `Post -> Comment(destroy) -> Reply(restrict)`
+        // graph fires `Comment::before_delete` and only then returns the restrict
+        // 409 — leaving a non-transactional hook side effect on a doomed tx.
+        // Order in the arm must be: grandchild-restrict probe < child before_delete
+        // < grandchild-mutating cascade < child row delete.
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                hooks = CommentHooks,
+                dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict),
+                dependent(PgLikeRepository, fk = "comment_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        let restrict_probe_pos = destroy_arm
+            .find("PgReplyRepository")
+            .expect("grandchild restrict probe (Reply) must be emitted");
+        let before_delete_pos = destroy_arm
+            .find("before_delete")
+            .expect("child before_delete hook must be emitted");
+        let mutating_pos = destroy_arm
+            .find("PgLikeRepository")
+            .expect("grandchild mutating cascade (Like) must be emitted");
+        let child_delete_pos = destroy_arm
+            .find("diesel :: delete")
+            .expect("child row DELETE must be emitted");
+        assert!(
+            restrict_probe_pos < before_delete_pos,
+            "round-5-A: the grandchild restrict probe must run BEFORE the child \
+             before_delete hook: {destroy_arm}"
+        );
+        assert!(
+            before_delete_pos < mutating_pos,
+            "round-5-A: mutating grandchildren must be cascaded AFTER the child \
+             before_delete hook: {destroy_arm}"
+        );
+        assert!(
+            mutating_pos < child_delete_pos,
+            "round-5-A: mutating grandchildren must still be removed BEFORE the child \
+             row delete (deepest-first, no FK dangle): {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_arm_pre_scans_sibling_restricts_before_any_hook() {
+        // #1800 case 2: the grandchild restrict probe must be hoisted into a
+        // PRE-SCAN pass over EVERY selected child id, ahead of the per-child
+        // mutating loop that fires `before_delete`. So with multiple destroy
+        // siblings a later sibling's restrict grandchild aborts before an earlier
+        // sibling's hook runs. Structurally: a `for __row in & __ids` pre-scan loop
+        // emits the grandchild restrict probe, then a separate `for __row in __ids`
+        // loop fires the child before_delete — with the probe strictly before the
+        // hook (and no probe left inside the mutating loop).
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                hooks = CommentHooks,
+                dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict),
+                dependent(PgLikeRepository, fk = "comment_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        let prescan_pos = destroy_arm
+            .find("for __row in & __ids")
+            .expect("#1800 case 2: a `for __row in &__ids` restrict pre-scan pass must be emitted");
+        let mutating_loop_pos = destroy_arm
+            .find("for __row in __ids")
+            .expect("the per-child mutating loop must still be emitted");
+        let restrict_probe_pos = destroy_arm
+            .find("PgReplyRepository")
+            .expect("grandchild restrict probe (Reply) must be emitted");
+        let before_delete_pos = destroy_arm
+            .find("before_delete")
+            .expect("child before_delete hook must be emitted");
+        assert!(
+            prescan_pos < mutating_loop_pos,
+            "#1800 case 2: the restrict pre-scan loop must precede the mutating loop: {destroy_arm}"
+        );
+        assert!(
+            prescan_pos < restrict_probe_pos && restrict_probe_pos < mutating_loop_pos,
+            "#1800 case 2: the grandchild restrict probe must live in the pre-scan loop \
+             (before the mutating loop), not inside the per-child mutating loop: {destroy_arm}"
+        );
+        assert!(
+            restrict_probe_pos < before_delete_pos,
+            "#1800 case 2: every sibling's restrict grandchild is probed before any \
+             child before_delete hook fires: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_arm_locks_child_ids_before_restrict_prescan() {
+        // Codex P2 ("Lock children before the restrict pre-scan"): the child-id
+        // selection that feeds the sibling restrict PRE-SCAN must acquire
+        // `FOR UPDATE` on the selected child rows. Otherwise, under READ
+        // COMMITTED, a concurrent FK insert of a `restrict` grandchild can commit
+        // AFTER this EXISTS pass and BEFORE the Phase-2 `for_update` child reload,
+        // so the child `before_delete` hook still fires and the hard delete falls
+        // through to a raw FK error (or a soft delete proceeds despite a live
+        // restrict dependent). Holding `FOR UPDATE` on the child row blocks the
+        // concurrent grandchild insert's `FOR KEY SHARE` on that referenced row,
+        // closing the TOCTOU window between probe and hook/delete.
+        //
+        // The child-id SELECT now appends a backend-gated lock suffix rather than
+        // a hard-coded `FOR UPDATE`: `... ORDER BY id{}` where the `{}` binding
+        // (`__for_update`) is `" FOR UPDATE"` on Postgres and `""` on `SQLite`
+        // (which rejects `SELECT … FOR UPDATE`), selected in autumn-web's
+        // compilation via `backend_select!`. The Postgres SQL is byte-identical to
+        // before. Structurally: the backend-gated `FOR UPDATE` lock must still be
+        // applied to the `SELECT id ... ORDER BY id` query, which must precede the
+        // `for __row in & __ids` pre-scan loop.
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                hooks = CommentHooks,
+                dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict),
+                dependent(PgLikeRepository, fk = "comment_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        // The Postgres arm of the backend-gated lock suffix must still emit
+        // `FOR UPDATE`, bound into the child-id SELECT's `ORDER BY id{}` clause.
+        let pg_lock_pos = destroy_arm
+            .find("backend_select ! { pg => { \" FOR UPDATE\" } , sqlite => { \"\" } , }")
+            .expect(
+                "Codex P2: the child-id selection feeding the restrict pre-scan must \
+                 acquire FOR UPDATE on Postgres via the backend_select! lock seam",
+            );
+        let ordered_lock_pos = destroy_arm.find("ORDER BY id{}").expect(
+            "Codex P2: the child-id SELECT must append the backend-gated lock \
+             suffix to its ORDER BY id clause (SELECT id ... ORDER BY id{})",
+        );
+        let id_select_pos = destroy_arm
+            .find("SELECT id FROM")
+            .expect("the child-id selection query must be emitted");
+        let prescan_pos = destroy_arm
+            .find("for __row in & __ids")
+            .expect("the restrict pre-scan loop must be emitted");
+        // The backend-gated FOR UPDATE lock belongs to the child-id SELECT: the
+        // `__for_update` suffix binding is emitted just before the `format!`, and
+        // the `ORDER BY id{}` clause consumes it in the same query.
+        assert!(
+            pg_lock_pos < id_select_pos && id_select_pos < ordered_lock_pos,
+            "Codex P2: the backend-gated FOR UPDATE lock must belong to the child-id \
+             SELECT (ORDER BY id{{}} suffix): {destroy_arm}"
+        );
+        assert!(
+            id_select_pos < prescan_pos && ordered_lock_pos < prescan_pos,
+            "Codex P2: the locked child-id SELECT must run BEFORE the restrict \
+             pre-scan EXISTS pass so no FK insert can slip between probe and hook: \
+             {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_arm_separates_all_handled_from_physical_dedup() {
+        // #1800 case 1: the two dedup concerns are tracked in SEPARATE sets.
+        //   * `__deleted` records EVERY handled row (soft OR physical) — it backs the
+        //     bulk `delete_many` root dedup / hook double-fire guard, so a
+        //     soft-deleted descendant that is also a batch root is skipped by the
+        //     root hook loop (fires its `before_delete` exactly once).
+        //   * `__physical` records ONLY physically-removed rows — it backs the diamond
+        //     traversal revisit-skip, so a hard-delete path can still physically
+        //     remove a row a soft-delete path merely marked `deleted_at` on.
+        // For a `#[soft_delete]` child the `__deleted` mark is UNCONDITIONAL while the
+        // `__physical` mark is gated on a physical delete (`if ! __parent_soft`).
+        let soft = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let soft_arm = dependent_destroy_arm(&soft);
+        // "All handled" mark is unconditional (NOT gated on `if ! __parent_soft`), so
+        // a soft-deleted row is recorded for the bulk-root dedup.
+        assert!(
+            soft_arm.contains("__deleted . insert")
+                && !soft_arm.contains("if ! __parent_soft { __deleted . insert"),
+            "#1800 case 1: a soft_delete child must record __deleted (all handled) \
+             UNCONDITIONALLY so the bulk-root dedup skips it: {soft_arm}"
+        );
+        // Physical mark is gated on a physical delete only.
+        assert!(
+            soft_arm.contains("if ! __parent_soft { __physical . insert"),
+            "#1800 case 1: a soft_delete child must record __physical only on a physical \
+             delete (`if ! __parent_soft`): {soft_arm}"
+        );
+        // The diamond revisit-skip consults the PHYSICAL set, not the all-handled set,
+        // so a soft-visited row is still reachable by a later hard path.
+        assert!(
+            soft_arm.contains("if __physical . contains"),
+            "#1800 case 1: the diamond revisit-skip must consult __physical: {soft_arm}"
+        );
+        assert!(
+            soft_arm.contains("if __parent_soft && __record . deleted_at . is_some")
+                && soft_arm.contains("continue"),
+            "#1800 case 1: a redundant soft re-visit of an already-soft-deleted row \
+             must be skipped: {soft_arm}"
+        );
+        // A non-soft child is always physically deleted, so BOTH marks are
+        // unconditional (no `if ! __parent_soft` gate on either) and there is no
+        // soft-revisit skip.
+        let hard = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let hard_arm = dependent_destroy_arm(&hard);
+        assert!(
+            hard_arm.contains("__deleted . insert")
+                && hard_arm.contains("__physical . insert")
+                && !hard_arm.contains("if ! __parent_soft { __deleted . insert")
+                && !hard_arm.contains("if ! __parent_soft { __physical . insert"),
+            "#1800 case 1: a non-soft child must record BOTH __deleted and __physical \
+             unconditionally: {hard_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_bulk_root_skip_uses_all_handled_not_physical_set() {
+        // #1800 case 1: the bulk `delete_many` root dedup guards — the Phase-2 root
+        // skip and the HOOKED root loop skip — must consult the "all handled"
+        // `__autumn_deleted` set (which records soft AND physical deletes), NOT the
+        // physical-only set. Otherwise a soft-deleted descendant that is also a batch
+        // root would not be skipped and its `before_delete` would fire twice. The
+        // per-row diamond revisit-skip inside the leaf executor, by contrast, consults
+        // the physical set.
+        let generated = repository_macro(
+            quote! { Node, soft_delete, hooks = NodeHooks, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
+            quote! { pub trait NodeRepository {} },
+        )
+        .to_string();
+        let section = delete_many_section(&generated);
+        // The bulk-root dedup (Phase 2 + hooked root loop) references the all-handled
+        // set keyed by (table, id).
+        assert!(
+            section.contains("__autumn_deleted . contains (& (\"nodes\" , __autumn_pid))"),
+            "#1800: the bulk Phase-2 root skip must consult the all-handled \
+             __autumn_deleted set: {section}"
+        );
+        assert!(
+            section.contains("__autumn_deleted . contains (& (\"nodes\" , record . id))"),
+            "#1800: the hooked bulk-root hook loop skip must consult the all-handled \
+             __autumn_deleted set: {section}"
+        );
+        // The physical-only set is threaded into the bulk cascade calls (so the leaf
+        // executor's diamond revisit-skip has it) but is NOT what the bulk-root dedup
+        // consults.
+        assert!(
+            section.contains("__autumn_physically_deleted"),
+            "#1800: the physical-delete set must be threaded through the bulk cascade: {section}"
+        );
+        assert!(
+            !section.contains("__autumn_physically_deleted . contains"),
+            "#1800: the bulk-root dedup must NOT consult the physical-only set \
+             (that would regress soft-delete graphs): {section}"
+        );
+        // And the leaf executor's per-row diamond revisit-skip consults `__physical`.
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("if __physical . contains"),
+            "#1800: the leaf diamond revisit-skip must consult the physical set: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grandchild_restrict_prescan_skip_uses_physical_not_handled_set() {
+        // #1800 (Codex "Re-probe restricts on hard revisits"): the grandchild
+        // `restrict` PRE-SCAN skip must consult the PHYSICAL-delete set, NOT the
+        // "all handled" `__deleted` set. In a mixed soft/hard diamond a row that was
+        // soft-deleted on an earlier (soft-parent) path sits in `__deleted` but not
+        // in `__physical`. The Phase-2 mutating loop keys its revisit-skip on
+        // `__physical`, so it still hard-deletes that row on a later hard-delete
+        // path; the pre-scan MUST therefore also key on `__physical` so it re-runs
+        // the restrict probe on that hard revisit. If it kept keying on `__deleted`
+        // the probe would be skipped while the hard delete proceeds — firing the
+        // child hook and falling through to a raw FK failure instead of the typed
+        // 409 when the row has a soft-deleted restrict dependent.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        // Isolate the read-only restrict PRE-SCAN region: it iterates the ids by
+        // reference (`for __row in & __ids`) and ends where the Phase-2 mutating
+        // loop iterates them by value (`for __row in __ids`).
+        let prescan_start = destroy_arm
+            .find("for __row in & __ids")
+            .expect("#1800: restrict pre-scan loop (by-ref) present");
+        let after = &destroy_arm[prescan_start..];
+        let prescan_end = after
+            .find("for __row in __ids")
+            .expect("#1800: Phase-2 mutating loop (by-value) present");
+        let prescan = &after[..prescan_end];
+        // The pre-scan skip guard consults the physical set...
+        assert!(
+            prescan.contains("if ! __physical . contains"),
+            "#1800: the grandchild restrict pre-scan skip must consult __physical: {prescan}"
+        );
+        // ...and NOT the "all handled" set (which would skip the probe on a hard
+        // revisit of a soft-deleted row, letting the hard delete FK-fail).
+        assert!(
+            !prescan.contains("if ! __deleted . contains"),
+            "#1800: the grandchild restrict pre-scan skip must NOT consult the \
+             all-handled __deleted set (regresses the mixed soft/hard diamond): {prescan}"
+        );
+        // Consistency: the Phase-2 diamond revisit-skip below already keys on
+        // `__physical`, so the pre-scan now matches it.
+        assert!(
+            destroy_arm.contains("if __physical . contains"),
+            "#1800: the Phase-2 diamond revisit-skip must consult __physical: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_parent_restrict_probed_before_parent_before_delete_hook() {
+        // #1800 case 3: `assemble_cascade_body` must emit the parent's `restrict`
+        // dependent probe BEFORE the parent `before_delete` hook, mirroring the
+        // child-tier ordering — a restrict 409 must not leave a non-transactional
+        // parent hook side effect behind. Covers BOTH the repository-attribute
+        // (compile-time) and the model-declared (runtime) cascade branches.
+        //
+        // Repository-attribute branch: a hooked parent with a restrict dependent.
+        let repo_attr = repository_macro(
+            quote! { Post, hooks = PostHooks, dependent(PgGuardRepository, fk = "post_id", on_delete = restrict) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&repo_attr);
+        let restrict_pos = section
+            .find("DependentAction :: Restrict")
+            .expect("the parent restrict cascade call must be emitted");
+        let hook_pos = section
+            .find("self . hooks . before_delete")
+            .expect("the parent before_delete hook must be emitted");
+        assert!(
+            restrict_pos < hook_pos,
+            "#1800 case 3 (repo-attribute): the parent restrict probe must precede the \
+             parent before_delete hook: {section}"
+        );
+
+        // Model-declared branch: no repository-attribute dependent(...), so the
+        // parent cascade dispatches at runtime via Model::dependents(). The
+        // generated body has two arms (`if __autumn_rt_deps.is_empty()` plain path,
+        // `else` runtime-cascade path); scope to the runtime arm (it seeds
+        // `__autumn_path`) so the plain arm's hook doesn't confuse the ordering. The
+        // Phase-1 restrict loop (filtering on DependentAction::Restrict) must precede
+        // the parent before_delete hook there.
+        let model_side = repository_macro(
+            quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&model_side);
+        let runtime_arm_pos = section
+            .find("__autumn_path . insert")
+            .expect("the runtime cascade arm (seeding __autumn_path) must be emitted");
+        let runtime_arm = &section[runtime_arm_pos..];
+        let restrict_pos = runtime_arm
+            .find("== :: autumn_web :: repository :: DependentAction :: Restrict")
+            .expect("the runtime Phase-1 restrict filter must be emitted");
+        let hook_pos = runtime_arm
+            .find("self . hooks . before_delete")
+            .expect("the parent before_delete hook must be emitted");
+        assert!(
+            restrict_pos < hook_pos,
+            "#1800 case 3 (model-declared): the runtime restrict probe loop must precede \
+             the parent before_delete hook: {runtime_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_helper_destroy_arm_repo_attr_deps_do_not_runtime_dispatch() {
+        // Precedence (Codex P1, mirrors the top-level rule exactly to avoid
+        // double-cascade): a repository-attribute `dependent(...)` WINS — the
+        // Destroy arm keeps the #1739 compile-time grandchild recursion ONLY and
+        // must NOT also walk the runtime `Model::dependents()`, so a grandchild
+        // is never processed by both paths.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let helper = dependent_helper_body(&generated);
+        assert!(
+            !helper.contains("AutumnDependents"),
+            "a repo-attribute dependent(...) helper must not runtime-dispatch \
+             (repo-attr wins, no double-cascade): {helper}"
+        );
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("__autumn_apply_dependent_on_conn"),
+            "the #1739 compile-time grandchild recursion must remain: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_helper_fires_child_hooks() {
+        // AC4: destroy fires the child's before_delete lifecycle hook.
+        let generated = repository_macro(
+            quote! { Comment, hooks = CommentHooks, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let start = generated
+            .find("__autumn_apply_dependent_on_conn")
+            .expect("helper present");
+        let helper = &generated[start..];
+        assert!(
+            helper.contains("before_delete"),
+            "destroy path must fire the child's before_delete hook: {helper}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_defers_broadcast_to_post_commit() {
+        // AC4 + broadcast timing: a `broadcasts = true` (non-commit-hook) child
+        // must NOT publish mid-transaction — a rollback couldn't retract it.
+        // Instead the cascade *accumulates* (topic, dom_id) into a buffer, and
+        // the parent publishes them only AFTER the tx closure commits.
+        let generated = repository_macro(
+            quote! { Comment, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        // Child side: the destroy arm ACCUMULATES, it does not publish mid-tx.
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("__ret_broadcasts . push"),
+            "broadcasts-only child destroy must accumulate (topic, dom_id), not publish: {destroy_arm}"
+        );
+        assert!(
+            !destroy_arm.contains("publish_oob"),
+            "the child cascade must not publish an OOB broadcast mid-transaction: {destroy_arm}"
+        );
+        assert!(
+            !destroy_arm.contains("enqueue_repository_commit_hook_on_conn"),
+            "a broadcasts-only child must not enqueue a durable commit hook: {destroy_arm}"
+        );
+        // Parent side: the deferred broadcasts are published AFTER the tx closure
+        // (post-commit), i.e. after the connection is dropped.
+        let section = delete_by_id_section(&generated);
+        let tx_pos = section
+            .find("scoped_immediate_transaction")
+            .expect("dependent delete_by_id opens an immediate write transaction (#1996)");
+        let drop_pos = section
+            .find("mem :: drop")
+            .expect("dependent delete_by_id drops the conn after the tx");
+        let publish_pos = section
+            .find("publish_deferred_dependent_broadcasts")
+            .expect("parent must publish deferred cascade broadcasts");
+        assert!(
+            tx_pos < drop_pos && drop_pos < publish_pos,
+            "deferred cascade broadcasts must be published AFTER the tx closure / conn drop (post-commit): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_commit_hooks_child_enqueues_and_does_not_broadcast() {
+        // A commit_hooks child enqueues the durable hook (which carries the
+        // broadcast) and must NOT also accumulate/publish inline — no double emit.
+        let generated = repository_macro(
+            quote! { Comment, hooks = CommentHooks, commit_hooks = true, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("enqueue_repository_commit_hook_on_conn"),
+            "a commit_hooks child destroy must enqueue the durable commit hook: {destroy_arm}"
+        );
+        assert!(
+            !destroy_arm.contains("publish_oob")
+                && !destroy_arm.contains("__ret_broadcasts . push"),
+            "a commit_hooks child must not also accumulate/publish the inline broadcast (no double emit): {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_generates_typed_list_method() {
+        // #1126: `list()` is generated alongside `page()` and delegates
+        // ordering/filtering to the model's typed, allowlisted helpers — never
+        // raw SQL built from request input.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("fn list"),
+            "repository must declare a `list` method: {generated}"
+        );
+        assert!(
+            generated.contains("Post :: __autumn_list_apply_filters")
+                && generated.contains("Post :: __autumn_list_apply_order"),
+            "list() must apply sort/filter through the model's typed allowlist helpers: {generated}"
+        );
+        assert!(
+            generated.contains("into_boxed"),
+            "list() must build a boxed Diesel query (typed DSL), not string SQL: {generated}"
+        );
+        // The `list` body must not fabricate a raw ORDER BY / sql_query from the
+        // request — the allowlist helpers are the only ordering path.
+        let list_pos = generated.find("async fn list").expect("list impl present");
+        let list_body = &generated[list_pos..(list_pos + 2500).min(generated.len())];
+        assert!(
+            !list_body.contains("ORDER BY") && !list_body.contains("sql_query"),
+            "list() must not interpolate request-derived ORDER BY / raw SQL: {list_body}"
+        );
+        // #1841: without `owner =`, no scoped methods are emitted (zero impact
+        // on ordinary repositories).
+        assert!(
+            !generated.contains("list_scoped") && !generated.contains("search_page_scoped"),
+            "no `owner =` attr must emit no owner-scoped methods: {generated}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_with_owner() {
+        // #1841: `owner = <column>` is parsed onto `RepoConfig::owner_column`.
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id"#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(
+            config.owner_column.as_deref(),
+            Some("author_id"),
+            "owner attribute must be stored on RepoConfig"
+        );
+    }
+
+    #[test]
+    fn repository_owner_scoped_list_filters_owner_in_count_and_page() {
+        // #1841: `owner =` emits `list_scoped(owner_id, ..)` whose owner filter is
+        // applied to BOTH the COUNT and the page query, before the allowlisted
+        // sort/filter helpers, so `total` and the returned rows can never be
+        // widened past the owner's rows.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", owner = author_id },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("fn list_scoped"),
+            "owner-scoped repository must declare `list_scoped`: {generated}"
+        );
+        let pos = generated
+            .find("async fn list_scoped")
+            .expect("list_scoped impl present");
+        let body = &generated[pos..(pos + 3000).min(generated.len())];
+        // The owner filter must appear twice — once on the count query and once
+        // on the page query (`__count_q` / `__page_q` each gain a `.filter`).
+        let owner_filters = body.matches("posts :: author_id . eq (owner_id)").count();
+        assert!(
+            owner_filters >= 2,
+            "list_scoped must filter by owner on both the count and page query \
+             (found {owner_filters}): {body}"
+        );
+        assert!(
+            body.contains("__count_q = __count_q . filter (posts :: author_id . eq (owner_id))")
+                && body
+                    .contains("__page_q = __page_q . filter (posts :: author_id . eq (owner_id))"),
+            "list_scoped must filter both __count_q and __page_q by owner: {body}"
+        );
+    }
+
+    #[test]
+    fn repository_owner_scoped_search_filters_all_three_phases() {
+        // #1841: `owner =` + `searchable` emits `search_page_scoped(owner_id, ..)`
+        // that filters the COUNT raw SQL, the id-SELECT raw SQL, AND the typed
+        // hydration query by owner — all three, or `total`/rows would disagree
+        // and the endpoint could leak another user's rows.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", owner = author_id, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("fn search_page_scoped"),
+            "owner-scoped searchable repository must declare `search_page_scoped`: {generated}"
+        );
+        let pos = generated
+            .find("async fn search_page_scoped")
+            .expect("search_page_scoped impl present");
+        // #1996: the pg/sqlite `backend_select!` fork roughly doubled this method
+        // body, so widen the window from 9000 to 24000 to still reach the typed
+        // hydration owner filter (the filter itself is unchanged — the pg + sqlite
+        // COUNT/SELECT arms are simply emitted before it).
+        let body = &generated[pos..(pos + 24000).min(generated.len())];
+        // (a) COUNT raw SQL owner clause, (b) id-SELECT raw SQL owner clause —
+        // both go through the `" AND author_id = $3"` literal appended to
+        // count_sql / select_sql.
+        assert!(
+            body.contains("\" AND author_id = $3\""),
+            "search_page_scoped raw SQL (count + select) must filter by owner: {body}"
+        );
+        // owner id is bound positionally, never string-interpolated.
+        assert!(
+            body.contains(". bind :: < :: autumn_web :: reexports :: diesel :: sql_types :: BigInt , _ > (owner_id)"),
+            "search_page_scoped must bind owner_id as a positional BigInt param: {body}"
+        );
+        // (c) typed hydration owner filter.
+        assert!(
+            body.contains(
+                "records_query = records_query . filter (posts :: author_id . eq (owner_id))"
+            ),
+            "search_page_scoped hydration query must filter by owner: {body}"
         );
     }
 
@@ -9100,10 +19157,46 @@ mod tests {
         let impl_delete = generated
             .find("async fn delete_by_title")
             .expect("delete_by_title impl must be generated");
-        let section = &generated[impl_delete..impl_delete + 800];
+        let section = &generated[impl_delete..impl_delete + 1200];
         assert!(
             section.contains("deleted_at"),
             "derived delete_by_title must reference deleted_at in soft-delete mode: {section}"
+        );
+    }
+
+    // ── #1379: normalization wiring in the repository codegen ─────────────
+
+    #[test]
+    fn repository_macro_derived_finder_normalizes_string_lookup_arg() {
+        // AC3: a derived `find_by_email` must canonicalize its String argument
+        // through the model's `NormalizedModel` impl before filtering, so
+        // `find_by_email("FOO@X.COM")` matches the stored `foo@x.com` row.
+        let generated = repository_macro(
+            quote! { User },
+            quote! { pub trait UserRepository {
+                fn find_by_email(email: String) -> Vec<User>;
+            } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("SpezLookup :: < User >"),
+            "derived finder must normalize its String lookup argument: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_normalizes_new_input() {
+        // AC2: the insert path (`save`/`save_many`) normalizes the `New*` input
+        // before the `before_create` hook and the DB write.
+        let generated =
+            repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
+        assert!(
+            generated.contains("SpezNormalize (new) . spez_normalize ()"),
+            "save must normalize the New input before persisting: {generated}"
+        );
+        assert!(
+            generated.contains("SpezNormalize (new) . spez_normalize_many ()"),
+            "save_many must normalize each New input before persisting: {generated}"
         );
     }
 
@@ -9288,6 +19381,221 @@ mod tests {
         );
     }
 
+    /// #1996: the version-history writer and reader must fork through
+    /// `backend_select!` so a `versioned = true` repository runs on `SQLite`.
+    ///
+    /// The Postgres arm keeps its `::jsonb` / `::bigint` / `::timestamptz` /
+    /// `changes::text` casts and the `Timestamptz` diesel type verbatim; the
+    /// `SQLite` arm drops every cast (JSON is stored as TEXT) and names
+    /// `TimestamptzSqlite` (there is no `FromSql<Timestamptz, Sqlite>`), and the
+    /// writer additionally binds `recorded_at` so TEXT range comparisons stay
+    /// monotonic. This assertion pins each of those forks in the generated tokens.
+    #[test]
+    fn repository_macro_versioned_history_forks_sqlite_dialect() {
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // Both the writer and the reader route through the backend seam.
+        assert!(
+            generated.contains("backend_select ! { pg =>"),
+            "versioned repository must emit a backend_select! fork: {generated}"
+        );
+
+        // ── Write path ────────────────────────────────────────────────
+        // Postgres keeps the jsonb cast; SQLite drops it and binds recorded_at.
+        let write_pos = generated
+            .find("INSERT INTO _autumn_version_history")
+            .expect("versioned repository must write history");
+        let write_section = &generated[write_pos..];
+        assert!(
+            write_section.contains("$7 :: jsonb") || write_section.contains("$7::jsonb"),
+            "the Postgres write arm must keep the $7::jsonb cast: {write_section}"
+        );
+        // The SQLite insert names all eight columns (recorded_at bound
+        // explicitly) and uses uncast $1..$8 placeholders. The literal preserves
+        // its `\`-continuations, so the column list and the VALUES clause are on
+        // separate source lines — assert each single-line fragment independently.
+        assert!(
+            generated.contains(
+                "(table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at)"
+            ),
+            "the SQLite write arm must bind recorded_at as an 8th column: {generated}"
+        );
+        assert!(
+            generated.contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"),
+            "the SQLite write arm must use uncast $1..$8 placeholders: {generated}"
+        );
+        // The SQLite write arm binds the explicit timestamp via chrono Utc::now().
+        assert!(
+            generated.contains("Utc :: now ())"),
+            "the SQLite write arm must bind recorded_at explicitly (Utc::now()): {generated}"
+        );
+
+        // ── Read path (SQLite arm drops every Postgres cast) ──────────
+        assert!(
+            generated.contains("SELECT COUNT(*) AS count"),
+            "the SQLite count arm must drop the ::bigint cast: {generated}"
+        );
+        assert!(
+            generated.contains("($3 IS NULL OR tenant_id = $3)"),
+            "the SQLite read arm must drop the $3::text tenant cast: {generated}"
+        );
+        assert!(
+            generated.contains("($4 IS NULL OR recorded_at >= $4)")
+                && generated.contains("($5 IS NULL OR recorded_at <= $5)"),
+            "the SQLite read arm must drop the ::timestamptz range casts: {generated}"
+        );
+        // The SQLite read arm must name TimestamptzSqlite (there is no
+        // FromSql<Timestamptz, Sqlite>) for the recorded_at column type and the
+        // range-filter binds.
+        assert!(
+            generated.contains("TimestamptzSqlite"),
+            "the SQLite read arm must use TimestamptzSqlite: {generated}"
+        );
+
+        // The Postgres arm must still carry its casts verbatim (no regression).
+        assert!(
+            generated.contains("SELECT COUNT(*)::bigint AS count")
+                && generated.contains("($3::text IS NULL OR tenant_id = $3)")
+                && generated.contains("($4::timestamptz IS NULL OR recorded_at >= $4)")
+                && generated.contains("changes::text AS changes"),
+            "the Postgres read arm must keep its ::bigint/::text/::timestamptz/changes::text casts: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_searchable_forks_sqlite_fts5() {
+        // #1910: the full-text search codegen must fork into pg/sqlite
+        // `backend_select!` arms. Postgres keeps tsvector ranked search; SQLite
+        // queries an external-content FTS5 virtual table (`"<table>__fts"`),
+        // MATCH-filtered and bm25-ranked over SEARCH_FIELDS.
+        let generated = repository_macro(
+            quote! { Post, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The search methods must route through the backend seam.
+        assert!(
+            generated.contains("backend_select ! { pg =>"),
+            "a searchable repository must emit a backend_select! fork: {generated}"
+        );
+
+        // ── SQLite arm: FTS5 MATCH + bm25, no LIKE / tsvector functions ──
+        assert!(
+            generated.contains("{tbl}__fts") && generated.contains("MATCH $1"),
+            "the SQLite search arm must MATCH against the FTS5 virtual table: {generated}"
+        );
+        assert!(
+            generated.contains("bm25(\\\"{tbl}__fts\\\""),
+            "the SQLite search arm must rank with bm25 over the FTS5 table: {generated}"
+        );
+        // Codex P2 (#1910): every base-table column referenced across the FTS
+        // JOIN must be qualified with the base table (`"{tbl}".<col>`), or a
+        // model that marks a base column (e.g. `tenant_id`) `#[searchable]`
+        // would make SQLite raise `ambiguous column name`. The selected id and
+        // the bm25 tiebreak id are both base-table-qualified.
+        assert!(
+            generated.contains("SELECT \\\"{tbl}\\\".id FROM \\\"{tbl}\\\""),
+            "the SQLite search select must qualify id against the base table: {generated}"
+        );
+        assert!(
+            generated.contains("\\\"{tbl}\\\".id DESC"),
+            "the SQLite bm25 tiebreak must qualify id against the base table: {generated}"
+        );
+        assert!(
+            generated.contains("SEARCH_FIELDS"),
+            "the SQLite search arm must derive its bm25 weights from SEARCH_FIELDS: {generated}"
+        );
+        assert!(
+            generated.contains("sqlite_fts5_match_query"),
+            "the SQLite search arm must sanitize the MATCH query (fail-closed): {generated}"
+        );
+        assert!(
+            !generated.contains("LIKE $1 ESCAPE"),
+            "the SQLite search arm must NOT keep the old LIKE fallback: {generated}"
+        );
+
+        // ── Postgres arm: tsvector ranked search preserved (no regression) ──
+        assert!(
+            generated.contains("websearch_to_tsquery"),
+            "the Postgres search arm must keep websearch_to_tsquery: {generated}"
+        );
+        assert!(
+            generated.contains("ts_rank_cd"),
+            "the Postgres search arm must keep ts_rank_cd ranking: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_tenant_scoped_searchable_filters_tenant_in_both_arms() {
+        // #1910: tenant isolation is load-bearing — BOTH the pg (tsvector) and
+        // sqlite (FTS5) arms must carry the `tenant_id = $n` predicate so a search
+        // never crosses tenants on either backend. The pg arm binds tenant at $3;
+        // the sqlite arm renumbers to $2 (the FTS5 MATCH string is $1).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("AND tenant_id = $3"),
+            "the Postgres search arm must filter tenant_id = $3: {generated}"
+        );
+        // Codex P2 (#1910): the SQLite tenant predicate must be base-table-
+        // qualified (`"{tbl}".tenant_id`) so a searchable `tenant_id` column
+        // (which also lands on `<table>__fts`) doesn't make it ambiguous under
+        // the FTS JOIN. The predicate survives — only the qualification changes.
+        assert!(
+            generated.contains("AND \\\"{tbl}\\\".tenant_id = $2"),
+            "the SQLite search arm must filter \"{{tbl}}\".tenant_id = $2: {generated}"
+        );
+        // The pg arm still ranks with tsvector; the sqlite arm still MATCHes FTS5.
+        assert!(
+            generated.contains("websearch_to_tsquery") && generated.contains("MATCH $1"),
+            "both search arms must survive tenant scoping: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_owner_scoped_searchable_forks_sqlite_fts5() {
+        // #1910: the owner-scoped search_page_scoped (#1841) path must fork too,
+        // and the owner filter must survive in BOTH arms so an owner-scoped search
+        // never leaks another user's rows. pg binds owner at $3; sqlite renumbers
+        // the owner filter to $2 (FTS5 MATCH string is $1).
+        let generated = repository_macro(
+            quote! { Post, owner = user_id, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("search_page_scoped"),
+            "an owner-scoped searchable repository must emit search_page_scoped: {generated}"
+        );
+        // Postgres owner filter (ranked) and SQLite owner filter (FTS5 MATCH).
+        assert!(
+            generated.contains("AND user_id = $3"),
+            "the Postgres owner-scoped arm must filter user_id = $3: {generated}"
+        );
+        // Codex P2 (#1910): the SQLite owner predicate must be base-table-
+        // qualified (`"posts"."user_id"`) so a searchable owner column doesn't
+        // collide with the `<table>__fts` side of the JOIN. The owner filter
+        // survives — only the qualification changes.
+        assert!(
+            generated.contains("AND \\\"posts\\\".\\\"user_id\\\" = $2"),
+            "the SQLite owner-scoped arm must filter \"posts\".\"user_id\" = $2: {generated}"
+        );
+        assert!(
+            generated.contains("websearch_to_tsquery") && generated.contains("MATCH $1"),
+            "both owner-scoped search arms must be present: {generated}"
+        );
+    }
+
     #[test]
     fn repository_macro_versioned_update_locks_before_history_diff_without_expected_version() {
         let generated = repository_macro(
@@ -9296,13 +19604,19 @@ mod tests {
         )
         .to_string();
 
+        // The versioned-update load was reshaped: a single `load_query` is now
+        // declared once, and the no-expected-version arm is the `else` branch that
+        // loads the before image through the `maybe_for_update!` lock seam
+        // (`FOR UPDATE` on Postgres, a plain read on `SQLite`) instead of a bare
+        // `.for_update()` chain. That branch must still lock the row before the
+        // history diff (`INSERT INTO _autumn_version_history`) is computed.
         let no_expected_branch = generated
-            .find("} else { load_query")
+            .find("} else { :: autumn_web :: maybe_for_update ! (load_query)")
             .expect("versioned update should have a no-expected-version load branch");
         let section = &generated[no_expected_branch..];
         let lock_pos = section
-            .find(". for_update ()")
-            .expect("versioned update must lock the row before computing history diff");
+            .find("maybe_for_update ! (load_query)")
+            .expect("versioned update must lock the row (maybe_for_update! seam) before computing history diff");
         let first_pos = section
             .find(". first :: < Post >")
             .expect("versioned update should load the row before applying the update");
@@ -9312,7 +19626,7 @@ mod tests {
 
         assert!(
             lock_pos < first_pos && first_pos < history_pos,
-            "versioned update must SELECT FOR UPDATE before loading the before image and writing history: {section}"
+            "versioned update must lock (maybe_for_update! → FOR UPDATE on Postgres) before loading the before image and writing history: {section}"
         );
     }
 
@@ -9374,16 +19688,128 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_tenant_scoped_upsert_many_rejects_partial() {
+    fn repository_macro_versioned_upsert_many_gates_advisory_lock_to_postgres_only() {
+        // Bug 1 (#1996, PR #2021): `pg_advisory_xact_lock` is a Postgres-only
+        // function; emitting it unconditionally made versioned `upsert_many` fail
+        // at runtime on SQLite. The advisory-lock acquisition must now sit inside
+        // a `backend_select!` whose `pg` arm holds it and whose `sqlite` arm is
+        // empty — SQLite is single-writer, so the serialization is already
+        // guaranteed and nothing must be acquired.
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let select_pos = generated
+            .find("backend_select")
+            .expect("versioned upsert_many must wrap the advisory lock in a backend_select!");
+        let lock_pos = generated
+            .find("pg_advisory_xact_lock")
+            .expect("versioned upsert_many must still acquire the advisory lock on Postgres");
+        assert!(
+            select_pos < lock_pos,
+            "the advisory lock must be emitted inside the backend_select! (pg arm), not before it: {generated}"
+        );
+        // The `pg =>` selector must precede the advisory lock, proving it lives in
+        // the Postgres arm (skipped on SQLite where the arm is empty).
+        let pg_arm_pos = generated[select_pos..]
+            .find("pg =>")
+            .map(|p| select_pos + p)
+            .expect("backend_select! must have a pg arm");
+        assert!(
+            pg_arm_pos < lock_pos,
+            "pg_advisory_xact_lock must be inside the `pg =>` arm of the backend_select!: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_tenant_scoped_upsert_many_reconciles_dropped_rows_fail_closed() {
         let generated = repository_macro(
             quote! { Post, tenant_scoped },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
 
+        // The tenant-scoped path must NOT emit the old `!has_lock` partial
+        // rejection — a cross-tenant-filtered row is dropped by the SQL
+        // ON CONFLICT ... WHERE tenant_id = $t predicate and must stay silent,
+        // matching single-op cross-tenant scoping and sibling update_many/delete_many.
         assert!(
-            generated.contains("! has_lock && upserted . len () != records . len ()"),
-            "tenant-scoped upsert_many must reject partial upserts when lock versioning is absent: {generated}"
+            !generated.contains("! has_lock && upserted . len () != records . len ()"),
+            "tenant-scoped upsert_many must not loudly reject cross-tenant-filtered partial upserts: {generated}"
+        );
+
+        // (a) #1963 + Codex P2 fail-closed reconciliation: on a drop, the
+        // tenant-scoped path re-selects the DROPPED ids UNDER THE CURRENT TENANT
+        // SCOPE and only then decides. The distinctive reconciliation tokens must
+        // be present.
+        assert!(
+            generated.contains("__autumn_dropped_ids")
+                && generated.contains("__autumn_still_present"),
+            "tenant-scoped upsert_many must emit the drop-triggered tenant-scoped reconciliation: {generated}"
+        );
+
+        // (b) It must NOT be the OLD blanket "409 on ANY size mismatch" behavior:
+        // the size-mismatch guard must lead into a tenant-scoped RE-SELECT of the
+        // dropped ids BEFORE any Conflict is returned — i.e. the ordering is
+        //   guard  <  dropped-id computation  <  tenant re-select  <  Conflict return
+        // and a `tenant_id . eq` tenant filter sits inside that reconciliation.
+        let guard_pos = generated
+            .find("has_lock && upserted . len () != records . len ()")
+            .expect("reconciliation must be guarded by the size-mismatch check");
+        let dropped_pos = generated
+            .find("__autumn_dropped_ids")
+            .expect("reconciliation must compute the dropped ids");
+        let still_present_pos = generated
+            .find("__autumn_still_present")
+            .expect("reconciliation must re-select the dropped ids under tenant scope");
+        // The Conflict returned by the reconciliation is the one that appears
+        // AFTER the tenant re-select (the earlier Conflict is the pre-upsert
+        // detector). Its presence proves we fail closed on a genuine same-tenant
+        // lock conflict discovered post-upsert.
+        let recon_conflict_rel = generated[still_present_pos..]
+            .find("RepositoryError :: Conflict")
+            .expect("reconciliation must fail closed with a Conflict once a dropped row is still present under the tenant");
+        let recon_conflict_pos = still_present_pos + recon_conflict_rel;
+        assert!(
+            guard_pos < dropped_pos
+                && dropped_pos < still_present_pos
+                && still_present_pos < recon_conflict_pos,
+            "reconciliation must re-select dropped ids under tenant scope before returning a Conflict: {generated}"
+        );
+        // The reconciliation's re-select must be tenant-scoped (a second
+        // `tenant_id . eq` filter and a FOR UPDATE lock sit between the guard and
+        // the Conflict return), so a cross-tenant row is filtered out and cannot
+        // reintroduce the #1963 false positive.
+        let recon_body = &generated[guard_pos..recon_conflict_pos];
+        assert!(
+            recon_body.contains("tenant_id . eq") && recon_body.contains("for_update"),
+            "reconciliation re-select must filter by tenant and lock FOR UPDATE: {generated}"
+        );
+
+        // (c) Genuine same-tenant optimistic-lock conflicts are ALSO caught up
+        // front by the PRE-upsert per-row lock detector (operating on the
+        // tenant-filtered, FOR UPDATE `existing_rows`), which must remain present.
+        // `incoming_lock != db_lock` is unique to that pre-upsert detector.
+        assert!(
+            generated.contains("incoming_lock != db_lock")
+                && generated.contains("expected_version : incoming_lock"),
+            "tenant-scoped upsert_many must retain the pre-upsert optimistic-lock conflict detector: {generated}"
+        );
+
+        // (d) The NON-tenant branch is unchanged: it still emits the coarse
+        // post-upsert size check with its `conflict_msg`. (Generated from a
+        // non-tenant-scoped versioned repo so the `else` branch is selected.)
+        let non_tenant = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            non_tenant.contains("has_lock && upserted . len () != records . len ()")
+                && non_tenant.contains("potential lock-version/optimistic lock conflict"),
+            "non-tenant upsert_many must retain its coarse post-upsert size check: {non_tenant}"
         );
     }
 
@@ -9570,6 +19996,460 @@ mod tests {
         assert!(
             generated.contains("save"),
             "non-versioned repository must still generate save"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_sharded_flag() {
+        let tokens: proc_macro2::TokenStream = "Post, tenant_scoped, sharded".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert!(config.sharded, "sharded attribute must be set");
+        assert!(config.tenant_scoped, "tenant_scoped must also be set");
+    }
+
+    #[test]
+    fn parse_repo_args_sharded_defaults_off() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(!config.sharded, "sharded must default to false");
+    }
+
+    #[test]
+    fn parse_repo_args_sharded_alone() {
+        // `sharded` without `tenant_scoped` is allowed — routing uses
+        // ShardKeyOverride or the tenancy config.
+        let tokens: proc_macro2::TokenStream = "Post, sharded".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.sharded);
+        assert!(!config.tenant_scoped);
+    }
+
+    // ── §1d: sharded + tenant_scoped across_tenants fan-out ────────
+
+    #[test]
+    fn sharded_tenant_scoped_find_all_contains_fan_out_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The fan-out guard iterates __shards
+        assert!(
+            generated.contains("__shards"),
+            "sharded+tenant_scoped find_all must contain fan-out guard over __shards: {generated}"
+        );
+        // It must build a per-shard sub-repo via __autumn_for_shard, which
+        // honors that shard's read routing and the parent request context
+        // (rather than with_pool_untracked, which forces primary + resets the
+        // timeout).
+        assert!(
+            generated.contains("__autumn_for_shard"),
+            "fan-out guard must build sub-repo via __autumn_for_shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_for_shard_helper_honors_read_route_and_timeout() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // __autumn_for_shard must source pool + read route from the shard and
+        // carry the parent's statement timeout / slow threshold.
+        assert!(
+            generated.contains("fn __autumn_for_shard"),
+            "must emit the __autumn_for_shard helper: {generated}"
+        );
+        assert!(
+            generated.contains("__shard . read_route ()")
+                || generated.contains("__shard.read_route()"),
+            "sub-repo must adopt the shard's read_route: {generated}"
+        );
+        assert!(
+            generated
+                .contains("__autumn_statement_timeout_ms : self . __autumn_statement_timeout_ms")
+                || generated
+                    .contains("__autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms"),
+            "sub-repo must preserve the parent statement timeout: {generated}"
+        );
+    }
+
+    /// The connection-acquire helper forks `statement_timeout` per backend
+    /// (issue #1996, item 4). The Postgres arm keeps `SET statement_timeout`
+    /// exactly; the `SQLite` arm is a deliberate no-op — `SQLite` cannot enforce
+    /// a per-statement timeout through the async connection wrapper, so autumn-web
+    /// fail-closes at boot (`db::reject_sqlite_statement_timeout`) whenever a
+    /// non-zero timeout is configured under the sqlite backend, which guarantees
+    /// `timeout_ms` is always 0 by the time it reaches the `SQLite` arm. This test
+    /// pins BOTH arms so a future edit cannot (a) drop the Postgres `SET`, or
+    /// (b) turn the `SQLite` arm into something that silently applies/misuses a
+    /// real timeout value.
+    #[test]
+    fn statement_timeout_forks_per_backend_with_sqlite_noop() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        // The value is threaded and capped before the fork.
+        assert!(
+            generated.contains("let timeout_ms = self . __autumn_statement_timeout_ms")
+                || generated.contains("let timeout_ms = self.__autumn_statement_timeout_ms"),
+            "must read the threaded statement timeout: {generated}"
+        );
+
+        // Postgres arm: the `SET statement_timeout` session statement is emitted
+        // verbatim (Postgres behavior must be 100% unchanged).
+        assert!(
+            generated.contains("SET statement_timeout = {timeout_ms}"),
+            "pg arm must still emit `SET statement_timeout`: {generated}"
+        );
+
+        // SQLite arm: an explicit `let _ = timeout_ms ;` no-op — NOT a
+        // `SET statement_timeout`, NOT any other application of the value. The
+        // boot guard (asserted by the runtime test
+        // `sqlite_statement_timeout_fail_closed`) makes this no-op correct rather
+        // than a silent swallow of a configured guarantee.
+        let sqlite_arm_start = generated
+            .find("sqlite => { { let _ = timeout_ms ;")
+            .or_else(|| generated.find("sqlite => {{ let _ = timeout_ms ;"));
+        assert!(
+            sqlite_arm_start.is_some(),
+            "sqlite arm must be the deliberate `let _ = timeout_ms;` no-op backed by \
+             the boot guard: {generated}"
+        );
+
+        // The two arms live inside one `backend_select!` seam.
+        assert!(
+            generated.contains("backend_select ! { pg => { {"),
+            "the fork must be a backend_select! seam: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_find_by_id_fans_out() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__autumn_find_by_id_one_shard"),
+            "sharded+tenant_scoped find_by_id must fan out via a one-shard helper: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_derived_read_fans_out() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! {
+                pub trait PostRepository {
+                    async fn find_by_title(&self, title: String) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+
+        // A derived read fans out via a generated one-shard helper rather than
+        // hitting only the originally-routed shard.
+        assert!(
+            generated.contains("__autumn_find_by_title_one_shard"),
+            "derived read must fan out via a one-shard helper: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_derived_read_with_borrowed_param_rejects() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! {
+                pub trait PostRepository {
+                    async fn find_by_title(&self, title: &str) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+
+        // A borrowed param can't be cloned into an owned 'static value for the
+        // fan-out futures, so it must reject cross-shard rather than emit a
+        // one-shard helper (which would not compile).
+        assert!(
+            !generated.contains("__autumn_find_by_title_one_shard"),
+            "borrowed-param derived read must not fan out: {generated}"
+        );
+        assert!(
+            generated.contains("cross-shard find_by_title is not supported"),
+            "borrowed-param derived read must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_derived_write_rejects_cross_shard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! {
+                pub trait PostRepository {
+                    async fn delete_by_title(&self, title: String);
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("cross-shard derived writes are not supported"),
+            "derived write on a sharded across_tenants repo must reject: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_fan_out_calls_inherent_one_shard_helpers_not_trait_methods() {
+        // Regression: the fan-out must route through inherent
+        // `__autumn_*_one_shard` helpers rather than recursively calling the
+        // RPITIT trait methods, or the read futures' `Send` auto-trait becomes
+        // unprovable once hooks/versioning add captured state (issue #1209 §1d).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, versioned = true, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        for helper in [
+            "__autumn_find_all_one_shard",
+            "__autumn_count_one_shard",
+            "__autumn_exists_by_id_one_shard",
+        ] {
+            assert!(
+                generated.contains(helper),
+                "fan-out must define and call the inherent helper {helper}: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn versioned_tenant_scoped_delete_many_chunk_is_a_block_expression() {
+        // Regression: the chunked delete in the versioned path is assigned with
+        // `let chunk_deleted_ids = <expr>`, so the tenant-scoped
+        // `delete_returning_expr` must be a braced block — otherwise it emits
+        // `let chunk_deleted_ids = let query = ...` (issue #1209 §1e).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, versioned = true, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("let chunk_deleted_ids = {"),
+            "versioned+tenant_scoped delete_many must wrap the chunk expression in a block: {generated}"
+        );
+        assert!(
+            !generated.contains("let chunk_deleted_ids = let "),
+            "versioned+tenant_scoped delete_many must not emit `let x = let y` : {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_count_contains_fan_out_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let count_pos = generated
+            .find("async fn count")
+            .expect("count must be generated");
+        let section = &generated[count_pos..count_pos + 600];
+        assert!(
+            section.contains("__shards"),
+            "sharded+tenant_scoped count must fan out across shards: {section}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_exists_by_id_contains_fan_out_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let pos = generated
+            .find("async fn exists_by_id")
+            .expect("exists_by_id must be generated");
+        let section = &generated[pos..pos + 800];
+        assert!(
+            section.contains("__shards"),
+            "sharded+tenant_scoped exists_by_id must fan out across shards: {section}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_write_methods_have_cross_shard_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The error message for cross-shard writes must appear in generated code
+        assert!(
+            generated.contains("cross-shard writes are not supported"),
+            "sharded+tenant_scoped write methods must include cross-shard write guard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_page_has_cross_shard_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let page_pos = generated
+            .find("async fn page")
+            .expect("page must be generated");
+        let section = &generated[page_pos..page_pos + 600];
+        assert!(
+            section.contains("cross-shard pagination is not supported"),
+            "sharded+tenant_scoped page() must include cross-shard pagination guard: {section}"
+        );
+    }
+
+    #[test]
+    fn non_sharded_tenant_scoped_has_no_fan_out_guard() {
+        // Non-sharded repos must NOT have the shard fan-out code
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("cross-shard writes are not supported"),
+            "non-sharded repo must not contain cross-shard write guard: {generated}"
+        );
+        assert!(
+            !generated.contains("cross-shard pagination is not supported"),
+            "non-sharded repo must not contain cross-shard pagination guard: {generated}"
+        );
+    }
+
+    // ── §1d: cross-shard soft-delete / search / version_history / preload ──
+
+    #[test]
+    fn sharded_tenant_scoped_soft_delete_readers_fan_out_and_reject() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // with_deleted / only_deleted fan out via inherent one-shard helpers.
+        assert!(
+            generated.contains("__autumn_with_deleted_one_shard"),
+            "with_deleted must fan out via a one-shard helper: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_only_deleted_one_shard"),
+            "only_deleted must fan out via a one-shard helper: {generated}"
+        );
+        // page_only_deleted is paginated and must reject cross-shard.
+        assert!(
+            generated.contains("cross-shard page_only_deleted is not supported"),
+            "page_only_deleted must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_search_fans_out_and_search_page_rejects() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // search (Vec-returning) fans out via an inherent one-shard helper.
+        assert!(
+            generated.contains("__autumn_search_one_shard"),
+            "search must fan out via a one-shard helper: {generated}"
+        );
+        // search_page is paginated and must reject cross-shard.
+        assert!(
+            generated.contains("cross-shard search_page is not supported"),
+            "search_page must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_version_history_rejects_cross_shard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // version_history is keyed by a single (per-shard ambiguous) record_id
+        // and is paginated, so it rejects rather than fanning out.
+        assert!(
+            generated.contains("cross-shard version_history is not supported"),
+            "version_history must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_preload_rejects_cross_shard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // preload cannot load associations from a single routed connection
+        // across shards, so it rejects cross-shard.
+        assert!(
+            generated.contains("cross-shard preload is not supported"),
+            "preload must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn non_sharded_soft_delete_readers_have_no_fan_out() {
+        // Non-sharded soft_delete repos keep the plain readers (no helpers,
+        // no reject messages).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("__autumn_with_deleted_one_shard"),
+            "non-sharded with_deleted must not emit a one-shard helper: {generated}"
+        );
+        assert!(
+            !generated.contains("cross-shard page_only_deleted is not supported"),
+            "non-sharded page_only_deleted must not reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_without_tenant_scoped_has_no_write_guard() {
+        // `sharded` alone (no `tenant_scoped`) means no across_tenants(), so
+        // the write guard is also not generated.
+        let generated = repository_macro(
+            quote! { Post, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("cross-shard writes are not supported"),
+            "sharded-only repo must not contain cross-shard write guard: {generated}"
         );
     }
 }

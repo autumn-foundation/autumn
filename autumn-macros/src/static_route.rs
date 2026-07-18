@@ -129,6 +129,13 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let static_meta_name = format_ident!("__autumn_static_meta_{}", fn_name);
     let vis = &input_fn.vis;
 
+    // Honor a `#[public]` marker on the handler so the route audit gate can
+    // classify this static route as `public` rather than `unclassified`.
+    // Mirrors the standard `#[get]`/`#[post]` route macro (see
+    // `crate::route`), which is the only place `is_public` was previously
+    // wired.
+    let is_public = crate::api_doc::is_public(&input_fn);
+
     // Build the revalidate expression
     let revalidate_expr = attrs.revalidate.map_or_else(
         || quote! { ::core::option::Option::None },
@@ -183,10 +190,21 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     required_roles: &[],
                     register_schemas: ::core::option::Option::None,
                     api_version: ::core::option::Option::None,
+                    public: #is_public,
+                    module_path: ::core::module_path!(),
                     ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::None,
                 idempotency: ::autumn_web::RouteIdempotency::Direct,
+                // Live inbound requests to this GET route (a manifest miss, no
+                // `dist`, or a cache read that falls through to the dynamic
+                // router) inherit the global deadline like any other route, so a
+                // slow/hung handler can't bypass `request_timeout_ms`. The
+                // build/ISR prerenders that drive this route internally are
+                // exempted instead via the `RenderDeadlineExempt` request marker
+                // (see `autumn_web::static_gen`), scoping the exemption to those
+                // internal renders rather than the live route metadata.
+                timeout: ::autumn_web::RouteTimeout::Inherit,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
             }
@@ -201,5 +219,60 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 params_fn: #params_fn_expr,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+
+    use super::static_get_macro;
+
+    #[test]
+    fn static_get_defaults_public_false() {
+        let generated = static_get_macro(
+            quote! { "/about" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("public : false"),
+            "an unannotated static route must record public = false: {generated}"
+        );
+        // The handler's module path is captured for audit diagnostics.
+        assert!(generated.contains("module_path"));
+    }
+
+    #[test]
+    fn static_get_marks_public_when_public_attribute_present() {
+        // Ordering A: `#[static_get]` outermost, `#[public]` still an attribute below.
+        let generated = static_get_macro(
+            quote! { "/about" },
+            quote! {
+                #[public]
+                async fn about() -> &'static str { "about" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("public : true"),
+            "a #[public] static route must record public = true: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_marks_public_from_expanded_marker() {
+        // Ordering B: `#[public]` written above `#[static_get]`, so it expands
+        // first and injects the `__AUTUMN_PUBLIC` marker into the body; the
+        // static route macro must recognize the marker.
+        let public_fn = crate::public::public_macro(
+            quote! {},
+            quote! { async fn about() -> &'static str { "about" } },
+        );
+        let generated = static_get_macro(quote! { "/about" }, public_fn).to_string();
+        assert!(
+            generated.contains("public : true"),
+            "a static route macro over an expanded #[public] marker must record public = true: {generated}"
+        );
     }
 }

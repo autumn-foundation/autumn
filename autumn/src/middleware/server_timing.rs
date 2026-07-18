@@ -1,0 +1,558 @@
+//! Server-Timing response header middleware (#1348).
+//!
+//! Emits a standards-conformant
+//! [`Server-Timing`](https://www.w3.org/TR/server-timing/) header on
+//! served responses when enabled by
+//! [`ObservabilityConfig`](crate::config::ObservabilityConfig).
+//!
+//! The header carries at minimum a `total` metric (whole-request wall
+//! time, measured with the same clock as the access log's `duration_ms`),
+//! and a `db;dur=…;desc="N queries"` metric summarising cumulative query
+//! time and query count when at least one instrumented DB query ran
+//! during the request. The count is exposed via `desc` for N+1 visibility
+//! in the browser's Network → Timing pane.
+//!
+//! The header is **off in production by default** and **on in the `dev`
+//! profile**; see [`crate::config::server_timing_enabled`]. The middleware
+//! is a no-op when disabled — it wraps the inner service directly and
+//! never allocates.
+//!
+//! # Streaming responses
+//!
+//! Responses whose `content-type` is `text/event-stream` (SSE) carry only
+//! the `total` metric. The `total` value reflects time to first byte —
+//! response headers are flushed once the middleware returns — not the full
+//! stream lifetime. Handlers that stream via other content types have a
+//! full metric set attached; if the body's duration matters, prefer a
+//! purpose-built metric emitted before the stream starts.
+//!
+//! # Units
+//!
+//! `dur` values are milliseconds as `f64`, rounded to three decimal places
+//! (`format!("{:.3}", …)`). The `total` metric uses the identical formula
+//! as [`AccessLogLayer`](crate::middleware::access_log) —
+//! `elapsed().as_secs_f64() * 1000.0`. Because this layer is applied outer
+//! to the access log, its `total` brackets the access-log `duration_ms`
+//! and the two agree within a few microseconds for the same request (the
+//! access log does path-matching work between the two `Instant` captures).
+//! See
+//! `docs/guide/observability/server-timing.md` in the repository for a
+//! browser `DevTools` walk-through.
+
+use std::fmt::Write as _;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
+use std::time::Instant;
+
+use axum::http::{HeaderName, HeaderValue, Request, Response};
+use pin_project_lite::pin_project;
+use tower::{Layer, Service};
+
+#[cfg(feature = "db")]
+use crate::db::{REQUEST_DB_TIMINGS, RequestDbTimings};
+
+/// Per-request DB-timing accumulator carried alongside the `Enabled` future.
+///
+/// With the `db` feature it is a shared [`RequestDbTimings`] the query
+/// instrumentation records into via the task-local; without `db` there is
+/// nothing to record, so it collapses to `()`.
+#[cfg(feature = "db")]
+type DbTimings = Arc<RequestDbTimings>;
+#[cfg(not(feature = "db"))]
+type DbTimings = ();
+
+/// The inner future for the enabled path.
+///
+/// With the `db` feature the inner service future is wrapped in the
+/// [`REQUEST_DB_TIMINGS`] task-local scope so DB query instrumentation can
+/// record into the accumulator; without `db` it is the bare service future.
+#[cfg(feature = "db")]
+type ScopedInner<F> = tokio::task::futures::TaskLocalFuture<Arc<RequestDbTimings>, F>;
+#[cfg(not(feature = "db"))]
+type ScopedInner<F> = F;
+
+/// Wrap the inner service future so DB query timings can be accumulated.
+///
+/// With the `db` feature this establishes the [`REQUEST_DB_TIMINGS`]
+/// task-local scope and returns the accumulator to read back after poll;
+/// without `db` it is a no-op passing the future through untouched.
+#[cfg(feature = "db")]
+fn scope_inner<F: Future>(fut: F) -> (DbTimings, ScopedInner<F>) {
+    // Always construct a FRESH per-scope accumulator. Each `ServerTimingLayer`
+    // scope measures only the DB queries that run under its own scope, so
+    // nested Server-Timing scopes stay isolated and never share counts.
+    //
+    // This isolation is load-bearing. When both `server_timing` and `mcp` are
+    // enabled, `ServerTimingLayer` nests `REQUEST_DB_TIMINGS` twice (the outer
+    // `/mcp` fallback envelope + the inner dispatch). If the inner scope reused
+    // the outer accumulator, the inner dispatch and the outer fallback would
+    // share DB counts and the fallback would re-emit the same `db` metric the
+    // MCP path already forwarded — double-emitting `db` for a DB-backed MCP
+    // tool call. A fresh accumulator per scope keeps each `db` metric correct.
+    //
+    // Request-wide SQL capture (the test harness's `TestResponse` assertions)
+    // rides a SEPARATE task-local lane — `crate::db::REQUEST_QUERY_CAPTURE` —
+    // scoped once around the whole request, so it is entirely unaffected by how
+    // this timing accumulator is scoped or nested here.
+    let timings = Arc::new(RequestDbTimings::default());
+    // Scope the inner future so any DB query instrumentation that runs
+    // during it can record into `timings` via the task-local. We keep a
+    // clone of the Arc outside the scope to read back after poll.
+    let scope = REQUEST_DB_TIMINGS.scope(Arc::clone(&timings), fut);
+    (timings, scope)
+}
+
+#[cfg(not(feature = "db"))]
+const fn scope_inner<F>(fut: F) -> (DbTimings, ScopedInner<F>) {
+    ((), fut)
+}
+
+/// Snapshot the accumulated DB timing for a completed request.
+///
+/// Returns `(db_ms, query_count)`, with `db_ms` present only when at least
+/// one instrumented query ran. Without the `db` feature the query
+/// instrumentation is compiled out, so the snapshot is always `(None, 0)`.
+#[cfg(feature = "db")]
+fn read_db_snapshot(timings: &DbTimings) -> (Option<f64>, usize) {
+    let query_count = timings.query_count.load(Ordering::Relaxed);
+    let db_micros = timings.total_us.load(Ordering::Relaxed);
+    let db_ms = if query_count == 0 {
+        None
+    } else {
+        // Match the `total` formula: microseconds → f64 ms.
+        #[allow(clippy::cast_precision_loss)]
+        Some((db_micros as f64) / 1000.0)
+    };
+    (db_ms, query_count)
+}
+
+// Without the `db` feature there is no query instrumentation, so the snapshot
+// is always empty. The `&DbTimings` (a `&()`) parameter keeps the signature
+// identical to the `db` variant so the call site needs no feature gate.
+#[cfg(not(feature = "db"))]
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn read_db_snapshot(_timings: &DbTimings) -> (Option<f64>, usize) {
+    (None, 0)
+}
+
+/// Header name for the `Server-Timing` response header.
+static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
+
+/// Shared sentinel coordinating the primary and fallback `Server-Timing`
+/// layers, mirroring `AccessLogEmitted`.
+///
+/// The fallback inserts it into the **request** extensions on the way in, and
+/// the primary flips it once it appends its header, so the outermost fallback
+/// only stamps responses that short-circuited before the primary ran. It
+/// rides the request (not the response) because error-page / exception
+/// filters may rebuild the response entirely, which would drop a
+/// response-side marker — and because appending the header twice would emit a
+/// duplicate `total` metric.
+#[derive(Clone, Debug, Default)]
+pub struct ServerTimingEmitted(Arc<AtomicBool>);
+
+impl ServerTimingEmitted {
+    /// Flip the sentinel so the outermost fallback layer stays silent.
+    ///
+    /// The primary layer calls this when it appends its header, so a request
+    /// that flows through both layers carries a single `total` metric. The MCP
+    /// endpoint deliberately does *not* call this: it forwards only the inner
+    /// dispatch's non-`total` metrics and lets the fallback append the real
+    /// `/mcp` `total` (which brackets the endpoint's body buffering).
+    pub(crate) fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_marked(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Tower [`Layer`] that stamps a `Server-Timing` response header on every
+/// served response.
+///
+/// Applied automatically by the framework router when
+/// `server_timing_enabled` resolves
+/// to `true` for the active configuration/profile.
+#[derive(Clone, Debug)]
+pub struct ServerTimingLayer {
+    enabled: bool,
+    fallback: bool,
+}
+
+impl ServerTimingLayer {
+    /// Create the primary layer. Pass `enabled = false` to make the layer a
+    /// pass-through no-op — used in tests and by the router when the
+    /// feature is turned off. When it appends its header it flips the
+    /// [`ServerTimingEmitted`] sentinel the fallback planted, keeping the
+    /// fallback silent for that request.
+    #[must_use]
+    pub const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            fallback: false,
+        }
+    }
+
+    /// Create the outermost fallback layer: it appends the `Server-Timing`
+    /// header only for responses that do **not** already carry the
+    /// [`ServerTimingEmitted`] marker — i.e. requests that short-circuited
+    /// (startup 503, pre-built static page hit, session-store outage,
+    /// late `/mcp` merge) before the primary layer ran. Emits `total` only;
+    /// short-circuit paths run no instrumented DB queries.
+    #[must_use]
+    pub const fn fallback(enabled: bool) -> Self {
+        Self {
+            enabled,
+            fallback: true,
+        }
+    }
+}
+
+impl<S> Layer<S> for ServerTimingLayer {
+    type Service = ServerTimingService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ServerTimingService {
+            inner,
+            enabled: self.enabled,
+            fallback: self.fallback,
+        }
+    }
+}
+
+/// Tower [`Service`] produced by [`ServerTimingLayer`]. Constructed by the
+/// layer — you do not build this directly.
+#[derive(Clone, Debug)]
+pub struct ServerTimingService<S> {
+    inner: S,
+    enabled: bool,
+    fallback: bool,
+}
+
+impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for ServerTimingService<S>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = ServerTimingFuture<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        if !self.enabled {
+            return ServerTimingFuture::Disabled {
+                inner: self.inner.call(req),
+            };
+        }
+        let mut req = req;
+        // Coordinate the primary and fallback layers via the shared sentinel,
+        // mirroring the access-log fallback: the fallback plants it for the
+        // primary to flip; the primary picks it up when present (it is absent
+        // in bare setups that apply only the primary layer).
+        let sentinel = if self.fallback {
+            let sentinel = ServerTimingEmitted::default();
+            req.extensions_mut().insert(sentinel.clone());
+            Some(sentinel)
+        } else {
+            req.extensions().get::<ServerTimingEmitted>().cloned()
+        };
+        let (timings, inner) = scope_inner(self.inner.call(req));
+        ServerTimingFuture::Enabled {
+            start: Instant::now(),
+            timings,
+            inner,
+            fallback: self.fallback,
+            sentinel,
+        }
+    }
+}
+
+pin_project! {
+    /// Future that stamps the `Server-Timing` header on the returned response.
+    ///
+    /// Two variants: `Disabled` passes the inner future through untouched;
+    /// `Enabled` scopes the DB task-local and computes the header when the
+    /// inner future resolves.
+    #[project = ServerTimingProj]
+    pub enum ServerTimingFuture<F: Future> {
+        Disabled {
+            #[pin] inner: F,
+        },
+        Enabled {
+            start: Instant,
+            timings: DbTimings,
+            #[pin] inner: ScopedInner<F>,
+            // `true` for the outermost fallback layer, which must skip
+            // emission when the primary already stamped the header.
+            fallback: bool,
+            // Shared marker: flipped by the primary on emit, checked by the
+            // fallback to avoid a duplicate `total` metric. `None` in bare
+            // primary-only setups (no fallback planted it).
+            sentinel: Option<ServerTimingEmitted>,
+        },
+    }
+}
+
+impl<F, ResBody, E> Future for ServerTimingFuture<F>
+where
+    F: Future<Output = Result<Response<ResBody>, E>>,
+{
+    type Output = Result<Response<ResBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            ServerTimingProj::Disabled { inner } => inner.poll(cx),
+            ServerTimingProj::Enabled {
+                start,
+                timings,
+                inner,
+                fallback,
+                sentinel,
+            } => match inner.poll(cx) {
+                Poll::Ready(Ok(mut response)) => {
+                    // The fallback stays silent when the primary already
+                    // stamped the header, so a request flowing through both
+                    // layers carries a single `total` metric. Short-circuit
+                    // responses never ran the primary, so the marker is unset
+                    // and the fallback emits.
+                    let already_emitted = *fallback
+                        && sentinel
+                            .as_ref()
+                            .is_some_and(ServerTimingEmitted::is_marked);
+                    if !already_emitted {
+                        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        let (db_ms, query_count) = read_db_snapshot(timings);
+                        let streaming = is_streaming_response(&response);
+                        let value = build_header_value(total_ms, db_ms, query_count, streaming);
+                        if let Ok(hv) = HeaderValue::from_str(&value) {
+                            // Append rather than insert so any `Server-Timing`
+                            // metrics a handler already emitted are preserved —
+                            // the W3C spec allows multiple comma-joined metrics
+                            // across repeated header lines.
+                            response.headers_mut().append(SERVER_TIMING.clone(), hv);
+                        }
+                        // Primary flips the sentinel so the outer fallback
+                        // knows not to append a duplicate `total`.
+                        if !*fallback && let Some(sentinel) = sentinel.as_ref() {
+                            sentinel.mark();
+                        }
+                    }
+                    Poll::Ready(Ok(response))
+                }
+                other => other,
+            },
+        }
+    }
+}
+
+/// Return `true` when the response's `content-type` starts with
+/// `text/event-stream` (case-insensitive) — i.e. an SSE stream, whose
+/// timing header should carry only the `total` metric.
+fn is_streaming_response<B>(response: &Response<B>) -> bool {
+    response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
+}
+
+/// Build the `Server-Timing` header value from measured request metrics.
+///
+/// Extracted for unit tests; the middleware calls this on every enabled
+/// response. The output is always a `total;dur=<ms>` metric, and — unless
+/// `streaming` is set — a `db;dur=<ms>;desc="N queries"` metric when at
+/// least one DB query ran. Durations are rounded to three decimals.
+pub fn build_header_value(
+    total_ms: f64,
+    db_ms: Option<f64>,
+    query_count: usize,
+    streaming: bool,
+) -> String {
+    let mut out = format!("total;dur={total_ms:.3}");
+    if streaming {
+        return out;
+    }
+    if let Some(db) = db_ms
+        && query_count > 0
+    {
+        let noun = if query_count == 1 { "query" } else { "queries" };
+        // Header format is bounded and small; write! into the buffer to
+        // avoid an intermediate allocation.
+        let _ = write!(out, ", db;dur={db:.3};desc=\"{query_count} {noun}\"");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_header_value_total_only_when_no_queries() {
+        let v = build_header_value(12.345, None, 0, false);
+        assert_eq!(v, "total;dur=12.345");
+    }
+
+    #[test]
+    fn build_header_value_db_uses_singular_query_word() {
+        let v = build_header_value(20.0, Some(3.5), 1, false);
+        assert_eq!(v, "total;dur=20.000, db;dur=3.500;desc=\"1 query\"");
+    }
+
+    #[test]
+    fn build_header_value_db_uses_plural_queries_word() {
+        let v = build_header_value(50.0, Some(21.25), 14, false);
+        assert_eq!(v, "total;dur=50.000, db;dur=21.250;desc=\"14 queries\"");
+    }
+
+    #[test]
+    fn build_header_value_streaming_omits_db_even_when_present() {
+        let v = build_header_value(9.0, Some(4.0), 2, true);
+        assert_eq!(v, "total;dur=9.000");
+    }
+
+    #[test]
+    fn build_header_value_zero_query_count_omits_db_even_with_ms() {
+        let v = build_header_value(1.0, Some(0.0), 0, false);
+        assert_eq!(v, "total;dur=1.000");
+    }
+
+    /// P2 nested-isolation regression: with an active outer `REQUEST_DB_TIMINGS`
+    /// scope (as `ServerTimingLayer`'s outer `/mcp` fallback establishes when
+    /// both `server_timing` and `mcp` are enabled), `scope_inner` must build a
+    /// FRESH accumulator — NOT reuse the outer one. Sharing the accumulator
+    /// would make the inner dispatch and the outer fallback accumulate into the
+    /// same counts, so the fallback re-emits the same `db` metric the MCP path
+    /// already forwarded, double-emitting `db` for a DB-backed MCP tool call.
+    /// A distinct `Arc` per scope is what keeps each `db` metric correct.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn scope_inner_isolates_nested_scopes() {
+        let outer = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&outer), async {
+                let (inner, _scope) = scope_inner(std::future::ready(()));
+                assert!(
+                    !Arc::ptr_eq(&inner, &outer),
+                    "nested scope_inner must isolate with a fresh accumulator, \
+                     not share the outer one (which would double-emit the db metric)"
+                );
+            })
+            .await;
+    }
+
+    /// With NO active outer scope (the production/dev path), `scope_inner`
+    /// builds a fresh accumulator so server-timing reads its own per-request
+    /// counts — unchanged behavior.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn scope_inner_creates_fresh_accumulator_off_scope() {
+        let (fresh, _scope) = scope_inner(std::future::ready(()));
+        assert_eq!(
+            fresh.query_count.load(Ordering::Relaxed),
+            0,
+            "a fresh off-scope accumulator starts with no recorded queries"
+        );
+    }
+
+    /// The P2 fix decouples query capture from the timing accumulator: capturing
+    /// rides `crate::db::REQUEST_QUERY_CAPTURE`, a task-local separate from the
+    /// nested `REQUEST_DB_TIMINGS` timing scopes. This reproduces the reported
+    /// scenario without a live database: with a capture sink scoped, record a
+    /// query under an INNER `scope_inner` timing scope nested inside an OUTER
+    /// one, and assert (a) the capture sink collects the query exactly once (no
+    /// duplication) and (b) the two nested timing accumulators are distinct
+    /// `Arc`s (no shared counts → no duplicate `db` metric).
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn nested_scopes_do_not_duplicate_capture_and_stay_isolated() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        crate::db::REQUEST_QUERY_CAPTURE
+            .scope(Arc::clone(&capture), async {
+                // Outer timing scope (e.g. the `/mcp` fallback envelope).
+                let (outer_timings, outer_scope) = scope_inner(async {
+                    // Inner timing scope (the dispatch layer) runs the query.
+                    let (inner_timings, inner_scope) = scope_inner(async {
+                        crate::db::record_request_db_query(
+                            Duration::from_micros(500),
+                            Some("SELECT * FROM books WHERE id = $1"),
+                        );
+                    });
+                    inner_scope.await;
+                    inner_timings
+                });
+                let inner_timings = outer_scope.await;
+                assert!(
+                    !Arc::ptr_eq(&outer_timings, &inner_timings),
+                    "nested timing scopes must be distinct Arcs (no shared counts)"
+                );
+            })
+            .await;
+
+        let captured = capture
+            .lock()
+            .map(|v| v.clone())
+            .expect("capture mutex poisoned");
+        assert_eq!(
+            captured.len(),
+            1,
+            "the query must be captured exactly once — no duplication across \
+             nested Server-Timing scopes"
+        );
+        assert_eq!(captured[0].sql, "SELECT * FROM books WHERE id = $1");
+    }
+
+    /// End-to-end coverage of the db-metric path without a live database:
+    /// enter the `REQUEST_DB_TIMINGS` task-local scope the middleware sets,
+    /// record two queries through the same crate-internal hook the connection
+    /// instrumentation uses (`db.rs`'s `record_request_db_query`), snapshot the
+    /// accumulator, then feed it into [`build_header_value`] and assert the
+    /// emitted `db;dur=…;desc="N queries"` metric. This mirrors what a real DB
+    /// request produces.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn db_accumulator_feeds_header_value() {
+        use std::time::Duration;
+
+        let timings = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&timings), async {
+                crate::db::record_request_db_query(Duration::from_micros(1_500), None);
+                crate::db::record_request_db_query(Duration::from_micros(2_500), None);
+            })
+            .await;
+
+        let query_count = timings.query_count.load(Ordering::Relaxed);
+        let db_micros = timings.total_us.load(Ordering::Relaxed);
+        assert_eq!(
+            query_count, 2,
+            "both instrumented queries should be counted"
+        );
+        assert_eq!(
+            db_micros, 4_000,
+            "microsecond totals should accumulate (1500 + 2500)"
+        );
+
+        #[allow(clippy::cast_precision_loss)]
+        let db_ms = (db_micros as f64) / 1000.0;
+        let value = build_header_value(50.0, Some(db_ms), query_count, false);
+        assert_eq!(
+            value, "total;dur=50.000, db;dur=4.000;desc=\"2 queries\"",
+            "accumulated db time and query count should surface in the header"
+        );
+    }
+}

@@ -130,6 +130,53 @@ curl http://localhost:3000/backoffice/jobs
 The jobs page shows enqueued, running, completed, and failed work, plus the
 registered scheduled cleanup task.
 
+## Subscribe to the feed
+
+The blog exposes an Atom 1.0 feed of published posts at `/feed.xml`, built with
+Autumn's `feed::Feed` renderer. The whole route is under 20 lines of wiring
+(see [`src/routes/feed.rs`](src/routes/feed.rs)):
+
+```rust
+use autumn_web::feed::{Feed, FeedEntry};
+use autumn_web::reexports::axum::response::Response;
+use autumn_web::reexports::http::HeaderMap;
+use autumn_web::{AutumnResult, Db, get};
+
+use crate::models::Post;
+
+const SITE_URL: &str = "https://autumn-demo.example.com";
+
+#[get("/feed.xml")]
+pub async fn feed_xml(mut db: Db, headers: HeaderMap) -> AutumnResult<Response> {
+    let posts = Post::published(&mut db).await?;
+    let feed = Feed::atom("Autumn Blog", SITE_URL, format!("{SITE_URL}/feed.xml"))
+        .author("Autumn Blog")
+        .entries(posts.iter().map(|p| {
+            let url = format!("{SITE_URL}/posts/{}", p.slug);
+            FeedEntry::new(url.clone(), p.title.as_str(), url)
+                .summary(p.body.as_str())
+                .published(p.created_at.and_utc())
+                .updated(p.updated_at.and_utc())
+        }));
+    Ok(feed.conditional(&headers))
+}
+```
+
+`Feed` implements `IntoResponse` and sets `Content-Type: application/atom+xml`,
+XML-escaping every text field. `Feed::conditional(&headers)` reuses Autumn's
+`etag` layer, so an unchanged feed is served as `304 Not Modified`:
+
+```bash
+# Fetch the feed and note the ETag header
+curl -i http://localhost:3000/feed.xml
+
+# Repeat with the ETag — the server responds 304 Not Modified with no body
+curl -i -H 'If-None-Match: "<etag-from-above>"' http://localhost:3000/feed.xml
+```
+
+Swap `Feed::atom` for `Feed::rss` (same arguments) to serve RSS 2.0 with
+`Content-Type: application/rss+xml` instead.
+
 ## Try the hybrid-rendering flow
 
 The `/about` page is declared with `#[static_get("/about")]`.
@@ -276,6 +323,7 @@ git diff routes.txt
 | GET | `/` | Public blog listing |
 | GET | `/about` | Static page rendered via `#[static_get]` |
 | GET | `/greet` | i18n demo with locale switcher |
+| GET | `/feed.xml` | Atom feed of published posts (conditional GET / 304) |
 | GET | `/posts/{slug}` | View a published post |
 | GET | `/admin` | Admin post dashboard |
 | GET | `/admin/new` | New post form |

@@ -1,0 +1,188 @@
+name: Cold-Start Onboarding Gate
+
+# Scheduled weekly + manual trigger (issue #977).
+# Per-PR: only the `--cold-start --dry-run` budget table and the measurement
+# unit tests run (no build/compile of a throwaway project needed).
+# Weekly / manual: the full cold-start measurement executes — it scaffolds a
+# throwaway project and compiles it from a cold target, which is far too slow
+# and variable for a per-PR required check, so it is gated behind the
+# `workflow_dispatch` and `schedule` triggers only via the
+# `if: github.event_name != 'pull_request'` condition on the measure job.
+on:
+  schedule:
+    # Every Monday at 07:00 UTC (an hour after the warm dev-loop gate).
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Number of cold-start measurement runs (each is a full clean compile)"
+        required: false
+        default: "3"
+      include_db:
+        description: "Also measure the database-backed shape (informational)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      fail_on_regression:
+        description: "Exit 1 if the no-DB cold start exceeds its budget"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+  pull_request:
+    branches: [trunk, trunk-dev]
+    paths:
+      # Re-run when the benchmark module, the live measurement driver, CLI
+      # plumbing, scaffolding, docs, or this workflow change.
+      - "autumn-cli/src/dev_loop_bench.rs"
+      - "autumn-cli/src/cold_start_driver.rs"
+      - "autumn-cli/src/new.rs"
+      - "autumn-cli/src/main.rs"
+      # The harness builds the *generated* project, whose sources are embedded
+      # from these templates via `include_str!`, so template-only changes must
+      # still run the cold-start smoke/unit checks.
+      - "autumn-cli/src/templates/**"
+      - "docs/guide/dev-loop-latency.md"
+      - ".github/workflows/cold-start-latency.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Minimal token scope: every job only needs to read the repo. Artifact upload
+# and step-summary writes do not require additional permissions.
+permissions:
+  contents: read
+
+jobs:
+  # ── Budget table smoke-check (runs on every PR, no build/server) ───────────
+  budget-table:
+    name: Cold-start budget table (dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Build CLI
+        run: cargo build -p autumn-cli
+
+      - name: Print cold-start budget table
+        run: |
+          AUTUMN_BENCH_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          AUTUMN_BENCH_RUST_VERSION="$(rustc --version)" \
+          ./target/debug/autumn dev-loop-bench --cold-start --dry-run --include-db
+
+  # ── Unit tests for measurement module ─────────────────────────────────────
+  unit-tests:
+    name: Measurement unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Run cold-start measurement unit tests
+        # `shell: bash` enables `pipefail` on the runner, so a failing
+        # `cargo test` is not masked by the `tee` in the pipeline.
+        shell: bash
+        run: |
+          # Pass the relevant module names as test-binary filters so the pure
+          # logic in `dev_loop_bench`, the live-driver helpers in
+          # `cold_start_driver` (scaffold locate/repoint, zero-run, dry-run), and
+          # the `new` scaffold-generation tests (which exercise the embedded
+          # templates this workflow also triggers on) are all run.
+          cargo test -p autumn-cli \
+            -- dev_loop_bench cold_start_driver new:: \
+            2>&1 | tee test-output.txt
+          grep -E "^test result:" test-output.txt
+          # Guard against a stale filter silently matching zero tests: assert a
+          # representative test from each targeted module actually ran.
+          for module in dev_loop_bench cold_start_driver new; do
+            if ! grep -qE "^test ${module}::tests::.* \.\.\. ok" test-output.txt; then
+              echo "::error::No ${module} unit tests ran — the test filter may be stale."
+              exit 1
+            fi
+          done
+
+  # ── Live cold-start measurement (scheduled / manual only) ──────────────────
+  measure:
+    name: Measure cold-start onboarding
+    runs-on: ubuntu-latest
+    # Only run live measurement on schedule or manual dispatch, not on PRs.
+    if: github.event_name != 'pull_request'
+    # A cold compile of a fresh project can take many minutes per run.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Build CLI
+        run: cargo build -p autumn-cli
+
+      - name: Run cold-start benchmark
+        id: bench
+        # `shell: bash` enables `pipefail`, so a non-zero exit from the
+        # benchmark (scaffold/build failure, server timeout, or a tripped
+        # `--fail-on-regression`) fails the step instead of being swallowed by
+        # the `tee` pipeline.
+        shell: bash
+        run: |
+          export AUTUMN_BENCH_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export AUTUMN_BENCH_RUST_VERSION="$(rustc --version)"
+          RUNS="${{ inputs.runs || '3' }}"
+          INCLUDE_DB="${{ inputs.include_db || 'false' }}"
+          FAIL="${{ inputs.fail_on_regression || 'true' }}"
+          FAIL_FLAG=""
+          if [ "$FAIL" = "true" ]; then FAIL_FLAG="--fail-on-regression"; fi
+          DB_FLAG=""
+          if [ "$INCLUDE_DB" = "true" ]; then DB_FLAG="--include-db"; fi
+          ./target/debug/autumn dev-loop-bench --cold-start \
+            --runs "$RUNS" \
+            --output cold-start-report.json \
+            $DB_FLAG \
+            $FAIL_FLAG | tee cold-start-summary.txt
+
+      - name: Upload JSON report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: cold-start-report-${{ github.run_id }}
+          path: |
+            cold-start-report.json
+            cold-start-summary.txt
+          retention-days: 90
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## Cold-Start Onboarding Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          cat cold-start-summary.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Full JSON report archived as workflow artifact \`cold-start-report-${{ github.run_id }}\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "See [dev-loop-latency.md](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/guide/dev-loop-latency.md#cold-start-onboarding-budget) for the budget and methodology." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Regression gate
+        if: ${{ inputs.fail_on_regression == 'true' || inputs.fail_on_regression == '' }}
+        run: |
+          # Fail closed: a missing or unparseable report must NOT pass the gate.
+          ALL_PASSED=$(jq -r '.all_passed' cold-start-report.json 2>/dev/null || echo "false")
+          if [ "$ALL_PASSED" != "true" ]; then
+            echo "::error::The no-DB cold-start onboarding budget was exceeded."
+            echo "::error::See the report artifact for per-shape diagnostics and next actions."
+            exit 1
+          fi

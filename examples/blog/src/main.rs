@@ -36,6 +36,12 @@ impl SitemapSource for BlogSitemapSource {
 async fn main() {
     autumn_web::app()
         .migrations(MIGRATIONS)
+        // In-process fragment cache for the post-list view. Rendered post
+        // cards are cached by `(post.id, post.updated_at)` (see
+        // `routes::posts::post_card`), so unchanged rows skip the `html!{}`
+        // work and editing a post re-renders only that card. Swap in the
+        // Redis backend to share the cache across replicas.
+        .with_cache_backend(autumn_web::cache::MokaCache::new(1_000, None))
         // Auto-load i18n bundle from `i18n/<locale>.ftl` according to the
         // `[i18n]` block in `autumn.toml`. Visit `/greet` to see it work
         // end-to-end with a locale switcher.
@@ -54,7 +60,8 @@ async fn main() {
             routes::about::about, // #[static_get] — pre-rendered
             routes::posts::index,
             routes::posts::show,
-            routes::greet::greet, // i18n demo
+            routes::greet::greet,   // i18n demo
+            routes::feed::feed_xml, // Atom feed of published posts
             // Admin routes
             routes::posts::admin_list,
             routes::posts::new_form,
@@ -156,5 +163,32 @@ mod tests {
 
         assert!(html.contains("Autumn Blog"), "html: {html}");
         assert!(!html.contains("nav.brand"), "html: {html}");
+    }
+
+    #[tokio::test]
+    async fn home_hero_i18n_keys_resolve_in_both_locales() {
+        let bundle = autumn_web::i18n::Bundle::load_from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("i18n"),
+            &autumn_web::i18n::I18nConfig {
+                supported_locales: vec!["en".to_owned(), "es".to_owned()],
+                ..Default::default()
+            },
+        )
+        .expect("blog i18n bundle");
+        let bundle = std::sync::Arc::new(bundle);
+
+        let en = autumn_web::i18n::Locale::new("en").with_bundle(bundle.clone());
+        assert_eq!(en.t("home.hero.title"), "Welcome to the Blog");
+        assert_eq!(
+            en.t("home.hero.subtitle"),
+            "Thoughts, tutorials, and stories — powered by Autumn."
+        );
+
+        let es = autumn_web::i18n::Locale::new("es").with_bundle(bundle);
+        assert_eq!(es.t("home.hero.title"), "Bienvenido al Blog");
+        assert_eq!(
+            es.t("home.hero.subtitle"),
+            "Reflexiones, tutoriales e historias — con la potencia de Autumn."
+        );
     }
 }

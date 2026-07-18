@@ -1,0 +1,29 @@
+# Autumn configuration for {{project_name}} — a multi-tenant SaaS starter.
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[log]
+level = "info"
+
+[health]
+path = "/health"
+
+[database]
+# Matches docker-compose.yml. Point this at your own Postgres in production.
+url = "postgres://autumn:autumn@localhost:5432/{{crate_name}}"
+pool_size = 10
+
+# Tenancy is middleware-driven: every request resolves a tenant from the session
+# (seeded at signup/login), and the tenant_scoped repositories filter each query
+# by it automatically — handlers never touch `with_tenant`. The public_paths
+# below stay reachable without a tenant so unauthenticated visitors can reach the
+# login/signup screens and static assets; a missing tenant on any other route
+# redirects to login instead of returning a raw 401.
+[tenancy]
+enabled = true
+source = "session"
+session_key = "tenant_id"
+public_paths = ["/", "/login", "/signup", "/logout", "/static", "/favicon.ico"]
+login_redirect = "/login"

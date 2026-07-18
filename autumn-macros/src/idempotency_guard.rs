@@ -18,7 +18,7 @@ fn block_has_generated_replay_guard(block: &Block) -> bool {
             return true;
         }
 
-        if stmt_is_generated_auth_prologue(stmt) {
+        if stmt_is_generated_auth_prologue(stmt) || stmt_is_generated_throttle_prologue(stmt) {
             index += 1;
             continue;
         }
@@ -51,7 +51,8 @@ fn stmt_is_generated_replay_guard(stmt: &Stmt) -> bool {
 fn stmt_is_generated_auth_prologue(stmt: &Stmt) -> bool {
     if matches!(
         stmt,
-        Stmt::Item(Item::Const(item)) if item.ident == "__AUTUMN_SECURED_ROLES"
+        Stmt::Item(Item::Const(item))
+            if item.ident == "__AUTUMN_SECURED_ROLES" || item.ident == "__AUTUMN_SECURED_SCOPES"
     ) {
         return true;
     }
@@ -61,6 +62,68 @@ fn stmt_is_generated_auth_prologue(stmt: &Stmt) -> bool {
     };
 
     if_let_generated_check_returns_error(expr_if)
+}
+
+/// Skips the two statements the `#[throttle]` macro prepends ahead of the
+/// idempotency-replay guard when it expands BEFORE the route macro (i.e.
+/// `#[throttle]` written above `#[get]`/`#[post]`): the
+/// `const __AUTUMN_THROTTLE_ROUTE_ID` bucket-namespace constant and the
+/// `if let Err(__autumn_throttle_response) = …__check_throttle(…).await { return … }`
+/// guard. Recognizing them lets the body scan reach the generated replay guard
+/// that follows, so the route macro suppresses the outer
+/// `IdempotencyReplayLayer` under this attribute ordering exactly as it already
+/// does for `#[secured]`/`#[authorize]` (which expand the same way when written
+/// above the route attribute).
+fn stmt_is_generated_throttle_prologue(stmt: &Stmt) -> bool {
+    if matches!(
+        stmt,
+        Stmt::Item(Item::Const(item)) if item.ident == "__AUTUMN_THROTTLE_ROUTE_ID"
+    ) {
+        return true;
+    }
+
+    let Stmt::Expr(Expr::If(expr_if), _) = stmt else {
+        return false;
+    };
+
+    if_let_throttle_check_returns(expr_if)
+}
+
+fn if_let_throttle_check_returns(expr_if: &ExprIf) -> bool {
+    let Expr::Let(expr_let) = expr_if.cond.as_ref() else {
+        return false;
+    };
+
+    pat_is_err_throttle_response(&expr_let.pat)
+        && expr_is_generated_throttle_check_call(&expr_let.expr)
+        && block_returns_ident(&expr_if.then_branch, "__autumn_throttle_response")
+}
+
+fn pat_is_err_throttle_response(pat: &Pat) -> bool {
+    match pat {
+        Pat::TupleStruct(tuple) => {
+            path_matches(&tuple.path, &["core", "result", "Result", "Err"])
+                && tuple.elems.len() == 1
+                && pat_binds_ident(&tuple.elems[0], "__autumn_throttle_response")
+        }
+        _ => false,
+    }
+}
+
+fn expr_is_generated_throttle_check_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Await(await_expr) => expr_is_generated_throttle_check_call(&await_expr.base),
+        Expr::Call(call) => {
+            path_expr_matches(&call.func, &["autumn_web", "security", "__check_throttle"])
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_state"))
+        }
+        Expr::Group(group) => expr_is_generated_throttle_check_call(&group.expr),
+        Expr::Paren(paren) => expr_is_generated_throttle_check_call(&paren.expr),
+        _ => false,
+    }
 }
 
 fn if_let_replays_and_returns(expr_if: &ExprIf) -> bool {
@@ -149,6 +212,20 @@ fn expr_is_generated_auth_check_call(expr: &Expr) -> bool {
         Expr::Call(call)
             if path_expr_matches(
                 &call.func,
+                &["autumn_web", "auth", "__check_secured_scopes"],
+            ) =>
+        {
+            // __check_secured_scopes(__autumn_token_scopes…, __AUTUMN_SECURED_SCOPES)
+            call.args.len() == 2
+                && call
+                    .args
+                    .iter()
+                    .nth(1)
+                    .is_some_and(|arg| path_expr_ends_with(arg, "__AUTUMN_SECURED_SCOPES"))
+        }
+        Expr::Call(call)
+            if path_expr_matches(
+                &call.func,
                 &["autumn_web", "authorization", "__check_policy"],
             ) =>
         {
@@ -165,10 +242,46 @@ fn expr_is_generated_auth_check_call(expr: &Expr) -> bool {
                 && call.args.iter().nth(2).is_some_and(expr_is_string_literal)
                 && call.args.iter().nth(3).is_some_and(expr_is_ref_to_path)
         }
+        Expr::Call(call)
+            if path_expr_matches(
+                &call.func,
+                &["autumn_web", "authorization", "__check_policy_scoped"],
+            ) =>
+        {
+            // __check_policy_scoped(&state, &session, scopes_map, "action", &resource)
+            call.args.len() == 5
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_state"))
+                && call
+                    .args
+                    .iter()
+                    .nth(1)
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_session"))
+                && call.args.iter().nth(2).is_some_and(expr_is_scopes_map_arg)
+                && call.args.iter().nth(3).is_some_and(expr_is_string_literal)
+                && call.args.iter().nth(4).is_some_and(expr_is_ref_to_path)
+        }
         Expr::Group(group) => expr_is_generated_auth_check_call(&group.expr),
         Expr::Paren(paren) => expr_is_generated_auth_check_call(&paren.expr),
         _ => false,
     }
+}
+
+/// Recognizes `__autumn_token_scopes.as_ref().map(|__e| &__e.0)` — the
+/// generated scopes argument emitted by `#[authorize]` for `__check_policy_scoped`.
+fn expr_is_scopes_map_arg(expr: &Expr) -> bool {
+    let Expr::MethodCall(outer) = expr else {
+        return false;
+    };
+    if outer.method != "map" {
+        return false;
+    }
+    let Expr::MethodCall(inner) = outer.receiver.as_ref() else {
+        return false;
+    };
+    inner.method == "as_ref" && path_expr_ends_with(&inner.receiver, "__autumn_token_scopes")
 }
 
 fn block_returns_ident(block: &Block, expected: &str) -> bool {
@@ -619,6 +732,72 @@ mod tests {
     }
 
     #[test]
+    fn generated_throttle_prologue_before_replay_guard_counts() {
+        // `#[throttle]` written above `#[post]` expands first: it prepends the
+        // route-id const and the throttle check, then the replay guard. The scan
+        // must skip the throttle prologue and still recognize the replay guard so
+        // the route macro suppresses the outer IdempotencyReplayLayer.
+        let block: syn::Block = syn::parse_quote!({
+            const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+                ::core::concat!(::core::module_path!(), "::", "handler");
+            if let ::core::result::Result::Err(__autumn_throttle_response) =
+                ::autumn_web::security::__check_throttle(
+                    &__autumn_state,
+                    __AUTUMN_THROTTLE_ROUTE_ID,
+                    ::autumn_web::security::ThrottleSpec::Inline {
+                        limit: 1,
+                        per_secs: 60,
+                        key: ::core::option::Option::None,
+                    },
+                    &__autumn_throttle_headers,
+                    __autumn_throttle_peer.as_ref().map(|ext| ext.0.0),
+                    __autumn_throttle_principal.as_ref().map(|e| &e.0),
+                    __autumn_throttle_session.as_ref().map(|e| &e.0),
+                    __autumn_throttle_exempt.is_some(),
+                )
+                .await
+            {
+                return __autumn_throttle_response;
+            }
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        });
+
+        assert!(block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn throttle_prologue_with_side_effect_argument_does_not_count() {
+        // A throttle-shaped prologue whose check call takes a side-effecting first
+        // argument (not `&__autumn_state`) must NOT be skipped, so a hand-written
+        // look-alike cannot trick the route macro into dropping the replay layer.
+        let block: syn::Block = syn::parse_quote!({
+            const __AUTUMN_THROTTLE_ROUTE_ID: &str = "handler";
+            if let ::core::result::Result::Err(__autumn_throttle_response) =
+                ::autumn_web::security::__check_throttle(
+                    side_effect_before_replay_stop(),
+                    __AUTUMN_THROTTLE_ROUTE_ID,
+                )
+                .await
+            {
+                return __autumn_throttle_response;
+            }
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        });
+
+        assert!(!block_has_replay_guard(&block));
+    }
+
+    #[test]
     fn generated_secured_prologue_before_replay_guard_counts() {
         let block: syn::Block = syn::parse_quote!({
             const __AUTUMN_SECURED_ROLES: &[&str] = &["admin"];
@@ -667,6 +846,34 @@ mod tests {
                 {
                     return __autumn_response;
                 }
+                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    __autumn_error,
+                );
+            }
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        });
+
+        assert!(block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn generated_authorize_scoped_prologue_before_replay_guard_counts() {
+        let block: syn::Block = syn::parse_quote!({
+            if let ::core::result::Result::Err(__autumn_error) =
+                ::autumn_web::authorization::__check_policy_scoped::<Post>(
+                    &__autumn_state,
+                    &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
+                    "update",
+                    &post,
+                )
+                .await
+            {
                 return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
                     __autumn_error,
                 );

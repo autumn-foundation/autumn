@@ -26,6 +26,7 @@ async fn main() {
             routes::pages::create,
             routes::pages::edit_form,
             routes::pages::update,
+            routes::pages::transition_status,
             routes::pages::history,
             routes::pages::search,
             repositories::page_api_list,

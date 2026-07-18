@@ -17,6 +17,11 @@ place:
 6. an explicit migration job before web replicas start
 7. a clear choice between `#[scheduled]` and Harvest for background work
 
+When a single primary (plus replicas) stops being enough for writes, see
+the [Horizontal Sharding guide](sharding.md) — `[[database.shards]]`
+routes tenant data across multiple Postgres databases while framework
+state stays on the control role.
+
 ## What `autumn new` Gives You
 
 The scaffold now includes:
@@ -252,6 +257,82 @@ Use Harvest when:
 - work should be coordinated across replicas
 - you are really describing a workflow, not a cron callback
 
+## Split web/worker topology
+
+The same image can run as two deployments: **web** replicas that serve HTTP and
+enqueue jobs, and **worker** replicas that drain jobs and run the scheduler.
+Pick the role per deployment with `AUTUMN_ROLE` — no app code or image changes.
+This is the standard "web tier + separately scaled worker tier" production shape
+(Rails/Sidekiq, Laravel Horizon, Django/Celery, Loco.rs `--worker`); scale,
+deploy, and drain each tier on its own.
+
+Requirements:
+
+- **A durable jobs backend** — `jobs.backend = "postgres"` or `"redis"`. The
+  `local` backend is in-process, so a web replica would enqueue where no worker
+  can drain. Autumn rejects a split role on `local` at startup and
+  `autumn doctor --strict` flags it. See
+  [Web and worker process roles](jobs.md#web-and-worker-process-roles).
+- **The same migration gate** — both tiers share one backend, so run the
+  dedicated migration job (below) once before either tier starts.
+- **Probes on the worker tier** — a `worker` replica serves no user routes but
+  still binds `/live`, `/ready`, `/startup`, and `/actuator/*`, so wire the same
+  liveness/readiness probes you use for web.
+
+Docker Compose sketch — one image, two roles, shared Postgres backend:
+
+```yaml
+services:
+  # db + migrate: as in the Migration Jobs section below — migrate runs once, first.
+
+  web:
+    image: my-app:latest
+    environment:
+      AUTUMN_ROLE: web
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    image: my-app:latest
+    environment:
+      AUTUMN_ROLE: worker
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+```
+
+On Kubernetes this is two `Deployment`s off the same image — one with
+`AUTUMN_ROLE=web`, one with `AUTUMN_ROLE=worker` — each with its own replica
+count and autoscaler, both pointing the readiness probe at `/ready` so the
+[rolling-deploy drain](#rolling-deploy-lifecycle) supervises worker rollouts the
+same way it does web.
+
+### Gating app-owned background work
+
+`AUTUMN_ROLE` gates the **framework's** `#[job]`/`#[scheduled]` workers, but not
+a background loop your app spawns itself in an `on_startup` hook — that runs on
+every replica, including the web tier, unless you gate it. The resolved role is
+exposed on `AppState` as the same value the framework used to gate its own
+workers, so self-gate app-owned loops instead of re-reading `AUTUMN_ROLE`:
+
+```rust
+use autumn_web::{AppState, ProcessRole};
+
+// on_startup hook: only start the embedded loop where workers run.
+if state.role().runs_workers() {
+    tokio::spawn(my_embedded_worker(state.clone()));
+}
+```
+
+`state.role()` returns a `ProcessRole` with `serves_http()` / `runs_workers()`
+predicates; see
+[Self-gating app-owned background work](jobs.md#self-gating-app-owned-background-work).
+Custom/named roles are unsupported today — for finer placement use per-queue
+worker pinning (#1623) plus app-level `state.role()` gating.
+
 ## Migration Jobs
 
 For multi-replica deployments, do not rely on each web process racing to apply
@@ -268,6 +349,69 @@ AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@primary:5432/app" autumn migr
 `AUTUMN_DATABASE__PRIMARY_URL` keeps the deployment contract explicit. Keep
 `auto_migrate_in_production = false` on web replicas unless you are deliberately
 running a single-process deployment.
+
+### Waiting for the Database at Cold Start
+
+On a fresh Compose stack, a cold managed Postgres, or a Kubernetes pod that
+races ahead of its database, `autumn migrate` may be called before the database
+is accepting connections. Instead of crashing and requiring a bespoke
+`wait-for-it.sh` wrapper, you can tell `autumn migrate` to wait:
+
+```bash
+# Via environment variable (recommended for container deployments):
+AUTUMN_DATABASE__STARTUP_WAIT_SECS=60 autumn migrate
+
+# Via CLI flag (overrides the environment variable and config file):
+autumn migrate --wait 60
+
+# Via autumn.toml:
+# [database]
+# startup_wait_secs = 60
+```
+
+When `startup_wait_secs` is set to a non-zero value, `autumn migrate` retries
+the initial connection with capped exponential backoff (starting at 500 ms,
+doubling each attempt, capped at 5 s) until the database responds or the total
+wait exceeds the configured limit. On each retry, the attempt number and delay
+are printed so you can see progress in container logs.
+
+Only transient "server not yet reachable" errors are retried (connection
+refused, network unreachable, database system starting up, etc.). Authentication
+failures, missing databases, and malformed URLs fail immediately so you do not
+burn the entire wait window on a configuration mistake.
+
+The default is `0`, which preserves today's fail-fast behavior with no
+behavioral change for existing deployments.
+
+**Docker Compose example** — no `depends_on: condition: service_healthy` or
+`wait-for-it.sh` required:
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+
+  migrate:
+    image: my-app:latest
+    command: autumn migrate
+    environment:
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+      AUTUMN_DATABASE__STARTUP_WAIT_SECS: "60"
+    depends_on:
+      - db
+
+  web:
+    image: my-app:latest
+    environment:
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+```
 
 ## Migration Safety Preflight
 
@@ -380,6 +524,56 @@ The distributed bookmarks example uses this shape explicitly with a primary,
 streaming replica, one migration job, two web replicas, and a readiness gate
 that fails while the replica has not replayed the latest Diesel migration.
 
+## Replication lag and read-your-own-writes
+
+> **Warning — the classic anomaly.** Replication is asynchronous. A read
+> immediately after a write can land on a lagging replica and return stale data
+> — the user submits a form, is redirected, reloads the page, and the change
+> appears gone. DDIA §5 calls this the *read-your-own-writes* anomaly.
+
+Autumn's default behavior routes all replica-eligible reads to the replica
+regardless of whether the same request performed a write. Add
+`read_your_writes` in `[database]` to pin post-write reads to the primary:
+
+```toml
+[database]
+primary_url   = "postgres://user:pass@primary:5432/app"
+replica_url   = "postgres://user:pass@replica:5432/app"
+
+# Option A — intra-request pin only (Laravel "sticky")
+read_your_writes = "request"
+
+# Option B — cross-request pin via signed cookie (Rails automatic role switching)
+read_your_writes = "session"
+pin_after_write_secs = 5          # how long the cookie pins reads; default 5 s
+```
+
+### Modes
+
+| Mode | What happens | Tradeoff |
+|------|-------------|----------|
+| `off` (default) | No pinning. Replica reads always use the replica. | Zero overhead; stale reads possible after writes. |
+| `request` | Once the current request checks out a **primary** connection (via `Db` or a generated mutating method), all subsequent replica-eligible reads in that request route to the primary. | Eliminates intra-request anomalies at negligible overhead. A read-only handler that still injects `Db` will pin its reads unnecessarily — document this in your team's conventions. |
+| `session` | Like `request`, plus a signed `autumn.ryw` cookie pins the same client's reads to the primary for `pin_after_write_secs` seconds after a write. | Eliminates post-redirect anomalies. Adds a small cookie round-trip and increases primary read load during the pin window. |
+
+### Composing with `replica_fallback`
+
+`read_your_writes` and `replica_fallback` are independent: you can have
+`read_your_writes = "request"` and `replica_fallback = "primary"` simultaneously.
+When the replica is unready and fallback is `primary`, all reads already go to
+the primary regardless of the pin. When fallback is `fail_readiness`, a
+`ReadRoute::Unavailable` repo returns an error on reads even while pinned — the
+pin does not bypass the health gate.
+
+### Observability
+
+Every pin-redirected read (a replica-eligible read sent to the primary because
+the pin is active) increments `autumn_read_your_writes_pins_total` in
+`/actuator/metrics` and emits a `DEBUG` event to the `autumn::db` tracing
+target. A spike in this counter after a deployment indicates more reads than
+expected are being pinned — tune `pin_after_write_secs` or audit which handlers
+are injecting `Db` unnecessarily.
+
 ## Shared Cache
 
 In-process Moka caches are the zero-config default and are perfect for
@@ -426,6 +620,11 @@ with the default per-function Moka caches.
 
 The `memory` default produces a startup warning in the `prod` profile — the
 same pattern as sessions and file storage.
+
+For read-through fills that coalesce concurrent misses into a single
+recompute (in-process single-flight, plus an opt-in distributed fill lock and
+stale-while-revalidate on the Redis backend), see [Cache Stampede
+Protection](cache-stampede.md).
 
 ## Concurrent Writes
 
@@ -712,6 +911,7 @@ Before calling an Autumn app "cloud ready", verify:
 - migrations run before web rollout via a dedicated migration job
 - destructive/irreversible migrations follow the expand/contract pattern
 - background jobs use the right runtime model
+- a split web/worker topology (`AUTUMN_ROLE=web` / `worker`) runs on a durable jobs backend (`postgres`/`redis`, never `local`), with worker replicas exposing `/live` + `/ready`
 - `autumn_jobs` has `traceparent` / `tracestate` columns if using the Postgres backend with `telemetry-otlp`
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery

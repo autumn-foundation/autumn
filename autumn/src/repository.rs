@@ -11,12 +11,106 @@
 //! the generated `on_primary()` method. When no replica is configured, all
 //! methods use the primary — nothing changes for single-pool apps.
 //!
+//! Sharded repositories built from a
+//! [`ShardedDb`](crate::sharding::ShardedDb) via the generated `from_shard`
+//! constructor get the same treatment **per shard**: reads route to the
+//! shard's replica when one is configured and healthy (honoring the shard's
+//! `replica_fallback` policy via
+//! [`Shard::read_route`](crate::sharding::Shard::read_route)), writes stay on
+//! the shard primary, and `primary_reads` / `on_primary()` pin reads back to
+//! the shard primary.
+//!
 //! [`RepositoryError`] surfaces typed errors that arise during repository
 //! operations — most notably optimistic-lock conflicts when two replicas
 //! write the same row concurrently.
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+/// Backend-portable `FOR UPDATE` seam for generated `#[repository]` CRUD.
+///
+/// Postgres pessimistic-lock reads chain `.for_update()` onto a select query to
+/// take a row lock, but diesel's `LockingClause` only implements
+/// `QueryFragment<Pg>` — the same query is not constructible against the
+/// `SQLite` backend at all, so even a *simple* repository's always-emitted lock
+/// reads would fail to compile under `--features sqlite`. Worse, diesel's
+/// `FOR UPDATE` lock marker is `pub(crate)`, so no generic extension trait in a
+/// downstream crate can name the bound `for_update()` needs — a portable seam
+/// cannot be a plain trait.
+///
+/// This macro is that seam: the `#[repository]` macro emits
+/// `::autumn_web::maybe_for_update!(<query>)` where it used to chain
+/// `<query>.for_update()`, and the returned query is still loadable
+/// (`.first(...)`/`.load(...)`), so the generated call chains compose
+/// identically on either backend. Because the `#[cfg]` that selects the
+/// expansion lives on the macro **definition**, it is evaluated in
+/// **autumn-web's** compilation (where the `sqlite` feature actually lives) —
+/// not the consumer crate's — so a downstream app needs no `sqlite` feature of
+/// its own for the right arm to be chosen.
+///
+/// - **Postgres** (default): expands to `QueryDsl::for_update(<query>)` — the
+///   `FOR UPDATE` locking clause, unchanged. Marker resolution happens at the
+///   concrete call site, so no unnameable bound is ever written.
+/// - **`SQLite`**: expands to `<query>` verbatim — `SQLite` has no
+///   `SELECT … FOR UPDATE` (it serializes writers with a database-level lock),
+///   so the row-lock read degrades to a plain read. Write-write correctness
+///   still rests on the optimistic `lock_version` check plus the pool's
+///   `busy_timeout`; see [`crate::db::RuntimeConnection`] and issue #1996 for
+///   the residual single-writer concurrency caveat.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[macro_export]
+macro_rules! maybe_for_update {
+    ($query:expr $(,)?) => {
+        $crate::reexports::diesel::query_dsl::QueryDsl::for_update($query)
+    };
+}
+
+/// `SQLite` arm of [`maybe_for_update!`] — the identity.
+///
+/// See the Postgres
+/// definition for the full contract; `SQLite` has no `SELECT … FOR UPDATE`, so a
+/// pessimistic-lock read degrades to a plain read.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+#[macro_export]
+macro_rules! maybe_for_update {
+    ($query:expr $(,)?) => {
+        $query
+    };
+}
+
+/// Compile-time backend block selector for generated `#[repository]`/`#[model]` CRUD.
+///
+/// Used where the two backends need *structurally different* code (not just a
+/// swapped receiver), e.g. Postgres multi-row batch insert vs. the `SQLite`
+/// per-row loop, or the batched `ON CONFLICT` upsert vs. `SQLite`'s per-row
+/// upsert.
+///
+/// The `#[cfg]` selecting the arm lives on the macro **definition**, so it is
+/// evaluated in **autumn-web's** compilation (where the `sqlite` feature lives)
+/// — the un-selected arm's tokens are never even type-checked, which is what
+/// lets each arm use backend-specific diesel fragments (Postgres `DEFAULT`-keyword
+/// batch inserts, `SQLite` per-row `RETURNING`) that would not compile against
+/// the other backend.
+///
+/// Expands to the chosen block as an expression:
+/// `::autumn_web::backend_select! { pg => { … }, sqlite => { … } }`.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[macro_export]
+macro_rules! backend_select {
+    (pg => $pg:block, sqlite => $sqlite:block $(,)?) => {
+        $pg
+    };
+}
+
+/// `SQLite` arm of [`backend_select!`]. See the Postgres definition for the
+/// contract.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+#[macro_export]
+macro_rules! backend_select {
+    (pg => $pg:block, sqlite => $sqlite:block $(,)?) => {
+        $sqlite
+    };
+}
 
 /// Where a generated repository routes its read-only methods (`find_by_id`,
 /// `find_all`, `count`, `paginate`, `cursor_page`, derived `find_by_*`,
@@ -39,10 +133,12 @@ pub enum ReadRoute {
     /// or the primary when the replica is unready and the
     /// [`ReplicaFallback::Primary`](crate::config::ReplicaFallback) policy
     /// applies.
-    ReadPool(diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>),
+    ReadPool(diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>),
     /// A replica is configured but currently unready, and the
     /// [`ReplicaFallback::FailReadiness`](crate::config::ReplicaFallback)
-    /// policy forbids falling back to the primary. Generated reads fail
+    /// policy forbids falling back to the primary.
+    ///
+    /// Generated reads fail
     /// fast with `503 Service Unavailable` instead of silently serving
     /// from the wrong role.
     Unavailable,
@@ -77,6 +173,23 @@ impl std::fmt::Debug for ReadRoute {
     }
 }
 
+/// Upper bound on bound parameters in one prepared statement, per backend —
+/// used by generated bulk-write CRUD to size insert/update chunks so a batch
+/// never exceeds the driver's placeholder limit.
+///
+/// Postgres caps a statement at 65535 (`u16`) parameters; `SQLite`'s default
+/// `SQLITE_MAX_VARIABLE_NUMBER` is 32766 (since 3.32.0). The generated code
+/// divides this by the per-row column count to pick a chunk size, so the
+/// value tracks the active backend via the same `sqlite` feature that flips
+/// [`crate::db::RuntimeConnection`]. (The `SQLite` write path also inserts
+/// row-by-row, so this bound is a conservative belt-and-suspenders there.)
+#[cfg(not(feature = "sqlite"))]
+pub const MAX_BIND_PARAMS: usize = 65535;
+/// See [`MAX_BIND_PARAMS`] (Postgres). `SQLite`'s default
+/// `SQLITE_MAX_VARIABLE_NUMBER` is 32766.
+#[cfg(feature = "sqlite")]
+pub const MAX_BIND_PARAMS: usize = 32766;
+
 /// Typed errors returned by generated repository methods.
 ///
 /// Distinct from [`crate::AutumnError`] so callers can match on the
@@ -105,6 +218,189 @@ pub enum RepositoryError {
         actual_version: Option<i64>,
     },
 }
+
+/// How a parent's dependent children are handled when the parent is deleted.
+///
+/// Declared per association on the `#[repository]` macro via
+/// `dependent(ChildRepository, fk = "parent_fk", on_delete = <action>)`, and
+/// applied inside the parent's `delete_by_id` transaction so a parent delete
+/// never leaves orphaned child rows (issue #1369).
+///
+/// The cascade runs app-side (not via a DB `ON DELETE` constraint) so that
+/// soft-delete, lifecycle/commit hooks, and counter caches stay correct — a
+/// guarantee raw `ON DELETE CASCADE` cannot provide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependentAction {
+    /// Delete each child through the child repository's delete path, honoring
+    /// the child's soft-delete mode and firing its lifecycle/commit hooks.
+    Destroy,
+    /// Bulk hard-delete every child in a single `DELETE`, skipping per-row hooks.
+    DeleteAll,
+    /// Set the child's foreign-key column to `NULL` (the child rows survive,
+    /// detached from the deleted parent).
+    Nullify,
+    /// Refuse to delete the parent while any child exists, surfacing a typed
+    /// `409 Conflict` error instead of orphaning or cascading.
+    Restrict,
+}
+
+/// The boxed, `Send` future a [`RuntimeDependentCascadeFn`] returns.
+///
+/// It resolves to the deferred `(topic, dom_id)` OOB delete broadcasts a single
+/// child association's cascade accumulated (empty for a non-broadcasting child).
+pub type RuntimeDependentCascadeFuture<'a> = ::std::pin::Pin<
+    ::std::boxed::Box<
+        dyn ::std::future::Future<Output = crate::AutumnResult<Vec<(String, String)>>> + Send + 'a,
+    >,
+>;
+
+/// A type-erased entry point into one child repository's
+/// `__autumn_apply_dependent_on_conn` leaf executor (#1738).
+///
+/// `#[model]` emits one of these per model-declared
+/// `#[has_many(Child, dependent = …)]` association, resolving the child
+/// repository through the `Pg{Child}Repository` naming convention. Given the
+/// parent repository's pool, its live connection/transaction, the parent id,
+/// the parent's soft-delete kind, and the two shared cascade-guard sets, it
+/// constructs the child repository and applies this one association's cascade,
+/// returning any deferred OOB delete broadcasts to publish post-commit.
+///
+/// The three guard sets serve distinct roles (Codex round-5-B + #1800 case 1):
+/// `__path` is the ACTIVE recursion stack (pushed before descending into a node's
+/// children, popped once that subtree completes) used only to break
+/// self-/mutual-referential cycles; `__deleted` is a monotonic set of every row
+/// HANDLED by the cascade — soft OR physical — used by the bulk `delete_many` root
+/// dedup / hook double-fire guard to skip a root already processed as another
+/// root's descendant (so its `before_delete` never fires twice); `__physical` is
+/// the subset of rows PHYSICALLY removed, used only by the diamond traversal
+/// revisit-skip so a hard-delete path can still physically remove a row a
+/// soft-delete path merely marked `deleted_at` on. Keeping `__deleted` and
+/// `__physical` separate is what lets the bulk root skip stay complete for
+/// soft-delete graphs while the diamond hard path is still free to run; keeping
+/// `__path` separate lets a batch process a descendant root before its ancestor
+/// without the ancestor's cascade skipping a still-referenced intermediate
+/// (immediate-FK failure).
+///
+/// All references share one lifetime so the returned future can borrow the
+/// connection and all three guard sets for exactly as long as it is awaited.
+pub type RuntimeDependentCascadeFn = for<'a> fn(
+    &'a ::diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+    &'a mut crate::db::RuntimeConnection,
+    i64,
+    bool,
+    &'a mut ::std::collections::HashSet<(&'static str, i64)>,
+    &'a mut ::std::collections::HashSet<(&'static str, i64)>,
+    &'a mut ::std::collections::HashSet<(&'static str, i64)>,
+) -> RuntimeDependentCascadeFuture<'a>;
+
+/// One model-declared dependent-cascade association, produced at compile time
+/// by `#[model]` and consulted at run time by the parent's `delete_by_id`
+/// (#1738).
+///
+/// The `#[model]` and `#[repository]` derives are separate proc-macro
+/// invocations, so the repository macro — which owns the `delete_by_id` cascade
+/// codegen — never sees the model struct's `#[has_many]` attributes. This spec
+/// bridges the two at run time: the parent iterates
+/// [`AutumnDependents::dependents`] and drives each spec's [`cascade`] inside
+/// its transaction, reproducing exactly the cascade the repository-attribute
+/// `dependent(PgChildRepository, …)` form produces.
+///
+/// Framework plumbing; not constructed by hand.
+///
+/// [`cascade`]: RuntimeDependentSpec::cascade
+pub struct RuntimeDependentSpec {
+    /// The child foreign-key column referencing the parent id. Informational:
+    /// the [`cascade`] thunk already binds it. Mirrors the repository-attribute
+    /// `fk = "…"`.
+    ///
+    /// [`cascade`]: RuntimeDependentSpec::cascade
+    pub fk: &'static str,
+    /// What to do with the children when the parent is deleted.
+    pub action: DependentAction,
+    /// Type-erased entry into the child repository's cascade leaf executor.
+    pub cascade: RuntimeDependentCascadeFn,
+}
+
+/// Exposes a model's runtime dependent-cascade specs to the parent
+/// repository's generated `delete_by_id` (#1738).
+///
+/// A blanket impl returns an empty slice for every type; `#[model]` emits an
+/// *inherent* `dependents()` associated function — which shadows this trait
+/// method under Rust's inherent-before-trait resolution, mirroring the
+/// [`AutumnLockVersionModelExt`] pattern — only when the model declares at
+/// least one `#[has_many(…, dependent = …)]` / `#[has_one(…, dependent = …)]`
+/// association. The generated repository calls `Model::dependents()`, so a
+/// model with no dependents (or one defined without `#[model]`) resolves to the
+/// empty blanket and keeps its exact prior delete codegen.
+///
+/// Precedence: the repository-attribute `dependent(…)` form is the explicit
+/// escape hatch (needed for child repositories that do not follow the
+/// `Pg{Child}Repository` convention, e.g. cross-crate children). When a
+/// repository declares `dependent(…)`, its compile-time specs are authoritative
+/// and the model-declared runtime specs are ignored; a repository with no
+/// `dependent(…)` drives the cascade from `Model::dependents()`.
+pub trait AutumnDependents {
+    /// The model's dependent-cascade specs, in declaration order. Defaults to
+    /// none; `#[model]` overrides via an inherent shadow when dependents exist.
+    #[must_use]
+    fn dependents() -> &'static [RuntimeDependentSpec] {
+        &[]
+    }
+}
+
+// Blanket fallback — any type without an inherent `dependents()` (i.e. a model
+// with no dependent associations, or a type not built through `#[model]`)
+// resolves to the empty slice.
+impl<T: ?Sized> AutumnDependents for T {}
+
+/// Publish a batch of deferred dependent-cascade OOB *delete* broadcasts.
+///
+/// Accumulated during a `dependent = destroy` cascade over `broadcasts = true`
+/// children and published **after** the parent transaction commits (#1369).
+///
+/// Each entry is `(topic, dom_id)`; the fragment is empty and the swap is
+/// [`OobSwap::Delete`](crate::htmx::OobSwap::Delete). Deferring to post-commit
+/// means a rolled-back cascade publishes nothing, so live clients are never told
+/// to remove a child that still exists. Commit-hook children defer via the
+/// durable outbox instead and are not routed through here.
+///
+/// Framework plumbing; not a public API. No-op when the live-channel /
+/// `maud` / `htmx` features are not built in (the buffer is always empty then).
+#[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+#[doc(hidden)]
+pub fn publish_deferred_dependent_broadcasts(broadcasts: Vec<(String, String)>) {
+    if broadcasts.is_empty() {
+        return;
+    }
+    if let Some(channels) = crate::__private::get_global_channels() {
+        let fragment = crate::html! {};
+        // Consume the buffer so the owned (topic, dom_id) strings move straight
+        // into the publish call (no needless clone, and the `Vec` is consumed —
+        // avoiding `clippy::needless_pass_by_value`).
+        for (topic, dom_id) in broadcasts {
+            if let Err(err) = channels.broadcast().publish_oob(
+                &topic,
+                &dom_id,
+                &crate::htmx::OobSwap::Delete,
+                &fragment,
+            ) {
+                tracing::warn!(
+                    error = %err,
+                    "auto-broadcast dependent-destroy delete failed"
+                );
+            }
+        }
+    }
+}
+
+/// No-op fallback when live broadcasting is not compiled in.
+///
+/// The accumulation
+/// side only runs for `broadcasts = true` children (which require these
+/// features), so the buffer is always empty in this configuration.
+#[cfg(not(all(feature = "ws", feature = "maud", feature = "htmx")))]
+#[doc(hidden)]
+pub fn publish_deferred_dependent_broadcasts(_broadcasts: Vec<(String, String)>) {}
 
 /// Extension trait that provides a fallback `None` for model structs that do
 /// not have a `#[lock_version]` field — or that are defined manually without
@@ -171,7 +467,7 @@ pub trait AutumnUpsertExecutionExt {
     fn __autumn_execute_upsert<'a>(
         chunk: &'a [Self::Model],
         tenant_id: ::core::option::Option<&'a str>,
-        conn: &'a mut ::diesel_async::AsyncPgConnection,
+        conn: &'a mut crate::db::RuntimeConnection,
     ) -> impl ::std::future::Future<
         Output = ::core::result::Result<::std::vec::Vec<Self::Model>, ::diesel::result::Error>,
     > + Send
@@ -199,11 +495,95 @@ pub trait CanSetTenantId {
     fn set_tenant_id(&mut self, tenant_id: String);
 }
 
+/// Trait implemented by models to expose their primary key value.
+pub trait ModelPrimaryKey {
+    type IdType: ::std::fmt::Display + ::core::clone::Clone + Send + Sync + 'static;
+    fn primary_key_value(&self) -> Self::IdType;
+}
+
+/// Framework plumbing bridging a `#[repository]`-generated struct to the
+/// many-to-many (`#[has_many(Target, through = join_table)]`) mutation
+/// helpers `#[model]` generates.
+///
+/// `#[repository(Model, ...)]` implements this
+/// once, unconditionally, alongside the model's other generated impls; the
+/// `Model` associated type is what keeps `add_*`/`remove_*`/`set_*` method
+/// resolution unambiguous when more than one m2m trait is in scope (e.g. two
+/// models both associate `through` the same join table, or a model has more
+/// than one m2m association) — each mutation trait is blanket-implemented
+/// only for `M2mConnSource<Model = TheAssociationsOwner>`.
+///
+/// Not part of the public API; not implemented by hand.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub trait M2mConnSource: Send + Sync {
+    /// The model whose `#[has_many(..., through = ...)]` associations this
+    /// repository's mutation helpers operate on.
+    type Model;
+
+    /// Acquire a primary-pool connection for an `add_*`/`remove_*`/`set_*`
+    /// many-to-many mutation.
+    ///
+    /// Mirrors the write-connection acquisition every
+    /// other mutating generated method uses (marks the read-your-writes pin
+    /// on success).
+    fn __autumn_m2m_write_conn(
+        &self,
+    ) -> impl ::std::future::Future<
+        Output = crate::AutumnResult<
+            diesel_async::pooled_connection::deadpool::Object<crate::db::RuntimeConnection>,
+        >,
+    > + Send;
+}
+
 /// Metadata trait implemented for model structs to expose FTS configuration.
 pub trait AutumnSearchableModel {
     const IS_SEARCHABLE: bool;
     const SEARCH_LANGUAGE: &'static str;
     const SEARCH_FIELDS: &'static [(&'static str, char)];
+}
+
+/// Build a fail-closed `SQLite` FTS5 `MATCH` query string from raw user input
+/// (issue #1910).
+///
+/// `SQLite` FTS5's `MATCH` right-hand operand is a query *language*, not a plain
+/// string: bare words are terms, but `AND` / `OR` / `NOT` / `NEAR`, a `col:`
+/// prefix, `*` (prefix), `^` (initial-token), `(`/`)` grouping, `"` phrases and
+/// a leading `-` are all operators. Passing raw user input straight to `MATCH`
+/// would let a caller inject FTS5 query syntax — or, more commonly, trigger a
+/// hard syntax error on innocuous punctuation. This helper neutralizes all of
+/// it: the input is split on Unicode whitespace and each token is emitted as a
+/// quoted FTS5 string literal (a `"..."` phrase), with any embedded `"` doubled
+/// (`""`) per FTS5's own string escaping. The quoted tokens are joined with a
+/// single space, which FTS5 reads as an implicit AND of literal phrases. Every
+/// operator character therefore becomes part of a literal term and can never
+/// change the query's structure (the analogue of the Postgres path's
+/// `websearch_to_tsquery` and the old LIKE path's metacharacter escaping).
+///
+/// Returns `None` when the input yields no tokens (empty or whitespace-only).
+/// The caller MUST treat `None` as an empty result set and run **no** query —
+/// never an unfiltered scan.
+#[must_use]
+pub fn sqlite_fts5_match_query(input: &str) -> Option<String> {
+    // Worst case (no embedded quotes to double): every byte kept plus the two
+    // surrounding quotes of a single token — pre-size to avoid reallocation.
+    let mut out = String::with_capacity(input.len() + 2);
+    for token in input.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push('"');
+        for ch in token.chars() {
+            if ch == '"' {
+                // FTS5 escapes a literal double-quote inside a "..." string by
+                // doubling it.
+                out.push('"');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Derive a stable signed 64-bit advisory lock key for repository upserts.
@@ -225,9 +605,150 @@ pub fn repository_upsert_advisory_lock_key(table_name: &str, record_id: i64) -> 
     i64::from_be_bytes(bytes)
 }
 
+/// Trait for formatting repository model fields into SSE broadcast topic segments.
+///
+/// This provides a uniform display format for both primitive types and optional/nullable values.
+pub trait DisplayTopicField {
+    /// Formats the field into a string suitable for a topic name.
+    fn to_topic_string(&self) -> String;
+}
+
+impl DisplayTopicField for String {
+    fn to_topic_string(&self) -> String {
+        self.clone()
+    }
+}
+
+impl DisplayTopicField for &str {
+    fn to_topic_string(&self) -> String {
+        (*self).to_string()
+    }
+}
+
+impl DisplayTopicField for bool {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl DisplayTopicField for char {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+macro_rules! impl_display_topic_field_num {
+    ($($t:ty),*) => {
+        $(
+            impl DisplayTopicField for $t {
+                fn to_topic_string(&self) -> String {
+                    self.to_string()
+                }
+            }
+        )*
+    };
+}
+
+impl_display_topic_field_num!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
+
+impl DisplayTopicField for ::uuid::Uuid {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl DisplayTopicField for ::chrono::NaiveDateTime {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl DisplayTopicField for ::chrono::NaiveDate {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl DisplayTopicField for ::chrono::NaiveTime {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl<T> DisplayTopicField for ::chrono::DateTime<T>
+where
+    T: ::chrono::TimeZone,
+    T::Offset: std::fmt::Display,
+{
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl<T: DisplayTopicField> DisplayTopicField for Option<T> {
+    fn to_topic_string(&self) -> String {
+        self.as_ref()
+            .map_or_else(|| "none".to_string(), DisplayTopicField::to_topic_string)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fts5_match_quotes_plain_terms_and_ands_them() {
+        // A plain multi-word query becomes an implicit-AND of quoted phrases.
+        assert_eq!(
+            sqlite_fts5_match_query("rust web").as_deref(),
+            Some("\"rust\" \"web\"")
+        );
+        assert_eq!(
+            sqlite_fts5_match_query("hello").as_deref(),
+            Some("\"hello\"")
+        );
+    }
+
+    #[test]
+    fn fts5_match_neutralizes_operators_as_literals() {
+        // FTS5 operators are quoted into literal terms — never parsed as syntax.
+        assert_eq!(
+            sqlite_fts5_match_query("foo OR bar").as_deref(),
+            Some("\"foo\" \"OR\" \"bar\"")
+        );
+        assert_eq!(
+            sqlite_fts5_match_query("title:secret").as_deref(),
+            Some("\"title:secret\"")
+        );
+        assert_eq!(sqlite_fts5_match_query("pre*").as_deref(), Some("\"pre*\""));
+        assert_eq!(
+            sqlite_fts5_match_query("NEAR(a b)").as_deref(),
+            Some("\"NEAR(a\" \"b)\"")
+        );
+    }
+
+    #[test]
+    fn fts5_match_doubles_embedded_quotes() {
+        // An embedded double-quote is escaped by doubling, so it can never close
+        // the phrase early and inject trailing syntax.
+        assert_eq!(
+            sqlite_fts5_match_query("a\"b").as_deref(),
+            Some("\"a\"\"b\"")
+        );
+        assert_eq!(
+            sqlite_fts5_match_query("\" OR x").as_deref(),
+            Some("\"\"\"\" \"OR\" \"x\"")
+        );
+    }
+
+    #[test]
+    fn fts5_match_empty_input_is_none() {
+        // Empty / whitespace-only / no-token input yields None so the caller
+        // returns an empty page WITHOUT running any query (fail-closed).
+        assert_eq!(sqlite_fts5_match_query(""), None);
+        assert_eq!(sqlite_fts5_match_query("   "), None);
+        assert_eq!(sqlite_fts5_match_query("\t\n  \r"), None);
+    }
 
     #[test]
     fn conflict_variant_stores_all_fields() {

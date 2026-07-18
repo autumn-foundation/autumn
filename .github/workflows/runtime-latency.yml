@@ -1,0 +1,279 @@
+name: Runtime Latency Gate
+
+# Autumn-only per-request latency gate.
+#
+# Builds benchmarks/runtime/autumn in release mode, seeds a Postgres database
+# with the canonical schema/init.sql + seed/seed.sql, and runs a pinned k6
+# profile (VUs=20, duration=30s, k6 v0.55.0) against:
+#   - GET /api/posts  (JSON list)
+#   - GET /posts      (HTML list)
+#
+# Fails the job if the median p99 across R=3 measured runs exceeds the
+# committed budget in benchmarks/runtime/budgets.toml.
+#
+# Three-job design (mirrors dev-loop-latency.yml):
+#   gate-unit-tests  — fast PR job: unit-tests the gate crate
+#   budget-validate  — fast PR job: --check-budgets dry-run (no server)
+#   measure          — heavy scheduled/dispatch job: live load test + gate
+#
+# Flake policy (see benchmarks/runtime/README.md for details):
+#   - 1 discarded warmup run before the 3 measured runs.
+#   - Median p99 across the 3 runs is compared to the budget.
+#   - Budgets include 1.20x headroom over the local bare-metal baseline
+#     (50ms floor for shared CI runner overhead).
+#   - A single re-run is allowed on a suspected flake (CI → Re-run failed jobs).
+#
+# Gate: Autumn-only. No Ruby / Java / Elixir / Python toolchains are required.
+on:
+  schedule:
+    # Every Monday at 07:00 UTC (offset from dev-loop-latency to avoid runner contention)
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      fail_on_regression:
+        description: "Exit 1 if any path exceeds its budget"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+  pull_request:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "benchmarks/runtime/gate/**"
+      - "benchmarks/runtime/budgets.toml"
+      - "benchmarks/runtime/load/k6/gate.js"
+      - "benchmarks/runtime/autumn/**"
+      - "benchmarks/runtime/schema/**"
+      - "benchmarks/runtime/seed/**"
+      - ".github/workflows/runtime-latency.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Minimal token scope: the workflow only reads the repo and uploads artifacts
+# (artifact upload uses the job token without needing extra repo write scope).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  K6_VERSION: "v0.55.0"
+
+jobs:
+  # ── Gate crate unit tests (runs on every PR, no live server) ────────────────
+  gate-unit-tests:
+    name: Gate unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+
+      - name: Run gate crate unit tests
+        run: |
+          set -o pipefail
+          cargo test -p bench-runtime-gate --lib 2>&1 | tee gate-test-output.txt
+          grep -E "^test result:" gate-test-output.txt
+
+  # ── Budget file dry-run (runs on every PR, no live server) ─────────────────
+  budget-validate:
+    name: Validate budgets.toml (dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+
+      - name: Build gate binary
+        run: cargo build -p bench-runtime-gate
+
+      - name: Validate budgets.toml covers all required paths
+        run: |
+          ./target/debug/bench-runtime-gate \
+            --check-budgets \
+            --budgets benchmarks/runtime/budgets.toml
+
+  # ── Live measurement (scheduled / manual only) ──────────────────────────────
+  measure:
+    name: Measure Autumn request latency
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: benchmark
+          POSTGRES_USER: benchmark
+          POSTGRES_PASSWORD: benchmark
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U benchmark -d benchmark"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          workspaces: |
+            . -> target
+            benchmarks/runtime/autumn -> benchmarks/runtime/autumn/target
+        continue-on-error: true
+
+      # ── Apply schema and seed ────────────────────────────────────────────────
+      - name: Apply canonical schema and seed
+        env:
+          PGPASSWORD: benchmark
+        run: |
+          psql -h 127.0.0.1 -U benchmark -d benchmark \
+            -f benchmarks/runtime/schema/init.sql
+          psql -h 127.0.0.1 -U benchmark -d benchmark \
+            -f benchmarks/runtime/seed/seed.sql
+          echo "Schema and seed applied."
+
+      # ── Build gate binary first (fast; fail-fast on compile errors) ──────────
+      - name: Build gate binary
+        run: cargo build -p bench-runtime-gate
+
+      # ── Build bench-autumn (release) ─────────────────────────────────────────
+      - name: Build bench-autumn (release)
+        run: |
+          cd benchmarks/runtime/autumn
+          cargo build --release
+          echo "Binary: $(ls -lh target/release/bench-autumn)"
+
+      # ── Boot bench-autumn ─────────────────────────────────────────────────────
+      - name: Boot bench-autumn and wait for /health
+        env:
+          AUTUMN_DATABASE__URL: "postgres://benchmark:benchmark@127.0.0.1:5432/benchmark"
+          AUTUMN_SERVER__HOST: "127.0.0.1"
+          AUTUMN_SERVER__PORT: "8080"
+          AUTUMN_SECURITY__CSRF__ENABLED: "false"
+          AUTUMN_SECURITY__SIGNING_SECRET: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS: "127.0.0.1,localhost"
+          AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION: "true"
+          RUST_LOG: "warn"
+        run: |
+          AUTUMN_MANIFEST_DIR="$(pwd)/benchmarks/runtime/autumn" \
+            ./benchmarks/runtime/autumn/target/release/bench-autumn &
+          echo "APP_PID=$!" >> "$GITHUB_ENV"
+
+          # Poll /health for up to 30 seconds
+          deadline=$(( SECONDS + 30 ))
+          until curl -sf http://127.0.0.1:8080/health > /dev/null 2>&1; do
+            if (( SECONDS >= deadline )); then
+              echo "::error::bench-autumn did not become healthy within 30s"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "bench-autumn is healthy."
+
+      # ── Install pinned k6 ────────────────────────────────────────────────────
+      - name: Install k6 ${{ env.K6_VERSION }}
+        run: |
+          curl -sL \
+            "https://github.com/grafana/k6/releases/download/${{ env.K6_VERSION }}/k6-${{ env.K6_VERSION }}-linux-amd64.tar.gz" \
+            -o /tmp/k6.tar.gz
+          tar -xzf /tmp/k6.tar.gz -C /tmp/
+          sudo mv "/tmp/k6-${{ env.K6_VERSION }}-linux-amd64/k6" /usr/local/bin/k6
+          k6 version
+
+      # ── Warmup run (discarded) ───────────────────────────────────────────────
+      - name: k6 warmup run (discarded)
+        run: |
+          mkdir -p gate-runs
+          cd gate-runs
+          BASE_URL=http://127.0.0.1:8080 k6 run \
+            ../benchmarks/runtime/load/k6/gate.js 2>&1 | tail -5
+          echo "Warmup complete (results discarded)."
+
+      # ── 3 measured runs ──────────────────────────────────────────────────────
+      - name: k6 measured run 1/3
+        run: |
+          cd gate-runs
+          BASE_URL=http://127.0.0.1:8080 k6 run \
+            ../benchmarks/runtime/load/k6/gate.js 2>&1 | tail -5
+          cp gate-summary.json summary-1.json
+          echo "Run 1: $(cat summary-1.json)"
+
+      - name: k6 measured run 2/3
+        run: |
+          cd gate-runs
+          BASE_URL=http://127.0.0.1:8080 k6 run \
+            ../benchmarks/runtime/load/k6/gate.js 2>&1 | tail -5
+          cp gate-summary.json summary-2.json
+          echo "Run 2: $(cat summary-2.json)"
+
+      - name: k6 measured run 3/3
+        run: |
+          cd gate-runs
+          BASE_URL=http://127.0.0.1:8080 k6 run \
+            ../benchmarks/runtime/load/k6/gate.js 2>&1 | tail -5
+          cp gate-summary.json summary-3.json
+          echo "Run 3: $(cat summary-3.json)"
+
+      # ── Compare median p99 against budget ────────────────────────────────────
+      - name: Compare median p99 against budget
+        id: gate
+        run: |
+          set -o pipefail
+          ./target/debug/bench-runtime-gate \
+            --budgets benchmarks/runtime/budgets.toml \
+            --summary gate-runs/summary-1.json \
+            --summary gate-runs/summary-2.json \
+            --summary gate-runs/summary-3.json \
+            --report gate-report.json \
+            | tee gate-summary.txt
+          echo "gate_exit=$?" >> "$GITHUB_OUTPUT"
+
+      # ── Upload artifacts ─────────────────────────────────────────────────────
+      - name: Upload gate artifacts
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: runtime-latency-gate-${{ github.run_id }}
+          path: |
+            gate-runs/
+            gate-report.json
+            gate-summary.txt
+          retention-days: 90
+
+      # ── Post summary ─────────────────────────────────────────────────────────
+      - name: Post summary to workflow
+        if: always()
+        run: |
+          echo "## Runtime Latency Gate" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat gate-summary.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(no summary)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Full report archived as workflow artifact \`runtime-latency-gate-${{ github.run_id }}\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Budgets: [\`benchmarks/runtime/budgets.toml\`](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/benchmarks/runtime/budgets.toml)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Baseline: [\`benchmarks/runtime/baseline.json\`](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/benchmarks/runtime/baseline.json)" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Regression gate ──────────────────────────────────────────────────────
+      - name: Regression gate
+        if: ${{ inputs.fail_on_regression != 'false' }}
+        run: |
+          # Do NOT fall back to "true" on jq failure — a missing gate-report.json
+          # (e.g. the gate binary crashed before writing it) should fail the gate.
+          ALL_PASSED=$(jq -r '.all_passed' gate-report.json)
+          if [ "$ALL_PASSED" != "true" ]; then
+            echo "::error::One or more paths exceeded the p99 latency budget."
+            echo "::error::See gate-report.json artifact for details."
+            echo "::error::To re-baseline: update budgets.toml per benchmarks/runtime/README.md"
+            exit 1
+          fi

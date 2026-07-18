@@ -1,0 +1,167 @@
+x-bookmarks-base: &bookmarks-base
+  build:
+    context: ../..
+    dockerfile: examples/bookmarks-sharded/Dockerfile
+  environment:
+    AUTUMN_PROFILE: docker
+    AUTUMN_MANIFEST_DIR: /app/examples/bookmarks-sharded
+    # All replicas must share the same signing secret so that session cookies
+    # and CSRF tokens signed by one replica are accepted by the others.
+    # Generate once: openssl rand -hex 32
+    AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?AUTUMN_SECURITY__SIGNING_SECRET is required. Generate with: openssl rand -hex 32}"
+  restart: unless-stopped
+
+x-postgres-base: &postgres-base
+  image: postgres:16
+  restart: unless-stopped
+
+services:
+  bookmarks-migrate:
+    <<: *bookmarks-base
+    command: ["/app/bookmarks-sharded-migrate"]
+    restart: "no"
+    depends_on:
+      postgres-control:
+        condition: service_healthy
+      postgres-shard-0:
+        condition: service_healthy
+      postgres-shard-1:
+        condition: service_healthy
+
+  # Control database: framework state (jobs, sessions, flags). NOT sharded.
+  postgres-control:
+    <<: *postgres-base
+    environment:
+      POSTGRES_DB: bookmarks_control
+      POSTGRES_USER: autumn
+      POSTGRES_PASSWORD: autumn
+    ports:
+      - "5442:5432"
+    volumes:
+      - pgdata-control:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autumn -d bookmarks_control"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Shard primaries: tenant data, routed by slot.
+  postgres-shard-0:
+    <<: *postgres-base
+    environment:
+      POSTGRES_DB: bookmarks_shard0
+      POSTGRES_USER: autumn
+      POSTGRES_PASSWORD: autumn
+    ports:
+      - "5443:5432"
+    volumes:
+      - pgdata-shard-0:/var/lib/postgresql/data
+    # The stock postgres image only appends `host all all all <method>` to
+    # pg_hba.conf, and pg_hba's `all` database keyword does NOT match
+    # replication connections. Drop an init snippet (run once on a fresh volume,
+    # after initdb, by the entrypoint) that adds a `host replication …` rule so
+    # the shard-0 replica below can base-backup/stream; without it
+    # `pg_basebackup -h postgres-shard-0` is rejected and the replica loops
+    # forever. (`$$` escapes compose interpolation so the container sees `$`.)
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        echo 'echo "host replication all all scram-sha-256" >> "$$PGDATA/pg_hba.conf"' \
+          > /docker-entrypoint-initdb.d/10-enable-replication.sh
+        exec docker-entrypoint.sh postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autumn -d bookmarks_shard0"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Streaming read replica of shard 0. Demonstrates the per-shard replica
+  # path: `ShardedReadDb` (and `ShardedDb`'s SELECT routing) send shard-0
+  # reads here, writes still go to postgres-shard-0.
+  #
+  # Built with the stock postgres image: the primary adds a `host replication`
+  # pg_hba rule via its init step (see postgres-shard-0) and the `autumn`
+  # superuser carries the REPLICATION privilege, so a one-shot `pg_basebackup -R`
+  # clones the primary into an empty data dir and writes the standby/
+  # primary_conninfo settings. The volume MUST start empty (a fresh `docker
+  # compose up`); on a re-run with existing data the basebackup is skipped and
+  # Postgres starts against the prior clone.
+  postgres-shard-0-replica:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      PGPASSWORD: autumn
+    ports:
+      - "5445:5432"
+    volumes:
+      - pgdata-shard-0-replica:/var/lib/postgresql/data
+    depends_on:
+      postgres-shard-0:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        if [ ! -s "$$PGDATA/PG_VERSION" ]; then
+          echo "Cloning postgres-shard-0 via pg_basebackup…"
+          until pg_basebackup -h postgres-shard-0 -p 5432 -U autumn \
+                -D "$$PGDATA" -Fp -Xs -P -R; do
+            echo "primary not ready yet; retrying…"; sleep 2
+          done
+          chmod 0700 "$$PGDATA"
+        fi
+        exec docker-entrypoint.sh postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autumn -d bookmarks_shard0"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  postgres-shard-1:
+    <<: *postgres-base
+    environment:
+      POSTGRES_DB: bookmarks_shard1
+      POSTGRES_USER: autumn
+      POSTGRES_PASSWORD: autumn
+    ports:
+      - "5444:5432"
+    volumes:
+      - pgdata-shard-1:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autumn -d bookmarks_shard1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Two stateless web replicas behind nginx. Both hash the same tenant to
+  # the same shard — the routing function is deterministic across processes.
+  bookmarks-1:
+    <<: *bookmarks-base
+    depends_on:
+      bookmarks-migrate:
+        condition: service_completed_successfully
+
+  bookmarks-2:
+    <<: *bookmarks-base
+    depends_on:
+      bookmarks-migrate:
+        condition: service_completed_successfully
+
+  nginx:
+    image: nginx:1.27
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - bookmarks-1
+      - bookmarks-2
+
+volumes:
+  pgdata-control:
+  pgdata-shard-0:
+  pgdata-shard-0-replica:
+  pgdata-shard-1:

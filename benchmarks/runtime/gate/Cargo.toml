@@ -1,0 +1,19 @@
+[package]
+name = "bench-runtime-gate"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+publish = false
+
+[[bin]]
+name = "bench-runtime-gate"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

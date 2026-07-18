@@ -1,0 +1,5 @@
+[starter]
+name = "minimal"
+description = "A tiny fixture starter used by the CLI test-suite"
+verbatim = ["static/logo.bin"]
+post_scaffold_notes = "Scaffolded {{project_name}}."

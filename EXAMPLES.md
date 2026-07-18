@@ -37,6 +37,24 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/flock` — WASM Island (Yew CSR)
+
+<!-- catalog:example name=flock tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer who needs one heavy, client-side interactive widget inside an otherwise server-rendered Autumn page |
+| **Journey** | WASM island: server-render a maud page whose home route mounts a Yew CSR component compiled to `wasm32-unknown-unknown`, with a custom app-level CSP |
+| **Key capabilities** | maud-owned page, `data-*` island mount point, ES-module loader, `asset_url` static serving, custom `content_security_policy` with `'wasm-unsafe-eval'` |
+| **Prerequisites** | Rust 1.88.0+ (committed wasm artifacts run without a toolchain; rebuilding needs the `wasm32-unknown-unknown` target + `wasm-bindgen-cli`) |
+| **Run command** | `cargo run -p flock` |
+| **Success proof** | `curl -sD - -o /dev/null http://127.0.0.1:3000/ \| grep -i content-security-policy` shows `script-src 'self' 'wasm-unsafe-eval'`; the browser page animates the flocking canvas |
+
+The island crate that produces the wasm lives in `examples/island-flock`
+(cataloged as excluded). See `docs/guide/wasm-islands.md` for the design notes.
+
+---
+
 ### `examples/todo-app` — Classic CRUD App
 
 <!-- catalog:example name=todo-app tier=supported -->
@@ -97,6 +115,21 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/bookmarks-sharded` — Horizontal Sharding
+
+<!-- catalog:example name=bookmarks-sharded tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer scaling tenant data horizontally across multiple Postgres databases |
+| **Journey** | Framework-native sharding: tenant id → logical slot → shard, control database for framework state, multi-replica web tier, one-shot multi-target migrator |
+| **Key capabilities** | `[[database.shards]]` + `slots` config, `ShardedDb`/`Shards` extractors, concurrent `each_shard` fan-out, `db:shard:*` health components, per-shard metrics |
+| **Prerequisites** | Docker and Docker Compose |
+| **Run command** | `docker compose -f examples/bookmarks-sharded/docker-compose.yml up -d --build` |
+| **Success proof** | `curl -H 'X-Tenant-Id: acme' http://localhost:3000/api/bookmarks` returns `{"shard":"shard0","bookmarks":[]}` |
+
+---
+
 ### `examples/wiki` — Mutation Hooks and Revision History
 
 <!-- catalog:example name=wiki tier=supported -->
@@ -127,6 +160,50 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/saas` — Multi-Tenant SaaS Starter
+
+<!-- catalog:example name=saas tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer evaluating Autumn who wants a complete, runnable SaaS archetype rather than hand-assembled primitives |
+| **Journey** | Multi-tenant SaaS: sign up an organisation → log in → a tenant-scoped dashboard that only ever shows the signed-in organisation's projects |
+| **Key capabilities** | Session auth (`Session` + bcrypt `hash_password`/`verify_password`), row-level multi-tenancy (`#[repository(tenant_scoped)]` + `with_tenant`), Maud + htmx UI |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Run command** | `cargo run -p saas` |
+| **Success proof** | After signing up in the browser, `GET /dashboard` returns `200 OK` with the tenant's projects; a second organisation never sees the first's data |
+
+This is the flagship built-in starter behind `autumn new <name> --starter saas`.
+The committed tree here is the rendered form of the embedded starter; the
+`embedded_saas_matches_example_saas` test in `autumn-cli` keeps the two in lock-step.
+
+---
+
+## Excluded Examples
+
+Excluded examples are intentionally kept out of the workspace and the normal
+adoption path. They are not runnable Autumn servers, do not participate in
+workspace compilation or test validation, and never block a release. They exist
+to document spikes and specialised build targets.
+
+---
+
+### `examples/island-flock` — Yew WASM Island Spike
+
+<!-- catalog:example name=island-flock tier=excluded -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Framework contributor prototyping client-side interactivity inside an Autumn page |
+| **Journey** | WASM island spike: compile a Yew CSR component to `wasm32-unknown-unknown` and mount it as an island in server-rendered HTML |
+| **Key capabilities** | Yew CSR component, `cdylib` crate, `wasm32-unknown-unknown` target, hand-rolled island bootstrap |
+| **Rationale for exclusion** | This is an exploratory spike, not a supported server example. It is a `cdylib` targeting `wasm32-unknown-unknown`, so it cannot compile as a normal workspace member and is listed under `exclude` in `Cargo.toml`. It has no HTTP server, no README quickstart, and no place in the Journey Map. |
+| **Build command** | `examples/island-flock/build-island.sh` |
+
+See `docs/guide/wasm-islands.md` for the design notes behind this spike.
+
+---
+
 ## Journey Map
 
 The table below maps each example to a distinct learning journey so evaluators
@@ -135,12 +212,15 @@ can pick the closest starting point without overlap.
 | Journey | Example | One-line summary |
 |---------|---------|-----------------|
 | First route | `hello` | Simplest possible Autumn app — three routes, no database |
+| WASM island | `flock` | Server-rendered maud page that mounts a Yew CSR "literary boids" wasm widget on `GET /` |
 | CRUD + MCP | `todo-app` | Full-stack todo list with Diesel, Maud, htmx, bearer-token API, and MCP tool projection |
 | Admin / static rendering | `blog` | Blog engine with admin UI and `#[static_get]` pre-rendering |
 | Profiles / tasks | `bookmarks` | Repository macro, profile layering, actuator, hourly scheduled task |
 | Distributed deployment | `bookmarks-distributed` | Primary + replica Postgres, multi-replica web tier, Docker Compose |
+| Horizontal sharding | `bookmarks-sharded` | Tenant → slot → shard routing, control DB, cross-shard fan-out, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
 | Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting — the complete feature showcase |
+| Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 
 ---
 

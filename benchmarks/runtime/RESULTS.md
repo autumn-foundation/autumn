@@ -1,7 +1,46 @@
 # Benchmark Results
 
-> Fill in this template after each benchmark run.
+> This file contains two sections:
+> 1. **Autumn CI gate baseline** — committed real numbers for the two gated paths,
+>    produced by the `runtime-latency.yml` workflow. Updated when `budgets.toml` is re-baselined.
+> 2. **Full comparative run template** — fill in after a manual six-framework run.
+>
+> Machine-readable gate baseline: [`baseline.json`](baseline.json).
 > Raw k6 JSON output files are in `load/results/<timestamp>/`.
+
+## Autumn CI Gate Baseline
+
+> Gated paths measured locally with a fixed k6 profile (VUs=20, duration=30s, k6 v0.55.0).
+> Methodology: 1 discarded warmup + 3 measured runs; median p99 reported.
+> See [`baseline.json`](baseline.json) for full per-run data and [`budgets.toml`](budgets.toml) for CI thresholds.
+
+| Field | Value |
+|-------|-------|
+| Date | 2026-06-22 |
+| Host OS | Linux 6.18.5 x86_64 |
+| CPU | Intel Xeon @ 2.80GHz, 4 vCPU |
+| RAM | 15 GiB |
+| Postgres | 16 |
+| k6 version | v0.55.0 |
+| Track | Autumn-only (no container limits; local bare-metal) |
+| VUs | 20 |
+| Duration | 30s |
+| Methodology | 1 warmup (discarded) + 3 measured runs, median p99 |
+
+| Path | Run 1 p99 | Run 2 p99 | Run 3 p99 | Median p99 | CI Budget |
+|------|-----------|-----------|-----------|------------|-----------|
+| `GET /api/posts` (JSON) | 4.7ms | 4.9ms | 5.6ms | 4.9ms | 50ms |
+| `GET /posts` (HTML) | 3.9ms | 4.2ms | 4.4ms | 4.2ms | 50ms |
+
+The 50ms CI budget floor accounts for shared GitHub Actions runner overhead
+(typically 5-20× slower than local bare-metal due to CPU contention). The gate
+catches a ≥25% regression relative to CI steady-state performance.
+
+---
+
+## Full Comparative Run Template
+
+> Fill in this section after a manual six-framework comparable-infrastructure run.
 
 ## Run Metadata
 

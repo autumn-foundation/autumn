@@ -1,6 +1,6 @@
-# Postgres Full-Text Search (FTS) in Autumn
+# Full-Text Search (FTS) in Autumn
 
-Autumn provides first-class, high-performance Postgres Full-Text Search (FTS). Through declarative model-level annotations and automated CLI migration generators, Autumn configures database-level stored `tsvector` generated columns, attaches high-throughput `GIN` indexes, and exposes typed, paginated, and relevance-ranked search interfaces directly on your repositories.
+Autumn provides first-class, high-performance Full-Text Search (FTS) on **both** the Postgres and SQLite backends. Through declarative model-level annotations and automated CLI migration generators, Autumn configures a backend-appropriate search index — stored `tsvector` generated columns behind high-throughput `GIN` indexes on Postgres, external-content **FTS5** virtual tables on SQLite — and exposes the same typed, paginated, and relevance-ranked search interfaces directly on your repositories, so the same `#[searchable]` models and repository call sites work unchanged on either backend. Most of this guide illustrates the Postgres (`tsvector`/`tsquery`/`GIN`) path; the [SQLite FTS5](#6-sqlite-fts5) section below covers the SQLite equivalent.
 
 ---
 
@@ -229,3 +229,47 @@ pub async fn search(
     })
 }
 ```
+
+---
+
+## 6. SQLite FTS5
+
+The same `#[searchable]` model annotation and the same generated repository
+APIs (`search`, `search_page`, `search_page_scoped`) also work on the **SQLite**
+backend (#2047). The `--searchable` / `#[searchable]` scaffold now generates on both
+backends — you write your models the same way, and the generator emits a
+backend-appropriate search index:
+
+| | Postgres | SQLite |
+| --- | --- | --- |
+| Index | `tsvector` generated column + `GIN` index | external-content **FTS5** virtual table kept in sync by AFTER INSERT/DELETE/UPDATE triggers |
+| Tokenizer | Postgres text-search config | `unicode61` (full-Unicode case/diacritic folding, so `äpfel` matches `Äpfel`) |
+| Ranking | `ts_rank` | `bm25`, with per-column weights derived from `#[searchable(weight=…)]` priorities (A=10, B=5, C=2, else 1) |
+
+Nothing in your application or repository call sites changes — the tenant,
+soft-delete, and owner scoping predicates are applied identically on both
+backends.
+
+### Query safety (fail-closed)
+
+On SQLite, the free-text query is passed through a **fail-closed,
+injection-safe** sanitizer (`repository::sqlite_fts5_match_query`) before it ever
+reaches FTS5. It tokenizes the input on Unicode whitespace and turns every token
+into a literal quoted phrase — so every FTS5 operator (`AND` / `OR` / `NOT` /
+`NEAR` / `col:` / `*` / parentheses / quotes / a leading `-`) is treated as a
+**literal search term**, never as syntax. An empty or whitespace-only query (or
+one that produces no tokens) yields an **empty result page with no query run** —
+it never degrades into an unfiltered table scan.
+
+### FTS5 is a hard boot dependency
+
+FTS5 is not optional at runtime. `libsqlite3-sys` is built bundled with
+`SQLITE_ENABLE_FTS5`, and each SQLite connection probes FTS5 availability during
+setup. If FTS5 is missing, the app **fails loudly at boot** with an actionable
+message rather than silently falling back to a slower `LIKE` scan — so a SQLite
+search app is either correct or it does not start.
+
+> SQLite full-text search is part of the single-host [SQLite in
+> production](./sqlite-in-production.md) tier. For the scale-out reasons to
+> prefer Postgres (read replicas, sharding, multi-replica scheduling), see the
+> comparison table at the top of that guide.

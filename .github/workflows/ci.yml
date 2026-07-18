@@ -6,16 +6,23 @@ on:
   pull_request:
     branches: [trunk, trunk-dev]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  meta:
+    uses: ./.github/workflows/runner-routing.yml
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -24,54 +31,232 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (autumn-web, gated request-path features — panic gate)
+        # The default-feature Clippy above does not compile the feature-gated
+        # request-path modules (channels→ws, mail→mail, sync/*→offline-sync,
+        # session_redis→redis), so their `#![cfg_attr(not(test), deny(clippy::…))]`
+        # panic-gate lints never fire. Lint them with their features enabled so an
+        # unannotated `.unwrap()` in those production paths fails CI. (`--all-features`
+        # is unusable here: `managed-pg-bundled` pulls in `postgresql_embedded`, whose
+        # build script downloads Postgres binaries; this explicit list covers exactly
+        # the gated modules with no new services.)
+        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis" --all-targets -- -D warnings
+      - name: Panic-free request-path gate
+        run: ./scripts/check-panic-gate.sh
+      - name: Accessibility gate (raw html! escape hatches across the repo)
+        # `autumn a11y verify` statically audits raw `html!` markup for fields
+        # that bypass the typed a11y primitives and lack an accessible name.
+        # Scoped to the whole repo root now that the framework source, the admin
+        # plugin, and every example are clean (issue #1934). The scanner skips
+        # `target/`, dot-dirs, and `tests/` directories (test scaffolding and the
+        # committed red/green fixtures), so a single invocation over `.` fails the
+        # job on any real product finding.
+        run: cargo run -p autumn-cli --bin autumn -- a11y verify .
+
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - name: cargo-deny check
+        run: cargo deny check advisories licenses sources
+      - name: cargo-deny check (sqlite backend graph)
+        run: cargo deny --config deny-sqlite.toml check advisories licenses sources
 
   test:
     name: Test (${{ matrix.os }})
-    needs: lint
+    needs: [lint, meta]
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(needs.meta.outputs.heavy_runs_on) || matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # The full workspace build (especially the wide-feature +
+          # Postgres-container step below) sits near the runner's disk
+          # ceiling; a cold-cache PR build tips it over ("No space left on
+          # device"). Reclaim the preinstalled toolchains a Rust build never
+          # uses before the cache is restored.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
       - name: Run tests
         run: cargo test --workspace
-      - name: Run Docker-dependent tests
+      - name: Install Postgres client tools (Linux)
         if: runner.os == 'Linux'
         run: |
+          # The offsite-backup round-trip below drives `autumn db backup`, which
+          # shells out to the HOST `pg_dump`/`pg_restore`. ubuntu-latest does not
+          # guarantee these on PATH, so install the client package explicitly.
+          # (postgresql-client installs pg_dump/pg_restore into /usr/bin via the
+          # pg_wrapper symlinks, so no extra PATH tweak is needed.)
+          # openssh-client (ssh/scp) is also installed here: the AC-7 deploy
+          # end-to-end test (#1607) drives the real `autumn deploy` over ssh/scp
+          # against a privileged systemd container, and ubuntu-latest does not
+          # guarantee the ssh *client* on PATH.
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client openssh-client
+          pg_dump --version
+          pg_restore --version
+          ssh -V
+      - name: Run Docker-dependent tests
+        if: runner.os == 'Linux'
+        timeout-minutes: 45
+        run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
-          cargo test -p autumn-web --all-features --test feature_flags_pg_integration -- --ignored
+          cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
+          # NOTE: explicit feature list (NOT `--all-features`). `--all-features`
+          # would enable the backend-flip `sqlite` feature, which flips
+          # `db::RuntimeConnection` from `AsyncPgConnection` to a SQLite
+          # connection and fails to compile the Postgres-assuming modules
+          # (db.rs/managed_pg.rs/state.rs/job.rs/repository.rs/sharding.rs). This
+          # list is every autumn-web feature EXCEPT `sqlite` (i.e. the Postgres
+          # backend, which this pg-integration test requires). See #1614.
+          cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
+          cargo test -p autumn-web --test scoped_tokens_db -- --ignored
+          cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
+          cargo test -p autumn-cache-redis -- --ignored
+          cargo test -p autumn-cli --test flags -- --ignored
+          cargo test -p autumn-cli --test config -- --ignored
+          cargo test -p autumn-cli --test experiments -- --ignored
+          # Offsite-backup DR round-trip (#1744): seed -> `autumn db backup
+          # --upload` -> restore from offsite -> row-level equality, against real
+          # MinIO + Postgres testcontainers. The `offsite` filter selects both
+          # ignored tests in autumn-cli/tests/integration/offsite_backup.rs.
+          # Needs Docker (testcontainers) + host pg_dump/pg_restore (installed
+          # above). Runs in the existing Docker-dependent Linux step rather than a
+          # separate required gate.
+          cargo test -p autumn-cli --test cli_tests -- --ignored offsite
+          # Consolidated `integration_tests` binary: discover-and-run ALL the
+          # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
+          # per-feature allowlist (#1923). Enabling `test-support` (testcontainers)
+          # + `offline-sync` compiles in every db-gated module (db + maud are
+          # already defaults), and the bare `--ignored` sweep then runs every
+          # ignored test in the binary — so a newly-added house-pattern
+          # testcontainer DB test runs here automatically, with no workflow edit.
+          # This subsumes the old offline_sync_pg (#1346) and nested_form (#1346)
+          # scoped lines and picks up the previously-unrun suites
+          # (validate_on_update_blind #1801, repository_*, tenancy, distributed_lock, …).
+          #
+          # Non-Docker `#[ignore]` tests must NOT be swept in here: browser
+          # (Chromium) tests live behind the `system-tests` feature and never
+          # compile into this run; any other non-Docker ignored test (bench /
+          # timing) must be feature-gated OR added to the `--skip` list below.
+          # The lone current exception is the release-mode timing microbenchmark
+          # in access_log.rs, which is unconditionally compiled.
+          # The non-ignored offline-sync engine/store/conformance tests are
+          # `#[cfg(feature = "offline-sync")]` (not a default feature), so the
+          # workspace test run above compiles them out; run them here. Same
+          # feature set as the sweep below so the binary is compiled once.
+          #
+          # The feature set also enables `ws`, `mail`, and `redis` (#1945): those
+          # gate previously-unreachable testcontainer-managed Docker `#[ignore]`d
+          # tests (the `ws` live_broadcast OOB-fragment suite, the `redis` worker-
+          # gating/dedicated-capacity/rate-limit suites, and the `mail` newsletter
+          # unsubscribe test) which never compiled into this binary and so were
+          # never swept. All are Postgres/Redis testcontainer-managed, so no CI
+          # `services:` block is needed. Chromium/browser tests stay OUT — they
+          # live behind `system-tests` and require a browser this runner lacks.
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis" --test integration_tests offline_sync
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis" --test integration_tests -- \
+            --ignored \
+            --test-threads=1 \
+            --skip per_request_overhead_is_under_50_microseconds_p99 \
+            --skip cancelled_release_does_not_leak_lock # flaky wall-clock zero-duration-timeout race; needs deterministic/paused time to de-flake (tracked as a follow-up)
+          # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
+          # deploy up`/`rollback` over ssh/scp against a privileged systemd
+          # container (first deploy, zero-downtime redeploy, on-demand rollback,
+          # forced-failure auto-rollback). Isolated `--test deploy_e2e` binary; it
+          # builds its own fixture image (extracting kamal-proxy from the
+          # basecamp/kamal-proxy Docker Hub image) and needs the ssh client
+          # installed above.
+          cargo test -p autumn-cli --test deploy_e2e -- --ignored
 
   coverage:
     name: Coverage
-    needs: test
-    runs-on: ubuntu-latest
+    needs: [test, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        run: |
+          # llvm-cov instrumentation roughly doubles target/ size, so the
+          # coverage build is the most disk-hungry job; reclaim unused
+          # preinstalled toolchains so it doesn't exhaust the runner disk.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
+        # resolve with an empty tool input and install nothing (broke the Fuzz
+        # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
       - name: Generate coverage
+        env:
+          # `postgresql_embedded`'s build script downloads Postgres binaries via
+          # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
+          # fails the build with a 403. Authenticate with the job's token to get
+          # the higher rate limit.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --workspace --all-features --no-report
-          cargo llvm-cov --no-report -p autumn-web --all-features \
+          # `--all-features` is unsafe here: it would enable autumn-web's
+          # backend-flip `sqlite` feature alongside the Postgres-assuming
+          # features, flipping `db::RuntimeConnection` to SQLite and failing
+          # autumn-web's lib to compile (#1614). Cargo has no "all-features
+          # except one crate feature" flag, so cover the rest of the workspace
+          # with `--all-features --exclude autumn-web`, then cover autumn-web
+          # separately with an explicit Postgres feature list (every autumn-web
+          # feature EXCEPT `sqlite`). Both accumulate into the same profile set.
+          PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,system-tests,managed-pg,managed-pg-bundled,tls,acme"
+          cargo llvm-cov --workspace --exclude autumn-web --all-features --no-report
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES"
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test db_hooks_lifecycle -- --ignored
-          cargo llvm-cov --no-report -p autumn-web --all-features \
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test repository_shard_replica_routing -- --ignored
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test feature_flags_pg_integration -- --ignored
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test scoped_tokens_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test token_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
+          cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
+          cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
+          cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
@@ -81,10 +266,83 @@ jobs:
     name: MSRV (1.88.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Check MSRV alignment
         run: ./scripts/check-msrv.sh
       - name: Check MSRV compiles
         run: cargo check --workspace
+
+  # SQLite runtime lane gate (issue #1614, AC#11). This is the ONLY place in CI
+  # that enables autumn-web's `sqlite` feature, and it does so via an EXPLICIT
+  # `--features sqlite` on each dedicated invocation below — NEVER via
+  # `--all-features` and never via a workspace dependency edge. `sqlite` is a
+  # backend-flip feature: it flips `db::RuntimeConnection` from `AsyncPgConnection`
+  # to a SQLite connection, so unifying it with the Postgres-assuming features
+  # breaks compilation (the earlier trunk-red). Keep it isolated to this job.
+  #
+  # No Postgres `services:` / Docker: the sqlite tests use tempfile/in-memory
+  # SQLite with no external DB. The job builds + lints autumn-web under the
+  # sqlite backend and runs the sqlite integration suite by NAMED `[[test]]`
+  # target — a bare `cargo test --features sqlite` is unsafe (it would compile
+  # the Postgres `integration_tests` binary and the pg-URL lib unit tests under
+  # the flipped backend and fail).
+  sqlite-runtime:
+    name: SQLite runtime (feature=sqlite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Build autumn-web under the sqlite backend
+        run: cargo build -p autumn-web --features sqlite
+      - name: Clippy (autumn-web lib, sqlite backend)
+        run: cargo clippy -p autumn-web --features sqlite --lib -- -D warnings
+      - name: Run the sqlite integration suite
+        # Named sqlite `[[test]]` targets only. `test-support` is required by the
+        # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
+        # sqlite_transactional_url_pool) and is additive/harmless for the rest.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_boot_serve \
+            --test sqlite_migrations \
+            --test sqlite_foreign_keys \
+            --test sqlite_db_extractor \
+            --test sqlite_pool_pragmas \
+            --test sqlite_read_only_pool \
+            --test sqlite_scoped_repository \
+            --test sqlite_read_only_tx \
+            --test sqlite_transactional_url_pool \
+            --test sqlite_version_history \
+            --test sqlite_searchable_repository \
+            --test sqlite_immediate_transaction \
+            --test sqlite_statement_timeout_fail_closed \
+            --test sqlite_crud_basic \
+            --test sqlite_upsert_isolation \
+            --test sqlite_dependent_destroy \
+            --test sqlite_commit_hook_worker
+
+  # Genuine loom model checks: the loom_models test binary uses loom::sync::*
+  # unconditionally, so loom::model() exhaustively explores thread interleavings
+  # here. We gate the binary with a NEUTRAL custom cfg (loom_models) rather than
+  # the conventional `--cfg loom`, because `--cfg loom` poisons the whole
+  # dependency tree — hyper-util/tokio ship their own `#[cfg(loom)]` type-swap
+  # paths that fail to compile. Release mode is loom's own recommendation, and
+  # the preemption budget + job timeout bound the state-space search.
+  loom:
+    name: Loom
+    needs: [test, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Run loom model checks
+        run: cargo test -p autumn-web --release --test loom_models
+        env:
+          RUSTFLAGS: "--cfg loom_models"
+          LOOM_MAX_PREEMPTIONS: "3"

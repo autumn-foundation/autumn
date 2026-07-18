@@ -1,0 +1,36 @@
+use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
+use autumn_web::prelude::*;
+use autumn_web::reexports::serde_json;
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+
+// JSON-first API scaffold (`autumn new --api`): handlers return `Json<...>`,
+// there is no HTML/CSS view layer. Add typed request/response structs with
+// `#[derive(serde::Serialize)]` (via `autumn_web::reexports::serde`) as your
+// API grows.
+
+#[get("/")]
+async fn index() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "name": "{{project_name}}",
+        "message": "Welcome to {{project_name}}!",
+    }))
+}
+
+#[get("/hello/{name}")]
+async fn hello_name(name: autumn_web::extract::Path<String>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "message": format!("Hello, {}!", *name),
+    }))
+}
+
+#[autumn_web::main]
+async fn main() {
+    let app = autumn_web::app()
+        .routes(routes![index, hello_name])
+        .migrations(MIGRATIONS);
+
+    app
+        .run()
+        .await;
+}

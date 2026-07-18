@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "date": "2026-06-22",
+    "host_os": "Linux 6.18.5 x86_64",
+    "cpu": "Intel Xeon @ 2.80GHz, 4 vCPU",
+    "ram": "15 GiB",
+    "k6_version": "v0.55.0",
+    "autumn_version": "0.5.0",
+    "postgres_version": "16",
+    "vus": 20,
+    "duration_s": 30,
+    "methodology": "1 discarded warmup + 3 measured runs; median p99 reported",
+    "note": "Local bare-metal run (no container limits); CI budget includes 50ms floor for shared-runner overhead"
+  },
+  "gated_paths": {
+    "GET /api/posts": {
+      "runs_p99_ms": [4.72, 4.92, 5.58],
+      "median_p99_ms": 4.92,
+      "budget_p99_ms": 50
+    },
+    "GET /posts": {
+      "runs_p99_ms": [3.92, 4.23, 4.39],
+      "median_p99_ms": 4.23,
+      "budget_p99_ms": 50
+    }
+  }
+}

@@ -1,0 +1,41 @@
+# Bookmarks Sharded — framework-native horizontal sharding.
+#
+# The top-level [database] role is the CONTROL topology: framework state
+# (autumn_jobs, scheduler locks, sessions, feature flags) lives there and
+# is never sharded. Tenant data (bookmarks) routes across the shards by
+# hashing the tenant id onto logical slots.
+
+[server]
+port = 3000
+
+[log]
+level = "info"
+
+[database]
+primary_url = "postgres://autumn:autumn@localhost:5442/bookmarks_control"
+pool_size = 4
+
+# Explicit slot assignments over the fixed 16384 logical slots (the same
+# constant Redis Cluster uses): declaration order is inert and resharding
+# is a config flip (move a slot's rows, then move the slot).
+[[database.shards]]
+name = "shard0"
+primary_url = "postgres://autumn:autumn@localhost:5443/bookmarks_shard0"
+slots = ["0-8191"]
+
+[[database.shards]]
+name = "shard1"
+primary_url = "postgres://autumn:autumn@localhost:5444/bookmarks_shard1"
+slots = ["8192-16383"]
+
+# The tenant id doubles as the shard routing key: `ShardedDb` resolves it
+# from the X-Tenant-Id header on every request.
+[tenancy]
+enabled = true
+source = "header"
+header_name = "x-tenant-id"
+# The browser auto-requests /favicon.ico for any page load; without this it's
+# rejected by the same header check as every other route (400, not the 404 a
+# missing route would give), which the browser's headless smoke test reports
+# as a real console error.
+public_paths = ["/favicon.ico"]

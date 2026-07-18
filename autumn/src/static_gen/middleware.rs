@@ -295,6 +295,9 @@ async fn regenerate_page(
         .oneshot(
             Request::builder()
                 .uri(url)
+                // Internal ISR regeneration render: exempt from the inbound
+                // request-timeout deadline (no client connection).
+                .extension(super::RenderDeadlineExempt)
                 .body(Body::empty())
                 .expect("valid request"),
         )

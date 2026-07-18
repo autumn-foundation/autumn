@@ -31,6 +31,12 @@ pub const HTMX_JS: &[u8] = include_bytes!("../vendor/htmx.min.js");
 /// Same-origin path where Autumn serves embedded htmx.
 pub const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 
+/// htmx SSE extension JavaScript, embedded at compile time.
+pub const HTMX_SSE_JS: &[u8] = include_bytes!("../vendor/sse.js");
+
+/// Same-origin path where Autumn serves embedded htmx SSE extension.
+pub const HTMX_SSE_JS_PATH: &str = "/static/js/sse.js";
+
 /// Autumn widget runtime JavaScript, embedded at compile time.
 ///
 /// Provides CSP-compatible event-listener wiring for built-in widgets
@@ -56,6 +62,22 @@ pub const AUTUMN_WIDGETS_JS_PATH: &str = "/static/js/autumn-widgets.js";
 /// The request header defaults to `X-CSRF-Token`; override it with
 /// `data-header="..."` on the meta tag when using a custom CSRF header name.
 pub const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
+
+/// Idiomorph DOM-morphing library, embedded at compile time.
+///
+/// Serves at [`IDIOMORPH_JS_PATH`] with immutable caching headers.
+/// Enables `hx-swap="morph"` on htmx requests for smooth DOM updates.
+///
+/// Reference in your layout:
+/// ```html
+/// <script src="/static/js/idiomorph.min.js"></script>
+/// ```
+#[cfg(feature = "htmx")]
+pub const IDIOMORPH_JS: &[u8] = include_bytes!("../vendor/idiomorph.min.js");
+
+/// Same-origin path where Autumn serves the idiomorph library.
+#[cfg(feature = "htmx")]
+pub const IDIOMORPH_JS_PATH: &str = "/static/js/idiomorph.min.js";
 
 /// CSP-compatible htmx CSRF helper JavaScript.
 ///
@@ -206,6 +228,457 @@ fn append_hx_header<T: IntoResponse>(response: T, name: &'static str, value: &st
     res
 }
 
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OobMethod {
+    OuterHTML,
+    InnerHTML,
+    BeforeBegin,
+    AfterBegin,
+    BeforeEnd,
+    AfterEnd,
+    Delete,
+}
+
+#[cfg(feature = "maud")]
+impl OobMethod {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::OuterHTML => "outerHTML",
+            Self::InnerHTML => "innerHTML",
+            Self::BeforeBegin => "beforebegin",
+            Self::AfterBegin => "afterbegin",
+            Self::BeforeEnd => "beforeend",
+            Self::AfterEnd => "afterend",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OobSwap {
+    /// Swap the element outerHTML-style by matching its own ID (`hx-swap-oob="true"`).
+    True,
+    /// Swap using a specific method, targeting the element matching the fragment's ID.
+    OuterHTML,
+    InnerHTML,
+    BeforeBegin,
+    AfterBegin,
+    BeforeEnd,
+    AfterEnd,
+    Delete,
+    /// Swap using a specific method targeting a custom CSS selector.
+    Target(OobMethod, String),
+    /// Already contains `hx-swap-oob` on the root element. Do not wrap in a `<template>` tag.
+    Raw,
+    /// Custom raw string for the `hx-swap-oob` attribute.
+    Custom(String),
+}
+
+#[cfg(feature = "maud")]
+impl OobSwap {
+    #[must_use]
+    pub fn format_value<'a>(&'a self, id: &'a str) -> std::borrow::Cow<'a, str> {
+        let clean_id = id.strip_prefix('#').unwrap_or(id);
+        if clean_id.is_empty() {
+            return match self {
+                Self::True => std::borrow::Cow::Borrowed("true"),
+                Self::OuterHTML => std::borrow::Cow::Borrowed("outerHTML"),
+                Self::InnerHTML => std::borrow::Cow::Borrowed("innerHTML"),
+                Self::BeforeBegin => std::borrow::Cow::Borrowed("beforebegin"),
+                Self::AfterBegin => std::borrow::Cow::Borrowed("afterbegin"),
+                Self::BeforeEnd => std::borrow::Cow::Borrowed("beforeend"),
+                Self::AfterEnd => std::borrow::Cow::Borrowed("afterend"),
+                Self::Delete => std::borrow::Cow::Borrowed("delete"),
+                Self::Target(method, _) => std::borrow::Cow::Borrowed(method.as_str()),
+                Self::Custom(val) => std::borrow::Cow::Borrowed(val),
+                Self::Raw => {
+                    unreachable!("Raw strategy should not be formatted into a template wrapper")
+                }
+            };
+        }
+        match self {
+            Self::True => std::borrow::Cow::Borrowed("true"),
+            Self::OuterHTML => std::borrow::Cow::Borrowed("outerHTML"),
+            Self::InnerHTML => std::borrow::Cow::Owned(format!("innerHTML:#{clean_id}")),
+            Self::BeforeBegin => std::borrow::Cow::Owned(format!("beforebegin:#{clean_id}")),
+            Self::AfterBegin => std::borrow::Cow::Owned(format!("afterbegin:#{clean_id}")),
+            Self::BeforeEnd => std::borrow::Cow::Owned(format!("beforeend:#{clean_id}")),
+            Self::AfterEnd => std::borrow::Cow::Owned(format!("afterend:#{clean_id}")),
+            Self::Delete => std::borrow::Cow::Owned(format!("delete:#{clean_id}")),
+            Self::Target(method, selector) => {
+                std::borrow::Cow::Owned(format!("{}:{}", method.as_str(), selector))
+            }
+            Self::Custom(val) => std::borrow::Cow::Borrowed(val),
+            Self::Raw => {
+                unreachable!("Raw strategy should not be formatted into a template wrapper")
+            }
+        }
+    }
+
+    /// Whether htmx applies this swap by iterating the carrier element's own
+    /// child nodes — true for the *positional* swaps (`beforebegin` /
+    /// `afterbegin` / `beforeend` / `afterend`) **and** for `innerHTML`, which
+    /// all route through the same insert loop over `carrier.childNodes`. Only
+    /// the element-replacing swaps (`true` / `outerHTML` by id) unwrap the
+    /// carrier by id instead, so they return `false`.
+    ///
+    /// This matters for the carrier tag: htmx's insert loop iterates the
+    /// carrier's `childNodes`, but an `HTMLTemplateElement` keeps its children
+    /// in `.content` (a `DocumentFragment`), so `template.childNodes` is empty
+    /// and htmx would append nothing. Child-node-inserting swaps must therefore
+    /// use a plain `<div>` carrier — whose real children live in `childNodes` —
+    /// while element-replacing swaps keep the `<template>` carrier (#1688).
+    #[must_use]
+    const fn inserts_child_nodes(&self) -> bool {
+        match self {
+            Self::InnerHTML
+            | Self::BeforeBegin
+            | Self::AfterBegin
+            | Self::BeforeEnd
+            | Self::AfterEnd => true,
+            Self::Target(method, _) => matches!(
+                method,
+                OobMethod::InnerHTML
+                    | OobMethod::BeforeBegin
+                    | OobMethod::AfterBegin
+                    | OobMethod::BeforeEnd
+                    | OobMethod::AfterEnd
+            ),
+            Self::True | Self::OuterHTML | Self::Delete | Self::Custom(_) | Self::Raw => false,
+        }
+    }
+}
+
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+struct OobFragment {
+    id: String,
+    strategy: OobSwap,
+    markup: maud::Markup,
+}
+
+#[cfg(feature = "maud")]
+/// A response builder for composing out-of-band multi-region swaps in htmx.
+///
+/// This builder allows a handler to return a primary HTML fragment plus one or
+/// more out-of-band (OOB) fragments that update other disjoint regions of the
+/// page.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::prelude::*;
+/// use autumn_web::htmx::{HtmxFragments, OobSwap};
+/// use maud::Render;
+///
+/// let primary = html! { div { "Task created successfully!" } };
+/// let flash = html! { div id="flash-message" class="alert alert-success" { "Succesfully saved!" } };
+/// let counter = html! { span { "5" } };
+///
+/// let response = HtmxFragments::new(primary)
+///     .oob("flash-message", flash)
+///     .oob_with_strategy("task-count", OobSwap::InnerHTML, counter);
+///
+/// // HtmxFragments implements `IntoResponse` and `maud::Render`
+/// let rendered = response.render().into_string();
+/// assert!(rendered.contains("<div>Task created successfully!</div>"));
+/// assert!(rendered.contains("<template hx-swap-oob=\"true\"><div id=\"flash-message\""));
+/// // htmx inserts the carrier's child nodes for `innerHTML`, so the carrier
+/// // must be a `<div>` — a `<template>`'s children live in `.content`, giving
+/// // empty `childNodes`, so nothing would land in the DOM.
+/// assert!(rendered.contains("<div hx-swap-oob=\"innerHTML:#task-count\"><span>5</span></div>"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct HtmxFragments {
+    primary: Option<maud::Markup>,
+    oob: Vec<OobFragment>,
+}
+
+#[cfg(feature = "maud")]
+impl HtmxFragments {
+    /// Create a new builder with a primary fragment.
+    #[must_use]
+    pub const fn new(primary: maud::Markup) -> Self {
+        Self {
+            primary: Some(primary),
+            oob: Vec::new(),
+        }
+    }
+
+    /// Create a new empty builder (only OOB fragments).
+    #[must_use]
+    pub const fn oob_only() -> Self {
+        Self {
+            primary: None,
+            oob: Vec::new(),
+        }
+    }
+
+    /// Attach an out-of-band fragment using the default `OobSwap::True` strategy.
+    #[must_use]
+    pub fn oob(self, id: impl Into<String>, markup: maud::Markup) -> Self {
+        self.oob_with_strategy(id, OobSwap::True, markup)
+    }
+
+    /// Attach an out-of-band fragment with a specific swap strategy.
+    #[must_use]
+    pub fn oob_with_strategy(
+        mut self,
+        id: impl Into<String>,
+        strategy: OobSwap,
+        markup: maud::Markup,
+    ) -> Self {
+        self.oob.push(OobFragment {
+            id: id.into(),
+            strategy,
+            markup,
+        });
+        self
+    }
+}
+
+#[cfg(feature = "maud")]
+fn escape_attribute(w: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => w.push_str("&amp;"),
+            '"' => w.push_str("&quot;"),
+            '<' => w.push_str("&lt;"),
+            '>' => w.push_str("&gt;"),
+            _ => w.push(c),
+        }
+    }
+}
+
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn escape_attribute_string(s: &str) -> String {
+    let mut w = String::with_capacity(s.len() + 10);
+    escape_attribute(&mut w, s);
+    w
+}
+
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn inject_hx_swap_oob(html: &str, oob_value: &str) -> Option<String> {
+    let mut idx = 0;
+    while let Some(start_pos) = html[idx..].find('<') {
+        let abs_start = idx + start_pos;
+        let remaining = &html[abs_start..];
+        if remaining.starts_with("<!--") {
+            let comment_end = remaining.find("-->")?;
+            idx = abs_start + comment_end + 3;
+        } else {
+            let mut tag_name_end = 0;
+            for (char_idx, c) in remaining.char_indices().skip(1) {
+                if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '>' || c == '/' {
+                    tag_name_end = char_idx;
+                    break;
+                }
+            }
+            if tag_name_end == 0 {
+                return None;
+            }
+            let insert_pos = abs_start + tag_name_end;
+            let escaped_val = escape_attribute_string(oob_value);
+            let mut result = String::with_capacity(html.len() + escaped_val.len() + 30);
+            result.push_str(&html[..insert_pos]);
+            result.push_str(" hx-swap-oob=\"");
+            result.push_str(&escaped_val);
+            result.push('"');
+            result.push_str(&html[insert_pos..]);
+            return Some(result);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "maud")]
+impl maud::Render for HtmxFragments {
+    fn render_to(&self, w: &mut String) {
+        if let Some(primary) = &self.primary {
+            primary.render_to(w);
+        }
+        for oob in &self.oob {
+            let rendered = &oob.markup.0;
+            if has_oob_attribute(rendered) || matches!(oob.strategy, OobSwap::Raw) {
+                w.push_str(rendered);
+            } else {
+                let value = oob.strategy.format_value(&oob.id);
+                // Child-node-inserting swaps must use a `<div>` carrier: htmx
+                // inserts the carrier's `childNodes` for the positional swaps
+                // (beforebegin/afterbegin/beforeend/afterend) *and* for
+                // `innerHTML`, and a `<template>` keeps its children in
+                // `.content` (empty `childNodes`), so the fragment would never
+                // land in the DOM (#1688). Element-replacing swaps (`true` /
+                // `outerHTML` by id) keep the `<template>` carrier htmx unwraps.
+                //
+                // Because htmx inserts the carrier's direct `childNodes`, a
+                // fragment given to such a swap must be a valid direct child of
+                // a `<div>`. Do NOT pass a bare `<tr>`/`<td>`/`<tbody>`/
+                // `<option>`/`<col>`: the HTML parser foster-parents those out
+                // of a `<div>`, so they vanish before htmx sees them.
+                // Table-row live swaps instead go through the element-replacing
+                // (`outerHTML` / `inserts_child_nodes() == false`) path with the
+                // id on the row itself (see `channels.rs::sse_oob_envelope`); a
+                // positional table-row fragment API is a documented follow-up.
+                let carrier = if oob.strategy.inserts_child_nodes() {
+                    "div"
+                } else {
+                    "template"
+                };
+                w.push('<');
+                w.push_str(carrier);
+                w.push_str(" hx-swap-oob=\"");
+                escape_attribute(w, &value);
+                w.push_str("\">");
+                w.push_str(rendered);
+                w.push_str("</");
+                w.push_str(carrier);
+                w.push('>');
+            }
+        }
+    }
+}
+
+#[cfg(feature = "maud")]
+impl IntoResponse for HtmxFragments {
+    fn into_response(self) -> Response {
+        use maud::Render;
+
+        let mut capacity = 0;
+        if let Some(primary) = &self.primary {
+            capacity += primary.0.len();
+        }
+        for oob in &self.oob {
+            capacity += oob.markup.0.len() + 64;
+        }
+        let mut w = String::with_capacity(capacity);
+
+        self.render_to(&mut w);
+        axum::response::Html(w).into_response()
+    }
+}
+
+#[cfg(feature = "maud")]
+fn has_oob_attribute(html: &str) -> bool {
+    let mut in_tag = false;
+    let mut in_quote = None;
+    let mut chars = html.char_indices().peekable();
+
+    while let Some((idx, c)) = chars.next() {
+        if in_tag {
+            if let Some(q) = in_quote {
+                if c == q {
+                    in_quote = None;
+                }
+            } else if c == '"' || c == '\'' {
+                in_quote = Some(c);
+            } else if c == '>' {
+                in_tag = false;
+            } else {
+                let remaining = &html[idx..];
+                let match_len = if remaining
+                    .get(..11)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("hx-swap-oob"))
+                {
+                    Some(11)
+                } else if remaining
+                    .get(..16)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("data-hx-swap-oob"))
+                {
+                    Some(16)
+                } else {
+                    None
+                };
+
+                if let Some(len) = match_len {
+                    let after = remaining.chars().nth(len);
+                    match after {
+                        None | Some('=' | ' ' | '\t' | '\n' | '\r' | '>' | '/') => {
+                            let is_word_start = if idx == 0 {
+                                true
+                            } else if let Some(prev_char) = html[..idx].chars().next_back() {
+                                prev_char.is_ascii_whitespace()
+                                    || prev_char == '/'
+                                    || prev_char == '<'
+                                    || prev_char == '"'
+                                    || prev_char == '\''
+                            } else {
+                                true
+                            };
+                            if is_word_start {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else if c == '<' {
+            let remaining = &html[idx..];
+            if remaining.starts_with("<!--") {
+                while let Some((_, next_c)) = chars.next() {
+                    if next_c == '-' {
+                        let rem = &html[chars.peek().map_or(html.len(), |&(i, _)| i)..];
+                        if rem.starts_with("->") {
+                            chars.next();
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+            } else {
+                in_tag = true;
+                in_quote = None;
+            }
+        }
+    }
+    false
+}
+
+/// Extracts the `id` attribute value from the root HTML element in the given HTML string.
+///
+/// Looks for an `id` attribute within the root start tag (before the first `>`).
+/// The attribute name must be preceded by a whitespace boundary.
+#[must_use]
+pub fn extract_html_id(html: &str) -> Option<String> {
+    let start_tag_end = html.find('>')?;
+    let start_tag = &html[..start_tag_end];
+    let mut id_idx = None;
+    let mut search_start = 0;
+    while let Some(offset) = start_tag[search_start..].find("id=") {
+        let absolute_idx = search_start + offset;
+        if absolute_idx > 0 {
+            let prev_char = start_tag.as_bytes()[absolute_idx - 1];
+            if prev_char == b' ' || prev_char == b'\t' || prev_char == b'\n' || prev_char == b'\r' {
+                id_idx = Some(absolute_idx);
+                break;
+            }
+        }
+        search_start = absolute_idx + 3;
+    }
+    let idx = id_idx?;
+    let after_id = &start_tag[idx + 3..];
+    let mut chars = after_id.chars();
+    let quote = chars.next()?;
+    if quote == '"' || quote == '\'' {
+        let mut val = String::new();
+        for c in chars {
+            if c == quote {
+                break;
+            }
+            val.push(c);
+        }
+        Some(val)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +688,7 @@ mod tests {
     #[allow(clippy::const_is_empty)]
     fn htmx_js_is_not_empty() {
         assert!(!HTMX_JS.is_empty(), "htmx.min.js should not be empty");
+        assert!(!HTMX_SSE_JS.is_empty(), "sse.js should not be empty");
     }
 
     #[test]
@@ -223,6 +697,14 @@ mod tests {
         assert!(
             start.contains("htmx") || start.contains("function") || start.contains('('),
             "htmx.min.js doesn't look like JavaScript: {start}"
+        );
+        let sse_start = std::str::from_utf8(&HTMX_SSE_JS[..50]).expect("sse should be valid UTF-8");
+        assert!(
+            sse_start.contains("Server")
+                || sse_start.contains("function")
+                || sse_start.contains('/')
+                || sse_start.contains('*'),
+            "sse.js doesn't look like JavaScript: {sse_start}"
         );
     }
 
@@ -235,6 +717,7 @@ mod tests {
     fn htmx_asset_paths_are_same_origin_static_paths() {
         assert_eq!(HTMX_JS_PATH, "/static/js/htmx.min.js");
         assert_eq!(HTMX_CSRF_JS_PATH, "/static/js/autumn-htmx-csrf.js");
+        assert_eq!(HTMX_SSE_JS_PATH, "/static/js/sse.js");
     }
 
     #[test]
@@ -243,6 +726,50 @@ mod tests {
         assert!(HTMX_CSRF_JS.contains("X-CSRF-Token"));
         assert!(HTMX_CSRF_JS.contains("csrf-token"));
         assert!(!HTMX_CSRF_JS.contains("<script"));
+    }
+
+    #[test]
+    fn widgets_js_wires_nav_bar() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        assert!(js.contains("data-autumn-nav"), "{js}");
+        assert!(js.contains("data-nav-toggle"), "{js}");
+        assert!(js.contains("data-nav-menu-toggle"), "{js}");
+        assert!(js.contains("aria-expanded"), "{js}");
+        assert!(js.contains("Escape"), "{js}");
+    }
+
+    #[test]
+    fn widgets_js_wires_modal() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        // Fallback open/close wiring for browsers without the Invoker
+        // Commands API (command/commandfor), used by autumn_web::widgets::modal
+        // and confirm_action (issue #1233).
+        assert!(js.contains("data-modal-open"), "{js}");
+        assert!(js.contains("data-modal-close"), "{js}");
+        assert!(js.contains("showModal"), "{js}");
+        assert!(
+            js.contains("'command' in HTMLButtonElement.prototype"),
+            "{js}"
+        );
+        // The whole point of this widget is to replace the native
+        // window.confirm() dialog with a server-rendered, testable one.
+        assert!(!js.contains("window.confirm"), "{js}");
+    }
+
+    #[test]
+    fn widgets_js_polyfills_light_dismiss_backdrop_click() {
+        // PR review (chatgpt-codex-connector): closedby="any" (see
+        // ModalConfig::light_dismiss) has limited browser support, so
+        // backdrop clicks must be polyfilled for browsers that don't honor
+        // it natively yet — mirroring the command/commandfor fallback above.
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        assert!(
+            js.contains(r#"dialog[closedby="any"][open]"#),
+            "must polyfill backdrop-click dismissal for closedby=\"any\" dialogs: {js}"
+        );
     }
 
     #[tokio::test]
@@ -362,5 +889,304 @@ mod tests {
         assert_eq!(hx.prompt, None);
         assert!(!hx.boosted);
         Ok(())
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_renders_correctly() {
+        use axum::response::IntoResponse;
+
+        let primary = maud::html! { div { "primary body" } };
+        let oob1 = maud::html! { div id="badge" { "3" } };
+        let oob2 = maud::html! { li { "new item" } };
+
+        let response = HtmxFragments::new(primary)
+            .oob("badge", oob1)
+            .oob_with_strategy("list", OobSwap::BeforeEnd, oob2)
+            .into_response();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert!(
+            body_str.contains("<div>primary body</div>"),
+            "got: {body_str}"
+        );
+        assert!(
+            body_str
+                .contains("<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>"),
+            "got: {body_str}"
+        );
+        // Positional swaps (#1688) use a <div> carrier — NOT a <template> —
+        // because htmx inserts the carrier's childNodes, which are empty for a
+        // <template> (its children live in .content).
+        assert!(
+            body_str.contains("<div hx-swap-oob=\"beforeend:#list\"><li>new item</li></div>"),
+            "got: {body_str}"
+        );
+        assert!(
+            !body_str.contains("<template hx-swap-oob=\"beforeend"),
+            "positional swap must not emit a <template> carrier: {body_str}"
+        );
+    }
+
+    /// Regression for #1688: a positional OOB swap must emit a carrier whose own
+    /// `childNodes` htmx can iterate and insert. This models htmx's positional
+    /// insert (which reads `carrier.childNodes`, empty for a `<template>` since
+    /// its children live in `.content`) rather than only asserting the string.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_positional_oob_uses_div_carrier_with_real_children() {
+        use axum::response::IntoResponse;
+        use maud::Render;
+
+        // Render each positional strategy and confirm the carrier is a <div>
+        // (whose childNodes are the fragment) and never a <template>.
+        for (strategy, value) in [
+            (OobSwap::BeforeEnd, "beforeend:#list"),
+            (OobSwap::AfterBegin, "afterbegin:#list"),
+            (OobSwap::BeforeBegin, "beforebegin:#list"),
+            (OobSwap::AfterEnd, "afterend:#list"),
+        ] {
+            let fragment = maud::html! { li { "row" } };
+            let rendered = HtmxFragments::oob_only()
+                .oob_with_strategy("list", strategy, fragment)
+                .render()
+                .into_string();
+
+            let open = format!("<div hx-swap-oob=\"{value}\">");
+            assert!(
+                rendered.starts_with(&open) && rendered.ends_with("</div>"),
+                "positional swap {value:?} must use a <div> carrier: {rendered}"
+            );
+            assert!(
+                !rendered.contains("<template"),
+                "positional swap {value:?} must not use a <template> carrier: {rendered}"
+            );
+
+            // Model htmx's positional insert: the nodes it appends are the
+            // carrier's *direct children* (the text between the carrier's open
+            // and close tags). For this <div> carrier those children are the
+            // rendered fragment; a <template> carrier would expose no childNodes
+            // here and htmx would append nothing.
+            let children = rendered
+                .strip_prefix(&open)
+                .and_then(|s| s.strip_suffix("</div>"))
+                .expect("carrier open/close tags");
+            assert_eq!(
+                children, "<li>row</li>",
+                "the <div> carrier's childNodes must be the fragment htmx inserts",
+            );
+        }
+
+        // outerHTML/by-id (`true`) swaps still use the <template> carrier that
+        // htmx unwraps — this is deliberately unchanged.
+        let response = HtmxFragments::oob_only()
+            .oob("badge", maud::html! { div id="badge" { "3" } })
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            body_str,
+            "<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>"
+        );
+    }
+
+    /// Regression (same class as #1688): an `innerHTML` OOB swap must also emit
+    /// a `<div>` carrier, not a `<template>`. htmx's `innerHTML` swap is
+    /// non-inline and iterates the carrier's `childNodes` (only `outerHTML` /
+    /// `true` unwrap the carrier by id), so a `<template>` carrier — whose
+    /// children live in `.content` — would insert nothing at runtime. This
+    /// mirrors `channels.rs::sse_oob_envelope`, which already wraps `innerHTML`
+    /// in a `<div>`.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_inner_html_oob_uses_div_carrier_with_real_children() {
+        use maud::Render;
+
+        // Both the shorthand `InnerHTML` and the targeted
+        // `Target(InnerHTML, …)` strategy must use a <div> carrier.
+        for (strategy, value) in [
+            (OobSwap::InnerHTML, "innerHTML:#count"),
+            (
+                OobSwap::Target(OobMethod::InnerHTML, "#count".to_string()),
+                "innerHTML:#count",
+            ),
+        ] {
+            let fragment = maud::html! { span { "5" } };
+            let rendered = HtmxFragments::oob_only()
+                .oob_with_strategy("count", strategy, fragment)
+                .render()
+                .into_string();
+
+            let open = format!("<div hx-swap-oob=\"{value}\">");
+            assert!(
+                rendered.starts_with(&open) && rendered.ends_with("</div>"),
+                "innerHTML swap {value:?} must use a <div> carrier: {rendered}"
+            );
+            assert!(
+                !rendered.contains("<template"),
+                "innerHTML swap {value:?} must not use a <template> carrier: {rendered}"
+            );
+
+            // Model htmx's innerHTML insert: the nodes it appends are the
+            // carrier's *direct children* (the text between the carrier's open
+            // and close tags). For this <div> carrier those children are the
+            // rendered fragment; a <template> carrier would expose no childNodes
+            // here and htmx would insert nothing.
+            let children = rendered
+                .strip_prefix(&open)
+                .and_then(|s| s.strip_suffix("</div>"))
+                .expect("carrier open/close tags");
+            assert_eq!(
+                children, "<span>5</span>",
+                "the <div> carrier's childNodes must be the fragment htmx inserts",
+            );
+        }
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_empty_primary() {
+        use axum::response::IntoResponse;
+
+        let oob = maud::html! { div id="badge" { "3" } };
+
+        let response = HtmxFragments::oob_only().oob("badge", oob).into_response();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        // Should not contain any stray wrapper or primary body, only the OOB fragment template
+        assert_eq!(
+            body_str,
+            "<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_no_double_wrap() {
+        use axum::response::IntoResponse;
+
+        // Already contains hx-swap-oob in markup
+        let oob = maud::html! { div id="badge" hx-swap-oob="true" { "3" } };
+
+        let response = HtmxFragments::oob_only().oob("badge", oob).into_response();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        // Should not be wrapped in template
+        assert_eq!(body_str, "<div id=\"badge\" hx-swap-oob=\"true\">3</div>");
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_composes_with_headers() {
+        use axum::response::IntoResponse;
+
+        let primary = maud::html! { div { "ok" } };
+        let response = HtmxFragments::new(primary)
+            .hx_trigger("custom-event")
+            .into_response();
+
+        let headers = response.headers();
+        assert_eq!(headers.get("hx-trigger").unwrap(), "custom-event");
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(body_str.contains("<div>ok</div>"));
+    }
+
+    #[test]
+    fn test_has_oob_attribute_detector() {
+        // True cases
+        assert!(has_oob_attribute("<div hx-swap-oob=\"true\"></div>"));
+        assert!(has_oob_attribute("<div data-hx-swap-oob=\"true\"></div>"));
+        assert!(has_oob_attribute("<div hx-swap-oob = 'true' ></div>"));
+        assert!(has_oob_attribute("<div hx-swap-oob></div>"));
+        assert!(has_oob_attribute(
+            "<div class=\"x\" hx-swap-oob=\"true\"></div>"
+        ));
+        assert!(has_oob_attribute(
+            "<div hx-swap-oob=\"true\" class=\"x\"></div>"
+        ));
+
+        // False cases
+        assert!(!has_oob_attribute("<div>Learn hx-swap-oob today</div>"));
+        assert!(!has_oob_attribute("<div class=\"hx-swap-oob\"></div>"));
+        assert!(!has_oob_attribute(
+            "<div id=\"some-hx-swap-oob-element\"></div>"
+        ));
+        assert!(!has_oob_attribute(
+            "<!-- <div hx-swap-oob=\"true\"></div> -->"
+        ));
+        assert!(!has_oob_attribute(
+            "<div class=\"x\">some text hx-swap-oob=\"true\"</div>"
+        ));
+    }
+
+    #[test]
+    fn test_oob_swap_format_value_empty_id() {
+        assert_eq!(OobSwap::True.format_value(""), "true");
+        assert_eq!(OobSwap::True.format_value("#"), "true");
+        assert_eq!(OobSwap::InnerHTML.format_value(""), "innerHTML");
+        assert_eq!(OobSwap::InnerHTML.format_value("#"), "innerHTML");
+        assert_eq!(OobSwap::BeforeEnd.format_value(""), "beforeend");
+        assert_eq!(OobSwap::BeforeEnd.format_value("#"), "beforeend");
+        assert_eq!(
+            OobSwap::Target(OobMethod::InnerHTML, "#target".to_string()).format_value(""),
+            "innerHTML"
+        );
+        assert_eq!(
+            OobSwap::Target(OobMethod::BeforeEnd, "#target".to_string()).format_value("#"),
+            "beforeend"
+        );
+
+        // Non-empty ID case
+        assert_eq!(OobSwap::InnerHTML.format_value("my-id"), "innerHTML:#my-id");
+        assert_eq!(
+            OobSwap::InnerHTML.format_value("#my-id"),
+            "innerHTML:#my-id"
+        );
+    }
+
+    #[test]
+    fn test_inject_hx_swap_oob() {
+        assert_eq!(
+            inject_hx_swap_oob("<li id=\"1\"></li>", "beforeend:#container"),
+            Some("<li hx-swap-oob=\"beforeend:#container\" id=\"1\"></li>".to_string())
+        );
+        assert_eq!(
+            inject_hx_swap_oob("<!-- comment -->\n  <div class=\"foo\"></div>", "outerHTML"),
+            Some(
+                "<!-- comment -->\n  <div hx-swap-oob=\"outerHTML\" class=\"foo\"></div>"
+                    .to_string()
+            )
+        );
+        assert_eq!(inject_hx_swap_oob("Hello world", "true"), None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn test_inject_on_maud_markup() {
+        use maud::html;
+        let oob = html! { li id="item-1" { "Item" } };
+        let injected = inject_hx_swap_oob(&oob.0, "beforeend:#container");
+        assert_eq!(
+            injected,
+            Some("<li hx-swap-oob=\"beforeend:#container\" id=\"item-1\">Item</li>".to_string())
+        );
     }
 }

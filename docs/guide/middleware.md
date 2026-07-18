@@ -12,9 +12,90 @@ and the common recipes.
 
 ---
 
-## Quick start
+## Built-in request timeout
 
-Apply a Tower timeout layer to every route in the app:
+You do **not** need a tower layer for a per-request deadline — Autumn ships one.
+Set a single config key and a hung handler returns a framework-standard `503`
+(Problem Details JSON for API clients, the HTML error page for browsers) and
+frees its worker, instead of letting one slow request starve the pool:
+
+```toml
+# autumn.toml
+[server.timeouts]
+request_timeout_ms = 30000  # 0 or unset disables the deadline
+```
+
+Override at runtime with `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`. The
+`prod` profile smart-defaults this to `30000` (30s), so a fresh `autumn new` app
+is production-safe with **zero** user-written tower layers; `dev` leaves it off.
+
+A timeout emits structured telemetry — a `request_timeouts_total` counter plus a
+`tracing` warning (target `autumn::timeout`) carrying the `route` template and
+`elapsed_ms` — so you can alert on it.
+
+### What the deadline covers
+
+The deadline bounds the time to produce the **response head**, not the duration
+of body streaming. So **SSE and chunked/streaming responses are exempt** — once
+the head is sent, the body is never interrupted mid-stream. WebSocket upgrades
+(`#[ws]`) follow the same rule: the pre-upgrade handshake (any async auth or
+setup that runs before the upgrade response) counts against the deadline, but the
+**established socket is never interrupted** — it is handed off after the head is
+sent. `#[static_get]` **build-time and ISR regeneration** renders are exempt
+automatically (they run with no inbound client request to bound), but **live**
+requests that fall through to the dynamic handler — a cache miss, no `dist`, or a
+path absent from the manifest — are bounded like any other route.
+
+**Long-poll handlers are the exception**: because they block *before* returning
+the response head (waiting for an event), that wait counts against the deadline
+and the request will 503 once it elapses. Give such routes an explicit
+`timeout = "off"` (see below) if a poll may legitimately outlast the deadline.
+
+**Idempotent mutations are also bounded.** A mutating request carrying an
+`Idempotency-Key` has its full response body buffered (so the response can be
+cached and replayed) before the head is returned, so even a streamed body counts
+against the deadline. Give such endpoints a per-route override if they
+legitimately produce slow or large idempotent bodies.
+
+### Per-route overrides
+
+Extend the deadline for known-slow endpoints, or disable it entirely, right on
+the route — no manual tower wiring:
+
+```rust,no_run
+use autumn_web::prelude::*;
+
+// Large report export: allow up to two minutes.
+#[get("/reports/export", timeout_ms = 120000)]
+async fn export() -> &'static str { "…" }
+
+// Intentionally long-lived: exempt from the global deadline.
+#[get("/events", timeout = "off")]
+async fn events() -> &'static str { "…" }
+```
+
+> **WebSocket routes inherit only.** `#[ws]` does not accept `timeout_ms` /
+> `timeout = "off"`. The handshake is always bounded by the global
+> `request_timeout_ms` and the established socket is never bounded (see above).
+> If a handshake needs a different bound, wrap the async auth/setup inside the
+> upgrade handler with `tokio::time::timeout`.
+
+> **SSG/ISG outer layers are not bounded.** When a `dist` manifest is active,
+> `AppBuilder::static_gate` layers and `AppBuilder::layer` custom layers run
+> *outside* the deadline (it sits inside the dynamic router, inner to
+> `RequestId`, so cached hits and the gate never reach it). A hung async
+> `static_gate` — e.g. remote auth — is therefore not capped by
+> `request_timeout_ms`; bound it with a layer-level or server/proxy read
+> timeout. Live requests that fall through to the dynamic handler are bounded
+> normally.
+
+---
+
+## Quick start: any tower layer
+
+When you need something off the beaten path, [`AppBuilder::layer`] drops in any
+standard [`tower::Layer`]. For example, adding a *different* tower layer (here a
+raw `TimeoutLayer`, though for request deadlines prefer the built-in above):
 
 ```rust,no_run
 use std::time::Duration;
@@ -46,7 +127,8 @@ async fn main() {
 
 Tower's `TimeoutLayer` surfaces its own `BoxError` on timeout, while axum
 requires every layer to produce `Infallible`. `HandleErrorLayer` bridges the
-two — it converts any error from the inner layer into an HTTP response.
+two — it converts any error from the inner layer into an HTTP response. (The
+built-in request timeout already handles all of this for you.)
 
 ---
 
@@ -131,6 +213,87 @@ fn log_with_id<B>(req: &Request<B>) {
 
 Because user layers sit inside `RequestIdLayer`, the extension is always
 present in `call(..)` — there's no race condition to worry about.
+
+---
+
+## Gating cached pages with `static_gate`
+
+When you pre-render routes (SSG) or revalidate them on a schedule (ISG), the
+cached HTML is served by Autumn's static-first middleware **before** the inner
+router — session, auth, and your `.layer()` calls — is ever reached. That is
+what makes static hits fast and keeps them available even if the session
+backend is down, but it also means the framework's auth layers cannot gate a
+pre-rendered response: the same HTML is served to every visitor regardless of
+auth state.
+
+`AppBuilder::static_gate` is Autumn's answer to this, analogous to Next.js
+*Edge Middleware* (`middleware.ts`) running before the CDN cache lookup. A gate
+layer runs **outermost** — outside the session layer and ahead of the static
+cache — so it can redirect or reject a request before a cached page is served:
+
+```
+static_gate (auth check / redirect)
+  └─ static cache lookup
+       └─ pre-rendered page served (or regenerated for ISG)
+            └─ … session, your .layer() calls, route handler …
+```
+
+```rust,ignore
+use autumn_web::prelude::*;
+use axum::{
+    extract::Request,
+    http::{header, Method, StatusCode},
+    middleware::Next,
+    response::Response,
+};
+
+async fn require_auth(req: Request, next: Next) -> Response {
+    // Only gate page navigation: let non-GET/HEAD requests (JSON APIs, form
+    // POSTs, the `/mcp` JSON-RPC transport, CORS preflights) pass through so a
+    // browser redirect never turns them into a 302.
+    let is_page = matches!(req.method(), &Method::GET | &Method::HEAD);
+    // Verify a signed/JWT session cookie DIRECTLY — the session Extension is
+    // not available this far out in the stack.
+    if !is_page || has_valid_session_cookie(req.headers()) {
+        next.run(req).await
+    } else {
+        Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, "/login")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+}
+
+autumn_web::app()
+    .routes(routes![dashboard])
+    .static_gate(axum::middleware::from_fn(require_auth))
+    .run()
+    .await;
+```
+
+Key properties and trade-offs:
+
+- **Runs before the static cache** in SSG/ISG mode, so cached pages can be
+  auth-gated without baking user-specific content into the pre-rendered HTML.
+- **Runs in the same outermost position in fully-dynamic mode** (no `dist/`
+  directory), so the same gate behaves identically whether or not static
+  generation is active — gating code is portable.
+- **No session `Extension`.** The session layer runs *inside* the gate, so you
+  cannot read session-populated extensions here. Verify a signed session cookie
+  or JWT directly, using the same signing key you configure for sessions.
+- **Personalised content still needs a dynamic route** (or client-side fetch).
+  `static_gate` decides *whether* to serve a cached page, not *what* it
+  contains.
+- **Page-cache gate, not API auth.** The gate is global, so a well-behaved gate
+  should no-op on non-GET/HEAD requests (note the `is_page` check above) — a
+  browser redirect is meaningless for a JSON API or the `/mcp` JSON-RPC POST
+  transport, and the gate is never applied to MCP `tools/call` dispatch anyway.
+  Authenticate JSON APIs and MCP tools with route-level guards / `#[secured]` /
+  session auth.
+- Multiple `static_gate` calls stack in registration order (first =
+  outermost), like `.layer()`. Plugins can pre-flight with
+  `has_static_gate::<L>()` / `get_static_gate_types()`.
 
 ---
 

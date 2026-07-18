@@ -11,12 +11,12 @@ use super::dsl::parse_fields;
 use super::emit::Plan;
 use super::naming::pascal_to_snake;
 use super::schema_edit::{
-    MigrationShape, add_columns_down_sql, add_columns_up_sql, add_search_down_sql,
-    add_search_up_sql, detect_migration_shape, encrypt_columns_down_sql, encrypt_columns_up_sql,
-    parse_model_search_config_for_table, remove_columns_down_sql, remove_columns_up_sql,
-    singularize,
+    MigrationShape, add_columns_down_sql_for, add_columns_up_sql_for, add_search_down_sql_for,
+    add_search_up_sql_for, detect_migration_shape, encrypt_columns_down_sql,
+    encrypt_columns_up_sql, parse_model_search_config_for_table, remove_columns_down_sql_for,
+    remove_columns_up_sql_for, singularize,
 };
-use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+use super::{GenerateError, detect_backend, ensure_project_root};
 
 fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -38,15 +38,44 @@ fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBu
 ///
 /// # Errors
 /// Project layout, name, and DSL errors surface here.
+#[allow(dead_code)]
 pub fn plan_migration(
     project_root: &Path,
     name: &str,
     field_tokens: &[String],
     timestamp: &str,
 ) -> Result<Plan, GenerateError> {
+    plan_migration_with_options(project_root, name, field_tokens, timestamp, &[])
+}
+
+/// [`plan_migration`], plus `--unique FIELD` flags (issue #1032) — mirrors
+/// the DSL's inline `:unique` modifier, which already works via
+/// [`parse_fields`] alone (no options struct needed, unlike `generate
+/// model`/`scaffold`'s `ModelOptions`).
+///
+/// # Errors
+/// Project layout, name, DSL, and unknown-field errors surface here.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a linear match over the migration shapes (add/remove/encrypt/search \
+              columns), each arm emitting its own up/down SQL; splitting an arm out \
+              would not make any single shape clearer"
+)]
+pub fn plan_migration_with_options(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    uniques: &[String],
+) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
-    let fields = parse_fields(field_tokens)?;
+    let mut fields = parse_fields(field_tokens)?;
+    super::model::apply_unique_flags(&mut fields, uniques)?;
+
+    // Determine the target app's database backend so the emitted ALTER TABLE
+    // DDL is backend-aware (SQLite foundation, issue #1614).
+    let backend = detect_backend(project_root);
 
     // The directory uses snake_case (`add_title_to_posts`) but the shape is
     // detected from the original PascalCase form because the keywords `To`
@@ -55,16 +84,61 @@ pub fn plan_migration(
     let dir_name = format!("{timestamp}_{}", snake_or_pascal_to_snake(name));
     let migration_dir = project_root.join("migrations").join(&dir_name);
 
+    let mut plan = Plan::new(project_root);
+
     let shape = detect_migration_shape(&pascalish(name));
     let (up, down) = match shape {
-        MigrationShape::AddColumns { ref table } if !fields.is_empty() => (
-            add_columns_up_sql(table, &fields),
-            add_columns_down_sql(table, &fields),
-        ),
-        MigrationShape::RemoveColumns { ref table } if !fields.is_empty() => (
-            remove_columns_up_sql(table, &fields),
-            remove_columns_down_sql(table, &fields),
-        ),
+        MigrationShape::AddColumns { ref table } if !fields.is_empty() => {
+            // A `references` field here gets the same target-model warning /
+            // UUID-PK error as `generate model`/`generate scaffold` (issue
+            // #1026) — otherwise the same DSL token gives inconsistent
+            // feedback depending only on which subcommand declared it.
+            // `own_id_type` is `None`: this shape only `ALTER TABLE`s an
+            // *existing* table, so its actual primary-key type isn't tracked
+            // anywhere the generator can see — a self-reference here is left
+            // unvalidated rather than guessed at.
+            super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            // A field kind with no working diesel SQLite conversion (Uuid,
+            // Attachment, Decimal) would leak an uncompilable column into the
+            // generated SQLite app, so reject it here too — same guard as
+            // `generate model`/`scaffold` (AC #4, #1924).
+            if backend == autumn_web::config::DatabaseBackend::Sqlite {
+                super::reject_sqlite_unsupported_field_kinds(&fields)?;
+            }
+            // `src/schema.rs`'s current content, so a `unique` field being
+            // added here can't pick an index name that coincidentally
+            // collides with a plain index on some other, already-existing
+            // column from an earlier migration this one has no other way to
+            // see (issue #1032 review follow-up). Empty string (no
+            // collision-check widening) if the file doesn't exist yet.
+            let existing_schema =
+                std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
+            (
+                add_columns_up_sql_for(backend, table, &fields, &existing_schema)?,
+                add_columns_down_sql_for(backend, table, &fields, &existing_schema),
+            )
+        }
+        MigrationShape::RemoveColumns { ref table } if !fields.is_empty() => {
+            // `remove_columns_down_sql`'s rollback restores the FK
+            // constraint/index for a `references` field (issue #1026), so it
+            // needs the same UUID-PK guard as `AddColumns` — otherwise a
+            // target with a UUID primary key still produces a `down.sql`
+            // that fails to apply on rollback.
+            super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            // The rollback (`down.sql`) re-adds the removed columns via
+            // `ALTER TABLE … ADD COLUMN …`, so a field kind with no working
+            // diesel SQLite conversion would still leak into generated DDL —
+            // reject it up front, matching the AddColumns path (AC #4, #1924).
+            if backend == autumn_web::config::DatabaseBackend::Sqlite {
+                super::reject_sqlite_unsupported_field_kinds(&fields)?;
+            }
+            let existing_schema =
+                std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
+            (
+                remove_columns_up_sql_for(backend, table, &fields, &existing_schema),
+                remove_columns_down_sql_for(backend, table, &fields, &existing_schema)?,
+            )
+        }
         MigrationShape::EncryptColumns {
             ref table,
             ref columns,
@@ -73,6 +147,11 @@ pub fn plan_migration(
             encrypt_columns_down_sql(table, columns),
         ),
         MigrationShape::AddSearch { ref table } => {
+            // Full-text search is backend-aware (issue #1910): Postgres emits a
+            // `tsvector` generated column + GIN index; SQLite emits an
+            // external-content FTS5 virtual table + maintenance triggers (see
+            // `add_search_up_sql_for`). Neither leaks DDL that breaks the other
+            // backend, so `--search` now works on both.
             let singular = singularize(table);
 
             // Collect all potential model file candidates in order of preference
@@ -133,16 +212,52 @@ pub fn plan_migration(
             };
 
             (
-                add_search_up_sql(table, &language, &fts_fields),
-                add_search_down_sql(table),
+                add_search_up_sql_for(backend, table, &language, &fts_fields)?,
+                add_search_down_sql_for(backend, table),
             )
         }
         _ => (String::new(), String::new()),
     };
 
-    let mut plan = Plan::new(project_root);
     plan.create(migration_dir.join("up.sql"), up);
     plan.create(migration_dir.join("down.sql"), down);
+    Ok(plan)
+}
+
+/// Fallback destroy-only plan for `autumn destroy migration <name>` when
+/// [`plan_migration_with_options`] can't be recomputed — e.g. an
+/// `AddSearchTo<Table>` migration whose model file (or its `#[searchable]`
+/// config) is already gone by the time destroy runs, a common cleanup order
+/// like deleting/destroying the model first (issue #1048 PR review).
+/// `plan_migration_with_options` needs that config to render the right SQL,
+/// which is meaningless (and an error) once it's gone.
+///
+/// Locates the migration directory by suffix only — the same
+/// `{timestamp}_{suffix}` naming [`plan_migration_with_options`] uses, which
+/// is all [`Plan::revert`] actually needs to find it (destroy always
+/// recomputes a fresh timestamp anyway, so exact SQL content was never
+/// load-bearing for *locating* the directory). Its expected content is
+/// unknowable without re-deriving the search config, so `up.sql`/`down.sql`
+/// are recorded with an empty placeholder — real content (never empty)
+/// always counts as diverged, so they're only removed with `--force`,
+/// exactly like [`super::admin::plan_admin_destroy_fallback`].
+///
+/// # Errors
+/// Returns [`GenerateError`] when `project_root` isn't a valid project, or
+/// `name` fails validation.
+pub fn plan_migration_destroy_fallback(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+) -> Result<Plan, GenerateError> {
+    ensure_project_root(project_root)?;
+    super::model::validate_resource_name(name)?;
+
+    let dir_name = format!("{timestamp}_{}", snake_or_pascal_to_snake(name));
+    let migration_dir = project_root.join("migrations").join(&dir_name);
+    let mut plan = Plan::new(project_root);
+    plan.create(migration_dir.join("up.sql"), String::new());
+    plan.create(migration_dir.join("down.sql"), String::new());
     Ok(plan)
 }
 
@@ -166,28 +281,10 @@ fn pascalish(name: &str) -> String {
     }
 }
 
-/// CLI entry point.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    let timestamp = timestamp_now();
-    match plan_migration(&cwd, name, field_tokens, &timestamp).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 
@@ -209,6 +306,114 @@ mod tests {
         let down = fs::read_to_string(dir.join("down.sql")).unwrap();
         assert!(up.is_empty());
         assert!(down.is_empty());
+    }
+
+    #[test]
+    fn generate_then_destroy_migration_round_trips_to_original_project_state() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                let plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "20260427000000",
+                )
+                .unwrap();
+                plan.execute(Flags::default()).unwrap();
+                let dir = tmp
+                    .path()
+                    .join("migrations/20260427000000_add_title_to_posts");
+                assert!(dir.exists());
+
+                // Destroy recomputes the plan with a FRESH timestamp; the
+                // real on-disk directory must still be found by suffix.
+                let destroy_plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                destroy_plan.revert(Flags::default()).unwrap();
+
+                assert!(!dir.exists());
+                assert!(
+                    fs::read_dir(tmp.path().join("migrations"))
+                        .map_or(true, |mut d| d.next().is_none())
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn destroy_migration_refuses_directory_with_unplanned_file_unless_forced() {
+        // issue #1048 PR review: a developer may drop a README.md or an
+        // auxiliary fixture alongside the generated up.sql/down.sql. Destroy
+        // must treat that extra file as divergence rather than silently
+        // sweeping it up with `remove_dir_all`.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                let plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "20260427000000",
+                )
+                .unwrap();
+                plan.execute(Flags::default()).unwrap();
+                let dir = tmp
+                    .path()
+                    .join("migrations/20260427000000_add_title_to_posts");
+                assert!(dir.exists());
+                fs::write(dir.join("README.md"), "hand-authored notes\n").unwrap();
+
+                let destroy_plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                let err = destroy_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: false,
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, GenerateError::Diverged(_)));
+                assert!(
+                    dir.join("README.md").exists(),
+                    "hand-authored file must survive without --force"
+                );
+
+                let destroy_plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                destroy_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: true,
+                    })
+                    .unwrap();
+                assert!(!dir.exists(), "--force must still remove the directory");
+            },
+        );
     }
 
     #[test]
@@ -253,6 +458,74 @@ mod tests {
         )
         .unwrap();
         assert!(up.contains("ALTER TABLE posts DROP COLUMN body"));
+    }
+
+    #[test]
+    fn remove_columns_migration_with_references_field_restores_fk_on_rollback() {
+        // `RemovePostFromComments post:references` — down.sql must restore
+        // the FK constraint and index, not just a bare column (issue #1026).
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "RemovePostFromComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let down = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_remove_post_from_comments/down.sql"),
+        )
+        .unwrap();
+        assert!(
+            down.contains(
+                "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
+            ),
+            "down.sql: {down}"
+        );
+        assert!(
+            down.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "down.sql: {down}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_with_references_field_errors_on_uuid_target() {
+        // The restored FK constraint in remove_columns_down_sql needs the
+        // same UUID-PK guard as AddColumns — otherwise a target with a UUID
+        // primary key still produces a down.sql that fails on rollback.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_migration(
+            tmp.path(),
+            "RemovePostFromComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn remove_columns_with_references_field_warns_when_target_model_missing() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "RemovePostFromComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("posts"));
     }
 
     #[test]
@@ -326,5 +599,578 @@ pub struct Post {
         );
         assert!(down.contains("DROP INDEX IF EXISTS idx_posts_search_vector;"));
         assert!(down.contains("ALTER TABLE posts DROP COLUMN IF EXISTS search_vector;"));
+    }
+
+    // ── SQLite backend awareness (issue #1614) ──────────────────────────────
+
+    /// Null the DB-URL environment variables so backend detection reads the
+    /// temp project's `autumn.toml` deterministically.
+    fn with_no_db_env<R>(f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            f,
+        )
+    }
+
+    fn sqlite_project() -> TempDir {
+        let tmp = project();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// `AddSearchTo…` on a `SQLite` app now emits an FTS5 external-content virtual
+    /// table + maintenance triggers (issue #1910) instead of being rejected, and
+    /// no Postgres-only `tsvector`/GIN DDL leaks into the `SQLite` migration.
+    #[test]
+    fn add_search_migration_on_sqlite_emits_fts5() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            // The AddSearch shape reads the model's #[searchable] config from a
+            // model file to know which columns to index.
+            fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+            fs::write(
+                tmp.path().join("src/models/post.rs"),
+                "#[autumn_web::model(table = \"posts\")]\n\
+                 #[searchable(language = \"english\")]\n\
+                 pub struct Post {\n\
+                 \x20   #[id]\n\
+                 \x20   pub id: i64,\n\
+                 \x20   #[searchable(weight = \"A\")]\n\
+                 \x20   pub title: String,\n\
+                 \x20   #[searchable(weight = \"B\")]\n\
+                 \x20   pub body: String,\n\
+                 }\n",
+            )
+            .unwrap();
+
+            let plan =
+                plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
+            plan.execute(Flags::default()).unwrap();
+
+            let dir = tmp
+                .path()
+                .join("migrations/20260427000000_add_search_to_posts");
+            let up = fs::read_to_string(dir.join("up.sql")).unwrap();
+            let down = fs::read_to_string(dir.join("down.sql")).unwrap();
+
+            assert!(
+                up.contains(
+                    "CREATE VIRTUAL TABLE \"posts__fts\" USING fts5(\"title\", \"body\", \
+                     content='posts', content_rowid='id', tokenize='unicode61');"
+                ),
+                "up.sql must create the FTS5 vtable: {up}"
+            );
+            assert!(
+                up.contains("INSERT INTO \"posts__fts\"(\"posts__fts\") VALUES('rebuild');"),
+                "up.sql must backfill via 'rebuild': {up}"
+            );
+            for trig in ["posts__fts_ai", "posts__fts_ad", "posts__fts_au"] {
+                assert!(up.contains(trig), "up.sql must create trigger {trig}: {up}");
+                assert!(
+                    down.contains(&format!("DROP TRIGGER IF EXISTS \"{trig}\";")),
+                    "down.sql must drop trigger {trig}: {down}"
+                );
+            }
+            assert!(
+                down.contains("DROP TABLE IF EXISTS \"posts__fts\";"),
+                "down.sql must drop the FTS table: {down}"
+            );
+            for leak in ["tsvector", "to_tsvector", "USING gin", "search_vector"] {
+                assert!(!up.contains(leak), "SQLite up.sql leaked `{leak}`: {up}");
+            }
+        });
+    }
+
+    /// `Add…To…` on a `SQLite` app emits `SQLite`-valid column types
+    /// (`i64` -> `INTEGER`, not Postgres `BIGINT`). Uses a *nullable* column
+    /// because `SQLite` rejects `ADD COLUMN … NOT NULL` without a default (see
+    /// `add_columns_migration_on_sqlite_rejects_not_null_without_default`).
+    #[test]
+    fn add_columns_migration_on_sqlite_emits_sqlite_types() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let plan = plan_migration(
+                tmp.path(),
+                "AddViewsToPosts",
+                &["views:Option<i64>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_add_views_to_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("ALTER TABLE posts ADD COLUMN views INTEGER NULL"),
+                "up.sql: {up}"
+            );
+            assert!(!up.contains("BIGINT"), "SQLite up.sql leaked BIGINT: {up}");
+        });
+    }
+
+    /// `Add…To…` on a `SQLite` app with a `NOT NULL` column and no default is
+    /// rejected at generate time (issue #1614 AC #4): `SQLite` rejects
+    /// `ALTER TABLE … ADD COLUMN … NOT NULL` without a `DEFAULT` once the table
+    /// has rows, and this command has no way to attach a column default, so the
+    /// generated migration would fail to apply. Mirrors the `--search`
+    /// reject-at-generate contract.
+    #[test]
+    fn add_columns_migration_on_sqlite_rejects_not_null_without_default() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let err = plan_migration(
+                tmp.path(),
+                "AddViewsToPosts",
+                &["views:i64".into()],
+                "20260427000000",
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(
+                msg.contains("NOT NULL") && msg.contains("views") && msg.contains("posts"),
+                "message must name the column/table and the constraint: {msg}"
+            );
+            assert!(
+                msg.contains("nullable") || msg.contains("default"),
+                "message must be actionable (nullable / default): {msg}"
+            );
+        });
+    }
+
+    /// A *nullable* `NOT NULL`-free column is added without a default on
+    /// `SQLite`, while the reject above guards the `NOT NULL` case — together
+    /// they cover both branches of the `SQLite` `ADD COLUMN` gate.
+    #[test]
+    fn add_columns_migration_on_sqlite_allows_nullable_without_default() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let plan = plan_migration(
+                tmp.path(),
+                "AddNoteToPosts",
+                &["note:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_add_note_to_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("ALTER TABLE posts ADD COLUMN note TEXT NULL"),
+                "up.sql: {up}"
+            );
+        });
+    }
+
+    /// A `SQLite` `Add…To…` migration that adds a nullable `references` field
+    /// creates an index in `up.sql`, and its `down.sql` must `DROP INDEX` before
+    /// `DROP COLUMN` — `SQLite` refuses to drop a column still used by an index
+    /// (issue #1614 finding 5).
+    #[test]
+    fn add_columns_migration_on_sqlite_drops_index_before_column_on_rollback() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let plan = plan_migration(
+                tmp.path(),
+                "AddAuthorToPosts",
+                &["author:references?".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let dir = tmp
+                .path()
+                .join("migrations/20260427000000_add_author_to_posts");
+            let up = fs::read_to_string(dir.join("up.sql")).unwrap();
+            assert!(
+                up.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+                "up.sql: {up}"
+            );
+            let down = fs::read_to_string(dir.join("down.sql")).unwrap();
+            let drop_idx = down
+                .find("DROP INDEX idx_posts_author_id;")
+                .expect("drop index");
+            let drop_col = down
+                .find("ALTER TABLE posts DROP COLUMN author_id;")
+                .expect("drop column");
+            assert!(
+                drop_idx < drop_col,
+                "down.sql must DROP INDEX before DROP COLUMN: {down}"
+            );
+        });
+    }
+
+    /// Regression guard: the same `Add…To…` on a Postgres app emits no explicit
+    /// `DROP INDEX` in `down.sql` — Postgres cascades the index drop with the
+    /// column, so the rollback stays byte-for-byte the historical output.
+    #[test]
+    fn add_columns_migration_on_postgres_has_no_explicit_drop_index_on_rollback() {
+        with_no_db_env(|| {
+            let tmp = project();
+            let plan = plan_migration(
+                tmp.path(),
+                "AddAuthorToPosts",
+                &["author:references?".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let down = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_add_author_to_posts/down.sql"),
+            )
+            .unwrap();
+            assert!(!down.contains("DROP INDEX"), "Postgres down.sql: {down}");
+            assert!(
+                down.contains("ALTER TABLE posts DROP COLUMN author_id;"),
+                "down.sql: {down}"
+            );
+        });
+    }
+
+    /// A `SQLite` `Add…To…` / `Remove…From…` migration rejects field kinds with
+    /// no working diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`) at
+    /// generate time, citing #1924 (issue #1614 AC #4).
+    #[test]
+    fn column_migrations_on_sqlite_reject_unsupported_field_kinds_citing_1924() {
+        with_no_db_env(|| {
+            for name in ["AddTokenToPosts", "RemoveTokenFromPosts"] {
+                let tmp = sqlite_project();
+                let err =
+                    plan_migration(tmp.path(), name, &["token:Uuid".into()], "20260427000000")
+                        .unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    matches!(err, GenerateError::Config(_)),
+                    "{name}: expected Config error, got: {err:?}"
+                );
+                assert!(msg.contains("1924"), "{name}: must cite #1924: {msg}");
+                assert!(
+                    msg.contains("uuid::Uuid"),
+                    "{name}: message must name the Rust type: {msg}"
+                );
+            }
+        });
+    }
+
+    /// Regression guard: with no `autumn.toml`, the backend defaults to Postgres
+    /// and `Add…To…` emits the historical Postgres column type.
+    #[test]
+    fn add_columns_migration_defaults_to_postgres_types() {
+        with_no_db_env(|| {
+            let tmp = project();
+            let plan = plan_migration(
+                tmp.path(),
+                "AddViewsToPosts",
+                &["views:i64".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_add_views_to_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("ALTER TABLE posts ADD COLUMN views BIGINT NOT NULL"),
+                "up.sql: {up}"
+            );
+        });
+    }
+
+    /// `Remove…From…` on a `SQLite` app is rejected at generate time when the
+    /// rollback would re-add a `NOT NULL` column with no default (issue #1614
+    /// AC #4). The `down.sql` of a "remove columns" migration regenerates
+    /// `ALTER TABLE … ADD COLUMN …` to restore the dropped column, and `SQLite`
+    /// rejects that DDL for a `NOT NULL` column without a `DEFAULT` — the same
+    /// limit the forward path guards
+    /// (`add_columns_migration_on_sqlite_rejects_not_null_without_default`), so
+    /// the reverse path must be consistent.
+    #[test]
+    fn remove_columns_migration_on_sqlite_rejects_not_null_re_add_on_rollback() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let err = plan_migration(
+                tmp.path(),
+                "RemoveViewsFromPosts",
+                &["views:i64".into()],
+                "20260427000000",
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(
+                msg.contains("NOT NULL") && msg.contains("views") && msg.contains("posts"),
+                "message must name the column/table and the constraint: {msg}"
+            );
+            assert!(
+                msg.contains("nullable") || msg.contains("default"),
+                "message must be actionable (nullable / default): {msg}"
+            );
+        });
+    }
+
+    /// A *nullable* re-added column is restored without a default on `SQLite`,
+    /// while the reject above guards the `NOT NULL` case — together they cover
+    /// both branches of the `SQLite` rollback `ADD COLUMN` gate.
+    #[test]
+    fn remove_columns_migration_on_sqlite_allows_nullable_re_add_on_rollback() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let plan = plan_migration(
+                tmp.path(),
+                "RemoveNoteFromPosts",
+                &["note:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let down = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_remove_note_from_posts/down.sql"),
+            )
+            .unwrap();
+            assert!(
+                down.contains("ALTER TABLE posts ADD COLUMN note TEXT NULL"),
+                "down.sql: {down}"
+            );
+        });
+    }
+
+    /// Regression guard: with no `autumn.toml`, the backend defaults to Postgres
+    /// and `Remove…From…`'s rollback re-adds the `NOT NULL` column with the
+    /// historical Postgres column type — byte-for-byte unchanged by the
+    /// `SQLite` reject above.
+    #[test]
+    fn remove_columns_migration_defaults_to_postgres_types_on_rollback() {
+        with_no_db_env(|| {
+            let tmp = project();
+            let plan = plan_migration(
+                tmp.path(),
+                "RemoveViewsFromPosts",
+                &["views:i64".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let down = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_remove_views_from_posts/down.sql"),
+            )
+            .unwrap();
+            assert!(
+                down.contains("ALTER TABLE posts ADD COLUMN views BIGINT NOT NULL"),
+                "down.sql: {down}"
+            );
+        });
+    }
+
+    // ── `plan_migration_destroy_fallback` (issue #1048 PR review) ───────────
+
+    #[test]
+    fn destroy_add_search_migration_after_model_already_destroyed_still_removes_it() {
+        // A common cleanup order — destroying the model before destroying
+        // an `AddSearchTo<Table>` migration that depended on its
+        // `#[searchable]` config — must not strand the migration directory
+        // just because `plan_migration_with_options` can no longer read it.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                let models_dir = tmp.path().join("src/models");
+                fs::create_dir_all(&models_dir).unwrap();
+                let model_src = r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"#;
+                fs::write(models_dir.join("post.rs"), model_src).unwrap();
+
+                let plan =
+                    plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
+                plan.execute(Flags::default()).unwrap();
+                let dir = tmp
+                    .path()
+                    .join("migrations/20260427000000_add_search_to_posts");
+                assert!(dir.exists());
+
+                // Simulate `autumn destroy model Post` having already run.
+                fs::remove_file(models_dir.join("post.rs")).unwrap();
+                assert!(
+                    plan_migration(tmp.path(), "AddSearchToPosts", &[], "99999999999999").is_err()
+                );
+
+                let fallback_plan = plan_migration_destroy_fallback(
+                    tmp.path(),
+                    "AddSearchToPosts",
+                    "99999999999999",
+                )
+                .unwrap();
+                // Without --force: content is unverifiable (the search
+                // config is gone), so it's treated as diverged and left in
+                // place.
+                let err = fallback_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: false,
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, GenerateError::Diverged(_)));
+                assert!(dir.exists());
+
+                let fallback_plan = plan_migration_destroy_fallback(
+                    tmp.path(),
+                    "AddSearchToPosts",
+                    "99999999999999",
+                )
+                .unwrap();
+                fallback_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: true,
+                    })
+                    .unwrap();
+                assert!(!dir.exists());
+            },
+        );
+    }
+
+    #[test]
+    fn plan_migration_destroy_fallback_fails_outside_project() {
+        let tmp = TempDir::new().unwrap();
+        let err = plan_migration_destroy_fallback(tmp.path(), "AddSearchToPosts", "20260427000000")
+            .unwrap_err();
+        assert!(matches!(err, GenerateError::NotInProject));
+    }
+
+    // ── references field: parity with `generate model` (issue #1026) ───────
+
+    #[test]
+    fn add_columns_with_references_field_emits_fk_and_index() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddPostToComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_add_post_to_comments/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("post_id BIGINT NOT NULL REFERENCES posts(id)"));
+        assert!(up.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"));
+    }
+
+    #[test]
+    fn add_columns_with_references_field_warns_when_target_model_missing() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddPostToComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("posts"));
+    }
+
+    #[test]
+    fn add_columns_with_references_field_errors_on_uuid_target() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_migration(
+            tmp.path(),
+            "AddPostToComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn add_columns_self_reference_to_table_being_altered_has_no_warning() {
+        // `AddCategoryToCategories category:references` targets the very
+        // table it's altering — a filesystem lookup for a "Category" model
+        // is irrelevant here (the table obviously already exists, that's
+        // the point of ALTER TABLE), so no "model not found" warning should
+        // fire for the self-reference.
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddCategoryToCategories",
+            &["category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn add_columns_self_reference_errors_when_existing_model_has_uuid_pk() {
+        // Unlike `generate model`, `generate migration Add…To…` alters an
+        // EXISTING table — if that table's own model file is on disk and
+        // declares a UUID primary key, the self-reference must still be
+        // caught (it's not "unknown PK type, can't check", it's "known PK
+        // type, from the file the caller didn't think to look at").
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("category.rs"),
+            "#[autumn_web::model]\npub struct Category {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_migration(
+            tmp.path(),
+            "AddCategoryToCategories",
+            &["category:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+        assert!(err.to_string().contains("self-referential"));
     }
 }

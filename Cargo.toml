@@ -1,5 +1,15 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "autumn-storage-s3", "autumn-cache-redis", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/wiki", "examples/reddit-clone"]
+members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "examples/hello", "examples/flock", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "benchmarks/runtime/gate", "example-e2e"]
+# The cargo-fuzz crate builds only under nightly with sanitizers and pulls
+# `autumn` in as a path dependency. Excluding it keeps `cargo build/test
+# --workspace` (and the publish gate) untouched; `fuzz/Cargo.toml` is also its
+# own workspace root. It is intentionally NOT a member.
+exclude = ["fuzz", "examples/island-flock"]
+# `examples/island-flock` is a Yew CSR "island" SPIKE that ONLY builds
+# for wasm32-unknown-unknown (it links `yew` and cannot compile for the host
+# target). Excluding it keeps `cargo build/clippy --workspace` from ever
+# building it natively; it is its own workspace root too. Build it via
+# `examples/island-flock/build-island.sh`. See docs/guide/wasm-islands.md.
 resolver = "3"
 
 # `cargo test --workspace` builds every example, plugin, integration test, and
@@ -18,20 +28,43 @@ autumn-web = { path = "autumn" }
 [workspace.package]
 edition = "2024"
 rust-version = "1.88.0"
-version = "0.5.0"
+version = "0.6.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/madmax983/autumn"
 
 [workspace.dependencies]
 # Runtime
 axum = { version = "0.8", features = ["macros", "ws"] }
+# Multipart boundary parsing for the submit-token replay guard. `multer` is the
+# exact parser axum's `Multipart` extractor uses downstream (via `mime`), so the
+# guard and the extractor can never disagree about the boundary. Already in the
+# graph transitively (axum/tower-http); this only adds the direct edge. Pinned to
+# the version already resolved in Cargo.lock.
+multer = "3.1"
 tokio-util = "0.7"
+# Automatic ACME (Let's Encrypt) certificate provisioning (issue #1608, the
+# `acme` feature on autumn-web). `default-features = false` + `ring` is load
+# bearing: the DEFAULT features of both crates pull `aws-lc-rs` into the
+# dependency graph, which violates the workspace single-crypto-backend rule
+# (rustls 0.23 + ring). `instant-acme` drives the ACME order state machine over
+# hyper-rustls; `rcgen` generates the ACME account key, the certificate
+# keypair/CSR, and the self-signed placeholder certificate.
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# `socket2` (already in the graph transitively via tokio/hyper) is used directly
+# to build a dual-stack IPv4+IPv6 `[::]` HTTP-01 challenge listener with
+# `IPV6_V6ONLY = false`, so Let's Encrypt can validate an AAAA-only deployment.
+socket2 = { version = "0.6", features = ["all"] }
 diesel = { version = "2", features = ["sqlite", "postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
-diesel-async = { version = "0.8", features = ["deadpool", "postgres"] }
+# `async-connection-wrapper` provides the sync diesel API (incl. running
+# diesel_migrations) over an async connection — used to run startup
+# migrations and wait checks through the rustls TLS connector, since the
+# bundled libpq (`pq-sys` below) has no SSL support.
+diesel-async = { version = "0.9", features = ["deadpool", "postgres", "async-connection-wrapper"] }
 diesel_migrations = "2"
 http = "1"
-libsqlite3-sys = { version = "0.36", features = ["bundled"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
@@ -39,14 +72,15 @@ serde_json = "1"
 thiserror = "2"
 maud = { version = "0.27", features = ["axum"] }
 toml = "1.1"
+toml_edit = "0.25"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "trace", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.7", features = ["cors", "fs", "trace", "compression-gzip", "compression-br"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-tracing-opentelemetry = "0.32.1"
-opentelemetry = { version = "0.31.0", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
+tracing-opentelemetry = "0.33.0"
+opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "grpc-tonic", "tls-aws-lc", "tls-roots", "http-proto", "reqwest-client", "reqwest-rustls"] }
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script"] }
 tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
@@ -64,6 +98,7 @@ testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "m
 time = { version = ">=0.3, <0.3.48" }
 
 csv = "1.3"
+rust_decimal = "1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 chromiumoxide = { version = "0.9", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
@@ -75,6 +110,17 @@ proc-macro2 = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# `fuzzing` is set by cargo-fuzz/libFuzzer when building the `fuzz/` crate's
+# targets (which pull `autumn` in as a path dependency). Declaring it here keeps
+# the `#[cfg(fuzzing)]` seams in the source from tripping the `unexpected_cfgs`
+# lint under `-D warnings` in normal (non-fuzzing) workspace builds.
+#
+# `loom_models` is set (via `RUSTFLAGS="--cfg loom_models"`) only when building
+# the isolated `autumn/tests/loom_models.rs` loom model-checking binary; a
+# neutral custom cfg is used instead of the usual `--cfg loom` so the flag does
+# not poison dependency crates (hyper-util/tokio) that carry their own
+# `#[cfg(loom)]` paths.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(loom_models)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

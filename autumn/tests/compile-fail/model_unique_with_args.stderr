@@ -1,0 +1,5 @@
+error: `#[unique]` takes no arguments; write a bare `#[unique]`
+ --> tests/compile-fail/model_unique_with_args.rs:8:5
+  |
+8 |     #[unique(x)]
+  |     ^^^^^^^^^^^^

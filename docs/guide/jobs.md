@@ -36,6 +36,85 @@ autumn_web::app()
 SendWelcomeEmailJob::enqueue(WelcomeEmailArgs { user_id: 42 }).await?;
 ```
 
+## Delayed and scheduled jobs
+
+Sometimes you want a job to run **once, at a future time** — "email a signup
+reminder in 24h", "expire this cart in 30 minutes", "publish at 9am", "retry
+this external call in 5 minutes". Use `enqueue_in` (relative delay) or
+`enqueue_at` (absolute instant) instead of `enqueue`:
+
+```rust,ignore
+use std::time::Duration;
+
+// Run once, 24 hours from now.
+SendReminderJob::enqueue_in(ReminderArgs { user_id: 42 }, Duration::from_secs(24 * 60 * 60)).await?;
+
+// Run once, at an absolute UTC instant.
+let when = chrono::Utc::now() + chrono::TimeDelta::hours(2);
+PublishPostJob::enqueue_at(PublishArgs { post_id: 7 }, when).await?;
+```
+
+The same free functions exist on the `job` module
+(`autumn_web::job::enqueue_in(name, payload, delay)` /
+`enqueue_at(name, payload, when)`), mirroring `enqueue`.
+
+A delayed job is recorded immediately but is **not delivered to a worker until
+its due time passes**. Once due, it runs through the normal path — the same
+`max_attempts` / `initial_backoff_ms` retry/backoff and dead-letter semantics
+apply unchanged. An `enqueue_at` time in the past runs immediately.
+
+### Transactional delayed enqueue
+
+Delayed enqueue composes with the transactional variants, so a job is invisible
+to workers until **both** the row commits **and** the due time passes:
+
+```rust,ignore
+use scoped_futures::ScopedFutureExt;
+
+// Crash-safe on Postgres: the future run time is written inside your tx.
+db.tx(move |conn| async move {
+    let cart = carts::create(new_cart, conn).await?;
+    autumn_web::job::enqueue_in_on_conn(
+        "expire_cart",
+        ExpireArgs { cart_id: cart.id },
+        Duration::from_secs(30 * 60),
+        conn,
+    ).await?;
+    Ok(cart)
+}.scope_boxed()).await?;
+
+// Process-local after-commit defer (not crash-safe), absolute or relative:
+autumn_web::job::enqueue_in_after_commit("send_reminder", args, Duration::from_secs(3600)).await?;
+autumn_web::job::enqueue_at_after_commit("publish_post", args, when).await?;
+```
+
+### Durability
+
+| Backend    | Pending delay survives restart? | How                                   |
+|------------|---------------------------------|---------------------------------------|
+| `postgres` | **Yes** (crash-safe)            | future `run_at` column; claim query skips it until due |
+| `redis`    | **Yes** (crash-safe)            | `:delayed` ZSET scored by due-time; promoted to the queue when due |
+| `local`    | **No** (local-safe only)        | in-process timer; a pending delay is **lost on restart**, consistent with other in-process caveats |
+
+### Pick the right tool
+
+| Need                                            | Use                          |
+|-------------------------------------------------|------------------------------|
+| **Recurring** work on a cron / fixed interval   | `#[scheduled]`               |
+| **One-shot** "run once, later" timer            | delayed `#[job]` (`enqueue_in` / `enqueue_at`) |
+| **Durable multi-step** orchestration, long-horizon timers, history | Autumn Harvest |
+
+`#[scheduled]` is for repeating tasks; it does not do one-shot future work.
+Autumn Harvest is for durable workflows with history and stronger orchestration
+semantics — heavier than a one-shot timer. Delayed `#[job]` fills the gap
+between "now" and "durable workflow".
+
+### Admin dashboard
+
+Delayed jobs appear in a distinct **Scheduled** list on `GET /admin/jobs`
+showing each job's due time, and can be **canceled before they run**. (A job
+that has already become due / started running cannot be canceled.)
+
 ## Backend selection (`autumn.toml`)
 
 ```toml
@@ -69,6 +148,131 @@ visibility_timeout_ms = 30000
   `autumn migrate` run before the first worker starts.
 - `redis`: Durable, Redis-backed queue for multi-replica workers. Higher
   throughput ceiling than `postgres` but adds Redis as an infrastructure dependency.
+
+## Web and worker process roles
+
+The same binary can run in one of three **process roles**, so you can scale the
+HTTP tier separately from the background-work tier without touching app code. No
+handler, `#[job]`, or `#[scheduled]` definition changes — only config or a flag.
+
+| Role | Serves user routes | Runs workers + scheduler | Enqueues jobs |
+|---|---|---|---|
+| `combined` (default) | Yes | Yes | Yes |
+| `web` | Yes | **No** | Yes |
+| `worker` | **No** (probes/actuator only) | Yes | Yes |
+
+- **`combined`** is the default and preserves today's single-process behavior:
+  it serves HTTP, drains `#[job]` workers, and runs the `#[scheduled]` cron.
+  Existing apps and `autumn dev` need zero changes.
+- **`web`** serves HTTP and still **enqueues** jobs, but runs no workers and no
+  scheduler, so background work never competes with request handling on a web
+  replica.
+- **`worker`** runs the workers and the cron scheduler against the shared
+  durable backend and does **not** serve user routes — but it still binds the
+  HTTP listener to expose only the liveness/readiness probes (`/live`, `/ready`,
+  `/startup`, `/health`) and the actuator (`/actuator/*`, including
+  `/actuator/jobs`), so an orchestrator can supervise it.
+
+### Selecting a role
+
+Three equivalent mechanisms:
+
+```bash
+# Environment variable — the usual container knob.
+AUTUMN_ROLE=web     # or: worker | combined
+```
+
+```toml
+# autumn.toml — top-level key.
+role = "worker"     # or: web | combined
+```
+
+```bash
+# CLI flag on the production server command.
+autumn serve --role worker   # or: --role web
+```
+
+### Self-gating app-owned background work
+
+The framework already uses the resolved role to gate the `#[job]` runtime, the
+`#[scheduled]` cron scheduler, and commit-hook workers — but that gate only
+covers **framework-managed** work. If your app wires its own background loop in
+an `on_startup` hook (a poller, a warm-cache refresher, a queue consumer you
+manage yourself), that loop runs on **every** replica unless you gate it too.
+
+The resolved role is available as a first-class accessor on `AppState`, so you
+can self-gate without re-reading `AUTUMN_ROLE` by hand. It is the same value the
+framework resolved (config + `AUTUMN_ROLE` env override + `--role` flag) — one
+source of truth, no second parse:
+
+```rust
+use autumn_web::{AppState, ProcessRole};
+
+// In an on_startup hook, plugin, state_initializer, or handler:
+fn start_background_work(state: &AppState) {
+    if state.role().runs_workers() {
+        // Only replicas that run workers (combined or worker) spin up the loop.
+        tokio::spawn(my_embedded_worker(state.clone()));
+    }
+
+    if state.role().serves_http() {
+        // Web-facing warmups belong on replicas that serve user routes.
+        warm_render_caches(state);
+    }
+}
+```
+
+`state.role()` returns a `ProcessRole` (exported at `autumn_web::ProcessRole`);
+its `serves_http()` and `runs_workers()` predicates map roles to tiers exactly
+as the table above does. The value is reachable from `state_initializer`,
+`on_startup`/`on_shutdown` hooks, plugins, and request handlers.
+
+> **Footgun: `AUTUMN_ROLE` alone does not gate app-owned background work.**
+> Setting `AUTUMN_ROLE=web` stops the framework's `#[job]`/`#[scheduled]`
+> workers, but a background task you `tokio::spawn` yourself in `on_startup` has
+> nothing to do with that gate — it will still run on your web replicas and
+> double-process work alongside the worker tier. Wrap app-owned loops in
+> `if state.role().runs_workers() { … }` so they land only where you intend.
+
+Custom or named roles beyond `combined`/`web`/`worker` are not supported today;
+if you need finer-grained placement, use per-queue worker pinning (#1623)
+combined with app-level `state.role()` gating rather than inventing new role
+names.
+
+### Split roles require a durable backend
+
+A split web/worker topology **requires a durable jobs backend**
+(`jobs.backend = "postgres"` or `"redis"`). The default `local` backend is an
+in-process, in-memory queue: a `web` replica would enqueue into its own memory,
+where no separate `worker` replica can ever drain it.
+
+Autumn rejects this combination at startup — a `web` or `worker` role on the
+`local` backend exits with a clear error rather than silently dropping work —
+and `autumn doctor --strict` reports it as a **Fail**. `combined` on `local` is
+always fine, because one process both enqueues and drains.
+
+```toml
+[jobs]
+backend = "postgres"   # or "redis"; required once role is "web" or "worker"
+```
+
+### Graceful drain on workers
+
+A `worker`-role process joins the same shutdown sequence as a web replica. On
+SIGTERM it stops claiming new jobs, gives in-flight jobs the configured drain
+window (`server.shutdown_timeout_secs` / `server.prestop_grace_secs`) to finish
+or be released back to the queue, then exits cleanly. Its `/ready` probe flips
+to `503` during the drain, so an orchestrator supervises a rolling worker deploy
+exactly as it would a web deploy. See
+[Rolling Deploy Lifecycle](cloud-native.md#rolling-deploy-lifecycle) for the
+full phase ordering.
+
+### Where job execution shows up
+
+`/actuator/jobs` and the admin dashboard attribute each job's execution to the
+process that actually ran it. In a split topology that is always a `worker`
+process — `web` replicas only enqueue, so handler execution, in-flight counts,
+and last-error data surface on the worker tier.
 
 ## Postgres delivery semantics
 
@@ -115,6 +319,196 @@ domain aggregate id, or provider idempotency token.
 - Exhausted jobs are dead-lettered.
 - Redis retries are scheduled in Redis before the worker moves on, so a crash
   during the backoff window does not drop the job.
+
+## Job priorities
+
+By default every job drains from a single FIFO queue, so a flood of low-value
+work (analytics rollups, thumbnails, bulk re-indexing) can sit *ahead of*
+latency-sensitive work like password-reset emails or payment-webhook fan-out.
+Named queues fix this head-of-line blocking: route each job to a queue, and let
+workers drain queues in priority order.
+
+Tag a job's queue with `queue = "..."`. Jobs with no `queue` land on the
+`"default"` queue, so apps that don't opt in behave exactly as before.
+
+```rust,ignore
+#[job(queue = "critical", max_attempts = 5)]
+async fn send_password_reset(state: AppState, args: ResetArgs) -> AutumnResult<()> { … }
+
+#[job(queue = "low")]
+async fn rebuild_search_index(state: AppState, args: IndexArgs) -> AutumnResult<()> { … }
+
+// No queue → the "default" queue.
+#[job]
+async fn send_receipt(state: AppState, args: ReceiptArgs) -> AutumnResult<()> { … }
+```
+
+Configure the worker drain order in `autumn.toml`. Two forms:
+
+```toml
+# Strict priority — workers always empty higher queues before lower ones.
+# A single `critical` job jumps ahead of a 1,000-job `low` backlog.
+[jobs]
+queues = ["critical", "default", "low"]
+```
+
+```toml
+# Weighted — fair draining that never starves a lower queue. Over a sustained
+# mixed load each queue is served in proportion to its weight (here roughly
+# 4 : 2 : 1), so `low` always makes forward progress even while `critical` has work.
+[jobs.queues]
+critical = 4
+default = 2
+low = 1
+```
+
+- **Strict** (`queues = [...]`) is the simple case: highest priority first, and a
+  worker only pulls a lower queue when every higher queue is empty.
+- **Weighted** (`[jobs.queues]` table) avoids starvation under sustained load:
+  it uses smooth weighted round-robin, so each queue is the first choice in
+  proportion to its weight over each cycle.
+
+Routing is honored end-to-end on every backend (local, Redis, Postgres): the
+queue is preserved through retries/backoff, dead-lettering, delayed enqueues, and
+`enqueue_after_commit`. The actuator/admin job view shows each job's queue.
+
+If a job declares a `queue` that is **not** in the configured drain list, that is
+a loud, documented condition — it is logged at startup (`WARN`) and the queue is
+appended at lowest priority so the job still drains instead of silently stalling.
+Add the queue to `[jobs] queues` to control its priority.
+
+> **Role-based scaling** — running a separately scaled worker tier that drains
+> all configured queues — is covered in
+> [Web and worker process roles](#web-and-worker-process-roles).
+
+## Per-queue worker pools, caps, and pinning
+
+By default every worker process draws from one shared pool of `jobs.workers`
+slots and drains all configured queues. Three config-only knobs (no application
+code changes) let you carve that pool up per queue and dedicate worker processes
+to specific queues.
+
+### Dedicated capacity and per-queue caps
+
+Extend the weighted `[jobs.queues]` table so a queue's value is a table instead
+of a bare weight. Two per-queue controls are available:
+
+- `reserved = N` — **dedicated slots** that no other queue may ever consume. A
+  flood on another queue can never starve this one: `N` of the process's worker
+  slots are always available to it.
+- `concurrency = N` — a **hard cap**: this queue may occupy at most `N` of the
+  process's worker slots at once, so a bulk queue can never take more than its
+  configured share.
+
+```toml
+[jobs]
+workers = 8
+
+[jobs.queues]
+# `critical` keeps 2 slots reserved for it at all times — a slow flood on
+# `bulk` can never delay a password-reset email.
+critical = { weight = 4, reserved = 2 }
+# `bulk` is capped at 4 of the 8 slots, so re-indexing never monopolizes the
+# process.
+bulk = { weight = 1, concurrency = 4 }
+# A bare integer is still just a weight (no cap, no reservation).
+default = 2
+```
+
+The bare-integer form (`critical = 4`) and the strict array form
+(`queues = ["critical", "default", "low"]`) keep working unchanged; a queue with
+neither `reserved` nor `concurrency` behaves exactly as before. Slots are
+accounted **per process**: total capacity is always `jobs.workers`, and the
+reserved/cap rules only redistribute how those slots are shared between queues.
+
+The accounting is enforced on every backend (local, Redis, Postgres): before a
+worker claims a job it restricts itself to the queues that currently have a free
+slot, so a queue at its cap — or whose only free slots are reserved for another
+queue — is skipped rather than blocked behind.
+
+### Pinning a worker tier to a subset of queues
+
+Combine per-queue pools with [process roles](#web-and-worker-process-roles) to
+dedicate an entire worker tier to a subset of queues. Set `jobs.pin` (or the
+`AUTUMN_JOBS__PIN` environment variable, comma-separated) to the queues that
+process should claim:
+
+```toml
+# A worker replica dedicated to latency-sensitive work.
+# `role` is a TOP-LEVEL key (AutumnConfig.role) and must appear before any
+# `[table]` header — equivalently, set `AUTUMN_ROLE=worker` in the environment.
+role = "worker"
+
+[jobs]
+backend = "redis"
+pin = ["critical"]
+```
+
+```bash
+# Same thing via env — handy for a separate deployment of the same image.
+AUTUMN_JOBS__PIN=bulk,default
+```
+
+A pinned process **never** claims jobs from queues outside its subset, on both
+the Postgres and Redis backends. Weighted/strict ordering is preserved *within*
+the pinned subset. An empty/unset `pin` (the default) keeps today's behavior:
+the process drains every configured queue from the single shared pool.
+
+### Zero-coverage guard
+
+If pinning leaves a configured queue with **no** worker coverage anywhere —
+e.g. you pin every worker to `critical` but still enqueue to `bulk` — those jobs
+would silently accumulate. Autumn diagnoses this loudly:
+
+The **runtime startup warning is the authoritative check**: a worker process
+that pins to a subset logs a `WARN` at startup naming the configured queues it
+does not cover (and an `ERROR` if the pin matches no queue on its effective
+schedule at all, so the process would claim nothing). This runs *inside the
+app*, against the job registry and the real effective schedule, so it knows both
+the `[jobs.queues]` config **and** any queues declared solely via
+`#[job(queue = "…")]` — and diagnoses a genuinely uncovered queue loudly at
+boot.
+
+`autumn doctor --strict` **does not fail** on queue coverage — it reports
+coverage **informationally** (a `jobs_queue_coverage` line that always passes).
+It prints what the pinned tier claims, which configured queues it does not
+claim, and any pinned queues absent from `[jobs.queues]`. Why it can only
+report, not enforce: doctor is **config-only and per-process**. It sees only
+**one** process, so it cannot know what sibling worker tiers drain — a multi-tier
+deployment where each pinned tier omits queues covered by other tiers (one
+process `AUTUMN_JOBS__PIN=critical`, another `AUTUMN_JOBS__PIN=bulk,default`) is
+legitimate. And it inspects only `[jobs.queues]` (plus the implicit `default`
+queue), so it cannot see a queue declared solely via `#[job(queue = "…")]`,
+which the runtime appends to the effective schedule and drains. Any hard-fail
+doctor asserted on coverage would therefore false-positive on a valid
+deployment, which is exactly why enforcement lives in the runtime warning above.
+
+Ensuring every queue is drained by some tier remains the operator's
+responsibility: make sure some process (an unpinned worker tier, or one pinned
+to those queues) covers every queue you enqueue to.
+
+### Observability
+
+The actuator jobs endpoint (`<actuator-prefix>/jobs`) reports per-queue queue
+depth and the age of the oldest still-waiting job under a `queues` key, in
+addition to the existing per-job-type gauges under `jobs`:
+
+```json
+{
+  "jobs": { "send_password_reset": { "queued": 0, "in_flight": 1, "...": 0 } },
+  "queues": { "critical": { "depth": 3, "oldest_waiting_age_ms": 1200 } }
+}
+```
+
+On durable backends (Postgres/Redis) with multiple processes, these per-queue
+gauges — like the existing per-job-type gauges — reflect enqueue/start events
+observed in the local process, so an enqueue-only `web` replica shows work it
+doesn't drain; treat them as per-process approximations. Authoritative
+cluster-wide queue depth is tracked as future work (composes with the metrics
+in #1378).
+
+> Still out of scope (separate follow-up): per-job-instance dynamic priority at
+> enqueue time.
 
 ## Uniqueness and concurrency limits
 
@@ -188,6 +582,255 @@ Semantics:
   adds the nullable `unique_key`/`unique_window`/`concurrency_key`/
   `concurrency_limit` columns; rows and jobs without them behave as before.
 
+## Tracked jobs and progress polling
+
+Plain `enqueue` is fire-and-forget — there's no handle, no progress, and
+nowhere for the caller to check "is it done yet?". `enqueue_tracked` fixes
+that: it returns a handle carrying a public, unguessable token, distinct
+from the internal job id, that the browser can poll at a built-in status
+route while the job reports progress from the inside.
+
+### Enqueue a tracked job
+
+```rust,ignore
+let handle = ExportOrdersJob::enqueue_tracked(ExportArgs { account_id: 42 }).await?;
+// handle.token is the raw, unguessable token — deliver it to the caller.
+// handle.status_path() is "/_autumn/jobs/{token}".
+```
+
+By default the token is an **anonymous capability**: anyone holding it can
+poll the status. To bind status access to the caller's session/user instead,
+use `enqueue_tracked_for` with an owner derived from the current session:
+
+```rust,ignore
+use autumn_web::job::TrackedJobOwner;
+
+let owner = TrackedJobOwner::from_session(&session, &state).await;
+let handle = ExportOrdersJob::enqueue_tracked_for(args, owner).await?;
+```
+
+A request whose session doesn't match the bound owner gets the identical
+`404` an unknown token would — the route is never an existence/ownership
+oracle.
+
+`enqueue_tracked`/`enqueue_tracked_for` wrap your `Args` in an internal
+envelope under a reserved top-level field named `__autumn_tracked`. Don't
+give a job's `Args` struct a field with that exact name — `enqueue`/
+`enqueue_in`/`enqueue_at` and their `on_conn` variants reject a payload
+shaped that way with a `400` rather than risk it being misread as a tracked
+envelope.
+
+### Report progress from inside the handler
+
+Add a third `JobContext` argument to a `#[job]` handler to opt into
+progress reporting; the two-argument form keeps working unchanged:
+
+```rust,ignore
+#[job(name = "export_orders")]
+async fn export_orders(
+    state: AppState,
+    args: ExportArgs,
+    ctx: JobContext,
+) -> AutumnResult<()> {
+    ctx.set_progress(0, Some("Starting export")).await?;
+
+    // ... do the work, reporting progress as it goes ...
+    ctx.set_progress(50, Some("Rows 2500/5000")).await?;
+
+    // On success, the JSON result is whatever the caller wants back —
+    // e.g. a link to the finished file.
+    ctx.set_result(serde_json::json!({ "download_url": "/blob/orders-42.csv" }));
+    Ok(())
+}
+```
+
+If the handler returns `Err`, the job retries as usual (`max_attempts`,
+backoff); only the **final** failed attempt (or a panic, which always
+dead-letters) settles the tracked record to `failed`. Call
+`ctx.set_user_error("...")` before returning `Err` to control the message
+shown to the caller — otherwise a generic "The job failed." is recorded (the
+raw error is never leaked to the tracked-status response).
+
+### Poll the status
+
+`GET /_autumn/jobs/{token}` (mounted automatically; disable with
+`jobs.tracking.route_enabled = false`) is content-negotiated:
+
+- **API clients** (no `Accept: text/html`, no `HX-Request`) get JSON:
+
+  ```json
+  {"status": "running", "progress": 50, "message": "Rows 2500/5000", "result": null, "error": null}
+  ```
+
+- **htmx requests** (`HX-Request: true`) or a browser `Accept: text/html`
+  get a self-polling fragment. While the job is pending/running, the
+  fragment carries `hx-get={path} hx-trigger="every 2s" hx-swap="outerHTML"`,
+  so it keeps re-fetching and replacing itself with zero app-authored JS.
+  Once the job reaches a terminal state, the fragment drops every `hx-*`
+  attribute — htmx has nothing left to poll — and renders either a download
+  link (when the result carries a `download_url`) or the failure message.
+
+Embed the poll target directly in a page:
+
+```rust,ignore
+html! {
+    div hx-get=(handle.status_path()) hx-trigger="load" hx-swap="outerHTML" {
+        "Starting export…"
+    }
+}
+```
+
+### Result store TTL and backends
+
+Progress/result records expire `jobs.tracking.ttl_secs` after their last
+write (default `86400`, 24h). The record store follows whichever job
+backend is configured — `local` and `redis` use an in-memory or Redis-backed
+store respectively, `postgres` uses the `autumn_job_tracking` table (see
+[Migration notes](#migration-notes)) — so a tracked job's status composes
+with the backend an app already runs, with no extra setup. Expired records
+are invisible to reads/writes immediately on all three stores; each also
+actually frees the expired record so long-running processes don't
+accumulate one dead entry per tracked job forever: the in-memory store
+sweeps them out opportunistically (amortized across `create` calls), a
+Postgres background sweep runs every 5 minutes to `DELETE` expired rows,
+and Redis expires keys natively via `EX`.
+
+### Async CSV export, end to end
+
+The synchronous `GET /{plural}/export.csv` admin route runs inline on the
+request thread — fine for small tables, but a 50k-row export blocks the
+worker and risks tripping a proxy idle timeout. A tracked job moves that
+work off the request thread:
+
+```rust,ignore
+use autumn_web::data::csv::export_csv;
+use autumn_web::prelude::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportOrdersArgs {
+    pub account_id: i64,
+}
+
+#[job(name = "export_orders")]
+async fn export_orders(
+    state: AppState,
+    args: ExportOrdersArgs,
+    ctx: JobContext,
+) -> AutumnResult<()> {
+    let repo = OrderRepository::from_state(&state);
+    let orders = repo.for_account(args.account_id).await?;
+
+    let total = orders.len();
+    let mut buffer = Vec::new();
+    for (i, chunk) in orders.chunks(500).enumerate() {
+        export_csv(chunk.iter().cloned(), &mut buffer)?;
+        let done = ((i + 1) * 500).min(total);
+        ctx.set_progress(
+            u8::try_from(done * 100 / total.max(1)).unwrap_or(100),
+            Some(&format!("Rows {done}/{total}")),
+        )
+        .await?;
+    }
+
+    let url = state.storage().put("exports/orders.csv", buffer).await?;
+    ctx.set_result(serde_json::json!({ "download_url": url }));
+    Ok(())
+}
+
+// Kick it off from a request handler and hand back a poll target — the
+// initiating request returns immediately instead of blocking on the export.
+#[post("/orders/export")]
+async fn start_export(state: AppState, session: Session) -> AutumnResult<Markup> {
+    let owner = TrackedJobOwner::from_session(&session, &state).await;
+    let handle = ExportOrdersJob::enqueue_tracked_for(
+        ExportOrdersArgs { account_id: 1 },
+        owner,
+    )
+    .await?;
+
+    Ok(html! {
+        div hx-get=(handle.status_path()) hx-trigger="load" hx-swap="outerHTML" {
+            "Export starting…"
+        }
+    })
+}
+```
+
+The browser gets a progress bar within milliseconds and a download link the
+moment the job finishes — no hand-written status table, token, or polling
+endpoint anywhere in app code.
+
+### Known limitation: tracked status vs. the durable queue record
+
+On the Redis and Postgres backends, a job's tracked status (`succeeded`/
+`failed`) is settled *before* that backend's own success/dead-letter
+acknowledgement is written. In the rare case where that ack later fails or
+is skipped (e.g. the claim changed because another worker recovered it as
+stale in between), the tracked status can briefly report a terminal state
+the durable queue record hasn't actually reached — a poller may stop
+watching a moment before the durable backend finishes catching up, which it
+does automatically on its own retry/recovery path. This window only opens
+on an ack failure, not on ordinary success/failure/retry. Treat the tracked
+status as a progress/UX signal for the caller, not as the source of truth
+for whether a job will run again — use the admin dashboard
+([Observability](#observability)) or `JobAdminBackend` for that.
+
+### Known limitation: stale progress writes on the Redis/Postgres stores
+
+`mark_running`/`set_progress` intentionally no-op once a tracked record is
+already terminal, so a stray write from an abandoned attempt can't overwrite
+a legitimate final result — but on the Redis and Postgres tracking stores
+that guard is evaluated against the value read at the *start* of that write
+(read the record, decide, write it back), not atomically at write time. If a
+worker's claim times out and it keeps running past that point while a
+replacement worker claims and completes the same job, the original worker's
+next progress write can land *after* the replacement's terminal write and
+briefly clobber it, because its in-memory guard was evaluated against the
+`running` record it read before the replacement settled. The record
+self-corrects on the next terminal write (the replacement's own retry
+path settles it, or TTL expiry clears it), so this is a transient display
+glitch, not a lost result — the queue's own durable state (visible via the
+admin dashboard) is never affected. Closing this fully means moving the
+terminal-status guard into the durable write itself (a Lua script for
+Redis, a conditional `UPDATE` for Postgres — the same compare-and-swap
+approach `JobTrackingStore::reset_for_retry` already uses to make an
+operator retry race-safe); tracked as a follow-up rather than folded into
+this change.
+
+### Known limitation: a `JobInterceptor` erroring after `next` still settles the tracked record as failed
+
+`enqueue_tracked`/`enqueue_tracked_for` treat any `Err` from the enqueue call
+as "never delivered" and settle the tracked record to `failed`. If an app
+installs a `JobInterceptor` whose `intercept_enqueue`
+successfully awaits `next` (so the job *was* delivered to the backend) and
+then its own post-`next` logic returns an error — e.g. an audit-log call
+that fails — that error is indistinguishable, from this call site alone,
+from a delivery failure: the tracked record settles to `failed` and the
+caller sees an error even though the job will still run. A caller that
+retries on that error risks enqueueing a duplicate. Closing this requires
+`JobClient::enqueue_with_outcome` to expose whether the backend write
+actually happened on its error path too (it currently tracks this
+internally via a `started` flag but only uses it to select the `Ok`
+variant), which is a signature change shared by every enqueue path — plain
+`enqueue()` has the identical gap for the same reason — not just the
+tracked ones; tracked as a follow-up. In the meantime, avoid returning an
+error from `intercept_enqueue` after `next` has resolved successfully.
+
+### Known limitation: the built-in job-status route can collide with a user route
+
+`GET /_autumn/jobs/{token}` mounts by default (`jobs.tracking.route_enabled
+= true`) for every app that registers jobs, merged after user routes are
+already mounted. If an app happens to define its own route at that exact
+path, `try_build_router_inner` panics on the resulting Axum overlapping-route
+error at startup rather than surfacing a typed, recoverable collision error
+(the framework's other reserved-but-default-on routes — the mail
+unsubscribe endpoint, mail previews — have the same gap). `/_autumn/` is a
+framework-reserved path prefix, so this should not come up in practice;
+set `jobs.tracking.route_enabled = false` if a conflict is ever hit.
+Building a general framework-route-vs-user-route collision preflight
+(mirroring the existing OpenAPI/MCP-vs-everything check) is a broader
+router-building change than this PR's scope; tracked as a follow-up.
+
 ## Observability
 
 Mount `autumn-admin-plugin` to get the built-in operator dashboard at
@@ -222,11 +865,14 @@ workers start. Run your app migrations as a one-shot `autumn migrate` job before
 scaling web and worker replicas:
 
 ```bash
-autumn migrate   # creates autumn_jobs, your domain tables, etc.
+autumn migrate   # creates autumn_jobs, autumn_job_tracking, your domain tables, etc.
 ```
 
 The migration is bundled with the framework and is applied automatically by
-`autumn migrate` as long as the `db` feature is enabled.
+`autumn migrate` as long as the `db` feature is enabled. `enqueue_tracked`
+works the same way regardless of `jobs.backend` — the framework migration
+also creates `autumn_job_tracking`, the table the Postgres-backed tracking
+store uses (see [Tracked jobs and progress polling](#tracked-jobs-and-progress-polling)).
 
 ---
 

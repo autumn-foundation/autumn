@@ -9,3 +9,14 @@
 # git autocrlf on Windows does not corrupt the frontmatter delimiters.
 examples/wiki/content/*.md text eol=lf
 autumn/src/**/*.md text eol=lf
+
+# The saas starter is embedded via include_dir! and compared byte-for-byte against
+# its rendered form in examples/saas; force LF on both so Windows autocrlf does not
+# introduce line-ending drift (mirrors the eol=lf rules above).
+autumn-cli/src/starters/saas/** text eol=lf
+examples/saas/** text eol=lf
+
+# Golden snapshots are compared byte-for-byte against generator output
+# (which always emits LF); force LF so Windows autocrlf does not fail the
+# comparison on checkout (same rationale as the saas rules above).
+autumn-cli/tests/golden/** text eol=lf

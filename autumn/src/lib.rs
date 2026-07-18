@@ -66,12 +66,27 @@
 #[allow(unused_extern_crates)]
 extern crate self as autumn_web;
 
+/// Typed accessible UI primitives (issue #1706).
+///
+/// These make the accessible name a compile-time obligation. See [`mod@a11y`].
+#[cfg(feature = "maud")]
+pub mod a11y;
 pub mod actuator;
+pub mod aggregate;
+/// Operator alerts for built-in failure conditions.
+///
+/// Connects built-in failure signals (dead-lettered jobs, Down health
+/// indicators, 5xx-rate spikes, scheduled-task failures) to the app's
+/// configured mailer and signed outbound webhook behind `[alerts]` config —
+/// with zero application code. See [`mod@alerts`].
+pub mod alerts;
 pub mod app;
 pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod batches;
+pub mod build_info;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -84,18 +99,31 @@ pub mod canary;
 pub mod circuit_breaker;
 pub mod config;
 pub mod credentials;
+pub mod current;
 #[cfg(feature = "db")]
 pub mod db;
+pub mod dotenv;
+pub mod download;
 pub mod encryption;
 pub mod error;
+#[cfg(feature = "maud")]
 pub mod error_pages;
 pub mod extract;
+/// Deterministic fake-data generation backing factory `.fake()` support.
+pub mod fake;
+pub mod feed;
+/// View-layer value formatting helpers (currency, delimited numbers,
+/// pluralize, truncate, relative/absolute dates) for Maud templates.
+///
+/// See [`mod@format`] for the full API.
+pub mod format;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
 pub mod idempotency;
+pub mod range;
 pub mod seo;
 /// Translation lookup macro with compile-time key validation.
 ///
@@ -110,16 +138,104 @@ pub mod interceptor;
 #[cfg(feature = "mail")]
 pub mod mail;
 pub mod maintenance;
+#[cfg(feature = "managed-pg")]
+pub mod managed_pg;
 #[cfg(feature = "db")]
 pub mod migrate;
+pub(crate) mod pg_conn_str;
 pub mod plugin;
 pub mod plugin_conformance;
 pub mod probe;
+
+/// Re-export of the [`include_dir`](https://docs.rs/include_dir) crate.
+///
+/// Lets apps embed their `static/` and `i18n/` trees without adding `include_dir`
+/// as a direct dependency. Used by the [`embed_static!`] and [`embed_locales!`]
+/// macros. Nested in a module (rather than a crate-root `pub use`) so the
+/// re-export resolves for external consumers, mirroring [`reexports`].
+#[cfg(feature = "embed-assets")]
+pub mod include_dir {
+    pub use ::include_dir::*;
+}
+
+/// Embed the app's `static/` directory (including the `.autumn-manifest.json`
+/// written by `autumn build --embed`) into the binary at compile time.
+///
+/// Expands to an [`include_dir::Dir`] rooted at the **calling crate's**
+/// `static/` directory (resolved via `$CARGO_MANIFEST_DIR`, exactly like
+/// `embed_migrations!`). Pass the result to
+/// [`AppBuilder::embedded_static`](crate::app::AppBuilder::embedded_static):
+///
+/// ```rust,ignore
+/// static STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();
+///
+/// #[autumn_web::main]
+/// async fn main() {
+///     autumn_web::app().embedded_static(&STATIC).run().await;
+/// }
+/// ```
+#[cfg(feature = "embed-assets")]
+#[macro_export]
+macro_rules! embed_static {
+    () => {{
+        // `include_dir!` emits `include_dir::{Dir, File, ...}` paths resolved at
+        // the call site, so bring our re-export into scope under that name. This
+        // lets apps embed without depending on the `include_dir` crate directly.
+        #[allow(unused_imports)]
+        use $crate::include_dir;
+        $crate::include_dir::include_dir!("$CARGO_MANIFEST_DIR/static")
+    }};
+}
+
+/// Embed the app's i18n locale bundles (the `i18n/` directory, or a custom
+/// directory) into the binary at compile time.
+///
+/// Pass the result to
+/// [`AppBuilder::embedded_locales`](crate::app::AppBuilder::embedded_locales).
+///
+/// ```rust,ignore
+/// static LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();
+/// // or a custom directory:
+/// static LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!("translations");
+/// ```
+#[cfg(all(feature = "embed-assets", feature = "i18n"))]
+#[macro_export]
+macro_rules! embed_locales {
+    () => {{
+        #[allow(unused_imports)]
+        use $crate::include_dir;
+        $crate::include_dir::include_dir!("$CARGO_MANIFEST_DIR/i18n")
+    }};
+    ($dir:literal) => {{
+        #[allow(unused_imports)]
+        use $crate::include_dir;
+        $crate::include_dir::include_dir!(concat!("$CARGO_MANIFEST_DIR/", $dir))
+    }};
+}
 #[cfg(feature = "system-info")]
 pub mod system_info;
 pub use plugin::{Plugin, Plugins};
 
 pub mod route_listing;
+
+/// Inbound (server-side) TLS support (issue #1603).
+///
+/// Load and validate a certificate + key, build a reloadable rustls
+/// `ServerConfig`, and inspect leaf-certificate expiry. Gated behind the
+/// off-by-default `tls` feature.
+#[cfg(feature = "tls")]
+pub mod tls;
+
+/// Automatic ACME (Let's Encrypt) certificate provisioning + renewal (#1608).
+///
+/// Builds on the [`tls`] listener: the certificate obtained over the ACME
+/// HTTP-01 challenge hot-swaps into the same `ReloadableCertResolver` the TLS
+/// listener serves. Gated behind the off-by-default `acme` feature.
+#[cfg(feature = "acme")]
+pub mod acme;
+
+#[cfg(feature = "db")]
+pub mod sharding;
 
 #[cfg(feature = "db")]
 pub mod repository;
@@ -127,6 +243,23 @@ pub mod repository;
 pub(crate) mod repository_commit_hooks;
 #[cfg(feature = "db")]
 pub use repository::RepositoryError;
+
+/// Read-your-own-writes routing support.
+///
+/// When `database.read_your_writes` is `request` or `session`, generated
+/// repository read methods consult the per-request task-local at acquire time
+/// and redirect replica-eligible reads to the primary when a write has
+/// occurred in the same request (or within the session cookie window).
+#[cfg(feature = "db")]
+pub mod read_your_writes;
+
+/// Offline-first local SQLite store and background sync engine for
+/// occasionally-connected apps (e.g. Tauri mobile).
+///
+/// See the [`sync`] module documentation for the architecture (change
+/// tracking, tombstoning, conflict resolution) and wiring examples.
+#[cfg(feature = "offline-sync")]
+pub mod sync;
 
 /// Automatic record version history for `#[repository]` writes.
 ///
@@ -144,6 +277,48 @@ pub use version_history::{
 /// that will handle incoming HTTP requests.
 pub(crate) mod router;
 
+/// Fuzzing-only re-export surface.
+///
+/// Compiled only when the crate is built with `--cfg fuzzing` (as cargo-fuzz
+/// does for the workspace-root `fuzz/` crate). It re-exports otherwise-private
+/// or `pub(crate)` request-path parsing seams so the fuzz targets can drive
+/// them over raw untrusted bytes. Everything here is guarded by `#[cfg(fuzzing)]`
+/// so normal builds — and `cargo package` output — are byte-identical.
+///
+/// Not part of the public API; no stability guarantees.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod __fuzz {
+    // Routing / path-parameter extraction (functions are `pub` inside the
+    // `pub(crate)` `router` module).
+    pub use crate::router::{
+        extract_host_without_port, join_nested_path, path_matches_route_prefix,
+    };
+    // `extract_path_params` only exists under the `openapi` feature (it backs
+    // spec-URL generation); the `fuzz/` crate enables `openapi` so this routing
+    // seam is present when fuzzing.
+    #[cfg(feature = "openapi")]
+    pub use crate::router::extract_path_params;
+
+    // Trusted-proxy / `X-Forwarded-*` header parsing.
+    pub use crate::security::trusted_proxies::{
+        __fuzz_parse_forwarded_ip as parse_forwarded_ip,
+        __fuzz_parse_trusted_proxy as parse_trusted_proxy,
+        __fuzz_resolve_forwarded as resolve_forwarded,
+    };
+
+    // Cookie / signed-session decode.
+    pub use crate::session::__fuzz_decode_cookie as decode_cookie;
+
+    // Body handling: form-urlencoded (always) + inbound-mail MIME (feature-gated).
+    pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;
+    #[cfg(feature = "inbound-mail")]
+    pub use crate::inbound_mail::{
+        __fuzz_parse_address_list as parse_address_list, __fuzz_parse_generic as parse_generic,
+        __fuzz_parse_ses as parse_ses,
+    };
+}
+
 #[cfg(feature = "db")]
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,
@@ -160,7 +335,15 @@ pub use http_client as http;
 #[cfg(feature = "flash")]
 pub mod flash;
 #[cfg(feature = "htmx")]
-pub(crate) mod htmx;
+pub mod htmx;
+/// Declarative live-broadcast trait for `#[repository(Model, broadcasts = "topic")]`.
+///
+/// Implement [`live::LiveFragment`] on a model to enable automatic `hx-swap-oob`
+/// broadcasts after each `save`/`update`/`delete_by_id` call. Requires the
+/// `ws`, `maud`, and `htmx` features.
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub mod live;
+pub mod lock;
 pub mod log;
 pub(crate) mod logging;
 /// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI
@@ -170,17 +353,34 @@ pub(crate) mod logging;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod middleware;
+/// Content-negotiated success responder (`Negotiate` / `Negotiated` / `Format`).
+#[cfg(feature = "maud")]
+pub mod negotiate;
 pub mod openapi;
 pub mod pagination;
 pub mod paths;
+/// Eager-loading (preload) runtime for `#[model]` associations.
+///
+/// See [`preload`] for [`preload::Preloaded`], [`preload::NotLoaded`], and the
+/// [`preload::Preloadable`] trait that generated code implements.
+pub mod preload;
 pub mod prelude;
 pub use paths::PathExt;
 #[cfg(feature = "presence")]
 pub mod presence;
+#[cfg(all(feature = "presence", feature = "maud"))]
+pub use presence::presence_badge;
+#[cfg(all(
+    feature = "presence",
+    feature = "ws",
+    feature = "maud",
+    feature = "htmx"
+))]
+pub use presence::presence_stream;
 #[cfg(feature = "presence")]
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
-pub use route::{RepositoryApiMeta, Route, RouteIdempotency};
+pub use route::{RepositoryApiMeta, Route, RouteIdempotency, RouteTimeout};
 /// First-class Markdown rendering with frontmatter parsing and SSG integration.
 ///
 /// Enable with the Cargo feature `markdown`.
@@ -204,24 +404,84 @@ pub mod step_up;
 #[cfg(feature = "storage")]
 pub mod storage;
 pub mod tenancy;
+pub mod tenant_cell;
 pub mod time;
+pub mod time_zone;
 pub mod user_agent;
 
+pub mod events;
 pub mod experiments;
 pub mod feature_flags;
 pub mod form;
 pub mod gdpr;
 pub mod job;
+pub mod job_tracking;
+/// Safe, method-aware link helpers: [`links::link_to`] anchors and
+/// [`links::button_to`] CSRF-protected action buttons.
+pub mod links;
+pub mod nested_form;
+pub mod payload_version;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+
+// ── #1343 AC4: fake-seeder registration forwarding ──────────────────────────
+//
+// `#[model]` emits a call to `autumn_web::__autumn_register_fake_seeder!` for
+// every model so `autumn seed --count N --model M` can find and run the model's
+// factory without the user editing `src/bin/seed.rs`. The registration must
+// exist *exactly* when `autumn_web::seed::FakeSeeder` and the db-backed
+// `create_many` do — i.e. when this crate is built with the `seed` feature.
+//
+// A downstream `#[cfg(feature = "seed")]` in the emitted code would test the
+// *application* crate's features, not autumn-web's, so it can't be used
+// directly. Instead we forward through a `#[macro_export]` macro whose two
+// cfg-gated definitions are resolved against *autumn-web's* features at the
+// point autumn-web is compiled: the real `inventory::submit!` when `seed` is on,
+// and a no-op otherwise. This keeps models compiling unchanged when seeding is
+// disabled (e.g. autumn-web's own default-feature test build).
+
+/// Register a model's factory as a CLI-callable fake seeder (internal; invoked
+/// by `#[model]`). Expands to an `inventory::submit!` of a
+/// [`seed::FakeSeeder`](crate::seed::FakeSeeder).
+#[cfg(feature = "seed")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_fake_seeder {
+    ($model:ty, $name:expr) => {
+        $crate::reexports::inventory::submit! {
+            $crate::seed::FakeSeeder {
+                model: $name,
+                run: |__pool, __count| ::std::boxed::Box::pin(async move {
+                    <$model>::factory().fake().create_many(__count, __pool).await.len()
+                }),
+            }
+        }
+    };
+}
+
+/// No-op fake-seeder registration (internal): emitted when autumn-web is built
+/// without the `seed` feature, so `#[model]` compiles unchanged.
+#[cfg(not(feature = "seed"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_fake_seeder {
+    ($model:ty, $name:expr) => {};
+}
+/// Widget story gallery (issue #1526).
+///
+/// Browsable `/_stories` UI plus a CI anti-rot registry of zero-arg widget
+/// render examples.
+#[cfg(feature = "maud")]
+pub mod stories;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
 /// Active search and autocomplete form primitives with htmx integration.
 ///
 /// See [`widgets`] for the full API including [`widgets::active_search`],
-/// [`widgets::autocomplete_input`], and their configuration types.
+/// [`widgets::autocomplete_input`], [`widgets::data_table`],
+/// [`widgets::property_list`], and their configuration types.
 pub mod widgets;
 /// First-class multi-step form wizards with session-backed state and per-step validation.
 ///
@@ -234,7 +494,14 @@ pub use form::Changeset;
 pub use form::ChangesetForm;
 /// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
 pub use form::IntoChangeset;
+#[cfg(feature = "maud")]
+pub use nested_form::{InputsForOptions, RowScope, inputs_for, nested_row_fragment};
+/// Nested (`has_many`) form binding: parent + one child collection.
+pub use nested_form::{
+    NestedChangeset, NestedChangesetForm, NestedChild, NestedRow, decode_nested_urlencoded,
+};
 pub mod data;
+pub mod normalize;
 pub mod validation;
 pub mod webhook;
 #[cfg(feature = "http-client")]
@@ -248,6 +515,12 @@ pub mod ws;
 #[doc(hidden)]
 pub mod __private {
     #[cfg(feature = "db")]
+    pub use crate::db::scoped_immediate_transaction;
+    #[cfg(feature = "db")]
+    pub use crate::db::scoped_transaction;
+    #[cfg(all(feature = "db", feature = "ws"))]
+    pub use crate::repository_commit_hooks::CURRENT_CHANNELS;
+    #[cfg(feature = "db")]
     pub use crate::repository_commit_hooks::{
         RepositoryCommitHookDescriptor, catch_repository_after_hook_unwind,
         discard_repository_commit_hook_pending, enqueue_repository_commit_hook_on_conn,
@@ -257,6 +530,11 @@ pub mod __private {
         finalize_repository_commit_hook_after_hook, kick_repository_commit_hook_dispatcher,
         mark_repository_commit_hook_after_hook_failed, register_repository_commit_hook_runner,
         start_repository_commit_hook_pending_finalizer_heartbeat,
+        start_repository_commit_hook_worker,
+    };
+    #[cfg(feature = "db")]
+    pub use crate::repository_commit_hooks::{
+        clear_global_channels, get_global_channels, set_global_channels,
     };
     #[cfg(feature = "db")]
     pub use crate::version_history::VersionedRepositoryDescriptor;
@@ -305,12 +583,32 @@ pub use app::{ApiVersion, RegisteredApiVersions};
 #[cfg(feature = "db")]
 pub use db::Db;
 
+/// Transaction options (isolation level + retry policy) and the savepoint
+/// helper for [`Db::tx_with`]. See [`db::TxOptions`].
+#[cfg(feature = "db")]
+pub use db::{IsolationLevel, TxOptions, savepoint};
+
+/// The runtime database connection type (Postgres by default; `SQLite` under the
+/// `sqlite` feature). Named by generated `#[repository]`/`#[model]` code as
+/// `::autumn_web::RuntimeConnection`. See [`db::RuntimeConnection`].
+#[cfg(feature = "db")]
+pub use db::RuntimeConnection;
+
+/// The runtime diesel query backend (`diesel::pg::Pg` by default;
+/// `diesel::sqlite::Sqlite` under the `sqlite` feature). Named by generated
+/// `#[repository]`/`#[model]` code as `::autumn_web::RuntimeBackend`. See
+/// [`db::RuntimeBackend`].
+#[cfg(feature = "db")]
+pub use db::RuntimeBackend;
+
 /// Framework error type and result alias.
 ///
 /// [`AutumnError`] wraps any `Error + Send + Sync` with an HTTP status code.
 /// [`AutumnResult<T>`] is `Result<T, AutumnError>`.
 /// See the [`error`] module for details.
 pub use error::{AutumnError, AutumnResult};
+
+pub use tenant_cell::{QuotaExceeded, TenantCell, TenantCellHandle, TenantCellRegistry};
 
 /// Paginated list response wrapper with navigation metadata.
 ///
@@ -324,12 +622,27 @@ pub use pagination::Page;
 /// patterns.
 pub use pagination::PageRequest;
 
+/// Allowlisted sort/filter parameters extracted from the query string, and the
+/// canonical [`SortDir`] direction. Compose with [`PageRequest`] to drive the
+/// `#[repository]`-generated `list()` method.
+///
+/// See the [`pagination`] module for the security model (the allowlist is the
+/// injection boundary) and the query contract.
+pub use pagination::{ListQuery, SortDir};
+
 /// Cursor pagination response wrapper. Companion to [`CursorRequest`]
 /// for keyset/seek pagination of real-time feeds.
 ///
 /// See the [`pagination`] module for the full query contract and usage
 /// patterns.
 pub use pagination::CursorPage;
+
+/// Eager-loaded record wrapper and the typed `NotLoaded` accessor error.
+///
+/// See the [`preload`] module for declaring `#[belongs_to]` / `#[has_many]` /
+/// `#[has_one]` associations and loading them with a `#[repository]`
+/// `preload(...)` call.
+pub use preload::{NotLoaded, Preloaded};
 
 /// Cursor pagination parameters extracted from the query string.
 ///
@@ -350,11 +663,22 @@ pub use validation::Validated;
 /// Useful for cache-busting or diagnostic logging. The corresponding
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
-pub use htmx::{AUTUMN_WIDGETS_JS_PATH, HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
+pub use htmx::{
+    AUTUMN_WIDGETS_JS_PATH, HTMX_CSRF_JS_PATH, HTMX_JS, HTMX_JS_PATH, HTMX_SSE_JS,
+    HTMX_SSE_JS_PATH, HTMX_VERSION, IDIOMORPH_JS, IDIOMORPH_JS_PATH,
+};
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub use htmx::{HtmxFragments, OobSwap};
+/// Trait for rendering a model instance as an htmx `hx-swap-oob` fragment.
+///
+/// Implement this on your model and declare `broadcasts = "topic"` on the
+/// `#[repository]` attribute to enable automatic live broadcasts.
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub use live::LiveFragment;
 #[cfg(feature = "mail")]
 pub use mail::{
-    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailTransport, Mailer,
-    SmtpConfig, TlsMode, Transport,
+    Mail, MailAttachment, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError,
+    MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
 };
 /// Extension trait adding `.validate()` to all `validator::Validate` types.
 pub use validation::ValidateExt;
@@ -452,6 +776,12 @@ pub use autumn_macros::mailer_preview;
 /// }
 /// ```
 pub use autumn_macros::main;
+/// Author a widget story for the `/_stories` gallery:
+/// `story!{ "Group", "Name", { ... } }`.
+///
+/// Also available as [`stories::story`], the macro's module home.
+#[cfg(feature = "maud")]
+pub use autumn_macros::story;
 
 /// Derive Diesel and Serde traits for a database model struct.
 ///
@@ -681,8 +1011,12 @@ pub use autumn_macros::cached;
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
 
+/// Declare a typed domain event. See [`mod@events`] module.
+pub use autumn_macros::event;
 /// Declare an on-demand background job. See [`mod@job`] module.
 pub use autumn_macros::job;
+/// Declare an event listener. See [`mod@events`] module.
+pub use autumn_macros::listener;
 /// Declare a scheduled background task. See [`mod@task`] module.
 pub use autumn_macros::scheduled;
 /// Declare a one-off operational task. See [`task::OneOffTaskInfo`].
@@ -697,8 +1031,15 @@ pub use auth::ApiToken;
 /// Tower layer that validates `Authorization: Bearer <token>` on API routes.
 ///
 /// Verifies tokens against any [`auth::ApiTokenStore`] implementation.
-/// Returns `401 Unauthorized` for missing, unknown, or revoked tokens.
+/// Returns `401 Unauthorized` for missing, unknown, revoked, or expired tokens.
 pub use auth::RequireApiToken;
+
+/// Scoped service-token types and helpers: mint named, scoped, optionally
+/// expiring tokens whose granted scopes flow into the policy layer.
+pub use auth::{
+    ApiTokenScopes, IssueTokenSpec, TokenMetadata, VerifiedToken, issue_scoped_api_token,
+    list_api_tokens, rotate_api_token,
+};
 
 /// Postgres-backed API token store (requires `db` feature).
 ///
@@ -761,6 +1102,25 @@ pub use auth::API_TOKEN_MIGRATIONS;
 /// ```
 pub use autumn_macros::secured;
 
+/// Declare a route handler as deliberately public (unauthenticated).
+///
+/// A compile-time marker that records intent: it injects no runtime guard and
+/// leaves the handler signature untouched, but surfaces on the route's
+/// [`ApiDoc::public`](crate::openapi::ApiDoc::public) so the build-time security
+/// classifier (`autumn routes audit`) treats the route as an explicit opt-out
+/// of authentication rather than an oversight.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[get("/pricing")]
+/// #[public]
+/// async fn pricing() -> &'static str { "free" }
+/// ```
+pub use autumn_macros::public;
+
 /// Require fresh ("step-up") authentication before a route handler runs.
 ///
 /// The handler is guarded by a freshness check on the session's
@@ -791,6 +1151,35 @@ pub use autumn_macros::secured;
 /// }
 /// ```
 pub use autumn_macros::step_up;
+
+/// Apply a per-route rate limit that composes with the global limiter.
+///
+/// # Forms
+///
+/// - `#[throttle(limit = 5, per = "1m")]` — inline limit; keying strategy
+///   matches the global limiter (`[security.rate_limit]`).
+/// - `#[throttle(limit = 5, per = "1m", key = "ip" | "principal" | "token")]`
+///   — inline limit with an explicit key strategy.
+/// - `#[throttle("login")]` — reference a named limiter defined in
+///   `[security.rate_limit.named.login]`.
+///
+/// Requests denied by the per-route bucket receive `429 Too Many Requests`
+/// with a `Retry-After` header and the standard `x-ratelimit-*` headers.
+/// [`RateLimitExempt`](crate::security::RateLimitExempt) still bypasses the
+/// per-route throttle.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// #[post("/login")]
+/// #[throttle(limit = 5, per = "1m", key = "ip")]
+/// async fn login() -> AutumnResult<&'static str> {
+///     Ok("welcome back")
+/// }
+/// ```
+pub use autumn_macros::throttle;
 
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or
@@ -831,6 +1220,8 @@ pub use autumn_macros::feature_flag;
 pub use autumn_macros::authorize;
 /// Collect `#[job]` handlers into a `Vec<JobInfo>`.
 pub use autumn_macros::jobs;
+/// Collect `#[listener]` handlers into a `Vec<events::ListenerInfo>`.
+pub use autumn_macros::listeners;
 
 /// Collect `#[task]` handlers into a `Vec<task::OneOffTaskInfo>`.
 pub use autumn_macros::one_off_tasks;
@@ -862,6 +1253,157 @@ pub use autumn_macros::static_routes;
 /// }
 /// ```
 pub use autumn_macros::static_get;
+
+/// Turn a plain state enum into a statically-verified lifecycle.
+///
+/// Applied to an enum with an `initial` state, one or more `terminal` states,
+/// and a set of `transitions`, this preserves the original enum and appends
+/// metadata consts (`LIFECYCLE_INITIAL`, `LIFECYCLE_TERMINALS`,
+/// `LIFECYCLE_STATES`, `LIFECYCLE_TRANSITIONS`) plus `can_transition_to` on the
+/// enum, and a typestate transition module (named after the enum in
+/// `snake_case`) whose `Machine<S>` only exposes `to_<target>` methods for
+/// declared edges — firing an undeclared transition is a compile error.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::lifecycle;
+///
+/// #[lifecycle(
+///     initial = Draft,
+///     terminal(Archived),
+///     transitions(
+///         Draft -> Published,
+///         Published -> Archived,
+///         Published -> Draft,
+///     )
+/// )]
+/// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// pub enum ArticleState { Draft, Published, Archived }
+/// ```
+pub use autumn_macros::lifecycle;
+
+/// Marker trait implemented by every `#[lifecycle]` enum, exposing that
+/// lifecycle's transition edges as a string-keyed table.
+///
+/// This is the bridge that lets a field-level `#[state_machine(lifecycle = X)]`
+/// on a `#[model]` derive its runtime transitions table from a `#[lifecycle]`
+/// enum `X` instead of an inline `transitions(...)` list — "transitions defined
+/// once, typed" (issue #1911). The `#[lifecycle]` macro is the *only* thing that
+/// implements this trait; referencing a type that is not a `#[lifecycle]` enum in
+/// `#[state_machine(lifecycle = ...)]` therefore fails to compile with an
+/// unsatisfied `T: Lifecycle` trait bound rather than a cryptic
+/// "no associated const" error.
+///
+/// [`STATE_MACHINE_TRANSITIONS`](Lifecycle::STATE_MACHINE_TRANSITIONS) has the
+/// exact `(from, to, guard)` shape the field-level `#[state_machine]` inline
+/// table uses, so a lifecycle-derived state machine is byte-for-byte the same
+/// runtime construct as the equivalent inline one. Lifecycle transitions carry
+/// no guards, so every `guard` slot is `None` (see the `#[state_machine]` docs
+/// for the guards rationale).
+pub trait Lifecycle {
+    /// This lifecycle's declared transition edges as
+    /// `(from_variant_name, to_variant_name, guard)` triples, where the variant
+    /// names are the enum variants rendered as strings (matching the value
+    /// stored in the model's `String` column). The `guard` slot is always
+    /// `None` — lifecycle transitions are unguarded.
+    const STATE_MACHINE_TRANSITIONS: &'static [(
+        &'static str,
+        &'static str,
+        ::core::option::Option<&'static str>,
+    )];
+}
+
+/// Context payload delivered to an `on_commit` transition-effect job
+/// (issue #1973).
+///
+/// When a `#[state_machine]` edge declares `on_commit = SomeJob`, firing that
+/// edge via the generated `transition_{field}_to_on_conn` method enqueues
+/// `SomeJob` **transactionally** on the caller's connection with an instance of
+/// this struct as its payload. Because the enqueue writes the job row inside the
+/// caller's own transaction, a rollback drops the effect; the durable worker
+/// runs it post-commit with full `AppState` (at-least-once delivery).
+///
+/// Declare the job to receive it, deduping on the derived key so a retried
+/// transition coalesces into a single delivery:
+///
+/// ```rust,ignore
+/// #[job(name = "send_shipped_email", unique_by = "idempotency_key")]
+/// async fn send_shipped_email(
+///     state: AppState,
+///     effect: TransitionEffect,
+/// ) -> AutumnResult<()> {
+///     // effect.model / .field / .record_id / .from_state / .to_state
+///     Ok(())
+/// }
+/// ```
+///
+/// The [`idempotency_key`](TransitionEffect::idempotency_key) is derived from
+/// `(model, field, record_id, from_state, to_state)`, so declaring the job
+/// `unique_by = "idempotency_key"` gives idempotent, coalescing delivery.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransitionEffect {
+    /// The model type name whose field transitioned (e.g. `"Order"`).
+    pub model: String,
+    /// The state-machine field name that transitioned (e.g. `"status"`).
+    pub field: String,
+    /// The record's primary-key value, rendered as a string.
+    pub record_id: String,
+    /// The state the field moved from.
+    pub from_state: String,
+    /// The state the field moved to.
+    pub to_state: String,
+    /// Derived dedup key:
+    /// `"{model}:{field}:{record_id}:{from_state}:{to_state}"`.
+    pub idempotency_key: String,
+}
+
+/// Internal: returns `true` if `(from, to)` appears as an edge in a
+/// `#[lifecycle]` enum's `STATE_MACHINE_TRANSITIONS` table. Used by
+/// `#[state_machine(lifecycle = ..., effects(...))]` codegen to reject at
+/// compile time an effect declared on an edge the lifecycle does not permit
+/// (which would otherwise silently drop the effect). Not part of the public API.
+#[doc(hidden)]
+#[must_use]
+pub const fn __transition_edge_declared(
+    table: &[(&str, &str, ::core::option::Option<&str>)],
+    from: &str,
+    to: &str,
+) -> bool {
+    // Iterators/`for` are not permitted in a const fn, so index with `while`.
+    #[allow(clippy::needless_range_loop)]
+    let mut i = 0;
+    while i < table.len() {
+        let (f, t, _) = table[i];
+        if __const_str_eq(f, from) && __const_str_eq(t, to) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Internal: byte-wise `&str` equality usable in a const context (where the
+/// `PartialEq` `==` operator on `str` is not available). Not part of the
+/// public API.
+#[doc(hidden)]
+#[must_use]
+pub const fn __const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    // Iterators/`for` are not permitted in a const fn, so index with `while`.
+    #[allow(clippy::needless_range_loop)]
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 // ── Maud re-exports ────────────────────────────────────────────────
 
@@ -1017,8 +1559,10 @@ pub mod reexports {
     pub use inventory;
     #[cfg(feature = "mail")]
     pub use lettre;
+    pub use rust_decimal;
     #[cfg(feature = "db")]
     pub use scoped_futures;
+    pub use serde;
     pub use serde_json;
     pub use tokio;
     pub use tokio_util;
@@ -1039,6 +1583,7 @@ pub mod test;
 /// Dependency-free HTML parser + CSS-selector matcher backing the structural
 /// HTML assertions on [`test::TestResponse`].
 mod test_html;
+pub use config::ProcessRole;
 pub use state::AppState;
 
 #[cfg(test)]

@@ -66,7 +66,13 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   are stable; actuator endpoint payloads follow the actuator docs.
 - The CLI commands shipped by `autumn-cli` (`autumn new`, `autumn setup`,
   `autumn dev`, `autumn build`, `autumn migrate`) and their documented
-  flags.
+  flags. This includes the `autumn new` starter flags — `--starter`,
+  `--list-starters`, `--starter-ref`, and `--yes` — and the
+  `autumn-starter.toml` manifest schema documented in
+  [`docs/guide/starters.md`](docs/guide/starters.md), which built-in and
+  community starters share. Adding new built-in starters or new optional
+  manifest fields is additive (non-breaking); removing or renaming a manifest
+  field, or changing the substitution tokens, is a breaking change.
 
 **Not stable (explicitly excluded from SemVer):**
 
@@ -202,6 +208,36 @@ Cargo feature flags are part of the public API:
 - The `default` feature set is stable: removing a feature from `default`
   is a breaking change.
 
+### Feature-combination CI gate
+
+Every individual `autumn-web` feature flag is proven to compile in
+isolation (with `--no-default-features`) in CI via a `cargo hack
+--each-feature` sweep.  A curated set of representative real-world
+combinations is also checked on every PR:
+
+| Combination | Rationale |
+|---|---|
+| `--no-default-features` (no flags) | bare-minimum compile |
+| each flag alone | isolation regression guard |
+| `db` | db-only API server |
+| `mail` | mail without the full default set |
+| `storage,db` | file storage backed by database |
+| `maud,htmx` | minimal web front-end |
+| `telemetry-otlp` | standalone telemetry |
+
+### Unsupported feature combinations (CI excluded)
+
+The following features are **not** checked in CI because their build
+requirements make them cost-prohibitive or unsuitable for standard
+runners.  They remain available for users with the necessary environment:
+
+| Feature | Reason excluded |
+|---|---|
+| `managed-pg` | downloads Postgres binaries on first build |
+| `managed-pg-bundled` | embeds Postgres binaries (~150 MB) into the executable |
+| `system-tests` | requires a headless Chromium browser (`chromiumoxide`) |
+| `test-support` | dev-only; pulls `testcontainers` (Docker-dependent) |
+
 ## Deprecation process
 
 We prefer a long deprecation ramp over abrupt removal:
@@ -213,6 +249,29 @@ We prefer a long deprecation ramp over abrupt removal:
 3. The item is removed in the next *major* release.
 
 Deprecations never change behavior — only signal intent.
+
+### Config-key deprecations
+
+Config key deprecations (TOML schema and `AUTUMN_*` env vars) are tracked in
+`DEPRECATED_CONFIG_KEYS` in `autumn/src/config.rs`. Each entry records the
+dotted key path, the replacement key path, `since` (the minor version that
+introduced the deprecation), and `remove_in` (the first major version that
+removes it).
+
+At startup `AutumnConfig::load_with_env` emits one structured `WARN` per
+deprecated key that is found in the resolved config (TOML file or environment
+variable). The old value is still honored during the deprecation window — only
+the signal changes. Use `autumn doctor` to check for deprecated config keys
+without starting the full application; the `deprecated_keys` check appears in
+plain-text and `--json` output.
+
+A CI guard (`autumn/tests/schema_drift_guard.rs`) enforces that any key
+removed from the compiled schema has a corresponding entry in the registry.
+Regenerate its snapshot after schema changes:
+
+```
+UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p autumn-web schema_keys_snapshot_guard
+```
 
 ## Migration guides
 

@@ -1,0 +1,157 @@
+name: CLI Release Binaries
+
+# Builds prebuilt `autumn` CLI binaries for Linux + macOS (x86_64 + aarch64)
+# and Windows (x86_64) and attaches them — with sha256 checksums — to a GitHub Release.
+#
+# Binaries correspond to DELIBERATE, TAGGED CRATE RELEASES, not trunk. This is a
+# reusable workflow invoked by `release.yml` (its `binaries` job) right after the
+# GitHub Release for a `v[0-9]+.*` tag is created — so it runs only once the Publish
+# Gate has passed and the release exists, and it uploads to that release. Cutting a
+# release is always an explicit maintainer action; there are no rolling/nightly
+# trunk-dev builds, and `releases/latest/download/...` always means "the latest
+# RELEASED version".
+#
+# It is deliberately NOT triggered by `on: release`: release.yml creates the release
+# with the default GITHUB_TOKEN, and events raised by GITHUB_TOKEN do not start new
+# workflow runs, so an `on: release` trigger would silently never fire. Invoking it
+# as a reusable job from release.yml side-steps that entirely and is deterministic.
+#
+# `workflow_dispatch` is a manual escape hatch: supply a `tag` to (re)build a
+# specific released tag and attach to its release, or leave it blank to build the
+# current ref for validation (uploads workflow artifacts, no release upload).
+#
+# Distribution contract (see scripts/install.sh and the README "Install" section):
+#   - Version-pinned: .../releases/download/<tag>/autumn-<target>.tar.gz  (Windows: .zip)
+#   - Stable latest:  .../releases/latest/download/autumn-<target>.tar.gz (Windows: .zip)
+# Asset names are intentionally version-less so the latest/download URL is stable.
+# Linux targets build via `cross` (musl, no glibc dependency); macOS and Windows
+# targets build natively on their runners. The Windows binary (autumn.exe) ships as
+# a .zip packaged with PowerShell (Git-bash on windows-latest lacks `zip`); see #2005.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to build from and attach binaries to (e.g. v0.6.0)."
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Released tag to build from and attach to (e.g. v0.6.0). Blank = build the current ref for validation only (artifacts, no release upload)."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cli-release-${{ inputs.tag || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          # Native windows-latest build (aws-lc crypto stack builds there — see ci.yml).
+          # NOT cross: `cross` is Linux-container only. Packaged as a .zip, not a tarball.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: ${{ matrix.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build autumn via cross (${{ matrix.target }})
+        if: ${{ matrix.cross }}
+        run: cross build --locked -p autumn-cli --release --bin autumn --target ${{ matrix.target }}
+
+      - name: Build autumn via cargo (${{ matrix.target }})
+        if: ${{ ! matrix.cross }}
+        run: cargo build --locked -p autumn-cli --release --bin autumn --target ${{ matrix.target }}
+
+      # Linux/macOS: tarball the `autumn` binary + licenses, checksum with coreutils.
+      - name: Package tarball + checksum
+        if: ${{ runner.os != 'Windows' }}
+        run: |
+          set -euo pipefail
+          asset="autumn-${{ matrix.target }}.tar.gz"
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/autumn" "$staging/autumn"
+          cp LICENSE-MIT LICENSE-APACHE "$staging/" 2>/dev/null || true
+          tar -C "$staging" -czf "$asset" .
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          echo "--- checksum ---"
+          cat "$asset.sha256"
+
+      # Windows: zip the `autumn.exe` binary + licenses (Git-bash has no `zip`),
+      # and emit a sha256sum-format checksum ("<hash>  <file>") via Get-FileHash.
+      - name: Package zip + checksum (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $asset = "autumn-${{ matrix.target }}.zip"
+          $staging = Join-Path $env:RUNNER_TEMP "autumn-stage"
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/autumn.exe" (Join-Path $staging "autumn.exe")
+          Copy-Item LICENSE-MIT, LICENSE-APACHE $staging -ErrorAction SilentlyContinue
+          Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $asset -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
+          # Match `sha256sum` output format so downstream verification is uniform.
+          Set-Content -Path "$asset.sha256" -Value "$hash  $asset" -Encoding ascii
+          Write-Host "--- checksum ---"
+          Get-Content "$asset.sha256"
+
+      # Glob covers both the Linux/macOS `.tar.gz(.sha256)` and Windows `.zip(.sha256)` assets.
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: autumn-${{ matrix.target }}
+          path: autumn-${{ matrix.target }}.*
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: ${{ inputs.tag != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Glob expands to the archive + its .sha256 (.tar.gz on Linux/macOS, .zip on Windows).
+          gh release upload "$TAG" \
+            autumn-${{ matrix.target }}.* \
+            --clobber --repo "$GITHUB_REPOSITORY"

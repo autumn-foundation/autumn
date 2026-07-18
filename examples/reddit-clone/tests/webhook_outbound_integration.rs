@@ -86,14 +86,16 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
 
     let mut jobs = reddit_clone::jobs::registered_jobs();
     jobs.push(JobInfo {
+        version: 1,
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 1,
         initial_backoff_ms: 1,
+        queue: "default".to_string(),
         uniqueness: None,
         concurrency: None,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
     });
-    job::start_runtime(jobs, state, &shutdown, &config).unwrap();
+    job::start_runtime(jobs, state, &shutdown, &config, true).unwrap();
 
     // 5. Fire a POST request to /register to trigger the user.created webhook event
     let response = app

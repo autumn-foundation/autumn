@@ -52,6 +52,44 @@ async fn reset(mailer: Mailer) -> AutumnResult<&'static str> {
 }
 ```
 
+## Attachments
+
+Attach a file with `.attach(filename, content_type, bytes)` — call it once per
+file, in the order you want them to appear:
+
+```rust
+use autumn_web::prelude::*;
+
+#[post("/orders/{id}/confirm")]
+async fn confirm(mailer: Mailer, id: String) -> AutumnResult<&'static str> {
+    let invoice: Vec<u8> = render_invoice_pdf(&id); // your own PDF generator
+
+    let mail = Mail::builder()
+        .to("ada@example.com")
+        .subject("Your order confirmation")
+        .text("Thanks for your order! Your invoice is attached.")
+        .attach("invoice.pdf", "application/pdf", invoice)
+        .build()?;
+
+    mailer.deliver_later(mail);
+    Ok("queued")
+}
+```
+
+- Attachments are declared-order, `multipart/mixed` parts on both the `smtp`
+  and `file` transports, encoded `base64` with the `Content-Type` you passed
+  in. A `Mail` with zero attachments produces byte-for-byte the same message
+  it always has — attachments are purely additive.
+- Filenames are sanitized against header injection and RFC 2231/2047-encoded
+  automatically when they contain non-ASCII characters; you never need to
+  escape a filename yourself.
+- `Mail` (including its attachments) is `Serialize`/`Deserialize`, so
+  attachments survive a round-trip through `deliver_later` and any custom
+  [`MailDeliveryQueue`] outbox unchanged.
+- Out of scope for this API: inline/CID attachments (`cid:` image embeds),
+  attaching directly from a file path or `BlobStore` handle, and attachment
+  size limits — enforce those at the call site if your app needs them.
+
 ## `#[mailer]`
 
 Put templates on a small struct and let the macro generate `send_*` and
@@ -124,12 +162,82 @@ transaction or when you deliberately want fire-and-forget semantics — use
 See [Transactions -> after_commit](transactions.md#after_commit--post-commit-process-local-callbacks)
 for the full story on atomic DB + mail patterns.
 
+## Generator (`autumn generate mailer`)
+
+`autumn generate mailer <Name>` scaffolds a mailer struct, templates, a dev
+preview, and wires everything into `src/main.rs` in one step:
+
+```
+autumn generate mailer Welcome
+```
+
+### Shared layout
+
+By default the generator creates `templates/mailers/_layout.html` and
+`templates/mailers/_layout.txt` on first use. Every subsequently generated
+mailer template is a **body fragment** (no `<head>`, no `<body>`) composed into
+the layout at build time via the `{{ content }}` slot:
+
+```html
+<!-- templates/mailers/_layout.html (created once, never overwritten) -->
+<!DOCTYPE html>
+<html>
+  <body>
+    <!-- your branding, header, footer -->
+    {{ content }}   <!-- per-mailer body goes here -->
+  </body>
+</html>
+```
+
+Edit the layout freely after generation — subsequent `generate mailer` runs
+skip it if it already exists, so your changes are preserved.
+
+Generated mailers call `.layout(...)` to compose the body into the shared
+shell at build time:
+
+```rust
+Mail::builder()
+    .to(to)
+    .subject("Welcome")
+    .html(include_str!("../../templates/mailers/welcome.html"))
+    .text(include_str!("../../templates/mailers/welcome.txt"))
+    .layout(
+        include_str!("../../templates/mailers/_layout.html"),
+        include_str!("../../templates/mailers/_layout.txt"),
+    )
+    .build()
+    .expect("valid mail")
+```
+
+### Opting out of the shared layout
+
+Pass `--no-layout` when a mailer needs a fully-custom HTML document (a
+one-line plaintext alert, an email with a unique design, etc.):
+
+```
+autumn generate mailer Transactional --no-layout
+```
+
+With `--no-layout` the template is emitted as a self-contained full HTML
+document and no `.layout(...)` call is generated.
+
+### List-Unsubscribe
+
+```
+autumn generate mailer Newsletter --list-unsubscribe newsletter
+```
+
+Adds a `#[mailer(list_unsubscribe = "newsletter")]` attribute and creates a
+`mail_unsubscribes` suppression migration. See
+[Mail compliance: List-Unsubscribe](mail-compliance.md).
+
 ## Previewing Emails In Dev
 
 When the active profile is `dev` and `[mail] transport = "file"`, Autumn mounts
 the mail preview UI at `/_autumn/mail`. The index shows recent `.eml` captures
 from `mail.file_dir` newest-first and links to a detail view with sandboxed HTML,
-plain text, selected headers, and raw source.
+plain text, an attachments list (filename and content type) when the message
+has any, selected headers, and raw source.
 
 Register sample-data previews with `#[mailer_preview]` and `mail_previews![...]`:
 
@@ -229,7 +337,9 @@ imply durable delivery on their own. The framework provides two paths:
    ```
 
    When a queue is registered, `deliver_later` routes through it instead of
-   the in-process fallback.
+   the in-process fallback. `Mail` — [attachments](#attachments) included —
+   is the same value across `send`, `deliver_later`, and the queue, so a
+   deferred email with attachments arrives intact.
 
 ### Production Guard
 
@@ -288,3 +398,6 @@ build a `Mailer::with_transport(...)`.
   case Autumn falls back to an in-process Tokio task and logs failures.
 - For DB-write + mail-orchestration flows, use the [Transactions
   Guide](transactions.md) for the canonical atomic write pattern.
+- Shipping newsletters, digests, or other bulk mail? See
+  [Mail compliance: List-Unsubscribe](mail-compliance.md) to meet Gmail/Yahoo
+  bulk-sender requirements with one attribute and one config key.

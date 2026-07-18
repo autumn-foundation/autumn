@@ -31,16 +31,26 @@ pub use crate::paths::PathExt;
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, authorize, cached, delete, feature_flag, get, job, jobs, main, oauth2_callback,
-    one_off_tasks, patch, paths, post, put, routes, scheduled, secured, service, static_get,
-    static_routes, step_up, task, tasks,
+    api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
+    main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, routes, scheduled,
+    secured, service, static_get, static_routes, step_up, task, tasks, throttle,
 };
 #[cfg(feature = "mail")]
 pub use autumn_macros::{mail_previews, mailer, mailer_preview};
 
 // ── Rendering ────────────────────────────────────────────────────
+/// Typed accessible UI primitives — accessible name enforced at compile time.
+/// See [`crate::a11y`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::a11y::{Button, ButtonType, Img, Link, MenuItem, TextField};
 /// Resolve a logical static asset path to a fingerprinted URL in release builds.
 pub use crate::assets::asset_url;
+/// Render a `<script>` tag with SRI integrity for a named vendored JS dependency.
+#[cfg(feature = "maud")]
+pub use crate::assets::javascript_include_tag;
+/// Cache a rendered Maud fragment keyed by `(identity, version)`.
+#[cfg(feature = "maud")]
+pub use crate::cache::{cache_fragment, cache_fragment_global};
 /// Maud HTML templating types.
 #[cfg(feature = "maud")]
 pub use maud::{Markup, PreEscaped, html};
@@ -51,6 +61,15 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Transaction isolation levels and retry options for [`crate::db::Db::tx_with`].
+#[cfg(feature = "db")]
+pub use crate::db::{IsolationLevel, TxOptions};
+/// Typed domain event bus publisher extractor. The `Event` trait it works with
+/// lives at [`crate::events::Event`] (kept out of the prelude to avoid clashing
+/// with [`crate::sse::Event`]).
+pub use crate::events::Events;
+/// Current request path extractor, for path-aware view helpers like `nav_link`.
+pub use crate::extract::CurrentPath;
 /// Form data extractor.
 pub use crate::extract::Form;
 /// JSON request/response type.
@@ -65,18 +84,50 @@ pub use crate::extract::Query;
 /// Flash message extractor.
 #[cfg(feature = "flash")]
 pub use crate::flash::{Flash, FlashLevel, FlashMessage};
+/// Accessible flash-banner renderer.
+#[cfg(all(feature = "flash", feature = "maud"))]
+pub use crate::flash::{FlashMessagesConfig, flash_messages, flash_messages_with};
 /// Extension trait for adding htmx response headers.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::HxResponseExt;
-/// htmx request extractor.
+/// htmx request extractor and asset paths.
 #[cfg(feature = "htmx")]
-pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HxRequest};
+pub use crate::htmx::{
+    HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_SSE_JS_PATH, HxRequest, IDIOMORPH_JS_PATH,
+};
+/// Out-of-band multi-region swaps response builder.
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub use crate::htmx::{HtmxFragments, OobSwap};
+/// Trait for live-broadcasting model fragments via `#[repository(Model, broadcasts = "topic")]`.
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub use crate::live::LiveFragment;
+/// Named, cluster-wide distributed lock for run-once-across-replicas work.
+#[cfg(feature = "db")]
+pub use crate::lock::{Lock, LockError, LockGuard};
 /// Transactional email types and extractor.
 #[cfg(feature = "mail")]
 pub use crate::mail::{
-    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailPreview,
-    MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
+    Mail, MailAttachment, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError,
+    MailPreview, MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode,
+    Transport,
 };
+/// Content-negotiated success responder: [`Negotiate`] extractor, its
+/// [`Negotiated`] response, and the [`Format`] it resolves to — serve HTML to
+/// browsers and JSON to API clients from one handler.
+#[cfg(feature = "maud")]
+pub use crate::negotiate::{Format, Negotiate, Negotiated};
+#[cfg(all(feature = "presence", feature = "maud"))]
+pub use crate::presence_badge;
+#[cfg(all(
+    feature = "presence",
+    feature = "ws",
+    feature = "maud",
+    feature = "htmx"
+))]
+pub use crate::presence_stream;
+/// Shard routing extractors and types for `[[database.shards]]` apps.
+#[cfg(feature = "db")]
+pub use crate::sharding::{ShardKey, ShardKeyOverride, ShardedDb, ShardedReadDb, Shards};
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
 /// Structured CLI argument extractor for one-off `#[task]` handlers.
@@ -94,10 +145,14 @@ pub use crate::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub use axum::extract::State;
 /// Trait for types that can be converted into an HTTP response.
 pub use axum::response::IntoResponse;
+/// HTTP methods — pass to [`crate::links::button_to`]/[`crate::links::button_to_with`].
+pub use http::Method;
 /// HTTP status codes.
 pub use http::StatusCode;
 
 // ── Conditional GET / ETag ───────────────────────────────────────
+/// Declarative `Cache-Control` freshness builder — attach via a tuple or `.wrap(..)`.
+pub use crate::etag::CacheControl;
 /// `ETag` type for conditional-GET responses.
 pub use crate::etag::ETag;
 /// Tower middleware that auto-derives weak `ETag`s from response bodies.
@@ -106,6 +161,8 @@ pub use crate::etag::EtagLayer;
 pub use crate::etag::FreshWhen;
 /// Conversion trait — implemented for `String`, `&str`, `i64`, `(NaiveDateTime, i64)`, `ETag`.
 pub use crate::etag::IntoETag;
+/// Start a `Cache-Control` freshness directive (`max-age`); defaults to `private`.
+pub use crate::etag::cache_for;
 /// One-liner conditional-GET helper; returns a [`FreshWhen`] resolved with `.or(response)`.
 pub use crate::etag::fresh_when;
 /// Derive a weak `ETag` from any [`Hash`] value.
@@ -117,9 +174,18 @@ pub use crate::audit::{AuditEvent, AuditStatus};
 /// Framework error and result types.
 pub use crate::error::{AutumnError, AutumnResult};
 
+// ── Tenancy ─────────────────────────────────────────────────────
+/// Per-tenant in-process memory accounting cells and registry.
+pub use crate::tenant_cell::{TenantCell, TenantCellHandle, TenantCellRegistry};
+
 // ── Pagination ──────────────────────────────────────────────────
 /// Pagination primitives — offset and cursor extractors and wrappers.
-pub use crate::pagination::{CursorPage, CursorRequest, Page, PageRequest};
+pub use crate::pagination::{CursorPage, CursorRequest, ListQuery, Page, PageRequest, SortDir};
+/// Reusable Maud pager renderers and options — render an accessible,
+/// filter-preserving, htmx-ready pager from a [`Page`]/[`CursorPage`] in one
+/// line. See [`crate::ui::pagination`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::ui::pagination::{PagerOptions, cursor_pagination_nav, pagination_nav};
 
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.
@@ -133,15 +199,44 @@ pub use validator::Validate;
 /// See [`crate::form`] for the full surface including Maud rendering helpers.
 pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 
-// ── Search & autocomplete widgets ─────────────────────────────────
-/// Active search and autocomplete configuration types and rendering helpers.
+// ── Display & search widgets ───────────────────────────────────────
+/// Card, stat tile, hero, active search, autocomplete, data table, property
+/// list, and breadcrumb configuration types and rendering helpers.
 ///
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
-    ActiveSearchConfig, AutocompleteConfig, SearchMethod, active_search, active_search_empty_state,
-    active_search_input, active_search_results, autocomplete_empty_state, autocomplete_input,
-    autocomplete_option,
+    ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig, AvatarConfig, AvatarSize,
+    BadgeConfig, BadgeVariant, CardConfig, Column, ConfirmActionConfig, Crumb, Cta, CtaStyle,
+    DEFAULT_TOAST_REGION_ID, DataTableConfig, FeedConfig, FeedMode, HeadingLevel, HeroConfig,
+    ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch, NavMenu, SearchMethod,
+    active_search, active_search_empty_state, active_search_input, active_search_results, alert,
+    alert_with, autocomplete_empty_state, autocomplete_input, autocomplete_option, avatar, badge,
+    badge_with, breadcrumb, card, confirm_action, data_table, error_summary, feed_page, hero,
+    infinite_feed, modal, modal_close_button, modal_trigger, nav_bar, nav_link, nav_link_matched,
+    property_list, stat_card, status_tag, tabs, toast, toast_in, toast_region,
+};
+
+// ── Widget stories ───────────────────────────────────────────────
+/// Widget story macro for the `/_stories` gallery: `story!{ "Group", "Name", { ... } }`.
+#[cfg(feature = "maud")]
+pub use crate::stories::story;
+/// Widget story gallery types (registered via `AppBuilder::with_story_gallery`)
+/// and the error returned by `Story::render`.
+///
+/// See [`crate::stories`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::stories::{Story, StoryGallery, StoryRegistry, StoryRenderError};
+
+// ── Link helpers ─────────────────────────────────────────────────
+/// Safe, method-aware `<a>`/`<form>` link helpers: [`crate::links::link_to`]
+/// for GET navigation and [`crate::links::button_to`] for CSRF-protected,
+/// method-override action buttons.
+///
+/// See [`crate::links`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::links::{
+    ButtonToOptions, LinkToOptions, button_to, button_to_with, link_to, link_to_with,
 };
 
 // ── Hooks ───────────────────────────────────────────────────────
@@ -247,6 +342,62 @@ pub use crate::i18n::Locale;
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
 
+// ── Formatting ───────────────────────────────────────────────────
+/// Currency, delimited-number, precision/separator configuration for
+/// [`number_to_currency`]. See [`crate::format`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::format::CurrencyOptions;
+/// Format a `chrono` UTC timestamp with a strftime-style absolute format string.
+#[cfg(feature = "maud")]
+pub use crate::format::format_datetime;
+/// Format a [`rust_decimal::Decimal`] as currency (`$1,234.50`) using sane defaults.
+#[cfg(feature = "maud")]
+pub use crate::format::number_to_currency;
+/// Render an integer or decimal with grouped thousands (`1,234,567`).
+#[cfg(feature = "maud")]
+pub use crate::format::number_with_delimiter;
+/// Render `"{count} {word}"`, pluralizing with a simple irregular-aware rule.
+#[cfg(feature = "maud")]
+pub use crate::format::pluralize;
+/// Render `"{count} {word}"`, choosing between an explicit singular and plural.
+#[cfg(feature = "maud")]
+pub use crate::format::pluralize_with;
+/// Render `"3 minutes ago"` / `"in 2 days"` relative to `now` (pass `clock.now()`
+/// from the [`Clock`] extractor, or a [`crate::time::ClockSource`]
+/// like [`crate::time::FixedClock`] in tests).
+#[cfg(feature = "maud")]
+pub use crate::format::time_ago_in_words;
+/// Shorten text to at most `len` characters without splitting a UTF-8 character mid-byte.
+#[cfg(feature = "maud")]
+pub use crate::format::{truncate, truncate_with};
+/// Shorten text to at most `n` whitespace-delimited words.
+#[cfg(feature = "maud")]
+pub use crate::format::{truncate_words, truncate_words_with};
+/// Exact-precision decimal type accepted by [`number_to_currency`] and
+/// [`number_with_delimiter`].
+pub use rust_decimal::Decimal;
+
+// ── Time zones ────────────────────────────────────────────────────
+/// Request-scoped time zone extractor (resolves from user extension,
+/// session, cookie, and query parameter — see [`crate::time_zone`]).
+pub use crate::time_zone::TimeZone;
+/// Newtype for auth middleware to publish the authenticated user's zone
+/// into request extensions.
+pub use crate::time_zone::UserTimeZone;
+/// Render only the date portion in the given zone.
+#[cfg(feature = "maud")]
+pub use crate::time_zone::local_date;
+/// Render a UTC timestamp as a `<time>` element in the given zone.
+#[cfg(feature = "maud")]
+pub use crate::time_zone::local_datetime;
+/// Parse a browser `datetime-local` value as a local time in `tz` → UTC.
+pub use crate::time_zone::parse_local_datetime;
+/// Render a relative time string (e.g. "3 minutes ago") as a `<time>` element.
+#[cfg(feature = "maud")]
+pub use crate::time_zone::time_ago;
+/// Format a UTC timestamp as a `datetime-local` input value in `tz`.
+pub use crate::time_zone::to_local_input_value;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,7 +411,9 @@ mod tests {
             )),
             pool: None,
             replica_pool: None,
+            shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -282,6 +435,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
@@ -289,6 +443,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -310,6 +465,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let _err: AutumnResult<()> = Ok(());
     }
@@ -332,5 +488,13 @@ mod tests {
     fn maud_types_work_through_prelude() {
         let markup: Markup = html! { "hello" };
         assert!(markup.into_string().contains("hello"));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn format_helpers_work_through_prelude() {
+        let price: Decimal = "9.5".parse().unwrap();
+        assert_eq!(number_to_currency(price).into_string(), "$9.50");
+        assert_eq!(pluralize(1, "comment").into_string(), "1 comment");
     }
 }

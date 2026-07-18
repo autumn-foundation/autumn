@@ -178,8 +178,29 @@ than hitting the network — so unregistered calls are caught immediately.
 
 ## Standalone usage (outside handlers)
 
-You can construct a `Client` directly when you need it outside of a handler
-(e.g. in a `#[job]`, a startup hook, or a CLI task):
+### In `#[scheduled]` and `#[job]` tasks
+
+Tasks that receive `AppState` should call `Client::from_state` to borrow the shared
+connection pool built once at server startup.  This avoids creating a new TCP/TLS
+connection on every task invocation:
+
+```rust
+use autumn_web::http::Client;
+use autumn_web::prelude::*;
+
+#[scheduled(every = "1h", name = "link-checker")]
+pub async fn check_links(state: AppState) -> AutumnResult<()> {
+    let client = Client::from_state(&state);
+    // client reuses the shared connection pool — no cold handshake
+    client.get("https://api.example.com/status").send().await?;
+    Ok(())
+}
+```
+
+### Outside the framework
+
+For truly standalone use (CLI utilities, benchmarks, tests that run without an
+`AppState`), construct a client directly:
 
 ```rust
 use autumn_web::http::Client;

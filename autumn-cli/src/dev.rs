@@ -14,7 +14,7 @@
 //! unnecessary rebuilds.
 
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -132,6 +132,14 @@ impl ChangePlan {
 struct DevReloadState {
     path: PathBuf,
     version: u64,
+    /// The build-error payload for the currently-broken Rust build, if any.
+    ///
+    /// When set, every ordinary [`Self::signal`] re-emits it so a non-build
+    /// reload (CSS/Tailwind/static save routed through the watch loop) keeps
+    /// the compile-error overlay up instead of dismissing it and reloading the
+    /// still-broken stale app. Only a green Rust build clears it, via
+    /// [`Self::signal_build_success`].
+    active_build_error: Option<(Vec<BuildDiagnostic>, bool)>,
 }
 
 impl DevReloadState {
@@ -142,7 +150,11 @@ impl DevReloadState {
                 .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
         }
 
-        let state = Self { path, version: 0 };
+        let state = Self {
+            path,
+            version: 0,
+            active_build_error: None,
+        };
         state.write(ReloadKind::Full)?;
         Ok(state)
     }
@@ -151,6 +163,14 @@ impl DevReloadState {
         &self.path
     }
 
+    /// Signal an ordinary reload (CSS/Tailwind/full). Bumps the version and
+    /// writes fresh state.
+    ///
+    /// If a Rust build is currently broken (`active_build_error` is `Some`),
+    /// the build-error payload is CARRIED FORWARD into the new state so the
+    /// overlay survives — a CSS/Tailwind/static save while the code doesn't
+    /// compile must not dismiss the overlay and reload the stale app. Only a
+    /// green Rust build ([`Self::signal_build_success`]) clears it.
     fn signal(&mut self, kind: ReloadKind) -> Result<(), String> {
         if kind == ReloadKind::None {
             return Ok(());
@@ -160,7 +180,80 @@ impl DevReloadState {
             .version
             .checked_add(1)
             .ok_or("live reload version overflowed")?;
+
+        if let Some((diagnostics, stale)) = self.active_build_error.as_ref() {
+            let (diagnostics, stale) = (diagnostics.clone(), *stale);
+            self.write_build_error(&diagnostics, stale)
+        } else {
+            self.write(kind)
+        }
+    }
+
+    /// Bump the version and write a full-reload state carrying compiler
+    /// diagnostics so the browser client renders a compile-error overlay
+    /// instead of reloading into a broken/stale page.
+    ///
+    /// The payload is also stashed in `active_build_error` so subsequent
+    /// ordinary [`Self::signal`] calls carry it forward and keep the overlay
+    /// up until a green build clears it.
+    ///
+    /// `stale` is true when a previously-built binary is still serving (the
+    /// browser is looking at a now-outdated page); false on a cold start (or
+    /// on Windows, where the old binary must be stopped before rebuilding)
+    /// where no server is up yet.
+    fn signal_build_error(
+        &mut self,
+        diagnostics: &[BuildDiagnostic],
+        stale: bool,
+    ) -> Result<(), String> {
+        self.version = self
+            .version
+            .checked_add(1)
+            .ok_or("live reload version overflowed")?;
+
+        self.active_build_error = Some((diagnostics.to_vec(), stale));
+        self.write_build_error(diagnostics, stale)
+    }
+
+    /// Clear a previously-signaled build error after a GREEN Rust build, then
+    /// write ordinary reload state (with NO `build_error` field) so the client
+    /// dismisses the overlay and reloads into the freshly-built app.
+    ///
+    /// This is the ONLY path that clears the overlay: an ordinary
+    /// [`Self::signal`] carries an active build error forward instead.
+    fn signal_build_success(&mut self, kind: ReloadKind) -> Result<(), String> {
+        self.active_build_error = None;
+        // A successful build always warrants a reload to pick up the new
+        // binary, so treat `None` as a full reload rather than a no-op.
+        let kind = if kind == ReloadKind::None {
+            ReloadKind::Full
+        } else {
+            kind
+        };
+
+        self.version = self
+            .version
+            .checked_add(1)
+            .ok_or("live reload version overflowed")?;
         self.write(kind)
+    }
+
+    /// Write full-reload state carrying a `build_error` payload.
+    fn write_build_error(
+        &self,
+        diagnostics: &[BuildDiagnostic],
+        stale: bool,
+    ) -> Result<(), String> {
+        let body = serde_json::json!({
+            "version": self.version,
+            "kind": "full",
+            "build_error": {
+                "diagnostics": diagnostics,
+                "stale": stale,
+            },
+        });
+        std::fs::write(&self.path, body.to_string())
+            .map_err(|e| format!("failed to write {}: {e}", self.path.display()))
     }
 
     fn write(&self, kind: ReloadKind) -> Result<(), String> {
@@ -207,12 +300,22 @@ pub fn run(package: Option<&str>, show_config: bool) {
             None
         }
     };
-    // Initial build
-    if !cargo_build(package) {
+    // Initial build. There is no prior server here (cold start), so a browser
+    // overlay isn't reachable — the CLI doesn't know the app's port and no
+    // process is up to answer the state endpoint. We still record the failure
+    // in the state file (harmless, and dismissed by the first green build);
+    // the terminal errors remain the primary feedback for this case.
+    let (built, diagnostics) = cargo_build_capturing(package);
+    if !built {
         eprintln!("\u{2717} Initial build failed. Fix errors and save to retry.\n");
+        if let Some(state) = reload_state.as_mut()
+            && let Err(error) = state.signal_build_error(&diagnostics, false)
+        {
+            eprintln!("  Warning: live reload signal failed: {error}");
+        }
     }
 
-    let binary = find_binary(package);
+    let binary = find_binary(package, false);
     let mut child = start_server(
         &binary,
         reload_state.as_ref().map(DevReloadState::path),
@@ -463,44 +566,83 @@ fn execute_plan(
     mut reload_state: Option<&mut DevReloadState>,
     show_config: bool,
 ) {
-    let mut applied_reload = ReloadKind::None;
-
     if plan.build {
-        stop_server(child);
+        // The order of "stop old binary" vs. "cargo build" is platform-gated.
+        //
+        // On Unix/macOS, replacing a running binary file mid-build is safe
+        // (inode semantics), so we build FIRST with the old binary still
+        // serving. A failed rebuild then leaves the stale app up to answer the
+        // live-reload endpoint and render the diagnostics overlay.
+        //
+        // On Windows the running `target/debug/<app>.exe` is LOCKED while the
+        // process is alive, so `cargo build` can't relink over it (access
+        // denied / linker failure). There we must stop the old binary BEFORE
+        // building. The tradeoff: a failed Windows rebuild leaves the app down,
+        // so the overlay's stale-page serving isn't available and the client
+        // falls back to a normal reconnect (documented limitation).
+        let stop_before_build = cfg!(windows);
 
-        if cargo_build(package) {
+        if stop_before_build {
+            stop_server(child);
+        }
+
+        let (built, diagnostics) = cargo_build_capturing(package);
+
+        if built {
+            if !stop_before_build {
+                stop_server(child);
+            }
             if restart_server(
                 package,
                 child,
                 reload_state.as_ref().map(|s| s.path()),
                 show_config,
-            ) {
-                applied_reload = ReloadKind::Full;
+            ) && let Some(reload_state) = reload_state.as_mut()
+                && let Err(error) = reload_state.signal_build_success(ReloadKind::Full)
+            {
+                // A green build is the only thing that clears the overlay.
+                eprintln!("  Warning: live reload signal failed: {error}");
             }
         } else {
             eprintln!("  \u{2717} Build failed. Waiting for changes...\n");
-            *child = None;
-        }
-    } else {
-        if plan.tailwind && tailwind_build() {
-            applied_reload = applied_reload.max(ReloadKind::Css);
-        }
-
-        if plan.restart {
-            stop_server(child);
-            if restart_server(
-                package,
-                child,
-                reload_state.as_ref().map(|s| s.path()),
-                show_config,
-            ) {
-                applied_reload = ReloadKind::Full;
+            // On Unix the (stale) binary is still running, so it keeps
+            // answering the live-reload state endpoint and the browser renders
+            // the overlay. On Windows we already stopped it above, so nothing
+            // is serving: `child.is_some()` is false there and the client
+            // falls back to a normal reconnect.
+            let stale = child.is_some();
+            if let Some(reload_state) = reload_state.as_mut()
+                && let Err(error) = reload_state.signal_build_error(&diagnostics, stale)
+            {
+                eprintln!("  Warning: live reload signal failed: {error}");
             }
-        } else if plan.reload == ReloadKind::Full {
-            applied_reload = ReloadKind::Full;
         }
+        return;
     }
 
+    let mut applied_reload = ReloadKind::None;
+
+    if plan.tailwind && tailwind_build() {
+        applied_reload = applied_reload.max(ReloadKind::Css);
+    }
+
+    if plan.restart {
+        stop_server(child);
+        if restart_server(
+            package,
+            child,
+            reload_state.as_ref().map(|s| s.path()),
+            show_config,
+        ) {
+            applied_reload = ReloadKind::Full;
+        }
+    } else if plan.reload == ReloadKind::Full {
+        applied_reload = ReloadKind::Full;
+    }
+
+    // Ordinary (non-build) reload. If a Rust build is still broken,
+    // `signal` carries the build-error overlay forward instead of dismissing
+    // it, so this CSS/Tailwind/static change doesn't reload the stale app.
     if let Some(reload_state) = reload_state.as_mut()
         && let Err(error) = reload_state.signal(applied_reload)
     {
@@ -534,18 +676,213 @@ fn plan_changes(
 }
 
 /// Build a `cargo build` command for the given package.
-fn build_cargo_command(package: Option<&str>) -> Command {
+pub fn build_cargo_command(package: Option<&str>, release: bool) -> Command {
     let mut cmd = Command::new("cargo");
     cmd.arg("build");
+    if release {
+        cmd.arg("--release");
+    }
     if let Some(pkg) = package {
         cmd.args(["-p", pkg]);
     }
     cmd
 }
 
+/// A single compiler error extracted from `cargo build --message-format=json`.
+///
+/// Serialized into the live-reload state file so the browser overlay can
+/// render the failure without the CLI needing to talk to the app directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BuildDiagnostic {
+    /// Error code (e.g. `E0425`), when the compiler assigned one.
+    code: Option<String>,
+    /// Primary human-readable message (`message.message`).
+    message: String,
+    /// File of the primary span, empty when the error has no primary span.
+    file: String,
+    /// 1-based line of the primary span (0 when absent).
+    line: u32,
+    /// 1-based column of the primary span (0 when absent).
+    column: u32,
+    /// Full multi-line rendered diagnostic (`message.rendered`).
+    rendered: String,
+}
+
+/// Parse `cargo build --message-format=json` stdout into ordered error
+/// diagnostics.
+///
+/// Keeps only `compiler-message` records at `error` level (warnings are out of
+/// scope) and preserves the compiler's emission order. Non-JSON lines and other
+/// message kinds (artifacts, build-finished) are skipped. Mirrors the JSON
+/// walking pattern used by [`crate::dev_loop_bench::cargo_executable_path`].
+fn parse_build_diagnostics(stdout: &[u8]) -> Vec<BuildDiagnostic> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut diagnostics = Vec::new();
+
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-message") {
+            continue;
+        }
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        if message.get("level").and_then(serde_json::Value::as_str) != Some("error") {
+            continue;
+        }
+
+        let code = message
+            .get("code")
+            .and_then(|code| code.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let text_message = message
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let rendered = message
+            .get("rendered")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+
+        let primary = message
+            .get("spans")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|spans| {
+                spans.iter().find(|span| {
+                    span.get("is_primary").and_then(serde_json::Value::as_bool) == Some(true)
+                })
+            });
+        let (file, line, column) = primary.map_or_else(
+            || (String::new(), 0, 0),
+            |span| {
+                let file = span
+                    .get("file_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let line = span
+                    .get("line_start")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0);
+                let column = span
+                    .get("column_start")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0);
+                (file, line, column)
+            },
+        );
+
+        diagnostics.push(BuildDiagnostic {
+            code,
+            message: text_message,
+            file,
+            line,
+            column,
+            rendered,
+        });
+    }
+
+    diagnostics
+}
+
+/// Run `cargo build` for the given package while capturing compiler
+/// diagnostics as JSON.
+///
+/// Returns `(success, error_diagnostics)`. Diagnostics are echoed to stderr via
+/// their `rendered` form so the terminal experience matches a plain build.
+/// Used by the watch loop so a failed rebuild can surface errors as a browser
+/// overlay; `serve` keeps using [`cargo_build`].
+fn cargo_build_capturing(package: Option<&str>) -> (bool, Vec<BuildDiagnostic>) {
+    use std::io::{BufRead, BufReader};
+
+    let mut cmd = build_cargo_command(package, false);
+    cmd.arg("--message-format=json");
+    // Pipe stdout so we can read structured JSON diagnostics line by line as the
+    // compiler emits them, while cargo's own progress/status output (the live
+    // "Compiling ..." lines) streams straight through on inherited stderr. This
+    // keeps the terminal responsive instead of freezing until the build ends.
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
+
+    eprintln!("  Compiling...");
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("  \u{2717} Failed to run cargo build: {e}");
+            return (false, Vec::new());
+        }
+    };
+
+    // Accumulate raw stdout so `parse_build_diagnostics` can build the returned
+    // Vec once at the end. Error `rendered` blocks are echoed live in compiler
+    // order as their lines arrive, so each error appears exactly once and the
+    // final parse never re-prints them.
+    let mut buffer = String::new();
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                // A read error mid-stream: stop consuming and fall back to
+                // whatever we captured so far rather than panicking.
+                break;
+            };
+            if let Some(rendered) = compiler_message_rendered(&line) {
+                eprint!("{rendered}");
+            }
+            buffer.push_str(&line);
+            buffer.push('\n');
+        }
+    }
+
+    let diagnostics = parse_build_diagnostics(buffer.as_bytes());
+    match child.wait() {
+        Ok(status) if status.success() => {
+            eprintln!("  \u{2713} Build succeeded");
+            (true, diagnostics)
+        }
+        Ok(_) => (false, diagnostics),
+        Err(e) => {
+            eprintln!("  \u{2717} cargo build failed: {e}");
+            (false, diagnostics)
+        }
+    }
+}
+
+/// If `line` is a single `cargo build --message-format=json` record that is a
+/// `compiler-message` carrying a non-empty `rendered` block, return that text so
+/// it can be echoed to the terminal the instant it arrives. This deliberately
+/// echoes diagnostics at *every* level (errors, warnings, notes, help, etc.) so
+/// the live output matches what plain `cargo build` would print — the overlay
+/// payload, built separately by [`parse_build_diagnostics`], stays errors-only.
+/// Non-JSON lines and non-`compiler-message` records (artifacts, build scripts,
+/// build-finished) yield `None`, as do compiler messages with no `rendered`
+/// text.
+fn compiler_message_rendered(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-message") {
+        return None;
+    }
+    let rendered = value
+        .get("message")?
+        .get("rendered")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if rendered.is_empty() {
+        return None;
+    }
+    Some(rendered.to_owned())
+}
+
 /// Run `cargo build` for the given package. Returns true on success.
-fn cargo_build(package: Option<&str>) -> bool {
-    let mut cmd = build_cargo_command(package);
+pub fn cargo_build(package: Option<&str>, release: bool) -> bool {
+    let mut cmd = build_cargo_command(package, release);
 
     eprintln!("  Compiling...");
     match cmd.status() {
@@ -568,7 +905,24 @@ fn start_server(
     show_config: bool,
 ) -> Option<Child> {
     eprintln!("  Starting server...\n");
+
+    // Resolve `.env` fresh right before each spawn so a hot-reload restart
+    // picks up an edited `.env`. Values are injected explicitly into the child
+    // process (rather than mutating this process's environment); the child also
+    // self-loads via the config overlay, so this is belt-and-suspenders and
+    // makes a bare `DATABASE_URL` visible to the child. A malformed `.env`
+    // fails loudly. Applied BEFORE the explicit `.env(...)` calls below so those
+    // win on any key overlap.
+    let dotenv_vars = match autumn_web::dotenv::resolve_process_dotenv() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("  \u{274C} .env: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let mut command = Command::new(binary);
+    command.envs(dotenv_vars);
     // Inherit stdio so tracing output (including --show-config) is visible.
     // Previously used Stdio::null(), but server logs are valuable during dev.
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -589,19 +943,13 @@ fn start_server(
     }
 }
 
-#[cfg(unix)]
-fn validate_pid_for_kill(pid: u32) -> Option<libc::pid_t> {
-    let cast_pid = pid.try_into().ok()?;
-    if cast_pid > 0 { Some(cast_pid) } else { None }
-}
-
 /// Stop the running server process gracefully.
 fn stop_server(child: &mut Option<Child>) {
     if let Some(proc) = child {
         // Send SIGTERM on Unix for graceful shutdown
         #[cfg(unix)]
         {
-            if let Some(pid) = validate_pid_for_kill(proc.id())
+            if let Some(pid) = crate::process::validate_pid_for_kill(proc.id())
                 && let Err(e) = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(pid),
                     nix::sys::signal::Signal::SIGTERM,
@@ -610,7 +958,7 @@ fn stop_server(child: &mut Option<Child>) {
                 eprintln!("  Warning: failed to send SIGTERM to process: {e}");
             }
             // Wait briefly for graceful shutdown before forcing
-            if wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
+            if crate::process::wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
                 let _ = proc.kill();
                 let _ = proc.wait();
             }
@@ -623,24 +971,6 @@ fn stop_server(child: &mut Option<Child>) {
         }
     }
     *child = None;
-}
-
-/// Wait for a child process with a timeout. Returns Err if timed out.
-#[cfg(unix)]
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(), ()> {
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    return Err(());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => return Err(()),
-        }
-    }
 }
 
 /// Check if a file change event is relevant enough to trigger a rebuild.
@@ -657,7 +987,20 @@ fn classify_change(
     kind: DebouncedEventKind,
     custom_watch_dirs: &[CustomWatchDir],
 ) -> ChangeEffect {
-    if !matches!(kind, DebouncedEventKind::Any) || should_ignore_path(path) {
+    if !matches!(kind, DebouncedEventKind::Any) {
+        return ChangeEffect::Ignore;
+    }
+
+    // A root-level dotenv file the config loader reads (`.env`, `.env.local`,
+    // `.env.<profile>`, `.env.<profile>.local`) must restart the server so an
+    // edited `.env` takes effect — even though `should_ignore_path` would
+    // otherwise discard it as a dotfile. Checked before that ignore so the
+    // dotenv exception wins, while all other dotfiles stay ignored.
+    if is_watched_dotenv_file(path) {
+        return ChangeEffect::RestartOnly;
+    }
+
+    if should_ignore_path(path) {
         return ChangeEffect::Ignore;
     }
 
@@ -719,6 +1062,61 @@ fn classify_change(
     }
 
     ChangeEffect::Ignore
+}
+
+/// Editor/tooling temp or backup suffixes (the final `.`-segment) that must not
+/// trigger a restart even when they decorate a dotenv filename — e.g. a vim swap
+/// file `.env.swp` or a backup `.env.tmp`. `.env.example` is a committed
+/// template the loader never reads, so it is excluded too.
+const DOTENV_NON_LOADED_SUFFIXES: &[&str] =
+    &["swp", "swo", "swx", "swpx", "tmp", "bak", "orig", "example"];
+
+/// Whether `name` is a dotenv file the config loader actually reads: `.env`,
+/// `.env.local`, `.env.<profile>`, or `.env.<profile>.local`.
+///
+/// Editor/backup decorations (`.env.swp`, `.env~`, `.env.tmp`, …) are rejected
+/// so a save-in-progress swap file does not cause a spurious restart.
+fn is_dotenv_loader_filename(name: &str) -> bool {
+    if name == ".env" {
+        return true;
+    }
+    // Must be `.env.<something>`; a bare `.env~`/`.env.swp`-style backup that
+    // lacks the `.env.` prefix is rejected here, and a trailing `~` backup
+    // (e.g. `.env.local~`) is rejected explicitly.
+    let Some(rest) = name.strip_prefix(".env.") else {
+        return false;
+    };
+    if rest.is_empty() || name.ends_with('~') {
+        return false;
+    }
+    let last_segment = rest.rsplit('.').next().unwrap_or(rest);
+    !DOTENV_NON_LOADED_SUFFIXES.contains(&last_segment)
+}
+
+/// Whether `path` is a project-root dotenv file the loader reads (see
+/// [`is_dotenv_loader_filename`]).
+///
+/// Scoped to root-level files: any dotenv-named file living under a dotted
+/// directory (e.g. `.git/.env`) or `target/` is rejected, mirroring
+/// [`should_ignore_path`] so only the genuine project-root `.env*` files are
+/// un-ignored.
+fn is_watched_dotenv_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !is_dotenv_loader_filename(name) {
+        return false;
+    }
+    path.parent().is_none_or(|parent| {
+        parent.components().all(|component| {
+            if let std::path::Component::Normal(part) = component {
+                let part = part.to_string_lossy();
+                part != "target" && !part.starts_with('.')
+            } else {
+                true
+            }
+        })
+    })
 }
 
 fn should_ignore_path(path: &Path) -> bool {
@@ -795,7 +1193,7 @@ fn restart_server(
     reload_state_path: Option<&Path>,
     show_config: bool,
 ) -> bool {
-    let binary = find_binary(package);
+    let binary = find_binary(package, false);
     *child = start_server(&binary, reload_state_path, show_config);
     child.is_some()
 }
@@ -906,6 +1304,44 @@ fn cargo_metadata() -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("parse cargo metadata")
 }
 
+/// Best-effort `cargo metadata`: returns `None` instead of exiting when the
+/// workspace manifests are missing/invalid. Used by lifecycle paths (e.g.
+/// `autumn serve stop`) that must keep working even with a broken `Cargo.toml`.
+fn try_cargo_metadata() -> Option<serde_json::Value> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Directory containing a workspace member's `Cargo.toml`, resolved via
+/// `cargo metadata`.
+///
+/// `autumn serve -p <member>` launched from a workspace root would otherwise run
+/// the app with the workspace-root CWD, so the app's config loader (which falls
+/// back to CWD when `AUTUMN_MANIFEST_DIR` is unset) skips the member's
+/// `autumn.toml`/profile and asset dirs. Callers use this to point the child at
+/// the member's directory. Best-effort: returns `None` if metadata can't be read
+/// or the package isn't found, so lifecycle commands never fail solely because
+/// `cargo metadata` does.
+#[must_use]
+pub fn find_manifest_dir(package: &str) -> Option<PathBuf> {
+    let metadata = try_cargo_metadata()?;
+    metadata["packages"].as_array()?.iter().find_map(|pkg| {
+        if pkg["name"].as_str() == Some(package) {
+            Path::new(pkg["manifest_path"].as_str()?)
+                .parent()
+                .map(Path::to_path_buf)
+        } else {
+            None
+        }
+    })
+}
+
 /// Resolve a binary path from parsed cargo metadata JSON.
 ///
 /// Extracted from `find_binary` for testability. Takes the parsed
@@ -980,19 +1416,30 @@ fn resolve_binary_from_metadata(
 
 /// Locate the compiled binary using `cargo metadata`.
 ///
-/// Always targets the debug profile since `autumn dev` is for development.
-fn find_binary(package: Option<&str>) -> PathBuf {
+/// Resolves the debug-profile path; when `release` is set, swaps the profile
+/// directory to `release` (used by `autumn serve` for production builds).
+pub fn find_binary(package: Option<&str>, release: bool) -> PathBuf {
     let metadata = cargo_metadata();
 
     let cwd = std::env::current_dir().expect("current dir");
 
-    resolve_binary_from_metadata(&metadata, package, &cwd).unwrap_or_else(|e| {
+    let path = resolve_binary_from_metadata(&metadata, package, &cwd).unwrap_or_else(|e| {
         eprintln!("\u{2717} {e}");
         if package.is_none() {
             eprintln!("  Hint: use -p <package> to specify the target package");
         }
         std::process::exit(1);
-    })
+    });
+
+    if release {
+        // `.../<target>/debug/<bin>` -> `.../<target>/release/<bin>`.
+        if let (Some(target_dir), Some(bin)) =
+            (path.parent().and_then(Path::parent), path.file_name())
+        {
+            return target_dir.join("release").join(bin);
+        }
+    }
+    path
 }
 
 #[cfg(test)]
@@ -1060,6 +1507,70 @@ mod tests {
             classify_change(Path::new("autumn-dev.toml"), DebouncedEventKind::Any, &[]),
             ChangeEffect::RestartOnly
         );
+    }
+
+    #[test]
+    fn dotenv_change_requires_restart_only() {
+        for name in [".env", ".env.local", ".env.dev", ".env.production.local"] {
+            assert_eq!(
+                classify_change(Path::new(name), DebouncedEventKind::Any, &[]),
+                ChangeEffect::RestartOnly,
+                "{name} should restart the dev server",
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_editor_temp_files_are_ignored() {
+        // Editor swap/backup files must not trigger spurious restarts.
+        for name in [
+            ".env.swp",
+            ".env.swo",
+            ".env~",
+            ".env.local~",
+            ".env.tmp",
+            ".env.bak",
+        ] {
+            assert_eq!(
+                classify_change(Path::new(name), DebouncedEventKind::Any, &[]),
+                ChangeEffect::Ignore,
+                "{name} should not restart the dev server",
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_change_ignored_for_non_any_event() {
+        // A dotenv edit still only restarts on a settled `Any` event.
+        assert_eq!(
+            classify_change(Path::new(".env"), DebouncedEventKind::AnyContinuous, &[]),
+            ChangeEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn nested_dotenv_under_hidden_dir_is_ignored() {
+        // Only root-level dotenv files are un-ignored; `.git/.env` stays ignored.
+        assert_eq!(
+            classify_change(Path::new(".git/.env"), DebouncedEventKind::Any, &[]),
+            ChangeEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn is_watched_dotenv_file_classifies_variants() {
+        assert!(is_watched_dotenv_file(Path::new(".env")));
+        assert!(is_watched_dotenv_file(Path::new(".env.local")));
+        assert!(is_watched_dotenv_file(Path::new(".env.dev")));
+        assert!(is_watched_dotenv_file(Path::new(".env.dev.local")));
+        // Root-level file behind an absolute project path still matches.
+        assert!(is_watched_dotenv_file(Path::new("/home/alice/app/.env")));
+        // Non-loaded / decorated names do not.
+        assert!(!is_watched_dotenv_file(Path::new(".env.swp")));
+        assert!(!is_watched_dotenv_file(Path::new(".env.example")));
+        assert!(!is_watched_dotenv_file(Path::new("env")));
+        // A dotenv-named file under a dotted directory is not root-level.
+        assert!(!is_watched_dotenv_file(Path::new(".git/.env")));
     }
 
     #[test]
@@ -1325,7 +1836,7 @@ mod tests {
 
     #[test]
     fn build_command_without_package() {
-        let cmd = build_cargo_command(None);
+        let cmd = build_cargo_command(None, false);
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(cmd.get_program(), "cargo");
         assert_eq!(args, &["build"]);
@@ -1333,10 +1844,17 @@ mod tests {
 
     #[test]
     fn build_command_with_package() {
-        let cmd = build_cargo_command(Some("my-app"));
+        let cmd = build_cargo_command(Some("my-app"), false);
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(cmd.get_program(), "cargo");
         assert_eq!(args, &["build", "-p", "my-app"]);
+    }
+
+    #[test]
+    fn build_command_release_adds_flag() {
+        let cmd = build_cargo_command(None, true);
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, &["build", "--release"]);
     }
 
     #[test]
@@ -1559,21 +2077,6 @@ mod tests {
 
     // ── stop_server tests ──────────────────────────────────────────
 
-    #[cfg(unix)]
-    mod havoc_proptest {
-        use super::*;
-        use proptest::prelude::*;
-
-        proptest! {
-            #[test]
-            fn safe_pid_cast(pid in proptest::num::u32::ANY) {
-                if let Some(safe_pid) = validate_pid_for_kill(pid) {
-                    assert!(safe_pid > 0, "Safe PID must be strictly positive");
-                }
-            }
-        }
-    }
-
     #[test]
     fn stop_server_with_none_is_noop() {
         let mut child: Option<Child> = None;
@@ -1596,42 +2099,20 @@ mod tests {
         assert!(child.is_none());
     }
 
-    // ── wait_with_timeout tests ────────────────────────────────────
-
-    #[cfg(unix)]
-    #[test]
-    fn wait_with_timeout_succeeds_for_fast_process() {
-        let mut child = Command::new("true").spawn().expect("spawn true");
-        // Give it a moment to exit
-        std::thread::sleep(Duration::from_millis(50));
-        let result = wait_with_timeout(&mut child, Duration::from_secs(2));
-        assert!(result.is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wait_with_timeout_times_out_for_long_process() {
-        let mut child = Command::new("sleep")
-            .arg("60")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
-        let result = wait_with_timeout(&mut child, Duration::from_millis(100));
-        assert!(result.is_err());
-        // Clean up
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
     // ── find_binary tests ──────────────────────────────────────────
 
     #[test]
     fn find_binary_resolves_workspace_package() {
         // We're running inside the autumn workspace, so this should find
         // the hello example's binary.
-        let path = find_binary(Some("hello"));
+        let path = find_binary(Some("hello"), false);
         assert!(path.ends_with("debug/hello") || path.ends_with("debug/hello.exe"));
+    }
+
+    #[test]
+    fn find_binary_release_resolves_release_dir() {
+        let path = find_binary(Some("hello"), true);
+        assert!(path.ends_with("release/hello") || path.ends_with("release/hello.exe"));
     }
 
     // ── constants tests ────────────────────────────────────────────
@@ -1660,7 +2141,11 @@ mod tests {
     fn dev_reload_state_signal_writes_css_and_full_versions() {
         let reload_file = tempfile::NamedTempFile::new().expect("reload file");
         let path = reload_file.path().to_path_buf();
-        let mut state = DevReloadState { path, version: 0 };
+        let mut state = DevReloadState {
+            path,
+            version: 0,
+            active_build_error: None,
+        };
 
         state.signal(ReloadKind::Css).expect("css signal");
         let body = std::fs::read_to_string(state.path()).expect("read css");
@@ -1672,10 +2157,232 @@ mod tests {
     }
 
     #[test]
+    fn parse_build_diagnostics_extracts_errors_in_order_excluding_warnings() {
+        // A realistic `cargo build --message-format=json` stream: an artifact
+        // line, an error, a warning (must be excluded), a non-JSON line, a
+        // second error whose primary span is NOT the first span, and a
+        // build-finished line.
+        let stdout = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"app"}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"code":{"code":"E0425"},"level":"error","message":"cannot find value `foo` in this scope","rendered":"error[E0425]: cannot find value `foo`\n --> src/main.rs:3:5\n","spans":[{"file_name":"src/main.rs","line_start":3,"column_start":5,"is_primary":true}]}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"code":null,"level":"warning","message":"unused variable: `x`","rendered":"warning: unused variable\n","spans":[{"file_name":"src/main.rs","line_start":9,"column_start":1,"is_primary":true}]}}"#,
+            "\n",
+            "   Compiling app v0.1.0 (not json)\n",
+            r#"{"reason":"compiler-message","message":{"code":{"code":"E0308"},"level":"error","message":"mismatched types","rendered":"error[E0308]: mismatched types\n --> src/lib.rs:12:9\n","spans":[{"file_name":"src/other.rs","line_start":1,"column_start":1,"is_primary":false},{"file_name":"src/lib.rs","line_start":12,"column_start":9,"is_primary":true}]}}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":false}"#,
+            "\n",
+        );
+
+        let diags = parse_build_diagnostics(stdout.as_bytes());
+
+        assert_eq!(diags.len(), 2, "warnings and non-error lines excluded");
+        assert_eq!(
+            diags[0],
+            BuildDiagnostic {
+                code: Some("E0425".to_owned()),
+                message: "cannot find value `foo` in this scope".to_owned(),
+                file: "src/main.rs".to_owned(),
+                line: 3,
+                column: 5,
+                rendered: "error[E0425]: cannot find value `foo`\n --> src/main.rs:3:5\n"
+                    .to_owned(),
+            }
+        );
+        // Compiler order is preserved: E0425 first, then E0308.
+        assert_eq!(diags[1].code, Some("E0308".to_owned()));
+        assert_eq!(diags[1].message, "mismatched types");
+        // Primary span wins over the (earlier) non-primary span.
+        assert_eq!(diags[1].file, "src/lib.rs");
+        assert_eq!(diags[1].line, 12);
+        assert_eq!(diags[1].column, 9);
+    }
+
+    #[test]
+    fn compiler_message_rendered_echoes_all_levels_but_not_other_records() {
+        // Warning-level messages must be echoed live so the terminal matches
+        // plain `cargo build` output, even though they never enter the overlay.
+        let warning = r#"{"reason":"compiler-message","message":{"code":null,"level":"warning","message":"unused variable: `x`","rendered":"warning: unused variable\n"}}"#;
+        assert_eq!(
+            compiler_message_rendered(warning).as_deref(),
+            Some("warning: unused variable\n"),
+        );
+
+        // Error-level messages are echoed too.
+        let error = r#"{"reason":"compiler-message","message":{"code":{"code":"E0425"},"level":"error","message":"cannot find value `foo`","rendered":"error[E0425]: cannot find value `foo`\n"}}"#;
+        assert_eq!(
+            compiler_message_rendered(error).as_deref(),
+            Some("error[E0425]: cannot find value `foo`\n"),
+        );
+
+        // Non-JSON progress lines yield nothing.
+        assert_eq!(compiler_message_rendered("   Compiling app v0.1.0"), None);
+
+        // Non-`compiler-message` records (artifacts, build scripts, finished)
+        // are never echoed.
+        assert_eq!(
+            compiler_message_rendered(r#"{"reason":"compiler-artifact","target":{"name":"app"}}"#),
+            None,
+        );
+
+        // A compiler message with no `rendered` text yields nothing rather than
+        // an empty echo.
+        assert_eq!(
+            compiler_message_rendered(
+                r#"{"reason":"compiler-message","message":{"level":"warning","message":"x"}}"#
+            ),
+            None,
+        );
+    }
+
+    /// A representative single-error diagnostic list for the build-error tests.
+    fn sample_build_diagnostics() -> Vec<BuildDiagnostic> {
+        vec![BuildDiagnostic {
+            code: Some("E0425".to_owned()),
+            message: "cannot find value `foo`".to_owned(),
+            file: "src/main.rs".to_owned(),
+            line: 3,
+            column: 5,
+            rendered: "error[E0425]: cannot find value `foo`".to_owned(),
+        }]
+    }
+
+    #[test]
+    fn dev_reload_state_signal_build_error_writes_payload() {
+        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
+        let path = reload_file.path().to_path_buf();
+        let mut state = DevReloadState {
+            path,
+            version: 0,
+            active_build_error: None,
+        };
+
+        let diags = sample_build_diagnostics();
+
+        state
+            .signal_build_error(&diags, true)
+            .expect("build error signal");
+        assert_eq!(state.version, 1, "build error bumps the version");
+
+        let body = std::fs::read_to_string(state.path()).expect("read build error");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["kind"], "full");
+        assert_eq!(value["build_error"]["stale"], true);
+        assert_eq!(value["build_error"]["diagnostics"][0]["code"], "E0425");
+        assert_eq!(
+            value["build_error"]["diagnostics"][0]["file"],
+            "src/main.rs"
+        );
+        assert_eq!(value["build_error"]["diagnostics"][0]["line"], 3);
+        assert_eq!(value["build_error"]["diagnostics"][0]["column"], 5);
+        assert_eq!(
+            value["build_error"]["diagnostics"][0]["message"],
+            "cannot find value `foo`"
+        );
+    }
+
+    #[test]
+    fn dev_reload_state_signal_carries_build_error_across_non_build_reloads() {
+        // P2 regression guard: once a Rust build is broken, an ordinary CSS
+        // (or other non-build) reload must NOT dismiss the overlay. It carries
+        // the build_error payload forward while still bumping the version so
+        // the client re-polls but stays on the overlay instead of reloading the
+        // stale app.
+        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
+        let path = reload_file.path().to_path_buf();
+        let mut state = DevReloadState {
+            path,
+            version: 0,
+            active_build_error: None,
+        };
+
+        let diags = sample_build_diagnostics();
+        state
+            .signal_build_error(&diags, true)
+            .expect("build error signal");
+        assert_eq!(state.version, 1);
+
+        // A Tailwind/CSS save while Rust is broken.
+        state.signal(ReloadKind::Css).expect("css signal");
+        assert_eq!(state.version, 2, "carrying forward still bumps the version");
+        let body = std::fs::read_to_string(state.path()).expect("read carried");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["kind"], "full", "build error state stays a full kind");
+        assert!(
+            value.get("build_error").is_some(),
+            "a non-build reload must carry the build_error forward"
+        );
+        assert_eq!(value["build_error"]["stale"], true);
+        assert_eq!(value["build_error"]["diagnostics"][0]["code"], "E0425");
+
+        // A plain full reload (e.g. a config-only restart) also carries it.
+        state.signal(ReloadKind::Full).expect("full signal");
+        assert_eq!(state.version, 3);
+        let body = std::fs::read_to_string(state.path()).expect("read carried again");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert!(
+            value.get("build_error").is_some(),
+            "a plain full reload must also carry the build_error forward"
+        );
+    }
+
+    #[test]
+    fn dev_reload_state_signal_build_success_clears_overlay() {
+        // Only a green Rust build clears the overlay: the explicit
+        // success-clear drops the build_error field and bumps the version so
+        // the client dismisses the overlay and reloads the freshly-built app.
+        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
+        let path = reload_file.path().to_path_buf();
+        let mut state = DevReloadState {
+            path,
+            version: 0,
+            active_build_error: None,
+        };
+
+        let diags = sample_build_diagnostics();
+        state
+            .signal_build_error(&diags, true)
+            .expect("build error signal");
+        assert_eq!(state.version, 1);
+
+        state
+            .signal_build_success(ReloadKind::Full)
+            .expect("success signal");
+        assert_eq!(state.version, 2);
+        let body = std::fs::read_to_string(state.path()).expect("read cleared");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert!(
+            value.get("build_error").is_none(),
+            "a green build must clear the build_error field"
+        );
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["kind"], "full");
+
+        // After a green build, ordinary signals no longer carry an overlay.
+        state.signal(ReloadKind::Css).expect("css signal");
+        let body = std::fs::read_to_string(state.path()).expect("read post-clear");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert!(
+            value.get("build_error").is_none(),
+            "no overlay should persist once cleared by a green build"
+        );
+        assert_eq!(value["kind"], "css");
+        assert_eq!(value["version"], 3);
+    }
+
+    #[test]
     fn dev_reload_state_signal_none_is_noop() {
         let reload_file = tempfile::NamedTempFile::new().expect("reload file");
         let path = reload_file.path().to_path_buf();
-        let mut state = DevReloadState { path, version: 41 };
+        let mut state = DevReloadState {
+            path,
+            version: 41,
+            active_build_error: None,
+        };
 
         state.signal(ReloadKind::None).expect("noop signal");
         assert_eq!(state.version, 41);
@@ -1694,6 +2401,7 @@ mod tests {
         let mut state = DevReloadState {
             path,
             version: u64::MAX,
+            active_build_error: None,
         };
 
         let error = state

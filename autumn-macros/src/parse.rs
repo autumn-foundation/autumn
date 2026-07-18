@@ -18,6 +18,19 @@ pub struct RouteAttrArgs {
     pub api_version: Option<LitStr>,
     /// Whether this route opts out of sunset 410 response
     pub sunset_opt_out: bool,
+    /// Per-route override for the global inbound request timeout.
+    pub timeout: RouteTimeoutAttr,
+}
+
+/// Parsed `timeout_ms = ...` / `timeout = "off"` route attribute.
+#[derive(Clone, Copy)]
+pub enum RouteTimeoutAttr {
+    /// No override — inherit the global `request_timeout_ms` deadline.
+    Inherit,
+    /// Override the global deadline with this many milliseconds.
+    Ms(u64),
+    /// Exempt this route from the global deadline entirely.
+    Disabled,
 }
 
 impl RouteAttrArgs {
@@ -38,6 +51,7 @@ impl syn::parse::Parse for RouteAttrArgs {
         let mut name_override = None;
         let mut api_version = None;
         let mut sunset_opt_out = false;
+        let mut timeout = RouteTimeoutAttr::Inherit;
 
         while input.peek(Token![,]) {
             let _comma: Token![,] = input.parse()?;
@@ -53,12 +67,31 @@ impl syn::parse::Parse for RouteAttrArgs {
             } else if key == "sunset_opt_out" {
                 let val: syn::LitBool = input.parse()?;
                 sunset_opt_out = val.value();
+            } else if key == "timeout_ms" {
+                let val: syn::LitInt = input.parse()?;
+                timeout = RouteTimeoutAttr::Ms(val.base10_parse::<u64>()?);
+            } else if key == "timeout" {
+                // Only the disabling form is accepted as a string: `timeout = "off"`.
+                let val: LitStr = input.parse()?;
+                match val.value().as_str() {
+                    "off" | "disabled" | "none" => timeout = RouteTimeoutAttr::Disabled,
+                    other => {
+                        return Err(syn::Error::new(
+                            val.span(),
+                            format!(
+                                "invalid `timeout` value {other:?}. Use `timeout = \"off\"` to \
+                                 disable the request deadline, or `timeout_ms = <millis>` to \
+                                 override it."
+                            ),
+                        ));
+                    }
+                }
             } else {
                 return Err(syn::Error::new(
                     key.span(),
                     format!(
-                        "unknown route attribute key `{key}`. \
-                         Supported keys: `name`, `api_version`, `sunset_opt_out`."
+                        "unknown route attribute key `{key}`. Supported keys: `name`, \
+                         `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout`."
                     ),
                 ));
             }
@@ -69,6 +102,7 @@ impl syn::parse::Parse for RouteAttrArgs {
             name_override,
             api_version,
             sunset_opt_out,
+            timeout,
         })
     }
 }

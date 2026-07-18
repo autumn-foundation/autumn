@@ -6,6 +6,22 @@
 //!
 //! Metrics are exposed via the `/actuator/metrics` endpoint.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -56,6 +72,13 @@ struct MetricsInner {
     /// Requests that exceeded the configured per-request timeout.
     /// Exposed as `autumn_request_timeouts_total`.
     request_timeouts_total: AtomicU64,
+    /// Replica reads redirected to the primary by the RYWW pin.
+    /// Exposed as `autumn_read_your_writes_pins_total`.
+    read_your_writes_pins_total: AtomicU64,
+    /// Requests rejected by the admission-control (load-shedding) layer
+    /// because `server.max_concurrent_requests` was at its ceiling.
+    /// Exposed as `autumn_requests_shed_total`.
+    requests_shed_total: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +129,8 @@ impl MetricsCollector {
                 idempotency_conflicts: AtomicU64::new(0),
                 shutdown_aborted_requests: AtomicU64::new(0),
                 request_timeouts_total: AtomicU64::new(0),
+                read_your_writes_pins_total: AtomicU64::new(0),
+                requests_shed_total: AtomicU64::new(0),
             }),
         }
     }
@@ -124,6 +149,22 @@ impl MetricsCollector {
     pub fn record_request_timeout(&self) {
         self.inner
             .request_timeouts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the load-shedding counter (`autumn_requests_shed_total`) —
+    /// a request rejected because `server.max_concurrent_requests` was at
+    /// its ceiling.
+    pub fn record_request_shed(&self) {
+        self.inner
+            .requests_shed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the read-your-own-writes pin redirect counter.
+    pub fn record_read_your_writes_pin(&self) {
+        self.inner
+            .read_your_writes_pins_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -189,6 +230,10 @@ impl MetricsCollector {
         }
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shard_idx is hash % SHARD_COUNT so always in bounds; buf slice length is <= 256, the buffer size"
+    )]
     fn record_route(&self, method: &str, route: &str, latency_ms: u64) {
         // ⚡ Bolt Optimization:
         // FNV-1a hash is faster than DefaultHasher (SipHash) for short strings like routes.
@@ -248,6 +293,10 @@ impl MetricsCollector {
     }
 
     /// Record a database query's duration.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shard_idx is hash % SHARD_COUNT so always in bounds"
+    )]
     pub fn record_db_query(&self, key: &str, latency_ms: u64) {
         // Hash key to determine shard index using FNV-1a
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -337,6 +386,7 @@ impl MetricsCollector {
                     .shutdown_aborted_requests
                     .load(Ordering::Relaxed),
                 request_timeouts_total: self.inner.request_timeouts_total.load(Ordering::Relaxed),
+                requests_shed_total: self.inner.requests_shed_total.load(Ordering::Relaxed),
             },
             idempotency: IdempotencyMetricsSnapshot {
                 hits: self.inner.idempotency_hits.load(Ordering::Relaxed),
@@ -344,6 +394,10 @@ impl MetricsCollector {
                 conflicts: self.inner.idempotency_conflicts.load(Ordering::Relaxed),
             },
             db_queries,
+            read_your_writes_pins_total: self
+                .inner
+                .read_your_writes_pins_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -373,6 +427,9 @@ pub struct MetricsSnapshot {
     /// Database queries tracked.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub db_queries: HashMap<String, DbQueryMetric>,
+    /// Read-your-own-writes: number of replica reads redirected to the primary
+    /// due to an active RYWW pin. Zero when `read_your_writes = "off"`.
+    pub read_your_writes_pins_total: u64,
 }
 
 /// Idempotency-key middleware counters.
@@ -405,6 +462,10 @@ pub struct HttpMetrics {
     /// Requests that exceeded the configured per-request timeout
     /// (`autumn_request_timeouts_total`).
     pub request_timeouts_total: u64,
+    /// Requests rejected by the admission-control (load-shedding) layer
+    /// because `server.max_concurrent_requests` was at its ceiling
+    /// (`autumn_requests_shed_total`).
+    pub requests_shed_total: u64,
 }
 
 /// Percentiles for latency measurements.
@@ -455,6 +516,10 @@ struct Percentiles {
     p99: u64,
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "p95_idx <= p99_idx <= len - 1, so the inclusive ranges stay within data's bounds"
+)]
 fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
     let len = latencies.len();
     if len == 0 {
@@ -792,5 +857,33 @@ mod tests {
         let snap = collector.snapshot();
         assert_eq!(snap.http.requests_total, 1);
         assert_eq!(snap.http.request_timeouts_total, 1);
+    }
+
+    // ── requests_shed_total (#1006) ─────────────────────────────────────────
+
+    #[test]
+    fn collector_requests_shed_starts_at_zero() {
+        let collector = MetricsCollector::new();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_shed_total, 0);
+    }
+
+    #[test]
+    fn collector_records_request_shed() {
+        let collector = MetricsCollector::new();
+        collector.record_request_shed();
+        collector.record_request_shed();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_shed_total, 2);
+    }
+
+    #[test]
+    fn requests_shed_total_independent_of_regular_requests() {
+        let collector = MetricsCollector::new();
+        collector.record("GET", "/api", 200, 5);
+        collector.record_request_shed();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_total, 1);
+        assert_eq!(snap.http.requests_shed_total, 1);
     }
 }

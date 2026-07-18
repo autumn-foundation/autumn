@@ -64,15 +64,29 @@ pub struct AppState {
     /// `database.primary_url` or legacy `database.url` is configured.
     #[cfg(feature = "db")]
     pub(crate) pool:
-        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+        Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
 
     /// Read-replica connection pool, or `None` when no replica role is configured.
     #[cfg(feature = "db")]
     pub(crate) replica_pool:
-        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+        Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
+
+    /// Configured shard set, or `None` when no `[[database.shards]]`
+    /// entries exist. The `pool`/`replica_pool` roles above are the
+    /// control topology; tenant data routes across these shards.
+    #[cfg(feature = "db")]
+    pub(crate) shards: Option<crate::sharding::ShardSet>,
 
     /// Active profile name (e.g., "dev", "prod", "staging").
     pub(crate) profile: Option<String>,
+
+    /// Resolved process role for this replica, after config parsing and the
+    /// `AUTUMN_ROLE` env override. This is the same value the framework uses to
+    /// gate the job runtime, scheduler, and commit-hook worker, exposed here as
+    /// a first-class accessor ([`role`](Self::role)) so `on_startup`/`on_shutdown`
+    /// hooks, plugins, and handlers can self-gate app-owned background work
+    /// without re-reading `AUTUMN_ROLE` by hand.
+    pub(crate) role: crate::config::ProcessRole,
 
     /// When the application started. Used for uptime calculation.
     pub(crate) started_at: std::time::Instant,
@@ -148,6 +162,43 @@ pub struct AppState {
     /// Injected wall-clock. Defaults to [`SystemClock`] (real time).
     /// Tests override via [`crate::test::TestApp::with_clock`].
     pub(crate) clock: Arc<dyn ClockSource>,
+
+    /// Process-unique identity assigned once per real `AppState` construction
+    /// and preserved verbatim across `.clone()` (it is `Copy`).
+    ///
+    /// Two independently built apps that happen to share identical rate-limit
+    /// config would otherwise collide in the process-global `#[throttle]`
+    /// limiter registry (keyed only by route/name + config fingerprint), so
+    /// traffic in one app would drain the other's per-route bucket. Folding
+    /// this id into the registry key gives each app its own buckets. Sourced
+    /// from a monotonic `AtomicU64` — never reused, unlike a pointer address.
+    pub(crate) app_id: u64,
+}
+
+/// Monotonic source for [`AppState::app_id`]. Starts at 1 so `0` can never be a
+/// live app id.
+static NEXT_APP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl crate::authorization::ProvideAuthorizationState for AppState {
+    fn policy_registry(&self) -> &crate::authorization::PolicyRegistry {
+        &self.policy_registry
+    }
+
+    fn auth_session_key(&self) -> &str {
+        &self.auth_session_key
+    }
+
+    fn forbidden_response(&self) -> &crate::authorization::ForbiddenResponse {
+        &self.forbidden_response
+    }
+
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    {
+        self.pool.as_ref()
+    }
 }
 
 impl AppState {
@@ -190,6 +241,36 @@ impl AppState {
             .and_then(|value| Arc::downcast::<T>(value).ok())
     }
 
+    /// Fetch the extension of type `T`, inserting `f()`'s result if absent.
+    /// Atomic get-or-insert under the write lock: concurrent callers share one
+    /// value. Used to lazily register process-wide registries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned.
+    pub fn extension_or_insert_with<T>(&self, f: impl FnOnce() -> T) -> Arc<T>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        if let Some(existing) = self.extension::<T>() {
+            return existing;
+        }
+        let mut map = self
+            .extensions
+            .write()
+            .expect("app state extension lock poisoned");
+        if let Some(existing) = map
+            .get(&TypeId::of::<T>())
+            .cloned()
+            .and_then(|value| Arc::downcast::<T>(value).ok())
+        {
+            return existing;
+        }
+        let arc = Arc::new(f());
+        map.insert(TypeId::of::<T>(), arc.clone() as Arc<dyn Any + Send + Sync>);
+        arc
+    }
+
     /// Returns the registered error reporters, if any were installed via
     /// [`AppBuilder::with_error_reporter`](crate::app::AppBuilder::with_error_reporter).
     ///
@@ -211,7 +292,7 @@ impl AppState {
     #[must_use]
     pub const fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.pool.as_ref()
     }
@@ -221,9 +302,20 @@ impl AppState {
     #[must_use]
     pub const fn replica_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.replica_pool.as_ref()
+    }
+
+    /// Returns the configured shard set, when `[[database.shards]]`
+    /// entries exist.
+    ///
+    /// The control roles ([`pool`](Self::pool)/[`replica_pool`](Self::replica_pool))
+    /// are unaffected by sharding; framework state lives there.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        self.shards.as_ref()
     }
 
     /// Returns the pool used for read-only work.
@@ -231,7 +323,7 @@ impl AppState {
     #[must_use]
     pub fn read_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         if self.replica_pool.is_some() && self.probes.should_route_reads_to_replica() {
             self.replica_pool.as_ref()
@@ -296,6 +388,25 @@ impl AppState {
             .map_or_else(crate::config::AutumnConfig::default, |arc| (*arc).clone())
     }
 
+    /// Allocate the next process-unique app id.
+    ///
+    /// Called exactly once per genuine `AppState` construction; clones copy the
+    /// resulting `u64` verbatim, so a cloned state (what `State<AppState>` hands
+    /// a handler) reports the same id as its origin while a separately built
+    /// state gets a fresh one.
+    pub(crate) fn next_app_id() -> u64 {
+        NEXT_APP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Process-unique identity of this app, stable across clones.
+    ///
+    /// Used to scope per-route `#[throttle]` limiters so two independently
+    /// built apps with identical config never share a token bucket.
+    #[must_use]
+    pub(crate) const fn app_id(&self) -> u64 {
+        self.app_id
+    }
+
     /// Returns the shared probe lifecycle state.
     #[must_use]
     pub const fn probes(&self) -> &probe::ProbeState {
@@ -317,7 +428,7 @@ impl AppState {
     #[must_use]
     pub fn with_pool(
         mut self,
-        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
     ) -> Self {
         self.pool = Some(pool);
         self
@@ -328,9 +439,17 @@ impl AppState {
     #[must_use]
     pub fn with_replica_pool(
         mut self,
-        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
     ) -> Self {
         self.replica_pool = Some(pool);
+        self
+    }
+
+    /// Sets the shard set.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_shards(mut self, shards: crate::sharding::ShardSet) -> Self {
+        self.shards = Some(shards);
         self
     }
 
@@ -468,6 +587,32 @@ impl AppState {
         self.profile.as_deref().unwrap_or("default")
     }
 
+    /// Returns the resolved [`ProcessRole`](crate::config::ProcessRole) for this
+    /// replica.
+    ///
+    /// This is the role after config parsing and the `AUTUMN_ROLE` env override
+    /// — the exact same value the framework uses to gate the job runtime,
+    /// scheduler, and commit-hook worker. Use it from `state_initializer`,
+    /// `on_startup`/`on_shutdown` hooks, plugins, and request handlers to
+    /// self-gate app-owned background work:
+    ///
+    /// ```rust
+    /// # use autumn_web::AppState;
+    /// # fn example(state: &AppState) {
+    /// if state.role().runs_workers() {
+    ///     // start an embedded worker loop only on replicas that run workers
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// [`serves_http`](crate::config::ProcessRole::serves_http) and
+    /// [`runs_workers`](crate::config::ProcessRole::runs_workers) are reachable
+    /// on the returned value.
+    #[must_use]
+    pub const fn role(&self) -> crate::config::ProcessRole {
+        self.role
+    }
+
     /// Returns how long the application has been running.
     #[must_use]
     pub fn uptime(&self) -> std::time::Duration {
@@ -563,7 +708,10 @@ impl AppState {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: probe::ProbeState::ready_for_test(),
@@ -585,6 +733,7 @@ impl AppState {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: Arc::new(SystemClock),
+            app_id: Self::next_app_id(),
         }
     }
 
@@ -605,23 +754,27 @@ impl DbState for AppState {
 
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.pool.as_ref()
     }
 
     fn replica_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.replica_pool.as_ref()
     }
 
     fn read_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         Self::read_pool(self)
+    }
+
+    fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        self.shards.as_ref()
     }
 
     fn db_interceptors(
@@ -664,7 +817,7 @@ impl crate::probe::ProvideProbeState for AppState {
     #[cfg(feature = "db")]
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.pool.as_ref()
     }
@@ -672,7 +825,7 @@ impl crate::probe::ProvideProbeState for AppState {
     #[cfg(feature = "db")]
     fn replica_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.replica_pool.as_ref()
     }
@@ -743,9 +896,14 @@ impl crate::actuator::ProvideActuatorState for AppState {
     #[cfg(feature = "db")]
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.pool.as_ref()
+    }
+
+    #[cfg(feature = "db")]
+    fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        self.shards.as_ref()
     }
     // a11y_posture() uses the trait default (all-false) intentionally: AppState
     // cannot know whether the application's layout is accessible.  Override this

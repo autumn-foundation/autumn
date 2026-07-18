@@ -38,6 +38,22 @@
 //! model. The bind step is always your own CSRF- and session-protected route.
 //! See [`complete_direct_upload`] for how to enforce this.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::time::Duration;
 
 use super::{Blob, BlobMeta, BlobStore, BlobStoreError};

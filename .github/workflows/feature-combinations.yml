@@ -1,0 +1,113 @@
+name: Feature Combination Compile Gate
+
+# Issue #982 — prove that autumn-web's feature-flag subsets compile in isolation
+# so a downstream app or plugin author building with a trimmed feature set does
+# not hit a silent feature-gating regression.
+#
+# Bounded strategy (not the cost-prohibitive 2^N powerset):
+#   Phase A — `cargo hack --each-feature` on autumn-web.
+#             Builds with default features, once with NO features, then once per
+#             individual feature.  Linear in the number of features; ~31 builds
+#             after exclusions.
+#   Phase B — five curated combos that mirror documented user journeys:
+#             db-only API, minimal web (maud+htmx), mail without defaults,
+#             storage+db, and telemetry-otlp only.
+#
+# Excluded features (documented unsupported-in-CI in STABILITY.md):
+#   managed-pg / managed-pg-bundled  — download / embed Postgres binaries
+#   system-tests                     — pulls chromiumoxide (headless Chromium)
+#   test-support                     — dev-only; pulls testcontainers
+#
+# telemetry-otlp requires protoc (installed below); it is swept in Phase A and
+# also verified in Phase B.
+#
+# When does this run?
+#   - Every PR to trunk / trunk-dev that touches the autumn-web feature surface,
+#     the gate script, or this workflow.  Path-scoped so it does not tax PRs that
+#     only change docs or unrelated crates.
+#   - Every push to trunk / trunk-dev (keeps the main branch permanently green).
+#   - workflow_dispatch for manual spot-checks.
+
+on:
+  push:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "autumn/Cargo.toml"
+      - "autumn/src/**"
+      - "Cargo.toml"
+      - "scripts/check-feature-combinations.sh"
+      - ".github/workflows/feature-combinations.yml"
+  pull_request:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "autumn/Cargo.toml"
+      - "autumn/src/**"
+      - "Cargo.toml"
+      - "scripts/check-feature-combinations.sh"
+      - ".github/workflows/feature-combinations.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  meta:
+    uses: ./.github/workflows/runner-routing.yml
+
+  feature-combinations:
+    name: Feature combination compile gate
+    needs: meta
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space (Linux)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      # protoc is required by telemetry-otlp in both Phase A (each-feature sweep)
+      # and Phase B (curated combo). It is not available in the standard ubuntu-latest image.
+      - name: Install protoc (required for telemetry-otlp)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install cargo-hack
+        # Pin @v2 and pass the tool explicitly. The bare @cargo-hack tag form can
+        # resolve with an empty tool input and install nothing (broke the Fuzz
+        # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      - name: Run feature-combination compile gate
+        run: ./scripts/check-feature-combinations.sh 2>&1 | tee gate-output.txt
+
+      - name: Write gate summary
+        if: always()
+        run: |
+          # Extract and publish the "Gated N feature combinations" count line.
+          COUNT_LINE=$(grep -E '^Gated [0-9]+ feature combinations' gate-output.txt || true)
+          if [[ -n "$COUNT_LINE" ]]; then
+            echo "### Feature-combination compile gate" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo ":white_check_mark: $COUNT_LINE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Feature-combination compile gate" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo ":x: Gate did not complete successfully — see job log for details." >> "$GITHUB_STEP_SUMMARY"
+          fi

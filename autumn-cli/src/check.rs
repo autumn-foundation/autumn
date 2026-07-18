@@ -49,6 +49,69 @@ pub struct A11yCheckOptions {
     pub html: Option<String>,
 }
 
+/// Run the config check on autumn.toml and profiles.
+pub fn run_config_check() -> Result<(), String> {
+    run_config_check_impl(std::path::Path::new("."))
+}
+
+/// Helper for `run_config_check` allowing path injection for testing.
+pub fn run_config_check_impl(dir: &std::path::Path) -> Result<(), String> {
+    let toml_path = dir.join("autumn.toml");
+    if !toml_path.exists() {
+        return Err("autumn.toml not found".to_string());
+    }
+
+    let toml_content = std::fs::read_to_string(&toml_path)
+        .map_err(|e| format!("failed to read autumn.toml: {e}"))?;
+
+    let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+    let mut errors = Vec::new();
+
+    // 1. Validate base autumn.toml
+    let base_errors = crate::doctor::validate_toml_content(&toml_content, &schema);
+    for (path, sug) in base_errors {
+        errors.push(format!(
+            "autumn.toml: unknown key \"{path}\"{}",
+            sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                .unwrap_or_default()
+        ));
+    }
+
+    // 2. Validate any autumn-*.toml profile files
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                let is_profile = path.is_file()
+                    && filename.starts_with("autumn-")
+                    && std::path::Path::new(filename)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
+                if is_profile {
+                    let read_result = std::fs::read_to_string(&path);
+                    if let Ok(file_content) = read_result {
+                        let profile_errors =
+                            crate::doctor::validate_toml_content(&file_content, &schema);
+                        for (p_path, sug) in profile_errors {
+                            errors.push(format!(
+                                "{filename}: unknown key \"{p_path}\"{}",
+                                sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                                    .unwrap_or_default()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
 /// Run the a11y audit and return all violations found.
 ///
 /// Returns `Err` only on I/O failures (e.g. cannot connect to `url`); an
@@ -682,6 +745,80 @@ pub fn print_report(violations: &[A11yViolation], url: &str, critical_only: bool
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_run_config_check_passes_on_valid_and_fails_on_typo() {
+        let temp = tempfile::tempdir().unwrap();
+        let toml_path = temp.path().join("autumn.toml");
+        std::fs::write(
+            &toml_path,
+            "[database]\nprimary_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
+
+        // Valid check passes
+        if let Err(e) = run_config_check_impl(temp.path()) {
+            panic!("Valid check failed: {e}");
+        }
+
+        // Typo check fails
+        std::fs::write(
+            &toml_path,
+            "[database]\nprimry_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
+        let res = run_config_check_impl(temp.path());
+        assert!(res.is_err());
+        assert!(res.err().unwrap().contains("primry_url"));
+
+        // Inline profile with valid key passes
+        std::fs::write(
+            &toml_path,
+            "[profile.dev.database]\nprimary_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
+        if let Err(e) = run_config_check_impl(temp.path()) {
+            panic!("Inline profile with valid key failed: {e}");
+        }
+
+        // Inline profile with typo fails
+        std::fs::write(
+            &toml_path,
+            "[profile.dev.database]\nprimry_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
+        let res = run_config_check_impl(temp.path());
+        assert!(res.is_err());
+        assert!(res.err().unwrap().contains("primry_url"));
+
+        // Reset autumn.toml to be clean
+        std::fs::write(
+            &toml_path,
+            "[database]\nprimary_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
+
+        // Profile file (autumn-dev.toml) with typo fails
+        let profile_toml_path = temp.path().join("autumn-dev.toml");
+        std::fs::write(
+            &profile_toml_path,
+            "[database]\nprimry_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
+        let res = run_config_check_impl(temp.path());
+        assert!(res.is_err());
+        assert!(res.err().unwrap().contains("primry_url"));
+
+        // Profile file (autumn-dev.toml) valid passes
+        std::fs::write(
+            &profile_toml_path,
+            "[database]\nprimary_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
+        if let Err(e) = run_config_check_impl(temp.path()) {
+            panic!("Profile file with valid key failed: {e}");
+        }
+    }
+
     fn violation_ids(html: &str) -> Vec<&'static str> {
         let mut ids: Vec<&'static str> =
             analyse_html(html).into_iter().map(|v| v.rule_id).collect();
@@ -1252,6 +1389,43 @@ mod tests {
         assert!(ids.contains(&"html-has-lang"), "{ids:?}");
         assert!(ids.contains(&"image-alt"), "{ids:?}");
         assert!(ids.contains(&"button-name"), "{ids:?}");
+    }
+
+    // ── nav_bar full-page a11y (#1137) ──────────────────────────────
+
+    #[test]
+    fn nav_bar_full_page_passes_all_a11y_lints() {
+        use autumn_web::widgets::{NavBarConfig, NavItem, NavMenu, nav_bar};
+
+        let nav = nav_bar(
+            "/",
+            &NavBarConfig::new()
+                .brand("Acme", "/")
+                .item(NavItem::link("/", "Home"))
+                .item(NavItem::menu(
+                    NavMenu::new("Products").link("/widgets", "Widgets"),
+                ))
+                .trailing(NavItem::plain_link("/login", "Log in")),
+        )
+        .into_string();
+
+        let html = format!(
+            r##"<!DOCTYPE html>
+<html lang="en">
+<body>
+  <a href="#main-content" class="skip-link">Skip to content</a>
+  <header>{nav}</header>
+  <main id="main-content">Content</main>
+</body>
+</html>"##
+        );
+
+        let violations = analyse_html(&html);
+        assert!(
+            violations.is_empty(),
+            "nav_bar layout must pass autumn check --a11y: {:#?}",
+            violations.iter().map(|v| v.rule_id).collect::<Vec<_>>()
+        );
     }
 
     // ── severity ordering ──────────────────────────────────────────

@@ -54,6 +54,8 @@
 //! - [`MutationContext`] -- carries actor identity, request ID, and
 //!   timestamp into every hook invocation.
 
+use std::borrow::Cow;
+
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 
@@ -114,13 +116,20 @@ pub struct MutationContext {
 impl MutationContext {
     /// Create a new context for the given operation.
     ///
-    /// Auto-populates `now` with `Utc::now()` and `request_id` with a
-    /// freshly generated UUID v4.
+    /// Auto-populates `now` with `Utc::now()`, `request_id` with a freshly
+    /// generated UUID v4, and `actor` from the ambient
+    /// [`Current::actor`](crate::current::Current::actor) (the authenticated
+    /// principal when inside a request; `None` otherwise).
     #[must_use]
     pub fn new(op: MutationOp) -> Self {
         Self {
             op,
-            actor: None,
+            // Seed the actor from the ambient request-scoped current actor so
+            // generated writes auto-attribute to the authenticated principal
+            // with zero per-call wiring. `None` outside any scope, preserving
+            // the previous behavior. A `before_*` hook still overrides this,
+            // since hooks run after construction.
+            actor: crate::current::Current::actor(),
             request_id: Some(uuid::Uuid::new_v4().to_string()),
             now: chrono::Utc::now(),
             invalidate_keys: Vec::new(),
@@ -415,6 +424,147 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
     }
 }
 
+// ── `Patch<T>` validator per-field trait impls (#1719) ───────────────
+//
+// The `#[repository(api = ...)]` macro generates an `UpdateModel` whose mutable
+// fields are `Patch<T>`. So that the model's declarative `#[validate(...)]`
+// rules are enforced on PATCH/PUT (returning a 422 with the same per-field
+// error map as create), the generated `UpdateModel` derives
+// `validator::Validate` and carries the field `#[validate]` attributes. That
+// derive expands to per-field calls like `self.title.validate_length(..)`,
+// so `Patch<T>` must implement validator's per-field traits.
+//
+// These impls mirror validator's own `Option<T>` impls: an absent field
+// (`Unchanged`/`Clear`) is skipped — it behaves like `None` and always passes —
+// while `Set(v)` delegates to the inner value's rule. `Patch` is a local type,
+// so implementing these foreign traits raises no orphan-rule issue.
+//
+// Only the *declarative, single-field* validators are implemented.
+// `must_match`/`nested`/`custom` are intentionally omitted: they are
+// meaningless or ill-typed on a tri-state patch field. `required` IS implemented
+// (below), but with distinct, non-skip semantics: unlike the other rules, an
+// absent field is not uniformly "pass" — `Clear` (explicit null on a required
+// field) must FAIL so a PATCH/PUT cannot violate the model's `required` contract
+// by nulling the column. `ValidateDoesNotContain`
+// is deliberately NOT implemented here — validator provides it automatically via
+// its blanket `impl<T: ValidateContains> ValidateDoesNotContain for T`, which
+// covers `Patch<T>` through the `ValidateContains` impl below (a manual impl
+// would collide with that blanket). `ValidateCreditCard` (validator's `card`
+// feature) and `ValidateNonControlCharacter` (its `unic` feature) are not
+// exported under this workspace's `validator` feature set, so they are omitted.
+
+impl<T: validator::ValidateLength<u64>> validator::ValidateLength<u64> for Patch<T> {
+    fn length(&self) -> Option<u64> {
+        match self {
+            Self::Set(v) => validator::ValidateLength::length(v),
+            _ => None,
+        }
+    }
+}
+
+impl<N, T: validator::ValidateRange<N>> validator::ValidateRange<N> for Patch<T> {
+    fn greater_than(&self, max: N) -> Option<bool> {
+        match self {
+            Self::Set(v) => validator::ValidateRange::greater_than(v, max),
+            _ => None,
+        }
+    }
+
+    fn less_than(&self, min: N) -> Option<bool> {
+        match self {
+            Self::Set(v) => validator::ValidateRange::less_than(v, min),
+            _ => None,
+        }
+    }
+}
+
+impl<T: validator::ValidateEmail> validator::ValidateEmail for Patch<T> {
+    fn as_email_string(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Self::Set(v) => validator::ValidateEmail::as_email_string(v),
+            _ => None,
+        }
+    }
+}
+
+impl<T: validator::ValidateUrl> validator::ValidateUrl for Patch<T> {
+    fn as_url_string(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Self::Set(v) => validator::ValidateUrl::as_url_string(v),
+            _ => None,
+        }
+    }
+}
+
+impl<T: validator::ValidateContains> validator::ValidateContains for Patch<T> {
+    fn validate_contains(&self, needle: &str) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateContains::validate_contains(v, needle),
+            _ => true,
+        }
+    }
+}
+
+impl<T: validator::ValidateIp> validator::ValidateIp for Patch<T> {
+    fn validate_ipv4(&self) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateIp::validate_ipv4(v),
+            _ => true,
+        }
+    }
+
+    fn validate_ipv6(&self) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateIp::validate_ipv6(v),
+            _ => true,
+        }
+    }
+
+    fn validate_ip(&self) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateIp::validate_ip(v),
+            _ => true,
+        }
+    }
+}
+
+impl<T: validator::ValidateRegex> validator::ValidateRegex for Patch<T> {
+    fn validate_regex(&self, regex: impl validator::AsRegex) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateRegex::validate_regex(v, regex),
+            _ => true,
+        }
+    }
+}
+
+// `required` has *tri-state* semantics that differ from the skip-on-absent rules
+// above (#1719 / Codex P2). `required` is meaningful only on `Option`-typed model
+// fields, whose `UpdateModel` field is `Patch<Option<T>>`, so the bound is
+// `T: ValidateRequired` (satisfied by validator's `impl<T> ValidateRequired for
+// Option<T>`). The derive calls `self.field.validate_required()`:
+//   - `Unchanged` -> `true`: the field was omitted from the patch, so the
+//     existing (non-null) value is kept — nothing to reject.
+//   - `Clear`     -> `false`: an explicit JSON `null` on a required field would
+//     write SQL `NULL`, violating the `required` contract — reject (422).
+//   - `Set(v)`    -> delegate to the inner `Option<T>`: `Set(Some)` passes,
+//     `Set(None)` fails (same as create).
+impl<T: validator::ValidateRequired> validator::ValidateRequired for Patch<T> {
+    fn validate_required(&self) -> bool {
+        match self {
+            Self::Unchanged => true,
+            Self::Clear => false,
+            Self::Set(v) => validator::ValidateRequired::validate_required(v),
+        }
+    }
+
+    fn is_some(&self) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateRequired::is_some(v),
+            _ => false,
+        }
+    }
+}
+
 /// Per-field before/after diff accessor for mutation hooks.
 ///
 /// `FieldDiff<T>` holds the previous and proposed values for a single field,
@@ -703,6 +853,57 @@ mod tests {
         assert_eq!(Patch::<i32>::Unchanged.into_option(), None);
     }
 
+    // ── Patch validator-trait tests (#1719) ─────────────────────
+    //
+    // `Patch<T>` mirrors validator's `Option<T>` impls: an absent field
+    // (`Unchanged`/`Clear`) always passes; a `Set(v)` field delegates to the
+    // inner value's rule. This lets the generated `UpdateModel` derive
+    // `validator::Validate` and enforce `#[validate(...)]` on PATCH/PUT.
+
+    #[test]
+    fn patch_validate_length_set_delegates_to_inner() {
+        use validator::ValidateLength;
+        // `Set` with an empty string fails a `length(min = 1)` rule …
+        assert!(!Patch::Set(String::new()).validate_length(Some(1), None, None));
+        // … while a `Set` with a satisfying value passes.
+        assert!(Patch::Set(String::from("ok")).validate_length(Some(1), None, None));
+    }
+
+    #[test]
+    fn patch_validate_length_absent_passes() {
+        use validator::ValidateLength;
+        // Absent variants behave like `None`: the rule is skipped (passes).
+        assert!(Patch::<String>::Unchanged.validate_length(Some(1), None, None));
+        assert!(Patch::<String>::Clear.validate_length(Some(1), None, None));
+    }
+
+    // `required` has tri-state semantics (#1719 / Codex P2): unlike the
+    // skip-on-absent rules, `Clear` and `Set(None)` must FAIL so a PATCH/PUT
+    // cannot null a `#[validate(required)]` column; `Unchanged` skips.
+    #[test]
+    fn patch_validate_required_unchanged_passes() {
+        use validator::ValidateRequired;
+        assert!(Patch::<Option<String>>::Unchanged.validate_required());
+    }
+
+    #[test]
+    fn patch_validate_required_clear_fails() {
+        use validator::ValidateRequired;
+        assert!(!Patch::<Option<String>>::Clear.validate_required());
+    }
+
+    #[test]
+    fn patch_validate_required_set_some_passes() {
+        use validator::ValidateRequired;
+        assert!(Patch::Set(Some(String::from("x"))).validate_required());
+    }
+
+    #[test]
+    fn patch_validate_required_set_none_fails() {
+        use validator::ValidateRequired;
+        assert!(!Patch::<Option<String>>::Set(None).validate_required());
+    }
+
     // ── FieldDiff tests ──────────────────────────────────────────
 
     #[test]
@@ -744,12 +945,24 @@ mod tests {
     fn field_diff_option_was_set() {
         let diff = FieldDiff::new(None, Some(42));
         assert!(diff.was_set());
+        let diff2 = FieldDiff::new(Some(42), Some(42));
+        assert!(!diff2.was_set());
+        let diff3 = FieldDiff::new(None::<i32>, None);
+        assert!(!diff3.was_set());
+        let diff4 = FieldDiff::new(Some(42), None);
+        assert!(!diff4.was_set());
     }
 
     #[test]
     fn field_diff_option_was_cleared() {
         let diff = FieldDiff::new(Some(42), None);
         assert!(diff.was_cleared());
+        let diff2 = FieldDiff::new(Some(42), Some(42));
+        assert!(!diff2.was_cleared());
+        let diff3 = FieldDiff::new(None::<i32>, None);
+        assert!(!diff3.was_cleared());
+        let diff4 = FieldDiff::new(None, Some(42));
+        assert!(!diff4.was_cleared());
     }
 
     // ── MutationOp tests ────────────────────────────────────────────
@@ -768,15 +981,22 @@ mod tests {
 
     // ── MutationContext tests ───────────────────────────────────────
 
-    #[test]
-    fn mutation_context_auto_populates() {
-        let ctx = MutationContext::new(MutationOp::Create);
-        assert!(ctx.actor.is_none());
-        assert!(ctx.request_id.is_some());
-        // UUID v4 format: 8-4-4-4-12 = 36 chars
-        assert_eq!(ctx.request_id.as_ref().unwrap().len(), 36);
-        assert!(matches!(ctx.op, MutationOp::Create));
-        assert!(ctx.invalidate_keys.is_empty());
+    #[tokio::test]
+    async fn mutation_context_auto_populates() {
+        // Construct inside an (empty) request scope so `actor` is deterministically
+        // `None`: an in-scope read never consults the process-global default actor,
+        // which a concurrent test (`current::…default_actor_is_used_only_out_of_scope`)
+        // may transiently have set. Avoids a test-isolation race on that global.
+        crate::current::scope_request(async {
+            let ctx = MutationContext::new(MutationOp::Create);
+            assert!(ctx.actor.is_none());
+            assert!(ctx.request_id.is_some());
+            // UUID v4 format: 8-4-4-4-12 = 36 chars
+            assert_eq!(ctx.request_id.as_ref().unwrap().len(), 36);
+            assert!(matches!(ctx.op, MutationOp::Create));
+            assert!(ctx.invalidate_keys.is_empty());
+        })
+        .await;
     }
 
     #[test]
@@ -792,6 +1012,24 @@ mod tests {
         let mut ctx = MutationContext::new(MutationOp::Update);
         ctx.actor = Some("user-123".into());
         assert_eq!(ctx.actor.as_deref(), Some("user-123"));
+    }
+
+    #[tokio::test]
+    async fn mutation_context_seeds_actor_from_ambient_scope() {
+        // Inside an (empty) request scope the constructor yields `None`
+        // deterministically — an in-scope read never consults the process-global
+        // default actor a concurrent test may transiently have set (isolation).
+        crate::current::scope_request(async {
+            assert!(MutationContext::new(MutationOp::Create).actor.is_none());
+        })
+        .await;
+
+        // Inside `with_actor(...)` the constructor auto-populates the actor.
+        crate::current::with_actor("u1", async {
+            let ctx = MutationContext::new(MutationOp::Create);
+            assert_eq!(ctx.actor.as_deref(), Some("u1"));
+        })
+        .await;
     }
 
     #[test]
@@ -1059,6 +1297,21 @@ mod tests {
         let field = DraftField::new(&before, &mut after);
         assert!(field.was_set());
         assert!(!field.was_cleared());
+
+        let before2: Option<i32> = Some(42);
+        let mut after2: Option<i32> = Some(42);
+        let field2 = DraftField::new(&before2, &mut after2);
+        assert!(!field2.was_set());
+
+        let before3: Option<i32> = None;
+        let mut after3: Option<i32> = None;
+        let field3 = DraftField::new(&before3, &mut after3);
+        assert!(!field3.was_set());
+
+        let before4: Option<i32> = Some(42);
+        let mut after4: Option<i32> = None;
+        let field4 = DraftField::new(&before4, &mut after4);
+        assert!(!field4.was_set());
     }
 
     #[test]
@@ -1068,5 +1321,20 @@ mod tests {
         let field = DraftField::new(&before, &mut after);
         assert!(field.was_cleared());
         assert!(!field.was_set());
+
+        let before2: Option<i32> = Some(42);
+        let mut after2: Option<i32> = Some(42);
+        let field2 = DraftField::new(&before2, &mut after2);
+        assert!(!field2.was_cleared());
+
+        let before3: Option<i32> = None;
+        let mut after3: Option<i32> = None;
+        let field3 = DraftField::new(&before3, &mut after3);
+        assert!(!field3.was_cleared());
+
+        let before4: Option<i32> = None;
+        let mut after4: Option<i32> = Some(42);
+        let field4 = DraftField::new(&before4, &mut after4);
+        assert!(!field4.was_cleared());
     }
 }

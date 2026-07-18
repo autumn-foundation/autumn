@@ -34,18 +34,39 @@ pub fn run(opts: &TaskOptions<'_>) {
     }
 }
 
+/// Point a one-off task run at the serve daemon's managed-Postgres cluster:
+/// share its data dir and, when the cluster is live, attach to it instead of
+/// starting a second postmaster on the daemon's locked data dir. A no-op for
+/// apps that don't use managed Postgres (the env vars are simply unread).
+fn apply_managed_pg_env(cmd: &mut Command, package: Option<&str>) {
+    // The attach URL is CLI→child plumbing, not an operator knob. Clear any
+    // inherited value up front so a stale/foreign one can't override the data dir
+    // (the provider checks the attach URL first) — including when an explicit
+    // `AUTUMN_MANAGED_PG_DATA_DIR` override makes `managed_pg_env` return `None`.
+    // We re-set it only when we discover a live cluster to attach to.
+    cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
+    let Some(env) = crate::serve::managed_pg_env(package) else {
+        return;
+    };
+    cmd.env(crate::serve::MANAGED_PG_DATA_DIR_ENV, &env.data_dir);
+    if let Some(url) = env.attach_url {
+        cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
+    }
+}
+
 fn list_tasks(binary: &std::path::Path, opts: &TaskOptions<'_>) {
-    let output = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .env("AUTUMN_LIST_TASKS", "1")
         .env("AUTUMN_ENV", opts.profile)
         .env("AUTUMN_PROFILE", opts.profile)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to run {}: {error}", binary.display());
-            std::process::exit(1);
-        });
+        .stderr(Stdio::inherit());
+    apply_managed_pg_env(&mut command, opts.package);
+    let output = command.output().unwrap_or_else(|error| {
+        eprintln!("Failed to run {}: {error}", binary.display());
+        std::process::exit(1);
+    });
 
     if !output.status.success() {
         eprintln!(
@@ -77,19 +98,20 @@ fn run_task(binary: &std::path::Path, opts: &TaskOptions<'_>) {
         std::process::exit(1);
     });
 
-    let status = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .env("AUTUMN_RUN_TASK", name)
         .env("AUTUMN_TASK_ARGS_JSON", args_json)
         .env("AUTUMN_ENV", opts.profile)
         .env("AUTUMN_PROFILE", opts.profile)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to run {}: {error}", binary.display());
-            std::process::exit(1);
-        });
+        .stderr(Stdio::inherit());
+    apply_managed_pg_env(&mut command, opts.package);
+    let status = command.status().unwrap_or_else(|error| {
+        eprintln!("Failed to run {}: {error}", binary.display());
+        std::process::exit(1);
+    });
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));

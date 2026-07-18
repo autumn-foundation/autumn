@@ -27,8 +27,9 @@ Import the helpers you need:
 
 ```rust
 use autumn_web::form::{
-    text_input, password_input, textarea_input,
-    required_text_input, aria_live_region, skip_link,
+    text_input, password_input, textarea_input, required_text_input,
+    checkbox_input, number_input, date_input, datetime_input, select_input,
+    aria_live_region, skip_link,
 };
 ```
 
@@ -85,6 +86,92 @@ Renders a labelled `<textarea>` with the same error-linking pattern.
 ```rust
 html! {
     (textarea_input(&changeset, "body", "Post body"))
+}
+```
+
+### `checkbox_input`
+
+Renders a labelled `<input type="checkbox">` for a `bool` field. Unchecked
+checkboxes are omitted from submitted form data by the browser, so the
+target field must be marked with `#[serde(default)]` to decode as `false`
+when absent (rather than pairing it with a hidden input sibling, which
+would cause duplicate-key errors on checked submissions).
+
+```rust
+html! {
+    (checkbox_input(&changeset, "published", "Published"))
+}
+```
+
+### `number_input`
+
+Renders a labelled `<input type="number">` for `i32`/`i64`/`f32`/`f64`
+fields. Pass `step` to control the HTML `step` attribute — `Some("1")` for
+integers, `Some("0.01")` or `Some("any")` for floats, `None` for the browser
+default.
+
+```rust
+html! {
+    (number_input(&changeset, "quantity", "Quantity", Some("1")))
+    (number_input(&changeset, "price", "Price", Some("0.01")))
+}
+```
+
+### `date_input` / `datetime_input`
+
+Render `<input type="date">` and `<input type="datetime-local">`
+respectively. The current value is normalized to the shape each control
+requires (`YYYY-MM-DD` / `YYYY-MM-DDTHH:MM[:SS[.f]]`, preserving
+seconds/fractional seconds when present), regardless of whether the
+underlying field serializes as a bare date or a full RFC 3339 timestamp.
+
+```rust
+html! {
+    (date_input(&changeset, "birthday", "Birthday"))
+    (datetime_input(&changeset, "starts_at", "Starts at"))
+}
+```
+
+`<input type="datetime-local">` has no timezone concept, so a
+`chrono::DateTime<Utc>` field's rendered value never carries an offset —
+chrono's default `Deserialize` for `DateTime<Utc>` requires one and rejects
+the submission. Attach `deserialize_datetime_local_utc` (or
+`deserialize_datetime_local_utc_option` for `Option<DateTime<Utc>>`):
+
+```rust
+#[derive(serde::Deserialize)]
+struct EventForm {
+    #[serde(deserialize_with = "autumn_web::form::deserialize_datetime_local_utc")]
+    starts_at: chrono::DateTime<chrono::Utc>,
+}
+```
+
+`chrono::NaiveDateTime` fields don't hit that offset problem, but a value
+the user actively edits through the browser's native picker isn't
+guaranteed to include seconds (unlike the always-seconds-inclusive
+pre-filled value), which chrono's default `Deserialize` also rejects.
+Attach `deserialize_naive_datetime_local` (or
+`deserialize_naive_datetime_local_option` for `Option<NaiveDateTime>`) as a
+defensive measure:
+
+```rust
+#[derive(serde::Deserialize)]
+struct EventForm {
+    #[serde(deserialize_with = "autumn_web::form::deserialize_naive_datetime_local")]
+    starts_at: chrono::NaiveDateTime,
+}
+```
+
+### `select_input`
+
+Renders a labelled `<select>` from `(value, label)` option pairs, marking the
+option matching the changeset's current value as `selected`. This is the
+control closed-set fields (enums, references) target.
+
+```rust
+let statuses = [("draft", "Draft"), ("published", "Published")];
+html! {
+    (select_input(&changeset, "status", "Status", &statuses))
 }
 ```
 
@@ -331,6 +418,199 @@ The endpoint is available at `GET /actuator/a11y` and returns:
 `is_compliant()` returns `true` only when all three fields are `true`. You can
 poll this endpoint in health checks or monitoring dashboards to confirm your
 accessibility posture hasn't regressed.
+
+---
+
+## Typed accessible primitives (`autumn_web::a11y`)
+
+The form helpers above make the *right* thing easy. The primitives in
+`autumn_web::a11y` go one step further and make the *wrong* thing impossible:
+they encode the accessible name as a **type-level obligation**, so an image
+without alt text, a button without a name, or an input without a label does not
+compile. This is accessibility conformance by construction, proven at build
+time by the framework's compile-fail test harness.
+
+Each primitive implements `maud::Render`, so it splices straight into an
+`html!` block, and maps to a specific WCAG 2.1 success criterion:
+
+| Primitive    | WCAG SC                                                      | Obligation                                       |
+| ------------ | ----------------------------------------------------------- | ------------------------------------------------ |
+| `Img`        | 1.1.1 Non-text Content                                      | `alt` is a required constructor argument         |
+| `Button`     | 4.1.2 Name, Role, Value                                     | accessible name is a required constructor argument |
+| `Link`       | 2.4.4 Link Purpose (In Context) / 4.1.2 Name, Role, Value  | link text is a required constructor argument     |
+| `MenuItem`   | 4.1.2 Name, Role, Value                                     | accessible name is a required constructor argument (renders `role="menuitem"`) |
+| `TextField`  | 1.3.1 Info and Relationships / 3.3.2 Labels / 4.1.2         | only a *labeled* field can be rendered (typestate) |
+
+```rust
+use autumn_web::a11y::{Button, Img, Link, MenuItem, TextField};
+use autumn_web::html;
+
+let page = html! {
+    (Img::new("/logo.svg", "Autumn logo"))                 // alt required
+    (Img::decorative("/divider.svg"))                       // explicit alt=""
+    (TextField::new("email").input_type("email").label("Email address"))
+    (Button::icon(html! { span aria-hidden="true" { "🗑" } }, "Delete"))
+    (Button::new("Save").submit())
+    (Link::new("/about", "About us"))                       // link text required
+    (Link::new("https://example.com", "Docs").new_tab())    // rel="noopener noreferrer"
+    (MenuItem::new("Settings"))                             // role="menuitem", name required
+    (MenuItem::new("Home").href("/"))                       // link-style menu item
+};
+```
+
+`Link::new` takes the visible link text as a required argument (an icon-only
+link routes its name to `aria-label` via `Link::icon`), and `MenuItem::new`
+requires the accessible name, emitting `role="menuitem"` on a `<button>` by
+default or an `<a>` when an `.href(..)` is attached.
+
+### Red build → fix → green build
+
+**Red** — an alt-less image or an unlabeled input used to compile clean. With
+the typed primitives it does not:
+
+```rust
+// error[E0061]: this function takes 2 arguments but 1 argument was supplied
+let _ = Img::new("/logo.png");
+
+// error[E0061]: this function takes 2 arguments but 1 argument was supplied
+//        — a link with no text has no accessible name
+let _ = Link::new("/about");
+
+// error[E0061]: this function takes 1 argument but 0 arguments were supplied
+//        — a menu item must carry an accessible name
+let _ = MenuItem::new();
+
+// error: no method named `render` found for `TextField<NoLabel>`
+//        — an unlabeled field cannot be turned into markup
+let _ = TextField::new("email").render();
+```
+
+**Fix** — supply the accessible name / attach a label:
+
+```rust
+let _ = Img::new("/logo.png", "Company logo");            // ✅ compiles
+let _ = Link::new("/about", "About us");                  // ✅ compiles
+let _ = MenuItem::new("Settings");                        // ✅ compiles
+let _ = TextField::new("email").label("Email").render();  // ✅ compiles
+```
+
+**Green** — the build passes only once every primitive carries its accessible
+name. `TextField::new(..)` returns a `TextField<NoLabel>`; attaching a label
+with `.label(..)`, `.aria_label(..)`, or `.labelled_by(..)` transitions it to
+`TextField<Labeled>`, the only state that implements `Render`. There is no
+`.render()`/`.build()` on the unlabeled state, so an unlabeled field is
+literally unrepresentable as markup.
+
+What this proves at compile time: the *presence* of an accessible name on every
+image, button, and text field. What still belongs to runtime/authoring review:
+whether that name is *meaningful* (a helpful `alt`, not `"image"`), plus page
+structure, contrast, and focus order — the checklist and audit tooling above
+cover those.
+
+---
+
+## `autumn a11y verify` (build-time raw-`html!` audit)
+
+The typed primitives above are the *compile-time proof*: code that uses `Img`,
+`Button`, `Link`, `MenuItem`, or `TextField` cannot ship without an accessible
+name, so it never needs re-checking. But a project can always drop down to raw
+`maud::html! { … }` markup, which bypasses the primitives entirely and the type
+system cannot see. `autumn a11y verify` is the net for that escape hatch.
+
+Because there is no walkable widget tree at runtime, `verify` is a **static**
+pass: it token-scans the `html!` blocks in your project's `.rs` files (the same
+descent `autumn i18n check` uses to find `t!` calls inside `html!`) and reports
+raw elements that are missing an accessible name. It reuses the WCAG success
+criteria, rule ids, and severity levels of `autumn check --a11y`, applied to
+source rather than rendered HTML.
+
+### What it checks
+
+| Rule id       | Element                              | Condition                                                              | WCAG SC               |
+| ------------- | ----------------------------------- | --------------------------------------------------------------------- | --------------------- |
+| `image-alt`   | `<img>`                             | no `alt` attribute                                                     | 1.1.1                 |
+| `label`       | `<input>` / `<select>` / `<textarea>` | no matching `<label for=…>`, `aria-label`, or `aria-labelledby`       | 1.3.1 / 3.3.2 / 4.1.2 |
+| `button-name` | `<button>`                          | no text content and no `aria-label`/`aria-labelledby`                  | 4.1.2                 |
+| `link-name`   | `<a href>`                          | no link text and no `aria-label`/`aria-labelledby`                     | 2.4.4 / 4.1.2         |
+
+Each finding carries the fix hint — the typed primitive that discharges the
+obligation at compile time (`Img::new(src, alt)`, `TextField::new(..).label(..)`,
+`Button::new(name)`, `Link::new(href, text)`).
+
+### Usage
+
+```bash
+# Audit the current project (defaults to the working directory)
+autumn a11y verify
+
+# Point at a specific crate/directory
+autumn a11y verify ./crates/web
+
+# Machine-readable conformance manifest
+autumn a11y verify --format json
+
+# Fail on any finding (Moderate and above), mirroring `i18n check --strict`
+autumn a11y verify --strict
+```
+
+### `--format json` (conformance manifest)
+
+The JSON output is an array of findings keyed to WCAG success criteria plus a
+summary, suitable for archiving as a conformance manifest:
+
+```json
+{
+  "files_scanned": 12,
+  "html_blocks": 34,
+  "findings": [
+    {
+      "file": "src/views/profile.rs",
+      "line": 42,
+      "element": "img",
+      "rule_id": "image-alt",
+      "wcag": "1.1.1",
+      "severity": "Serious",
+      "message": "raw <img> has no alt attribute",
+      "hint": "use autumn_web::a11y::Img::new(src, alt) / Img::decorative(src)"
+    }
+  ],
+  "summary": { "critical": 0, "serious": 1, "moderate": 0, "total": 1 }
+}
+```
+
+### CI integration
+
+`autumn a11y verify` exits non-zero when any finding meets the failure threshold
+(Serious by default; `--strict` lowers it to Moderate), so it fails the build
+just like `autumn i18n check`:
+
+```yaml
+# GitHub Actions example
+- name: Accessibility (raw html!) verification
+  run: autumn a11y verify --format json
+```
+
+### Scope and limitations
+
+The primitives are the proof; `verify` is the safety net. Code that splices a
+typed primitive — `(Img::new(src, alt))` — is a `(expr)` splice, not an `img`
+element, so it is **never** re-scanned or falsely flagged. Like `autumn i18n
+check`, the scanner reads tokens rather than a resolved AST and always errs
+toward *not* flagging what it cannot resolve, so it never breaks CI on a false
+positive: a spliced attribute value or content (`alt=(caption)`,
+`button { (label) }`) is treated as present, and a `<label for=…>`/`id`
+association a splice makes unresolvable suppresses the `label` finding.
+
+In short, `verify` is **best-effort and advisory**. Because it prefers to skip
+anything ambiguous, dynamic, or non-maud — unresolved splices, complex Rust
+expressions, and non-maud `html!` macros are passed over rather than guessed at
+— a clean run is not itself a proof of accessibility: the scanner can *miss* a
+defect buried in exotic markup (an acceptable trade by design), so its
+raw-`html!` findings are advisory-grade signal and may not be exhaustive. For
+the real, by-construction guarantee, route accessible content through the typed
+primitives in `autumn_web::a11y`, where an accessible name is a compile-time
+type obligation (proven by trybuild) rather than something a source scan has to
+infer.
 
 ---
 

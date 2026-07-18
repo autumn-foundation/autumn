@@ -1,0 +1,25 @@
+# Runtime latency budgets for the Autumn CI gate.
+#
+# Each entry sets the p99 latency budget in milliseconds for a gated path.
+# The gate fails CI if the median p99 across R=3 measured k6 runs exceeds the budget.
+#
+# Budget derivation:
+#   budget_p99_ms = ceil(baseline_median_p99 * 1.20)
+#   with a minimum of 50ms to accommodate shared CI runner variability.
+#
+# Baseline (2026-06-22, Intel Xeon @ 2.80GHz, 4 vCPU, 15GiB RAM, k6 v0.55.0):
+#   GET /api/posts  median p99 = 4.9ms  (runs: 4.7, 4.9, 5.6ms)
+#   GET /posts      median p99 = 4.2ms  (runs: 3.9, 4.2, 4.4ms)
+#
+# The 50ms floor accounts for shared CI runner overhead (typically 5-20x
+# slower than bare-metal local runs due to CPU contention and memory pressure).
+# A >=25% regression on the hot path relative to CI baseline trips this gate
+# when the floor is not the active constraint.
+#
+# Re-baselining: see benchmarks/runtime/README.md § "Re-baselining the latency budget".
+
+[paths."GET /api/posts"]
+p99_ms = 50
+
+[paths."GET /posts"]
+p99_ms = 50

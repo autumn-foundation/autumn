@@ -1,0 +1,167 @@
+name: Macro-Scaling Benchmark Gate
+
+# Gates that the warm incremental rebuild stays near-flat as an Autumn app
+# grows (issue #983). A synthetic app is generated at N ∈ {1,25,50,100}
+# #[get] handlers + #[model]/#[repository] pairs; a single-handler edit is
+# timed N_runs times at each size; the gate asserts:
+#   • p95 ≤ 8 s at every size (absolute ceiling)
+#   • slope (p95@N=100 / p95@N=1) ≤ 2× (near-flat growth)
+#   • slope regression vs accepted baseline ≤ 20% (once baseline established)
+#
+# Per-PR: only the dry-run budget table and unit tests run (no compilation of
+# synthetic apps; that takes minutes per size point). Scheduled / manual: the
+# full sweep runs.
+on:
+  schedule:
+    # Every Monday at 08:00 UTC (after dev-loop 06:00 and cold-start 07:00).
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: "Comma-separated app sizes to sweep (e.g. 1,25,50,100)"
+        required: false
+        default: "1,25,50,100"
+      runs:
+        description: "Number of timed incremental builds per size"
+        required: false
+        default: "5"
+      fail_on_regression:
+        description: "Exit 1 if any budget is exceeded"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+  pull_request:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "autumn-cli/src/dev_loop_scaling.rs"
+      - "autumn-cli/src/scaling_driver.rs"
+      - "autumn-cli/src/main.rs"
+      - "benchmarks/dev-loop-scaling/baseline.json"
+      - "docs/guide/dev-loop-latency.md"
+      - ".github/workflows/dev-loop-scaling.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Budget table smoke-check (runs on every PR, no build needed) ───────────
+  budget-table:
+    name: Scaling budget table (dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Build CLI
+        run: cargo build -p autumn-cli
+
+      - name: Print scaling budget table
+        run: |
+          AUTUMN_BENCH_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          AUTUMN_BENCH_RUST_VERSION="$(rustc --version)" \
+          ./target/debug/autumn dev-loop-bench --scaling --dry-run
+
+  # ── Unit tests for scaling module ─────────────────────────────────────────
+  unit-tests:
+    name: Scaling unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Run scaling unit tests
+        shell: bash
+        run: |
+          cargo test -p autumn-cli \
+            -- dev_loop_scaling scaling_driver \
+            2>&1 | tee test-output.txt
+          grep -E "^test result:" test-output.txt
+          # Guard against a stale filter matching zero tests.
+          for module in dev_loop_scaling scaling_driver; do
+            if ! grep -qE "^test ${module}::tests::.* \.\.\. ok" test-output.txt; then
+              echo "::error::No ${module} unit tests ran — the test filter may be stale."
+              exit 1
+            fi
+          done
+
+  # ── Live scaling sweep (scheduled / manual only) ───────────────────────────
+  measure:
+    name: Measure macro-scaling sweep (${{ inputs.sizes || '1,25,50,100' }})
+    runs-on: ubuntu-latest
+    # Only run the live sweep on schedule or manual dispatch.
+    if: github.event_name != 'pull_request'
+    # Compiling the synthetic app at N=100 takes several minutes; allow up to
+    # 120 minutes total for the full 4-size sweep.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Build CLI
+        run: cargo build -p autumn-cli
+
+      - name: Run scaling sweep
+        id: bench
+        shell: bash
+        run: |
+          export AUTUMN_BENCH_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export AUTUMN_BENCH_RUST_VERSION="$(rustc --version)"
+          SIZES="${{ inputs.sizes || '1,25,50,100' }}"
+          RUNS="${{ inputs.runs || '5' }}"
+          FAIL="${{ inputs.fail_on_regression || 'true' }}"
+          FAIL_FLAG=""
+          if [ "$FAIL" = "true" ]; then FAIL_FLAG="--fail-on-regression"; fi
+          ./target/debug/autumn dev-loop-bench --scaling \
+            --sizes "$SIZES" \
+            --runs "$RUNS" \
+            --baseline benchmarks/dev-loop-scaling/baseline.json \
+            --output scaling-report.json \
+            $FAIL_FLAG | tee scaling-summary.txt
+
+      - name: Upload JSON report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: scaling-report-${{ github.run_id }}
+          path: |
+            scaling-report.json
+            scaling-summary.txt
+          retention-days: 90
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## Macro-Scaling Benchmark Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          cat scaling-summary.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Full JSON report archived as workflow artifact \`scaling-report-${{ github.run_id }}\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "See [dev-loop-latency.md](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/guide/dev-loop-latency.md#scaling-macro-tax-budget) for the budget matrix and methodology." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Regression gate
+        if: ${{ inputs.fail_on_regression == 'true' || inputs.fail_on_regression == '' }}
+        run: |
+          # Fail closed: a missing or unparseable report must NOT pass the gate.
+          ALL_PASSED=$(jq -r '.all_passed' scaling-report.json 2>/dev/null || echo "false")
+          if [ "$ALL_PASSED" != "true" ]; then
+            echo "::error::Macro-scaling benchmark failed: p95 ceiling or slope budget exceeded."
+            echo "::error::See the report artifact for per-size diagnostics."
+            exit 1
+          fi

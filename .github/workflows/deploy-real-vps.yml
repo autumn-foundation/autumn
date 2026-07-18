@@ -1,0 +1,221 @@
+# Real-VPS deploy validation (issue #1948, AC-7 follow-up).
+#
+# OPT-IN ONLY. This workflow provisions a throwaway cloud VM and runs the REAL
+# `autumn deploy` lifecycle against it to cover the four things the container e2e
+# harness (autumn-cli/tests/deploy_e2e.rs) structurally cannot: a real kernel
+# reboot, bare-host prep from a STOCK image, the onboarding wall-clock metric,
+# and real pam_systemd / XDG_RUNTIME_DIR control-socket fidelity.
+#
+# It NEVER runs on `pull_request` or `push`: it costs money (a real VM) and must
+# never block or bill routine CI. It runs only when a maintainer triggers it
+# (`workflow_dispatch`) or on the off-peak nightly schedule.
+#
+# Provider: Hetzner Cloud (cheapest throwaway VMs; single `hcloud` CLI + one
+# `HCLOUD_TOKEN` secret). The provider-specific steps are grouped so another
+# provider can be swapped in without touching the lifecycle script.
+name: Deploy real-VPS validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      ubuntu_image:
+        description: "Stock Ubuntu image to provision (no pre-baked deploy tooling)"
+        type: string
+        default: "ubuntu-24.04"
+        # Optional HINT only. The provisioning step queries Hetzner live and
+        # picks the first orderable type from a cheapest-first preference list;
+        # this value, when set, is merely tried first (empty on scheduled runs).
+        # No need to update it when Hetzner retires a plan — that is exactly the
+        # failure class the live selection removes.
+      server_type:
+        description: "Hetzner server type (optional hint; live selection is authoritative)"
+        type: string
+        default: ""
+      location:
+        description: "Hetzner location"
+        type: string
+        default: "nbg1"
+      kamal_proxy_version:
+        description: "kamal-proxy image tag to install during host bootstrap (pin a released tag, not latest)"
+        type: string
+        default: "v0.9.2"
+  schedule:
+    # 04:17 UTC nightly — off-peak, jittered minute to avoid the top-of-hour herd.
+    - cron: "17 4 * * *"
+
+# Never run two provisioning jobs at once (they share a per-run ssh-key name
+# derived from the run id, but overlapping runs would still race on quota/cost).
+concurrency:
+  group: deploy-real-vps
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  real-vps:
+    name: Real-VPS deploy lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      APP_NAME: rvpsapp
+      PUBLIC_PORT: "80"
+      SSH_USER: root
+      # 15-minute onboarding success budget (issue AC-1 metric).
+      ONBOARD_BUDGET_SECS: "900"
+      # Per-run names so parallel/aborted runs never collide or leak.
+      HCLOUD_SERVER_NAME: autumn-rvps-${{ github.run_id }}-${{ github.run_attempt }}
+      HCLOUD_SSH_KEY_NAME: autumn-rvps-key-${{ github.run_id }}-${{ github.run_attempt }}
+      # Credentials are consumed from the environment (job-level indirection), not
+      # re-referenced per step. HCLOUD_TOKEN is the ONLY required one; the signing
+      # secret is optional — a later step generates one per run when it is unset.
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      AUTUMN_DEPLOY_SIGNING_SECRET: ${{ secrets.AUTUMN_DEPLOY_SIGNING_SECRET }}
+    steps:
+      # ── Constraint 1: fail CLEARLY and early when the ONE required credential
+      # is absent. The workflow reads `HCLOUD_TOKEN` from the environment (a repo
+      # secret, or however you configure Actions env) — nothing is hardcoded. The
+      # app signing secret is intentionally NOT required here: it is read from the
+      # environment when provided and otherwise generated per run (see below). ──
+      - name: Check required credential is present
+        run: |
+          if [ -z "${HCLOUD_TOKEN}" ]; then
+            echo "::error::Real-VPS validation reads HCLOUD_TOKEN from the environment, but it is not set."
+            printf 'Supply HCLOUD_TOKEN (Hetzner Cloud API token, Read & Write; from https://console.hetzner.cloud → project → Security → API Tokens) — e.g. as a repository secret (Settings → Secrets and variables → Actions) — then re-run.\n'
+            exit 1
+          fi
+          echo "HCLOUD_TOKEN is present."
+
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Build the autumn CLI (release)
+        run: cargo build --locked -p autumn-cli --release --bin autumn
+
+      - name: Install hcloud CLI
+        run: |
+          ver="1.66.0"
+          curl -fsSL "https://github.com/hetznercloud/cli/releases/download/v${ver}/hcloud-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin hcloud
+          hcloud version
+
+      - name: Generate ephemeral SSH keypair
+        run: |
+          ssh-keygen -t ed25519 -N "" -q -f "${RUNNER_TEMP}/rvps_key"
+          echo "SSH_KEY=${RUNNER_TEMP}/rvps_key" >> "${GITHUB_ENV}"
+
+      # ── Provider-specific provisioning (Hetzner Cloud). Swap this block for a
+      # different provider without touching the lifecycle script below. ────────
+      #
+      # RESILIENT server-type selection (issue #2019). Hardcoding one
+      # --type/--location wedged the run every time Hetzner retired or sold out a
+      # plan (cx22, then cpx11 — "Server Type X is unavailable in Y and can no
+      # longer be ordered"). Instead we query Hetzner LIVE and pick the first
+      # ACTUALLY-ORDERABLE type from a cheapest-first preference list, trying the
+      # configured location first and then EU fallbacks; the choice is logged.
+      # Orderability comes from each server type's own `locations[].available`
+      # flag — the non-deprecated signal (the datacenter `server_types.available`
+      # list stops being returned after 2026-10-01). If nothing matches we fail
+      # with the full per-location availability table. This converts the whole
+      # "guessed-wrong-static-type" failure class into a logged runtime decision.
+      - name: Provision throwaway VM (Hetzner Cloud)
+        id: provision
+        run: |
+          set -euo pipefail
+          hcloud ssh-key create --name "${HCLOUD_SSH_KEY_NAME}" --public-key-from-file "${SSH_KEY}.pub"
+
+          # Cheapest-first preference list of CURRENT Hetzner shared-vCPU plans
+          # (verified 2026-07 against docs.hetzner.cloud/changelog): cost-optimized
+          # Intel `cx*3` (cx23/cx33/cx43/cx53) interleaved small->large with AMD
+          # `cpx*` (cpx22/cpx32/cpx42/cpx52/cpx62). The prior cx22/cx32/cx42/cx52
+          # and cpx11/cpx21/cpx31/cpx41/cpx51 generations were retired for new
+          # orders on 2026-01-01, so those names are dropped (a stale name is
+          # harmless — it just never matches — but omitting a current one is the
+          # bug this list guards against). Refresh when Hetzner retires a
+          # generation (watch the changelog for the next server-type deprecation).
+          # The workflow_dispatch `server_type` input is kept for backward-compat
+          # but is now only a HINT: it is tried first when set (empty on scheduled
+          # runs), then the live selection is authoritative — a retired/sold-out
+          # hint simply falls through.
+          PREF_TYPES="${{ inputs.server_type }} cx23 cpx22 cx33 cpx32 cx43 cpx42 cx53 cpx52 cpx62"
+          # Configured location first, then EU fallbacks (deduped, order kept).
+          LOCATIONS="${{ inputs.location || 'nbg1' }} fsn1 hel1 nbg1"
+
+          types_json="$(hcloud server-type list -o json)"
+          chosen_type=""; chosen_loc=""
+          for loc in $(printf '%s\n' $LOCATIONS | awk '!seen[$0]++'); do
+            # Names of server types orderable (available == true) in this location.
+            avail_names="$(printf '%s' "$types_json" \
+              | jq -r --arg loc "$loc" '.[] | select(any(.locations[]?; .name == $loc and .available)) | .name')"
+            [ -z "$avail_names" ] && continue
+            for pref in $PREF_TYPES; do
+              if printf '%s\n' "$avail_names" | grep -qx "$pref"; then
+                chosen_type="$pref"; chosen_loc="$loc"; break
+              fi
+            done
+            [ -n "$chosen_type" ] && break
+          done
+
+          if [ -z "$chosen_type" ]; then
+            echo "::error::No preferred server type ($PREF_TYPES) is orderable in any of: $LOCATIONS"
+            echo "=== orderable server types per location (live Hetzner availability) ==="
+            for loc in $(printf '%s\n' $LOCATIONS | awk '!seen[$0]++'); do
+              printf -- '-- %s --\n' "$loc"
+              printf '%s' "$types_json" \
+                | jq -r --arg loc "$loc" '.[] | select(any(.locations[]?; .name == $loc and .available)) | .name' \
+                | paste -sd' ' -
+            done
+            echo "=== hcloud server-type list ==="; hcloud server-type list
+            echo "=== hcloud datacenter list ==="; hcloud datacenter list
+            exit 1
+          fi
+
+          echo "Selected server type '$chosen_type' in location '$chosen_loc' (live Hetzner availability)."
+          hcloud server create \
+            --name "${HCLOUD_SERVER_NAME}" \
+            --type "$chosen_type" \
+            --image "${{ inputs.ubuntu_image || 'ubuntu-24.04' }}" \
+            --location "$chosen_loc" \
+            --ssh-key "${HCLOUD_SSH_KEY_NAME}"
+          ip="$(hcloud server ip "${HCLOUD_SERVER_NAME}")"
+          echo "Provisioned ${HCLOUD_SERVER_NAME} (${chosen_type}/${chosen_loc}) at ${ip}"
+          echo "TARGET_HOST=${ip}" >> "${GITHUB_ENV}"
+          echo "HCLOUD_LOCATION=${chosen_loc}" >> "${GITHUB_ENV}"
+          echo "HCLOUD_SERVER_TYPE=${chosen_type}" >> "${GITHUB_ENV}"
+
+      # The app signing secret is env-provided WHEN PRESENT, per-run GENERATED
+      # when absent (a throwaway VM never needs a persistent secret). Either way
+      # the effective value is masked so it never prints, then exported as
+      # SIGNING_SECRET for the lifecycle script.
+      - name: Resolve app signing secret (env-provided or generated per run)
+        run: |
+          set -euo pipefail
+          if [ -n "${AUTUMN_DEPLOY_SIGNING_SECRET}" ]; then
+            secret="${AUTUMN_DEPLOY_SIGNING_SECRET}"
+            echo "Using AUTUMN_DEPLOY_SIGNING_SECRET from the environment."
+          else
+            secret="$(openssl rand -hex 32)"
+            echo "AUTUMN_DEPLOY_SIGNING_SECRET not set — generated a per-run signing secret."
+          fi
+          echo "::add-mask::${secret}"
+          echo "SIGNING_SECRET=${secret}" >> "${GITHUB_ENV}"
+
+      - name: Run real-VPS deploy lifecycle assertions
+        env:
+          AUTUMN_BIN: ${{ github.workspace }}/target/release/autumn
+          SSH_PORT: "22"
+          KAMAL_PROXY_VERSION: ${{ inputs.kamal_proxy_version || 'v0.9.2' }}
+        run: |
+          chmod +x scripts/deploy-real-vps-validate.sh
+          ./scripts/deploy-real-vps-validate.sh
+
+      # ── Always-cleanup: destroy the VM and deregister the ephemeral key even if
+      # any step above failed (idempotent — safe if provisioning never ran). No
+      # lingering/billing VM is ever left behind. ──────────────────────────────
+      - name: Destroy VM and deregister SSH key
+        if: always()
+        run: |
+          hcloud server delete "${HCLOUD_SERVER_NAME}" || echo "server already gone / never created"
+          hcloud ssh-key delete "${HCLOUD_SSH_KEY_NAME}" || echo "ssh-key already gone / never created"

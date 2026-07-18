@@ -1026,6 +1026,19 @@ tokio::task_local! {
     pub static WEBHOOK_REPLAY_KEY: ReplayStoreCell;
 }
 
+/// Guard that releases the in-flight webhook replay keys if the handler does not
+/// complete normally.
+///
+/// Webhook delivery is at-least-once: providers retry on any failure, and
+/// handlers are expected to be idempotent. So when a handler fails — whether it
+/// panics, the request-timeout deadline cancels its future (this middleware is
+/// applied *inner* to the timeout layer), or it returns a `5xx` (handled in
+/// [`webhook_replay_cleanup_middleware`]) — the inserted replay keys are removed
+/// so the provider's redelivery is accepted rather than rejected as a replay.
+/// This is deliberate and consistent across all three failure modes; it does
+/// mean a handler that committed its side effect *before* failing can be invoked
+/// again on retry, which is the standard at-least-once contract handlers must
+/// tolerate.
 struct ReplayKeyGuard {
     cell: ReplayStoreCell,
     completed: bool,
@@ -1041,7 +1054,7 @@ impl Drop for ReplayKeyGuard {
             if let Some((store, keys)) = to_remove {
                 tokio::spawn(async move {
                     for key in keys {
-                        tracing::debug!(key = %key, "Releasing webhook replay key due to panic in handler");
+                        tracing::debug!(key = %key, "Releasing webhook replay key after handler panic or deadline cancellation");
                         let _ = store.remove(&key).await;
                     }
                 });

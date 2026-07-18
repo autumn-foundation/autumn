@@ -6,6 +6,7 @@ use axum::{
 };
 use http_body::Body as HttpBody;
 use pin_project_lite::pin_project;
+use secrecy::ExposeSecret;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -26,6 +27,13 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
         parts: &mut axum::http::request::Parts,
         state: &crate::AppState,
     ) -> Result<Self, Self::Rejection> {
+        // Fast path: when the tenancy middleware has already resolved and scoped
+        // the tenant for this request, read it from the task-local rather than
+        // performing a second extraction from headers/session/cookies.
+        if let Ok(Some(tenant_id)) = CURRENT_TENANT.try_with(Clone::clone) {
+            return Ok(Self(tenant_id));
+        }
+
         let config = state
             .extension::<crate::config::AutumnConfig>()
             .ok_or_else(|| {
@@ -51,7 +59,9 @@ pub async fn extract_tenant_from_parts(
     config: &crate::config::AutumnConfig,
 ) -> Result<String, crate::AutumnError> {
     if !config.tenancy.enabled {
-        return Err(crate::AutumnError::bad_request_msg("Tenancy is disabled"));
+        return Err(crate::AutumnError::service_unavailable_msg(
+            "Tenancy is not enabled; set [tenancy] enabled = true in autumn.toml",
+        ));
     }
 
     match config.tenancy.source.as_str() {
@@ -243,7 +253,7 @@ pub async fn extract_tenant_from_parts(
 
             let token_data = ::jsonwebtoken::decode::<serde_json::Value>(
                 token,
-                &::jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &::jsonwebtoken::DecodingKey::from_secret(secret.expose_secret().as_bytes()),
                 &validation,
             )
             .map_err(|e| {
@@ -296,6 +306,99 @@ pub async fn extract_tenant_from_parts(
     }
 }
 
+/// Returns true when `path` is exempt from tenant resolution.
+///
+/// A path is public if:
+/// - it matches any entry in `tenancy.public_paths` (slash-boundary prefix; empty
+///   entries and trailing slashes in the list are normalized away so they can't
+///   accidentally exempt everything),
+/// - it matches the configured health/liveness/readiness/startup probe paths,
+/// - it is under the actuator prefix (e.g. `/actuator/prometheus`) — so Prometheus
+///   scraping and ops tooling are never blocked by tenancy, or
+/// - it exactly equals `tenancy.login_redirect` — so the redirect target itself is
+///   always reachable even if the operator forgot to add it to `public_paths`,
+///   preventing an infinite redirect loop.
+///
+/// The `OpenAPI`/docs endpoint is deliberately **not** auto-exempted: its mounted
+/// path comes from the programmatic `OpenApiConfig::openapi_json_path` (set via
+/// `AppBuilder::openapi(...)`), which is not visible from `AutumnConfig` here and
+/// can differ from the `[openapi]` `path` field. An app that wants its spec public
+/// under tenancy should list that path in `tenancy.public_paths`.
+///
+/// Matching uses the same slash-boundary prefix semantics as the rest of the
+/// framework (CSRF, CAPTCHA): `/login` matches `/login` and `/login/sso` but not
+/// `/login-admin`.
+fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
+    // Guard against empty prefixes: `path_matches_route_prefix(path, "")` is true
+    // for every absolute path, so an empty entry — whether a stray `public_paths`
+    // item or a misconfigured built-in like `health.path = ""` — would otherwise
+    // exempt the entire application from tenancy.
+    let matches =
+        |prefix: &str| !prefix.is_empty() && crate::router::path_matches_route_prefix(path, prefix);
+
+    // User-configured public paths — normalize trailing slashes so `/static/`
+    // behaves the same as `/static`, but preserve a bare `"/"` (a common landing
+    // page) rather than trimming it away to an empty, never-matching string.
+    let user_paths_match = config.tenancy.public_paths.iter().any(|p| {
+        let p = if p.len() > 1 {
+            p.trim_end_matches('/')
+        } else {
+            p.as_str()
+        };
+        matches(p)
+    });
+
+    // The login_redirect target must always be reachable to prevent an infinite
+    // redirect loop when a user forgets to add it to public_paths. Only auto-exempt
+    // *relative* targets (no authority): those land back on this app, so a loop is
+    // possible and the exemption is warranted. An absolute target — whether an
+    // external IdP (`https://idp.example.com/login`) or even a same-origin URL —
+    // is not auto-exempted: the external case causes no local loop, and we can't
+    // reliably tell same-origin from external here (server.host is the bind
+    // address, not the public host). A same-origin absolute target that must be
+    // public should be listed in `public_paths`. Parse as a URI so a relative
+    // target with a query (`/login?next=/dashboard`) still matches by path.
+    let redirect_match = config
+        .tenancy
+        .login_redirect
+        .as_deref()
+        .and_then(|target| target.parse::<axum::http::Uri>().ok())
+        .filter(|uri| uri.authority().is_none())
+        .is_some_and(|uri| uri.path() == path);
+
+    // Match the actuator prefix against its *normalized* form — the same
+    // transformation the actuator router applies before mounting (trim, drop
+    // trailing slashes, ensure a leading slash). Otherwise a non-canonical config
+    // value like `ops/` or `/ops/` would mount endpoints at `/ops/...` yet never
+    // match the raw string here, breaking the probe/scrape bypass.
+    let actuator_prefix = crate::actuator::normalize_actuator_prefix(&config.actuator.prefix);
+    let actuator_match = if actuator_prefix.is_empty() {
+        // A prefix that normalizes to empty (`/` or blank) is a root mount: the
+        // ops endpoints sit at `/health`, `/prometheus`, … directly. We can't
+        // exempt the whole root, so exempt the actual mounted endpoint paths.
+        crate::actuator::actuator_endpoint_paths(
+            &actuator_prefix,
+            config.actuator.sensitive,
+            config.actuator.prometheus,
+        )
+        .iter()
+        .any(|p| matches(p))
+    } else {
+        matches(&actuator_prefix)
+    };
+
+    // Built-in probe endpoints mount at their *exact* configured path
+    // (`mount_probe_endpoints` installs `router.route(&health.path, …)`, not a
+    // subtree), so match them exactly. Prefix matching here would wrongly exempt
+    // an app's own `/health/history` while the probe only serves `/health`.
+    let probe_match = path == config.health.path
+        || path == config.health.live_path
+        || path == config.health.ready_path
+        || path == config.health.startup_path;
+
+    user_paths_match || redirect_match || probe_match || actuator_match
+}
+
 // Tenancy middleware for Axum requests
 pub async fn tenancy_middleware(
     State(state): State<crate::AppState>,
@@ -312,9 +415,36 @@ pub async fn tenancy_middleware(
     }
 
     let (mut parts, body) = request.into_parts();
+
+    // Public paths (login/signup pages, static assets, health probes) stay
+    // reachable without a tenant so unauthenticated visitors can reach them —
+    // otherwise a session/jwt-sourced SaaS could never show a login screen.
+    if is_public_path(parts.uri.path(), &config) {
+        return next.run(Request::from_parts(parts, body)).await;
+    }
+
     let tenant_id = match extract_tenant_from_parts(&mut parts, &config).await {
         Ok(t) => t,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            // For browser logins, bounce a missing/unauthenticated tenant to the
+            // configured login page instead of returning a raw 401. Only do this
+            // for clients that accept HTML (navigating browsers): API clients
+            // (e.g. `Accept: application/json`) expect the 401 so their error
+            // handling isn't broken by a 303 to a login page. Other error classes
+            // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
+            // are not masked as login redirects.
+            if e.status() == axum::http::StatusCode::UNAUTHORIZED
+                && let Some(target) = &config.tenancy.login_redirect
+                && parts
+                    .headers
+                    .get(axum::http::header::ACCEPT)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|accept| accept.contains("text/html"))
+            {
+                return axum::response::Redirect::to(target).into_response();
+            }
+            return e.into_response();
+        }
     };
 
     // Tag the request-scoped log context (#1169) so every subsequent event
@@ -323,14 +453,40 @@ pub async fn tenancy_middleware(
 
     let request = Request::from_parts(parts, body);
     let tenant_id_clone = tenant_id.clone();
+
+    // Bind a lazily-materializing handle to the tenant's memory cell for the
+    // request lifecycle. The registry itself is lazily registered in the app
+    // state's extension map on first use, but building a handle does NOT create
+    // a cell: the cell is materialized only when a handler (or a streaming body)
+    // first accesses it via `current_tenant_cell()`. Requests to routes that
+    // never touch tenant memory therefore leave the registry untouched, even
+    // with request-controlled tenant ids.
+    let registry = state.extension_or_insert_with(|| {
+        crate::tenant_cell::TenantCellRegistry::with_limits(
+            config.tenancy.max_cells,
+            (config.tenancy.idle_ttl_secs > 0)
+                .then(|| std::time::Duration::from_secs(config.tenancy.idle_ttl_secs)),
+        )
+    });
+    let handle = crate::tenant_cell::TenantCellHandle::new(
+        (*registry).clone(),
+        tenant_id.clone(),
+        config.tenancy.quota_bytes,
+    );
+    let handle_for_body = Some(handle.clone());
+
     let response = CURRENT_TENANT
-        .scope(Some(tenant_id), next.run(request))
+        .scope(
+            Some(tenant_id),
+            crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(handle), next.run(request)),
+        )
         .await;
 
     let (parts, body) = response.into_parts();
     let wrapped = TenantPropagatingBody {
         inner: body,
         tenant_id: tenant_id_clone,
+        handle: handle_for_body,
     };
     Response::from_parts(parts, axum::body::Body::new(wrapped))
 }
@@ -343,6 +499,7 @@ pin_project! {
         #[pin]
         pub inner: B,
         pub tenant_id: String,
+        pub handle: Option<crate::tenant_cell::TenantCellHandle>,
     }
 }
 
@@ -359,7 +516,10 @@ where
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
         let tenant_id = this.tenant_id.clone();
-        CURRENT_TENANT.sync_scope(Some(tenant_id), || this.inner.poll_frame(cx))
+        let handle = this.handle.clone();
+        CURRENT_TENANT.sync_scope(Some(tenant_id), || {
+            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(handle, || this.inner.poll_frame(cx))
+        })
     }
 
     fn is_end_stream(&self) -> bool {
@@ -436,6 +596,24 @@ where
     fn get_values(self) -> Self::Values {
         use ::diesel::ExpressionMethods;
         (self.inner, Table::column().eq(self.tenant_id))
+    }
+}
+
+/// Helper trait to display or extract a string representation of the tenant ID.
+pub trait DisplayTenantId {
+    /// Returns the string slice of the tenant ID.
+    fn tenant_id_str(&self) -> &str;
+}
+
+impl DisplayTenantId for String {
+    fn tenant_id_str(&self) -> &str {
+        self
+    }
+}
+
+impl DisplayTenantId for Option<String> {
+    fn tenant_id_str(&self) -> &str {
+        self.as_deref().unwrap_or("default")
     }
 }
 
@@ -543,5 +721,192 @@ mod tests {
         });
         let result = extract_tenant_from_parts(&mut parts, &config).await;
         assert_eq!(result.unwrap(), "tenant3");
+    }
+
+    fn public_paths_config(paths: &[&str]) -> crate::config::AutumnConfig {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.public_paths = paths.iter().map(|s| (*s).to_string()).collect();
+        c
+    }
+
+    /// A configured public path matches itself and any slash-delimited subpath.
+    #[test]
+    fn public_path_exact_and_subtree_match() {
+        let c = public_paths_config(&["/login", "/static"]);
+        assert!(is_public_path("/login", &c));
+        assert!(is_public_path("/login/sso", &c));
+        assert!(is_public_path("/static/css/app.css", &c));
+    }
+
+    /// Exemptions do not bleed into adjacent prefixes or unrelated routes.
+    #[test]
+    fn public_path_does_not_bleed_to_adjacent_prefix() {
+        let c = public_paths_config(&["/login"]);
+        assert!(!is_public_path("/login-admin", &c));
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// Health/liveness/readiness/startup probes are public without being listed.
+    #[test]
+    fn health_paths_are_always_public() {
+        let c = crate::config::AutumnConfig::default();
+        assert!(c.tenancy.public_paths.is_empty());
+        assert!(is_public_path(&c.health.path, &c));
+        assert!(is_public_path(&c.health.live_path, &c));
+        assert!(is_public_path(&c.health.ready_path, &c));
+        assert!(is_public_path(&c.health.startup_path, &c));
+    }
+
+    /// Probe exemptions match the configured path *exactly* (the probe mounts at
+    /// that exact path), so an app's own subroute like `/health/history` is still
+    /// tenant-scoped rather than wrongly treated as public.
+    #[test]
+    fn probe_paths_match_exactly_not_as_prefix() {
+        let c = crate::config::AutumnConfig::default();
+        assert!(is_public_path("/health", &c));
+        assert!(!is_public_path("/health/history", &c));
+        assert!(!is_public_path("/live/details", &c));
+    }
+
+    /// Empty-string entries in `public_paths` must not exempt every path.
+    #[test]
+    fn empty_public_path_entry_does_not_exempt_all() {
+        let c = public_paths_config(&[""]);
+        assert!(!is_public_path("/dashboard", &c));
+        assert!(!is_public_path("/secret", &c));
+    }
+
+    /// Trailing-slash entries in `public_paths` behave like their unslashed form.
+    #[test]
+    fn trailing_slash_entry_matches_subtree() {
+        let c = public_paths_config(&["/static/"]);
+        assert!(is_public_path("/static", &c));
+        assert!(is_public_path("/static/css/app.css", &c));
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// The actuator prefix is always public so Prometheus scraping is never blocked.
+    #[test]
+    fn actuator_prefix_is_always_public() {
+        let c = crate::config::AutumnConfig::default();
+        assert!(is_public_path(&c.actuator.prefix, &c));
+        assert!(is_public_path(
+            &format!("{}/prometheus", c.actuator.prefix),
+            &c
+        ));
+        assert!(is_public_path(&format!("{}/health", c.actuator.prefix), &c));
+    }
+
+    /// A non-canonical actuator prefix (no leading slash, trailing slash) is
+    /// exempted at its *mounted* (normalized) path, matching the actuator router.
+    #[test]
+    fn actuator_prefix_is_normalized_before_exemption() {
+        for raw in ["ops/", "/ops/", "/ops", "ops"] {
+            let mut c = crate::config::AutumnConfig::default();
+            c.actuator.prefix = raw.to_string();
+            assert!(
+                is_public_path("/ops/prometheus", &c),
+                "prefix {raw:?} should exempt the mounted /ops/prometheus path"
+            );
+            assert!(
+                is_public_path("/ops", &c),
+                "prefix {raw:?} should exempt the mounted /ops base path"
+            );
+            assert!(!is_public_path("/dashboard", &c));
+        }
+    }
+
+    /// A root-mounted actuator (`prefix = "/"`, normalizing to empty) exempts its
+    /// actual endpoint paths rather than failing the empty-prefix guard.
+    #[test]
+    fn root_mounted_actuator_endpoints_are_public() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.actuator.prefix = "/".to_string();
+        c.actuator.prometheus = true;
+        // Prometheus + metrics live at root here.
+        assert!(is_public_path("/prometheus", &c));
+        assert!(is_public_path("/metrics", &c));
+        // But the root itself does not exempt the whole app.
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// The `OpenAPI`/docs spec path is NOT auto-exempted: its real mounted path
+    /// lives in the programmatic `OpenApiConfig`, not `AutumnConfig`, so apps that
+    /// want it public under tenancy must list it in `public_paths`.
+    #[test]
+    fn openapi_path_is_not_auto_exempt() {
+        let c = crate::config::AutumnConfig::default();
+        assert!(c.openapi_runtime.enabled);
+        assert!(!is_public_path(&c.openapi_runtime.path, &c));
+        // It becomes public only when explicitly listed.
+        let c = public_paths_config(&["/openapi.json"]);
+        assert!(is_public_path("/openapi.json", &c));
+    }
+
+    /// The `login_redirect` target is always public even if missing from
+    /// `public_paths`, preventing an infinite redirect loop.
+    #[test]
+    fn login_redirect_target_is_always_public() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.login_redirect = Some("/auth/login".to_string());
+        // Not in public_paths — should still be reachable.
+        assert!(is_public_path("/auth/login", &c));
+        // Only the exact target, not adjacent paths.
+        assert!(!is_public_path("/auth/login/sso", &c));
+    }
+
+    /// A `login_redirect` target carrying a query string is matched by its path
+    /// component, so the login page is still exempted and no loop forms.
+    #[test]
+    fn login_redirect_target_with_query_is_public_by_path() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.login_redirect = Some("/login?next=/dashboard".to_string());
+        // The follow-up request arrives as just the path.
+        assert!(is_public_path("/login", &c));
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// An absolute-URL `login_redirect` target (external `IdP`, or even same-origin)
+    /// is NOT auto-exempted: the local path is only made public for relative
+    /// targets, since we can't validate the authority here. Same-origin absolute
+    /// targets that must be public belong in `public_paths`.
+    #[test]
+    fn login_redirect_absolute_url_is_not_auto_exempt() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.login_redirect = Some("https://idp.example.com/login".to_string());
+        assert!(!is_public_path("/login", &c));
+
+        // Same-origin absolute is likewise not auto-exempted (authority present).
+        c.tenancy.login_redirect = Some("https://app.example.com/login".to_string());
+        assert!(!is_public_path("/login", &c));
+
+        // Listing it explicitly still works.
+        c.tenancy.public_paths = vec!["/login".to_string()];
+        assert!(is_public_path("/login", &c));
+    }
+
+    /// A bare `"/"` in `public_paths` exempts the root exactly (a common landing
+    /// page) and is not silently trimmed away to an empty, never-matching entry.
+    #[test]
+    fn root_public_path_is_preserved() {
+        let c = public_paths_config(&["/"]);
+        assert!(is_public_path("/", &c));
+        // The slash-boundary semantics mean `/` matches only the root, not every
+        // path, so protected routes still require a tenant.
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// A misconfigured empty built-in path (e.g. `health.path = ""`) must not
+    /// exempt the whole application from tenancy.
+    #[test]
+    fn empty_builtin_path_does_not_exempt_all() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.health.path = String::new();
+        c.health.live_path = String::new();
+        c.health.ready_path = String::new();
+        c.health.startup_path = String::new();
+        c.actuator.prefix = String::new();
+        assert!(!is_public_path("/dashboard", &c));
+        assert!(!is_public_path("/", &c));
     }
 }

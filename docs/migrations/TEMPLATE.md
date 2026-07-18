@@ -114,6 +114,22 @@ Items that were deprecated during the `{X.Y}` line and have now been
 removed. Link each to the release where the deprecation notice first
 appeared so users can see how much warning they had.
 
+### Config-key removals
+
+Config keys removed in this major release were registered in
+`DEPRECATED_CONFIG_KEYS` (`autumn/src/config.rs`) with `remove_in = "{X+1}.0.0"`.
+Startup issued a `WARN` log entry for each deprecated key detected in the config
+(via `since = "{X.Y}"`), and `autumn doctor` surfaced them in the
+`deprecated_keys` check.
+
+For each removed config key, fill in the table below:
+
+| Removed key (TOML / env var) | Replacement | Deprecated since | References |
+|------------------------------|-------------|------------------|------------|
+| `section.old_key` / `AUTUMN_SECTION__OLD_KEY` | `section.new_key` | `{X.Y}.0` | (link to changelog) |
+
+If no config keys were removed, delete this subsection.
+
 ## Upstream dependency updates
 
 For each major dependency bump carried with this release:

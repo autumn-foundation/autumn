@@ -1,7 +1,7 @@
 //! Authentication routes — register, login, logout.
 //!
 //! Demonstrates: Session extractor, password hashing (bcrypt),
-//! session.insert / session.destroy, `CsrfToken`, form handling.
+//! session.insert / clear / rotate_id, flash messages, `CsrfToken`, form handling.
 
 use autumn_web::auth::{hash_password, verify_password};
 use autumn_web::extract::Path;
@@ -124,6 +124,8 @@ pub async fn register(
     mut db: Db,
     mailer: Mailer,
     session: Session,
+    events: autumn_web::events::Events,
+    flash: Flash,
     form: Form<RegisterForm>,
 ) -> AutumnResult<Redirect> {
     let open = crate::config_svc()
@@ -207,6 +209,16 @@ pub async fn register(
         })
         .await?;
 
+    // Publish a typed domain event. Listeners (see `crate::listeners`) react
+    // independently — adding a new reaction needs zero edits to this handler.
+    // Use the injected `Events` extractor so dispatch is scoped to this app.
+    events
+        .publish(crate::events::UserSignedUp {
+            user_id: user.id,
+            username: user.username.clone(),
+        })
+        .await?;
+
     // Dispatch the outbound webhook event on "user.created"
     if let Some(manager) = state.extension::<WebhookOutboundManager>() {
         let dispatch_result = manager.dispatch(&state, "user.created", &user).await;
@@ -221,6 +233,9 @@ pub async fn register(
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
+    flash
+        .success(format!("Welcome to autumn/reddit, u/{}!", user.username))
+        .await;
     Ok(Redirect::to("/"))
 }
 
@@ -338,7 +353,12 @@ pub struct LoginForm {
 }
 
 #[post("/login")]
-pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> AutumnResult<Redirect> {
+pub async fn login(
+    mut db: Db,
+    session: Session,
+    flash: Flash,
+    form: Form<LoginForm>,
+) -> AutumnResult<Redirect> {
     let username = form.0.username.trim().to_lowercase();
 
     let user: User = users::table
@@ -358,14 +378,25 @@ pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> Autum
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
+    flash
+        .success(format!("Welcome back, u/{}!", user.username))
+        .await;
     Ok(Redirect::to("/"))
 }
 
 // ── Logout ─────────────────────────────────────────────────────
 
 #[post("/logout")]
-pub async fn logout(session: Session) -> autumn_web::reexports::axum::response::Response {
-    session.destroy().await;
+pub async fn logout(
+    session: Session,
+    flash: Flash,
+) -> autumn_web::reexports::axum::response::Response {
+    // Clear the session data and rotate the id so the old cookie can't be
+    // replayed, while letting a one-shot "signed out" notice ride the rotated
+    // session through to the front page.
+    session.clear().await;
+    session.rotate_id().await;
+    flash.info("You have been signed out.").await;
     super::layout::hx_redirect_to("/")
 }
 

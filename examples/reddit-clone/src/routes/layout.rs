@@ -2,7 +2,7 @@
 
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::http;
-use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, Markup, PreEscaped, html};
+use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_SSE_JS_PATH, Markup, PreEscaped, html};
 
 /// Redirect that works for both regular and htmx requests.
 ///
@@ -101,8 +101,16 @@ pub fn layout(
                 @if let Some(token) = csrf_token {
                     meta name="csrf-token" content=(token);
                 }
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href="/static/css/autumn.css";
+                style {
+                    " #posts-list.posts-feed-compact .posts-feed-card-version { display: none !important; } "
+                    " #posts-list:not(.posts-feed-compact) .posts-feed-compact-version { display: none !important; } "
+                    " #posts-list-sub .posts-feed-compact-version { display: none !important; } "
+                }
                 script src=(HTMX_JS_PATH) {}
+                script src=(HTMX_SSE_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
             }
             body class="bg-gray-100 min-h-screen text-gray-900" {

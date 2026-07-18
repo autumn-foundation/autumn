@@ -47,6 +47,22 @@
 //! # }
 //! ```
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -90,6 +106,34 @@ impl AutumnErrorInfo {
     }
 }
 
+/// Clone an error response's headers for re-attachment onto a freshly rebuilt
+/// body, dropping the ones that describe the *old* representation.
+///
+/// Filters like [`ProblemDetailsFilter`] and the HTML error-page filter render a
+/// brand-new, uncompressed body, so headers that describe the previous body must
+/// not ride along — keeping them yields a mismatched response (e.g. a stale
+/// `Content-Encoding: gzip` from an inner `CompressionLayer` left on plain JSON
+/// or HTML, which browsers fail to decode). What *should* survive are
+/// connection-level annotations the rebuilt response still wants, such as
+/// `X-Request-Id` and CORS headers mirrored onto a timeout 503.
+///
+/// Stripped: `Content-Type` and `Content-Length` (the rebuilt response sets its
+/// own), plus the body-representation headers `Content-Encoding`,
+/// `Transfer-Encoding`, and `Content-Range`.
+pub fn preserved_error_headers(response: &Response) -> http::HeaderMap {
+    let mut headers = response.headers().clone();
+    for name in [
+        http::header::CONTENT_TYPE,
+        http::header::CONTENT_LENGTH,
+        http::header::CONTENT_ENCODING,
+        http::header::TRANSFER_ENCODING,
+        http::header::CONTENT_RANGE,
+    ] {
+        headers.remove(name);
+    }
+    headers
+}
+
 /// Exception filter that rebuilds framework errors as request-aware Problem
 /// Details responses before HTML error-page negotiation runs.
 pub struct ProblemDetailsFilter {
@@ -109,9 +153,7 @@ impl ExceptionFilter for ProblemDetailsFilter {
                 .map(str::to_owned)
         });
         let instance = context.map(|ctx| ctx.uri.path().to_owned());
-        let mut preserved_headers = response.headers().clone();
-        preserved_headers.remove(http::header::CONTENT_TYPE);
-        preserved_headers.remove(http::header::CONTENT_LENGTH);
+        let preserved_headers = preserved_error_headers(&response);
 
         let mut out = problem_response_from_info(error, request_id, instance, self.is_dev);
         out.headers_mut().extend(preserved_headers);
@@ -402,6 +444,50 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["detail"], "Internal server error");
+    }
+
+    #[tokio::test]
+    async fn problem_details_filter_drops_stale_body_representation_headers() {
+        // If an inner layer transformed the body (e.g. compressed it) before the
+        // filter runs, the rebuilt Problem Details JSON must not inherit headers
+        // that described the old body.
+        let error = AutumnErrorInfo {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "boom".into(),
+            details: None,
+            problem_type: None,
+            backtrace_string: None,
+        };
+        let mut original = (StatusCode::INTERNAL_SERVER_ERROR, "compressed").into_response();
+        original.headers_mut().insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        original.headers_mut().insert(
+            http::header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-9/100"),
+        );
+        original
+            .headers_mut()
+            .insert("x-request-id", HeaderValue::from_static("req-7"));
+
+        let response = ProblemDetailsFilter { is_dev: false }.filter(&error, original);
+
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::CONTENT_ENCODING),
+            "stale Content-Encoding must be dropped"
+        );
+        assert!(
+            !response.headers().contains_key(http::header::CONTENT_RANGE),
+            "stale Content-Range must be dropped"
+        );
+        assert_eq!(response.headers()["x-request-id"], "req-7");
+        assert_eq!(
+            response.headers()[http::header::CONTENT_TYPE],
+            "application/problem+json"
+        );
     }
 
     #[tokio::test]

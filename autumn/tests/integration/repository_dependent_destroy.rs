@@ -1,0 +1,2945 @@
+//! Database-level integration tests for `dependent` destroy/nullify/restrict
+//! on repository associations (issue #1369).
+//!
+//! The seeded-graph tests **require Docker** (testcontainers) and are
+//! `#[ignore]`d by default. Two non-ignored tests prove the generated method
+//! surface exists (the `#1592`-style guard) without a live database, so
+//! `cargo test -p autumn --no-run --features db` type-checks every branch —
+//! plain `destroy`/`delete_all`/`nullify`/`restrict`, a soft-delete-aware
+//! `destroy`, and a hook-firing `destroy` — even where Docker is unavailable.
+//!
+//! Graph under test (the reddit-clone shape from the issue):
+//!
+//! ```text
+//!   dep_posts (parent)
+//!     - dep_comments   dependent = destroy    (per-row delete path)
+//!     - dep_votes      dependent = delete_all  (bulk hard delete)
+//!     - dep_bookmarks  dependent = nullify     (FK set to NULL)
+//!     - dep_awards     dependent = restrict    (409 if any exist)
+//! ```
+
+#![cfg(feature = "db")]
+#![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use autumn_web::AutumnResult;
+use autumn_web::hooks::{MutationContext, MutationHooks};
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
+
+// ── Parent ────────────────────────────────────────────────────────────────
+
+diesel::table! {
+    dep_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_posts")]
+pub struct DepPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(
+    DepPost,
+    table = "dep_posts",
+    dependent(PgDepCommentRepository, fk = "post_id", on_delete = destroy),
+    dependent(PgDepVoteRepository, fk = "post_id", on_delete = delete_all),
+    dependent(PgDepBookmarkRepository, fk = "post_id", on_delete = nullify),
+    dependent(PgDepAwardRepository, fk = "post_id", on_delete = restrict)
+)]
+pub trait DepPostRepository {}
+
+// A second parent whose only dependent is `restrict`, to exercise the blocking
+// path in isolation.
+#[autumn_web::model(table = "dep_posts")]
+pub struct DepPostRestrictOnly {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(
+    DepPostRestrictOnly,
+    table = "dep_posts",
+    dependent(PgDepAwardRepository, fk = "post_id", on_delete = restrict)
+)]
+pub trait DepPostRestrictOnlyRepository {}
+
+// ── Children ────────────────────────────────────────────────────────────────
+
+diesel::table! {
+    dep_comments (id) {
+        id -> Int8,
+        post_id -> Int8,
+        body -> Text,
+    }
+}
+
+pub static DESTROYED_COMMENTS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct DepCommentHooks;
+
+impl MutationHooks for DepCommentHooks {
+    type Model = DepComment;
+    type NewModel = NewDepComment;
+    type UpdateModel = UpdateDepComment;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &DepComment,
+    ) -> AutumnResult<()> {
+        // AC4: proves the child's lifecycle hook fires during a cascade.
+        DESTROYED_COMMENTS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[autumn_web::model(table = "dep_comments")]
+pub struct DepComment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(DepComment, table = "dep_comments", hooks = DepCommentHooks)]
+pub trait DepCommentRepository {}
+
+diesel::table! {
+    dep_votes (id) {
+        id -> Int8,
+        post_id -> Int8,
+        value -> Int4,
+    }
+}
+
+#[autumn_web::model(table = "dep_votes")]
+pub struct DepVote {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub value: i32,
+}
+
+#[autumn_web::repository(DepVote, table = "dep_votes")]
+pub trait DepVoteRepository {}
+
+diesel::table! {
+    dep_bookmarks (id) {
+        id -> Int8,
+        post_id -> Nullable<Int8>,
+        label -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_bookmarks")]
+pub struct DepBookmark {
+    #[id]
+    pub id: i64,
+    pub post_id: Option<i64>,
+    pub label: String,
+}
+
+#[autumn_web::repository(DepBookmark, table = "dep_bookmarks")]
+pub trait DepBookmarkRepository {}
+
+diesel::table! {
+    dep_awards (id) {
+        id -> Int8,
+        post_id -> Int8,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_awards")]
+pub struct DepAward {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub name: String,
+}
+
+#[autumn_web::repository(DepAward, table = "dep_awards")]
+pub trait DepAwardRepository {}
+
+// ── #1738: model-declared `#[has_many(dependent = ...)]` cascade ──────────────
+//
+// The SAME cascade as `DepPost` above, but declared on the MODEL struct via
+// `#[has_many(Child, dependent = <action>)]` instead of the repository
+// attribute. The parent repository declares NO `dependent(...)`, so the cascade
+// is driven at run time by `ModelDepPost::dependents()`, resolving each child
+// repository through the `Pg{Child}Repository` naming convention (`DepComment`
+// → `PgDepCommentRepository`, etc.). Reuses the existing child tables/repos via
+// an explicit `fk = "post_id"` (the default would infer `model_dep_post_id`).
+//
+// #1786: `dependent = nullify` is declared model-side too. A nullify child has a
+// NULLABLE foreign key (`DepBookmark::post_id: Option<i64>`); the `#[has_many]`
+// preload loader now normalizes the child FK through `preload::FkKey` (grouping
+// on `Option<i64>` and dropping `None`-FK orphans), so declaring a nullable-FK
+// association compiles and its model-side cascade (`dependents()`) sets the
+// child FK to NULL. destroy/delete_all/restrict/nullify all cascade from the
+// model side.
+#[autumn_web::model(table = "dep_posts")]
+#[has_many(DepComment, fk = "post_id", name = md_comments, dependent = destroy)]
+#[has_many(DepVote, fk = "post_id", name = md_votes, dependent = delete_all)]
+#[has_many(DepAward, fk = "post_id", name = md_awards, dependent = restrict)]
+#[has_many(DepBookmark, fk = "post_id", name = md_bookmarks, dependent = nullify)]
+pub struct ModelDepPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(ModelDepPost, table = "dep_posts")]
+pub trait ModelDepPostRepository {}
+
+// ── AC3: both-soft destroy graph (soft parent + soft children) ────────────────
+//
+// The parent is `#[soft_delete]` too, so `delete_by_id` soft-deletes the parent
+// (row remains, FK stays valid) and the cascade soft-deletes the children — the
+// AC3 "parent soft-deleted, cascade still runs, live graph stays consistent"
+// case, satisfiable against real Postgres.
+
+diesel::table! {
+    dep_soft_posts (id) {
+        id -> Int8,
+        title -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dep_soft_posts")]
+pub struct DepSoftPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    DepSoftPost,
+    table = "dep_soft_posts",
+    soft_delete,
+    dependent(PgDepSoftCommentRepository, fk = "post_id", on_delete = destroy)
+)]
+pub trait DepSoftPostRepository {}
+
+diesel::table! {
+    dep_soft_comments (id) {
+        id -> Int8,
+        post_id -> Int8,
+        body -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dep_soft_comments")]
+pub struct DepSoftComment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub body: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(DepSoftComment, table = "dep_soft_comments", soft_delete)]
+pub trait DepSoftCommentRepository {}
+
+// ── #1369 P1: hard parent + soft-delete child destroy graph ───────────────────
+//
+// A NON-soft parent that `destroy`s a `#[soft_delete]` child. Because the parent
+// is hard-deleted, the child must be HARD-deleted too (not merely soft-deleted),
+// otherwise a NOT NULL FK to the removed parent would be violated and the row
+// would be a semantic orphan. Locks in the P1 fix (child follows parent kind).
+
+diesel::table! {
+    dep_hard_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_hard_posts")]
+pub struct DepHardPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(
+    DepHardPost,
+    table = "dep_hard_posts",
+    dependent(PgDepHardSoftCommentRepository, fk = "post_id", on_delete = destroy)
+)]
+pub trait DepHardPostRepository {}
+
+diesel::table! {
+    dep_hard_soft_comments (id) {
+        id -> Int8,
+        post_id -> Int8,
+        body -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dep_hard_soft_comments")]
+pub struct DepHardSoftComment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub body: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(DepHardSoftComment, table = "dep_hard_soft_comments", soft_delete)]
+pub trait DepHardSoftCommentRepository {}
+
+// ── #1739: three-level grandchild destroy graph (Post → Comment → Reply) ──────
+//
+// Both `Dep3Post` and `Dep3Comment` declare `dependent = destroy`. Deleting a
+// post must recurse: destroy its comments AND each comment's replies, in one
+// transaction, leaving zero orphaned grandchildren. This is the exact #1739
+// acceptance graph.
+
+diesel::table! {
+    dep3_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep3_posts")]
+pub struct Dep3Post {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(
+    Dep3Post,
+    table = "dep3_posts",
+    dependent(PgDep3CommentRepository, fk = "post_id", on_delete = destroy)
+)]
+pub trait Dep3PostRepository {}
+
+diesel::table! {
+    dep3_comments (id) {
+        id -> Int8,
+        post_id -> Int8,
+        body -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep3_comments")]
+pub struct Dep3Comment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(
+    Dep3Comment,
+    table = "dep3_comments",
+    dependent(PgDep3ReplyRepository, fk = "comment_id", on_delete = destroy)
+)]
+pub trait Dep3CommentRepository {}
+
+diesel::table! {
+    dep3_replies (id) {
+        id -> Int8,
+        comment_id -> Int8,
+        body -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep3_replies")]
+pub struct Dep3Reply {
+    #[id]
+    pub id: i64,
+    pub comment_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(Dep3Reply, table = "dep3_replies")]
+pub trait Dep3ReplyRepository {}
+
+// ── Codex P1: FULLY model-side three-level grandchild graph ───────────────────
+//
+// The same `Post → Comment → Reply` recursion as `Dep3*` above, but declared
+// ENTIRELY on the model structs via `#[has_many(..., dependent = destroy)]`,
+// with NO repository-attribute `dependent(...)` anywhere. Each parent's
+// `config.dependents` is therefore empty, so both the top-level `delete_by_id`
+// dispatch (#1738) AND the intermediate child's `__autumn_apply_dependent_on_conn`
+// Destroy arm (Codex P1) must consult the runtime `Model::dependents()` to reach
+// the grandchildren. Deleting an `M3Post` must leave zero `M3Reply` (grandchild)
+// AND zero `M3Comment` (child) rows — the exact P1 acceptance criterion. The
+// child repositories resolve by the `Pg{Child}Repository` convention
+// (`M3Comment` → `PgM3CommentRepository`, `M3Reply` → `PgM3ReplyRepository`).
+
+diesel::table! {
+    m3_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+#[autumn_web::model(table = "m3_posts")]
+#[has_many(M3Comment, fk = "post_id", dependent = destroy)]
+pub struct M3Post {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(M3Post, table = "m3_posts")]
+pub trait M3PostRepository {}
+
+diesel::table! {
+    m3_comments (id) {
+        id -> Int8,
+        post_id -> Int8,
+        body -> Text,
+    }
+}
+
+// A model-side child that ITSELF declares a model-side dependent — this is what
+// exercises the new runtime-grandchild codegen inside its Destroy arm. The
+// grandchild table is `m3_replies` (autumn's smart pluralization of `M3Reply`:
+// consonant + `y` → `ies`, per #1753) so the `#[has_many]` preload codegen
+// resolves the Diesel table module by convention, matching the other has_many
+// targets in this file.
+#[autumn_web::model(table = "m3_comments")]
+#[has_many(M3Reply, fk = "comment_id", dependent = destroy)]
+pub struct M3Comment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(M3Comment, table = "m3_comments")]
+pub trait M3CommentRepository {}
+
+diesel::table! {
+    m3_replies (id) {
+        id -> Int8,
+        comment_id -> Int8,
+        body -> Text,
+    }
+}
+
+#[autumn_web::model(table = "m3_replies")]
+pub struct M3Reply {
+    #[id]
+    pub id: i64,
+    pub comment_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(M3Reply, table = "m3_replies")]
+pub trait M3ReplyRepository {}
+
+// ── #1739 cycle guard: a self-referential `destroy` dependent ─────────────────
+//
+// `dep_nodes.parent_id` references `dep_nodes.id`, and the repository declares a
+// `dependent = destroy` back onto itself. This is the self-referential cycle the
+// visited-set guard must survive: deleting a node destroys its children, which
+// recurse into THEIR children, etc.  Even with cyclic data (a descendant whose
+// FK points back at an ancestor) the traversal must terminate rather than
+// looping forever or overflowing the (boxed) recursive future.
+
+diesel::table! {
+    dep_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_nodes")]
+pub struct DepNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    DepNode,
+    table = "dep_nodes",
+    dependent(PgDepNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait DepNodeRepository {}
+
+// ── Codex P2: self-referential `destroy` with an IMMEDIATE self-FK ─────────────
+//
+// `dep_imm_nodes.parent_id` references the same table, but the FK is NOT
+// deferrable (checked immediately, per-row). Bulk-deleting `[ancestor,
+// descendant]` while an intermediate node is NOT in the id list must remove the
+// whole subtree without tripping an immediate FK constraint — which requires the
+// bulk cascade to NOT pre-seed the descendant into the visited set (otherwise the
+// ancestor's cascade skips it, the intermediate is deleted first, and the still-
+// present descendant's FK immediately fails). Distinct from `dep_nodes`, whose
+// DEFERRABLE FK would mask this by deferring the check to COMMIT.
+
+diesel::table! {
+    dep_imm_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_imm_nodes")]
+pub struct DepImmNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    DepImmNode,
+    table = "dep_imm_nodes",
+    dependent(PgDepImmNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait DepImmNodeRepository {}
+
+// ── Codex round-4: a HOOKED self-referential `destroy` (2-cycle re-entry) ──────
+//
+// `dep_cycle_nodes.parent_id` references the same table via a DEFERRABLE self-FK
+// (so a true 2-cycle can exist), the repository declares `dependent = destroy`
+// back onto itself, AND the model fires a `before_delete` hook that LOGS the id
+// of every row it deletes. For a 2-cycle A.parent_id = B, B.parent_id = A,
+// `delete_many([A])` must:
+//   1. fire A's `before_delete` hook EXACTLY ONCE (as the bulk parent delete) —
+//      NOT twice (it must not be re-entered as a cascaded child through B's
+//      destroy executor before the final bulk parent delete), and
+//   2. remove BOTH rows.
+// Before the round-4 fix the bulk loop never seeded the current root into the
+// shared visited set, so cascading A → child B → grandchild A re-entered A and
+// fired its hook a second time (as a cascaded child) before the bulk parent
+// delete. Seeding the current root immediately before its own destroy cascade
+// (mirroring `delete_by_id`) closes the re-entry.
+
+use std::sync::Mutex;
+
+// Records the id of every `DepCycleNode` whose `before_delete` hook fires, in
+// order. A row appearing twice means it was re-entered as a cascaded child.
+pub static CYCLE_DELETE_LOG: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Default)]
+pub struct DepCycleNodeHooks;
+
+impl MutationHooks for DepCycleNodeHooks {
+    type Model = DepCycleNode;
+    type NewModel = NewDepCycleNode;
+    type UpdateModel = UpdateDepCycleNode;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &DepCycleNode,
+    ) -> AutumnResult<()> {
+        CYCLE_DELETE_LOG.lock().unwrap().push(record.id);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    dep_cycle_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_cycle_nodes")]
+pub struct DepCycleNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    DepCycleNode,
+    table = "dep_cycle_nodes",
+    hooks = DepCycleNodeHooks,
+    dependent(PgDepCycleNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait DepCycleNodeRepository {}
+
+// ── Codex round-5-A: grandchild `restrict` must probe BEFORE the child hook ────
+//
+// Graph: `ra_posts` → `ra_comments` (dependent = destroy, with a `before_delete`
+// hook) → `ra_replies` (dependent = restrict). Deleting a post cascades into the
+// comment `destroy`; because the comment has a `restrict` grandchild (a reply),
+// the delete must return 409 — and it must do so WITHOUT firing the comment's
+// `before_delete` hook, since a non-transactional hook side effect on a doomed
+// transaction cannot be undone. The Destroy arm therefore probes the grandchild
+// restrict (read-only) BEFORE running the child `before_delete`.
+
+// Counts how many times `RaComment::before_delete` fired. Must stay 0 when a
+// grandchild restrict blocks the delete (round-5-A).
+pub static RA_COMMENT_HOOK_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct RaCommentHooks;
+
+impl MutationHooks for RaCommentHooks {
+    type Model = RaComment;
+    type NewModel = NewRaComment;
+    type UpdateModel = UpdateRaComment;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &RaComment,
+    ) -> AutumnResult<()> {
+        RA_COMMENT_HOOK_FIRED.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    ra_posts (id) { id -> Int8, title -> Text, }
+}
+diesel::table! {
+    ra_comments (id) { id -> Int8, post_id -> Int8, body -> Text, }
+}
+diesel::table! {
+    ra_replies (id) { id -> Int8, comment_id -> Int8, body -> Text, }
+}
+
+#[autumn_web::model(table = "ra_posts")]
+pub struct RaPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::model(table = "ra_comments")]
+pub struct RaComment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::model(table = "ra_replies")]
+pub struct RaReply {
+    #[id]
+    pub id: i64,
+    pub comment_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(
+    RaPost,
+    table = "ra_posts",
+    dependent(PgRaCommentRepository, fk = "post_id", on_delete = destroy)
+)]
+pub trait RaPostRepository {}
+
+#[autumn_web::repository(
+    RaComment,
+    table = "ra_comments",
+    hooks = RaCommentHooks,
+    dependent(PgRaReplyRepository, fk = "comment_id", on_delete = restrict)
+)]
+pub trait RaCommentRepository {}
+
+#[autumn_web::repository(RaReply, table = "ra_replies")]
+pub trait RaReplyRepository {}
+
+// ── Codex round-5-B: HOOKED self-referential chain with an IMMEDIATE self-FK ───
+//
+// `chain_nodes.parent_id` references the same table with a NON-deferrable FK, and
+// the model logs every `before_delete`. Chain Anc(1) ← I(2) ← D(3) (child's
+// parent_id points at its parent). Bulk `delete_many([D, Anc])` — a descendant
+// and its ancestor, with the intermediate NOT in the batch — must:
+//   1. remove all three rows with NO immediate FK violation (the ancestor's
+//      cascade deletes D deepest-first, before the intermediate it references), and
+//   2. fire D's `before_delete` hook EXACTLY ONCE (not once as a cascaded
+//      descendant AND once as a batch root).
+// Under the round-4 monotonic per-root seed, processing the descendant root D
+// before its ancestor pre-marked D visited, so the ancestor's cascade skipped D
+// while deleting the intermediate it still references → immediate FK; and the
+// other processing order double-fired D's hook. The round-5-B split into an
+// active-path stack + a monotonic deleted set fixes both.
+
+pub static CHAIN_DELETE_LOG: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Default)]
+pub struct ChainNodeHooks;
+
+impl MutationHooks for ChainNodeHooks {
+    type Model = ChainNode;
+    type NewModel = NewChainNode;
+    type UpdateModel = UpdateChainNode;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &ChainNode,
+    ) -> AutumnResult<()> {
+        CHAIN_DELETE_LOG.lock().unwrap().push(record.id);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    chain_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "chain_nodes")]
+pub struct ChainNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    ChainNode,
+    table = "chain_nodes",
+    hooks = ChainNodeHooks,
+    dependent(PgChainNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait ChainNodeRepository {}
+
+// ── #1800 case 1 (regression): bulk soft-delete must not double-fire hooks ─────
+//
+// A `#[soft_delete]` HOOKED self-referential `dependent = destroy` graph.
+// `bsd_nodes.parent_id` references the same table (DEFERRABLE self-FK so the whole
+// component can be handled in one transaction), the repo is `soft_delete`, and the
+// model logs every `before_delete`. Anc(1) ← Desc(2) (Desc.parent_id = Anc).
+// `delete_many([Desc, Anc])` — the descendant AND its ancestor — must fire Desc's
+// `before_delete` hook EXACTLY ONCE.
+//
+// This is the regression the first #1800 fix introduced: because the ancestor's
+// soft cascade soft-deletes Desc, and the (buggy) fix only recorded PHYSICALLY
+// deleted rows in `__deleted`, the bulk root hook loop no longer saw Desc as
+// already-handled and fired its `before_delete` a SECOND time (once as the
+// cascaded descendant, once as the batch root). Tracking every HANDLED row —
+// soft OR physical — in the "all handled" set (while a SEPARATE physical set backs
+// the diamond revisit-skip) restores single-firing for soft-delete graphs.
+
+pub static BSD_DELETE_LOG: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Default)]
+pub struct BsdNodeHooks;
+
+impl MutationHooks for BsdNodeHooks {
+    type Model = BsdNode;
+    type NewModel = NewBsdNode;
+    type UpdateModel = UpdateBsdNode;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &BsdNode,
+    ) -> AutumnResult<()> {
+        BSD_DELETE_LOG.lock().unwrap().push(record.id);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    bsd_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "bsd_nodes")]
+pub struct BsdNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    BsdNode,
+    table = "bsd_nodes",
+    soft_delete,
+    hooks = BsdNodeHooks,
+    dependent(PgBsdNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait BsdNodeRepository {}
+
+// ── #1740: a HOOKED parent that also declares a dependent ─────────────────────
+//
+// All the dependent-declaring parents above are hook-free, so they exercise the
+// no-hooks `delete_many` codegen branch. This one has `hooks = ...` AND a
+// dependent, so it monomorphizes the HOOKS-path bulk-cascade branch (#1740) —
+// otherwise that branch would never be type-checked. Used only by the codegen
+// surface test (no Docker graph test), so it reuses an existing child repo.
+
+#[derive(Clone, Default)]
+pub struct DepHookedPostHooks;
+
+impl MutationHooks for DepHookedPostHooks {
+    type Model = DepHookedPost;
+    type NewModel = NewDepHookedPost;
+    type UpdateModel = UpdateDepHookedPost;
+}
+
+diesel::table! {
+    dep_hooked_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_hooked_posts")]
+pub struct DepHookedPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(
+    DepHookedPost,
+    table = "dep_hooked_posts",
+    hooks = DepHookedPostHooks,
+    dependent(PgDepCommentRepository, fk = "post_id", on_delete = destroy)
+)]
+pub trait DepHookedPostRepository {}
+
+// ── #1800 case 1: mixed soft/hard-delete diamond ──────────────────────────────
+//
+// A SOFT parent (`dia_roots`) `destroy`s two children:
+//   - `dia_softs`  — a `#[soft_delete]` model (soft-deleted under a soft parent), and
+//   - `dia_hards`  — a NON-soft model (always hard-deleted).
+// Both children `destroy` the SAME grandchild table `dia_leaves` (a `#[soft_delete]`
+// model) via two different FKs: a leaf references its soft parent (`soft_id`) AND
+// its hard parent (`hard_id`). Because the soft child is processed FIRST, the leaf
+// is reached first through the soft branch (soft-deleted), then through the hard
+// branch (must be HARD-deleted, since its `hard_id` FK references a row that is
+// being physically removed).
+//
+// Before #1800 the leaf was added to the traversal `__deleted` set on the soft
+// delete, so the hard branch SKIPPED it — leaving the leaf physically present with
+// a `hard_id` pointing at the now-deleted hard row (an IMMEDIATE FK violation, i.e.
+// a 500, and a dangling FK). After #1800 a soft delete no longer records the row in
+// `__deleted`, so the hard branch still reaches and physically removes it.
+
+diesel::table! {
+    dia_roots (id) {
+        id -> Int8,
+        title -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dia_roots")]
+pub struct DiaRoot {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+// The soft child is declared BEFORE the hard child, so the cascade processes the
+// soft branch first (the order that triggers the pre-#1800 dangling-FK bug).
+#[autumn_web::repository(
+    DiaRoot,
+    table = "dia_roots",
+    soft_delete,
+    dependent(PgDiaSoftRepository, fk = "root_id", on_delete = destroy),
+    dependent(PgDiaHardRepository, fk = "root_id", on_delete = destroy)
+)]
+pub trait DiaRootRepository {}
+
+diesel::table! {
+    dia_softs (id) {
+        id -> Int8,
+        root_id -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dia_softs")]
+pub struct DiaSoft {
+    #[id]
+    pub id: i64,
+    pub root_id: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    DiaSoft,
+    table = "dia_softs",
+    soft_delete,
+    dependent(PgDiaLeafRepository, fk = "soft_id", on_delete = destroy)
+)]
+pub trait DiaSoftRepository {}
+
+diesel::table! {
+    dia_hards (id) {
+        id -> Int8,
+        root_id -> Int8,
+    }
+}
+
+#[autumn_web::model(table = "dia_hards")]
+pub struct DiaHard {
+    #[id]
+    pub id: i64,
+    pub root_id: i64,
+}
+
+#[autumn_web::repository(
+    DiaHard,
+    table = "dia_hards",
+    dependent(PgDiaLeafRepository, fk = "hard_id", on_delete = destroy)
+)]
+pub trait DiaHardRepository {}
+
+diesel::table! {
+    dia_leaves (id) {
+        id -> Int8,
+        soft_id -> Int8,
+        hard_id -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dia_leaves")]
+pub struct DiaLeaf {
+    #[id]
+    pub id: i64,
+    pub soft_id: i64,
+    pub hard_id: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(DiaLeaf, table = "dia_leaves", soft_delete)]
+pub trait DiaLeafRepository {}
+
+// ── #1800 (Codex "Re-probe restricts on hard revisits"): a mixed soft/hard ─────
+// diamond where the shared soft leaf has a SOFT-DELETED `restrict` dependent.
+//
+// Same diamond shape as `dia_*`, but the leaf (`dhr_leaves`, a `#[soft_delete]`
+// model) additionally:
+//   - fires a `before_delete` hook (so we can count how many times it runs), and
+//   - declares a `restrict` dependent (`dhr_guards`, itself `#[soft_delete]`).
+//
+// Graph: soft parent `dhr_roots` destroys a soft child (`dhr_softs`, declared
+// FIRST) and a hard child (`dhr_hards`, declared SECOND); both destroy the SAME
+// leaf via `soft_id` / `hard_id`. The leaf restrict-depends on `dhr_guards`.
+//
+// The test pre-SOFT-deletes the guard, then deletes the root:
+//   * Soft branch (processed first): the leaf is soft-deleted under the soft
+//     child. Its restrict probe runs with `__parent_soft == true`, so the live
+//     filter keeps the soft-deleted guard OUT — no 409, the leaf hook fires once,
+//     and the leaf lands in the "all handled" `__deleted` set but NOT `__physical`.
+//   * Hard branch: the leaf is reached again through the hard child, which HARD-
+//     deletes. The pre-scan skip now keys on `__physical` (the fix), so it re-runs
+//     the leaf restrict probe — this time with `__parent_soft == false`, dropping
+//     the live filter so the soft-deleted guard IS included → typed 409 BEFORE the
+//     leaf hook fires a second time and BEFORE the hard DELETE hits the guard FK.
+//
+// RED before the fix: the pre-scan skip keyed on `__deleted`, which already held
+// the soft-deleted leaf, so the hard-path probe was SKIPPED; Phase-2 (keyed on
+// `__physical`) still ran, firing the leaf hook a second time and hard-deleting the
+// leaf, which fell through to a raw FK failure (500) against the still-present
+// soft-deleted guard.
+
+pub static DHR_LEAF_HOOK_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct DhrLeafHooks;
+
+impl MutationHooks for DhrLeafHooks {
+    type Model = DhrLeaf;
+    type NewModel = NewDhrLeaf;
+    type UpdateModel = UpdateDhrLeaf;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &DhrLeaf,
+    ) -> AutumnResult<()> {
+        DHR_LEAF_HOOK_FIRED.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    dhr_roots (id) {
+        id -> Int8,
+        title -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dhr_roots")]
+pub struct DhrRoot {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+// Soft child declared BEFORE the hard child, so the cascade soft-deletes the leaf
+// first and only THEN reaches it through the hard branch (the revisit).
+#[autumn_web::repository(
+    DhrRoot,
+    table = "dhr_roots",
+    soft_delete,
+    dependent(PgDhrSoftRepository, fk = "root_id", on_delete = destroy),
+    dependent(PgDhrHardRepository, fk = "root_id", on_delete = destroy)
+)]
+pub trait DhrRootRepository {}
+
+diesel::table! {
+    dhr_softs (id) {
+        id -> Int8,
+        root_id -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dhr_softs")]
+pub struct DhrSoft {
+    #[id]
+    pub id: i64,
+    pub root_id: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    DhrSoft,
+    table = "dhr_softs",
+    soft_delete,
+    dependent(PgDhrLeafRepository, fk = "soft_id", on_delete = destroy)
+)]
+pub trait DhrSoftRepository {}
+
+diesel::table! {
+    dhr_hards (id) {
+        id -> Int8,
+        root_id -> Int8,
+    }
+}
+
+#[autumn_web::model(table = "dhr_hards")]
+pub struct DhrHard {
+    #[id]
+    pub id: i64,
+    pub root_id: i64,
+}
+
+#[autumn_web::repository(
+    DhrHard,
+    table = "dhr_hards",
+    dependent(PgDhrLeafRepository, fk = "hard_id", on_delete = destroy)
+)]
+pub trait DhrHardRepository {}
+
+diesel::table! {
+    dhr_leaves (id) {
+        id -> Int8,
+        soft_id -> Int8,
+        hard_id -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dhr_leaves")]
+pub struct DhrLeaf {
+    #[id]
+    pub id: i64,
+    pub soft_id: i64,
+    pub hard_id: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+// The leaf both fires a `before_delete` hook AND restrict-depends on `dhr_guards`.
+#[autumn_web::repository(
+    DhrLeaf,
+    table = "dhr_leaves",
+    soft_delete,
+    hooks = DhrLeafHooks,
+    dependent(PgDhrGuardRepository, fk = "leaf_id", on_delete = restrict)
+)]
+pub trait DhrLeafRepository {}
+
+diesel::table! {
+    dhr_guards (id) {
+        id -> Int8,
+        leaf_id -> Int8,
+        name -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dhr_guards")]
+pub struct DhrGuard {
+    #[id]
+    pub id: i64,
+    pub leaf_id: i64,
+    pub name: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(DhrGuard, table = "dhr_guards", soft_delete)]
+pub trait DhrGuardRepository {}
+
+// ── #1800 case 2: sibling restrict pre-scan ───────────────────────────────────
+//
+// Reuses the round-5-A `ra_posts → ra_comments(destroy, hooked) → ra_replies
+// (restrict)` graph, but with TWO comment siblings: comment #1 has no replies,
+// comment #2 has one. Deleting the post must return 409 (comment #2's restrict
+// grandchild blocks) WITHOUT firing comment #1's `before_delete` hook. Before
+// #1800 the grandchild restrict probe lived inside the per-child mutating loop, so
+// comment #1's hook fired and only then did comment #2's probe return the 409.
+
+// ── #1800 case 3: parent restrict probe before the parent before_delete hook ───
+//
+// A parent (`ph_posts`) with BOTH a `before_delete` hook (bumping a counter) AND a
+// `restrict` dependent (`ph_guards`) with a live child. Deleting the parent must
+// return 409 WITHOUT firing the parent hook — the parent restrict probe now runs
+// before `#parent_before_delete`. Before #1800 the parent hook fired first, then
+// the restrict probe returned the 409 (rolling back the DB but not the hook's
+// non-transactional side effect).
+
+pub static PH_POST_HOOK_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct PhPostHooks;
+
+impl MutationHooks for PhPostHooks {
+    type Model = PhPost;
+    type NewModel = NewPhPost;
+    type UpdateModel = UpdatePhPost;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &PhPost,
+    ) -> AutumnResult<()> {
+        PH_POST_HOOK_FIRED.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    ph_posts (id) { id -> Int8, title -> Text, }
+}
+diesel::table! {
+    ph_guards (id) { id -> Int8, post_id -> Int8, name -> Text, }
+}
+
+#[autumn_web::model(table = "ph_posts")]
+pub struct PhPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::model(table = "ph_guards")]
+pub struct PhGuard {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    PhPost,
+    table = "ph_posts",
+    hooks = PhPostHooks,
+    dependent(PgPhGuardRepository, fk = "post_id", on_delete = restrict)
+)]
+pub trait PhPostRepository {}
+
+#[autumn_web::repository(PhGuard, table = "ph_guards")]
+pub trait PhGuardRepository {}
+
+// ── Row-count helpers ─────────────────────────────────────────────────────────
+
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+async fn count(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
+    let row: CountRow = diesel::sql_query(sql)
+        .get_result::<CountRow>(conn)
+        .await
+        .expect("count query");
+    row.n
+}
+
+async fn setup_pool() -> (
+    Pool<AsyncPgConnection>,
+    testcontainers::ContainerAsync<Postgres>,
+) {
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool = Pool::builder(manager).max_size(8).build().expect("pool");
+
+    let mut conn = pool.get().await.expect("conn");
+    for stmt in [
+        "CREATE TABLE dep_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE dep_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_posts(id), body TEXT NOT NULL)",
+        "CREATE TABLE dep_votes (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_posts(id), value INT NOT NULL)",
+        "CREATE TABLE dep_bookmarks (id BIGSERIAL PRIMARY KEY, post_id BIGINT REFERENCES dep_posts(id), label TEXT NOT NULL)",
+        "CREATE TABLE dep_awards (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_posts(id), name TEXT NOT NULL)",
+        "CREATE TABLE dep_soft_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dep_soft_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_soft_posts(id), body TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dep_hard_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE dep_hard_soft_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_hard_posts(id), body TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dep3_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE dep3_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep3_posts(id), body TEXT NOT NULL)",
+        "CREATE TABLE dep3_replies (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES dep3_comments(id), body TEXT NOT NULL)",
+        // Codex P1: fully model-side three-level grandchild graph.
+        "CREATE TABLE m3_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE m3_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES m3_posts(id), body TEXT NOT NULL)",
+        "CREATE TABLE m3_replies (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES m3_comments(id), body TEXT NOT NULL)",
+        // Self-referential FK: parent_id references the same table. The FK is
+        // DEFERRABLE INITIALLY DEFERRED so a *cyclic* component can be hard-deleted
+        // within one transaction (the constraint is checked at COMMIT, by which
+        // point every row in the cycle is gone). ON DELETE has no DB-level cascade
+        // — the framework cascade is what must clear the whole component.
+        "CREATE TABLE dep_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES dep_nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL)",
+        // Codex P2: IMMEDIATE (non-deferrable) self-referential FK — the check
+        // fires per-row, so the cascade cannot rely on deferral to COMMIT.
+        "CREATE TABLE dep_imm_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES dep_imm_nodes(id), name TEXT NOT NULL)",
+        // Codex round-4: HOOKED self-referential FK, DEFERRABLE so a true 2-cycle
+        // (A.parent_id = B, B.parent_id = A) can exist — the bulk cascade must seed
+        // the current root before recursing so the root's hook fires exactly once.
+        "CREATE TABLE dep_cycle_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES dep_cycle_nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL)",
+        // Codex round-5-A: post → comment (destroy, hooked) → reply (restrict).
+        "CREATE TABLE ra_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE ra_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES ra_posts(id), body TEXT NOT NULL)",
+        "CREATE TABLE ra_replies (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES ra_comments(id), body TEXT NOT NULL)",
+        // Codex round-5-B: HOOKED self-referential chain with an IMMEDIATE self-FK.
+        "CREATE TABLE chain_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES chain_nodes(id), name TEXT NOT NULL)",
+        // #1800 case 1 (regression): HOOKED soft-delete self-referential graph. The
+        // self-FK is DEFERRABLE so the component can be handled in one transaction.
+        "CREATE TABLE bsd_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES bsd_nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        // #1800 case 1: mixed soft/hard-delete diamond. The leaf references BOTH a
+        // soft parent (soft_id) and a hard parent (hard_id) with IMMEDIATE FKs, so a
+        // leaf left present while its hard parent is deleted trips the FK at once.
+        "CREATE TABLE dia_roots (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dia_softs (id BIGSERIAL PRIMARY KEY, root_id BIGINT NOT NULL REFERENCES dia_roots(id), deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dia_hards (id BIGSERIAL PRIMARY KEY, root_id BIGINT NOT NULL REFERENCES dia_roots(id))",
+        "CREATE TABLE dia_leaves (id BIGSERIAL PRIMARY KEY, soft_id BIGINT NOT NULL REFERENCES dia_softs(id), hard_id BIGINT NOT NULL REFERENCES dia_hards(id), deleted_at TIMESTAMP NULL)",
+        // #1800 (Codex "Re-probe restricts on hard revisits"): same diamond, but the
+        // shared soft leaf HOOKS and restrict-depends on a soft-deletable guard. The
+        // guard FK is IMMEDIATE so a hard delete of the leaf (with the guard still
+        // present) trips a raw FK 500 in the RED (pre-fix) state.
+        "CREATE TABLE dhr_roots (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dhr_softs (id BIGSERIAL PRIMARY KEY, root_id BIGINT NOT NULL REFERENCES dhr_roots(id), deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dhr_hards (id BIGSERIAL PRIMARY KEY, root_id BIGINT NOT NULL REFERENCES dhr_roots(id))",
+        "CREATE TABLE dhr_leaves (id BIGSERIAL PRIMARY KEY, soft_id BIGINT NOT NULL REFERENCES dhr_softs(id), hard_id BIGINT NOT NULL REFERENCES dhr_hards(id), deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dhr_guards (id BIGSERIAL PRIMARY KEY, leaf_id BIGINT NOT NULL REFERENCES dhr_leaves(id), name TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        // #1800 case 3: parent with a before_delete hook AND a restrict dependent.
+        "CREATE TABLE ph_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE ph_guards (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES ph_posts(id), name TEXT NOT NULL)",
+    ] {
+        diesel::sql_query(stmt)
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("failed to create schema ({stmt}): {e}"));
+    }
+
+    (pool, container)
+}
+
+// ── Non-ignored: generated surface exists without a live database ─────────────
+
+/// AC1: proves the `dependent(...)` codegen ran on every variant — the delete
+/// path (`delete_by_id`) and the connection-taking cascade helper monomorphize
+/// as nameable function items without needing Docker.
+#[test]
+fn dependent_repository_surface_is_generated() {
+    fn assert_is_fn<F>(_f: F) {}
+    assert_is_fn(<PgDepPostRepository as DepPostRepository>::delete_by_id);
+    assert_is_fn(<PgDepPostRestrictOnlyRepository as DepPostRestrictOnlyRepository>::delete_by_id);
+    assert_is_fn(PgDepCommentRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDepVoteRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDepBookmarkRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDepAwardRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDepSoftCommentRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(<PgDepSoftPostRepository as DepSoftPostRepository>::delete_by_id);
+    assert_is_fn(<PgDepHardPostRepository as DepHardPostRepository>::delete_by_id);
+    assert_is_fn(PgDepHardSoftCommentRepository::__autumn_apply_dependent_on_conn);
+    // #1739: the grandchild graph and the self-referential cycle repo both
+    // monomorphize — proving the recursive (boxed-future) cascade codegen
+    // type-checks, including a repository that cascades onto its own type.
+    assert_is_fn(<PgDep3PostRepository as Dep3PostRepository>::delete_by_id);
+    assert_is_fn(PgDep3CommentRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDep3ReplyRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(<PgDepNodeRepository as DepNodeRepository>::delete_by_id);
+    assert_is_fn(PgDepNodeRepository::__autumn_apply_dependent_on_conn);
+    // Codex P2: the immediate-FK self-referential parent's bulk delete_many
+    // monomorphizes (its cascade must not pre-seed batch targets).
+    assert_is_fn(<PgDepImmNodeRepository as DepImmNodeRepository>::delete_many);
+    assert_is_fn(PgDepImmNodeRepository::__autumn_apply_dependent_on_conn);
+    // Codex round-4: the HOOKED self-referential parent's bulk delete_many
+    // monomorphizes the HOOKS-path bulk self-ref cascade (its Phase-2 loop seeds
+    // the current root before recursing, so a 2-cycle can't re-enter the root as a
+    // cascaded child and double-fire its hook).
+    assert_is_fn(<PgDepCycleNodeRepository as DepCycleNodeRepository>::delete_many);
+    assert_is_fn(PgDepCycleNodeRepository::__autumn_apply_dependent_on_conn);
+    // Codex round-5-A: the post→comment(destroy,hooked)→reply(restrict) graph
+    // monomorphizes — the Destroy arm's grandchild restrict probe runs before the
+    // child before_delete hook. All three repos' cascade surfaces must type-check.
+    assert_is_fn(<PgRaPostRepository as RaPostRepository>::delete_by_id);
+    assert_is_fn(PgRaCommentRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgRaReplyRepository::__autumn_apply_dependent_on_conn);
+    // Codex round-5-B: the HOOKED immediate-FK self-referential chain's bulk
+    // delete_many monomorphizes the two-structure (path + deleted) cascade.
+    assert_is_fn(<PgChainNodeRepository as ChainNodeRepository>::delete_many);
+    assert_is_fn(PgChainNodeRepository::__autumn_apply_dependent_on_conn);
+    // #1800 case 1 (regression): the HOOKED soft-delete self-referential parent's
+    // bulk delete_many monomorphizes the soft-delete bulk cascade — its soft
+    // `destroy` records the descendant in the "all handled" set so the bulk root
+    // hook loop skips it (no double-fire), while a SEPARATE physical set backs the
+    // diamond revisit-skip.
+    assert_is_fn(<PgBsdNodeRepository as BsdNodeRepository>::delete_many);
+    assert_is_fn(PgBsdNodeRepository::__autumn_apply_dependent_on_conn);
+    // #1740: the bulk `delete_many` path now carries the dependent cascade too;
+    // monomorphize it (hooks-child parent + restrict-only parent) to prove the
+    // bulk-cascade codegen type-checks without Docker.
+    assert_is_fn(<PgDepPostRepository as DepPostRepository>::delete_many);
+    assert_is_fn(<PgDepPostRestrictOnlyRepository as DepPostRestrictOnlyRepository>::delete_many);
+    // Hooks-path bulk cascade branch (#1740): a hooked parent with a dependent.
+    assert_is_fn(<PgDepHookedPostRepository as DepHookedPostRepository>::delete_many);
+    assert_is_fn(<PgDepHookedPostRepository as DepHookedPostRepository>::delete_by_id);
+    // #1738: the model-declared `#[has_many(dependent = ...)]` parent's
+    // `delete_by_id` monomorphizes — proving the runtime `RuntimeDependentSpec`
+    // dispatch (fn-pointer thunks into each child's cascade leaf executor, wired
+    // from the model side with no repository-attribute `dependent(...)`)
+    // type-checks against the same four cascade actions.
+    assert_is_fn(<PgModelDepPostRepository as ModelDepPostRepository>::delete_by_id);
+    // Codex P1: the model-declared parent's bulk `delete_many` monomorphizes too —
+    // proving the runtime `RuntimeDependentSpec` dispatch on the BULK path (all
+    // four actions: destroy + delete_all + restrict) type-checks.
+    assert_is_fn(<PgModelDepPostRepository as ModelDepPostRepository>::delete_many);
+    // The model exposes its runtime dependent specs (inherent shadow of
+    // `AutumnDependents::dependents`): destroy + delete_all + restrict + nullify.
+    // #1786: the `nullify` child (`DepBookmark`, nullable `post_id: Option<i64>`)
+    // is now declared model-side — the has_many preload loader groups the child
+    // through `preload::FkKey`, so a nullable-FK association compiles.
+    assert_is_fn(ModelDepPost::dependents);
+    assert_eq!(ModelDepPost::dependents().len(), 4);
+    // Codex P1: the fully model-side three-level graph monomorphizes. The key
+    // new codegen is the intermediate `M3Comment`'s cascade leaf executor —
+    // its Destroy arm now runtime-dispatches into `M3Comment::dependents()`
+    // (the grandchild `M3Reply` spec) because `M3Comment` declares its
+    // dependent ONLY model-side (empty `config.dependents`). Referencing the
+    // helper + both `delete_by_id`s type-checks that recursive runtime path.
+    assert_is_fn(<PgM3PostRepository as M3PostRepository>::delete_by_id);
+    // Codex P1: the fully model-side parent's BULK delete_many must also
+    // runtime-dispatch (and recurse into model-side grandchildren).
+    assert_is_fn(<PgM3PostRepository as M3PostRepository>::delete_many);
+    assert_is_fn(<PgM3CommentRepository as M3CommentRepository>::delete_by_id);
+    assert_is_fn(PgM3CommentRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgM3ReplyRepository::__autumn_apply_dependent_on_conn);
+    // A model-side child (M3Comment) that itself has a model-side dependent.
+    assert_eq!(M3Post::dependents().len(), 1);
+    assert_eq!(M3Comment::dependents().len(), 1);
+    // #1800 case 1: the mixed soft/hard-delete diamond monomorphizes — a soft
+    // parent, a soft child and a hard child both cascading into the same soft
+    // grandchild table via distinct FKs.
+    assert_is_fn(<PgDiaRootRepository as DiaRootRepository>::delete_by_id);
+    assert_is_fn(PgDiaSoftRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDiaHardRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDiaLeafRepository::__autumn_apply_dependent_on_conn);
+    // #1800 (Codex "Re-probe restricts on hard revisits"): the mixed soft/hard
+    // diamond whose shared soft leaf HOOKS and restrict-depends on a soft guard
+    // monomorphizes — its Destroy arm's restrict pre-scan skip now keys on the
+    // physical-delete set, so a hard revisit of a soft-deleted leaf re-probes.
+    assert_is_fn(<PgDhrRootRepository as DhrRootRepository>::delete_by_id);
+    assert_is_fn(PgDhrSoftRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDhrHardRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDhrLeafRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDhrGuardRepository::__autumn_apply_dependent_on_conn);
+    // #1800 case 3: a parent with a before_delete hook AND a restrict dependent
+    // monomorphizes the assemble_cascade_body branch that now probes the parent
+    // restrict BEFORE the parent hook.
+    assert_is_fn(<PgPhPostRepository as PhPostRepository>::delete_by_id);
+    assert_is_fn(PgPhGuardRepository::__autumn_apply_dependent_on_conn);
+}
+
+// ── Tests (require Docker) ────────────────────────────────────────────────────
+
+/// AC1/AC2/AC4/AC6 + success metric: deleting a post with N comments + votes +
+/// bookmarks leaves **zero** orphaned/dangling child rows and **zero** FK
+/// errors, in one transaction. Comments are destroyed via the repository delete
+/// path (firing hooks), votes are bulk-deleted, bookmarks are nullified.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn deleting_parent_cascades_and_leaves_no_orphans() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (1, 'hello')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_comments (id, post_id, body) VALUES ({i}, 1, 'c{i}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_votes (id, post_id, value) VALUES ({i}, 1, 1)"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_bookmarks (id, post_id, label) VALUES ({i}, 1, 'b{i}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    DESTROYED_COMMENTS.store(0, Ordering::SeqCst);
+
+    let repo = PgDepPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(1)
+        .await
+        .expect("cascade delete must not FK-error");
+
+    // Parent gone.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id = 1"
+        )
+        .await,
+        0
+    );
+    // destroy: comments hard-deleted (not soft-delete repo) → 0 orphans.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_comments WHERE post_id = 1"
+        )
+        .await,
+        0
+    );
+    // delete_all: votes gone.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_votes WHERE post_id = 1"
+        )
+        .await,
+        0
+    );
+    // nullify: bookmarks survive but detached.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_bookmarks WHERE post_id = 1"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_bookmarks WHERE post_id IS NULL"
+        )
+        .await,
+        3
+    );
+    // AC4: each destroyed comment fired its before_delete hook.
+    // (UFCS: `RunQueryDsl` is in scope, so disambiguate from diesel's `.load`.)
+    assert_eq!(AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst), 3);
+}
+
+/// #1740: `delete_many` on parents with `dependent(...)` runs the SAME cascade
+/// as `delete_by_id` — `destroy`/`delete_all`/`nullify` per child association —
+/// for every parent, in one transaction, leaving no orphaned or FK-dangling rows.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_cascades_dependents() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Two parents, each with a comment (destroy), a vote (delete_all) and a
+    // bookmark (nullify).
+    for p in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_posts (id, title) VALUES ({p}, 'p{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_comments (id, post_id, body) VALUES ({p}, {p}, 'c{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_votes (id, post_id, value) VALUES ({p}, {p}, 1)"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_bookmarks (id, post_id, label) VALUES ({p}, {p}, 'b{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    DESTROYED_COMMENTS.store(0, Ordering::SeqCst);
+
+    let repo = PgDepPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_many(&[1, 2])
+        .await
+        .expect("bulk cascade delete must not FK-error");
+
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_posts").await,
+        0,
+        "both parents deleted"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_comments").await,
+        0,
+        "#1740: destroy children cascaded on the bulk path"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_votes").await,
+        0,
+        "#1740: delete_all children cascaded on the bulk path"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_bookmarks WHERE post_id IS NOT NULL"
+        )
+        .await,
+        0,
+        "#1740: nullify children detached on the bulk path"
+    );
+    // Both destroy children fired their before_delete hook during the bulk cascade.
+    assert_eq!(AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst), 2);
+}
+
+/// #1740: a `restrict` dependent still blocks a bulk `delete_many` with a typed
+/// 409 and rolls the whole transaction back (no parent or child removed).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_restrict_blocks_and_rolls_back() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (7, 'guarded'), (8, 'free')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // Only post 7 has a restrict child; the bulk delete of [7, 8] must still be
+    // blocked and rolled back wholesale (post 8 survives too).
+    diesel::sql_query("INSERT INTO dep_awards (id, post_id, name) VALUES (1, 7, 'gold')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgDepPostRestrictOnlyRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_many(&[7, 8])
+        .await
+        .expect_err("restrict child must block the bulk delete");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "a blocking restrict must surface a 409 on the bulk path"
+    );
+
+    // Whole transaction rolled back: both parents and the child survive.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_posts").await,
+        2,
+        "both parents survive a blocked bulk delete"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_awards WHERE post_id = 7"
+        )
+        .await,
+        1,
+        "the restrict child survives"
+    );
+}
+
+/// #1739: deleting a `Dep3Post` with `dependent(Comment, destroy)` where
+/// `Comment` has `dependent(Reply, destroy)` must recurse — leaving zero
+/// `Dep3Reply` (grandchild) rows and zero orphaned comments, in one
+/// transaction, with no FK error.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn deleting_parent_recurses_into_grandchildren() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep3_posts (id, title) VALUES (1, 'p')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // 2 comments, each with 2 replies → 4 grandchildren.
+    for c in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep3_comments (id, post_id, body) VALUES ({c}, 1, 'c{c}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for r in 1..=2 {
+            let rid = c * 10 + r;
+            diesel::sql_query(format!(
+                "INSERT INTO dep3_replies (id, comment_id, body) VALUES ({rid}, {c}, 'r{rid}')"
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    let repo = PgDep3PostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(1)
+        .await
+        .expect("recursive cascade must not FK-error");
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep3_posts WHERE id = 1"
+        )
+        .await,
+        0,
+        "parent gone"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep3_comments").await,
+        0,
+        "all comments (children) destroyed"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep3_replies").await,
+        0,
+        "#1739: all replies (grandchildren) must be recursively destroyed — zero left"
+    );
+}
+
+/// Codex P1: deleting an `M3Post` whose graph is declared ENTIRELY model-side
+/// (`M3Post -> M3Comment -> M3Reply`, all via `#[has_many(..., dependent =
+/// destroy)]`, NO repository-attribute `dependent(...)`) must recurse all the
+/// way down. Because the intermediate `M3Comment` declares its dependent only
+/// model-side, its `config.dependents` is empty; the fix makes its Destroy arm
+/// consult the runtime `M3Comment::dependents()` so the grandchildren cascade
+/// too. Asserts **zero `M3Reply` rows AND zero `M3Comment` rows** remain (the
+/// exact acceptance criterion), in one transaction with no FK error.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn deleting_model_side_parent_recurses_into_model_side_grandchildren() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO m3_posts (id, title) VALUES (1, 'p')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // 2 comments, each with 2 replies → 4 grandchildren.
+    for c in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO m3_comments (id, post_id, body) VALUES ({c}, 1, 'c{c}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for r in 1..=2 {
+            let rid = c * 10 + r;
+            diesel::sql_query(format!(
+                "INSERT INTO m3_replies (id, comment_id, body) VALUES ({rid}, {c}, 'r{rid}')"
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    let repo = PgM3PostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(1)
+        .await
+        .expect("model-side recursive cascade must not FK-error");
+
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_posts WHERE id = 1").await,
+        0,
+        "parent gone"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_comments").await,
+        0,
+        "Codex P1: all comments (children) must be destroyed — zero left"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_replies").await,
+        0,
+        "Codex P1: all replies (grandchildren) must be recursively destroyed via \
+         the child's runtime Model::dependents() — zero left"
+    );
+}
+
+/// Codex P1: bulk `delete_many` on a FULLY model-side parent (`M3Post`, whose
+/// `#[has_many(M3Comment, dependent = destroy)]` is declared only on the model
+/// struct, no repository-attribute `dependent(...)`) must cascade — the bulk
+/// path has to consult the runtime `M3Post::dependents()` just like `delete_by_id`
+/// does, otherwise the children are orphaned / FK-error. Deleting `[1, 2]` must
+/// leave zero comments AND zero (grandchild) replies, in one transaction.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_model_side_parent_cascades_via_runtime_dispatch() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Two posts, each with a comment, each comment with a reply (grandchild).
+    for p in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO m3_posts (id, title) VALUES ({p}, 'p{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO m3_comments (id, post_id, body) VALUES ({p}, {p}, 'c{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO m3_replies (id, comment_id, body) VALUES ({p}, {p}, 'r{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let repo = PgM3PostRepository::with_pool_untracked(pool.clone());
+    repo.delete_many(&[1, 2])
+        .await
+        .expect("Codex P1: model-side bulk cascade must not FK-error / orphan");
+
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_posts").await,
+        0,
+        "both parents deleted"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_comments").await,
+        0,
+        "Codex P1: model-declared destroy children cascaded on the BULK path — zero left"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_replies").await,
+        0,
+        "Codex P1: grandchildren recursively destroyed on the bulk path via the \
+         child's runtime Model::dependents() — zero left"
+    );
+}
+
+/// #1739 cycle guard: a self-referential `destroy` cascade over a cyclic graph
+/// (a descendant whose `parent_id` points back at an ancestor) must terminate,
+/// not infinite-loop, and remove the whole reachable component in one tx.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn self_referential_destroy_terminates_on_cycle() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Chain 1 → 2 → 3, then create a cycle by pointing 1's parent at 3.
+    // (Insert with NULL parents first to satisfy the FK, then wire the edges.)
+    for id in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    // 2's parent = 1, 3's parent = 2, 1's parent = 3 → a 3-cycle.
+    diesel::sql_query("UPDATE dep_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("UPDATE dep_nodes SET parent_id = 2 WHERE id = 3")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("UPDATE dep_nodes SET parent_id = 3 WHERE id = 1")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgDepNodeRepository::with_pool_untracked(pool.clone());
+    // Must return (not hang / overflow). The visited-set guard breaks the cycle.
+    repo.delete_by_id(1)
+        .await
+        .expect("self-referential cascade over a cycle must terminate without error");
+
+    // The entire cyclic component is reachable from node 1 and removed.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_nodes").await,
+        0,
+        "#1739 cycle guard: the whole reachable cyclic component is destroyed, no rows left"
+    );
+}
+
+/// Codex P2: bulk-deleting `[ancestor, descendant]` of a self-referential
+/// `dependent = destroy` graph with an IMMEDIATE (non-deferrable) self-FK, where
+/// an intermediate node is NOT in the id list, must remove the whole subtree
+/// without an FK error. Chain: node 1 (ancestor) ← node 2 (intermediate, NOT in
+/// ids) ← node 3 (descendant). `delete_many([1, 3])`.
+///
+/// With the pre-#P2 pre-seeding, node 3 was marked visited up front, so the
+/// ancestor's cascade skipped it; deleting the intermediate (node 2) then failed
+/// the immediate FK from the still-present node 3. The fix populates the visited
+/// set only as rows are actually destroyed, so node 3 is cascaded (deepest first)
+/// before node 2 is removed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_self_referential_immediate_fk_removes_whole_subtree() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Insert with NULL parents first (immediate FK), then wire the chain.
+    for id in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_imm_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    // 2's parent = 1 (ancestor), 3's parent = 2 (intermediate).
+    diesel::sql_query("UPDATE dep_imm_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("UPDATE dep_imm_nodes SET parent_id = 2 WHERE id = 3")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgDepImmNodeRepository::with_pool_untracked(pool.clone());
+    // Intermediate node 2 is deliberately absent from the id list.
+    repo.delete_many(&[1, 3])
+        .await
+        .expect("Codex P2: bulk self-ref delete must not trip the immediate FK");
+
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_imm_nodes").await,
+        0,
+        "Codex P2: the whole reachable subtree (ancestor, intermediate, \
+         descendant) is destroyed with no immediate FK violation"
+    );
+}
+
+/// Codex round-4: `delete_many([A])` on a self-referential `dependent = destroy`
+/// graph that forms a TRUE 2-cycle (`A.parent_id` = B, `B.parent_id` = A) must fire
+/// A's `before_delete` hook EXACTLY ONCE (as the bulk parent delete) and remove
+/// BOTH rows. Before the fix the bulk cascade never seeded the current root into
+/// the shared visited set, so cascading A → child B → grandchild A re-entered A
+/// through B's destroy executor and fired A's hook a SECOND time (as a cascaded
+/// child) before the final bulk parent delete. Seeding the current root
+/// immediately before its own destroy cascade (mirroring `delete_by_id`) closes
+/// the re-entry while still cascading B deepest-first.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_self_referential_two_cycle_fires_root_hook_once() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Insert with NULL parents first (satisfy the deferrable FK), then wire the
+    // 2-cycle: node 1 (A).parent_id = 2 (B), node 2 (B).parent_id = 1 (A).
+    for id in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_cycle_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    diesel::sql_query("UPDATE dep_cycle_nodes SET parent_id = 2 WHERE id = 1")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("UPDATE dep_cycle_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    CYCLE_DELETE_LOG.lock().unwrap().clear();
+
+    let repo = PgDepCycleNodeRepository::with_pool_untracked(pool.clone());
+    // Bulk-delete only A (node 1). The cascade must reach B (node 2) but must NOT
+    // re-enter A as a cascaded child.
+    repo.delete_many(&[1])
+        .await
+        .expect("round-4: bulk self-ref 2-cycle delete must terminate without error");
+
+    // Both rows removed (the whole cyclic component reachable from A).
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_cycle_nodes").await,
+        0,
+        "round-4: both rows of the 2-cycle are destroyed"
+    );
+
+    // The root A (id 1) fired its `before_delete` hook EXACTLY ONCE — it was not
+    // re-entered as a cascaded child. B (id 2) also fires once (cascaded child).
+    let log: Vec<i64> = CYCLE_DELETE_LOG.lock().unwrap().clone();
+    assert_eq!(
+        log.iter().filter(|&&id| id == 1).count(),
+        1,
+        "round-4: the bulk root's before_delete hook must fire EXACTLY ONCE \
+         (not re-entered as a cascaded child): log = {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|&&id| id == 2).count(),
+        1,
+        "round-4: the cascaded child fires once: log = {log:?}"
+    );
+}
+
+/// Codex round-5-A: deleting a `Post -> Comment(destroy, hooked) -> Reply(restrict)`
+/// graph must return the restrict 409 WITHOUT firing the comment's `before_delete`
+/// hook. The Destroy arm probes the grandchild restrict (read-only) BEFORE running
+/// the child hook, so a doomed transaction never leaves a non-transactional hook
+/// side effect behind.
+///
+/// RED under the pre-fix ordering (grandchild cascade after `before_delete`):
+/// deleting the post fired `RaComment::before_delete` and only then hit the reply
+/// restrict 409 — the hook counter would read 1. GREEN: the probe precedes the
+/// hook, so the counter stays 0.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn grandchild_restrict_blocks_before_child_before_delete_hook_fires() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO ra_posts (id, title) VALUES (1, 'p')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO ra_comments (id, post_id, body) VALUES (1, 1, 'c')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // A reply exists → the comment's `restrict` grandchild must block the delete.
+    diesel::sql_query("INSERT INTO ra_replies (id, comment_id, body) VALUES (1, 1, 'r')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    RA_COMMENT_HOOK_FIRED.store(0, Ordering::SeqCst);
+
+    let repo = PgRaPostRepository::with_pool_untracked(pool.clone());
+    let result = repo.delete_by_id(1).await;
+    assert!(
+        result.is_err(),
+        "round-5-A: the grandchild restrict must block the post delete with a 409"
+    );
+
+    // The whole transaction rolled back — post, comment and reply all survive.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM ra_posts").await,
+        1
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM ra_comments").await,
+        1
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM ra_replies").await,
+        1
+    );
+
+    // The crux: the comment's before_delete hook must NOT have fired — the restrict
+    // probe ran first and returned the 409 before any child hook.
+    assert_eq!(
+        // Fully-qualified `load` — `RunQueryDsl::load` is in scope and would
+        // otherwise shadow the atomic's inherent method (see DESTROYED_COMMENTS).
+        AtomicUsize::load(&RA_COMMENT_HOOK_FIRED, Ordering::SeqCst),
+        0,
+        "round-5-A: RaComment::before_delete must NOT fire when a grandchild restrict \
+         blocks the delete (probe precedes the hook)"
+    );
+}
+
+/// Codex round-5-B: bulk `delete_many([D, Anc])` over a HOOKED self-referential
+/// chain Anc(1) ← I(2) ← D(3) with an IMMEDIATE self-FK (the intermediate I is
+/// NOT in the batch) must remove all three rows with NO immediate FK violation,
+/// and fire D's `before_delete` hook EXACTLY ONCE.
+///
+/// RED under the round-4 monotonic per-root seed: if the batch processed the
+/// descendant root D before its ancestor Anc, D was pre-marked visited, so Anc's
+/// cascade skipped D while deleting the intermediate I it still references →
+/// immediate FK failure; the opposite order double-fired D's hook (once as Anc's
+/// cascaded descendant, once as a batch root). GREEN with the two-structure model:
+/// the active-path stack only blocks re-entry while on the recursion stack (so a
+/// completed descendant root no longer suppresses the ancestor's cascade → D is
+/// deleted deepest-first, no FK), and the monotonic deleted set skips any row (or
+/// batch root) already removed (so D's hook fires exactly once).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_self_referential_immediate_fk_chain_no_double_hook() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Insert with NULL parents first (immediate FK), then wire the chain
+    // Anc(1) ← I(2) ← D(3): each child's parent_id points at its parent.
+    for id in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO chain_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    diesel::sql_query("UPDATE chain_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("UPDATE chain_nodes SET parent_id = 2 WHERE id = 3")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    CHAIN_DELETE_LOG.lock().unwrap().clear();
+
+    let repo = PgChainNodeRepository::with_pool_untracked(pool.clone());
+    // Batch the descendant D(3) and the ancestor Anc(1); the intermediate I(2) is
+    // deliberately absent from the id list.
+    repo.delete_many(&[3, 1])
+        .await
+        .expect("round-5-B: bulk self-ref immediate-FK chain delete must not trip the FK");
+
+    // All three rows (ancestor, intermediate, descendant) are gone.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM chain_nodes").await,
+        0,
+        "round-5-B: the whole chain is removed with no immediate FK violation"
+    );
+
+    let log = CHAIN_DELETE_LOG.lock().unwrap().clone();
+    // Each of the three nodes fired before_delete exactly once — in particular the
+    // descendant root D(3), which is both a batch target and a cascaded descendant.
+    assert_eq!(
+        log.iter().filter(|&&id| id == 3).count(),
+        1,
+        "round-5-B: D's before_delete must fire EXACTLY once (not once-as-child + \
+         once-as-root): log = {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|&&id| id == 2).count(),
+        1,
+        "round-5-B: the intermediate fires once: log = {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|&&id| id == 1).count(),
+        1,
+        "round-5-B: the ancestor fires once: log = {log:?}"
+    );
+}
+
+/// #1800 case 1 (regression): bulk `delete_many([Desc, Anc])` over a HOOKED
+/// `#[soft_delete]` self-referential `dependent = destroy` graph — the descendant
+/// AND its ancestor — must fire the descendant's `before_delete` hook EXACTLY ONCE.
+///
+/// The ancestor's soft cascade soft-deletes the descendant (firing its hook once as
+/// a cascaded descendant); the descendant is then also a batch root, so the bulk
+/// root hook loop must SKIP it. That skip consults the "all handled" `__autumn_deleted`
+/// set, which must record the SOFT-deleted descendant.
+///
+/// RED under the first #1800 fix (which recorded ONLY physically-deleted rows in the
+/// single `__deleted` set): the soft-deleted descendant was absent from the set, so
+/// the bulk root loop did not skip it and its `before_delete` fired a SECOND time
+/// (count == 2). GREEN once the "all handled" bulk-root set and the "physically
+/// deleted" diamond set are tracked SEPARATELY: the descendant is recorded as
+/// handled, the root loop skips it, and the hook fires exactly once (count == 1).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_soft_self_referential_fires_descendant_hook_once() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Insert with NULL parents first (satisfy the deferrable FK), then wire
+    // Anc(1) ← Desc(2): the descendant's parent_id points at the ancestor.
+    for id in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO bsd_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    diesel::sql_query("UPDATE bsd_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    BSD_DELETE_LOG.lock().unwrap().clear();
+
+    let repo = PgBsdNodeRepository::with_pool_untracked(pool.clone());
+    // Batch BOTH the descendant Desc(2) and the ancestor Anc(1). The ancestor's
+    // soft `destroy` cascade soft-deletes Desc; Desc is also a batch root.
+    repo.delete_many(&[2, 1])
+        .await
+        .expect("#1800: bulk soft self-ref delete must not error");
+
+    // Both rows are soft-deleted (present, deleted_at set) — nothing is physically
+    // removed on a soft-delete graph.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM bsd_nodes WHERE deleted_at IS NOT NULL"
+        )
+        .await,
+        2,
+        "#1800: both the ancestor and descendant are soft-deleted"
+    );
+
+    // The crux: the descendant Desc(2)'s `before_delete` hook fired EXACTLY ONCE —
+    // once as the ancestor's cascaded descendant, and NOT a second time as a batch
+    // root (the bulk root loop skips it because it is recorded in the "all handled"
+    // set even though it was only soft-deleted).
+    let log = BSD_DELETE_LOG.lock().unwrap().clone();
+    assert_eq!(
+        log.iter().filter(|&&id| id == 2).count(),
+        1,
+        "#1800: the soft-deleted descendant's before_delete must fire EXACTLY ONCE \
+         on the bulk path (not once-as-cascade + once-as-root): log = {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|&&id| id == 1).count(),
+        1,
+        "#1800: the ancestor fires once (as the bulk parent delete): log = {log:?}"
+    );
+}
+
+/// AC5: `dependent = restrict` blocks the delete with a typed 409 Conflict when
+/// children exist, and rolls back (parent survives).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn restrict_blocks_delete_with_conflict_and_rolls_back() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (5, 'guarded')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dep_awards (id, post_id, name) VALUES (1, 5, 'gold')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgDepPostRestrictOnlyRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_by_id(5)
+        .await
+        .expect_err("restrict must block the delete");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "restrict must surface a 409, not a 500"
+    );
+
+    // Rolled back: parent and child both survive.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id = 5"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_awards WHERE post_id = 5"
+        )
+        .await,
+        1
+    );
+}
+
+/// AC3 (both-soft): a `#[soft_delete]` parent with a `dependent = destroy` on a
+/// `#[soft_delete]` child. `delete_by_id` soft-deletes the parent (row remains,
+/// FK stays valid) and the cascade soft-deletes the children — all rows remain
+/// with `deleted_at` set, no FK error. This is the AC3 "parent soft-deleted,
+/// cascade still runs so the live graph stays consistent" scenario.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn destroy_soft_parent_soft_deletes_soft_children() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_soft_posts (id, title) VALUES (9, 'soft')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_soft_comments (id, post_id, body) VALUES ({i}, 9, 's{i}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let repo = PgDepSoftPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(9).await.expect("soft cascade delete");
+
+    // Parent row remains (soft-deleted, FK targets stay valid).
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_soft_posts WHERE id = 9 AND deleted_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "a soft-delete parent row must remain with deleted_at set"
+    );
+    // Children remain (soft-deleted, not hard-deleted) with deleted_at set.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_soft_comments WHERE post_id = 9"
+        )
+        .await,
+        2,
+        "soft-delete children must not be hard-deleted when the parent is soft-deleted"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_soft_comments WHERE post_id = 9 AND deleted_at IS NOT NULL"
+        )
+        .await,
+        2,
+        "each child must be soft-deleted (deleted_at set)"
+    );
+}
+
+/// #1369 P1 (hard parent + soft child, incl. a PRE-soft-deleted child): a
+/// NON-soft parent that `destroy`s a `#[soft_delete]` child. Because the parent
+/// is hard-deleted, the children must be HARD-deleted too (rows gone) — even a
+/// child that was ALREADY soft-deleted (`deleted_at` set) whose NOT NULL FK still
+/// points at the parent. The parent-soft-gated live filter is dropped for a hard
+/// parent, so the cascade selects every physically-present child. Assert zero
+/// surviving children, zero FK errors, parent gone.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn destroy_hard_parent_hard_deletes_soft_children() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_hard_posts (id, title) VALUES (11, 'hard')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_hard_soft_comments (id, post_id, body) VALUES ({i}, 11, 'h{i}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    // Pre-soft-delete one child: its deleted_at is already set, but its NOT NULL
+    // FK still references the parent. This row must NOT be skipped by the live
+    // filter on a hard-parent cascade, or the parent DELETE would FK-fail.
+    diesel::sql_query("UPDATE dep_hard_soft_comments SET deleted_at = now() WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgDepHardPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(11)
+        .await
+        .expect("hard-parent cascade must not FK-error, even with a pre-soft-deleted child");
+
+    // Parent gone.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_hard_posts WHERE id = 11"
+        )
+        .await,
+        0
+    );
+    // All children HARD-deleted (rows gone), including the pre-soft-deleted one.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_hard_soft_comments WHERE post_id = 11"
+        )
+        .await,
+        0,
+        "a hard-deleted parent must hard-delete every physically-present soft-delete child (incl. pre-soft-deleted), leaving no orphan and no FK error"
+    );
+}
+
+/// #1369 restrict ordering: `DepPost` declares `destroy(Comment)` BEFORE
+/// `restrict(Award)`, and `DepComment`'s `before_delete` increments a counter.
+/// When a restrict child (award) has rows, `delete_by_id` must return 409 and
+/// roll back WITHOUT ever firing the destroy child's `before_delete` — the
+/// restrict probe runs before any mutating dependent. Asserts: 409, the destroy
+/// hook counter did NOT move, and nothing was deleted.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn restrict_probes_before_destroy_fires_no_child_hooks() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (21, 'guarded')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_comments (id, post_id, body) VALUES ({i}, 21, 'c{i}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    // A restrict child (award) with a row → the delete must be blocked.
+    diesel::sql_query("INSERT INTO dep_awards (id, post_id, name) VALUES (1, 21, 'gold')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    DESTROYED_COMMENTS.store(0, Ordering::SeqCst);
+
+    let repo = PgDepPostRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_by_id(21)
+        .await
+        .expect_err("restrict child with rows must block the delete");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "a blocking restrict must surface a 409"
+    );
+
+    // The destroy child's before_delete hook must NOT have fired — the restrict
+    // probe runs before any mutating dependent, so no non-transactional side
+    // effect happened for a delete that never committed.
+    assert_eq!(
+        AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst),
+        0,
+        "restrict must be probed before destroy so the child before_delete hook never fires"
+    );
+
+    // Nothing was deleted (whole tx rolled back).
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id = 21"
+        )
+        .await,
+        1,
+        "the parent must survive a blocked delete"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_comments WHERE post_id = 21"
+        )
+        .await,
+        3,
+        "the destroy child rows must be untouched"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_awards WHERE post_id = 21"
+        )
+        .await,
+        1,
+        "the restrict child row must survive"
+    );
+}
+
+// ── #1738: model-declared cascade produces the same behavior ──────────────────
+
+/// #1738 primary AC: `#[has_many(Child, dependent = <action>)]` declared on the
+/// MODEL (no repository-attribute `dependent(...)`) produces the same
+/// transactional cascade the repository-attribute form produces. Deleting a
+/// `ModelDepPost` destroys its comments (firing their hooks) and bulk-deletes
+/// its votes — driven entirely by the runtime `ModelDepPost::dependents()`
+/// dispatch resolving `PgDepCommentRepository` / `PgDepVoteRepository` by
+/// convention. (No awards are inserted, since the model also declares
+/// `restrict(DepAward)`, exercised separately below.)
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn model_declared_dependent_cascades_like_repository_attribute() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (31, 'model-side')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_comments (id, post_id, body) VALUES ({}, 31, 'c{i}')",
+            100 + i
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_votes (id, post_id, value) VALUES ({}, 31, 1)",
+            100 + i
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    DESTROYED_COMMENTS.store(0, Ordering::SeqCst);
+
+    let repo = PgModelDepPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(31)
+        .await
+        .expect("model-declared cascade delete must not FK-error");
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id = 31"
+        )
+        .await,
+        0,
+        "parent gone"
+    );
+    // destroy: comments hard-deleted, and each fired its before_delete hook.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_comments WHERE post_id = 31"
+        )
+        .await,
+        0,
+        "destroy child rows removed via the model-declared cascade"
+    );
+    assert_eq!(
+        AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst),
+        3,
+        "each destroyed comment fired its before_delete hook (child lifecycle honored)"
+    );
+    // delete_all: votes bulk-removed.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_votes WHERE post_id = 31"
+        )
+        .await,
+        0,
+        "delete_all child rows removed via the model-declared cascade"
+    );
+}
+
+/// #1786: model-declared `#[has_many(dependent = nullify)]` sets the child FK to
+/// NULL from the MODEL side — the nullable-FK (`DepBookmark::post_id:
+/// Option<i64>`) association now compiles (`has_many` preload groups through
+/// `preload::FkKey`), and deleting the `ModelDepPost` detaches its bookmarks:
+/// the rows survive with `post_id IS NULL`, mirroring the repository-attribute
+/// nullify test but driven by `ModelDepPost::dependents()`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn model_declared_nullify_detaches_children() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (33, 'model-nullify')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_bookmarks (id, post_id, label) VALUES ({}, 33, 'b{i}')",
+            300 + i
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let repo = PgModelDepPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(33)
+        .await
+        .expect("model-declared nullify cascade must not FK-error");
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id = 33"
+        )
+        .await,
+        0,
+        "parent gone"
+    );
+    // nullify: bookmark rows survive but detached (FK set NULL) via the
+    // model-declared cascade.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_bookmarks WHERE post_id = 33"
+        )
+        .await,
+        0,
+        "no bookmark still points at the deleted parent"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_bookmarks WHERE post_id IS NULL AND id IN (301, 302, 303)"
+        )
+        .await,
+        3,
+        "nullify child rows survive detached (post_id = NULL) via the model-declared cascade"
+    );
+}
+
+/// #1738: model-declared `restrict` preserves the typed 409 + rollback, exactly
+/// as the repository-attribute form does. An award (restrict child) blocks the
+/// `ModelDepPost` delete, and the transaction rolls back leaving every row.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn model_declared_restrict_blocks_with_conflict_and_rolls_back() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (32, 'guarded-model')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dep_comments (id, post_id, body) VALUES (201, 32, 'c')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dep_awards (id, post_id, name) VALUES (11, 32, 'gold')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    DESTROYED_COMMENTS.store(0, Ordering::SeqCst);
+
+    let repo = PgModelDepPostRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_by_id(32)
+        .await
+        .expect_err("model-declared restrict child must block the delete");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "a blocking model-declared restrict must surface a 409"
+    );
+    // Restrict probed before destroy → the comment's before_delete never fired.
+    assert_eq!(
+        AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst),
+        0,
+        "restrict must be probed before destroy in the model-declared cascade too"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id = 32"
+        )
+        .await,
+        1,
+        "the parent must survive a blocked model-declared delete"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_comments WHERE post_id = 32"
+        )
+        .await,
+        1,
+        "the destroy child rows must be untouched after a blocked delete"
+    );
+}
+
+// ── #1800 case 1: mixed soft/hard-delete diamond ──────────────────────────────
+
+/// #1800 case 1: a SOFT parent destroys a soft child and a hard child that both
+/// point at the same soft grandchild (the leaf) via different FKs. The soft branch
+/// is processed first and soft-deletes the leaf; the hard branch must still HARD-
+/// delete the leaf (its `hard_id` FK references a row being physically removed).
+///
+/// RED before the fix: the soft delete recorded the leaf in the traversal
+/// `__deleted` set, so the hard branch skipped it — leaving the leaf physically
+/// present with a `hard_id` referencing the deleted hard row (an immediate FK
+/// violation → the whole delete errors, and the leaf dangles). GREEN after the
+/// fix: a soft delete no longer records the row as gone, so the hard branch reaches
+/// and physically removes the leaf; the delete succeeds with no dangling FK.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn mixed_soft_hard_diamond_hard_branch_still_removes_shared_leaf() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dia_roots (id, title) VALUES (1, 'root')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dia_softs (id, root_id) VALUES (1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dia_hards (id, root_id) VALUES (1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // The shared leaf references BOTH the soft child (soft_id) and the hard child
+    // (hard_id). It is reached through the soft branch first, then the hard branch.
+    diesel::sql_query("INSERT INTO dia_leaves (id, soft_id, hard_id) VALUES (1, 1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgDiaRootRepository::with_pool_untracked(pool.clone());
+    // Soft-deletes the root; cascades soft (dia_softs) then hard (dia_hards).
+    repo.delete_by_id(1)
+        .await
+        .expect("case 1: the hard branch must physically remove the shared leaf, no dangling FK");
+
+    // The hard child is physically gone.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dia_hards").await,
+        0,
+        "case 1: the hard child must be physically deleted"
+    );
+    // The shared leaf must be PHYSICALLY gone — not merely soft-deleted — because
+    // its hard parent was hard-deleted. A surviving (even soft-deleted) row would be
+    // a dangling `hard_id` FK.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dia_leaves").await,
+        0,
+        "case 1: the shared leaf must be HARD-deleted through the hard branch, \
+         not left present by the soft branch's __deleted mark (no dangling FK)"
+    );
+    // The soft parent and soft child remain present but soft-deleted (deleted_at set).
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dia_roots WHERE deleted_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "case 1: the soft root is soft-deleted (row present, deleted_at set)"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dia_softs WHERE deleted_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "case 1: the soft child is soft-deleted (row present, deleted_at set)"
+    );
+}
+
+// ── #1800 (Codex "Re-probe restricts on hard revisits") ───────────────────────
+
+/// #1800 (Codex "Re-probe restricts on hard revisits"): in a mixed soft/hard
+/// diamond, a soft-deleted leaf reached again through the hard branch must re-run
+/// its grandchild `restrict` pre-scan. The leaf restrict-depends on a SOFT-DELETED
+/// guard: the hard-path probe drops the live filter, so it sees the guard and must
+/// return a typed 409 BEFORE the leaf `before_delete` hook fires a second time and
+/// BEFORE the hard DELETE falls through to a raw FK failure against the guard.
+///
+/// RED before the fix: the restrict pre-scan skip keyed on the "all handled"
+/// `__deleted` set, which already held the soft-deleted leaf, so the hard-path
+/// probe was SKIPPED. Phase-2 (keyed on `__physical`) still fired the leaf hook a
+/// second time and hard-deleted the leaf → raw FK 500 (not the typed 409).
+/// GREEN after the fix: the pre-scan skip keys on `__physical` (which does NOT hold
+/// the soft-deleted leaf), so it re-probes with `__parent_soft == false`, includes
+/// the soft-deleted guard, and returns the 409 before any second hook fire.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn hard_revisit_reprobes_restrict_before_child_hook_and_fk_failure() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dhr_roots (id, title) VALUES (1, 'root')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dhr_softs (id, root_id) VALUES (1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dhr_hards (id, root_id) VALUES (1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // The shared leaf references BOTH the soft child (soft_id) and the hard child
+    // (hard_id). It is reached through the soft branch first, then the hard branch.
+    diesel::sql_query("INSERT INTO dhr_leaves (id, soft_id, hard_id) VALUES (1, 1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // The leaf's `restrict` dependent — a guard that we SOFT-DELETE below, so it is
+    // invisible to the soft-path probe (live-filtered) but visible to the hard-path
+    // probe (which drops the filter). Its FK to the leaf is a real, immediate DB
+    // constraint, so a hard delete of the leaf while the guard is present FK-fails.
+    diesel::sql_query("INSERT INTO dhr_guards (id, leaf_id, name) VALUES (1, 1, 'g')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    // Soft-delete the guard (its repo is `#[soft_delete]`), committing it as a
+    // soft-deleted restrict dependent BEFORE the root delete runs.
+    PgDhrGuardRepository::with_pool_untracked(pool.clone())
+        .delete_by_id(1)
+        .await
+        .expect("soft-deleting the guard must succeed");
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dhr_guards WHERE deleted_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "the guard must be soft-deleted (row present, deleted_at set)"
+    );
+
+    DHR_LEAF_HOOK_FIRED.store(0, Ordering::SeqCst);
+
+    let repo = PgDhrRootRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_by_id(1)
+        .await
+        .expect_err("the hard-revisit restrict must block the delete");
+
+    // The crux: a typed 409 (restrict conflict), NOT a raw FK 500. Before the fix
+    // the hard-path probe was skipped and the delete fell through to the guard FK.
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "the hard-path restrict probe must return a typed 409, not a raw FK 500"
+    );
+
+    // The leaf `before_delete` hook fired EXACTLY ONCE — on the soft branch — and
+    // NOT a second time on the hard branch (the 409 preempted it). Before the fix it
+    // fired twice (soft branch + a second time before the FK failure).
+    assert_eq!(
+        AtomicUsize::load(&DHR_LEAF_HOOK_FIRED, Ordering::SeqCst),
+        1,
+        "the leaf before_delete must not fire again on the hard revisit — the \
+         restrict 409 must precede it"
+    );
+
+    // Whole transaction rolled back: the root is NOT soft-deleted and the leaf is
+    // present and live (its soft-branch soft-delete was undone with everything else).
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dhr_roots WHERE id = 1 AND deleted_at IS NULL"
+        )
+        .await,
+        1,
+        "the root delete must have rolled back (deleted_at still NULL)"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dhr_leaves WHERE id = 1 AND deleted_at IS NULL"
+        )
+        .await,
+        1,
+        "the leaf must be present and live after rollback (no dangling FK, no \
+         physical delete)"
+    );
+}
+
+// ── #1800 case 2: sibling restrict pre-scan ───────────────────────────────────
+
+/// #1800 case 2: `Post → Comment(destroy, before_delete) → Reply(restrict)` with
+/// TWO comment siblings — comment #1 has no replies, comment #2 has one. Deleting
+/// the post must return 409 AND leave comment #1's `before_delete` counter at 0:
+/// every sibling's restrict grandchildren are pre-scanned before any child hook.
+///
+/// RED before the fix: the grandchild restrict probe ran inside the per-child
+/// mutating loop, so comment #1's `before_delete` fired, and only then comment #2's
+/// probe returned the 409 (counter == 1). GREEN after the fix: the pre-scan pass
+/// probes every comment's replies first, so comment #2's restrict aborts before any
+/// hook (counter == 0).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sibling_restrict_pre_scan_blocks_before_earlier_sibling_hook_fires() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO ra_posts (id, title) VALUES (2, 'p')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // Two comment siblings under the same post; comment #1 (lower id) is processed
+    // first and has NO replies, so its restrict probe passes.
+    diesel::sql_query("INSERT INTO ra_comments (id, post_id, body) VALUES (10, 2, 'c1')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO ra_comments (id, post_id, body) VALUES (11, 2, 'c2')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // Only comment #2 has a reply → its restrict grandchild must block the delete.
+    diesel::sql_query("INSERT INTO ra_replies (id, comment_id, body) VALUES (10, 11, 'r')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    RA_COMMENT_HOOK_FIRED.store(0, Ordering::SeqCst);
+
+    let repo = PgRaPostRepository::with_pool_untracked(pool.clone());
+    let result = repo.delete_by_id(2).await;
+    assert!(
+        result.is_err(),
+        "case 2: a later sibling's restrict grandchild must block the post delete with a 409"
+    );
+
+    // Whole transaction rolled back — post, both comments and the reply survive.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM ra_comments WHERE post_id = 2"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM ra_replies WHERE comment_id = 11"
+        )
+        .await,
+        1
+    );
+
+    // The crux: NO comment's before_delete fired — the restrict pre-scan covered
+    // every selected sibling before any child hook. Under the old per-child ordering
+    // this was 1 (comment #1's hook fired before comment #2's restrict aborted).
+    assert_eq!(
+        AtomicUsize::load(&RA_COMMENT_HOOK_FIRED, Ordering::SeqCst),
+        0,
+        "case 2: no sibling before_delete may fire before a later sibling's restrict \
+         grandchild returns the 409 (pre-scan precedes every child hook)"
+    );
+}
+
+// ── #1800 case 3: parent restrict probe before the parent before_delete hook ───
+
+/// #1800 case 3: a parent with a `before_delete` hook AND a live `restrict`
+/// dependent. Deleting it must return 409 AND leave the parent hook counter at 0 —
+/// the parent restrict probe now runs before `#parent_before_delete`.
+///
+/// RED before the fix: `assemble_cascade_body` emitted the parent hook before the
+/// cascade (where the restrict probe lives), so the hook fired and only then did the
+/// probe return the 409 (counter == 1). GREEN after the fix: the parent restrict is
+/// probed first (counter == 0).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn parent_restrict_probes_before_parent_before_delete_hook_fires() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO ph_posts (id, title) VALUES (1, 'guarded')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO ph_guards (id, post_id, name) VALUES (1, 1, 'g')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    PH_POST_HOOK_FIRED.store(0, Ordering::SeqCst);
+
+    let repo = PgPhPostRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_by_id(1)
+        .await
+        .expect_err("case 3: a live restrict dependent must block the parent delete");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "case 3: a blocking parent restrict must surface a 409"
+    );
+
+    // The crux: the parent's before_delete must NOT have fired — the restrict probe
+    // ran first and returned the 409 before the parent hook.
+    assert_eq!(
+        AtomicUsize::load(&PH_POST_HOOK_FIRED, Ordering::SeqCst),
+        0,
+        "case 3: the parent before_delete must NOT fire when a restrict dependent \
+         blocks the delete (parent restrict probe precedes the parent hook)"
+    );
+
+    // Rolled back: parent and guard both survive.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM ph_posts WHERE id = 1").await,
+        1
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM ph_guards WHERE post_id = 1"
+        )
+        .await,
+        1
+    );
+}

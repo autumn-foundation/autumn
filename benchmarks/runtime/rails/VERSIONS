@@ -1,6 +1,6 @@
 framework: Rails 7.2.x
 language:  Ruby 3.3.6
-server:    Puma 6.x
+server:    Puma 7.x
 runtime:   RAILS_MAX_THREADS=20 (Puma threads and ActiveRecord pool)
 db:        ActiveRecord + pg 1.5.x
 postgres:  16 (benchmark container)

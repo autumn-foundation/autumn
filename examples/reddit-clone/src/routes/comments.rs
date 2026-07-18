@@ -32,6 +32,7 @@ pub async fn create(
     State(state): State<AppState>,
     session: Session,
     mut db: Db,
+    flash: Flash,
     form: Form<CommentForm>,
 ) -> AutumnResult<Redirect> {
     let user_id: i64 = session
@@ -106,6 +107,7 @@ pub async fn create(
         .await?;
     publish_stored_live_event_best_effort(&state, event_id).await;
 
+    flash.success("Comment posted.").await;
     Ok(Redirect::to(&super::posts::__autumn_path_show(
         &sub_slug, &post_slug,
     )))

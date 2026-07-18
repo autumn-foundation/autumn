@@ -60,6 +60,21 @@ use http::StatusCode;
 
 use crate::session::Session;
 
+/// Provides the specific application state needed by the authorization subsystem.
+///
+/// This trait severs the dependency from the `authorization` module back to the
+/// `state` module, breaking a circular dependency (`state` -> `authorization` -> `session` -> `state`).
+pub trait ProvideAuthorizationState: Send + Sync {
+    fn policy_registry(&self) -> &PolicyRegistry;
+    fn auth_session_key(&self) -> &str;
+    fn forbidden_response(&self) -> &ForbiddenResponse;
+
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>;
+}
+
 /// Boxed future returned by [`Policy`] and [`Scope`] methods so the
 /// traits remain object-safe (`dyn Policy<R>` works regardless of
 /// rust edition).
@@ -90,12 +105,18 @@ pub struct PolicyContext {
     /// has no role or is anonymous.
     pub roles: Vec<String>,
 
+    /// Scopes (token abilities) granted to the authenticating service
+    /// token, e.g. `posts:read`, `posts:write`. Empty for session-only
+    /// requests. Distinct from the record-level [`Scope`] trait: these
+    /// are flat permission strings carried by a scoped API token.
+    /// Surfaced via [`has_scope`](Self::has_scope) and friends.
+    pub scopes: Vec<String>,
+
     /// Database connection pool, cloned from `AppState`. Policies
     /// that need to consult related rows (e.g. group membership)
     /// can borrow a connection here.
     #[cfg(feature = "db")]
-    pub pool:
-        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+    pub pool: Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
 
     /// Registered [`Policy`] / [`Scope`] map, cloned from
     /// `AppState`. Lets the [`Scoped`] blanket trait resolve a
@@ -115,22 +136,55 @@ impl PolicyContext {
     /// instead.
     pub async fn from_session(session: &Session, auth_session_key: &str) -> Self {
         let user_id = session.get(auth_session_key).await;
+
+        // Seed the ambient current actor (#1383) with the authenticated session
+        // user, mirroring how `auth.rs` publishes the principal next to
+        // `log::context::set_user_id`. This is the single seam that covers every
+        // `#[repository(policy = ...)]` route which gates on a
+        // session-authenticated policy check but is NOT also wrapped by
+        // `RequireAuth`/`#[secured]`/an API-token bearer (the three existing
+        // `set_actor` sites) — without this, such a route's versioned writes
+        // would fall back to `SYSTEM_ACTOR` even though a real user is in scope.
+        //
+        // This session seed is only a *fallback*: it never overrides an
+        // already-established principal. If a stronger actor is already in scope
+        // — an API-token bearer, `RequireAuth`/`#[secured]`, or an explicit
+        // `with_actor(...)` scope — `Current::actor()` is already `Some`, so we
+        // skip the seed and the stronger actor wins (a request carrying both a
+        // bearer token and a session cookie stays attributed to the token
+        // principal). It also never overrides an explicit `AuditEvent` actor or a
+        // `before_*` hook's `ctx.actor`, which are applied downstream.
+        //
+        // In-request but with nothing yet published, the empty `CURRENT_ACTOR`
+        // scope makes `Current::actor()` return `None` (an in-scope unset does not
+        // consult the process default), so a pure policy+session route still gets
+        // seeded here. `set_actor` is a no-op outside an established request scope,
+        // so this stays panic-safe for non-request callers (e.g. hand-rolled
+        // policy unit tests), and it never publishes for an anonymous session
+        // (guarded on `Some`).
+        if crate::current::Current::actor().is_none()
+            && let Some(user_id) = &user_id
+        {
+            crate::current::Current::set_actor(user_id.clone());
+        }
+
         let role = session.get("role").await;
         let roles = role.into_iter().collect();
         Self {
             session: session.clone(),
             user_id,
             roles,
+            scopes: Vec::new(),
             #[cfg(feature = "db")]
             pool: None,
             policy_registry: PolicyRegistry::default(),
         }
     }
 
-    /// Build a fully-populated [`PolicyContext`] from `AppState` +
+    /// Build a fully-populated [`PolicyContext`] from state +
     /// `Session`. Used by the `#[authorize]` macro and
     /// `#[repository(policy = ...)]`-generated handlers.
-    pub async fn from_request(state: &crate::AppState, session: &Session) -> Self {
+    pub async fn from_request(state: &impl ProvideAuthorizationState, session: &Session) -> Self {
         let mut ctx = Self::from_session(session, state.auth_session_key()).await;
         ctx.policy_registry = state.policy_registry().clone();
         #[cfg(feature = "db")]
@@ -173,6 +227,65 @@ impl PolicyContext {
         candidates.into_iter().any(|c| self.has_role(c.as_ref()))
     }
 
+    /// Returns `true` when the authenticating token granted `scope`.
+    ///
+    /// Mirrors [`has_role`](Self::has_role) for token abilities. Works for
+    /// non-user principals: a pure service token with no roles still
+    /// authorizes on its granted scopes.
+    #[must_use]
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s == scope)
+    }
+
+    /// Returns `true` when the token granted **any** of the supplied scopes.
+    /// Mirrors [`has_any_role`](Self::has_any_role).
+    #[must_use]
+    pub fn has_any_scope<I, S>(&self, candidates: I) -> bool
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        candidates.into_iter().any(|c| self.has_scope(c.as_ref()))
+    }
+
+    /// Returns `true` when the token granted **all** of the supplied scopes.
+    /// An empty candidate set is vacuously `true`.
+    #[must_use]
+    pub fn has_all_scopes<I, S>(&self, candidates: I) -> bool
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        candidates.into_iter().all(|c| self.has_scope(c.as_ref()))
+    }
+
+    /// Attach token scopes to the context. Used by the framework when
+    /// authorizing a scoped-token request; tests and hand-written handlers
+    /// can also call this to inject scopes by hand.
+    #[must_use]
+    pub fn with_scopes(mut self, scopes: Vec<String>) -> Self {
+        self.scopes = scopes;
+        self
+    }
+
+    /// Build a fully-populated [`PolicyContext`] from `AppState` + `Session`,
+    /// additionally threading the authenticating token's granted scopes (from
+    /// the [`crate::auth::ApiTokenScopes`] request extension) into the context.
+    ///
+    /// Use this from hand-written handlers that authorize a service principal on
+    /// scopes: extract `Option<Extension<ApiTokenScopes>>` and pass it through.
+    pub async fn from_request_parts(
+        state: &crate::AppState,
+        session: &Session,
+        scopes: Option<&crate::auth::ApiTokenScopes>,
+    ) -> Self {
+        let ctx = Self::from_request(state, session).await;
+        match scopes {
+            Some(s) => ctx.with_scopes(s.0.clone()),
+            None => ctx,
+        }
+    }
+
     /// Attach a database pool to the context. Used by the framework
     /// when constructing the context inside extractors; tests can
     /// also call this to inject a pool by hand.
@@ -180,7 +293,7 @@ impl PolicyContext {
     #[must_use]
     pub fn with_pool(
         mut self,
-        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
     ) -> Self {
         self.pool = Some(pool);
         self
@@ -293,15 +406,16 @@ pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
     fn list<'a>(
         &'a self,
         _ctx: &'a PolicyContext,
-        _conn: &'a mut diesel_async::AsyncPgConnection,
+        _conn: &'a mut crate::db::RuntimeConnection,
     ) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
 
 /// `Scope` companion that compiles when the `db` feature is off.
-/// The `db`-gated form takes `&mut AsyncPgConnection`; this one
-/// has no connection arg.
+/// The `db`-gated form takes `&mut RuntimeConnection` (the runtime
+/// pool connection — `AsyncPgConnection` by default, the `SQLite`
+/// wrapper under `--features sqlite`); this one has no connection arg.
 #[cfg(not(feature = "db"))]
 pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
     fn list<'a>(&'a self, _ctx: &'a PolicyContext) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
@@ -337,7 +451,7 @@ impl<R: Send + Sync + 'static> ScopeQuery<'_, R> {
     /// scope's own errors otherwise.
     pub async fn load(
         self,
-        conn: &mut diesel_async::AsyncPgConnection,
+        conn: &mut crate::db::RuntimeConnection,
     ) -> crate::AutumnResult<Vec<R>> {
         let scope = self.ctx.policy_registry.scope::<R>().ok_or_else(|| {
             crate::AutumnError::from(std::io::Error::other(format!(
@@ -396,9 +510,9 @@ impl<T: Send + Sync + 'static> Scoped for T {}
 /// Process-wide registry of resource → policy and resource →
 /// scope bindings.
 ///
-/// Stored on [`AppState`](crate::AppState) so handlers and
+/// Stored on application state so handlers and
 /// `#[repository]`-generated endpoints can resolve a policy by
-/// resource type via [`AppState::policy::<R>`](crate::AppState::policy).
+/// resource type.
 #[derive(Clone, Default)]
 pub struct PolicyRegistry {
     inner: Arc<RwLock<RegistryInner>>,
@@ -621,7 +735,7 @@ impl<'de> serde::Deserialize<'de> for ForbiddenResponse {
 /// }
 /// ```
 pub async fn authorize<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     action: &str,
     resource: &R,
@@ -646,12 +760,51 @@ where
     }
 }
 
+/// Like [`authorize`], but additionally threads the authenticating token's
+/// granted scopes into the [`PolicyContext`] so the policy can decide on
+/// `ctx.has_scope(...)`.
+///
+/// Use from hand-written handlers that authorize a service principal: extract
+/// `Option<Extension<ApiTokenScopes>>` and pass it through. A pure service
+/// token (no session user) is authorized purely on its scopes.
+///
+/// # Errors
+///
+/// Returns the configured deny response when the policy denies. Returns `500`
+/// when no policy is registered for `R`.
+pub async fn authorize_with_scopes<R>(
+    state: &crate::AppState,
+    session: &Session,
+    scopes: Option<&crate::auth::ApiTokenScopes>,
+    action: &str,
+    resource: &R,
+) -> crate::AutumnResult<()>
+where
+    R: Send + Sync + 'static,
+{
+    let policy = state.policy_registry().policy::<R>().ok_or_else(|| {
+        crate::AutumnError::from(std::io::Error::other(format!(
+            "no policy registered for resource type {}",
+            std::any::type_name::<R>()
+        )))
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+    })?;
+
+    let ctx = PolicyContext::from_request_parts(state, session, scopes).await;
+
+    if policy.can(action, &ctx, resource).await {
+        Ok(())
+    } else {
+        Err(state.forbidden_response().into_error())
+    }
+}
+
 /// Internal alias used by the `#[authorize]` proc-macro and the
 /// `#[repository(policy = ...)]` generated handlers. **Not part of
 /// the public API** — call [`authorize`] from user code.
 #[doc(hidden)]
 pub async fn __check_policy<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     action: &str,
     resource: &R,
@@ -660,6 +813,26 @@ where
     R: Send + Sync + 'static,
 {
     authorize(state, session, action, resource).await
+}
+
+/// Scope-aware variant of [`__check_policy`] emitted by the `#[authorize]`
+/// proc-macro. Threads the authenticating token's granted scopes into the
+/// [`PolicyContext`] so policies can decide on `ctx.has_scope(...)`.
+///
+/// **Not part of the public API** — call [`authorize_with_scopes`] from user
+/// code.
+#[doc(hidden)]
+pub async fn __check_policy_scoped<R>(
+    state: &crate::AppState,
+    session: &Session,
+    scopes: Option<&crate::auth::ApiTokenScopes>,
+    action: &str,
+    resource: &R,
+) -> crate::AutumnResult<()>
+where
+    R: Send + Sync + 'static,
+{
+    authorize_with_scopes(state, session, scopes, action, resource).await
 }
 
 /// Pre-insert authorization helper for the
@@ -673,7 +846,7 @@ where
 /// alias for older macro output.
 #[doc(hidden)]
 pub async fn __check_policy_create<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
 ) -> crate::AutumnResult<()>
 where
@@ -692,7 +865,7 @@ where
 /// only `autumn-web` is upgraded.
 #[doc(hidden)]
 pub async fn __check_policy_create_payload<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
@@ -700,6 +873,37 @@ where
     R: Send + Sync + 'static,
 {
     authorize_create_payload::<R>(state, session, payload).await
+}
+
+/// Scope-aware variant of [`__check_policy_create_payload`] emitted by the
+/// `#[repository(policy = ...)]` proc-macro. Threads the authenticating token's
+/// granted scopes into the [`PolicyContext`] so policies can decide on
+/// `ctx.has_scope(...)`.
+///
+/// **Not part of the public API.**
+#[doc(hidden)]
+pub async fn __check_policy_create_payload_scoped<R>(
+    state: &crate::AppState,
+    session: &Session,
+    scopes: Option<&crate::auth::ApiTokenScopes>,
+    payload: &serde_json::Value,
+) -> crate::AutumnResult<()>
+where
+    R: Send + Sync + 'static,
+{
+    let policy = state.policy_registry().policy::<R>().ok_or_else(|| {
+        crate::AutumnError::from(std::io::Error::other(format!(
+            "no policy registered for resource type {}",
+            std::any::type_name::<R>()
+        )))
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+    })?;
+    let ctx = PolicyContext::from_request_parts(state, session, scopes).await;
+    if policy.can_create_payload(&ctx, payload).await {
+        Ok(())
+    } else {
+        Err(state.forbidden_response().into_error())
+    }
 }
 
 /// Run a policy's `can_create` check before persisting a new record.
@@ -713,7 +917,7 @@ where
 /// Returns the configured deny response when the policy denies.
 /// Returns `500` when no policy is registered for `R`.
 pub async fn authorize_create<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
 ) -> crate::AutumnResult<()>
 where
@@ -749,7 +953,7 @@ where
 /// Returns the configured deny response when the policy denies.
 /// Returns `500` when no policy is registered for `R`.
 pub async fn authorize_create_payload<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
@@ -810,6 +1014,7 @@ mod tests {
             session,
             user_id: user_id.map(str::to_owned),
             roles: role.into_iter().map(str::to_owned).collect(),
+            scopes: Vec::new(),
             #[cfg(feature = "db")]
             pool: None,
             policy_registry: PolicyRegistry::default(),
@@ -934,6 +1139,90 @@ mod tests {
     }
 
     #[test]
+    fn scope_accessors_mirror_roles() {
+        let c = ctx(Some("42"), Some("editor"))
+            .with_scopes(vec!["posts:read".to_owned(), "posts:write".to_owned()]);
+        assert!(c.has_scope("posts:read"));
+        assert!(!c.has_scope("posts:delete"));
+        assert!(c.has_any_scope(["posts:delete", "posts:write"]));
+        assert!(!c.has_any_scope(["a", "b"]));
+        assert!(c.has_all_scopes(["posts:read", "posts:write"]));
+        assert!(!c.has_all_scopes(["posts:read", "posts:delete"]));
+        // Empty requirement is vacuously satisfied.
+        assert!(c.has_all_scopes(std::iter::empty::<&str>()));
+    }
+
+    #[test]
+    fn non_user_principal_authorizes_purely_on_scopes() {
+        // No user id, no roles — a pure service token — yet scopes authorize.
+        let c = ctx(None, None).with_scopes(vec!["posts:write".to_owned()]);
+        assert!(!c.is_authenticated());
+        assert!(c.user_id_i64().is_none());
+        assert!(!c.has_role("admin"));
+        assert!(c.has_scope("posts:write"));
+    }
+
+    #[tokio::test]
+    async fn from_session_leaves_scopes_empty() {
+        let session = session_with(Some("42"), Some("editor"));
+        let c = PolicyContext::from_session(&session, "user_id").await;
+        assert!(c.scopes.is_empty());
+        assert!(!c.has_scope("posts:read"));
+    }
+
+    #[tokio::test]
+    async fn from_session_seeds_current_actor_for_authenticated_user() {
+        // Mirrors the request path: the log-context middleware establishes an
+        // empty current-actor scope, then a session-authenticated policy check
+        // resolves the user via `from_session`. Even without RequireAuth /
+        // #[secured] / an API-token bearer having fired, the resolved user must
+        // become the ambient actor so versioned writes attribute to them rather
+        // than falling back to SYSTEM_ACTOR (#1383).
+        crate::current::scope_request(async {
+            assert_eq!(crate::current::Current::actor(), None);
+            let session = session_with(Some("42"), Some("editor"));
+            let c = PolicyContext::from_session(&session, "user_id").await;
+            assert_eq!(c.user_id.as_deref(), Some("42"));
+            assert_eq!(crate::current::Current::actor(), Some("42".to_owned()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn from_session_leaves_current_actor_none_for_anonymous() {
+        // An anonymous session must never publish an actor, so unauthenticated
+        // requests behave exactly as before this feature existed.
+        crate::current::scope_request(async {
+            let session = session_with(None, None);
+            let c = PolicyContext::from_session(&session, "user_id").await;
+            assert!(c.user_id.is_none());
+            assert_eq!(crate::current::Current::actor(), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn from_session_does_not_override_existing_actor() {
+        // The session seed is only a fallback. When a stronger principal is
+        // already established — an API-token bearer, RequireAuth/#[secured], or an
+        // explicit `with_actor(...)` scope — `from_session` must NOT clobber it,
+        // even if the request also carries a session cookie for a different user.
+        crate::current::scope_request(async {
+            crate::current::Current::set_actor("token-principal".to_owned());
+            let session = session_with(Some("42"), Some("editor"));
+            let c = PolicyContext::from_session(&session, "user_id").await;
+            // The session user is still resolved into the context...
+            assert_eq!(c.user_id.as_deref(), Some("42"));
+            // ...but the already-established principal wins as the ambient actor.
+            assert_eq!(
+                crate::current::Current::actor(),
+                Some("token-principal".to_owned())
+            );
+        })
+        .await;
+    }
+
+    #[test]
     fn forbidden_response_status_and_message_round_trip() {
         assert_eq!(
             ForbiddenResponse::Forbidden403.status(),
@@ -1050,13 +1339,54 @@ mod tests {
         assert!(dbg.contains("scopes"));
     }
 
-    fn detached_state_with(
-        _registry: PolicyRegistry,
-        forbidden: ForbiddenResponse,
-    ) -> crate::AppState {
-        crate::AppState::detached()
-            .with_forbidden_response(forbidden)
-            .with_auth_session_key("user_id")
+    #[derive(Clone)]
+    struct MockState {
+        policy_registry: PolicyRegistry,
+        forbidden_response: ForbiddenResponse,
+        auth_session_key: String,
+    }
+
+    impl ProvideAuthorizationState for MockState {
+        fn policy_registry(&self) -> &PolicyRegistry {
+            &self.policy_registry
+        }
+
+        fn auth_session_key(&self) -> &str {
+            &self.auth_session_key
+        }
+
+        fn forbidden_response(&self) -> &ForbiddenResponse {
+            &self.forbidden_response
+        }
+
+        #[cfg(feature = "db")]
+        fn pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+        {
+            None
+        }
+    }
+
+    impl MockState {
+        fn with_forbidden_response(mut self, forbidden: ForbiddenResponse) -> Self {
+            self.forbidden_response = forbidden;
+            self
+        }
+    }
+
+    fn detached_state() -> MockState {
+        MockState {
+            policy_registry: PolicyRegistry::default(),
+            forbidden_response: ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+        }
+    }
+
+    fn detached_state_with(registry: PolicyRegistry, forbidden: ForbiddenResponse) -> MockState {
+        let mut state = detached_state().with_forbidden_response(forbidden);
+        state.policy_registry = registry;
+        state
     }
 
     fn session_with(user_id: Option<&str>, role: Option<&str>) -> Session {
@@ -1086,11 +1416,7 @@ mod tests {
         let registry = PolicyRegistry::default();
         registry.register_policy::<Note, _>(AdminOrOwnerPolicy);
         let state = detached_state_with(registry.clone(), ForbiddenResponse::Forbidden403);
-        // Inject the registry into the live state's registry.
-        let live = state.policy_registry();
-        // Move registrations from `registry` into the state's registry.
-        // (`detached()` starts with an empty registry; we copy in.)
-        live.register_policy::<Note, _>(AdminOrOwnerPolicy);
+        // `state` already has the registry we passed in via `detached_state_with`.
 
         let session = session_with(Some("99"), None); // not the owner, no role
         let n = Note { author_id: 42 };
@@ -1102,7 +1428,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_returns_ok_when_policy_allows() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         state
             .policy_registry()
             .register_policy::<Note, _>(AdminOrOwnerPolicy);
@@ -1115,7 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_create_returns_500_when_no_policy_registered() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         let session = session_with(Some("42"), None);
         let err = authorize_create::<Note>(&state, &session)
             .await
@@ -1132,8 +1458,7 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(AuthOnlyCreatePolicy);
@@ -1164,8 +1489,7 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(OwnerPayloadPolicy);
@@ -1192,8 +1516,7 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(AuthOnlyCreatePolicy);
@@ -1226,8 +1549,7 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(OwnerPayloadPolicy);
@@ -1241,7 +1563,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_policy_alias_round_trips() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         state
             .policy_registry()
             .register_policy::<Note, _>(AdminOrOwnerPolicy);
@@ -1256,7 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn from_request_clones_pool_and_registry_from_state() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         state
             .policy_registry()
             .register_policy::<Note, _>(AdminOrOwnerPolicy);
@@ -1270,7 +1592,7 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_blanket_trait_constructible_without_registered_scope() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         let session = session_with(Some("1"), None);
         let ctx = PolicyContext::from_request(&state, &session).await;
         // No scope registered for `Note`.
@@ -1279,5 +1601,145 @@ mod tests {
         // testcontainer suite; here we just confirm the registry-miss
         // surfaces only at `.load()` time, not at `scope(&ctx)` time.
         assert!(ctx.policy_registry.scope::<Note>().is_none());
+    }
+
+    // ── authorize_with_scopes ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn authorize_with_scopes_returns_500_when_no_policy_registered() {
+        let state = crate::AppState::detached();
+        let session = session_with(None, None);
+        let err =
+            authorize_with_scopes::<Note>(&state, &session, None, "update", &Note { author_id: 1 })
+                .await
+                .unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn authorize_with_scopes_returns_deny_when_policy_denies() {
+        let state =
+            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(AdminOrOwnerPolicy);
+        let session = session_with(Some("99"), None); // not owner, no admin role
+        let n = Note { author_id: 42 };
+        let err = authorize_with_scopes::<Note>(&state, &session, None, "update", &n)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorize_with_scopes_threads_scopes_into_policy_context() {
+        struct ScopeGatedPolicy;
+        impl Policy<Note> for ScopeGatedPolicy {
+            fn can_update<'a>(
+                &'a self,
+                ctx: &'a PolicyContext,
+                _doc: &'a Note,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async move { ctx.has_scope("posts:write") })
+            }
+        }
+
+        let state = crate::AppState::detached();
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(ScopeGatedPolicy);
+        let session = session_with(None, None);
+        let n = Note { author_id: 1 };
+        let scopes = crate::auth::ApiTokenScopes(vec!["posts:write".to_owned()]);
+
+        // Scopes present → allow.
+        authorize_with_scopes::<Note>(&state, &session, Some(&scopes), "update", &n)
+            .await
+            .expect("scope allows update");
+
+        // No scopes → deny (default 404).
+        authorize_with_scopes::<Note>(&state, &session, None, "update", &n)
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn from_request_parts_propagates_scopes() {
+        let state = crate::AppState::detached();
+        let session = session_with(Some("7"), Some("admin"));
+        let scopes = crate::auth::ApiTokenScopes(vec!["posts:write".to_owned()]);
+        let ctx = PolicyContext::from_request_parts(&state, &session, Some(&scopes)).await;
+        assert_eq!(ctx.user_id.as_deref(), Some("7"));
+        assert!(ctx.has_role("admin"));
+        assert!(ctx.has_scope("posts:write"));
+        assert!(!ctx.has_scope("posts:read"));
+    }
+
+    #[tokio::test]
+    async fn from_request_parts_with_no_scopes_leaves_scopes_empty() {
+        let state = crate::AppState::detached();
+        let session = session_with(Some("7"), None);
+        let ctx = PolicyContext::from_request_parts(&state, &session, None).await;
+        assert!(ctx.scopes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_policy_scoped_round_trips_through_authorize_with_scopes() {
+        let state = crate::AppState::detached();
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(AdminOrOwnerPolicy);
+        let session = session_with(Some("42"), None); // owner
+        let n = Note { author_id: 42 };
+        __check_policy_scoped::<Note>(&state, &session, None, "update", &n)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_policy_create_payload_scoped_threads_scopes() {
+        struct ScopedCreatePolicy;
+        impl Policy<Note> for ScopedCreatePolicy {
+            fn can_create_payload<'a>(
+                &'a self,
+                ctx: &'a PolicyContext,
+                _payload: &'a serde_json::Value,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async move { ctx.has_scope("posts:write") })
+            }
+        }
+
+        let state =
+            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(ScopedCreatePolicy);
+        let session = session_with(None, None);
+        let payload = serde_json::json!({"title": "Hello"});
+        let scopes = crate::auth::ApiTokenScopes(vec!["posts:write".to_owned()]);
+
+        __check_policy_create_payload_scoped::<Note>(&state, &session, Some(&scopes), &payload)
+            .await
+            .expect("scope grants create");
+
+        let err = __check_policy_create_payload_scoped::<Note>(&state, &session, None, &payload)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn check_policy_create_payload_scoped_returns_500_when_no_policy() {
+        let state = crate::AppState::detached();
+        let session = session_with(None, None);
+        let err = __check_policy_create_payload_scoped::<Note>(
+            &state,
+            &session,
+            None,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

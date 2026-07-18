@@ -7,6 +7,10 @@ fn main() {
     #[cfg(target_os = "windows")]
     println!("cargo:rerun-if-env-changed=PATHEXT");
 
+    // Bake build + git provenance into the binary so `/actuator/info` can
+    // report exactly which commit/build is running (deploy/rollback checks).
+    emit_build_provenance();
+
     if let Some(tailwind) = find_tailwind_cli() {
         let status = std::process::Command::new(&tailwind)
             .args([
@@ -31,6 +35,231 @@ fn main() {
         // As per DX audit, removing the warning or making it quieter is better,
         // we'll just not emit a warning for missing tailwind when it's optional.
     }
+}
+
+/// Emit `AUTUMN_BUILD_*` compile-time env vars consumed by
+/// `#[autumn_web::main]` and surfaced on `/actuator/info`.
+///
+/// Provenance is sourced with a two-tier strategy so both local checkouts and
+/// containerized (production) builds report real values:
+///
+/// 1. **Build-arg passthrough** — if the corresponding `AUTUMN_BUILD_*` env var
+///    is set (e.g. Docker `--build-arg` surfaced as `ENV`), it wins. The
+///    scaffolded Dockerfile deliberately excludes `/.git` from the build
+///    context, so a container build has no repository to inspect; the deploy/CI
+///    supplies the SHA/branch/etc. explicitly instead.
+/// 2. **Git fallback** — otherwise fields are best-effort from `git`. Outside a
+///    checkout (tarball / CI cache with no passthrough) they are simply omitted
+///    and the framework reports them as `null` rather than failing the build.
+///
+/// The build timestamp is always emitted (passthrough `AUTUMN_BUILD_TIMESTAMP`
+/// wins, else `SOURCE_DATE_EPOCH` for reproducible builds, else wall clock).
+///
+/// The `dirty` flag is three-state: an explicit `AUTUMN_BUILD_GIT_DIRTY` build
+/// arg wins; else the real `git status` (a *clean* tree is `false`); else — no
+/// arg and no git — it is genuinely UNKNOWN and no var is emitted, so
+/// `/actuator/info` reports `null` instead of a misleading `false`.
+///
+/// Note: the git-derived `dirty` flag is a best-effort snapshot taken when this
+/// script last re-ran. Cargo only re-runs it on the declared `rerun-if-changed`
+/// inputs, so after an edit that doesn't touch a watched path the baked flag may
+/// lag until the next rebuild of a watched input.
+fn emit_build_provenance() {
+    // Re-run whenever a passthrough build arg changes so a new deploy re-bakes
+    // the provenance instead of reusing a cached, stale value.
+    for var in [
+        "AUTUMN_BUILD_GIT_SHA",
+        "AUTUMN_BUILD_GIT_SHA_SHORT",
+        "AUTUMN_BUILD_GIT_BRANCH",
+        "AUTUMN_BUILD_GIT_DIRTY",
+        "AUTUMN_BUILD_TIMESTAMP",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+
+    let timestamp = build_arg("AUTUMN_BUILD_TIMESTAMP").unwrap_or_else(build_timestamp);
+    println!("cargo:rustc-env=AUTUMN_BUILD_TIMESTAMP={timestamp}");
+
+    // Prefer the passthrough SHA (container build); fall back to git (local
+    // checkout). If neither yields a SHA, emit no git fields → reported `null`.
+    if let Some(sha) = build_arg("AUTUMN_BUILD_GIT_SHA").or_else(|| git(&["rev-parse", "HEAD"])) {
+        let short = build_arg("AUTUMN_BUILD_GIT_SHA_SHORT")
+            .or_else(|| git(&["rev-parse", "--short", "HEAD"]))
+            .unwrap_or_else(|| sha.chars().take(7).collect());
+        let branch = build_arg("AUTUMN_BUILD_GIT_BRANCH")
+            .or_else(|| git(&["rev-parse", "--abbrev-ref", "HEAD"]))
+            .unwrap_or_else(|| "unknown".into());
+        // Dirty is a THREE-state value: an explicit passthrough arg wins;
+        // otherwise the real `git status` result (a *clean* tree is `false`, not
+        // unknown); otherwise — no arg AND no git, the common case for a
+        // container build with `/.git` excluded — the dirty state is genuinely
+        // UNKNOWN. In that case emit no `AUTUMN_BUILD_GIT_DIRTY` at all, so
+        // `/actuator/info` reports `null` rather than a misleading `false`.
+        let dirty =
+            build_arg("AUTUMN_BUILD_GIT_DIRTY").or_else(|| git_dirty().map(|d| d.to_string()));
+        println!("cargo:rustc-env=AUTUMN_BUILD_GIT_SHA={sha}");
+        println!("cargo:rustc-env=AUTUMN_BUILD_GIT_SHA_SHORT={short}");
+        println!("cargo:rustc-env=AUTUMN_BUILD_GIT_BRANCH={branch}");
+        if let Some(dirty) = dirty {
+            println!("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY={dirty}");
+        }
+    }
+
+    // Re-run when the ref is checked out (HEAD), the index changes (staging /
+    // index), or HEAD *moves* — commit, `--amend`, `reset --soft` all rewrite
+    // `logs/HEAD` even when `HEAD` itself is untouched.
+    emit_git_rerun_triggers();
+
+    // Reproducible builds: re-run if the source date is pinned or changed.
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+}
+
+/// Read a provenance build arg passed through the environment (Docker
+/// `ARG`/`ENV`), trimming surrounding whitespace. Unset or blank values return
+/// `None` so detection falls through to git — an unpopulated `ARG` surfaces as
+/// an empty string, which must not shadow the git fallback.
+fn build_arg(name: &str) -> Option<String> {
+    let value = std::env::var(name).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Register `rerun-if-changed` triggers on the git ref state so a commit /
+/// amend / reset re-runs this script and re-bakes the SHA and dirty flag.
+///
+/// The gitdir is resolved by asking git itself (`git rev-parse --git-dir`)
+/// rather than looking for a `.git` entry in the package root. That matters for
+/// apps generated *inside* an existing repo/monorepo: the package root has no
+/// `.git`, but `git` still resolves the parent checkout — so we must register
+/// the parent's `HEAD`/`logs/HEAD`/`index`, or Cargo would never re-run after a
+/// commit and `/actuator/info` would report a stale SHA.
+///
+/// `--git-common-dir` covers linked worktrees, where per-worktree state lives
+/// in `--git-dir` but shared history (`logs/HEAD`) lives in the common dir. In
+/// a linked worktree a `commit --amend`/`reset` rewrites the *per-worktree*
+/// reflog (`<git-dir>/logs/HEAD`) while leaving the common-dir reflog untouched,
+/// so both reflogs are watched (deduped for a normal, non-worktree checkout).
+///
+/// Graceful degradation: if git is absent (tarball / CI cache), `git rev-parse`
+/// fails, we register no triggers, and the build still succeeds.
+fn emit_git_rerun_triggers() {
+    // git prints paths relative to the current dir; resolve them against the
+    // crate dir so they are valid regardless of Cargo's working directory.
+    let crate_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let resolve = |flag: &str| -> Option<std::path::PathBuf> {
+        let raw = git(&["rev-parse", flag])?;
+        let path = std::path::PathBuf::from(&raw);
+        Some(if path.is_absolute() {
+            path
+        } else {
+            crate_dir.join(path)
+        })
+    };
+
+    let Some(git_dir) = resolve("--git-dir") else {
+        return;
+    };
+    // Linked worktrees keep shared `logs/HEAD` in the common dir; when there is
+    // no separate common dir this is the same as `git_dir`.
+    let common_dir = resolve("--git-common-dir").unwrap_or_else(|| git_dir.clone());
+
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    for path in [
+        git_dir.join("HEAD"),
+        git_dir.join("index"),
+        // Per-worktree reflog: `--amend`/`reset` in a linked worktree rewrites
+        // `<git-dir>/logs/HEAD` but leaves the shared common-dir reflog
+        // untouched, so watch both. Deduped when git_dir == common_dir.
+        git_dir.join("logs/HEAD"),
+        common_dir.join("logs/HEAD"),
+    ] {
+        if seen.contains(&path) {
+            continue; // dedupe when git_dir == common_dir
+        }
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+        seen.push(path);
+    }
+}
+
+/// Best-effort working-tree dirtiness, distinguishing *clean* from *unknown*.
+///
+/// Returns `Some(true)`/`Some(false)` only when `git status` actually ran — a
+/// clean tree is `Some(false)`, uncommitted changes are `Some(true)`. Returns
+/// `None` when git is absent or the command fails (e.g. a container build with
+/// `/.git` excluded), so the caller can represent an *unknown* dirty state as
+/// absent (`/actuator/info` → `null`) rather than a misleading `false`.
+///
+/// This cannot reuse `git()`, which collapses empty stdout to `None` and would
+/// make a clean tree indistinguishable from git being unavailable.
+fn git_dirty() -> Option<bool> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(!text.trim().is_empty())
+}
+
+/// Run a git subcommand, returning trimmed stdout on success.
+fn git(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Build timestamp as ISO-8601 UTC. Honors `SOURCE_DATE_EPOCH` (a Unix seconds
+/// count) when set so reproducible builds get a deterministic timestamp;
+/// otherwise falls back to the current wall-clock time.
+fn build_timestamp() -> String {
+    let secs = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or_else(unix_now_secs);
+    iso8601_utc(secs)
+}
+
+/// Current time as whole Unix seconds (0 if the clock predates the epoch).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Format Unix `secs` as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`), computed with
+/// no external crates via the civil-from-days algorithm.
+fn iso8601_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    // Howard Hinnant's civil_from_days, epoch 1970-01-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 fn find_tailwind_cli() -> Option<std::path::PathBuf> {

@@ -39,6 +39,7 @@
 //! | `AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY` | `security.headers.content_security_policy` | `String` |
 //! | `AUTUMN_SECURITY__HEADERS__CSP_NONCE__ENABLED` | `security.headers.csp_nonce.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__CSRF__ENABLED` | `security.csrf.enabled` | `bool` |
+//! | `AUTUMN_SECURITY__CSRF__TOKEN_SCAN_BYTES` | `security.csrf.token_scan_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
@@ -54,6 +55,7 @@
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__UPLOAD__REJECT_ON_CONTENT_TYPE_MISMATCH` | `security.upload.reject_on_content_type_mismatch` | `bool` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` | `security.webhooks.replay.backend` | `memory` / `redis` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` | `security.webhooks.replay.redis.url` | `String` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` | `security.webhooks.replay.redis.key_prefix` | `String` |
@@ -117,7 +119,7 @@ const DEMO_VALUES: &[&str] = &[
 ///
 /// Set `secret` via the `AUTUMN_SECURITY__SIGNING_SECRET` environment variable
 /// (or `[security.signing_secret] secret` in `autumn.toml`). The secret must be:
-/// - At least [`MIN_SECRET_LEN`] bytes long.
+/// - At least `MIN_SECRET_LEN` bytes long.
 /// - Not a known template/demo value.
 /// - Stable across restarts and identical on every replica.
 ///
@@ -164,7 +166,7 @@ pub enum SigningSecretError {
     TooShort {
         /// Actual byte length of the supplied secret.
         actual: usize,
-        /// Minimum required byte length ([`MIN_SECRET_LEN`]).
+        /// Minimum required byte length (`MIN_SECRET_LEN`).
         required: usize,
     },
     /// The secret matches a known insecure demo or template value.
@@ -200,7 +202,7 @@ impl std::fmt::Display for SigningSecretError {
 ///
 /// In production:
 /// - `None` → [`SigningSecretError::MissingInProduction`]
-/// - Shorter than [`MIN_SECRET_LEN`] bytes → [`SigningSecretError::TooShort`]
+/// - Shorter than `MIN_SECRET_LEN` bytes → [`SigningSecretError::TooShort`]
 /// - Matches a known demo/template string → [`SigningSecretError::KnownWeakValue`]
 ///
 /// # Errors
@@ -362,6 +364,10 @@ pub struct SecurityConfig {
     /// CSRF (Cross-Site Request Forgery) protection.
     #[serde(default)]
     pub csrf: CsrfConfig,
+
+    /// One-time submit tokens — at-most-once form submissions.
+    #[serde(default)]
+    pub submit_token: SubmitTokenConfig,
 
     /// Rate limiting (per-client-IP token bucket).
     #[serde(default)]
@@ -674,6 +680,7 @@ impl Default for HeadersConfig {
 /// | `cookie_name` | `"autumn-csrf"` |
 /// | `safe_methods` | `["GET", "HEAD", "OPTIONS", "TRACE"]` |
 /// | `exempt_paths` | `[]` |
+/// | `token_scan_bytes` | `2_097_152` (2 MiB) |
 ///
 /// # Examples
 ///
@@ -718,6 +725,29 @@ pub struct CsrfConfig {
     /// under `/api/`.
     #[serde(default)]
     pub exempt_paths: Vec<String>,
+
+    /// Maximum number of leading request-body bytes scanned for the `_csrf`
+    /// form field on a urlencoded / multipart POST. Default: `2 MiB`
+    /// (`2 * 1024 * 1024`).
+    ///
+    /// The token scan reads at most this many bytes of the body into a prefix
+    /// buffer and looks for the `_csrf` field there. The rest of the body is
+    /// **streamed through unbuffered** to the handler, so a large file upload
+    /// is never fully copied into memory by the CSRF layer. This deliberately
+    /// does **not** track `upload.max_request_size_bytes`: buffering a whole
+    /// 32 MiB upload per request (× concurrency) just to locate a token would
+    /// be a DoS-shaped memory cost and would defeat the streaming upload path.
+    ///
+    /// **Token-early constraint:** because only this prefix is scanned, the
+    /// `_csrf` token must appear within the first `token_scan_bytes` of the
+    /// body. Scaffolded forms emit the hidden `_csrf` field *before* any file
+    /// field, so they are always safe. Hand-written forms that place large
+    /// fields ahead of `_csrf` should either move the token earlier or raise
+    /// this cap (the escape hatch). A genuinely oversized body whose token is
+    /// beyond the prefix is not found and is rejected downstream (403 missing
+    /// token, or the natural 413 from the upload/body limit).
+    #[serde(default = "default_csrf_token_scan_bytes")]
+    pub token_scan_bytes: usize,
 }
 
 impl Default for CsrfConfig {
@@ -729,8 +759,202 @@ impl Default for CsrfConfig {
             cookie_name: default_csrf_cookie(),
             safe_methods: default_safe_methods(),
             exempt_paths: Vec::new(),
+            token_scan_bytes: default_csrf_token_scan_bytes(),
         }
     }
+}
+
+/// One-time submit-token protection settings.
+///
+/// When enabled (the default), a per-render random token is exposed via the
+/// [`SubmitToken`](crate::security::SubmitToken) extractor and embedded as a
+/// hidden `_submit_token` field in scaffolded create/update forms. On the
+/// mutating POST the server consumes the token exactly once: a double-click,
+/// Back→resubmit, or browser retry carrying an already-consumed token replays
+/// the first response instead of re-running the handler, so no duplicate row is
+/// created — with no client-side JavaScript.
+///
+/// Unlike [`IdempotencyConfig`](crate::config::IdempotencyConfig), the guard is
+/// driven by a form field, not the `Idempotency-Key` header, so it protects
+/// bare browser form submits.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `enabled` | `true` |
+/// | `field_name` | `"_submit_token"` |
+/// | `ttl_secs` | `600` (10 min) |
+/// | `in_flight_ttl_secs` | `86_400` (24 h) |
+/// | `backend` | *inherits `[idempotency].backend`* (in-memory in dev, Redis in prod) |
+/// | `exempt_paths` | `[]` |
+///
+/// # Examples
+///
+/// ```toml
+/// [security.submit_token]
+/// enabled = true
+/// ttl_secs = 900
+/// backend = "redis"   # override; reuses the [idempotency.redis] connection settings
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubmitTokenConfig {
+    /// Enable one-time submit-token protection. Default: `true`.
+    #[serde(default = "default_submit_token_enabled")]
+    pub enabled: bool,
+
+    /// Hidden form field name carrying the token. Default: `"_submit_token"`.
+    #[serde(default = "default_submit_token_field")]
+    pub field_name: String,
+
+    /// Time-to-live in seconds for a consumed token's stored response.
+    /// Default: `600` (10 minutes).
+    #[serde(default = "default_submit_token_ttl_secs")]
+    pub ttl_secs: u64,
+
+    /// Maximum stale lifetime in seconds for an in-flight submission lock.
+    ///
+    /// While a mutating request is running, its token is locked so a concurrent
+    /// retry carrying the same token is excluded until the first request records
+    /// its consumed response. The lock is released as soon as that record is
+    /// stored, so this value is only the backend safety expiry for crashes or
+    /// lost unlocks — it must be comfortably longer than any supported mutating
+    /// request duration. Deliberately **independent of `ttl_secs`** (the replay
+    /// window): lowering `ttl_secs` must never shorten how long an active
+    /// submission is excluded from re-entry, which would let a slow request's
+    /// retry acquire a fresh lock and double-execute. Default: `86_400`
+    /// (24 hours), matching `[idempotency].in_flight_ttl_secs`.
+    #[serde(default = "default_submit_token_in_flight_ttl_secs")]
+    pub in_flight_ttl_secs: u64,
+
+    /// Storage backend for consumed submit tokens.
+    ///
+    /// When unset (the default, `None`), the submit-token store **inherits the
+    /// configured idempotency backend** (`[idempotency].backend`): a
+    /// Redis-configured app automatically shares one consumed-token store across
+    /// replicas, while a dev app on the default in-memory idempotency backend
+    /// keeps an in-memory token store. This matches issue #1360: the token store
+    /// is backed by the existing idempotency/session store backend (in-memory in
+    /// dev, Redis in prod), so a double-click load-balanced to a different
+    /// replica cannot re-run the mutation in production.
+    ///
+    /// Set explicitly to override the inherited backend for submit tokens only.
+    /// When it resolves to `"redis"`, the store reuses the `[idempotency.redis]`
+    /// connection settings so a multi-replica deployment shares one token store.
+    ///
+    /// Use [`Self::resolved_backend`] to obtain the effective backend.
+    #[serde(default)]
+    pub backend: Option<crate::config::IdempotencyBackend>,
+
+    /// Request path prefixes that are exempt from submit-token guarding.
+    /// Default: `[]`.
+    #[serde(default)]
+    pub exempt_paths: Vec<String>,
+}
+
+impl Default for SubmitTokenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_submit_token_enabled(),
+            field_name: default_submit_token_field(),
+            ttl_secs: default_submit_token_ttl_secs(),
+            in_flight_ttl_secs: default_submit_token_in_flight_ttl_secs(),
+            backend: None,
+            exempt_paths: Vec::new(),
+        }
+    }
+}
+
+impl SubmitTokenConfig {
+    /// Resolve the effective consumed-token storage backend.
+    ///
+    /// Returns the explicit `backend` override when one is configured;
+    /// otherwise inherits `idempotency_backend` (the app's
+    /// `[idempotency].backend`) so submit tokens share the idempotency store by
+    /// default. This is the single source of truth for backend selection so the
+    /// idempotency layer and the submit-token layer cannot drift apart.
+    #[must_use]
+    pub fn resolved_backend(
+        &self,
+        idempotency_backend: crate::config::IdempotencyBackend,
+    ) -> crate::config::IdempotencyBackend {
+        self.backend.unwrap_or(idempotency_backend)
+    }
+
+    /// Decide the production safety action for the resolved consumed-token
+    /// backend.
+    ///
+    /// Submit tokens are DEFAULT-ON, so the resolved backend can silently land
+    /// on the in-memory store in production when neither `[idempotency]` nor
+    /// `[security.submit_token].backend` is configured. A per-process memory
+    /// store cannot deduplicate submits across replicas, so this mirrors the
+    /// idempotency production-memory guard
+    /// ([`fail_fast_on_invalid_idempotency_config`](crate::app)) — using the
+    /// same `prod`/`production` profile detection — while distinguishing an
+    /// EXPLICIT opt-in from an INHERITED default:
+    ///
+    /// - EXPLICIT `[security.submit_token].backend = "memory"` in production
+    ///   ([`Self::backend`] is `Some(Memory)`) → [`SubmitTokenMemoryGuard::FailExplicit`]:
+    ///   the operator deliberately chose an unsafe backend, so fail fast like
+    ///   idempotency's explicit enabled+memory prod guard.
+    /// - INHERITED default ([`Self::backend`] is `None`) that resolves to
+    ///   memory in production → [`SubmitTokenMemoryGuard::WarnInherited`]: only
+    ///   warn, so upgrading Autumn does not turn into "prod won't boot without
+    ///   Redis" for a single-replica app.
+    /// - Non-production, or a resolved backend that is not memory →
+    ///   [`SubmitTokenMemoryGuard::Ok`].
+    #[must_use]
+    pub(crate) fn production_memory_guard(
+        &self,
+        idempotency_backend: crate::config::IdempotencyBackend,
+        is_production: bool,
+    ) -> SubmitTokenMemoryGuard {
+        use crate::config::IdempotencyBackend;
+        if !is_production
+            || self.resolved_backend(idempotency_backend) != IdempotencyBackend::Memory
+        {
+            return SubmitTokenMemoryGuard::Ok;
+        }
+        // Resolved to the in-memory store in production. `backend == Some(Memory)`
+        // is an explicit opt-in (hard fail); `backend == None` inherited the
+        // memory idempotency backend (warn only). `Some(Redis)` cannot reach here
+        // because it would not resolve to memory.
+        match self.backend {
+            Some(IdempotencyBackend::Memory) => SubmitTokenMemoryGuard::FailExplicit,
+            _ => SubmitTokenMemoryGuard::WarnInherited,
+        }
+    }
+}
+
+/// Production safety decision for the resolved submit-token consumed-token
+/// backend. Produced by [`SubmitTokenConfig::production_memory_guard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitTokenMemoryGuard {
+    /// No action: not production, or the resolved backend is not the in-memory
+    /// store.
+    Ok,
+    /// The default/inherited backend resolves to the in-memory store in
+    /// production. Boot proceeds, but an actionable startup warning is emitted.
+    WarnInherited,
+    /// An explicit `[security.submit_token].backend = "memory"` in production.
+    /// Boot must fail fast.
+    FailExplicit,
+}
+
+const fn default_submit_token_enabled() -> bool {
+    true
+}
+
+fn default_submit_token_field() -> String {
+    "_submit_token".to_owned()
+}
+
+const fn default_submit_token_ttl_secs() -> u64 {
+    600
+}
+
+const fn default_submit_token_in_flight_ttl_secs() -> u64 {
+    86_400
 }
 
 /// Strategy for identifying which client a rate-limit bucket belongs to.
@@ -757,9 +981,17 @@ pub enum KeyStrategy {
     #[default]
     Ip,
     /// Key on the `Authorization: Bearer` token value. Falls back to IP when absent.
+    ///
+    /// The `token` alias matches the `#[throttle(key = "token")]` macro spelling so an
+    /// operator can move an inline policy into `[security.rate_limit.named.*]` verbatim.
+    #[serde(alias = "token")]
     ApiToken,
     /// Key on the authenticated principal ID from the `RateLimitPrincipal` request
     /// extension (set by the auth middleware). Falls back to IP for unauthenticated requests.
+    ///
+    /// The `principal` alias matches the `#[throttle(key = "principal")]` macro spelling so
+    /// an operator can move an inline policy into `[security.rate_limit.named.*]` verbatim.
+    #[serde(alias = "principal")]
     AuthenticatedPrincipal,
 }
 
@@ -802,6 +1034,32 @@ pub struct RateLimitTierConfig {
     pub requests_per_second: f64,
     /// Maximum burst capacity (token bucket size) for this tier.
     pub burst: u32,
+}
+
+/// Named per-route rate limit referenced from `#[throttle("name")]`.
+///
+/// Declare one entry per named limiter under `[security.rate_limit.named.<name>]`
+/// and reference it from a handler via `#[throttle("name")]` so the throttling
+/// policy lives in config, not code.
+///
+/// ```toml
+/// [security.rate_limit.named.login]
+/// limit = 5
+/// per = "1m"
+/// key = "ip"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitNamedConfig {
+    /// Maximum number of requests allowed in each `per` window. Also serves as
+    /// the token-bucket burst capacity.
+    pub limit: u32,
+    /// Window duration parsed by [`crate::task::parse_duration`] (e.g. `"1m"`,
+    /// `"30s"`, `"1h"`). The steady-state refill rate is `limit / per`.
+    pub per: String,
+    /// Optional keying strategy override. When `None`, the named limiter uses
+    /// the same key strategy as the global limiter (`security.rate_limit.key_strategy`).
+    #[serde(default)]
+    pub key: Option<KeyStrategy>,
 }
 
 /// Rate limiting configuration.
@@ -940,6 +1198,22 @@ pub struct RateLimitConfig {
     #[serde(default)]
     pub tiers: HashMap<String, RateLimitTierConfig>,
 
+    /// Named per-route limiters referenced from `#[throttle("name")]`.
+    ///
+    /// Each entry defines a `limit` (tokens per window) and `per` (window
+    /// duration) so ops can tune per-route thresholds without a recompile.
+    /// An optional `key` overrides the default keying strategy for that
+    /// named limiter.
+    ///
+    /// ```toml
+    /// [security.rate_limit.named.login]
+    /// limit = 5
+    /// per = "1m"
+    /// key = "ip"
+    /// ```
+    #[serde(default)]
+    pub named: HashMap<String, RateLimitNamedConfig>,
+
     /// Bucket store backend. Default: `"memory"` (in-process, single-replica).
     ///
     /// Set to `"redis"` in multi-replica deployments so the configured
@@ -977,6 +1251,7 @@ impl Default for RateLimitConfig {
             trusted_proxies: Vec::new(),
             key_strategy: KeyStrategy::default(),
             tiers: HashMap::new(),
+            named: HashMap::new(),
             backend: RateLimitBackend::default(),
             #[cfg(feature = "redis")]
             redis: RateLimitRedisConfig::default(),
@@ -1092,8 +1367,17 @@ fn default_rate_limit_redis_key_prefix() -> String {
 /// - `max_request_size_bytes`: global request body cap (enforced by middleware)
 /// - `max_file_size_bytes`: per-file cap for `crate::extract::Multipart` helpers
 /// - `allowed_mime_types`: optional MIME-type allow list for uploaded parts
+/// - `reject_on_content_type_mismatch`: strict mode that rejects when the
+///   client-declared `Content-Type` disagrees with the sniffed content
 ///
 /// Leave `allowed_mime_types` empty to allow any content type.
+///
+/// # Content sniffing
+///
+/// The `crate::extract::Multipart` extractor validates uploaded file parts by
+/// their actual content (magic bytes), **not** the spoofable client-declared
+/// `Content-Type` header. See `allowed_mime_types` for the exact sniffed →
+/// markup-guard → declared-fallback precedence used when a list is configured.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadConfig {
     /// Maximum total multipart request body size in bytes.
@@ -1103,8 +1387,43 @@ pub struct UploadConfig {
     #[serde(default = "default_max_file_size_bytes")]
     pub max_file_size_bytes: usize,
     /// Optional allowed MIME types (e.g. `["image/png", "image/jpeg"]`).
+    ///
+    /// Enforced primarily against the **sniffed** (magic-byte) content type,
+    /// never blindly against the client-declared header. Because `infer` only
+    /// recognizes binary formats, the check applies this precedence for each
+    /// file part when the list is non-empty:
+    ///
+    /// 1. **Sniffed type recognized** → it must appear in the list, else the
+    ///    upload is rejected (`400`). The declared header is ignored.
+    /// 2. **Unrecognized but looks like markup** (leading `<…` after a BOM /
+    ///    whitespace — HTML, SVG, XML) → always rejected (`400`), so scripts
+    ///    or `<svg onload=…>` can't ride in under a spoofed declared type.
+    /// 3. **Unrecognized and not markup** → the declared content-type essence
+    ///    (media type without parameters) is trusted **only** when it names a
+    ///    signature-less TEXT type (`text/*`, `application/json`,
+    ///    `application/csv`) that appears in the list. Binary/sniffable types
+    ///    (`image/*`, `application/pdf`, …) are always enforced strictly by
+    ///    magic bytes: unrecognizable bytes declaring such a type are rejected
+    ///    (`400`), since a genuine file of that type would have sniffed
+    ///    positively. This is the only case where the declared header is
+    ///    trusted, and only to disambiguate among signature-less text formats.
     #[serde(default)]
     pub allowed_mime_types: Vec<String>,
+    /// When `true`, reject an uploaded file part if the client-declared
+    /// `Content-Type` header disagrees with the sniffed (magic-byte) content
+    /// type. Default: `false`.
+    ///
+    /// Behavior when enabled (comparison uses the declared essence — the media
+    /// type without parameters):
+    /// - declared and sniffed both known but differ → reject (`400`)
+    /// - declared known but content unrecognized (sniffed unknown) → reject
+    ///   (`400`, the declared type cannot be verified)
+    /// - no declared header → reject (`400`); omitting `Content-Type` must not
+    ///   silently bypass the mismatch check
+    ///
+    /// This is independent of `allowed_mime_types`; both checks apply when set.
+    #[serde(default)]
+    pub reject_on_content_type_mismatch: bool,
 }
 
 impl Default for UploadConfig {
@@ -1113,6 +1432,7 @@ impl Default for UploadConfig {
             max_request_size_bytes: default_max_request_size_bytes(),
             max_file_size_bytes: default_max_file_size_bytes(),
             allowed_mime_types: Vec::new(),
+            reject_on_content_type_mismatch: false,
         }
     }
 }
@@ -1207,6 +1527,14 @@ fn default_csrf_cookie() -> String {
     "autumn-csrf".to_owned()
 }
 
+/// Default CSRF token-scan prefix cap: 2 MiB.
+///
+/// Deliberately independent of `upload.max_request_size_bytes` — only the
+/// leading prefix is buffered to locate `_csrf`; the remainder streams through.
+const fn default_csrf_token_scan_bytes() -> usize {
+    2 * 1024 * 1024
+}
+
 fn default_safe_methods() -> Vec<String> {
     vec![
         "GET".to_owned(),
@@ -1235,6 +1563,114 @@ const fn default_max_file_size_bytes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IdempotencyBackend;
+
+    // ── submit-token backend resolution (Finding D: inherit idempotency) ─────
+
+    #[test]
+    fn submit_token_backend_defaults_to_none_and_inherits_idempotency() {
+        // Unset `[security.submit_token].backend` deserializes to `None`.
+        let cfg: SubmitTokenConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.backend, None, "unset backend must deserialize to None");
+        // With idempotency on Redis, the resolved submit-token backend follows
+        // it — NOT the old hardcoded Memory default.
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Redis),
+            IdempotencyBackend::Redis,
+            "an unset submit-token backend must inherit the Redis idempotency backend"
+        );
+        // A dev app on the default Memory idempotency backend stays Memory.
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Memory),
+            IdempotencyBackend::Memory,
+            "an unset submit-token backend on a Memory idempotency app stays Memory"
+        );
+    }
+
+    #[test]
+    fn submit_token_explicit_backend_overrides_inherited_idempotency() {
+        // An explicit `backend = "memory"` wins even when idempotency is Redis.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(cfg.backend, Some(IdempotencyBackend::Memory));
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Redis),
+            IdempotencyBackend::Memory,
+            "an explicit submit-token backend override must win over the inherited backend"
+        );
+
+        // An explicit `backend = "redis"` wins even when idempotency is Memory.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"redis\"").unwrap();
+        assert_eq!(cfg.backend, Some(IdempotencyBackend::Redis));
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Memory),
+            IdempotencyBackend::Redis,
+            "an explicit redis override must win over an inherited Memory backend"
+        );
+    }
+
+    // ── submit-token production memory guard (Finding O) ────────────────────
+
+    #[test]
+    fn submit_token_explicit_memory_in_production_fails_fast() {
+        // EXPLICIT `[security.submit_token].backend = "memory"` in production
+        // is a deliberate unsafe opt-in → hard fail, mirroring idempotency's
+        // explicit enabled+memory prod guard.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(cfg.backend, Some(IdempotencyBackend::Memory));
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Redis, true),
+            SubmitTokenMemoryGuard::FailExplicit,
+        );
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Memory, true),
+            SubmitTokenMemoryGuard::FailExplicit,
+        );
+    }
+
+    #[test]
+    fn submit_token_inherited_memory_in_production_only_warns() {
+        // INHERITED default (`backend = None`) resolving to Memory in production
+        // must NOT fail — upgrading Autumn must not turn into "prod won't boot
+        // without Redis". It only warns.
+        let cfg: SubmitTokenConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.backend, None);
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Memory, true),
+            SubmitTokenMemoryGuard::WarnInherited,
+        );
+        // Inherited Redis resolves to Redis → no warning, no fail.
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Redis, true),
+            SubmitTokenMemoryGuard::Ok,
+        );
+    }
+
+    #[test]
+    fn submit_token_memory_outside_production_is_ok() {
+        // Dev / non-production → no warn, no fail, regardless of explicit or
+        // inherited memory.
+        let explicit: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(
+            explicit.production_memory_guard(IdempotencyBackend::Memory, false),
+            SubmitTokenMemoryGuard::Ok,
+        );
+        let inherited: SubmitTokenConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            inherited.production_memory_guard(IdempotencyBackend::Memory, false),
+            SubmitTokenMemoryGuard::Ok,
+        );
+    }
+
+    #[test]
+    fn submit_token_explicit_redis_backend_never_triggers_guard() {
+        // An explicit Redis override never resolves to memory, so the guard is
+        // a no-op even in production.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"redis\"").unwrap();
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Memory, true),
+            SubmitTokenMemoryGuard::Ok,
+        );
+    }
 
     // ── validate_signing_secret (RED phase) ─────────────────────────────────
 
@@ -1601,6 +2037,87 @@ mod tests {
         assert_eq!(config.burst, 20);
         assert!(!config.trust_forwarded_headers);
         assert!(config.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn rate_limit_named_key_accepts_short_macro_spellings() {
+        // `#[throttle(key = "principal")]` / `key = "token"` use the SHORT macro
+        // spellings; an operator moving an inline policy into config must be able
+        // to use the same words. Serde aliases bridge macro and config vocabularies.
+        let toml_str = r#"
+            [named.login]
+            limit = 5
+            per = "1m"
+            key = "principal"
+
+            [named.api]
+            limit = 10
+            per = "1s"
+            key = "token"
+        "#;
+        let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.named["login"].key,
+            Some(KeyStrategy::AuthenticatedPrincipal),
+            "short `principal` must deserialize to AuthenticatedPrincipal"
+        );
+        assert_eq!(
+            config.named["api"].key,
+            Some(KeyStrategy::ApiToken),
+            "short `token` must deserialize to ApiToken"
+        );
+    }
+
+    #[test]
+    fn rate_limit_named_key_still_accepts_long_config_spellings() {
+        // The canonical long spellings must keep working unchanged.
+        let toml_str = r#"
+            [named.login]
+            limit = 5
+            per = "1m"
+            key = "authenticated_principal"
+
+            [named.api]
+            limit = 10
+            per = "1s"
+            key = "api_token"
+
+            [named.byip]
+            limit = 1
+            per = "1s"
+            key = "ip"
+        "#;
+        let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.named["login"].key,
+            Some(KeyStrategy::AuthenticatedPrincipal)
+        );
+        assert_eq!(config.named["api"].key, Some(KeyStrategy::ApiToken));
+        assert_eq!(config.named["byip"].key, Some(KeyStrategy::Ip));
+    }
+
+    #[test]
+    fn global_key_strategy_still_accepts_existing_spellings() {
+        // The aliases live on the shared `KeyStrategy` enum, so the global
+        // `key_strategy` field also accepts them — but its existing canonical
+        // spellings must remain valid.
+        for (toml_str, expected) in [
+            (
+                "key_strategy = \"authenticated_principal\"",
+                KeyStrategy::AuthenticatedPrincipal,
+            ),
+            ("key_strategy = \"api_token\"", KeyStrategy::ApiToken),
+            ("key_strategy = \"ip\"", KeyStrategy::Ip),
+            // Aliases also work here (a beneficial side effect).
+            (
+                "key_strategy = \"principal\"",
+                KeyStrategy::AuthenticatedPrincipal,
+            ),
+            ("key_strategy = \"token\"", KeyStrategy::ApiToken),
+        ] {
+            let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
+            assert_eq!(config.key_strategy, expected, "for {toml_str}");
+        }
     }
 
     #[test]

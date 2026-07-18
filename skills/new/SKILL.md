@@ -70,11 +70,21 @@ First-run checklist:
   `i18n/en.ftl`, the `[i18n]` block in `autumn.toml`, and the `i18n` feature
   on `autumn-web`).
 - `--with-seed`: Scaffold a stub `src/bin/seed.rs` for database seeding.
+- `--api` **(trunk-dev)**: Scaffold a JSON-first app instead of the HTML/view
+  flavor (issue #1847). Handlers return `Json<…>`; `autumn-web` is pinned
+  `default-features = false` to a lean set (`db`, `cache-moka`, `http-client`,
+  `reporting`, `flash`), dropping the maud/htmx/tailwind view stack. No
+  `static/`, `input.css`, `tailwind.config.js`, vendored assets, or Tailwind
+  CI/README notes are generated, and the first `cargo run` serves JSON (no
+  `autumn setup` Tailwind download needed). `--api` conflicts with `--daemon`
+  and `--bundled-pg`, but composes with `--with-i18n` and `--with-seed`.
 
 ## Key files to know
 
 | File | Purpose |
 |---|---|
+| `README.md` | Generated quickstart — prerequisites and the golden-path commands (configure the `[database]` block in `autumn.toml`, then `autumn migrate` → `autumn dev`) that take a clean checkout to a serving route, plus a CLI reference. Flag-aware: `--with-i18n` / `--with-seed` add sections for their extra steps. |
+| `.env.example` | Documented template of local env vars. Copy it to `.env` (gitignored) and fill in local values (e.g. `AUTUMN_DATABASE__URL`); Autumn auto-loads `.env` in the dev/test profiles. Real shell env vars always win over `.env`. |
 | `autumn.toml` | Base config (server, database, session, security, logging) |
 | `autumn-dev.toml` | Dev profile overrides (auto-detected in debug builds) |
 | `src/main.rs` | AppBuilder setup — register routes, tasks, jobs, migrations here |

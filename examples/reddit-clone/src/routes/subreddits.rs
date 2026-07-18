@@ -10,7 +10,7 @@ use diesel_async::RunQueryDsl;
 
 use crate::models::NewSubreddit;
 use crate::repositories::{PgSubredditRepository, SubredditRepository};
-use crate::schema::{subreddits, users};
+use crate::schema::users;
 use crate::slugify::slugify;
 
 use super::layout::{layout, time_ago};
@@ -128,7 +128,7 @@ pub struct CreateSubredditForm {
 #[post("/r/create")]
 pub async fn create(
     session: Session,
-    mut db: Db,
+    repo: PgSubredditRepository,
     form: Form<CreateSubredditForm>,
 ) -> AutumnResult<Redirect> {
     let user_id: i64 = session
@@ -158,13 +158,22 @@ pub async fn create(
         creator_id: user_id,
     };
 
-    diesel::insert_into(subreddits::table)
-        .values(&new_sub)
-        .execute(&mut *db)
-        .await
-        .map_err(|_| AutumnError::unprocessable_msg("Community name already taken"))?;
+    // Race-safe get-or-insert on the unique `slug` column (#1382): replaces the
+    // old raw `insert_into(...).map_err("already taken")`. If two requests race
+    // to create the same community, `ON CONFLICT DO NOTHING` lets exactly one
+    // win the insert while the loser reads the winner's row back — neither sees
+    // a unique-violation, and both land on the same community.
+    let (subreddit, created) = repo.find_or_create_by_slug(slug.clone(), &new_sub).await?;
+    if !created {
+        // The slug is already owned by an existing community; preserve the prior
+        // UX of rejecting the duplicate rather than redirecting into someone
+        // else's community as if the create had succeeded.
+        return Err(AutumnError::unprocessable_msg(
+            "Community name already taken",
+        ));
+    }
 
-    Ok(Redirect::to(&paths::show(slug)))
+    Ok(Redirect::to(&paths::show(&subreddit.slug)))
 }
 
 // ── Show subreddit with posts ──────────────────────────────────
@@ -176,6 +185,7 @@ pub async fn show(
     csrf: CsrfToken,
     repo: PgSubredditRepository,
     mut db: Db,
+    flash: Flash,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
@@ -203,11 +213,14 @@ pub async fn show(
             .load(&mut *db)
             .await?;
 
+    // Consume the flash only after all fallible work above.
+    let flash_html = flash.render().await;
     Ok(layout(
         &format!("r/{}", sub.name),
         current_user.as_deref(),
         Some(csrf.token()),
         html! {
+            (flash_html)
             // Subreddit header
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mb-6" {
                 div class="flex justify-between items-start" {
@@ -232,29 +245,31 @@ pub async fn show(
             }
 
             // Post list
-            div class="space-y-2" {
+            ul id="posts-list" class="space-y-2"
+                hx-ext="sse" sse-connect=(format!("/r/{}/posts/stream", sub.slug)) sse-swap="message" hx-swap="none" {
                 @for (post_id, title, post_slug, score, comment_count, author, created_at) in &posts {
-                    div class="bg-white rounded-lg shadow-sm border border-gray-200 \
-                               hover:border-orange-300 transition-colors" {
-                        div class="flex items-start gap-3 p-4" {
-                            // Vote controls
-                            (super::layout::vote_controls(*post_id, *score))
+                    li id=(format!("post-{}", post_id)) class="posts-feed-item transition-all" {
+                        div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
+                            div class="flex items-start gap-3 p-4" {
+                                // Vote controls
+                                (super::layout::vote_controls(*post_id, *score))
 
-                            // Post info
-                            div class="flex-1 min-w-0" {
-                                a href=(super::posts::__autumn_path_show(&sub.slug, post_slug))
-                                   class="text-lg font-medium text-gray-900 hover:text-orange-600" {
-                                    (title)
-                                }
-                                div class="text-xs text-gray-400 mt-1" {
-                                    "posted by "
-                                    a href=(super::auth::__autumn_path_profile(author))
-                                       class="text-gray-500 hover:underline" { "u/" (author) }
-                                    " " (time_ago(created_at))
-                                    " \u{2022} "
+                                // Post info
+                                div class="flex-1 min-w-0" {
                                     a href=(super::posts::__autumn_path_show(&sub.slug, post_slug))
-                                       class="text-gray-500 hover:text-orange-600" {
-                                        (comment_count) " comments"
+                                       class="text-lg font-medium text-gray-900 hover:text-orange-600" {
+                                        (title)
+                                    }
+                                    div class="text-xs text-gray-400 mt-1" {
+                                        "posted by "
+                                        a href=(super::auth::__autumn_path_profile(author))
+                                           class="text-gray-500 hover:underline" { "u/" (author) }
+                                        " " (time_ago(created_at))
+                                        " \u{2022} "
+                                        a href=(super::posts::__autumn_path_show(&sub.slug, post_slug))
+                                           class="text-gray-500 hover:text-orange-600" {
+                                            (comment_count) " comments"
+                                        }
                                     }
                                 }
                             }

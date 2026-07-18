@@ -1,0 +1,150 @@
+name: Release Image Build-and-Boot Gate
+
+# Issue #978 — build-and-boot the generated release image so the deploy story
+# can't rot.
+#
+# `autumn release init` scaffolds a production Dockerfile and docs/guide/deployment.md
+# promises "a fresh `autumn new` project to a running container in under 10
+# minutes", with `/health` wired as the container HEALTHCHECK. Until this gate,
+# nothing in CI ever ran `docker build` on the generated image and booted it —
+# the existing tests only string-assert Dockerfile contents and the publish-gate
+# smoke job only checks that a downstream project *compiles*. A base-image bump,
+# a missing system lib (libpq/tini), a cargo-chef change, or an asset-path drift
+# could silently break the headline deploy path and we'd only learn from a
+# user's first failed production deploy.
+#
+# This workflow scaffolds a fresh project, runs `autumn release init`,
+# `docker build`s the image, runs the documented one-shot `autumn migrate`, boots
+# the container against a throwaway Postgres, and asserts /health and
+# /actuator/health return 200 within the documented startup budget. It covers
+# both the bare `release init` target and the `--target docker-compose` variant.
+#
+# Path-scoped to the deployment-scaffold surface (so it does not tax unrelated
+# PRs) plus a weekly scheduled run so transitive base-image / crate rot is caught
+# even when no scaffold file is touched directly.
+
+on:
+  push:
+    branches: [trunk, trunk-dev]
+    paths:
+      - ".github/workflows/release-image-boot.yml"
+      - "scripts/check-release-image-boot.sh"
+      - "autumn-cli/src/release.rs"
+      - "autumn-cli/src/new.rs"
+      - "autumn-cli/src/templates/**"
+      - "autumn-cli/src/main.rs"
+      - "autumn-cli/Cargo.toml"
+      - "autumn/src/**"
+      - "autumn/Cargo.toml"
+  pull_request:
+    branches: [trunk, trunk-dev]
+    # Keep this list in sync with push.paths above — GitHub Actions YAML does
+    # not support anchors inside `on:`, so both blocks must be updated together.
+    paths:
+      - ".github/workflows/release-image-boot.yml"
+      - "scripts/check-release-image-boot.sh"
+      - "autumn-cli/src/release.rs"
+      - "autumn-cli/src/new.rs"
+      - "autumn-cli/src/templates/**"
+      - "autumn-cli/src/main.rs"
+      - "autumn-cli/Cargo.toml"
+      - "autumn/src/**"
+      - "autumn/Cargo.toml"
+  schedule:
+    # Weekly on Monday at 05:00 UTC — catches base-image / crate rot that does
+    # not touch the path-filtered files above.
+    - cron: "0 5 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The documented "≤ 30s after boot" health window and the secondary image
+  # size budget, surfaced as workflow-level knobs.
+  STARTUP_BUDGET_SECS: "30"
+  IMAGE_SIZE_BUDGET_MB: "150"
+
+jobs:
+  # ── Bare `release init` target ──────────────────────────────────────────────
+  #
+  # Builds the generated image, runs the one-shot `autumn migrate` against a
+  # throwaway Postgres service container, boots the web container, and probes
+  # /health + /actuator/health. The service container is reachable on localhost
+  # from the runner; the harness boots the app with `--network host` so the
+  # container reaches Postgres and binds :3000 on the runner.
+  bare-target:
+    name: Build + boot (bare release init)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: autumn
+          POSTGRES_PASSWORD: autumn
+          POSTGRES_DB: releasecheck_prod
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U autumn -d releasecheck_prod"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+                      /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+
+      - name: Build the autumn CLI (scaffold under test)
+        run: cargo build -p autumn-cli --bin autumn
+
+      - name: Build and boot the generated release image
+        env:
+          AUTUMN_BIN: ${{ github.workspace }}/target/debug/autumn
+          PG_HOST: localhost
+          PG_PORT: "5432"
+        run: ./scripts/check-release-image-boot.sh default
+
+  # ── docker-compose target ───────────────────────────────────────────────────
+  #
+  # Brings up the generated `docker-compose.yml` (app + one-shot migrate +
+  # managed Postgres), probes /health + /actuator/health, and tears the stack
+  # down cleanly (`docker compose down -v`). No service container here — the
+  # generated compose file provides its own Postgres.
+  compose-target:
+    name: Build + boot (--target docker-compose)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+                      /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+
+      - name: Build the autumn CLI (scaffold under test)
+        run: cargo build -p autumn-cli --bin autumn
+
+      - name: Build and boot the generated docker-compose stack
+        env:
+          AUTUMN_BIN: ${{ github.workspace }}/target/debug/autumn
+        run: ./scripts/check-release-image-boot.sh docker-compose

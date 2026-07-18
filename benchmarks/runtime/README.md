@@ -249,6 +249,109 @@ It checks that every framework directory, Dockerfile, migrations path, load
 script, and README section is present. This gate runs in CI to ensure the
 benchmark apps do not silently rot.
 
+### Runtime Latency Gate (CI)
+
+The `.github/workflows/runtime-latency.yml` workflow gates Autumn's per-request
+latency in CI. It runs automatically every Monday and on `workflow_dispatch`.
+
+**What it does:**
+1. Starts a `postgres:16-alpine` service container.
+2. Applies `benchmarks/runtime/schema/init.sql` then `seed/seed.sql`.
+3. Builds `benchmarks/runtime/autumn` in release mode.
+4. Boots the app and polls `/health`.
+5. Installs pinned k6 `v0.55.0`.
+6. Discards 1 warmup run, then runs `load/k6/gate.js` 3 times (VUs=20, 30s each).
+7. Feeds the 3 `gate-summary.json` files to `bench-runtime-gate`, which computes
+   the **median p99** per path and compares against `budgets.toml`.
+8. Fails with a message naming the path, observed p99, and budget if exceeded.
+
+**Gated paths and budgets** — see [`budgets.toml`](budgets.toml):
+
+| Path | CI Budget (p99) |
+|------|----------------|
+| `GET /api/posts` | 50ms |
+| `GET /posts` | 50ms |
+
+**Committed baseline** — see [`baseline.json`](baseline.json) for the raw numbers and
+[`RESULTS.md`](RESULTS.md) for the human-readable summary.
+
+#### Reproducing the Gated Run Locally
+
+```bash
+# 1. Start Postgres (or use an existing cluster).
+#    Adjust the connection string below to match your setup.
+psql postgres://localhost/postgres -c "CREATE ROLE benchmark LOGIN PASSWORD 'benchmark';"
+psql postgres://localhost/postgres -c "CREATE DATABASE benchmark OWNER benchmark;"
+
+# 2. Apply canonical schema and seed.
+PGPASSWORD=benchmark psql -h 127.0.0.1 -U benchmark -d benchmark \
+  -f benchmarks/runtime/schema/init.sql
+PGPASSWORD=benchmark psql -h 127.0.0.1 -U benchmark -d benchmark \
+  -f benchmarks/runtime/seed/seed.sql
+
+# 3. Build bench-autumn in release mode.
+cd benchmarks/runtime/autumn
+cargo build --release
+cd ../../..
+
+# 4. Boot the app (adjust port if 8080 is in use).
+AUTUMN_DATABASE__URL="postgres://benchmark:benchmark@127.0.0.1:5432/benchmark" \
+AUTUMN_SERVER__HOST="127.0.0.1" \
+AUTUMN_SERVER__PORT="8080" \
+AUTUMN_SECURITY__CSRF__ENABLED="false" \
+AUTUMN_SECURITY__SIGNING_SECRET="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS="127.0.0.1,localhost" \
+AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION="true" \
+AUTUMN_MANIFEST_DIR="$(pwd)/benchmarks/runtime/autumn" \
+RUST_LOG="warn" \
+./benchmarks/runtime/autumn/target/release/bench-autumn &
+
+curl --retry 10 --retry-delay 1 -sf http://127.0.0.1:8080/health
+
+# 5. Install pinned k6.
+K6_VERSION="v0.55.0"
+curl -sL "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-amd64.tar.gz" \
+  | tar -xzC /tmp/
+sudo mv /tmp/k6-${K6_VERSION}-linux-amd64/k6 /usr/local/bin/k6
+
+# 6. Warmup run (discard results).
+mkdir -p gate-runs && cd gate-runs
+BASE_URL=http://127.0.0.1:8080 k6 run ../benchmarks/runtime/load/k6/gate.js
+
+# 7. Three measured runs.
+for run in 1 2 3; do
+  BASE_URL=http://127.0.0.1:8080 k6 run ../benchmarks/runtime/load/k6/gate.js
+  cp gate-summary.json summary-${run}.json
+done
+cd ..
+
+# 8. Run the gate comparison.
+cargo run -p bench-runtime-gate -- \
+  --budgets benchmarks/runtime/budgets.toml \
+  --summary gate-runs/summary-1.json \
+  --summary gate-runs/summary-2.json \
+  --summary gate-runs/summary-3.json \
+  --report gate-report.json
+```
+
+#### Re-baselining the Latency Budget
+
+When an intentional change moves p99 (e.g. a new always-on middleware feature), update
+the budget so CI returns to green:
+
+1. Run the reproduction steps above on a quiet machine (no competing load).
+2. Note the median p99 for each gated path across the 3 runs.
+3. Set `budget_p99_ms = ceil(median * 1.20)` (minimum 50ms for CI runner headroom).
+4. Update `benchmarks/runtime/budgets.toml` with the new values.
+5. Update `benchmarks/runtime/baseline.json` with the new run data and metadata.
+6. Update the baseline table in `benchmarks/runtime/RESULTS.md`.
+7. Commit with a message explaining the intentional change (e.g. "benchmark: re-baseline after session middleware").
+
+**Flake policy:** The gate is designed to stay green on unchanged code across 10+
+consecutive runs. If the gate trips on what looks like a flake, use "Re-run failed jobs"
+in the GitHub Actions UI once before investigating. Repeated unexplained failures indicate
+that the budgets need recalibration for the current CI runner class.
+
 ## Caveats and Framework-Specific Notes
 
 - **JVM warm-up**: Spring Boot's p50/p95 during the first 10 s of a run are

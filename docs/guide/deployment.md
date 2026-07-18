@@ -7,6 +7,19 @@ no file editing is required to reach a running container.
 Target time: **under 10 minutes** on a machine with Docker and a working
 internet connection.
 
+> **This promise is machine-verified, not aspirational.** The
+> [`release-image-boot`](../../.github/workflows/release-image-boot.yml) CI gate
+> scaffolds a fresh project, runs every command on this page (`autumn new` →
+> `autumn release init --force` → `docker build` → one-shot `autumn migrate` →
+> boot), and fails the build unless the container answers `GET /health` **and**
+> `GET /actuator/health` with `200` within the documented startup budget. It
+> covers both the bare `release init` image and the `--target docker-compose`
+> stack, so the deployment scaffold can never silently rot — a base-image bump,
+> a missing system lib, or an asset-path drift is caught in CI, not by a user's
+> first failed production deploy. See
+> [`scripts/check-release-image-boot.sh`](../../scripts/check-release-image-boot.sh)
+> for the build-and-boot harness.
+
 ---
 
 ## Prerequisites
@@ -14,7 +27,496 @@ internet connection.
 - **Rust 1.88.0+** with `cargo`
 - **Docker** (or Docker Desktop) — `docker --version`
 - **PostgreSQL** accessible at a connection string you control (local or remote)
-- The `autumn` CLI - `cargo install autumn-cli --version 0.5.0`
+- The `autumn` CLI - `cargo install autumn-cli --version 0.6.0`
+
+---
+
+## Push-button deploy to your own server (`autumn deploy`)
+
+`autumn deploy` takes a fresh project to a live, zero-downtime service on a
+single Linux VPS you control — no Dockerfile, no container registry, no PaaS
+account. It uploads a single embedded binary, supervises it with systemd behind
+a reverse proxy, migrates before cutover, health-gates on `/ready`, and flips
+traffic atomically. Re-running it is a zero-downtime redeploy; one command rolls
+back.
+
+This is the **primary** deployment path. Two alternatives remain documented
+below and are better fits in specific cases:
+
+- **[Deploy to fly.io](#deploy-to-flyio)** — a managed platform (machines,
+  built-in metrics scraping, `fly deploy`).
+- **The container path** ([Step 1](#step-1--create-the-project) through
+  [How the production image works](#how-the-production-image-works)) — a
+  portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
+
+> **HTTPS/TLS.** kamal-proxy fronts your app and listens on your configured
+> public HTTP port (`server.port`) and, **by default, 443** — its HTTPS listener
+> is always bound and cannot be disabled. By default `autumn deploy` provisions
+> no certificate for your app, so nothing is served over HTTPS until you opt in.
+> Set `[deploy.tls] enabled = true` and `host = "app.example.com"` in
+> `autumn.toml` to have `autumn deploy` pass `--host`/`--tls` on your app's
+> kamal-proxy route/flip, so kamal-proxy provisions an **automatic Let's
+> Encrypt** certificate for that host on-demand and terminates TLS for it on its
+> always-bound 443 listener. This needs **no `server.port` change** — issuance
+> uses TLS-ALPN-01 on the already-bound 443, so it works on both the first deploy
+> and a later redeploy. Setting `server.port = 80` is **recommended** (it is the
+> default) so the proxy also serves HTTP on 80 for the HTTP→HTTPS redirect, but
+> it is not required. An external TLS terminator sharing the same host is **not**
+> supported (kamal-proxy always binds 443 and cannot release it); run such a
+> terminator on a separate host in front of the deploy host instead. Either way
+> TLS terminates at the **proxy**: don't enable in-process `[server.tls]`/ACME on
+> a deploy-managed app — deploy binds each slot to a private loopback HTTP port
+> that the readiness gate and kamal-proxy target over plain HTTP, so a TLS
+> listener there breaks its health checks. See the [TLS & HTTPS guide](./tls.md)
+> for the full picture, including in-process TLS for self-run apps.
+
+### Preconditions
+
+Everything except two host prerequisites is automated by `autumn deploy up`:
+
+- **Key-based SSH access as `root` (or an equivalently privileged account) to a
+  stock Ubuntu LTS (or other systemd) host.** The deploy runs non-interactively
+  (`BatchMode=yes`) as the configured user (`[deploy] user`, default `root`) —
+  no password prompts, so your SSH key must already be authorized on the target.
+  `autumn deploy` runs its remote steps **directly over SSH, without `sudo`**: it
+  writes units into `/etc/systemd/system/`, runs `systemctl`
+  (`daemon-reload`/`enable`/`restart`/`disable`) and `systemd-run`, and writes
+  under the app directory. The `[deploy] user` must therefore be `root` (the
+  default) or an account that **already holds those permissions directly**. A
+  plain non-root SSH login passes preflight (which only checks reachability and
+  secrets, not privilege) and then fails once it tries to write the unit or
+  invoke `systemctl`.
+- **The `kamal-proxy` binary present at `/usr/local/bin/kamal-proxy`.** The
+  deploy writes and supervises the proxy's systemd unit, but does **not**
+  download the binary itself — install it once as part of host bootstrap. (See
+  [Limitations](#limitations-and-known-gaps).)
+- **A local Rust toolchain** to build the release binary (`autumn build
+  --embed`).
+
+The reverse proxy, install directories, systemd units, release layout, and the
+secret env file are all created for you.
+
+### First deploy: from `autumn new` to a live app
+
+```bash
+# 1. Scaffold a project (its package name becomes the deploy app name).
+autumn new myapp
+cd myapp
+```
+
+Point the deploy at your server by adding a `[deploy]` section to `autumn.toml`:
+
+```toml
+[deploy]
+host = "203.0.113.10"     # SSH-reachable IP or hostname of your VPS (required)
+# user = "root"           # SSH user (default: root)
+# ssh_port = 22           # SSH port (default: 22)
+# app_dir = "/srv/autumn/myapp"   # remote install dir (default: /srv/autumn/<app_name>)
+# readiness_timeout_secs = 60     # /ready window before rollback (default: 60)
+# keep_releases = 3               # prior releases retained for rollback (default: 3)
+```
+
+Every key also has an environment override (`AUTUMN_DEPLOY__HOST`,
+`AUTUMN_DEPLOY__USER`, `AUTUMN_DEPLOY__SSH_PORT`, …) if you prefer to keep the
+host out of the file.
+
+Put these two values in a project `.env` (git-ignored — never committed). The
+deploy reads them and writes **only** them to a `0600` env file
+(`app_dir/shared/autumn.env`) **on the server**:
+
+```bash
+# .env
+AUTUMN_SECURITY__SIGNING_SECRET=<paste `openssl rand -hex 32` here>
+# Only if your app is database-backed:
+AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
+```
+
+> **The signing secret, the database URL, and the profile selector are
+> deployed.** `autumn deploy` serializes exactly three variables to the host env
+> file: `AUTUMN_SECURITY__SIGNING_SECRET`, — for database-backed apps —
+> `AUTUMN_DATABASE__URL`, and `AUTUMN_ENV` (the deploy profile, `prod` by
+> default — see below). **Any other runtime secret** (OAuth client secrets, SMTP
+> credentials, a Redis URL, object-storage keys, etc.) placed in `.env` is
+> **not** transferred to the server, so those features fail in production unless
+> you provision the secret on the target host yourself. The env file is
+> **rebuilt from scratch on every `deploy up`**, so hand-adding entries to
+> `app_dir/shared/autumn.env` is not durable — they are overwritten on the next
+> deploy; provision such secrets out of band on the host (or via the systemd
+> unit environment) and re-apply them after each deploy.
+
+> **`autumn deploy` runs the app under the production profile by default.** The
+> deploy writes `AUTUMN_ENV=prod` into the host env file, so the deployed app
+> boots under the `prod` profile and its production smart-defaults apply — strict
+> CORS, minimal actuators, prod CSRF/session hardening, and strict
+> signing-secret enforcement. To deploy a non-production target, set `[deploy]
+> profile = "staging"` in `autumn.toml` (or `AUTUMN_DEPLOY__PROFILE=staging`);
+> the deploy writes that value as `AUTUMN_ENV` instead.
+
+> **Your `autumn.toml` is deployed alongside the binary.** `autumn deploy up`
+> uploads your project's `autumn.toml` (and, when present, the profile sibling
+> `autumn-<profile>.toml`) into the **per-release directory** — next to the
+> binary it shipped with — and sets `AUTUMN_MANIFEST_DIR` to that release dir in
+> the systemd unit, so at startup the app loads the same non-secret configuration
+> you tested locally — auth, the jobs and scheduler backends, health/telemetry
+> paths, CORS, signing-secret rotation
+> (`security.signing_secret.previous_secrets`), and so on — instead of falling
+> back to built-in defaults (fixes
+> [#1952](https://github.com/madmax983/autumn/issues/1952)). Coupling the config
+> to the release (rather than a single shared dir) means a **rollback loads the
+> rolled-back release's own config** — never the latest deploy's — and **removing
+> a local override and redeploying no longer leaves a stale one loaded**, because
+> a fresh release dir carries only the manifests uploaded that deploy. The
+> profile sibling is picked the same way the host runtime picks it: the deploy
+> normalizes the profile and uploads the first matching `autumn-<profile>.toml`
+> (e.g. `profile = "Production"` uploads `autumn-production.toml`, matching the
+> file the app loads first). The raw manifest is uploaded, not a flattened copy,
+> so the app still applies its `[profile.<AUTUMN_ENV>]` overlay at runtime; the
+> manifest is re-uploaded on every `deploy up` so the config on the server always
+> matches the shipped binary. If no `autumn.toml` is found in the project
+> directory, the deploy prints a loud warning and the app runs built-in defaults
+> for all non-secret settings.
+> **Secrets never go in the manifest** — the manifest is owner-only (`0600`), so
+> any inline config secrets are never exposed to other local accounts, while the
+> signing secret, database URL, and `AUTUMN_ENV` continue to travel only
+> in the `0600` host env file (`app_dir/shared/autumn.env`), which overrides the
+> `autumn.toml` at load time.
+
+Generate the signing secret once and store it somewhere durable:
+
+```bash
+openssl rand -hex 32
+```
+
+Run the preflight — it checks SSH reachability, the signing secret, the database
+URL (when the app is DB-backed), and, via an offline scan of your local
+`migrations/` directory, that every migration file is safe for a rolling deploy.
+That scan does not consult the database, so it does not distinguish already-applied
+from pending migrations — an old destructive migration file left in the directory
+fails the check even after it has been applied. Keep `migrations/` rolling-safe
+(remove or adjust an already-applied destructive migration if it trips the scan).
+The preflight exits non-zero if anything fails, so nothing touches the server
+until it is green:
+
+```bash
+autumn deploy check      # doctor --online runs the same graders (plain doctor skips network probes)
+```
+
+Build the single embedded binary, then deploy:
+
+```bash
+autumn build --embed     # produces target/release/myapp (assets + i18n baked in)
+autumn deploy up
+```
+
+`autumn deploy up` re-runs the full preflight, aborts before any remote call if
+it fails, then on this first run:
+
+1. installs and supervises **kamal-proxy** on the public port
+   (`server.port`, default `3000`),
+2. creates the release + `shared` directories under `app_dir`,
+3. uploads the binary into a timestamped release dir (`0755`),
+4. writes the signing secret, database URL, and `AUTUMN_ENV` (the profile,
+   `prod` by default) to `app_dir/shared/autumn.env` (`0600`, sourced by
+   systemd — never printed, never on a command line; rebuilt each deploy),
+5. writes the app's systemd unit (bound to a private `127.0.0.1` port),
+   points `current` at the release, and starts it,
+6. health-gates on `GET /ready` within `readiness_timeout_secs`, then
+7. routes the proxy at the freshly-ready release.
+
+On success it prints:
+
+```
+✅ Deploy complete. Roll back with `autumn deploy rollback`.
+```
+
+Verify it is serving (the public port is your configured `server.port`):
+
+```bash
+curl http://203.0.113.10:3000/health   # -> {"status":"ok", ...}
+curl http://203.0.113.10:3000/ready    # readiness probe used during cutover
+```
+
+### Zero-downtime redeploy
+
+Ship a new version by re-running the exact same command:
+
+```bash
+autumn build --embed
+autumn deploy up
+```
+
+On a host that is already serving, `up` performs a blue/green cutover with **no
+dropped requests**:
+
+1. stands the new release up on the **idle** loopback slot while the current
+   release keeps serving,
+2. runs **pending migrations on the host before cutover** (`AUTUMN_MIGRATE=1`
+   one-shot) — a failed migration aborts here with the old version still live,
+3. health-gates the candidate on `/ready` within the readiness window,
+4. does an **atomic kamal-proxy upstream flip** old → new,
+5. drains and stops the old release, then
+6. prunes old releases, keeping the most recent `keep_releases` (default `3`)
+   plus any rollback targets.
+
+Because the run stops at the first failure, a bad migration or a candidate that
+never reports `/ready` leaves the previous version serving and tears the
+candidate down automatically — there is no half-deployed state serving traffic.
+
+### Rollback
+
+Roll back to the previous release on demand:
+
+```bash
+autumn deploy rollback
+```
+
+This resolves the previous release on the host, brings its slot back up, flips
+the proxy back to it (health-gated on `/ready`), repoints `current`, and
+re-probes `/ready`. It fails loudly and non-zero when there is no previous
+release to return to.
+
+> **Rollback runs the same local preflight as `deploy up` first.** Before it
+> makes any remote call — before it even resolves the previous release on the
+> host — `autumn deploy rollback` runs the identical local preflight graders
+> (signing secret, database URL, migrate-safety) and aborts non-zero if any fail.
+> So it needs the same local inputs as a deploy — your project's `.env`/signing
+> secret and database URL, and the `migrations/` dir — available **wherever you
+> invoke it**: an emergency rollback from a bare CI checkout or a machine without
+> the project's secrets fails preflight before it ever reaches the host. Keep the
+> deploy inputs available where you would run a rollback.
+
+### Inspect the plan without touching the server
+
+```bash
+autumn deploy plan
+```
+
+`plan` is a pure dry-run: it prints a **representative** systemd unit and the
+ordered zero-downtime rollout steps for review, without connecting to the host.
+The printed unit is illustrative — it mirrors the shape of what gets installed
+(`User`, working directory, `EnvironmentFile`, restart policy) but is **not**
+byte-for-byte what a real `deploy up` writes. Live deploys write **slot-specific**
+units named `{service}-blue.service` / `{service}-green.service`, each pinned to
+its own release directory and bound to a private `127.0.0.1` port, so the blue
+and green slots can run side by side for the health-gated cutover while the proxy
+owns the public port.
+
+The step **order** is illustrative too: the list shows the overall rollout shape
+for review, but its exact order can differ from a live `deploy up` — for example,
+`plan` lists the migration step before starting the candidate, whereas a real
+redeploy starts the candidate first and then runs the pre-cutover migration. Use
+`plan` to review the shape and what happens, not as a byte-exact order or unit
+reference.
+
+### Where secrets live
+
+The signing secret and database URL are written **only** to
+`app_dir/shared/autumn.env` on the target, with mode `0600`, and are sourced by
+the systemd unit via `EnvironmentFile`. They are never inlined into the
+world-readable unit, never placed on a command line, and never printed to logs
+or error messages.
+
+### Troubleshooting
+
+- **Preflight is failing.** Run `autumn deploy check` (or `autumn doctor --online`)
+  — each failing grader prints the exact problem and a one-line fix (missing
+  `[deploy] host`, unreachable SSH port, missing/weak signing secret, missing
+  writable database URL, or an unsafe migration in your local `migrations/`
+  directory). `autumn deploy check`
+  always probes SSH reachability; plain `autumn doctor` skips network probes, so
+  use `autumn doctor --online` to include the SSH-reachability grader.
+- **`release binary not found …`** — run `autumn build --embed` first; `deploy
+  up` uploads the pre-built binary, it does not build for you.
+- **Nothing answers on the public port** — confirm the app's `server.port`
+  matches the port you are curling, and that the host firewall allows it.
+
+### Limitations and known gaps
+
+- **The `kamal-proxy` binary must be installed on the host** (at
+  `/usr/local/bin/kamal-proxy`) before the first deploy. `autumn deploy up`
+  configures and supervises the proxy but does not download its binary —
+  provision it as part of host bootstrap.
+- **Only the signing secret, database URL, and profile selector are written to
+  the host env file.** `autumn deploy` serializes just
+  `AUTUMN_SECURITY__SIGNING_SECRET`, (for database-backed apps)
+  `AUTUMN_DATABASE__URL`, and `AUTUMN_ENV` (the deploy profile, `prod` by
+  default); any other runtime secret (OAuth/SMTP/Redis/storage/etc.) must be
+  provisioned on the target separately. The file is rebuilt on every `deploy
+  up`, so hand-added entries do not persist.
+- **Your project's `autumn.toml` is deployed**
+  ([#1952](https://github.com/madmax983/autumn/issues/1952)). `autumn deploy up`
+  uploads your `autumn.toml` (and the profile sibling `autumn-<profile>.toml`
+  when present) into the **per-release directory** at mode `0600` (owner-only, so
+  secrets are never exposed to other local accounts) and sets
+  `AUTUMN_MANIFEST_DIR` to that release dir in the systemd unit, so the app loads
+  the same non-secret configuration (auth, jobs and scheduler backends,
+  health/telemetry paths, CORS, signing-secret rotation `previous_secrets`, etc.)
+  you tested locally rather than falling back to built-in defaults. Because the
+  manifest is coupled to the release, a **rollback loads the rolled-back
+  release's own config** and **removing a local override then redeploying doesn't
+  leave a stale one lingering**. The profile sibling is normalized and chosen
+  exactly as the host runtime chooses it (e.g. `profile = "Production"` uploads
+  `autumn-production.toml`). The manifest is re-uploaded on every `deploy up`;
+  secrets never go in it — they stay in the `0600` host env file, which overrides
+  `autumn.toml` at load time. When no `autumn.toml` is found locally the deploy
+  prints a loud warning and the app runs built-in defaults.
+- **Migrations run on redeploys, not on the very first deploy.** The pre-cutover
+  migration one-shot is part of the zero-downtime redeploy path; the initial
+  `deploy up` stands the release up and health-gates it. For a database-backed
+  app, ensure the schema is applied (e.g. a follow-up `autumn deploy up`, or an
+  out-of-band `autumn migrate` against the primary) before relying on DB routes.
+- **Single host.** `[deploy] host` targets one server; there is no multi-host
+  fan-out. For horizontally scaled setups behind a shared load balancer, see
+  [Multi-replica setup](#multi-replica-setup).
+- **Remote state is updated step-by-step, not transactionally** (#1938). The
+  `current` symlink and the live/previous-release markers are written by
+  individual SSH commands, so an interrupted deploy can leave state mid-flight;
+  a subsequent `autumn deploy up` or `autumn deploy rollback` is the intended
+  recovery. To keep the most damaging drift self-correcting, each `autumn deploy
+  up` **reconciles the `live-slot` marker against the live proxy at deploy-start**:
+  the same probe that decides first-vs-redeploy also reads `kamal-proxy list`, and
+  when the proxy is unambiguously serving a slot the marker disagrees with (a
+  stale marker from an interrupted previous run), the deploy treats the proxy as
+  authoritative — it plans the cutover onto the genuinely idle slot (so it never
+  restarts the live one), warns loudly about the disagreement, and repairs the
+  marker on disk. If the proxy signal is absent or unclear it falls back to the
+  marker exactly as before, so the reconcile never changes a healthy deploy.
+
+### MediaMTX host provisioning (`[media]`)
+
+An app that uses the [autumn-media](../../autumn-media-plugin/README.md) plugin
+(RTMP/WHIP ingest, HLS/WebRTC playback, recording) can have `autumn deploy`
+provision **MediaMTX** as a host **systemd unit** on the same box — exactly as it
+already provisions kamal-proxy (#2051). It is **opt-in and disabled by default**,
+so a non-media project is byte-for-byte unaffected.
+
+Enable it in `autumn.toml` (or a profile / `autumn-<profile>.toml` layer):
+
+```toml
+[media.mediamtx]
+enabled = true                 # off by default; the controller is a no-op when false
+# recordings_dir = "/var/lib/mediamtx/recordings"
+# record_delete_after = "72h"  # MediaMTX recordDeleteAfter retention window
+# webrtc_additional_hosts = ["my-app-mediamtx.example.com"]  # extra WebRTC ICE hosts
+# The listen ports below default to MediaMTX's standard values; override only if
+# you also change the app-side *_base URLs to match.
+# api_port = 9997        # control API
+# rtmp_port = 1935       # RTMP ingest only (OBS / RTMP encoders)
+# hls_port = 8888        # HLS playback
+# webrtc_port = 8889     # WebRTC: WHIP publish (browser + room) AND WHEP/WebRTC playback
+# playback_port = 9996   # recording playback
+# webrtc_local_udp = 8189
+# config_path = "/etc/mediamtx/mediamtx.yml"   # where the rendered config is written
+# binary_path = "/usr/local/bin/mediamtx"      # host bootstrap installs it; deploy does not download it
+# unit_name = "mediamtx"                        # systemd unit name (no .service suffix)
+
+[media.ffmpeg]
+# bin = "/usr/bin/ffmpeg"  # concrete path; verified by the deploy-time FFmpeg preflight
+```
+
+When `enabled = true`, `autumn deploy up`:
+
+1. Runs **four fail-closed host preflight checks before touching the host** —
+   FFmpeg resolves (the concrete `[media.ffmpeg] bin`), the MediaMTX binary is
+   executable, the recordings directory is writable, and the MediaMTX ports are
+   free — plus a pure-config precheck that the configured MediaMTX listener ports
+   are distinct, and **aborts the deploy** if the host cannot serve media, rather
+   than shipping a half-provisioned box. One caveat on the FFmpeg check: only a
+   **concrete literal** `[media.ffmpeg] bin` is probed and fail-closed here; an
+   env/interpolation-indirected path (an empty value, or one carrying a `${...}`
+   placeholder such as `${AUTUMN_MEDIA__FFMPEG__BIN}`) is resolved by the deployed
+   service from its own environment, so it is **deferred to runtime** — surfaced as
+   a non-blocking warning that does **not** abort the deploy. These checks require a
+   live host executor and run **only at `deploy up`**.
+2. After the app cutover succeeds, renders `mediamtx.yml` (LL-HLS window, fmp4
+   recording under `recordings_dir`, WebRTC config, and a `~^room/.+$` path
+   matcher for autumn-media Rooms) plus the systemd unit, then runs
+   `daemon-reload && enable --now && restart`.
+
+`autumn deploy plan` is a pure dry-run: it surfaces the media unit, its
+provisioning steps, the names of the host preflight checks that **will** run at
+`deploy up`, and the CSP origins your app must allow — but it holds no host
+executor, so it **does not** probe MediaMTX/FFmpeg or validate ports remotely. The three browser-facing MediaMTX origins
+(WebRTC `:8889`, HLS `:8888`, playback `:9996`) must appear in your
+`connect-src` / `media-src` (and `frame-src` for WebRTC) CSP; in production they
+collapse to your public MediaMTX origin, and your object-store origin must also
+be allowed in `media-src` for recorded playback.
+
+> **`strict_config` interaction.** The `[media]` table is **plugin-owned** — it
+> is not part of autumn-web's `AutumnConfig` schema. `autumn deploy` reads the
+> `[media.mediamtx]` / `[media.ffmpeg]` **subtree** straight from the merged
+> `autumn.toml` (base ← inline `[profile.<name>]` ← `autumn-<profile>.toml`), so
+> that media-subtree read never itself routes through the strict schema. But that
+> does **not** make strict config deploy-safe. Before it ever reads the raw
+> `[media]` subtree, `deploy::run` calls `AutumnConfig::load()` — the strict
+> loader (`autumn-cli/src/deploy.rs`, ahead of `load_media_host_config`) — for
+> **every** subcommand. So if you turn on autumn-web's strict config validation
+> (`[server] strict_config = true`, or `AUTUMN_SERVER__STRICT_CONFIG=1`) **and**
+> keep a top-level `[media]` table in that strict-loaded config, the `[media]`
+> table is flagged as an **unknown top-level key** and **hard-fails** during that
+> load (unknown top-level keys were already strict pre-#1890, so this fails even
+> without `strict_config_enforce_all`). That means **both**:
+>
+> - the **app runtime fails to boot**, *and*
+> - **`autumn deploy plan` / `deploy up` also exit during config load** on the
+>   unknown `[media]` key — they never reach `load_media_host_config` and never
+>   provision MediaMTX, because the strict `AutumnConfig::load()` runs first.
+>
+> **Workaround:** treat `strict_config` and a top-level `[media]` table as
+> mutually exclusive today — don't enable `strict_config` while the strict-loaded
+> config carries a top-level `[media]` table (the validator has no knowledge of
+> the plugin's `[media]` section, on either the app-boot or the deploy path).
+
+**Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
+installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
+a host-bootstrap step); **creating and permissioning the `recordings_dir`**
+(default `/recordings`) so the media user can write to it — `autumn deploy` only
+`mkdir`s the MediaMTX config file's parent directory, so the fail-closed
+recordings-dir preflight (`test -d && test -w`) aborts `deploy up` when the
+directory is missing or not writable; and wiring the four host preflight checks
+into the offline `autumn doctor` CLI (they run only in the executor-holding
+`deploy up` path today; `deploy plan` names them but never executes them).
+
+### How the deploy path is validated in CI
+
+Two layers exercise the real `autumn deploy` lifecycle over real ssh/scp +
+systemd + kamal-proxy — nothing is mocked:
+
+- **Container e2e (every CI run):** `autumn-cli/tests/deploy_e2e.rs` drives first
+  deploy, zero-downtime redeploy, on-demand rollback, and forced-failure
+  auto-rollback against a privileged systemd+sshd container. A container cannot
+  power-cycle, prep a stock host from scratch, or reproduce a real
+  pam_systemd session, so those are deferred to the real-VPS job below.
+- **Real-VPS validation (opt-in):** the
+  [`Deploy real-VPS validation`](../../.github/workflows/deploy-real-vps.yml)
+  GitHub Actions workflow provisions a throwaway Hetzner Cloud VM from a **stock
+  Ubuntu image** and runs the same lifecycle assertions plus the four
+  VM-only checks: a **real kernel reboot** (app + kamal-proxy come back serving),
+  **bare-host prep from scratch**, the **`<15 min` onboarding wall-clock metric**,
+  and **kamal-proxy control-socket fidelity under real pam_systemd**
+  (`XDG_RUNTIME_DIR=/run/user/0`). It is **manually triggered
+  (`workflow_dispatch`) or nightly only** — it **never** runs on pull requests or
+  pushes, because it costs a real VM and must never block or bill routine CI. It
+  always destroys the VM on exit (even on failure), so nothing lingers.
+
+  The only credential it needs is `HCLOUD_TOKEN`. The workflow reads it from the
+  environment (supply it however you configure Actions env — e.g. a repository
+  secret under Settings → Secrets and variables → Actions); the job's first step
+  fails with a clear message if it is unset, and no credential is ever hardcoded:
+
+  | Env var | What it is |
+  |---|---|
+  | `HCLOUD_TOKEN` | A Hetzner Cloud API token (Read & Write) from the Hetzner console → project → Security → API Tokens. Used to provision and destroy the throwaway VM. **Required.** |
+  | `AUTUMN_DEPLOY_SIGNING_SECRET` | Optional. The app signing secret (`AUTUMN_SECURITY__SIGNING_SECRET`, 64 hex chars) so the deployed app passes production preflight. Taken from the environment when provided; otherwise a throwaway secret is generated per run — the VM is destroyed on exit, so it never needs a persistent value. |
+
+  The lifecycle is a self-contained shell script
+  (`scripts/deploy-real-vps-validate.sh`) that mirrors the container
+  harness's curl/ssh assertions while driving the real `autumn` binary; the
+  Hetzner-specific provisioning is isolated in the workflow so another provider
+  can be swapped in without touching the script. The in-container half of the
+  pam_systemd socket check runs as part of the standard
+  `cargo test -p autumn-cli --test deploy_e2e -- --ignored` Docker sweep (no
+  separate feature needed).
 
 ---
 
@@ -108,7 +610,7 @@ Visit [http://localhost:3000/health](http://localhost:3000/health) — a healthy
 response looks like:
 
 ```json
-{ "status": "ok", "version": "0.5.0" }
+{ "status": "ok", "version": "0.6.0" }
 ```
 
 > **Migration failure stops the rollout.** If the primary URL is wrong or the
@@ -123,17 +625,19 @@ response looks like:
 rust:1.88.0-bookworm (chef stage)
   └─ cargo chef prepare          # snapshot dependency graph
        └─ cargo chef cook        # build all dependencies (cached layer)
-            └─ cargo build --release
+            └─ autumn build --embed         # fingerprint + embed assets (embed-assets feature)
                  └─ debian:bookworm-slim (runtime stage)
                        libpq5, tini, ca-certificates, curl
-                       /usr/local/bin/myapp     ← your binary
-                       /app/static/             ← compiled Tailwind + assets
-                       /app/migrations/         ← SQL migration files
+                       /usr/local/bin/myapp     ← your binary (assets + locales embedded)
+                       /app/migrations/         ← SQL migration files (one-shot migrate job)
                        /app/autumn.toml         ← production config (host=0.0.0.0)
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/myapp"]
 ```
+
+> Projects without the `embed-assets` feature instead build with `cargo build
+> --release` and stage `/app/static/` — see [Single-binary deploys](#single-binary-deploys-embedded-assets).
 
 Key design decisions:
 
@@ -148,6 +652,75 @@ Key design decisions:
   binary binds to `0.0.0.0` (all interfaces) instead of the dev default
   `127.0.0.1`. Override any value at runtime via `AUTUMN_*` environment
   variables (see the [config reference](getting-started.md#configuration)).
+
+---
+
+## Single-binary deploys (embedded assets)
+
+Autumn's design pillar is **single binary deployment**: copy one file, run it, no
+sidecar directories. The generated release image delivers on this by **embedding**
+the app's `static/` tree (CSS/JS/fonts **and** the fingerprint manifest) and its
+i18n `i18n/` locale bundles into the binary at compile time — the same way Diesel
+migrations are embedded with `embed_migrations!`. With assets embedded:
+
+- `scp ./myapp host && ./myapp` serves styled, localized pages from an empty
+  directory — every referenced asset returns `200`, no `static/`/`i18n/` to stage.
+- `asset_url()` resolves against the embedded manifest (no disk read). The manifest
+  and the files are baked from the **same** build, so fingerprint-vs-manifest drift
+  is impossible.
+
+### How it works
+
+Embedding is an **opt-in, release-time** concern (a Cargo feature). In development
+— or whenever the feature is off — the app serves from disk so CSS/JS/translation
+hot-reload is unaffected.
+
+Generated apps are wired for it out of the box:
+
+```rust
+// src/main.rs (generated)
+#[cfg(feature = "embed-assets")]
+static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();
+
+#[autumn_web::main]
+async fn main() {
+    let app = autumn_web::app().routes(routes![/* … */]).migrations(MIGRATIONS);
+
+    #[cfg(feature = "embed-assets")]
+    let app = app.embedded_static(&EMBEDDED_STATIC);
+
+    app.run().await;
+}
+```
+
+```toml
+# Cargo.toml (generated)
+[features]
+embed-assets = ["autumn-web/embed-assets"]
+```
+
+i18n apps additionally embed locales via `embed_locales!()` /
+`.embedded_locales(&EMBEDDED_LOCALES)`.
+
+### Building
+
+```bash
+autumn build --embed
+```
+
+This compiles your build scripts (e.g. Tailwind), fingerprints `static/`, then
+recompiles with the `embed-assets` feature so the manifest and assets are baked in.
+
+`autumn release init` detects the `embed-assets` feature in your `Cargo.toml`: when
+present it emits a release `Dockerfile` that runs `autumn build --embed` and **does
+not** `COPY static`/`i18n` into the runtime image (only `migrations/` is staged, for
+the one-shot `autumn migrate` job). Projects without the feature get the disk-based
+build (`cargo build --release` + `COPY static`) so their Docker builds keep working.
+
+> Adding embedding to an existing app: add the `[features]` block above, wire
+> `.embedded_static()` (and `.embedded_locales()` if you use i18n) behind
+> `#[cfg(feature = "embed-assets")]`, then re-run `autumn release init --force` and
+> build with `autumn build --embed`.
 
 ---
 
@@ -485,6 +1058,41 @@ AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL=redis://redis:6379
 
 One `tracing::warn!` is emitted when Redis becomes unavailable and again when it
 recovers, so log volume stays low during outages.
+
+---
+
+## Continuous integration
+
+`autumn new` writes `.github/workflows/ci.yml` into every generated project.
+The workflow runs automatically on every branch push and pull request, so CI
+fires on your first push no matter what the default branch is named:
+
+| Step | Command |
+|------|---------|
+| Format check | `cargo fmt --all -- --check` |
+| Lint | `cargo clippy --all-targets -- -D warnings` |
+| Build | `cargo build` |
+| Test | `cargo test` |
+
+The Rust toolchain is pinned to the project MSRV (1.88.0+) via
+`dtolnay/rust-toolchain@<msrv>` so local and CI toolchains can't drift.
+
+A Postgres 16 service container is provisioned and `DATABASE_URL` is wired in
+so DB-dependent tests can opt in. Tests marked `#[ignore]` are skipped in the
+default `cargo test` run; pass `-- --ignored` to include them.
+
+### Extending the CI workflow
+
+**Tailwind CSS**: install the Tailwind CLI (`autumn setup --tailwind`) and add a
+step before `cargo build` to run it. The generated `build.rs` will auto-detect
+it on `PATH` or at `target/autumn/tailwindcss`.
+
+**Coverage**: install `cargo-llvm-cov` (`taiki-e/install-action@cargo-llvm-cov`)
+and upload the LCOV report to Codecov. Coverage gating is out of scope for the
+generated scaffold but straightforward to add.
+
+**Audit**: `cargo install cargo-audit --locked` then `cargo audit` as a separate
+step. Recommended before production deploys.
 
 ---
 

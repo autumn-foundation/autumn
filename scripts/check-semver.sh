@@ -61,7 +61,13 @@ migration_guide="docs/migrations/${workspace_version}.md"
 # cargo-semver-checks 0.48 requires rustc >= 1.91.0, while rustc 1.96.0 has
 # ICE'd in the rustdoc JSON path for the Diesel/diesel-async graph. Keep this
 # pinned to a known-good toolchain instead of following latest stable.
-semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.92.0}"
+# Floor raised from 1.92.0 to 1.94.1: the aws-smithy-* releases of 2026-07-07
+# (e.g. aws-smithy-async 1.3.0) declare rust-version 1.94.1, and
+# cargo-semver-checks builds the autumn-storage-s3 crates.io baseline with a
+# fresh lockfile, so any toolchain below that MSRV fails the baseline build.
+# Keep in sync with the dtolnay/rust-toolchain pin in the semver job of
+# .github/workflows/publish-gate.yml.
+semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.94.1}"
 
 command -v rustup &>/dev/null || die "rustup is required to run SemVer checks with Rust $semver_toolchain"
 if ! rustup toolchain list | grep -Fq "${semver_toolchain}-"; then
@@ -131,13 +137,16 @@ for crate in "${CRATES[@]}"; do
     # unrelated to our public API surface; skip rather than hard-fail so the
     # gate remains actionable for real semver breaks.
     echo "  SKIP: $crate — aws-runtime E0282 upstream regression on Rust $semver_toolchain (not a semver issue)"
-  elif echo "$crate_output" | grep -qE "error\[E0119\]" && echo "$crate_output" | grep -q "HourBase"; then
-    # time 0.3.48 introduced a blanket From<HourBase> impl that creates orphan-
-    # rule violations with aws-smithy-types and ratatui-widgets.  The isolated
-    # workspace used by cargo-semver-checks resolves time fresh and may pick
-    # 0.3.48; our workspace constraint (<0.3.48) does not carry over.  Skip
-    # rather than hard-fail until the upstream coherence issue is resolved.
-    echo "  SKIP: $crate — time 0.3.48 E0119 coherence regression (not a semver issue)"
+  elif echo "$crate_output" | grep -qE "error\[E0119\]" && echo "$crate_output" | grep -qE 'HourBase|conflicting implementation in crate `time`'; then
+    # time 0.3.48 added a blanket From<HourBase> impl that breaks trait
+    # coherence (E0119) in downstream crates with their own blanket From
+    # impls — bollard 0.20.x, aws-smithy-types 1.4.x, and ratatui-widgets
+    # are all affected. The isolated workspace used by cargo-semver-checks
+    # resolves time fresh, so it picks up the broken release even though
+    # the workspace pins time below it (<0.3.48). Upstream breakage, not a
+    # semver issue; remove once time yanks/fixes 0.3.48 or the affected
+    # crates ship releases compatible with it.
+    echo "  SKIP: $crate — time 0.3.48 coherence regression (E0119) breaking downstream crates (not a semver issue)"
   elif echo "$crate_output" | grep -qE "checks failed|semver requires"; then
     # Exit 1 with semver-violation output → actual breaking API changes found.
     # Allow them through only when BOTH conditions hold:

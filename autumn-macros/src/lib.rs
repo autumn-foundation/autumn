@@ -16,12 +16,16 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+mod event;
 mod feature_flag;
 mod i18n;
 mod idempotency_guard;
 mod inbound_mail;
 mod job;
 mod jobs_macro;
+mod lifecycle;
+mod listener;
+mod listeners_macro;
 mod mail_previews_macro;
 mod mailer;
 mod mailer_preview;
@@ -30,9 +34,11 @@ mod model;
 mod oauth2_callback;
 mod one_off_task;
 mod one_off_tasks_macro;
+mod openapi_schema;
 mod param_helpers;
 mod parse;
 mod paths_macro;
+mod public;
 mod repository;
 mod route;
 mod routes_macro;
@@ -42,7 +48,9 @@ mod service;
 mod static_route;
 mod static_routes_macro;
 mod step_up;
+mod story_macro;
 mod tasks_macro;
+mod throttle;
 mod ws;
 
 use proc_macro::TokenStream;
@@ -285,6 +293,20 @@ pub fn mail_previews(input: TokenStream) -> TokenStream {
     mail_previews_macro::mail_previews_macro(input.into()).into()
 }
 
+/// Define a widget story for the `/_stories` gallery:
+/// `story!{ "Group", "Name", { ... } }`.
+///
+/// The brace-delimited block is **both** executed for the live render and
+/// captured byte-for-byte (comments and formatting included) as the displayed
+/// source snippet, so the shown code is provably the code that rendered. The
+/// block must be a self-contained expression evaluating to `maud::Markup`:
+/// it is coerced to a plain `fn() -> Markup`, so capturing anything from the
+/// surrounding environment is a compile error.
+#[proc_macro]
+pub fn story(input: TokenStream) -> TokenStream {
+    story_macro::story_macro(input.into()).into()
+}
+
 /// Attribute macro for Autumn database models.
 ///
 /// Applies Diesel (`Queryable`, `Selectable`, `Insertable`) and Serde
@@ -318,9 +340,141 @@ pub fn mail_previews(input: TokenStream) -> TokenStream {
 ///     pub title: String,
 /// }
 /// ```
+///
+/// # Associations
+///
+/// Declare `#[belongs_to]`, `#[has_many]`, and `#[has_one]` on the struct to
+/// get batched eager preloading for free — no hand-written join queries, no
+/// N+1. Foreign keys and accessor names are inferred from the target's type
+/// name, with `fk = ...` / `name = ...` overrides:
+///
+/// ```ignore
+/// #[model]
+/// #[belongs_to(User, fk = author_id)]  // fk on THIS model
+/// #[has_many(Comment)]                 // fk (post_id) on the TARGET
+/// pub struct Post {
+///     #[id]
+///     pub id: i64,
+///     pub author_id: i64,
+///     pub title: String,
+/// }
+/// ```
+///
+/// Preload associations through a repository (`Model::preload()` builds the
+/// spec; `_with` nests into the related model's own associations):
+///
+/// ```ignore
+/// let posts = repo.find_all().await?;
+/// let posts = repo.preload(posts, Post::preload().author().comments()).await?;
+/// for post in &posts {
+///     let author = post.author()?;      // Result<Option<&Preloaded<User>>, NotLoaded>
+///     let comments = post.comments()?;  // Result<&[Preloaded<Comment>], NotLoaded>
+/// }
+/// ```
+///
+/// An association that was not preloaded returns `NotLoaded` from its
+/// accessor rather than issuing SQL — autumn never lazy-loads.
+///
+/// ## Many-to-many (`through =`)
+///
+/// Add `through = <join_table>` to `#[has_many]` to declare a many-to-many
+/// association backed by a join table, with the same batched preload
+/// semantics as `belongs_to`/`has_many`/`has_one`:
+///
+/// ```ignore
+/// #[model]
+/// #[has_many(Tag, through = post_tags)]  // join columns default to post_id / tag_id
+/// pub struct Post {
+///     #[id]
+///     pub id: i64,
+///     pub title: String,
+/// }
+/// ```
+///
+/// Join columns default to `{source}_id` / `{target}_id` and can be
+/// overridden with `fk = ...` and `target_fk = ...`; the join table itself
+/// needs no hand-written `diesel::table!` — the macro emits one and requires
+/// a composite primary key on `(fk, target_fk)`:
+///
+/// ```sql
+/// CREATE TABLE post_tags (
+///     post_id BIGINT NOT NULL REFERENCES posts(id),
+///     tag_id  BIGINT NOT NULL REFERENCES tags(id),
+///     PRIMARY KEY (post_id, tag_id)
+/// );
+/// ```
+///
+/// `Post::preload().tags()` issues one batched `INNER JOIN` query (plus one
+/// more per level of `_with` nesting) — a fixed number of queries regardless
+/// of how many tags each post has. The generated `tags()` accessor returns
+/// `&[Arc<Preloaded<Tag>>]` (rather than `has_many`'s plain
+/// `&[Preloaded<Tag>]`): the same tag can legitimately be linked to more than
+/// one currently-loaded post, so it's shared via `Arc` instead of being
+/// duplicated per parent.
+///
+/// The association also generates three mutation helpers on the model's
+/// `#[repository]` — `add_{singular}`, `remove_{singular}`, and
+/// `set_{plural}` (replace-all) — each idempotent and requiring no
+/// hand-written SQL:
+///
+/// ```ignore
+/// repo.add_tag(post_id, tag_id).await?;      // idempotent: ON CONFLICT DO NOTHING
+/// repo.remove_tag(post_id, tag_id).await?;   // idempotent: no-op if unlinked
+/// repo.set_tags(post_id, &tag_ids).await?;   // replace-all, one transaction
+/// ```
+///
+/// The `add_`/`remove_` singular is derived from the target *type* name, so a
+/// model may declare at most one m2m association per target type by default —
+/// a second one to the same target would generate colliding helpers (a compile
+/// error). To declare two m2m associations to the same target (e.g. a
+/// self-referential `followers`/`following` pair through one `Friendship` join
+/// table), give each a distinct explicit `helper = "..."` override, which sets
+/// the singular used for its `add_`/`remove_` helpers:
+///
+/// ```ignore
+/// #[model]
+/// #[has_many(User, through = friendships, name = followers,
+///            fk = followed_id, target_fk = follower_id, helper = "follower")]
+/// #[has_many(User, through = friendships, name = following,
+///            fk = follower_id, target_fk = followed_id, helper = "following")]
+/// pub struct User { /* ... */ }
+/// // -> add_follower/remove_follower and add_following/remove_following
+/// ```
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     model::model_macro(attr.into(), item.into()).into()
+}
+
+/// Derive a field-accurate `OpenApiSchema` impl for a plain struct with named
+/// fields (issue #1972).
+///
+/// Use it on a handler-arg struct — a `Query<T>` param struct or a
+/// non-`#[model]` `Json<T>` request body — so its `OpenAPI` component schema and
+/// MCP tool `inputSchema` describe the real fields instead of degrading to a
+/// generic `{"type":"object"}` placeholder, without a hand-written impl or an
+/// `OpenApiConfig::register_schema` call.
+///
+/// Each field becomes a JSON-schema property (nullable `Option<T>`, `Vec<T>`
+/// arrays, inline primitives, `$ref`s for other named types) and every
+/// non-`Option` field is `required` — mirroring the schema `#[model]` already
+/// generates. The derive also registers the schema in the compile-time
+/// inventory the spec/MCP back-fill consults, so the referencing route resolves
+/// it automatically.
+///
+/// # Examples
+///
+/// ```ignore
+/// use autumn_web::openapi::OpenApiSchema;
+///
+/// #[derive(serde::Deserialize, OpenApiSchema)]
+/// struct SearchParams {
+///     q: String,
+///     limit: Option<i32>,
+/// }
+/// ```
+#[proc_macro_derive(OpenApiSchema)]
+pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
+    openapi_schema::derive_openapi_schema(input)
 }
 
 /// Derive a repository with CRUD operations and derived queries.
@@ -374,9 +528,78 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Declare an on-demand background job.
+///
+/// Route latency-sensitive work to a named queue with `queue = "..."`. Workers
+/// drain queues in the priority order configured under `[jobs] queues` in
+/// `autumn.toml`, so a flood of low-priority jobs can't delay a critical one.
+/// Jobs with no `queue` land on the `"default"` queue.
+///
+/// ```ignore
+/// #[job(queue = "critical", max_attempts = 5)]
+/// async fn send_password_reset(state: AppState, args: ResetArgs) -> AutumnResult<()> {
+///     Ok(())
+/// }
+///
+/// // autumn.toml — strict priority (or weighted: { critical = 4, default = 1 }):
+/// // [jobs]
+/// // queues = ["critical", "default", "low"]
+/// SendPasswordResetJob::enqueue(ResetArgs { user_id: 1 }).await?;
+/// ```
+///
+/// Accept an optional third `JobContext` argument to report progress and
+/// record a terminal result/error for jobs enqueued with `enqueue_tracked`
+/// (the companion struct gains `enqueue_tracked` / `enqueue_tracked_for`
+/// alongside `enqueue`):
+///
+/// ```ignore
+/// #[job(name = "export_orders")]
+/// async fn export_orders(state: AppState, args: ExportArgs, ctx: JobContext) -> AutumnResult<()> {
+///     ctx.set_progress(50, Some("Rows 1200/5000")).await?;
+///     ctx.set_result(serde_json::json!({ "download_url": "/blob/abc.csv" }));
+///     Ok(())
+/// }
+///
+/// let handle = ExportOrdersJob::enqueue_tracked(ExportArgs { account_id: 1 }).await?;
+/// println!("poll at {}", handle.status_path());
+/// ```
 #[proc_macro_attribute]
 pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     job::job_macro(attr.into(), item.into()).into()
+}
+
+/// Declare a typed domain event.
+///
+/// Applies the serde + `Clone`/`Debug` derives the event bus needs and
+/// implements `autumn_web::events::Event` with a stable `NAME` (the struct
+/// name by default, or `#[event(name = "...")]`).
+///
+/// ```ignore
+/// #[event]
+/// struct UserSignedUp { user_id: i64 }
+/// ```
+#[proc_macro_attribute]
+pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
+    event::event_macro(attr.into(), item.into()).into()
+}
+
+/// Declare an event listener that reacts to a typed `#[event]`.
+///
+/// Runs **synchronously** (in-request) by default, or **durably** (enqueued on
+/// the `#[job]` queue, surviving restarts with retry + DLQ) with `durable`.
+///
+/// ```ignore
+/// #[listener(UserSignedUp, durable, max_attempts = 5)]
+/// async fn send_welcome_email(state: AppState, event: UserSignedUp) -> AutumnResult<()> { Ok(()) }
+/// ```
+#[proc_macro_attribute]
+pub fn listener(attr: TokenStream, item: TokenStream) -> TokenStream {
+    listener::listener_macro(attr.into(), item.into()).into()
+}
+
+/// Collect `#[listener]` handlers into a `Vec<ListenerInfo>`.
+#[proc_macro]
+pub fn listeners(input: TokenStream) -> TokenStream {
+    listeners_macro::listeners_macro(input.into()).into()
 }
 
 /// Declare a one-off operational task runnable with `autumn task <name>`.
@@ -463,6 +686,29 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
     secured::secured_macro(attr.into(), item.into()).into()
 }
 
+/// Declare a route handler as deliberately public (unauthenticated).
+///
+/// `#[public]` injects no runtime guard — it is a compile-time *marker* that
+/// records intent. The route macros surface it as `ApiDoc::public`, which the
+/// build-time security classifier (`autumn routes audit`) uses to distinguish
+/// a route that is *meant* to be open from one whose auth posture was simply
+/// never declared. Applying it makes an otherwise-unclassified route pass the
+/// audit gate, exactly like adding a [`#[secured]`](macro@secured) guard does.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/health")]
+/// #[public]
+/// async fn health() -> &'static str { "ok" }
+/// ```
+#[proc_macro_attribute]
+pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
+    public::public_macro(attr.into(), item.into()).into()
+}
+
 /// Require fresh ("step-up") authentication before a route handler runs.
 ///
 /// The handler is guarded by a freshness check on the session's
@@ -505,6 +751,67 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
     step_up::step_up_macro(attr.into(), item.into()).into()
+}
+
+/// Apply a per-route rate limit to a handler.
+///
+/// The handler is guarded by an additional rate limiter that composes with
+/// (and, for the annotated route, is stricter than) the global limiter
+/// configured under `[security.rate_limit]`. Requests denied by either
+/// limiter respond with `429 Too Many Requests` including a `Retry-After`
+/// header and the standard `x-ratelimit-*` headers.
+///
+/// # Forms
+///
+/// - `#[throttle(limit = 5, per = "1m")]` — inline limit; keying strategy
+///   matches the global limiter.
+/// - `#[throttle(limit = 5, per = "1m", key = "ip" | "principal" | "token")]`
+///   — inline limit with an explicit key strategy override.
+/// - `#[throttle("login")]` — reference a named limiter defined in
+///   `[security.rate_limit.named.login]`.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[post("/login")]
+/// #[throttle(limit = 5, per = "1m", key = "ip")]
+/// async fn login() -> AutumnResult<&'static str> {
+///     Ok("welcome back")
+/// }
+/// ```
+///
+/// # Limitations
+///
+/// Like the sibling `#[secured]` / `#[step_up]` guards it mirrors, the throttle
+/// check runs inside the handler after `FromRequestParts` extractors, but body
+/// extractors (`Json` / `Form` / `Multipart`) are parsed by Axum *before* the
+/// throttle check, so an over-limit client can still incur request-body parsing
+/// before receiving its `429`. For hard pre-body protection, combine with the
+/// global limiter layer under `[security.rate_limit]`.
+///
+/// # Attribute ordering
+///
+/// Place the route method attribute (`#[get]` / `#[post]` / …) *above*
+/// `#[throttle]`, i.e. method attribute outermost:
+///
+/// ```ignore
+/// #[post("/login")]           // method attribute outermost
+/// #[throttle(limit = 5, per = "1m", key = "ip")]
+/// async fn login() -> Json<Session> { /* … */ }
+/// ```
+///
+/// Both orders enforce throttling correctly (including idempotency-replay
+/// accounting). However, only the method-attribute-outermost order lets the
+/// route macro see the handler's real return type for `OpenAPI` response-schema
+/// generation. When `#[throttle]` expands first it rewrites the return type to
+/// `Response` (like the sibling `#[secured]` / `#[step_up]` / `#[authorize]`
+/// guards), so a `Json<T>` response schema would be lost from the generated
+/// `OpenAPI` document.
+#[proc_macro_attribute]
+pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
+    throttle::throttle_macro(attr.into(), item.into()).into()
 }
 
 /// Gate a route handler on a named feature flag.
@@ -843,4 +1150,44 @@ pub fn ws(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn t(input: TokenStream) -> TokenStream {
     i18n::t_macro(input.into()).into()
+}
+
+/// Turn a plain state enum into a statically-verified lifecycle.
+///
+/// Given a declared `initial` state, one or more `terminal` states, and a set
+/// of `transitions`, `#[lifecycle]` preserves the original enum and appends:
+///
+/// 1. Metadata consts (`LIFECYCLE_INITIAL`, `LIFECYCLE_TERMINALS`,
+///    `LIFECYCLE_STATES`, `LIFECYCLE_TRANSITIONS`) and a `can_transition_to`
+///    runtime check on the enum. Because these reference the enum's own
+///    variants, a declared state that is not a real variant is a compile error.
+/// 2. A typestate transition module named after the enum in `snake_case`, whose
+///    `Machine<S>` exposes a consuming `to_<target>` method *only* for declared
+///    edges — firing an undeclared transition does not compile.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::lifecycle;
+///
+/// #[lifecycle(
+///     initial = Draft,
+///     terminal(Archived),
+///     transitions(
+///         Draft -> Published,
+///         Published -> Archived,
+///         Published -> Draft,
+///     )
+/// )]
+/// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// pub enum ArticleState { Draft, Published, Archived }
+///
+/// let m = article_state::Machine::<article_state::Draft>::start();
+/// let m = m.to_published();      // only declared edges exist as methods
+/// assert_eq!(m.current(), ArticleState::Published);
+/// assert!(ArticleState::Draft.can_transition_to(&ArticleState::Published));
+/// ```
+#[proc_macro_attribute]
+pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
+    lifecycle::lifecycle_macro(attr.into(), item.into()).into()
 }

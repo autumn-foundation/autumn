@@ -36,6 +36,38 @@ pub enum AdminFieldKind {
     Json,
 }
 
+impl AdminFieldKind {
+    /// Whether an empty submitted string on a **nullable** field of this kind
+    /// should be coerced to `NULL`.
+    ///
+    /// Text-routed columns (`String`/`Uuid`/`Enum`/`Decimal` all map to
+    /// [`AdminFieldKind::Text`]) join the numeric/date kinds here so that a
+    /// blank submission on a nullable column clears to `NULL` instead of
+    /// storing an empty string (which fails validation for nullable
+    /// Uuid/decimal columns and silently stores `""` for strings).
+    ///
+    /// `Json` joins them: an empty submission can't be parsed by
+    /// `serde_json::from_str`, so without this it would silently persist the
+    /// raw `""` rather than clearing a nullable JSON column to `NULL`.
+    ///
+    /// `Boolean`/`Hidden`/`Password` are excluded: their empty submissions are
+    /// handled elsewhere or are not meaningfully "blank".
+    #[must_use]
+    pub const fn blank_submission_is_null(&self) -> bool {
+        matches!(
+            self,
+            Self::Integer
+                | Self::Float
+                | Self::Date
+                | Self::DateTime
+                | Self::Text
+                | Self::TextArea
+                | Self::Select(_)
+                | Self::Json
+        )
+    }
+}
+
 /// A single option in a [`AdminFieldKind::Select`] dropdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectOption {
@@ -46,6 +78,7 @@ pub struct SelectOption {
 /// Metadata for a single model field.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // orthogonal flags on a plain config record
+#[non_exhaustive]
 pub struct AdminField {
     /// Column name in the database / struct field name.
     pub name: &'static str,
@@ -63,6 +96,9 @@ pub struct AdminField {
     pub required: bool,
     /// Whether this field is editable (false for IDs, timestamps, etc.).
     pub editable: bool,
+    /// Editable only on create; shown as read-only on edit (e.g. `principal_id`, `expires_at`).
+    /// `strip_meta_fields` drops these on update submissions so the model never sees them.
+    pub create_only: bool,
     /// Sort priority in list view (None = not sortable).
     pub sortable: bool,
     /// Whether this column is encrypted at rest (#805). When set, the field is
@@ -100,6 +136,7 @@ impl AdminField {
             filterable: false,
             required: true,
             editable,
+            create_only: false,
             sortable: true,
             encrypted: false,
             encrypted_visible: false,
@@ -156,6 +193,15 @@ impl AdminField {
     #[must_use]
     pub const fn readonly(mut self) -> Self {
         self.editable = false;
+        self
+    }
+
+    /// Editable on create, read-only on edit (e.g. `principal_id`, `expires_at`).
+    /// The field renders normally in the create form but as a disabled display
+    /// in the edit form; update submissions never receive its value.
+    #[must_use]
+    pub const fn create_only(mut self) -> Self {
+        self.create_only = true;
         self
     }
 
@@ -383,28 +429,28 @@ pub trait AdminModel: Send + Sync + 'static {
     /// List records with pagination, search, sort, and filters.
     fn list(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         params: ListParams,
     ) -> AdminFuture<'_, ListResult>;
 
     /// Get a single record by ID.
     fn get(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
     ) -> AdminFuture<'_, Option<Value>>;
 
     /// Create a new record from form data.
     fn create(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         data: Value,
     ) -> AdminFuture<'_, Value>;
 
     /// Update an existing record.
     fn update(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
         data: Value,
     ) -> AdminFuture<'_, Value>;
@@ -412,7 +458,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Delete a record by ID.
     fn delete(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
     ) -> AdminFuture<'_, ()>;
 
@@ -429,7 +475,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`, so models that opt in must override this method.
     fn restore<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _id: i64,
     ) -> AdminFuture<'a, ()> {
         Box::pin(async move {
@@ -447,7 +493,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`.
     fn purge<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _id: i64,
     ) -> AdminFuture<'a, ()> {
         Box::pin(async move {
@@ -465,7 +511,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`.
     fn list_deleted<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _params: ListParams,
     ) -> AdminFuture<'a, ListResult> {
         Box::pin(async move {
@@ -480,7 +526,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Execute a bulk action on the given IDs.
     fn execute_action(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
@@ -550,7 +596,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Override if the backend can count without materializing records.
     fn count(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
     ) -> AdminFuture<'_, u64> {
         let params = ListParams {
             page: 1,
@@ -643,7 +689,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// [`supports_csv_import`]: AdminModel::supports_csv_import
     fn import_csv_row<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _line: u64,
         _row: std::collections::HashMap<String, String>,
         _mode: CsvImportMode,
@@ -665,7 +711,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// that do not opt in get a clear error instead of a silent no-op.
     fn get_history<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _record_id: i64,
         _page: u64,
         _per_page: u64,

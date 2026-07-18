@@ -1,0 +1,5 @@
+{
+  "established": false,
+  "accepted_slope": null,
+  "note": "First weekly CI run records the measured slope as the accepted baseline. Until established, the >20% slope-regression check is skipped; the absolute (p95 ≤ 8 s) and 2× slope budgets are always enforced. To re-baseline after an intentional regression: run the scaling sweep on the reference runner, compute the measured slope, set established=true and accepted_slope=<value>, and document the change in RELEASE_NOTES.md."
+}

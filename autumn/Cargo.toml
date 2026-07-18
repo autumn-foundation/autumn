@@ -10,18 +10,22 @@ homepage = "https://github.com/madmax983/autumn"
 readme = "../README.md"
 keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
+autotests = false
 
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "flash"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
-multipart = ["axum/multipart"]
+multipart = ["axum/multipart", "dep:infer"]
 tailwind = []
-http-client = ["dep:reqwest"]
+# `dep:sha1` is pulled in here because the password-policy breach check
+# (auth::password) needs SHA-1 for HIBP k-anonymity, and that path only exists
+# when an HTTP client is available.
+http-client = ["dep:reqwest", "dep:sha1"]
 oauth2 = ["http-client"]
 webauthn = ["dep:webauthn-rs"]
 openapi = ["dep:serde_yaml"]
@@ -40,9 +44,67 @@ db = [
     "dep:pq-sys",
     "dep:scoped-futures",
     "dep:tokio-postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "dep:webpki-roots",
     "diesel/postgres",
     "diesel/chrono",
+    "diesel/serde_json",
 ]
+# Offline-first local store + background sync engine for occasionally-
+# connected apps (e.g. Tauri mobile, issue #1508). Local state lives in an
+# in-process SQLite database (`sync::SyncStore`, change-tracked with
+# tombstones); a `sync::SyncEngine` pushes/pulls changes to a remote Autumn
+# app that mounts `sync::server::router()` over Postgres shadow tables.
+# Builds entirely on dependencies the `db` + `http-client` features already
+# compile (diesel's sqlite backend and the bundled libsqlite3-sys are
+# already in the graph) — zero new dependencies.
+offline-sync = ["db", "http-client"]
+# SQLite runtime lane (issue #1614). Flips the `db::RuntimeConnection` alias
+# from Postgres (`AsyncPgConnection`) to a SQLite connection
+# (`SyncConnectionWrapper<SqliteConnection>`) for the whole build graph.
+#
+# ⚠️ FEATURE-UNIFICATION HAZARD — READ BEFORE ADDING ANY EDGE ⚠️
+# This feature must ONLY ever be enabled by an END APPLICATION or an explicit
+# `--features sqlite` build invocation. It must NEVER be enabled by an
+# inter-crate dependency edge or a dev-dependency anywhere in the workspace
+# (e.g. `autumn-web = { ..., features = ["sqlite"] }` in autumn-cli /
+# autumn-admin-plugin / autumn-macros / examples/*, or an autumn-web
+# dev-dependency). Cargo feature unification is global: a single such edge
+# flips `RuntimeConnection` to SQLite for EVERY consumer in the graph and
+# breaks the Postgres default build. Feature-on testing is done via explicit
+# `cargo build -p autumn-web --features sqlite` invocations only.
+#
+# Do NOT enable via `--all-features` — this is a backend-flip feature, so
+# `--all-features` turns it on ALONGSIDE the Postgres-assuming features and
+# fails autumn-web's lib to compile. CI/scripts that want the Postgres backend
+# must use an explicit `--features` list that EXCLUDES `sqlite` (see
+# `.github/workflows/ci.yml`).
+#
+# PR1 is a no-op refactor: enabling it switches the connection *type alias* but
+# the SQLite pool CONSTRUCTION stays refused at runtime
+# (`PoolError::UnsupportedBackend`); a working pool is PR2. Needs no extra deps
+# — diesel's sqlite backend and diesel-async's sync-connection-wrapper are
+# already in the graph.
+# `sqlite` pulls in `db` so it is genuinely self-sufficient: `db` owns the
+# shared, backend-neutral migration/pool plumbing this feature builds on — the
+# `crate::migrate` module (itself `#[cfg(feature = "db")]`), `deadpool`, and
+# `diesel_migrations` — which the SQLite migration path (`app.rs`
+# `apply_pending_sqlite_or_exit`, gated on `#[cfg(feature = "sqlite")]`) calls
+# directly. Without this edge, `--no-default-features --features sqlite` fails to
+# compile (`crate::migrate` configured out). This is NOT a second backend: the
+# `RuntimeConnection` alias (see `src/db.rs`) flips to SQLite purely on
+# `#[cfg(feature = "sqlite")]` regardless of `db`, so enabling `db` alongside
+# does not resurrect the Postgres runtime — it only supplies the plumbing. This
+# mirrors the ratified verification lane `--features "db test-support sqlite"`.
+# The bundled SQLite amalgamation (`libsqlite3-sys` workspace dep pins
+# `features = ["bundled"]`, which `db` already pulls in) compiles with
+# `SQLITE_ENABLE_FTS5` defined, so FTS5 full-text search (issue #1910:
+# searchable repositories emit FTS5 virtual tables + bm25 ranking) is always
+# available. Adding `db` here changes nothing for the Postgres/default lane,
+# which never enables `sqlite`.
+sqlite = ["db", "diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",
@@ -52,6 +114,12 @@ telemetry-otlp = [
 ]
 redis = ["dep:redis"]
 i18n = []
+# Embed the app's `static/` tree (incl. the fingerprint manifest) and i18n
+# `locales`/`i18n` bundles into the release binary at compile time, so a single
+# binary serves styled, localized pages with zero sidecar files. Opt-in: dev
+# builds (or this feature off) still serve from disk for hot-reload. Mirrors the
+# `embed_migrations!` precedent. See `embed_static!`/`embed_locales!`.
+embed-assets = ["dep:include_dir"]
 # Pluggable file storage backends. Off by default; enabling adds the
 # `BlobStore` trait, the `Blob` value type, and a Local backend.
 # For S3-compatible storage add `autumn-storage-s3` as a separate
@@ -69,7 +137,7 @@ variants = ["storage", "dep:image"]
 # `LogReporter` as the default. On by default; disable to drop the panic-catch
 # layer and the reporting machinery.
 reporting = []
-mail = ["dep:lettre", "maud"]
+mail = ["dep:lettre", "dep:css-inline", "maud"]
 # First-class inbound email handling with provider webhooks and routing DSL.
 # Adds `autumn_web::inbound_mail` with the generic RFC 5322 adapter.
 inbound-mail = []
@@ -95,13 +163,44 @@ csv = ["dep:csv"]
 # live Autumn server. Off by default — intended as a dev-dependency only.
 # Adds `autumn_web::system_test::{SystemTest, Page, BrowserCheck}`.
 system-tests = ["dep:chromiumoxide"]
+# Managed local Postgres: a `ManagedPostgresPoolProvider` that provisions
+# (initdb) and supervises a local `postgres` child in the app's data dir,
+# surfaced through the pluggable pool-provider seam. Postgres binaries are
+# downloaded on first run. Implies `db`.
+managed-pg = ["db", "dep:postgresql_embedded"]
+# Bundled single-binary mode: embed the Postgres binaries into the app
+# executable at build time (no first-run download). Per-target build, large
+# binary (tens-to-~150MB), still a supervised child process with an on-disk
+# data dir. Implies `managed-pg`.
+managed-pg-bundled = ["managed-pg", "postgresql_embedded/bundled"]
+# Serve HTTPS directly from the app process: a config-driven native TLS
+# listener (`[server.tls]` cert + key) that terminates rustls in-process and
+# reuses the existing axum serve / graceful-shutdown / connect-info wiring
+# (issue #1603). Off by default — absent `[server.tls]` keeps today's plain
+# HTTP. Reuses the already-vendored `ring`-backed `rustls` (no second TLS
+# backend); adds `tokio-rustls` for the async accept-time handshake and
+# `x509-parser` for leaf-certificate expiry detection.
+tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-types"]
+# Automatic ACME (Let's Encrypt) certificate provisioning + renewal (issue
+# #1608). Builds on `tls`: the issued certificate hot-swaps into the same
+# `ReloadableCertResolver` the `tls` listener already serves. Off by default —
+# without it the ACME modules are not compiled at all. Adds `instant-acme` (the
+# ACME order state machine) and `rcgen` (account/cert key + CSR + self-signed
+# placeholder), both pinned to `ring` so no second crypto backend enters the
+# graph.
+acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
 
 [dependencies]
-autumn-macros = { version = "0.5.0", path = "../autumn-macros" }
+autumn-macros = { version = "0.6.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
 http-body = "1"
 http-body-util = "0.1"
+# Both already resolved transitively via tower-http's compression-gzip/
+# compression-br features (used to precompute static CSS encodings once
+# instead of recompressing on every request — see `static_css_response`).
+flate2 = "1"
+brotli = "8"
 bcrypt.workspace = true
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
 diesel = { workspace = true, optional = true }
@@ -110,20 +209,60 @@ diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1.4", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
+# TLS to Postgres (`sslmode=require`/`verify-full` in the database URL):
+# rustls-backed connector plugged into diesel-async's pool via a custom
+# setup callback. `ring` (not the aws-lc default) keeps cross-compilation
+# to mobile targets working; `webpki-roots` provides a deterministic root
+# store on platforms without an accessible native one.
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
+webpki-roots = { version = "1", optional = true }
+# Inbound/server TLS (issue #1603, `tls` feature): async accept-time rustls
+# handshake wrapping the existing TCP listener. `default-features = false` +
+# `ring` reuses the SAME crypto backend as the outbound Postgres TLS path —
+# the workspace forbids a second TLS backend (no aws-lc-rs / native-tls).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
+# Parse the leaf certificate's `NotAfter` for fail-fast expired-cert detection
+# at startup and the `autumn doctor` near-expiry warning. Only pulled by `tls`.
+x509-parser = { version = "0.16", optional = true }
+# Automatic ACME (Let's Encrypt) provisioning (issue #1608, `acme` feature).
+# Both pinned `default-features = false` + `ring` so the ACME path reuses the
+# SAME crypto backend as the rest of autumn-web — the workspace forbids a second
+# TLS/crypto backend (no aws-lc-rs), which the crates' defaults would pull in.
+instant-acme = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+# Build the dual-stack (`[::]`, IPV6_V6ONLY=false) HTTP-01 challenge listener so
+# the ACME CA can validate over IPv6 on AAAA-only deployments (issue #1608).
+socket2 = { workspace = true, optional = true }
+postgresql_embedded = { version = "0.19", optional = true, default-features = false, features = [
+    "tokio",
+    "theseus",
+    "rustls",
+] }
 futures.workspace = true
 http.workspace = true
 indexmap.workspace = true
 inventory.workspace = true
 libsqlite3-sys = { workspace = true, optional = true }
+# Conflict oracle for the #1012 duplicate-route preflight. axum 0.8 routes
+# through matchit, so we delegate path-shape conflict detection to the SAME
+# engine axum uses. This version MUST stay pinned to whatever axum resolves in
+# Cargo.lock (currently axum 0.8.9 → matchit 0.8.4); moving axum without moving
+# this in lockstep risks the oracle silently diverging from axum's real accept/
+# panic behavior. The `matchit_agrees_with_axum_route_conflicts` parity test in
+# `router.rs` is the guard — it fails loudly if the two ever disagree.
+matchit = "=0.8.4"
 maud = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }
+multer = { workspace = true }
 pin-project-lite = "0.2"
 serde.workspace = true
 serde_json = "1"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true, optional = true }
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 toml.workspace = true
 tower.workspace = true
 tower-http.workspace = true
@@ -137,12 +276,16 @@ redis = { workspace = true, optional = true }
 tokio-cron-scheduler.workspace = true
 validator.workspace = true
 uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+rand_chacha = "0.9"
 chrono = { workspace = true }
 chrono-tz.workspace = true
+rust_decimal.workspace = true
 croner = "3.0.1"
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 serde_urlencoded = "0.7"
+serde_path_to_error = "0.1"
 serde_yaml = { version = "0.9", optional = true }
 pulldown-cmark = { workspace = true, optional = true }
 subtle = "2.6.1"
@@ -152,18 +295,32 @@ percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"], optional = true }
 jsonwebtoken = { version = "10.1.0", default-features = false, features = ["rust_crypto"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"
+infer = { version = "0.16", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
 aes-gcm = "0.10"
 getrandom = "0.2"
 hex = "0.4"
+include_dir = { version = "0.7", optional = true }
 csv = { workspace = true, optional = true }
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
+# CSS inliner for HTML email (issue #1254). `default-features = false` drops the
+# optional network (`http`/reqwest) and local-file stylesheet fetchers — Autumn
+# only inlines embedded `<style>` blocks, never remote CSS — keeping the added
+# graph to the html5ever/selectors parsing stack. Gated behind the `mail` feature.
+css-inline = { version = "0.21", default-features = false, optional = true }
 chromiumoxide = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# `umask` (via the safe `nix` wrapper) for binding `server.unix_socket` with
+# owner-only permissions from creation, closing the bind→chmod race on
+# user-configured socket paths in shared directories.
+nix = { version = "0.31.2", features = ["fs"] }
 
 [dev-dependencies]
 diesel = { version = "2", features = ["chrono", "postgres"] }
@@ -185,6 +342,10 @@ loom = "0.7.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"
 rusty-fork = "0.3.1"
+# TLS stub server for the Postgres sslmode integration tests (already in the
+# dependency graph via the db feature — no new crates).
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 
 # docs.rs feature posture: include all features except those that require
 # system libraries unavailable in the docs.rs sandbox.
@@ -195,7 +356,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
-  "reporting", "csv",
+  "reporting", "csv", "embed-assets", "offline-sync",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -210,6 +371,309 @@ harness = false
 [[bench]]
 name = "inspector"
 harness = false
+
+[[test]]
+name = "integration_tests"
+path = "tests/integration_tests.rs"
+
+# SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_boot_serve`.
+[[test]]
+name = "sqlite_boot_serve"
+path = "tests/sqlite_boot_serve.rs"
+
+# SQLite startup-migration proof (issue #1614, PR3). Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_migrations`.
+[[test]]
+name = "sqlite_migrations"
+path = "tests/sqlite_migrations.rs"
+
+# SQLite pooled-connection foreign-key enforcement proof (issue #1614, Codex P1).
+# Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_foreign_keys`.
+[[test]]
+name = "sqlite_foreign_keys"
+path = "tests/sqlite_foreign_keys.rs"
+
+# SQLite `Db`-extractor proof (issue #1614, Codex P1). Drives the real framework
+# `Db` extractor over HTTP against a `sqlite:` target and asserts 200 (not the
+# 503 a Postgres-only `SET statement_timeout` in `Db::checkout` would produce).
+# Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_db_extractor`.
+[[test]]
+name = "sqlite_db_extractor"
+path = "tests/sqlite_db_extractor.rs"
+
+# SQLite pooled-connection PRAGMA proof (issue #1614, Codex P1). Asserts every
+# pool-issued connection carries the configured `busy_timeout` and the deliberate
+# WAL `journal_mode` (mirroring `crate::sync::store`), so overlapping writes wait
+# on the lock instead of failing fast with `SQLITE_BUSY`. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_pool_pragmas`.
+[[test]]
+name = "sqlite_pool_pragmas"
+path = "tests/sqlite_pool_pragmas.rs"
+
+# SQLite read-only-target pool proof (issue #1614, Codex P2). The per-connection
+# setup batch runs `PRAGMA journal_mode = WAL`, which WRITES — so against a
+# read-only URI target (`mode=ro`/`immutable`) it fails with "attempt to write a
+# readonly database", propagates out of `custom_setup`, and the pool can serve
+# no query (`Db` routes 503). `build_sqlite_pool` now skips the write-affecting
+# pragmas for read-only targets while keeping `foreign_keys` + `busy_timeout`.
+# Asserts the read-only pool builds, serves a committed read, keeps foreign_keys,
+# and rejects writes. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_read_only_pool`.
+[[test]]
+name = "sqlite_read_only_pool"
+path = "tests/sqlite_read_only_pool.rs"
+
+# SQLite scope-threading compile proof (issue #1614, Codex P1). Pins that
+# `Scope::list` / `ScopeQuery::load` accept `&mut RuntimeConnection` (the SQLite
+# wrapper under this feature) — the connection the repository macro passes into a
+# scoped list route — rather than a hard-coded `&mut AsyncPgConnection`. Fails to
+# compile before the threading; no-op for Postgres. (Deliberately scope-surface
+# only: a full `#[repository]`'s Pg-specific CRUD codegen is a separate SQLite
+# concern.) Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_scoped_repository`.
+[[test]]
+name = "sqlite_scoped_repository"
+path = "tests/sqlite_scoped_repository.rs"
+
+# Basic `#[repository]` CRUD proof on the SQLite backend (issue #1996, wave B+C):
+# instantiates a simple model + repository and exercises the always-emitted CRUD
+# (save/find_by_id/update/count/save_many/delete_by_id) on an in-memory SQLite
+# pool, proving the FOR UPDATE removal + on_conflict/batch dialect port compile
+# AND run with no Docker. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_crud_basic`.
+[[test]]
+name = "sqlite_crud_basic"
+path = "tests/sqlite_crud_basic.rs"
+
+# SQLite upsert isolation + optimistic-lock proof (issue #1996, PR #2021): the two
+# P1 fixes on the cfg-dual `__autumn_execute_upsert` SQLite arm. Proves (Bug 2,
+# SECURITY) a tenant-scoped `upsert_many` under tenant B with tenant A's id leaves
+# tenant A's row untouched (no cross-tenant leak) and (Bug 2, lock) a stale
+# `lock_version` upsert surfaces a 409 — matching Postgres. Runs on an in-memory
+# SQLite pool with no Docker. Bug 1 (advisory-lock cfg-gate) is pinned by the
+# autumn-macros expansion test. Only meaningful under `--features sqlite`; the
+# file is `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to
+# an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_upsert_isolation`.
+[[test]]
+name = "sqlite_upsert_isolation"
+path = "tests/sqlite_upsert_isolation.rs"
+
+# SQLite version-history end-to-end proof (issue #1996). Drives a
+# `versioned = true` repository against an in-memory SQLite pool: a create +
+# update + delete each append a `_autumn_version_history` row, `version_history()`
+# reads them back (op/actor/changes/time-range), and — the adversarial assertion —
+# `version_history()` scoped to tenant B never returns tenant A's rows
+# (fail-closed isolation). Exercises the forked writer (no `$7::jsonb`), reader
+# (no `::bigint`/`::text`/`::timestamptz`/`changes::text`, `TimestamptzSqlite`),
+# and the SQLite `_autumn_version_history` DDL. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_version_history`.
+[[test]]
+name = "sqlite_version_history"
+path = "tests/sqlite_version_history.rs"
+
+# SQLite durable commit-hook worker end-to-end proof (issue #1996 item 5). Drives
+# the ported worker (BEGIN IMMEDIATE claim + in-process Notify kick + retry/backoff
+# + dead-letter + graceful drain) and the real enqueue surface against an in-memory
+# SQLite pool: a queued hook survives a simulated restart and is delivered exactly
+# once (idempotency dedup), transient failures retry then succeed, a permanent
+# failure is dead-lettered after max_attempts, a graceful shutdown settles the
+# in-flight leased entry, and — the adversarial assertion — a hook enqueued under
+# tenant A executes with tenant A's scope and never touches tenant B's data while
+# tenant B has its own queued hook, and a hook with no tenant fails closed. Only
+# meaningful under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]`
+# so a default `cargo test` compiles it to an empty (passing) binary. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_commit_hook_worker`.
+[[test]]
+name = "sqlite_commit_hook_worker"
+path = "tests/sqlite_commit_hook_worker.rs"
+
+# SQLite searchable-repository fallback proof (issue #1996). Drives
+# `#[repository(searchable)]` against an in-memory SQLite pool: substring matches
+# are found case-insensitively, non-matches excluded, LIKE metacharacters (`%`,
+# `_`) match literally (never a match-everything wildcard), `search_page`
+# paginates, and — the adversarial assertions — a search under tenant B never
+# returns tenant A's rows and `search_page_scoped` never returns another owner's
+# rows (fail-closed isolation). Exercises the forked search codegen (SQLite arm =
+# `lower(col) LIKE '%term%'` over SEARCH_FIELDS, ordered id DESC, no tsvector).
+# Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_searchable_repository`.
+[[test]]
+name = "sqlite_searchable_repository"
+path = "tests/sqlite_searchable_repository.rs"
+
+# SQLite `BEGIN IMMEDIATE` write-transaction proof (issue #1996, item 3). The
+# generated write-RMW paths (with_lock / update / delete_by_id / find_or_create)
+# route through `scoped_immediate_transaction`, whose SQLite arm takes the write
+# lock up front so a second concurrent writer queues on `busy_timeout` instead of
+# failing its deferred snapshot upgrade with `SQLITE_BUSY_SNAPSHOT`. This test
+# proves that on a shared tempfile DB: two concurrent writers serialize with no
+# lost update / no busy error, a queued update commits and bumps lock_version, a
+# single-writer update commits, and an errored RMW rolls back. Only meaningful
+# under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a
+# default `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_immediate_transaction`.
+[[test]]
+name = "sqlite_immediate_transaction"
+path = "tests/sqlite_immediate_transaction.rs"
+
+# SQLite `statement_timeout` fail-closed boot guard (issue #1996, item 4). SQLite
+# cannot enforce a per-statement wall-clock timeout through the async connection
+# wrapper (diesel's SqliteConnection exposes no interrupt/progress-handler hook),
+# so `db::reject_sqlite_statement_timeout` fails the boot fast — from every
+# pool-construction entry point — when a non-zero `database.statement_timeout` is
+# configured under the sqlite backend, instead of silently ignoring it. This test
+# proves the loud, typed rejection (naming the config key + SQLite) and that a
+# `None`/zero timeout still boots cleanly. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_statement_timeout_fail_closed`.
+[[test]]
+name = "sqlite_statement_timeout_fail_closed"
+path = "tests/sqlite_statement_timeout_fail_closed.rs"
+
+# SQLite `dependent(..., on_delete = destroy)` cascade proof (issue #1996, PR
+# #2021). The Destroy arm selects child ids with a hand-built SQL string that
+# used to emit a trailing `FOR UPDATE` (rejected by SQLite) — outside the
+# `maybe_for_update!` DSL seam. This test proves the `backend_select!`-gated fix:
+# `delete_by_id` on a parent with a `destroy` child succeeds on an in-memory
+# SQLite pool and actually deletes the dependent child rows, with no Docker. Only
+# meaningful under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]`
+# so a default `cargo test` compiles it to an empty (passing) binary. Run
+# explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_dependent_destroy`.
+[[test]]
+name = "sqlite_dependent_destroy"
+path = "tests/sqlite_dependent_destroy.rs"
+
+# SQLite read-only-transaction safety proof (issue #1614, Codex P2). The SQLite
+# arm of `Db::tx_with` cannot enforce `READ ONLY`, so a `TxOptions::read_only()`
+# request is rejected before the closure runs rather than silently running a
+# writable transaction (which would let writes commit under a read-only
+# contract). Asserts the rejection commits nothing and that a normal read-write
+# transaction still commits. Needs `test-support` too (the public
+# `Db::connect_for_test` harness helper); the file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]` so a default
+# `cargo test` (and a bare `--features sqlite` run) compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_read_only_tx`.
+[[test]]
+name = "sqlite_read_only_tx"
+path = "tests/sqlite_read_only_tx.rs"
+
+# Explicit-URL pool proof for the SQLite test harness (issue #1614, Codex P2):
+# `TestApp::with_transactional_db("sqlite:...")` must build a real (plain, non-
+# transactional) SQLite pool from the recorded URL instead of dropping it and
+# leaving a `Db`-backed route to 503. Needs `test-support` for the public
+# `TestApp` harness; the file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]` so a default
+# `cargo test` (and a bare `--features sqlite` run) compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_transactional_url_pool`.
+[[test]]
+name = "sqlite_transactional_url_pool"
+path = "tests/sqlite_transactional_url_pool.rs"
+
+# Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
+# to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
+# consolidated binary — those vars would race the inline network tests.
+[[test]]
+name = "ssrf_proxy_bypass"
+path = "tests/ssrf_proxy_bypass.rs"
+
+# Isolated: installs the process-global tracing subscriber (issue #1044), a
+# process-wide side-effect that cannot share the consolidated binary.
+[[test]]
+name = "actuator_live_logger_reload"
+path = "tests/actuator_live_logger_reload.rs"
+
+[[test]]
+name = "db_hooks_lifecycle"
+path = "tests/db_hooks_lifecycle.rs"
+
+# #1911: field-level `#[state_machine(lifecycle = Enum)]` ≡ inline equivalence.
+# Pure in-memory unit tests over the generated validation logic — no DB
+# connection, runs without Docker. Isolated so it is cheap to compile/run alone.
+[[test]]
+name = "state_machine_lifecycle"
+path = "tests/state_machine_lifecycle.rs"
+
+# Issue #1973: `on_commit` transition-effect codegen — pure validation +
+# compile-time type-check of the generated connection-taking method. No DB
+# connection, runs without Docker. Isolated so it is cheap to compile/run alone.
+[[test]]
+name = "state_machine_on_commit"
+path = "tests/state_machine_on_commit.rs"
+
+# Issue #1973: sync `on = "handler"` in-transaction transition effect — pure
+# validation + compile-time type-check of the generated connection-taking
+# method. No DB connection, runs without Docker. Isolated so it is cheap to
+# compile/run alone.
+[[test]]
+name = "state_machine_on"
+path = "tests/state_machine_on.rs"
+
+# Issue #1973: `lifecycle = <Enum>` + binding-site `effects(...)` per-edge
+# effects converged onto the shared connection-taking method — pure validation +
+# compile-time type-check of the generated method. No DB connection, runs
+# without Docker. Isolated so it is cheap to compile/run alone.
+[[test]]
+name = "state_machine_lifecycle_effects"
+path = "tests/state_machine_lifecycle_effects.rs"
+
+[[test]]
+name = "repository_shard_replica_routing"
+path = "tests/repository_shard_replica_routing.rs"
+
+[[test]]
+name = "feature_flags_pg_integration"
+path = "tests/feature_flags_pg_integration.rs"
+
+[[test]]
+name = "scoped_tokens_db"
+path = "tests/scoped_tokens_db.rs"
+
+[[test]]
+name = "cache_global_integration"
+path = "tests/cache_global_integration.rs"
+
+[[test]]
+name = "cached_global_backend"
+path = "tests/cached_global_backend.rs"
+
+# Isolated: loom model-checking binary. Empty under a normal build
+# (`#![cfg(loom_models)]`); only compiles/runs under
+# `RUSTFLAGS="--cfg loom_models"`, and is exercised in its own dedicated CI job
+# — never the consolidated suite. A neutral `loom_models` cfg is used rather
+# than `--cfg loom` so the flag doesn't break hyper-util/tokio (which carry
+# their own `#[cfg(loom)]` paths); loom still model-checks because the tests use
+# `loom::sync`/`loom::thread` directly.
+[[test]]
+name = "loom_models"
+path = "tests/loom_models.rs"
 
 [lints]
 workspace = true

@@ -4,9 +4,11 @@
 //! use htmx attributes for interactive publish/delete behaviour.
 
 use autumn_web::assets::asset_url;
+use autumn_web::cache::cache_fragment_global;
 use autumn_web::extract::{Form, Path};
 use autumn_web::i18n::Locale;
 use autumn_web::seo::SeoMeta;
+use autumn_web::widgets::{Crumb, HeroConfig, breadcrumb, hero};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, t};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -44,6 +46,7 @@ pub fn layout_with_seo(locale: &Locale, seo: SeoMeta, content: Markup) -> Markup
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 (seo.render())
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href=(asset_url("css/autumn.css"));
                 script src=(asset_url("js/htmx.min.js")) {}
             }
@@ -96,7 +99,27 @@ pub fn layout_with_seo(locale: &Locale, seo: SeoMeta, content: Markup) -> Markup
 // ── Components ──────────────────────────────────────────────────
 
 /// Render a single post card for the listing page.
+///
+/// The rendered markup is cached with [`cache_fragment_global`], keyed by the
+/// post's id **plus** its `updated_at` timestamp. On a warm cache an unchanged
+/// row is served without re-running the `html!{}` work; editing the post bumps
+/// `updated_at`, which changes the cache key and re-renders the card on the
+/// very next request — no manual eviction. When no cache backend is configured
+/// the helper renders directly, so this is safe in any environment.
 fn post_card(post: &Post) -> Markup {
+    cache_fragment_global(
+        format_args!("blog:post_card:{}", post.id),
+        // Microsecond resolution so two edits in the same wall-clock second
+        // still produce distinct cache keys (a plain `timestamp()` would
+        // collide and serve the first edit's stale markup).
+        post.updated_at.and_utc().timestamp_micros(),
+        None,
+        || render_post_card(post),
+    )
+}
+
+/// The actual Maud render for a post card (executed only on a cache miss).
+fn render_post_card(post: &Post) -> Markup {
     let date = post.created_at.format("%b %d, %Y");
     let preview: String = post.body.chars().take(200).collect::<String>();
     let preview = if post.body.len() > 200 {
@@ -224,14 +247,10 @@ pub async fn index(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
         &locale,
         "Autumn Blog",
         html! {
-            header class="mb-10" {
-                h1 class="text-3xl font-bold tracking-tight text-stone-900 mb-2" {
-                    "Welcome to the Blog"
-                }
-                p class="text-stone-600" {
-                    "Thoughts, tutorials, and stories — powered by Autumn."
-                }
-            }
+            (hero(
+                &HeroConfig::new(&t!(locale, "home.hero.title"))
+                    .subtitle(&t!(locale, "home.hero.subtitle"))
+            ))
 
             @if published_posts.is_empty() {
                 div class="text-center py-20" {
@@ -275,13 +294,11 @@ pub async fn show(locale: Locale, slug: Path<String>, mut db: Db) -> AutumnResul
         &locale,
         seo,
         html! {
+            (breadcrumb(&[
+                Crumb::link("Blog", &paths::index()),
+                Crumb::current(&p.title),
+            ]))
             article {
-                // Back link
-                a href=(paths::index())
-                   class="inline-flex items-center gap-1 text-sm text-stone-600 \
-                          hover:text-amber-700 transition-colors mb-8" {
-                    "\u{2190} Back to blog"
-                }
 
                 // Post header
                 header class="mb-8" {
@@ -406,11 +423,10 @@ pub async fn new_form(locale: Locale) -> Markup {
         &locale,
         "New Post \u{2022} Autumn Blog",
         html! {
-            a href=(paths::admin_list())
-               class="inline-flex items-center gap-1 text-sm text-stone-600 \
-                      hover:text-amber-700 transition-colors mb-6" {
-                "\u{2190} Back to admin"
-            }
+            (breadcrumb(&[
+                Crumb::link("Admin", &paths::admin_list()),
+                Crumb::current("New Post"),
+            ]))
             h1 class="text-2xl font-semibold tracking-tight text-stone-900 mb-6" {
                 "New Post"
             }
@@ -441,11 +457,10 @@ pub async fn edit_form(locale: Locale, id: Path<i64>, mut db: Db) -> AutumnResul
         &locale,
         &format!("Edit: {} \u{2022} Autumn Blog", p.title),
         html! {
-            a href=(paths::admin_list())
-               class="inline-flex items-center gap-1 text-sm text-stone-600 \
-                      hover:text-amber-700 transition-colors mb-6" {
-                "\u{2190} Back to admin"
-            }
+            (breadcrumb(&[
+                Crumb::link("Admin", &paths::admin_list()),
+                Crumb::current(&format!("Edit: {}", p.title)),
+            ]))
             h1 class="text-2xl font-semibold tracking-tight text-stone-900 mb-6" {
                 "Edit Post"
             }
@@ -464,6 +479,9 @@ pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnRes
         slug: Some(validated.slug),
         body: Some(validated.body),
         published: Some(validated.published),
+        // Bump the version token so the cached post card re-renders on the
+        // next request (Postgres has no ON UPDATE trigger for `updated_at`).
+        updated_at: Some(chrono::Utc::now().naive_utc()),
     };
 
     let updated = diesel::update(posts::table.find(*id))

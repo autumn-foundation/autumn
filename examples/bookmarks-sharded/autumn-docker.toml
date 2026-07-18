@@ -1,0 +1,25 @@
+# Profile overrides for the docker-compose stack: service hostnames
+# instead of localhost ports, and bind all interfaces so nginx can reach
+# the web replicas across the container network.
+
+[server]
+host = "0.0.0.0"
+port = 3000
+
+[database]
+primary_url = "postgres://autumn:autumn@postgres-control:5432/bookmarks_control"
+
+[[database.shards]]
+name = "shard0"
+primary_url = "postgres://autumn:autumn@postgres-shard-0:5432/bookmarks_shard0"
+# Streaming read replica (see postgres-shard-0-replica in docker-compose.yml).
+# `ShardedReadDb` and SELECT routing on `ShardedDb` read from here; writes
+# stay on the primary above. Only shard 0 has a replica configured, so shard 1
+# transparently reads from its own primary.
+replica_url = "postgres://autumn:autumn@postgres-shard-0-replica:5432/bookmarks_shard0"
+slots = ["0-8191"]
+
+[[database.shards]]
+name = "shard1"
+primary_url = "postgres://autumn:autumn@postgres-shard-1:5432/bookmarks_shard1"
+slots = ["8192-16383"]

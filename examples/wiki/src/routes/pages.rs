@@ -15,6 +15,7 @@ pub fn layout(title: &str, content: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Wiki" }
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src="/static/js/htmx.min.js" {}
             }
@@ -92,6 +93,7 @@ pub async fn list(repo: PgPageRepository) -> AutumnResult<Markup> {
             }
             div class="mb-6 bg-white p-4 rounded shadow flex items-center" {
                 input type="search" name="q" placeholder="Search pages..."
+                      aria-label="Search pages"
                       hx-get="/search" hx-trigger="keyup changed delay:300ms, search"
                       hx-target="#search-results" hx-swap="outerHTML" hx-indicator="#search-indicator"
                       class="flex-grow border rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-emerald-500";
@@ -137,6 +139,10 @@ pub async fn show(
     Ok(layout(
         &page.title,
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::current(&page.title),
+            ]))
             article {
                 div class="flex justify-between items-center mb-4" {
                     h1 class="text-3xl font-bold" { (page.title) }
@@ -148,6 +154,22 @@ pub async fn show(
                           class="text-sm text-gray-500 hover:underline" { "History" }
                     }
                 }
+                // State-machine transition buttons, generated from the same
+                // `#[state_machine(...)]` declaration on `Page::status` that the
+                // `transition_status` route enforces. Only edges leaving the
+                // current state render; the `can_transition_status_to` guard
+                // disables an edge (e.g. publishing an empty page). No CSRF token
+                // is threaded here — the wiki example runs without CSRF, like its
+                // other forms.
+                (autumn_web::widgets::transition_controls(
+                    &paths::transition_status(page.slug.clone()),
+                    "status",
+                    &page.status,
+                    Page::__AUTUMN_SM_STATUS_TRANSITIONS,
+                    |to| page.can_transition_status_to(to),
+                    None,
+                    None,
+                ))
                 div class="prose bg-white rounded shadow p-6" {
                     @for para in page.body.split("\n\n") {
                         @if !para.trim().is_empty() {
@@ -191,6 +213,10 @@ pub async fn new_form() -> Markup {
     layout(
         "New Page",
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::current("New Page"),
+            ]))
             h1 class="text-2xl font-bold mb-6" { "New Page" }
             form action=(paths::create()) method="post"
                  class="space-y-4 bg-white rounded shadow p-6" {
@@ -254,6 +280,11 @@ pub async fn edit_form(Path(slug): Path<String>, repo: PgPageRepository) -> Autu
     Ok(layout(
         &format!("Edit: {}", page.title),
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::link(&page.title, &paths::show(page.slug.clone())),
+                Crumb::current("Edit"),
+            ]))
             h1 class="text-2xl font-bold mb-6" { "Edit: " (page.title) }
             form action=(paths::update(page.slug.clone())) method="post"
                  class="space-y-4 bg-white rounded shadow p-6" {
@@ -267,13 +298,11 @@ pub async fn edit_form(Path(slug): Path<String>, repo: PgPageRepository) -> Autu
                     textarea id="body" name="body" rows="10"
                              class="w-full border rounded p-2 mt-1" { (page.body) }
                 }
-                div {
-                    label for="status" class="block text-sm font-medium" { "Status" }
-                    select id="status" name="status" class="border rounded p-2 mt-1" {
-                        option value="draft" selected[page.status == "draft"] { "Draft" }
-                        option value="published" selected[page.status == "published"] { "Published" }
-                        option value="archived" selected[page.status == "archived"] { "Archived" }
-                    }
+                p class="text-sm text-gray-500" {
+                    "Status: " (status_badge(&page.status))
+                    " — change it from the "
+                    a href=(paths::show(page.slug.clone())) class="text-emerald-600 hover:underline" { "page" }
+                    " using the status controls."
                 }
                 input type="hidden" name="lock_version" value=(page.lock_version);
                 button type="submit"
@@ -293,6 +322,10 @@ pub async fn edit_form(Path(slug): Path<String>, repo: PgPageRepository) -> Autu
 pub struct PageForm {
     pub title: String,
     pub body: String,
+    // Only the create form submits an initial status; the edit form edits
+    // title/body and leaves status untouched (status changes flow through the
+    // dedicated transitions route), so this defaults when absent.
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub lock_version: i32,
@@ -313,9 +346,33 @@ impl PageForm {
             title: Patch::Set(self.title),
             slug: Patch::Unchanged,
             body: Patch::Set(self.body),
-            status: Patch::Set(self.status),
+            // Status transitions go through `transition_status`, never the edit
+            // form, so an edit leaves the stored status unchanged.
+            status: Patch::Unchanged,
             lock_version: self.lock_version,
         }
+    }
+}
+
+/// Form body posted by the `transition_controls` widget on the show page: the
+/// target state under the field name (`status`).
+#[derive(serde::Deserialize)]
+pub struct TransitionForm {
+    pub status: String,
+}
+
+pub(crate) fn generate_update_summary(
+    old_status: &str,
+    new_status: &str,
+    old_title: &str,
+    new_title: &str,
+) -> Option<String> {
+    if new_status != old_status {
+        Some(format!("Status changed: {} → {}", old_status, new_status))
+    } else if new_title != old_title {
+        Some(format!("Title changed: {} → {}", old_title, new_title))
+    } else {
+        None
     }
 }
 
@@ -330,16 +387,56 @@ pub async fn update(
     let update_page = form.0.into_update();
     let updated = repo.update(page.id, &update_page).await?;
 
-    let summary = if updated.status != page.status {
-        Some(format!(
-            "Status changed: {} → {}",
-            page.status, updated.status
-        ))
-    } else if updated.title != page.title {
-        Some(format!("Title changed: {} → {}", page.title, updated.title))
-    } else {
-        None
+    let summary =
+        generate_update_summary(&page.status, &updated.status, &page.title, &updated.title);
+
+    diesel::insert_into(revisions::table)
+        .values(&NewRevision {
+            page_id: updated.id,
+            op: "update".into(),
+            title: updated.title.clone(),
+            body: updated.body.clone(),
+            status: updated.status.clone(),
+            changed_by: None,
+            summary,
+        })
+        .execute(&mut *db)
+        .await?;
+
+    Ok(Redirect::to(&paths::show(updated.slug)))
+}
+
+/// `POST /pages/{slug}/transitions/status` — apply a state-machine transition.
+///
+/// The `transition_controls` widget on the show page posts the target state
+/// under the field name (`status`). Enforcement is the macro-generated
+/// `Page::transition_status_to`, which returns a 400 for an undefined edge or a
+/// rejected `can_publish` guard — surfaced here by `?`, matching the wiki's
+/// error-propagation convention (no Flash layer is configured).
+#[post("/pages/{slug}/transitions/status")]
+pub async fn transition_status(
+    Path(slug): Path<String>,
+    repo: PgPageRepository,
+    mut db: Db,
+    form: Form<TransitionForm>,
+) -> AutumnResult<Redirect> {
+    let page = find_page_by_slug(&repo, &slug).await?;
+
+    // The state machine is the single source of truth: illegal edges and
+    // guard rejections become a 400 here.
+    let new_status = page.transition_status_to(&form.0.status)?;
+
+    let update = crate::models::UpdatePage {
+        title: Patch::Unchanged,
+        slug: Patch::Unchanged,
+        body: Patch::Unchanged,
+        status: Patch::Set(new_status),
+        lock_version: page.lock_version,
     };
+    let updated = repo.update(page.id, &update).await?;
+
+    let summary =
+        generate_update_summary(&page.status, &updated.status, &page.title, &updated.title);
 
     diesel::insert_into(revisions::table)
         .values(&NewRevision {
@@ -375,6 +472,11 @@ pub async fn history(
     Ok(layout(
         &format!("History: {}", page.title),
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::link(&page.title, &paths::show(page.slug.clone())),
+                Crumb::current("History"),
+            ]))
             div class="flex justify-between items-center mb-6" {
                 h1 class="text-2xl font-bold" { "History: " (page.title) }
                 a href=(paths::show(page.slug.clone()))
@@ -422,7 +524,15 @@ pub async fn history(
 }
 
 autumn_web::paths![
-    list, show, new_form, create, edit_form, update, history, search
+    list,
+    show,
+    new_form,
+    create,
+    edit_form,
+    update,
+    transition_status,
+    history,
+    search
 ];
 
 /// Look up a page by slug, returning 404 if not found.

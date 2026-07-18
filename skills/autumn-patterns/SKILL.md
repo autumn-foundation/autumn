@@ -12,6 +12,23 @@ description: >
 Reference `skills/autumn-web/SKILL.md` for the API quick guide. This file
 covers patterns and design decisions that apply across an Autumn app.
 
+**First rule: prefer the framework idiom.** Before hand-rolling validation,
+CRUD queries, pagination, forms, auth checks, background threads, or caching,
+check the "Prefer framework idioms over raw Diesel/Axum" table in
+`skills/autumn-web/SKILL.md`. Raw Axum/Diesel is allowed but is a last resort.
+
+## Status fields: `#[state_machine]`, not hand-rolled checks
+
+When a model has a status/phase column with legal transitions, declare them
+with `#[state_machine(transitions(...))]` on the field and enforce with the
+generated `transition_{field}_to` in `before_update` — never write your own
+`match (old, new)` validation in hooks or handlers. To reuse one transition
+graph across fields/models, define a `#[lifecycle]` enum and reference it with
+`#[state_machine(lifecycle = Enum)]` (trunk-dev, #1916); `autumn lifecycle
+check` statically verifies soundness and `autumn lifecycle diagram` emits a
+DOT/Mermaid state diagram. See `docs/guide/state-machines.md` and the worked
+example in `skills/autumn-web/references/examples.md`.
+
 ## Testing with TestApp and TestClient
 
 The `test-support` feature ships an in-process test client. No running
@@ -45,6 +62,37 @@ async fn create_post_returns_redirect() {
 
 Always use `TestApp` in tests — never spin up a real server or hit a live
 database in unit tests.
+
+### Assert a route's query budget — catch N+1 (trunk-dev)
+
+Pin the SQL a route is allowed to run so an accidental N+1 fails the test:
+
+```rust
+client.get("/posts").send().await
+    .assert_status(200)
+    .assert_max_queries(3);   // panics naming the route if the count exceeds 3
+```
+
+`TestResponse::query_count()` returns the observed count (from the
+`Server-Timing` query counter); `assert_max_queries(n)` chains and returns
+`&Self` (issue #1262).
+
+### Fake-data factories and bulk seeding (trunk-dev)
+
+Don't hand-build model fixtures. `#[model]` generates a `{Model}Factory`; fill
+the rest with realistic fake data inferred from each field's name + type:
+
+```rust
+let post = Post::factory().title("Fixed").fake().build();  // NewPost, unset fields faked
+let posts = Post::factory().fake().build_many(10);         // Vec<NewPost>, each row re-drawn
+let saved = Post::factory().fake().create(&pool).await;    // persist (panics on failure)
+```
+
+Generators live in `autumn_web::fake` (`name`, `email`, `sentence`,
+`int_range`, `uuid`, …); seed deterministically with `AUTUMN_FAKE_SEED` or
+`autumn_web::fake::reseed(seed)`. For bulk data outside tests,
+`autumn seed --count N --model <Name>` (both flags together) inserts N faked rows
+via the model's factory (issue #1343). See `docs/guide/seeding.md`.
 
 ## Repository design
 
@@ -104,9 +152,16 @@ async fn publish_post(Path(id): Path<i64>, mut db: Db) -> AutumnResult<Redirect>
 Use `#[job]` for request-triggered work with retries. Keep jobs idempotent —
 they may run more than once.
 
-The `#[job]` macro requires exactly two arguments: `AppState` and a typed
-args struct (serializable). The macro generates a `PascalCaseJob` struct with
-a static `enqueue` method.
+The `#[job]` macro takes `AppState` and a typed args struct (serializable).
+The macro generates a `PascalCaseJob` struct with a static `enqueue` method.
+On trunk-dev (unreleased — not in published 0.5.0) a job may also accept an
+optional third `JobContext` argument for progress reporting on tracked jobs,
+and a `queue = "name"` attribute for named priority queues.
+
+Published 0.5.0 also supports idempotency/backpressure attributes:
+`#[job(unique)]`, `unique_by = "field"`, `unique_for_ms = N`,
+`concurrency = N`, `concurrency_key = "field"` — prefer these over
+hand-rolled dedupe tables or semaphores.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]

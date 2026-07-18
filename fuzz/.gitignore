@@ -1,0 +1,5 @@
+# Build output and fuzzer runtime artifacts. The seed corpora under `corpus/`
+# are intentionally NOT ignored — they are committed and grow over time.
+/target
+/artifacts
+/coverage

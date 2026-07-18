@@ -200,6 +200,9 @@ pub async fn render_static_routes(
                     .oneshot(
                         Request::builder()
                             .uri(&url)
+                            // Internal build render: exempt from the inbound
+                            // request-timeout deadline (no client connection).
+                            .extension(super::RenderDeadlineExempt)
                             .body(Body::empty())
                             .expect("valid request"),
                     )

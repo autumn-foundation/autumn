@@ -7,14 +7,16 @@
 //! # Known limitations
 //!
 //! - Statement splitting uses `;` as the delimiter with awareness of
-//!   `PostgreSQL` dollar-quoted blocks (`$$…$$` and `$tag$…$tag$`) and
-//!   `--` line comments. Semicolons inside a dollar-quoted function body or
-//!   inside a `--` comment are kept intact so they do not produce spurious
-//!   statement fragments. Semicolons inside single-quoted string literals are
-//!   not handled; that pattern is essentially absent from real migration files.
-//! - Line comment stripping matches `--` by position on each line. A `--`
-//!   sequence inside a string literal would be incorrectly treated as a comment
-//!   start. Again, this pattern is essentially absent from real migration files.
+//!   `PostgreSQL` dollar-quoted blocks (`$$…$$` and `$tag$…$tag$`), `--` line
+//!   comments, and single-quoted string literals (including the standard
+//!   `''`-doubled escaped quote). Semicolons inside any of these are kept
+//!   intact so they do not produce spurious statement fragments -- e.g. a
+//!   `DEFAULT 'hello; world'` clause splits as one statement, not two.
+//! - Line comment stripping matches `--` by position on each line, checked
+//!   only *outside* single-quoted literals and dollar-quoted blocks (both
+//!   handled above). A `--` or `;` sequence inside a double-quoted identifier
+//!   (e.g. a quoted column name) is not handled; this pattern is essentially
+//!   absent from real migration files.
 //! - Block comment stripping (`/* … */`) similarly does not handle `/*` or `*/`
 //!   tokens that appear inside string literals.
 
@@ -127,6 +129,21 @@ pub fn has_unsafe_findings(findings: &[SafetyFinding]) -> bool {
     findings.iter().any(|f| f.risk > RiskLevel::Safe)
 }
 
+/// True iff `sql` contains at least one non-empty, non-comment SQL statement.
+///
+/// Used to gate `autumn migrate down`: a `down.sql` that is blank or contains
+/// only comments is treated as absent — the command refuses to proceed and
+/// names the offending migration.
+pub fn has_executable_sql(sql: &str) -> bool {
+    let without_block_comments = strip_block_comments(sql);
+    split_statements(&without_block_comments)
+        .iter()
+        .any(|stmt| {
+            stmt.lines()
+                .any(|line| !line.trim().is_empty() && !line.trim().starts_with("--"))
+        })
+}
+
 // ── internals ────────────────────────────────────────────────────────────────
 
 /// Extract the table name from a normalized `CREATE TABLE name …` statement.
@@ -151,11 +168,12 @@ fn extract_index_table_name(normalized: &str) -> Option<&str> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// Split `sql` into individual statements, using `;` as the delimiter.
+/// Split `sql` into individual statements, using `;` as the delimiter. Each
+/// returned statement has its terminating `;` stripped.
 ///
 /// Dollar-quoted blocks (`$$…$$`, `$tag$…$tag$`) are kept intact so that
 /// semicolons inside a function body do not produce spurious fragments.
-fn split_statements(sql: &str) -> Vec<String> {
+pub fn split_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut i = 0;
@@ -184,6 +202,32 @@ fn split_statements(sql: &str) -> Vec<String> {
                 }
                 continue;
             }
+        }
+
+        // Single-quoted string literal: consume to the closing quote, treating
+        // a doubled `''` as an escaped quote (the standard SQL convention --
+        // matches how `sql_default_literal` escapes user-supplied defaults) so
+        // a semicolon inside a literal (e.g. a `DEFAULT 'hello; world'`) is
+        // never treated as a statement separator.
+        if rest.starts_with('\'') {
+            let mut j = 1;
+            loop {
+                if let Some(rel) = rest[j..].find('\'') {
+                    let abs = j + rel;
+                    if rest[abs + 1..].starts_with('\'') {
+                        j = abs + 2; // escaped '' -- keep scanning
+                    } else {
+                        j = abs + 1; // closing quote
+                        break;
+                    }
+                } else {
+                    j = rest.len(); // unclosed literal: consume to end of input
+                    break;
+                }
+            }
+            current.push_str(&rest[..j]);
+            i += j;
+            continue;
         }
 
         // Line comment: consume to end-of-line without treating the semicolons
@@ -1645,6 +1689,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn split_statements_keeps_semicolon_in_string_literal_intact() {
+        // Regression test (PR review, issue #1023): a `DEFAULT 'hello; world'`
+        // clause -- exactly what `sql_default_literal` produces for a
+        // `--default` value containing a semicolon -- must not be split at
+        // the semicolon inside the quotes.
+        let sql = "CREATE TABLE posts (\n    \
+             id BIGSERIAL PRIMARY KEY,\n    \
+             title TEXT NOT NULL DEFAULT 'hello; world',\n    \
+             created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+             );";
+        let statements = split_statements(sql);
+        assert_eq!(
+            statements.len(),
+            1,
+            "a semicolon inside a single-quoted literal must not split the statement: {statements:?}"
+        );
+        assert!(statements[0].contains("'hello; world'"));
+    }
+
+    #[test]
+    fn split_statements_handles_doubled_escaped_quote_in_literal() {
+        // `''` is the standard SQL-escaped single quote; a semicolon after one
+        // must still be treated as inside the (still-open) literal.
+        let sql = "INSERT INTO posts (title) VALUES ('it''s; still one literal');";
+        let statements = split_statements(sql);
+        assert_eq!(statements.len(), 1, "got: {statements:?}");
+    }
+
+    #[test]
+    fn split_statements_multiple_string_literals_with_semicolons() {
+        let sql = "CREATE TABLE posts (a TEXT DEFAULT 'x;y', b TEXT DEFAULT 'p;q');";
+        let statements = split_statements(sql);
+        assert_eq!(statements.len(), 1, "got: {statements:?}");
+    }
+
     // ── DROP INDEX ────────────────────────────────────────────────────────────
 
     #[test]
@@ -1695,5 +1775,44 @@ mod tests {
         let findings = classify_sql("DROP TYPE status CASCADE;");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::ManualReview);
+    }
+
+    // ── has_executable_sql ────────────────────────────────────────────────────
+
+    #[test]
+    fn has_executable_sql_empty_string_is_false() {
+        assert!(!has_executable_sql(""));
+    }
+
+    #[test]
+    fn has_executable_sql_whitespace_only_is_false() {
+        assert!(!has_executable_sql("   \n\t\n  "));
+    }
+
+    #[test]
+    fn has_executable_sql_line_comment_only_is_false() {
+        assert!(!has_executable_sql("-- nothing here\n-- just comments"));
+    }
+
+    #[test]
+    fn has_executable_sql_block_comment_only_is_false() {
+        assert!(!has_executable_sql("/* block comment only */"));
+    }
+
+    #[test]
+    fn has_executable_sql_real_sql_is_true() {
+        assert!(has_executable_sql("DROP TABLE posts;"));
+    }
+
+    #[test]
+    fn has_executable_sql_comment_plus_sql_is_true() {
+        assert!(has_executable_sql(
+            "-- undo the migration\nDROP TABLE posts;"
+        ));
+    }
+
+    #[test]
+    fn has_executable_sql_no_trailing_semicolon_is_true() {
+        assert!(has_executable_sql("DROP TABLE posts"));
     }
 }

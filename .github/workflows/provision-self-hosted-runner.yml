@@ -1,0 +1,153 @@
+name: Provision self-hosted runner
+
+# Manually provisions a Hetzner Cloud VM that hosts N EPHEMERAL GitHub Actions
+# runners (labels: self-hosted, hetzner, linux, x64). See
+# .github/self-hosted-ci-runners.md for the full runbook.
+#
+# Secrets required (create these first — this workflow never fabricates them):
+#   HCLOUD_TOKEN    already present (used by deploy-real-vps.yml).
+#   RUNNER_REG_PAT  a fine-grained PAT scoped to THIS repo with
+#                   "Administration: Read and write" (used only to mint
+#                   short-lived runner registration tokens). Delivered to the
+#                   box over SSH, stored root-only — never in user-data.
+on:
+  workflow_dispatch:
+    inputs:
+      server_type:
+        description: "Hetzner type (cpx32=4 vCPU/8 GB, cpx42=8 vCPU/16 GB)"
+        type: choice
+        options: [cpx42, cpx32]
+        default: cpx42
+      location:
+        description: "Hetzner location"
+        default: nbg1
+      ubuntu_image:
+        description: "Base image"
+        default: ubuntu-24.04
+      runner_count:
+        description: "Number of ephemeral runner slots"
+        default: "6"
+      server_name:
+        description: "Hetzner server name (also the teardown handle)"
+        default: autumn-ci-runner
+      admin_ssh_key_name:
+        description: "Optional existing hcloud ssh-key name to also attach for your own admin access"
+        default: ""
+
+concurrency:
+  group: provision-self-hosted-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      RUNNER_REG_PAT: ${{ secrets.RUNNER_REG_PAT }}
+      HCLOUD_VERSION: "1.66.0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Preflight — required secrets present
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${HCLOUD_TOKEN}" ]; then echo "::error::HCLOUD_TOKEN secret is empty"; missing=1; fi
+          if [ -z "${RUNNER_REG_PAT}" ]; then echo "::error::RUNNER_REG_PAT secret is empty (fine-grained PAT, repo Administration: Read and write)"; missing=1; fi
+          [ "$missing" = 0 ]
+
+      - name: Install hcloud CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/hcloud.tar.gz \
+            "https://github.com/hetznercloud/cli/releases/download/v${HCLOUD_VERSION}/hcloud-linux-amd64.tar.gz"
+          tar -xzf /tmp/hcloud.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/hcloud /usr/local/bin/hcloud
+          hcloud version
+
+      - name: Generate ephemeral provisioning SSH key
+        run: |
+          set -euo pipefail
+          ssh-keygen -t ed25519 -N "" -f "${RUNNER_TEMP}/prov_key"
+          echo "SSH_KEY=${RUNNER_TEMP}/prov_key" >> "$GITHUB_ENV"
+
+      - name: Render cloud-init user-data (no secrets)
+        env:
+          RUNNER_COUNT: ${{ inputs.runner_count }}
+        run: |
+          set -euo pipefail
+          gh_owner="${GITHUB_REPOSITORY%/*}"
+          gh_repo="${GITHUB_REPOSITORY#*/}"
+          {
+            echo '#!/usr/bin/env bash'
+            echo "export GH_OWNER=${gh_owner}"
+            echo "export GH_REPO=${gh_repo}"
+            echo "export RUNNER_COUNT=${RUNNER_COUNT}"
+            tail -n +2 scripts/self-hosted-runner/bootstrap.sh
+          } > "${RUNNER_TEMP}/user-data.sh"
+
+      - name: Create server
+        id: create
+        run: |
+          set -euo pipefail
+          key_name="autumn-ci-runner-prov-${{ github.run_id }}"
+          echo "SSH_KEY_NAME=${key_name}" >> "$GITHUB_ENV"
+          hcloud ssh-key create --name "${key_name}" --public-key-from-file "${SSH_KEY}.pub"
+          create_args=(server create
+            --name "${{ inputs.server_name }}"
+            --type "${{ inputs.server_type }}"
+            --image "${{ inputs.ubuntu_image }}"
+            --location "${{ inputs.location }}"
+            --ssh-key "${key_name}"
+            --user-data-from-file "${RUNNER_TEMP}/user-data.sh")
+          if [ -n "${{ inputs.admin_ssh_key_name }}" ]; then
+            create_args+=(--ssh-key "${{ inputs.admin_ssh_key_name }}")
+          fi
+          hcloud "${create_args[@]}"
+          ip="$(hcloud server ip "${{ inputs.server_name }}")"
+          echo "ip=${ip}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for cloud-init
+        run: |
+          set -euo pipefail
+          ip="${{ steps.create.outputs.ip }}"
+          ok=0
+          for _ in $(seq 1 60); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i "${SSH_KEY}" "root@${ip}" \
+                 'cloud-init status --wait >/dev/null 2>&1; test -d /opt/autumn-runner/slot-1'; then
+              ok=1; echo "cloud-init finished"; break
+            fi
+            sleep 15
+          done
+          [ "$ok" = 1 ] || { echo "::error::cloud-init did not finish in time"; exit 1; }
+
+      - name: Deliver registration PAT and start ephemeral runners
+        run: |
+          set -euo pipefail
+          ip="${{ steps.create.outputs.ip }}"
+          n="${{ inputs.runner_count }}"
+          printf '%s' "${RUNNER_REG_PAT}" | \
+            ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${ip}" \
+              'umask 077; cat > /etc/autumn-runner/pat && chown root:root /etc/autumn-runner/pat && chmod 600 /etc/autumn-runner/pat'
+          ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${ip}" \
+            "systemctl daemon-reload && systemctl enable --now \$(seq -f 'autumn-runner@%g' 1 ${n})"
+
+      - name: Teardown provisioning SSH key
+        if: always()
+        run: |
+          hcloud ssh-key delete "${SSH_KEY_NAME}" || echo "ssh-key already gone / never created"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Self-hosted runner provisioned"
+            echo ""
+            echo "- Server: \`${{ inputs.server_name }}\` — ${{ inputs.server_type }} @ ${{ inputs.location }} — IP \`${{ steps.create.outputs.ip }}\`"
+            echo "- Slots: ${{ inputs.runner_count }} ephemeral runners — labels: \`self-hosted, hetzner, linux, x64\`"
+            echo ""
+            echo "Next: confirm the runners at **Settings → Actions → Runners**, then set the repo variable **AUTUMN_SELF_HOSTED_HEAVY = 1** to route heavy trusted lanes here."
+          } >> "$GITHUB_STEP_SUMMARY"

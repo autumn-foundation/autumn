@@ -6,3 +6,6 @@ level = "info"
 
 [health]
 path = "/health"
+
+[http.client]
+timeout_secs = 10

@@ -1,0 +1,82 @@
+name: Fuzz (nightly long-run)
+
+# Deep, scheduled fuzzing that the per-PR gate (fuzz.yml) is too short to do.
+# Each target runs for 5 minutes and — crucially — the corpus is PERSISTED
+# across runs so coverage compounds over time: today's run starts from every
+# interesting input yesterday's run discovered, and libFuzzer only ever *adds*
+# new coverage-increasing inputs to the corpus directory (it never deletes
+# existing entries), so fuzz/corpus/<target> only grows. Newly minimized inputs
+# that widen coverage are surfaced as an artifact for a maintainer to review and
+# commit back into the repo corpus.
+#
+# Corpus retention is handled by actions/cache below: we RESTORE the previous
+# corpus before fuzzing and SAVE the (grown) corpus after. The cache is scoped
+# per fuzz target (each matrix leg caches only fuzz/corpus/<target>) so the five
+# legs never clobber each other's discoveries under a shared key. The cache key
+# also embeds the ref so branches keep independent corpora, and restore-keys
+# lets a fresh key fall back to the most recent prior corpus for the same
+# target+ref prefix — so a key rotation never resets the accumulated corpus to
+# empty.
+
+on:
+  schedule:
+    # 03:00 UTC daily — off-peak, well clear of business-hours CI contention.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: Fuzz long-run (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [idempotency, routing, headers, session, body]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        # Pin @v2 and pass the tool explicitly. The bare @cargo-fuzz tag form can
+        # resolve with an empty tool input and install nothing (broke the Fuzz
+        # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          workspaces: fuzz
+      # Restore the accumulated corpus for THIS target from the previous run.
+      # libFuzzer only appends coverage-increasing inputs, so this corpus grows
+      # monotonically; the cache is keyed per target so each of the five matrix
+      # legs persists its own discoveries independently. restore-keys falls back
+      # to the newest prior cache for this target+ref if the exact key misses, so
+      # the corpus is never silently reset to the committed seeds alone.
+      - name: Restore persisted corpus
+        uses: actions/cache@v7
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-${{ github.ref }}-
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz ${{ matrix.target }} (5 min, corpus persisted across runs)
+        # Force the gnu host target: cargo-fuzz is installed as a musl-static binary
+        # (via install-action's cargo-binstall fallback) and would otherwise default to
+        # x86_64-unknown-linux-musl, where the ASAN build fails (sanitizer vs static libc).
+        run: cargo +nightly fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=300 -timeout=10
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/**
+          if-no-files-found: ignore

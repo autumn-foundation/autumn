@@ -53,7 +53,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::{Stream, StreamExt as _};
 use serde_json::{Value, json};
@@ -146,6 +146,7 @@ impl McpRuntime {
 /// A single derived MCP tool plus the metadata needed to replay it as an
 /// in-process HTTP request.
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent dispatch flags mirroring ApiDoc metadata
 struct McpTool {
     name: String,
     description: Option<String>,
@@ -161,6 +162,12 @@ struct McpTool {
     /// True for a `#[api_doc(mcp, stream)]` tool whose handler returns an
     /// Autumn `Sse` stream, projected onto the Streamable-HTTP SSE channel.
     streams: bool,
+    /// True for a tool derived from an empty-body-contract route (declared
+    /// 204/205, no response schema). Dispatch enforces the contract by
+    /// returning empty text on success, so a route that mislabels its status
+    /// (e.g. an HTML handler tagged `status = 204`) can't leak its body into
+    /// the tool result.
+    empty_body: bool,
 }
 
 impl McpTool {
@@ -198,6 +205,14 @@ pub(crate) struct McpWiring {
     /// marked [`RateLimitExempt`](crate::security::RateLimitExempt) to avoid
     /// double-counting against the dispatch pipeline's own limiter.
     pub envelope_rate_limited: bool,
+    /// Whether a [`LoadShedLayer`](crate::middleware::LoadShedLayer) wraps the
+    /// `/mcp` envelope (true iff `server.max_concurrent_requests` is
+    /// configured). The dispatch clone (cloned from the already-middleware-
+    /// wrapped router) carries the SAME shared layer instance, so a
+    /// `tools/call` is counted once at the envelope; its replayed dispatch is
+    /// marked [`LoadShedExempt`](crate::middleware::LoadShedExempt) to avoid
+    /// consuming a second slot for the same logical request.
+    pub envelope_load_shed: bool,
 }
 
 /// The shared MCP server state attached to the endpoint handler. Holds the
@@ -233,6 +248,10 @@ pub struct McpServer {
     /// Whether the `/mcp` envelope is rate-limited; gates exempting the
     /// replayed `tools/call` dispatch from the pipeline limiter.
     envelope_rate_limited: bool,
+    /// Whether the `/mcp` envelope is load-shed gated; gates exempting the
+    /// replayed `tools/call` dispatch from double-counting against the same
+    /// shared `LoadShedLayer` instance.
+    envelope_load_shed: bool,
     server_name: String,
     server_version: String,
 }
@@ -365,7 +384,11 @@ fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
     // here from a legitimately body-less route — both leave `request_body`
     // unset. Such routes are a documented non-target for MCP exposure (see
     // `AppBuilder::mount_mcp`): opting one in yields a tool with no body input.
-    if doc.response.is_none() {
+    // Exception: a status whose body is empty *by contract* (e.g. the
+    // repository macro's generated DELETE returning 204) is structurally
+    // distinct from an HTML route's schema-less 200-with-body. It stays
+    // eligible, and dispatch enforces the empty result (see `call_tool`).
+    if doc.response.is_none() && !has_empty_body_contract(doc.success_status) {
         return false;
     }
     if doc.mcp_tool {
@@ -380,6 +403,15 @@ fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
 /// `GET` (and `HEAD`) are read-only; everything else mutates.
 fn is_read_only(method: &str) -> bool {
     matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD")
+}
+
+/// A declared success status whose body is empty *by contract* (RFC 9110):
+/// `204 No Content` and `205 Reset Content`. For these, a missing response
+/// schema is the deliberate shape of the endpoint, not the signal of an
+/// HTML/Maud route. Shared by [`should_expose`] and the warn/skip gate in
+/// [`derive_tools`] so the exemption list lives in exactly one place.
+const fn has_empty_body_contract(status: u16) -> bool {
+    matches!(status, 204 | 205)
 }
 
 /// MCP safety annotations derived purely from the HTTP verb.
@@ -402,7 +434,11 @@ fn annotations_for(method: &str, title: &str) -> Value {
 /// becomes a `query` object property, and the JSON request body becomes a
 /// `body` property. Named component refs are inlined into `$defs` so the
 /// schema is self-contained.
-fn build_input_schema(doc: &ApiDoc, components: &serde_json::Map<String, Value>) -> Value {
+fn build_input_schema(
+    doc: &ApiDoc,
+    components: &serde_json::Map<String, Value>,
+    index: &crate::openapi::SchemaComponentIndex,
+) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required: Vec<Value> = Vec::new();
     let mut defs = serde_json::Map::new();
@@ -427,12 +463,12 @@ fn build_input_schema(doc: &ApiDoc, components: &serde_json::Map<String, Value>)
     }
 
     if let Some(query) = &doc.query_schema {
-        let schema = rewrite_refs(schema_entry_to_value(query), components, &mut defs);
+        let schema = rewrite_refs(schema_entry_to_value(query, index), components, &mut defs);
         properties.insert("query".to_owned(), schema);
     }
 
     if let Some(body) = &doc.request_body {
-        let schema = rewrite_refs(schema_entry_to_value(body), components, &mut defs);
+        let schema = rewrite_refs(schema_entry_to_value(body, index), components, &mut defs);
         properties.insert("body".to_owned(), schema);
         required.push(json!("body"));
     }
@@ -493,6 +529,168 @@ fn rewrite_refs(
     }
 }
 
+/// A build-time quality problem detected in a tool's derived `inputSchema`.
+///
+/// Surfaced as `tracing::warn` from [`derive_tools`] (mirroring the existing
+/// ineligible-route warning) so an author sees it when assembling `/mcp`,
+/// rather than a runtime surprise when an LLM client calls the tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaDegradation {
+    /// The `query` property resolved to a bare `{"type":"object"}` placeholder
+    /// (the arg type has no `OpenApiSchema`), so the tool advertises no query
+    /// fields.
+    OpaqueQuery,
+    /// The `body` property resolved to a bare `{"type":"object"}` placeholder,
+    /// so the tool advertises no body fields.
+    OpaqueBody,
+    /// A `query` field is itself a nested object (or an array of objects) — a
+    /// shape `serde_urlencoded` (which `Query<T>` delegates to) cannot parse,
+    /// so dispatch of such an argument could never round-trip to the handler.
+    NestedQuery,
+}
+
+/// Resolve a schema node through a single `#/$defs/X` indirection (the form
+/// [`rewrite_refs`] inlines), returning the node itself when it is not a ref.
+fn resolve_local_ref<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
+    if let Some(name) = node
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/$defs/"))
+        && let Some(def) = root.get("$defs").and_then(|defs| defs.get(name))
+    {
+        return def;
+    }
+    node
+}
+
+/// True when `schema` is the opaque object placeholder the spec generator emits
+/// for a type with no real `OpenApiSchema` (`{"type":"object","title":…}` with
+/// no `properties`). A derived/registered object always carries a `properties`
+/// key (even if empty), so a legitimately field-less struct is not flagged.
+fn is_opaque_object(schema: &Value) -> bool {
+    schema.get("type").and_then(Value::as_str) == Some("object")
+        && schema
+            .as_object()
+            .is_none_or(|map| !map.contains_key("properties"))
+}
+
+/// True when a `oneOf`/`anyOf` branch is the `{"type":"null"}` arm the
+/// `OpenApiSchema` derive emits for the `None` case of an `Option<T>` field.
+fn is_null_branch(branch: &Value) -> bool {
+    branch.get("type").and_then(Value::as_str) == Some("null")
+}
+
+/// True when `schema` (already ref-resolved) is a nested object or an array of
+/// objects — the shapes flat `serde_urlencoded` query decoding cannot handle.
+///
+/// A nullable query field (`Option<Struct>`, `Option<Vec<Struct>>`) derives to a
+/// `oneOf`/`anyOf` with the nested-shape branch plus a `{"type":"null"}` branch
+/// and therefore carries no top-level `type`; unwrap those wrappers and treat the
+/// field as nested when ANY non-null branch is itself nested, so a nullable
+/// structured query field warns exactly like its non-nullable form (issue #1972).
+fn is_nested_query_shape(root: &Value, schema: &Value) -> bool {
+    if let Some(branches) = schema
+        .get("oneOf")
+        .or_else(|| schema.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        return branches
+            .iter()
+            .filter(|branch| !is_null_branch(branch))
+            .map(|branch| resolve_local_ref(root, branch))
+            .any(|branch| is_nested_query_shape(root, branch));
+    }
+
+    match schema.get("type").and_then(Value::as_str) {
+        // A non-placeholder object nested under a query field.
+        Some("object") => schema
+            .as_object()
+            .is_some_and(|map| map.contains_key("properties")),
+        Some("array") => schema
+            .get("items")
+            .map(|items| resolve_local_ref(root, items))
+            .is_some_and(|items| is_nested_query_shape(root, items)),
+        _ => false,
+    }
+}
+
+/// Inspect a built `inputSchema` for the degradations in [`SchemaDegradation`].
+///
+/// Pure and self-contained (no logging) so it is unit-testable; [`derive_tools`]
+/// turns the results into `tracing::warn` lines with route context.
+fn detect_schema_degradations(
+    input_schema: &Value,
+    has_query: bool,
+    has_body: bool,
+) -> Vec<SchemaDegradation> {
+    let mut out = Vec::new();
+    let props = input_schema.get("properties");
+
+    if has_body
+        && let Some(body) = props.and_then(|p| p.get("body"))
+        && is_opaque_object(resolve_local_ref(input_schema, body))
+    {
+        out.push(SchemaDegradation::OpaqueBody);
+    }
+
+    if has_query && let Some(query) = props.and_then(|p| p.get("query")) {
+        let resolved = resolve_local_ref(input_schema, query);
+        if is_opaque_object(resolved) {
+            out.push(SchemaDegradation::OpaqueQuery);
+        } else if let Some(fields) = resolved.get("properties").and_then(Value::as_object) {
+            // A `Query<T>` whose schema is real but has a nested/object-of-array
+            // field can't round-trip through `serde_urlencoded`.
+            let nested = fields
+                .values()
+                .map(|field| resolve_local_ref(input_schema, field))
+                .any(|field| is_nested_query_shape(input_schema, field));
+            if nested {
+                out.push(SchemaDegradation::NestedQuery);
+            }
+        }
+    }
+
+    out
+}
+
+/// Emit a `tracing::warn` for each degradation in a tool's derived
+/// `inputSchema`, naming the tool and the recommended fix (issue #1972).
+fn warn_on_degraded_input_schema(doc: &ApiDoc, input_schema: &Value) {
+    for degradation in detect_schema_degradations(
+        input_schema,
+        doc.query_schema.is_some(),
+        doc.request_body.is_some(),
+    ) {
+        match degradation {
+            SchemaDegradation::OpaqueBody => tracing::warn!(
+                operation_id = doc.operation_id,
+                method = doc.method,
+                path = doc.path,
+                "MCP tool body has no field-level schema (opaque object); derive or \
+                 impl `OpenApiSchema` on the `Json<T>` body type so the tool advertises \
+                 its real fields instead of a bare `{{\"type\":\"object\"}}` placeholder"
+            ),
+            SchemaDegradation::OpaqueQuery => tracing::warn!(
+                operation_id = doc.operation_id,
+                method = doc.method,
+                path = doc.path,
+                "MCP tool query has no field-level schema (opaque object); derive or \
+                 impl `OpenApiSchema` on the `Query<T>` type so the tool advertises \
+                 its real query parameters instead of a bare `{{\"type\":\"object\"}}` placeholder"
+            ),
+            SchemaDegradation::NestedQuery => tracing::warn!(
+                operation_id = doc.operation_id,
+                method = doc.method,
+                path = doc.path,
+                "MCP tool query advertises a nested object/array-of-object field; \
+                 `Query<T>` decodes with `serde_urlencoded`, which is strictly flat and \
+                 cannot parse nested query parameters — move the structured input to a \
+                 JSON request body (`Json<T>`) so it round-trips losslessly"
+            ),
+        }
+    }
+}
+
 /// Derive the tool catalog from collected route docs.
 ///
 /// Emits a build-time `tracing::warn` for any endpoint that opts into MCP but
@@ -520,15 +718,22 @@ pub fn derive_tools(
         .map(|c| serde_json::to_value(&c.schemas).unwrap_or(Value::Null))
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
+    // Resolve `$ref` component keys through the exact same identity→display-key
+    // mapping the OpenAPI generator used, so a tool's inlined `$defs` refs match
+    // the served component names even when two types share a last segment
+    // (issue #1972).
+    let index = crate::openapi::build_schema_component_index(&refs);
 
     let mut tools = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for doc in docs {
         // Surface the "opted in but ineligible" case as a build-time note.
-        // Streaming tools legitimately have no JSON response schema, so they
-        // are exempt from this "missing response" warning/skip.
+        // Streaming tools legitimately have no JSON response schema, and an
+        // empty-body status (204/205) makes the missing schema the route's
+        // contract, so both are exempt from this "missing response" warn/skip.
         if (doc.mcp_tool || (expose_all && is_read_only(doc.method)))
             && doc.response.is_none()
+            && !has_empty_body_contract(doc.success_status)
             && !doc.mcp_stream
             && !doc.mcp_exclude
             && !doc.hidden
@@ -537,8 +742,10 @@ pub fn derive_tools(
                 operation_id = doc.operation_id,
                 method = doc.method,
                 path = doc.path,
-                "skipping MCP exposure: endpoint has no JSON response schema \
-                 (HTML/Maud routes are not eligible as MCP tools)"
+                "skipping MCP exposure: endpoint has no JSON response schema; \
+                 eligible tools return Json<T>, declare an empty-body status \
+                 (204/205), or opt in as streaming (`stream`/`Route::mcp_stream`) \
+                 — HTML/Maud routes are not eligible"
             );
             continue;
         }
@@ -560,10 +767,12 @@ pub fn derive_tools(
             continue;
         }
         let title = doc.summary.unwrap_or(doc.operation_id);
+        let input_schema = build_input_schema(doc, &components, &index);
+        warn_on_degraded_input_schema(doc, &input_schema);
         tools.push(McpToolInfo {
             name: doc.operation_id.to_owned(),
             description: doc.description.or(doc.summary).map(str::to_owned),
-            input_schema: build_input_schema(doc, &components),
+            input_schema,
             annotations: annotations_for(doc.method, title),
             method: doc.method.to_owned(),
             path_template: doc.path.to_owned(),
@@ -571,6 +780,9 @@ pub fn derive_tools(
             has_body: doc.request_body.is_some(),
             has_query: doc.query_schema.is_some(),
             streams: doc.mcp_stream,
+            empty_body: doc.response.is_none()
+                && has_empty_body_contract(doc.success_status)
+                && !doc.mcp_stream,
         });
     }
     tools
@@ -580,6 +792,7 @@ pub fn derive_tools(
 /// [`derive_tools`] and consumed by the framework when assembling the MCP
 /// endpoint router.
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent dispatch flags mirroring ApiDoc metadata
 pub struct McpToolInfo {
     name: String,
     description: Option<String>,
@@ -591,6 +804,54 @@ pub struct McpToolInfo {
     has_body: bool,
     has_query: bool,
     streams: bool,
+    empty_body: bool,
+}
+
+impl McpToolInfo {
+    /// Tool name advertised in `tools/list` (the route's operation id).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Human-readable description derived from the route's
+    /// `description`/`summary`.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// JSON Schema for the tool's arguments, built from the handler's typed
+    /// contract (path params, query, JSON body).
+    #[must_use]
+    pub const fn input_schema(&self) -> &Value {
+        &self.input_schema
+    }
+
+    /// MCP safety annotations (`readOnlyHint`, `destructiveHint`, `title`)
+    /// derived from the HTTP verb.
+    #[must_use]
+    pub const fn annotations(&self) -> &Value {
+        &self.annotations
+    }
+
+    /// HTTP method the tool dispatches with.
+    #[must_use]
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    /// Route path template the tool dispatches to (e.g. `/api/todos/{id}`).
+    #[must_use]
+    pub fn path_template(&self) -> &str {
+        &self.path_template
+    }
+
+    /// Whether this is a streaming (`Sse`) tool.
+    #[must_use]
+    pub const fn streams(&self) -> bool {
+        self.streams
+    }
 }
 
 impl McpServer {
@@ -611,6 +872,7 @@ impl McpServer {
                 has_body: t.has_body,
                 has_query: t.has_query,
                 streams: t.streams,
+                empty_body: t.empty_body,
             })
             .collect();
         let by_name = tools
@@ -627,6 +889,7 @@ impl McpServer {
             tenant_header: wiring.tenant_header,
             csrf_header: wiring.csrf_header,
             envelope_rate_limited: wiring.envelope_rate_limited,
+            envelope_load_shed: wiring.envelope_load_shed,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -836,6 +1099,10 @@ async fn serve_mcp_get() -> Response {
 /// dispatch sees the same client identity a direct HTTP request would: the
 /// caller's headers, the proxy-resolved client identity, and the connection
 /// peer address (for the IP-keyed rate limiter).
+/// Header name for the `Server-Timing` response header (#1348), forwarded from
+/// the dispatch clone onto the rebuilt JSON-RPC response.
+static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
+
 struct ReplayContext<'a> {
     headers: &'a HeaderMap,
     identity: Option<&'a crate::security::ResolvedClientIdentity>,
@@ -1203,12 +1470,24 @@ async fn serve_tools_call(
             .insert(axum::extract::ConnectInfo(peer));
     }
     // When the `/mcp` envelope is itself rate-limited, this call was already
-    // counted there; mark the replay exempt so the dispatch pipeline's own
-    // limiter doesn't charge a second token for the same tool call.
+    // counted there; mark the replay envelope-counted so the framework-default
+    // limiter (which shares the envelope bucket) doesn't charge a second token
+    // for the same tool call. User/per-route limiters (path overrides,
+    // `#[throttle]`) don't share that bucket and still charge the replay.
     if server.envelope_rate_limited {
         request
             .extensions_mut()
-            .insert(crate::security::RateLimitExempt);
+            .insert(crate::security::RateLimitEnvelopeCounted);
+    }
+    // Likewise for load shedding: the envelope and the dispatch pipeline
+    // share the SAME `LoadShedLayer` instance (same `Arc` in-flight
+    // counter), so without this a `tools/call` would acquire one slot at the
+    // envelope and a second at this replay for the same logical request —
+    // silently halving the effective ceiling for MCP traffic.
+    if server.envelope_load_shed {
+        request
+            .extensions_mut()
+            .insert(crate::middleware::LoadShedExempt);
     }
 
     let response = match server.dispatch.clone().oneshot(request).await {
@@ -1253,6 +1532,21 @@ async fn serve_tools_call(
         return stream_tool_result(id, &params, response, cookies);
     }
 
+    // Capture the dispatch clone's `Server-Timing` header (#1348) so its
+    // non-`total` metrics can be forwarded onto the rebuilt response. The clone
+    // runs the primary `ServerTimingLayer`, which builds the full metric set —
+    // including `db;dur;desc="N queries"` for a DB-backed tool — but that inner
+    // response is discarded when the JSON-RPC envelope is rebuilt below. Without
+    // forwarding, a DB-backed `tools/call` would lose the query count. Only the
+    // non-`total` metrics are forwarded (see the append below); the inner
+    // `total` measured the dispatch clone alone and is dropped in favour of the
+    // outer fallback's real `/mcp` `total`. Captured before the body is
+    // consumed, like `Set-Cookie` above.
+    let mut server_timings: Vec<HeaderValue> = Vec::new();
+    for value in response.headers().get_all(&SERVER_TIMING) {
+        server_timings.push(value.clone());
+    }
+
     // Unlike a normal HTTP response (streamed straight to the socket), the MCP
     // path buffers the whole body to repackage it as a tool result. Cap that
     // buffer so a runaway handler can't OOM the process; report an overflow as
@@ -1275,22 +1569,89 @@ async fn serve_tools_call(
         String::from_utf8_lossy(&bytes).into_owned()
     };
 
-    let value = if status.is_success() {
-        success(id, tool_ok(&text))
+    let value = buffered_tool_result(tool, id, status, &text);
+    let mut resp = json_response(&value);
+    for cookie in cookies {
+        resp.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    // Forward only the inner dispatch's non-`total` `Server-Timing` metrics
+    // (e.g. `db;dur=…;desc="N queries"`) onto the rebuilt response, dropping the
+    // inner `total`. That inner `total` measured only the dispatch clone; it was
+    // captured before this endpoint buffered the body (`to_bytes`), collapsed an
+    // SSE body for a non-SSE client, and repackaged the JSON-RPC envelope, so it
+    // under-reports `/mcp` latency. By NOT marking the outer `ServerTimingEmitted`
+    // sentinel, the fallback `ServerTimingLayer` appends the real `/mcp` `total`
+    // (which brackets that buffering/serialization). Net result on a DB-backed
+    // call: the fallback's true `total` plus the inner `db` metric, with exactly
+    // one `total`. A non-DB call forwards nothing and the fallback emits
+    // total-only.
+    for timing in server_timings {
+        if let Ok(value) = timing.to_str()
+            && let Some(kept) = strip_total_metric(value)
+            && let Ok(hv) = HeaderValue::from_str(&kept)
+        {
+            resp.headers_mut().append(SERVER_TIMING.clone(), hv);
+        }
+    }
+    resp
+}
+
+/// Strip the `total` metric from a `Server-Timing` header value, returning the
+/// remaining comma-separated metrics (e.g. `db;dur=…;desc="N queries"`), or
+/// `None` when only `total` (or nothing usable) was present.
+///
+/// A `Server-Timing` value is a comma-separated list of metrics, each of the
+/// form `name` optionally followed by `;`-separated parameters (`dur`, `desc`).
+/// The metric name is the token before the first `;` or `=`. This keeps the
+/// output W3C-valid and preserves any future non-`total` metrics the inner
+/// pipeline emits.
+fn strip_total_metric(value: &str) -> Option<String> {
+    let kept: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| {
+            let name = entry.split([';', '=']).next().unwrap_or("").trim();
+            !name.eq_ignore_ascii_case("total")
+        })
+        .collect();
+    if kept.is_empty() {
+        None
     } else {
-        success(
+        Some(kept.join(", "))
+    }
+}
+
+/// Package a buffered handler response as the JSON-RPC tool result.
+///
+/// An empty-body-contract tool (declared 204/205, no response schema)
+/// advertises "empty text on success". Enforce that here rather than
+/// trusting the declaration: a handler whose real response carries a body
+/// (e.g. an HTML route mislabeled `status = 204`) must not leak it into the
+/// tool result. Discarding silently would hide the mislabel, so surface it.
+fn buffered_tool_result(tool: &McpTool, id: Value, status: StatusCode, text: &str) -> Value {
+    if !status.is_success() {
+        return success(
             id,
             tool_error(&format!(
                 "handler returned HTTP {}: {text}",
                 status.as_u16()
             )),
-        )
-    };
-    let mut resp = json_response(&value);
-    for cookie in cookies {
-        resp.headers_mut().append(header::SET_COOKIE, cookie);
+        );
     }
-    resp
+    if tool.empty_body {
+        if !text.is_empty() {
+            tracing::warn!(
+                tool = %tool.name,
+                body_len = text.len(),
+                "empty-body-contract tool returned a non-empty body; \
+                 discarding it (the route's declared 204/205 status does \
+                 not match what its handler actually returns)"
+            );
+        }
+        return success(id, tool_ok(""));
+    }
+    success(id, tool_ok(text))
 }
 
 // ── Progressive (SSE) tool-result projection ──────────────────────
@@ -1835,9 +2196,33 @@ mod tests {
             response: Some(SchemaEntry {
                 name: "Todo",
                 kind: SchemaKind::Ref,
+                identity: None,
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn strip_total_metric_drops_only_total() {
+        // Inner `total` is dropped; the `db` metric (with a comma-free quoted
+        // desc) is preserved so the outer fallback's real `/mcp` `total` is the
+        // only one on the response.
+        assert_eq!(
+            strip_total_metric("total;dur=5.000, db;dur=1.250;desc=\"2 queries\""),
+            Some("db;dur=1.250;desc=\"2 queries\"".to_owned())
+        );
+        // Metric order and a leading non-total entry are preserved.
+        assert_eq!(
+            strip_total_metric("app;dur=1.500, total;dur=42.000"),
+            Some("app;dur=1.500".to_owned())
+        );
+        // A total-only header forwards nothing.
+        assert_eq!(strip_total_metric("total;dur=9.000"), None);
+        // The metric-name token is matched case-insensitively before `;`/`=`,
+        // so a bare `total` (no params) is also dropped.
+        assert_eq!(strip_total_metric("Total"), None);
+        // Empty / whitespace-only input yields nothing.
+        assert_eq!(strip_total_metric("  "), None);
     }
 
     #[test]
@@ -1878,6 +2263,81 @@ mod tests {
         d.response = None; // HTML/Maud route
         d.mcp_tool = true;
         assert!(!should_expose(&d, false));
+    }
+
+    #[test]
+    fn no_content_delete_with_opt_in_is_eligible() {
+        // A 204 No Content route (e.g. the repository macro's generated
+        // DELETE) has no response schema *by contract*, not because it is an
+        // HTML route. An explicit opt-in must expose it.
+        let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
+        d.response = None;
+        d.success_status = 204;
+        d.mcp_tool = true;
+        assert!(
+            should_expose(&d, false),
+            "opted-in 204 route is a deliberate empty success contract"
+        );
+    }
+
+    #[test]
+    fn reset_content_205_with_opt_in_is_eligible() {
+        // 205 Reset Content is the other empty-body-by-contract status; the
+        // exemption is a shared predicate, not a hard-coded 204 literal.
+        let mut d = doc("POST", "/api/forms/clear", "clear_form");
+        d.response = None;
+        d.success_status = 205;
+        d.mcp_tool = true;
+        assert!(should_expose(&d, false));
+        let tools = derive_tools(&[d], false, None);
+        assert_eq!(tools.len(), 1, "opted-in 205 route must derive a tool");
+    }
+
+    #[test]
+    fn opted_in_202_is_skipped_not_exposed() {
+        // 202 Accepted does not guarantee an empty body, so a schema-less 202
+        // route stays behind the JSON-out gate even when opted in.
+        let mut d = doc("POST", "/api/enqueue", "enqueue");
+        d.response = None;
+        d.success_status = 202;
+        d.mcp_tool = true;
+        assert!(!should_expose(&d, false));
+        assert!(derive_tools(&[d], false, None).is_empty());
+    }
+
+    #[test]
+    fn no_content_without_opt_in_stays_hidden() {
+        let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
+        d.response = None;
+        d.success_status = 204;
+        assert!(!should_expose(&d, false), "no opt-in => hidden");
+    }
+
+    #[test]
+    fn no_content_under_hatch_pins_behavior() {
+        // A read-only, deliberately body-less endpoint under the whole-API
+        // hatch: 204 is a structural JSON-API signal (unlike an HTML route's
+        // 200-with-body), so the hatch includes it.
+        let mut d = doc("GET", "/api/ping", "ping");
+        d.response = None;
+        d.success_status = 204;
+        assert!(should_expose(&d, true));
+        assert!(!should_expose(&d, false), "still requires hatch or opt-in");
+    }
+
+    #[test]
+    fn derive_tools_keeps_opted_in_no_content_route() {
+        // The "opted in but no JSON response" warn/skip block in
+        // `derive_tools` must not silently drop a 204 route that
+        // `should_expose` accepts.
+        let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
+        d.response = None;
+        d.success_status = 204;
+        d.mcp_tool = true;
+        let tools = derive_tools(&[d], false, None);
+        assert_eq!(tools.len(), 1, "204 opt-in must derive a tool");
+        assert_eq!(tools[0].name, "widget_api_delete");
+        assert_eq!(tools[0].annotations["destructiveHint"], true);
     }
 
     #[test]
@@ -2005,14 +2465,169 @@ mod tests {
         d.request_body = Some(SchemaEntry {
             name: "NewUser",
             kind: SchemaKind::Ref,
+            identity: None,
         });
-        let schema = build_input_schema(&d, &serde_json::Map::new());
+        let schema = build_input_schema(
+            &d,
+            &serde_json::Map::new(),
+            &crate::openapi::SchemaComponentIndex::default(),
+        );
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["id"].is_object());
         assert!(schema["properties"]["body"].is_object());
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("id")));
         assert!(required.contains(&json!("body")));
+    }
+
+    #[test]
+    fn detect_degradation_flags_opaque_body_and_query() {
+        // Both `query` and `body` resolve to the bare object placeholder.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "object", "title": "Q" },
+                "body": { "type": "object", "title": "B" },
+            },
+        });
+        let degradations = detect_schema_degradations(&schema, true, true);
+        assert!(degradations.contains(&SchemaDegradation::OpaqueQuery));
+        assert!(degradations.contains(&SchemaDegradation::OpaqueBody));
+        assert!(!degradations.contains(&SchemaDegradation::NestedQuery));
+    }
+
+    #[test]
+    fn detect_degradation_ignores_field_accurate_schemas() {
+        // A real query object (with `properties`) and a real body: no warning.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": { "page": { "type": "integer" }, "tags": { "type": "array", "items": { "type": "string" } } },
+                },
+                "body": { "$ref": "#/$defs/Real" },
+            },
+            "$defs": { "Real": { "type": "object", "properties": { "a": { "type": "string" } } } },
+        });
+        assert!(detect_schema_degradations(&schema, true, true).is_empty());
+    }
+
+    #[test]
+    fn detect_degradation_flags_nested_query_object_and_array() {
+        // A query field that is itself an object → nested (flat-encoding cannot
+        // round-trip). Also cover an array-of-objects field.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": {
+                        "filter": { "type": "object", "properties": { "min": { "type": "integer" } } },
+                        "rows": { "type": "array", "items": { "type": "object", "properties": { "k": { "type": "string" } } } },
+                    },
+                },
+            },
+        });
+        let degradations = detect_schema_degradations(&schema, true, false);
+        assert!(degradations.contains(&SchemaDegradation::NestedQuery));
+        assert!(!degradations.contains(&SchemaDegradation::OpaqueQuery));
+    }
+
+    #[test]
+    fn detect_degradation_flags_nested_query_via_ref() {
+        // A query field that is a `$ref` to an object def is still nested.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": { "filter": { "$ref": "#/$defs/Filter" } },
+                },
+            },
+            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
+        });
+        assert!(
+            detect_schema_degradations(&schema, true, false)
+                .contains(&SchemaDegradation::NestedQuery)
+        );
+    }
+
+    #[test]
+    fn detect_degradation_flags_nullable_nested_query_field() {
+        // `filter: Option<Filter>` derives to a nullable `oneOf` (the nested
+        // object branch + a `{"type":"null"}` branch) with no top-level `type`.
+        // The detector must still flag it — `serde_urlencoded` cannot decode the
+        // structured value whether or not the field is optional (issue #1972).
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": {
+                        "filter": { "oneOf": [ { "$ref": "#/$defs/Filter" }, { "type": "null" } ] },
+                    },
+                },
+            },
+            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
+        });
+        let degradations = detect_schema_degradations(&schema, true, false);
+        assert!(
+            degradations.contains(&SchemaDegradation::NestedQuery),
+            "nullable nested query field must warn: {degradations:?}"
+        );
+    }
+
+    #[test]
+    fn detect_degradation_flags_nullable_array_of_objects_query_field() {
+        // `filter: Option<Vec<Filter>>` → `oneOf[{array of $ref}, {null}]`.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": {
+                        "filters": { "oneOf": [
+                            { "type": "array", "items": { "$ref": "#/$defs/Filter" } },
+                            { "type": "null" },
+                        ] },
+                    },
+                },
+            },
+            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
+        });
+        assert!(
+            detect_schema_degradations(&schema, true, false)
+                .contains(&SchemaDegradation::NestedQuery),
+            "nullable array-of-objects query field must warn"
+        );
+    }
+
+    #[test]
+    fn detect_degradation_ignores_nullable_scalar_query_field() {
+        // `q: Option<String>` → `oneOf[{type:string}, {type:null}]` and
+        // `tags: Option<Vec<String>>` → `oneOf[{array of scalar}, {null}]`: both
+        // are flat-encodable, so neither may produce a false positive.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": {
+                        "q": { "oneOf": [ { "type": "string" }, { "type": "null" } ] },
+                        "tags": { "oneOf": [
+                            { "type": "array", "items": { "type": "string" } },
+                            { "type": "null" },
+                        ] },
+                    },
+                },
+            },
+        });
+        assert!(
+            !detect_schema_degradations(&schema, true, false)
+                .contains(&SchemaDegradation::NestedQuery),
+            "nullable scalar / scalar-array query fields must NOT warn"
+        );
     }
 
     #[test]
@@ -2037,6 +2652,7 @@ mod tests {
             has_body,
             has_query,
             streams: false,
+            empty_body: false,
         }
     }
 
@@ -2270,6 +2886,7 @@ mod tests {
                 tenant_header: None,
                 csrf_header: "x-csrf-token".to_owned(),
                 envelope_rate_limited: false,
+                envelope_load_shed: false,
             },
         )
     }

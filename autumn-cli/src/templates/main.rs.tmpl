@@ -4,7 +4,23 @@ use autumn_web::prelude::*;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
+// Embed the `static/` tree (and its fingerprint manifest) into the binary for
+// single-binary deploys. Active only when built with the `embed-assets` feature
+// (`autumn build --embed`); in dev the app serves from disk for hot-reload.
+#[cfg(feature = "embed-assets")]
+static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();
+
+// `flash` carries one-shot notices set with `flash.success(...)` before a
+// redirect. Pass `flash_messages(&flash.consume().await)` from your handlers;
+// it renders any pending messages (and clears them) and is harmless when empty.
+//
+// `current_path` (from the `CurrentPath` extractor) lets nav_bar mark the
+// link matching the current page with `aria-current="page"`.
+pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+    let nav = NavBarConfig::new()
+        .brand("{{project_name}}", "/")
+        .aria_label("Main navigation")
+        .item(NavItem::link("/", "Home"));
     maud::html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -12,16 +28,19 @@ pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href="/static/css/app.css";
+                (javascript_include_tag("htmx"))
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
             }
             body {
                 (skip_link("#main-content", "Skip to main content"))
                 header role="banner" {
-                    nav aria-label="Main navigation" {
-                        a href="/" { "{{project_name}}" }
-                    }
+                    (nav_bar(current_path, &nav))
                 }
                 main id="main-content" role="main" {
+                    (flash)
                     (content)
                 }
                 footer role="contentinfo" {
@@ -33,8 +52,8 @@ pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
 }
 
 #[get("/")]
-async fn index() -> maud::Markup {
-    layout("Welcome", maud::html! {
+async fn index(flash: Flash, path: CurrentPath) -> maud::Markup {
+    layout("Welcome", path.as_str(), flash_messages(&flash.consume().await), maud::html! {
         h1 { "Welcome to {{project_name}}!" }
         p { "Edit " code { "src/main.rs" } " to get started." }
     })
@@ -52,9 +71,16 @@ async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
 
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
+    let app = autumn_web::app()
         .routes(routes![index, hello, hello_name])
-        .migrations(MIGRATIONS)
+        .migrations(MIGRATIONS);
+
+    // Single-binary deploys: serve static assets (and i18n locales) from the
+    // binary when built with `autumn build --embed`.
+    #[cfg(feature = "embed-assets")]
+    let app = app.embedded_static(&EMBEDDED_STATIC);
+
+    app
         .run()
         .await;
 }

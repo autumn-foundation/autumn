@@ -25,6 +25,22 @@
 //! 4. **Read-only mode** – when `readonly = true`, `GET`, `HEAD`, and
 //!    `OPTIONS` requests pass through; write methods are gated.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -46,6 +62,42 @@ pub const DEFAULT_HEALTH_PREFIX: &str = "/actuator";
 /// Retry-After value (seconds) sent in every 503 response.
 const RETRY_AFTER_SECS: &str = "120";
 
+/// Whether `path` matches a health/actuator prefix used by admission-style
+/// gates (maintenance mode, load shedding — see
+/// [`crate::middleware::load_shed`]): an empty prefix or `"/"` matches only
+/// the root path; otherwise `path` must equal the prefix exactly or start
+/// with the prefix followed by a `/` segment boundary.
+///
+/// `prefix_with_slash` must be `prefix` with a trailing `/` appended (or
+/// `prefix` itself if it already ends in `/`) — see
+/// [`prefix_with_trailing_slash`]. Callers precompute this once at
+/// construction time instead of reallocating it on every request, so this
+/// function itself never allocates.
+///
+/// Shared by [`MaintenanceService::gate_request`] and
+/// [`crate::middleware::load_shed::LoadShedService`] so the two gates cannot
+/// silently diverge on edge cases (e.g. an empty configured prefix).
+pub(crate) fn health_prefix_matches(path: &str, prefix: &str, prefix_with_slash: &str) -> bool {
+    if prefix.is_empty() || prefix == "/" {
+        path == "/"
+    } else {
+        path == prefix || path.starts_with(prefix_with_slash)
+    }
+}
+
+/// Precompute the trailing-slash form of `prefix` for
+/// [`health_prefix_matches`], once at construction time.
+pub(crate) fn prefix_with_trailing_slash(prefix: &str) -> String {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_owned()
+    } else {
+        let mut s = String::with_capacity(prefix.len() + 1);
+        s.push_str(prefix);
+        s.push('/');
+        s
+    }
+}
+
 /// Tower [`Layer`] that adds maintenance-mode gating to a service.
 ///
 /// Clone this layer and call [`with_health_prefix`](Self::with_health_prefix)
@@ -54,6 +106,7 @@ const RETRY_AFTER_SECS: &str = "120";
 pub struct MaintenanceLayer {
     state: MaintenanceState,
     health_prefix: String,
+    health_prefix_slash: String,
     bypass_paths: Vec<String>,
     probe_paths: Vec<String>,
 }
@@ -64,9 +117,12 @@ impl MaintenanceLayer {
     /// Uses `/actuator` as the health-check prefix by default.
     #[must_use]
     pub fn new(state: MaintenanceState) -> Self {
+        let health_prefix = DEFAULT_HEALTH_PREFIX.to_owned();
+        let health_prefix_slash = prefix_with_trailing_slash(&health_prefix);
         Self {
             state,
-            health_prefix: DEFAULT_HEALTH_PREFIX.to_owned(),
+            health_prefix,
+            health_prefix_slash,
             bypass_paths: Vec::new(),
             probe_paths: Vec::new(),
         }
@@ -80,6 +136,7 @@ impl MaintenanceLayer {
     #[must_use]
     pub fn with_health_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.health_prefix = prefix.into();
+        self.health_prefix_slash = prefix_with_trailing_slash(&self.health_prefix);
         self
     }
 
@@ -108,6 +165,7 @@ impl<S> Layer<S> for MaintenanceLayer {
             inner,
             state: self.state.clone(),
             health_prefix: self.health_prefix.clone(),
+            health_prefix_slash: self.health_prefix_slash.clone(),
             bypass_paths: self.bypass_paths.clone(),
             probe_paths: self.probe_paths.clone(),
         }
@@ -120,6 +178,7 @@ pub struct MaintenanceService<S> {
     inner: S,
     state: MaintenanceState,
     health_prefix: String,
+    health_prefix_slash: String,
     bypass_paths: Vec<String>,
     probe_paths: Vec<String>,
 }
@@ -136,19 +195,7 @@ impl<S> MaintenanceService<S> {
     ) -> Option<Response<Body>> {
         // 1. Actuator/health routes and configured bypass paths always pass through.
         let path = req.uri().path();
-        let health_matched = if self.health_prefix.is_empty() || self.health_prefix == "/" {
-            path == "/"
-        } else {
-            path == self.health_prefix
-                || if self.health_prefix.ends_with('/') {
-                    path.starts_with(&self.health_prefix)
-                } else {
-                    let mut prefix_slash = self.health_prefix.clone();
-                    prefix_slash.push('/');
-                    path.starts_with(&prefix_slash)
-                }
-        };
-        if health_matched {
+        if health_prefix_matches(path, &self.health_prefix, &self.health_prefix_slash) {
             return None;
         }
         for probe in &self.probe_paths {
@@ -241,6 +288,10 @@ where
 {
     type Output = Result<Response<Body>, E>;
 
+    #[allow(
+        clippy::expect_used,
+        reason = "unreachable: future not polled after Ready"
+    )]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             MaintenanceFutureProj::ShortCircuit { response } => Poll::Ready(Ok(response
@@ -293,6 +344,7 @@ fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
 }
 
 /// Build a 503 response with the appropriate content type.
+#[allow(clippy::expect_used, reason = "infallible: static 503 response")]
 fn build_503_response<B>(req: &Request<B>, config: &MaintenanceConfig) -> Response<Body> {
     let message = config
         .message

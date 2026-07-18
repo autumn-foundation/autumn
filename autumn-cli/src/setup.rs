@@ -8,7 +8,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 
 /// Pinned Tailwind CSS release version.
@@ -170,24 +169,9 @@ pub fn verify_checksum(expected: &str, actual: &str) -> Result<(), SetupError> {
 }
 
 fn download_with_progress(url: &str, dest: &Path) -> Result<(), SetupError> {
-    let response = reqwest::blocking::Client::new()
-        .get(url)
-        .send()?
-        .error_for_status()?;
-
-    let total = response.content_length().unwrap_or(0);
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template("  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-            .expect("valid progress template")
-            .progress_chars("=> "),
-    );
-
+    let bytes = crate::http::fetch_bytes(url)?;
     let mut file = fs::File::create(dest)?;
-    let bytes = response.bytes()?;
-    pb.set_length(bytes.len() as u64);
     file.write_all(&bytes)?;
-    pb.finish_and_clear();
     Ok(())
 }
 

@@ -10,44 +10,145 @@ homepage = "https://github.com/madmax983/autumn"
 readme = "../README.md"
 keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
+autotests = false
 
 [[bin]]
 name = "autumn"
 path = "src/main.rs"
 
+[features]
+# On by default so the shipped/release `autumn` binary can diagnose
+# `[server.tls]` (issue #1603): `autumn doctor` validates the configured
+# certificate + key and warns on near-expiry. Turning it off drops the TLS
+# certificate inspection from `autumn doctor` (the check then reports a Warn
+# explaining the feature is disabled). Enabling it turns on `autumn-web`'s
+# `tls` feature, whose `autumn_web::tls::inspect_leaf` does the offline
+# certificate parsing.
+# Default = the Postgres CLI: `tls` (below) plus the `postgres` bundle, which
+# carries the pg-only `autumn-web` features that predate — and do not compile
+# under — the sqlite backend-flip. The DEFAULT build enables exactly the same
+# `autumn-web` feature set as before (nothing dropped); only the feature GRAPH
+# is refactored so the mutually-exclusive `sqlite` build can select a
+# sqlite-compatible set.
+default = ["tls", "postgres"]
+tls = ["autumn-web/tls"]
+# The pg-only `autumn-web` features the CLI enables that assume the Postgres
+# runtime and fail to compile under the `sqlite` backend-flip. Only `mail`
+# (its `DbSuppressionStore` is hard-typed to `Pool<AsyncPgConnection>`) is a
+# genuine breaker today; it is grouped here (rather than left unconditionally on)
+# so the `sqlite` build — which excludes the `postgres` bundle — resolves a
+# mail-free `autumn-web` set that mirrors what autumn-web's OWN sqlite CI builds.
+# The CLI's own source references NO `autumn_web::mail` symbol (only generated
+# string literals), so no source `#[cfg]` gating is needed. Kept in `default`,
+# so a normal `cargo build -p autumn-cli` is byte-for-byte identical to before.
+postgres = ["autumn-web/mail"]
+# Mirrors autumn-web's `acme` feature (issue #1608). The `autumn doctor` ACME
+# preflight checks compile in every build (they only need `std`), but enabling
+# this keeps CLI/library feature parity and turns on `autumn-web/acme` for any
+# future ACME-aware CLI tooling. Implies `tls` (ACME builds on it).
+acme = ["tls", "autumn-web/acme"]
+# SQLite backend-flip for the CLI's `autumn schema migrate` (issue #1975 slice 6,
+# on top of autumn-web's #1614 sqlite runtime lane). Non-default and MUTUALLY
+# EXCLUSIVE with the default Postgres backend: it turns on `autumn-web/sqlite`,
+# which flips autumn-web's `RuntimeConnection` type alias from Postgres to SQLite
+# for the WHOLE build graph, and pulls diesel's sqlite migration backend. Because
+# cargo feature unification is global AND the `postgres` bundle (a default
+# feature) pulls the pg-only `mail` path that does not compile under the flip,
+# the sqlite CLI MUST be built with default features OFF:
+#   `cargo build -p autumn-cli --no-default-features --features sqlite`
+# NEVER `--all-features` (co-enables the Postgres path and fails to compile), and
+# never co-built with the `postgres` bundle. Default builds target Postgres and
+# reference no SQLite symbol. (See autumn-web's `sqlite` feature for parity.)
+sqlite = ["autumn-web/sqlite", "diesel_migrations/sqlite"]
+
 [dependencies]
-autumn-web = { version = "0.5.0", path = "../autumn", default-features = false, features = ["db", "htmx", "maud"] }
+autumn-web = { version = "0.6.0", path = "../autumn", default-features = false, features = [
+    "db", "htmx", "maud", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting"
+] }
+autumn-schema-core = { path = "../autumn-schema-core" }
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+diesel = { workspace = true }
+# File-based migration source (`FileBasedMigrations`) for `autumn schema migrate`.
+# Backend-agnostic: the pg/sqlite `MigrationSource` impls come from the `diesel`
+# backend features (both on via the workspace pin). The `sqlite` CLI feature
+# additionally enables `diesel_migrations/sqlite` for parity with the flip.
+diesel_migrations = { workspace = true }
 crossterm = "0.29"
 ctrlc = "3.5.2"
 getrandom = "0.4"
 hex = "0.4"
 hmac = "0.12"
+include_dir = "0.7"
 indicatif = "0.18"
 notify = "8"
 notify-debouncer-mini = "0.7"
 ratatui = "0.30"
 reqwest = { version = "0.13", features = ["blocking", "json", "rustls", "multipart", "cookies"], default-features = false }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = "0.10"
 syn = { workspace = true }
-thiserror = "2"
-toml = "1.1"
+quote = { workspace = true }
+proc-macro2 = { workspace = true, features = ["span-locations"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+url = "2.5.8"
+whoami = "2"
+percent-encoding = "2.3"
 
 tempfile = "3"
+directories = "6.0.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31.2", features = ["fs", "signal"] }
+nix = { version = "0.31.2", features = ["fs", "signal", "socket", "user"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["blocking", "rustls"], default-features = false }
 proptest = "1.4"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
-testcontainers = { workspace = true }
+# `blocking` enables the synchronous `SyncRunner` used by the deploy_e2e harness
+# (which is a procedural, non-async test).
+testcontainers = { workspace = true, features = ["blocking"] }
 testcontainers-modules = { workspace = true }
-tokio = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "cli_tests"
+path = "tests/cli_tests.rs"
+
+[[test]]
+name = "flags"
+path = "tests/flags.rs"
+
+[[test]]
+name = "config"
+path = "tests/config.rs"
+
+[[test]]
+name = "experiments"
+path = "tests/experiments.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+
+[[test]]
+name = "generate"
+path = "tests/generate.rs"
+
+# Isolated per CLAUDE.md: the AC-7 deploy end-to-end test (#1607, Slice 4) spawns
+# privileged systemd containers over real ssh/scp and is targeted independently in
+# the Docker-dependent CI step, so it is NOT part of the consolidated cli_tests.
+[[test]]
+name = "deploy_e2e"
+path = "tests/deploy_e2e.rs"

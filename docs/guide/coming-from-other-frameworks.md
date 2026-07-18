@@ -253,6 +253,13 @@ Both frameworks provide actuator endpoints out of the box:
 | `/actuator/loggers`      | `/actuator/loggers`            |
 | `/actuator/scheduledtasks` | `/actuator/scheduledtasks`   |
 
+Like Spring Boot's `loggers` actuator endpoint, Autumn's logger levels reload
+live -- `LogLevels::set_logger_level(name, level)` flips a target's level at
+runtime (with `current_level()` / `logger_overrides()` to inspect), no restart
+required. And just as `/actuator/info` surfaces git/build info, Autumn's
+`/actuator/info` carries a `BuildProvenance` (git SHA plus build metadata) via
+`build_provenance()`.
+
 ---
 
 ## Coming From Django
@@ -340,6 +347,17 @@ pub struct Post {
 | `get_object_or_404()`   | `.map_err(AutumnError::not_found)?`   |
 | `model.save()`          | `diesel::insert_into(...).values(...)` |
 | `ModelSerializer`       | `#[derive(Serialize, Deserialize)]` (via serde) |
+| `.iterator()` / chunking | `repo.find_each(500)` / `repo.find_in_batches(1000)` (keyset) |
+| `get_or_create()`       | `repo.find_or_create_by_slug(slug, &new_post).await` → `(Model, bool)` |
+| `.values(...).annotate(Count(...))` | `repo.count_grouped_by_<col>().load().await` |
+
+`find_each` / `find_in_batches` stream rows in keyset (PK cursor) batches --
+the Django `.iterator()` / chunking pattern without loading everything into
+memory. `find_or_create_by_<field>` is the race-safe `get_or_create()`
+equivalent, returning `(Model, created)`. Grouped aggregates
+(`count_grouped_by_x`, `sum_y_grouped_by_x`, plus avg/min/max) map to
+`.values(...).annotate(Count/Sum)` and return a builder with `.filter_eq`,
+`.filter_range`, and `.bucket`.
 
 Django generates migrations from model changes. In Autumn, you write SQL
 migrations by hand (or use `diesel migration generate`). The tradeoff: more
@@ -378,6 +396,11 @@ level = "debug"
 | `os.environ.get('DB_URL')`      | `AUTUMN_DATABASE__URL`           |
 | `DEBUG = True`                  | Auto (`dev` profile in debug builds) |
 | Middleware list in `settings.py` | Tower layers, `#[intercept]`    |
+
+Where Django reaches for `django-environ` or `python-dotenv`, Autumn
+auto-loads a `.env` file in the `dev` and `test` profiles (real OS env always
+wins), and `autumn new` scaffolds a `.env.example` to document the keys your
+app expects.
 
 ### Templates
 
@@ -485,6 +508,10 @@ No `resources :posts` shorthand yet. You declare each route explicitly. The
 `#[repository]` macro gives you the CRUD methods, but you wire routes
 manually.
 
+For the view side, `form_for(&changeset, "/posts", "post").csrf(tok).render()`
+mirrors Rails' `form_for` / `form_with` -- a changeset-backed form builder that
+renders fields (and errors) bound to your model.
+
 ### Active Record vs. Diesel
 
 | Rails (Active Record)        | Autumn (Diesel)                          |
@@ -496,6 +523,9 @@ manually.
 | `post.update!(title: "new")` | `diesel::update(posts::table.find(id)).set(...)` |
 | `post.destroy`              | `diesel::delete(posts::table.find(id))` |
 | `Post.count`                | `posts::table.count().get_result(&mut *db)` |
+| `Post.find_each` / `find_in_batches` | `repo.find_each(500)` / `repo.find_in_batches(1000)` (exact namesakes) |
+| `Post.find_or_create_by(...)` | `repo.find_or_create_by_slug(slug, &new_post).await` → `(Model, bool)` |
+| `Post.group(:x).count` / `.sum` | `repo.count_grouped_by_x()` / `repo.sum_y_grouped_by_x()` |
 | Callbacks (`before_save`)   | Mutation hooks (`#[repository(Post, hooks = MyHooks)]`) |
 
 Or use the `#[repository]` macro for a higher-level API:
@@ -508,6 +538,12 @@ repo.update(1, &changes).await  // post.update!(attrs)
 repo.delete_by_id(1).await      // post.destroy
 repo.count().await               // Post.count
 ```
+
+A few of these are exact namesakes of Active Record: `find_each` and
+`find_in_batches` batch by keyset (PK cursor) just like Rails, and
+`find_or_create_by_<field>` is the race-safe twin of `find_or_create_by`
+(returning `(Model, created)`). Grouped aggregates -- `count_grouped_by_x`,
+`sum_y_grouped_by_x` -- stand in for `group(:x).count` / `.sum`.
 
 ### Migrations
 
@@ -597,6 +633,13 @@ No Redis or external job queue is needed for simple scheduled tasks. For
 durable request-triggered background work with retries, use Autumn's `#[job]`
 runtime.
 
+Testing enqueues feels familiar too: the test client's `assert_job_enqueued`
+and `assert_job_enqueued_with(name, json)` mirror ActiveJob's
+`assert_enqueued_with` (with `perform_enqueued_jobs().await` to drain them).
+And where Rails 7.2 reaches for `rate_limit` (or rack-attack), Autumn's
+`#[throttle(limit = 5, per = "1m", key = "ip")]` applies per-route rate
+limiting -- placed outermost, above `#[get]` / `#[post]`.
+
 For Temporal, Celery canvas, Sidekiq batches, Spring Batch, or Camunda-style
 orchestration, use Autumn Harvest. Harvest is the companion workflow engine for
 workflow history, long-running activities, timers, and singleton execution
@@ -615,7 +658,47 @@ own release train instead of being required by core web examples.
 | Config file           | `config/database.yml`      | `autumn.toml`                 |
 | Profile config        | `config/environments/`     | `autumn-{profile}.toml`       |
 
+The CLI keeps the Rails muscle memory, too: `autumn test` (with `--reset`)
+spins up an isolated test DB and runs the suite like `rails test` /
+`rails db:test:prepare`, `autumn destroy` is the exact namesake of
+`rails destroy` for reverting a generator, and `autumn i18n check` gives you
+an i18n-tasks-style health report on missing and unused translation keys.
+
 ---
+
+## Recently Added: Cross-Framework Feature Map
+
+The features below landed in the latest release wave; this table maps the idiom
+you'd search for in each framework to the Autumn API that covers it. (A few
+teased items are *not* in this wave yet: a charts widget, password-policy +
+remember-me, and a query-count test assertion -- only a dev-mode N+1 inspector,
+`detect_n_plus_one`, exists today.)
+
+| Area        | Autumn                                                                              | Rails                                | Django                               | Laravel                              | Phoenix                              |
+|-------------|-------------------------------------------------------------------------------------|--------------------------------------|--------------------------------------|--------------------------------------|--------------------------------------|
+| Data        | `find_each`, `find_in_batches` (repo methods, keyset)                               | `find_each`, `find_in_batches`       | `.iterator()`                        | `chunk()`, `cursor()`                | `Repo.stream`                        |
+| Data        | `find_or_create_by_<field>` → `(Model, bool)`                                        | `find_or_create_by`                  | `get_or_create()`                    | `firstOrCreate()`                    | `Repo` upsert (`on_conflict`)        |
+| Data        | grouped aggregates: `count_grouped_by_x`, `sum_y_grouped_by_x`                       | `group(:x).count` / `.sum`           | `.values(...).annotate(Count/Sum)`   | `groupBy()->selectRaw`               | `Repo.aggregate` / `group_by`        |
+| Data        | `#[state_machine(transitions(...))]` (on a `#[model]` String field)                  | AASM / Statesman gems                | `django-fsm`                         | `spatie/laravel-model-states`        | `Machinery`                          |
+| Data        | audit actor attribution (`VersionEntry.actor`, `Model::history(...)`)                | paper_trail (`whodunnit`)            | django-simple-history                | `owen-it/laravel-auditing`           | `ex_audit`                           |
+| Web         | `form_for(&changeset, action, method)`                                               | `form_for`, `form_with`              | `ModelForm`                          | `Form::model()` (LaravelCollective)  | `<.form for={@form}>`                |
+| Web         | `Download` + HTTP Range/206 (`Download::from_bytes(...).into_response_ranged(&headers).await`)            | `send_file`, `send_data`             | `FileResponse` (Range)               | `response()->download()`             | `send_download`                      |
+| Web         | `cache_for(Duration)` → `CacheControl` (defaults `private`)                          | `expires_in`, `fresh_when`           | `cache_control` decorator            | `Cache-Control` header               | `Plug.Conn` cache headers            |
+| Web         | `Feed::atom(...)`, `Feed::rss(...)` (impl `IntoResponse`)                            | `atom_feed` builder                  | `django.contrib.syndication`         | `spatie/laravel-feed`                | —                                    |
+| Web         | Server-Timing header (`[observability] server_timing = true`)                        | rack-mini-profiler (manual)          | manual                               | manual                               | manual                               |
+| Realtime    | resumable SSE via Last-Event-ID (`sse::stream_resumable(...)`, `LastEventId`)        | `ActionController::Live`             | channels SSE                         | Broadcasting / SSE                   | Phoenix Channels / LiveView          |
+| Mail        | suppression list (`SuppressionStore`, `MailBuilder::ignore_suppression()`)           | provider-side                        | `django-post-office`                 | provider-side                        | Swoosh / Bamboo                      |
+| Mail        | CSS inlining at send (`MailBuilder::inline_css(true)`)                               | premailer-rails                      | Roadie                               | premailer                            | premailer                            |
+| Concurrency | distributed advisory `Lock` (`Lock::new(...).try_lock()` / `.lock()`)               | `with_advisory_lock` gem             | `select_for_update` / advisory       | `Cache::lock()`                      | `:global` / Postgrex advisory        |
+| Config      | `.env` auto-load in dev/test (+ `.env.example`)                                      | `dotenv-rails`                       | `django-environ`                     | built-in `.env` (phpdotenv)          | `Dotenvy`                            |
+| Security    | `#[throttle(limit = 5, per = "1m", key = "ip")]`                                     | rack-attack, `rate_limit`            | `django-ratelimit`, DRF throttling   | `throttle:60,1` middleware           | `PlugAttack` / Hammer                |
+| UI          | htmx `toast()` / `toast_region()` + `infinite_feed()` / `feed_page()` widgets        | Turbo Streams + flash                | messages framework                   | Livewire / Blade                     | LiveView streams (`phx-update`)      |
+| Testing     | `TestClient::acting_as(user_id)` (+ `login_as`, `log_out`), cookie-jar client        | `sign_in` (Devise)                   | `force_login()`                      | `actingAs()` (exact namesake)        | `log_in_user` conn helper            |
+| Testing     | job recorder asserts (`assert_job_enqueued`, `assert_job_enqueued_with`)             | `assert_enqueued_with` (ActiveJob)   | —                                    | `Queue::fake()`, `Bus::fake()`       | `Oban.Testing` `assert_enqueued`     |
+| CLI         | `autumn test [--reset]` (isolated test DB + run suite)                               | `rails test`, `rails db:test:prepare`| `manage.py test`                     | `php artisan test`                   | `mix test`                           |
+| CLI         | `autumn destroy <generator>` (revert a generator)                                   | `rails destroy` (exact namesake)     | —                                    | —                                    | —                                    |
+| CLI         | `autumn i18n check [--strict]` (missing/unused keys)                                 | `i18n-tasks health`                  | `makemessages` / lint                | lang linters                         | `gettext.extract --check-up-to-date` |
+| Ops         | actuator live logger reload + `/info` provenance (`LogLevels::set_logger_level`, `BuildProvenance`) | —                     | —                                    | Telescope / Horizon                  | —                                    |
 
 ## Concept Translation Cheat Sheet
 
@@ -643,6 +726,11 @@ own release train instead of being required by core web examples.
 | CLI                    | Spring CLI             | `manage.py`           | `rails`                | `autumn`                        |
 | Hot reload             | Spring DevTools        | Auto-reload           | `rails s`              | `autumn dev`                    |
 | Request inspector / N+1 detection | `rack-mini-profiler` + `bullet` | Django Debug Toolbar | `rack-mini-profiler` + `bullet` | `/_autumn/inspect` (dev only) |
+| Batched iteration      | N/A (JPA scroll)       | `.iterator()`         | `find_each` / `find_in_batches` | `repo.find_each(500)` / `repo.find_in_batches(1000)` |
+| Find-or-create         | `getOrSave`            | `get_or_create()`     | `find_or_create_by`    | `repo.find_or_create_by_slug(slug, &new_post)` |
+| Env file loading       | `.env` (spring-dotenv) | `django-environ`      | `dotenv-rails`         | `.env` auto-load (dev/test)     |
+| Response cache headers | `@Cacheable` / `Cache-Control` | `cache_control` decorator | `expires_in` / `fresh_when` | `cache_for(Duration)` → `CacheControl` |
+| Model-bound form       | Thymeleaf `th:object`  | `ModelForm`           | `form_for` / `form_with` | `form_for(&changeset, action, method)` |
 
 ---
 

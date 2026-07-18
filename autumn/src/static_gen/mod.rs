@@ -63,6 +63,22 @@ pub mod isr_coordinator;
 mod middleware;
 mod types;
 
+/// Request-extension marker for the internal `oneshot` render calls made by
+/// `autumn build` and ISR background regeneration.
+///
+/// These renders drive a `#[static_get]` GET route directly to capture its HTML
+/// — there is no inbound client connection whose `request_timeout_ms` deadline
+/// should apply, and a legitimately slow prerender must not fail the build or
+/// skip an ISR refresh with a `503`. The request-timeout middleware skips its
+/// deadline whenever this marker is present on the request.
+///
+/// Live inbound requests to the same route (a manifest miss, no `dist`, or a
+/// cache read that falls through to the dynamic router) do NOT carry this
+/// marker, so they remain bounded by the configured deadline. This scopes the
+/// build/ISR exemption to internal renders instead of the live route metadata.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderDeadlineExempt;
+
 pub use build::{BuildError, render_static_routes};
 #[cfg(feature = "db")]
 pub use isr_coordinator::PostgresIsrCoordinator;

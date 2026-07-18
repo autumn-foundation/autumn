@@ -124,6 +124,248 @@ RETURNING *;
 
 ---
 
+## 6. Race-safe get-or-insert: `find_or_create_by_<field>` *(unreleased)*
+
+The classic "find it, and if it isn't there create it" pattern is a **TOCTOU
+race**: between your `find_by_slug` returning empty and your `insert` landing,
+another request can insert the same key — and one of you gets a Postgres
+`23505` unique-violation (which also aborts the surrounding transaction).
+
+Declare the lookup in the repository trait (just the lookup fields — the `new`
+value is added for you):
+
+```rust
+#[autumn_web::repository(Subreddit)]
+pub trait SubredditRepository {
+    /// Backed by `CREATE UNIQUE INDEX ... ON subreddits (slug)`.
+    fn find_or_create_by_slug(slug: String);
+}
+```
+
+This generates an inherent method on `PgSubredditRepository`:
+
+```rust
+pub async fn find_or_create_by_slug(
+    &self,
+    slug: String,
+    new: &NewSubreddit,
+) -> AutumnResult<(Subreddit, bool)>;
+```
+
+Call it and branch on the returned `created` flag if you care:
+
+```rust
+let (community, created) = repo
+    .find_or_create_by_slug(slug.clone(), &new_sub)
+    .await?;
+if created {
+    tracing::info!(%slug, "created new community");
+}
+```
+
+Composite keys use `_and_`, matching a **composite** unique index:
+
+```rust
+// UNIQUE (user_id, list_id)
+fn find_or_create_by_user_id_and_list_id(user_id: i64, list_id: i64);
+```
+
+### The `(Model, bool)` return
+
+The method returns `(model, created)`. `created == true` **only** when this call
+actually inserted the row. When a matching row already exists — or when a
+concurrent caller won the insert race — you get the existing row with
+`created == false`.
+
+### How it stays race-safe
+
+1. **Preliminary lookup** on the read path (replica-eligible, honoring tenant
+   scoping and soft-delete). A hit returns `(row, false)` immediately and fires
+   **no** hooks.
+2. Otherwise **insert on the primary** with `INSERT ... ON CONFLICT DO NOTHING`.
+   `ON CONFLICT DO NOTHING` is the crux: instead of raising `23505` (and
+   poisoning the transaction), Postgres silently skips a conflicting insert.
+   - If a row comes back, this call created it → `(row, true)`, and create/commit
+     hooks fire.
+   - If nothing comes back, a concurrent caller won → the method re-reads the
+     row **on the primary** (read-your-writes) and returns `(row, false)` with no
+     hooks.
+
+Under 10+ concurrent callers for the same key, exactly one row exists
+afterward, exactly one caller observes `created == true`, and **no
+unique-violation ever surfaces to any caller.**
+
+### Hooks and replica routing
+
+- Lifecycle hooks (`before_create` / `after_create` and the durable
+  `after_create_commit` commit-hook queue) fire **only on the created path** —
+  never when the preliminary lookup finds an existing row.
+- One caveat: `before_create` runs *before* the `ON CONFLICT DO NOTHING` insert,
+  so when a concurrent caller wins the insert race the loser's `before_create`
+  has already executed — and any DB writes it made inside the transaction still
+  commit even though that caller's row ends up *not* created (it returns
+  `created == false`). Only `after_create` and the `after_create_commit` commit
+  hooks are guaranteed to run **exclusively** on the created path. Keep
+  `before_create` side effects idempotent, or move create-only work into
+  `after_create`.
+- Unlike `upsert_many`, `find_or_create_by_*` **is** generated on repositories
+  that configure `hooks = ...`. Because the found-vs-created decision is made
+  before any hook runs, there is no hook-bypass hazard.
+- The lookup may run on a replica; the insert and the read-your-writes re-lookup
+  always run on the primary, consistent with `on_primary()` write routing.
+
+### You must have a unique constraint (AC6)
+
+**Race-safety depends entirely on a unique constraint (or unique index)
+covering the lookup column(s).** `ON CONFLICT DO NOTHING` only skips inserts
+that violate a constraint — with no matching constraint, two concurrent callers
+will each insert a row and you get duplicates. The method cannot detect a
+missing constraint at compile time, so this is on you:
+
+- Single-field `find_or_create_by_slug` → `UNIQUE (slug)`.
+- Composite `find_or_create_by_a_and_b` → `UNIQUE (a, b)`.
+- On a `tenant_scoped` repository the unique index should include `tenant_id`
+  (e.g. `UNIQUE (tenant_id, slug)`) so the constraint and the tenant-filtered
+  re-lookup agree.
+- On a `soft_delete` repository the unique constraint **must be a partial index
+  scoped `WHERE deleted_at IS NULL`** (e.g.
+  `CREATE UNIQUE INDEX ... ON subreddits (slug) WHERE deleted_at IS NULL`).
+  With a plain (non-partial) unique index, a soft-deleted row keeps occupying
+  the unique slot: the insert conflicts with it, while the `deleted_at IS NULL`
+  lookup can't see it — so the re-lookup finds nothing and the method returns
+  the internal error below. A partial index frees the slot the moment a row is
+  soft-deleted, keeping the constraint and the filtered lookup in agreement.
+
+If an insert conflicts but the follow-up re-lookup finds nothing — the tell-tale
+sign that the conflict fired on a *different* constraint than the one you're
+looking up by — the method returns a clear internal error rather than silently
+looping or lying. Only `_and_` composites are supported; `_or_` is **rejected**
+at compile time because it would span multiple constraints and defeat the
+single-constraint guarantee.
+
+---
+
+## 7. Grouped aggregate queries: `count_/sum_/avg_/min_/max_..._grouped_by_<col>` *(unreleased)*
+
+Dashboard roll-ups — a post's vote tally, an experiment's audit-trail size, a
+per-day event time series — are `GROUP BY` aggregates. Hand-writing them as raw
+`diesel::sql_query("SELECT … SUM(...) … GROUP BY …")` strings bypasses the
+repository's replica routing, tenant scoping, and soft-delete filters, and has
+to be re-typed for every widening cast. Declare them on the `#[repository]`
+trait instead (issue #1364):
+
+```rust
+#[autumn_web::repository(Vote, table = "votes")]
+pub trait VoteRepository {
+    /// COUNT(*)  GROUP BY post_id → Vec<(post_id, count)>.
+    fn count_grouped_by_post_id() -> Vec<(i64, i64)>;
+    /// SUM(value) GROUP BY post_id → Vec<(post_id, Option<sum>)>.
+    fn sum_value_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+    /// AVG(value) GROUP BY post_id → Vec<(post_id, Option<f64>)>.
+    fn avg_value_grouped_by_post_id() -> Vec<(i64, Option<f64>)>;
+}
+```
+
+Each declared method becomes an **inherent** method on the generated `Pg*`
+struct that returns a lazy `GroupedAggregate<'_, K, V>` builder — nothing runs
+until the terminal `.load().await`:
+
+```rust
+// Top-5 posts by score, highest first.
+let top: Vec<(i64, Option<i64>)> = repo
+    .sum_value_grouped_by_post_id()
+    .order_by_aggregate_desc()
+    .limit(5)
+    .load()
+    .await?;
+
+// One post's tally: group by post_id, scope to it, take the single row.
+let score = repo
+    .sum_value_grouped_by_post_id()
+    .filter_eq(post_id)
+    .load()
+    .await?
+    .into_iter()
+    .next()
+    .and_then(|(_, sum)| sum)
+    .unwrap_or(0);
+
+// A day-bucketed time series over a bounded window.
+use autumn_web::aggregate::DateBucket;
+let per_day: Vec<(chrono::NaiveDateTime, i64)> = repo
+    .count_grouped_by_created_at()
+    .bucket(DateBucket::Day)
+    .filter_range(window_start, window_end)
+    .load()
+    .await?;
+```
+
+### Method-name shapes and the `Vec<(K, V)>` return
+
+The trait method **must** declare its pair return type; the macro reads `K` and
+`V` from it and bakes the matching Postgres bind/result SQL types.
+
+| method shape                              | `V`                                |
+|-------------------------------------------|------------------------------------|
+| `count_grouped_by_<col>`                  | `i64`                              |
+| `sum_<num_col>_grouped_by_<col>`          | `Option<T>` (`T` = column type)    |
+| `min_/max_<num_col>_grouped_by_<col>`     | `Option<T>`                        |
+| `avg_<num_col>_grouped_by_<col>`          | `Option<f64>`                      |
+
+`K` is the group column's Rust type (or, under `.bucket(..)`, the bucket-start
+timestamp's type). `sum`/`min`/`max`/`avg` are **null-safe**: a group whose
+values are all `NULL` yields `None`, and an empty result set is an empty `Vec`.
+
+A nullable group-key **type** (`K = Option<T>`) is unsupported and rejected at
+compile time. A nullable group-key **column** is safe: rows whose group key is
+`NULL` are silently **excluded** from the results (the generated query guards the
+group column with `IS NOT NULL`), so the `NULL` group is omitted rather than
+deserialized into the non-nullable `K`. Nullable **value** columns are fine — an
+all-`NULL` group simply yields `(key, None)`.
+
+Grouped aggregates are **not** available on an `#[encrypted(...)]` column (as the
+group key or as an aggregated value): the stored value is ciphertext, so grouping
+would return ciphertext keys and `.filter_eq(..)` would compare plaintext against
+ciphertext and match nothing. Such a method returns an error at call time — use a
+raw query, or group on a non-encrypted column.
+
+### Builder chain
+
+- `.order_by_aggregate_desc()` / `.order_by_aggregate_asc()` — order by the
+  aggregated value; combine with `.limit(n)` for a top-N roll-up.
+- `.limit(n)` — cap the number of groups returned.
+- `.filter_eq(v)` / `.filter_range(lo, hi)` — scope rows **before** grouping;
+  both filter the *raw group column* and are bound as query parameters (never
+  interpolated). `filter_range` is inclusive and works for date/time windows.
+  Note they filter the **raw** column even under `.bucket(..)`, so to window a
+  bucketed time series pass the raw-timestamp range to `.filter_range(lo, hi)` —
+  `.filter_eq(bucket_start)` would match only rows on the exact bucket boundary.
+- `.bucket(DateBucket::{Day, Week, Month})` — group by
+  `date_trunc('<unit>', <col>)`, producing a time series keyed by bucket start.
+  This method is **only available when the group column is a timestamp type**
+  (`NaiveDateTime` or `DateTime<Utc>`); non-temporal group keys (e.g. an `i64`
+  `post_id`) have no `.bucket()` method, so an invalid `date_trunc` over a
+  non-timestamp column is a compile error rather than a runtime failure.
+  The truncation zone follows the key type: a `NaiveDateTime`
+  (`timestamp WITHOUT time zone`) bucket truncates on the **stored wall-clock**
+  value (a deterministic field truncation, independent of the session
+  `TimeZone`), while a `DateTime<Utc>` (`timestamptz`) bucket is computed **in
+  UTC** — the generated SQL uses `date_trunc('<unit>', <col>, 'UTC')` so bucket
+  boundaries stay stable across deployments regardless of the DB session zone,
+  consistent with the `DateTime<Utc>` key type.
+
+### Scoping comes for free
+
+The generated query composes the repository's soft-delete filter and tenant
+predicate exactly like `count`, and acquires its connection through the same
+read-route helper — so **replica routing and multi-tenancy work with no extra
+code**. Because `sum`/`avg`/`min`/`max` cannot be merged across shards, a
+sharded, tenant-scoped repository used via `across_tenants()` **rejects** a
+grouped aggregate rather than returning a per-shard-partial answer; run it per
+shard with `from_shard(..)` instead.
+
+---
+
 ## Read Replicas: Automatic Read Routing
 
 When `database.replica_url` is configured, every generated **read-only** method — `find_by_id`, `find_all`, `count`, `exists_by_id`, `paginate`, `cursor_page`, derived `find_by_*` / `count_by_*` / `exists_by_*` queries, and full-text `search` / `search_page` — automatically acquires its connection from the replica pool. Mutating methods (`save`, `update`, `delete_by_id`, the bulk operations, hook-driven writes, `with_lock`) always run on the primary. Provisioning a replica therefore offloads your primary with **zero application code changes**.

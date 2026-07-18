@@ -373,11 +373,28 @@ impl Bundle {
             messages.insert(stem, parsed);
         }
 
-        let default_path = dir.join(format!("{}.ftl", config.default_locale));
+        Self::from_locale_messages(
+            messages,
+            config,
+            dir.join(format!("{}.ftl", config.default_locale)),
+        )
+    }
+
+    /// Validate that the default locale is present and assemble the bundle.
+    ///
+    /// Shared tail of [`load_from_dir`](Self::load_from_dir) and
+    /// [`load_from_embedded`](Self::load_from_embedded): only their file-source
+    /// loops differ. `missing_default_path` is the path reported when the
+    /// default locale's file is absent.
+    fn from_locale_messages(
+        messages: HashMap<String, HashMap<String, String>>,
+        config: &I18nConfig,
+        missing_default_path: PathBuf,
+    ) -> Result<Self, LoadError> {
         if !messages.contains_key(&config.default_locale) {
             return Err(LoadError::MissingDefaultLocale {
                 locale: config.default_locale.clone(),
-                path: default_path,
+                path: missing_default_path,
             });
         }
 
@@ -390,6 +407,54 @@ impl Bundle {
             warn_dedup_window: Duration::from_secs(60),
             miss_count: AtomicU64::new(0),
         })
+    }
+
+    /// Load all `<locale>.ftl` files from a directory embedded into the binary
+    /// at compile time (via [`embed_locales!`](crate::embed_locales)).
+    ///
+    /// The embedded counterpart to [`load_from_dir`](Self::load_from_dir): same
+    /// `.ftl` discovery, same [`parse_ftl`] parsing, and the same fail-fast on a
+    /// missing default locale — but every byte comes from the binary, so no
+    /// `i18n/` sidecar directory is required at runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError::MissingDefaultLocale`] if the default locale's file
+    /// is absent, [`LoadError::InvalidLocaleFilename`] if a file name or its
+    /// contents are not valid UTF-8, or [`LoadError::Parse`] on a syntax error.
+    #[cfg(feature = "embed-assets")]
+    pub fn load_from_embedded(
+        dir: &include_dir::Dir,
+        config: &I18nConfig,
+    ) -> Result<Self, LoadError> {
+        let mut messages: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+        for file in dir.files() {
+            let path = file.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("ftl") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| LoadError::InvalidLocaleFilename {
+                    path: path.to_path_buf(),
+                })?
+                .to_owned();
+            let raw = file
+                .contents_utf8()
+                .ok_or_else(|| LoadError::InvalidLocaleFilename {
+                    path: path.to_path_buf(),
+                })?;
+            let parsed = parse_ftl(raw, path)?;
+            messages.insert(stem, parsed);
+        }
+
+        Self::from_locale_messages(
+            messages,
+            config,
+            PathBuf::from(format!("{}.ftl", config.default_locale)),
+        )
     }
 
     /// Construct a bundle directly from in-memory translations (test helper).

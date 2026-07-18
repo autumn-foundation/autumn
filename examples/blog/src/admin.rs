@@ -217,6 +217,9 @@ impl AdminModel for PostAdmin {
                 slug: Some(new_post.slug),
                 body: Some(new_post.body),
                 published: Some(new_post.published),
+                // Bump the version token so the cached post card re-renders on
+                // the next request (Postgres has no ON UPDATE trigger).
+                updated_at: Some(chrono::Utc::now().naive_utc()),
             };
             let mut conn = pool.get().await.map_err(Self::pool_error)?;
 

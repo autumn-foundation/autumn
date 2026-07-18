@@ -33,7 +33,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.5.0
+cargo install autumn-cli --version 0.6.0
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli
@@ -57,6 +57,42 @@ autumn dev
 
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 `/actuator/health`, `/actuator/info`, and `/static/js/htmx.min.js`.
+
+### Install a prebuilt binary (macOS & Linux)
+
+Get the `autumn` CLI without compiling from source — no Rust toolchain required:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.sh | sh
+```
+
+The installer detects your OS and architecture (macOS or Linux, x86_64 or aarch64), downloads the matching prebuilt binary, verifies its sha256 checksum, and installs it to `~/.local/bin/autumn` — printing the line to add if that directory isn't on your `PATH`. Override the target dir with `AUTUMN_INSTALL_DIR`, or pin a version with `AUTUMN_VERSION=vX.Y.Z` (or `--version vX.Y.Z`).
+
+Prefer a manual download? Grab the tarball plus its `.sha256`:
+
+- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-<target>.tar.gz`
+- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
+
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+
+### Install a prebuilt binary (Windows)
+
+Windows ships a native `x86_64-pc-windows-msvc` build as a `.zip` (not a tarball). The POSIX `install.sh` above does not run on Windows; use the PowerShell installer instead:
+
+```powershell
+irm https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.ps1 | iex
+```
+
+It downloads `autumn-x86_64-pc-windows-msvc.zip`, verifies its sha256 (`Get-FileHash`), extracts `autumn.exe` to `%LOCALAPPDATA%\autumn\bin`, and prints the line to add if that directory isn't on your `PATH`. Override the install dir with `-Dir`, or pin a version with `-Version vX.Y.Z`.
+
+Prefer a manual download? Grab the zip plus its `.sha256`:
+
+- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-x86_64-pc-windows-msvc.zip`
+- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-x86_64-pc-windows-msvc.zip`
+
+Verify with `Get-FileHash autumn-x86_64-pc-windows-msvc.zip -Algorithm SHA256` and compare against the `.sha256` file, then extract `autumn.exe` and put it on your `PATH`.
+
+Prefer building from source? `cargo install --path autumn-cli` still works.
 
 ### Watching custom directories
 
@@ -88,8 +124,8 @@ If you add `#[static_get]` routes, `autumn build` pre-renders them into
 Autumn still distinguishes between "works on your laptop" and "safe to run in a
 multi-replica deployment":
 
-- Local-safe defaults: in-memory sessions, pretty logs in `dev`, `scheduler.backend = "in_process"` for `#[scheduled]`, and single-binary startup.
-- Production-safe options: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, Redis-backed channels/jobs, Postgres-coordinated scheduled tasks, container scaffolding from `autumn new`, and explicit migration jobs before web replicas roll.
+- Local-safe defaults: in-memory sessions, pretty logs in `dev`, `scheduler.backend = "in_process"` for `#[scheduled]`, single-binary startup, and no inbound request deadline (so a debugger pause never 503s you).
+- Production-safe options: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, Redis-backed channels/jobs, Postgres-coordinated scheduled tasks, container scaffolding from `autumn new`, explicit migration jobs before web replicas roll, and a built-in **inbound request timeout** (the `prod` profile smart-defaults `server.timeouts.request_timeout_ms = 30000`) so a single hung handler returns a clean `503` and frees its worker instead of starving the pool — no hand-written tower layers. Streaming responses (SSE) are never interrupted — the deadline bounds the response head, not the body stream — and WebSocket upgrades are bounded only for the handshake, never the live socket. Any route can override with `#[get("/export", timeout_ms = 120000)]` or `timeout = "off"`.
 
 If you are deploying beyond a single process, read the
 [Cloud-Native Guide](docs/guide/cloud-native.md) before treating the defaults as
@@ -173,12 +209,15 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | Example | Description |
 |---------|-------------|
 | [`examples/hello`](examples/hello) | Minimal hello-world app with route macros and no database |
+| [`examples/flock`](examples/flock) | WASM island spike: a server-rendered maud page whose home route mounts a Yew CSR "literary boids" widget compiled to `wasm32-unknown-unknown`, with a custom `'wasm-unsafe-eval'` CSP |
 | [`examples/todo-app`](examples/todo-app) | Full-stack CRUD app with Diesel, Maud, htmx, Tailwind, JSON API, bearer-token auth, and MCP tool projection |
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and pre-rendering pages to static HTML via `#[static_get]` |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
 | [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, and Docker Compose deployment |
+| [`examples/bookmarks-sharded`](examples/bookmarks-sharded) | Framework-native horizontal sharding: tenant → slot → shard routing, control database, cross-shard fan-out, and Docker Compose deployment |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
 | [`examples/reddit-clone`](examples/reddit-clone) | Canonical feature showcase: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable config |
+| [`examples/saas`](examples/saas) | Multi-tenant SaaS starter: session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype (see the [starters guide](docs/guide/starters.md)) |
 
 ## Documentation
 
@@ -190,9 +229,13 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
 - [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
 - [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
+- [Horizontal Sharding](docs/guide/sharding.md) — `[[database.shards]]`, slot-based routing, `ShardedDb`/`Shards` extractors, per-shard health and migrations
+- [Per-Tenant Memory Cells](docs/guide/tenant-cells.md) — `TenantCell` byte accounting with the `tenancy.quota_bytes` soft quota and deterministic per-tenant eviction
 - [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
 - [Exposing Your API as MCP Tools](docs/guide/mcp.md) — project typed endpoints into a Model Context Protocol server with `#[api_doc(mcp)]` + `mount_mcp`
 - [Mail Guide](docs/guide/mail.md)
+- [Widget Stories](docs/guide/stories.md) — the `/_stories` widget gallery and the `story!` macro
+- [View Formatting Helpers](docs/guide/format-helpers.md) — `number_to_currency`, `pluralize`, `truncate`, `time_ago_in_words`, and friends for Maud templates
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Logging & PII](docs/guide/logging-pii.md)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
@@ -200,6 +243,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 - [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments
+- [Transition effects](docs/guide/transition-effects.md) — per-edge `on` / `on_commit` side effects on `#[state_machine]` transitions.
 
 ## Stability
 

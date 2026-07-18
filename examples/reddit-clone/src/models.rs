@@ -1,6 +1,6 @@
 use autumn_web::storage::Blob;
 
-use crate::schema::{comments, posts, subreddits, users, votes};
+use crate::schema::{comments, posts, subreddits, tags, users, votes};
 
 // Manual model -- password_hash should never be auto-exposed via API.
 
@@ -21,6 +21,11 @@ pub struct User {
     pub avatar: Option<Blob>,
 }
 
+// `User` is a hand-written model (so `password_hash` is never auto-exposed),
+// but it is the target of `#[belongs_to(User, ...)]` on `Post`/`Comment`/
+// `Subreddit`. Make it a leaf preload target so `post.author()` works.
+autumn_web::impl_preloadable_leaf!(User);
+
 #[derive(Debug, Clone, diesel::Insertable, serde::Deserialize)]
 #[diesel(table_name = users)]
 pub struct NewUser {
@@ -29,6 +34,8 @@ pub struct NewUser {
 }
 
 #[autumn_web::model]
+#[belongs_to(User, fk = creator_id)]
+#[has_many(Post)]
 pub struct Subreddit {
     #[id]
     pub id: i64,
@@ -46,6 +53,10 @@ pub struct Subreddit {
 }
 
 #[autumn_web::model]
+#[belongs_to(User, fk = author_id)]
+#[belongs_to(Subreddit)]
+#[has_many(Comment)]
+#[has_many(Tag, through = post_tags)]
 pub struct Post {
     #[id]
     pub id: i64,
@@ -71,7 +82,25 @@ pub struct Post {
     pub updated_at: chrono::NaiveDateTime,
 }
 
+// Many-to-many (#1324): `#[has_many(Post, through = post_tags)]` is the
+// mirror image of `Post`'s `#[has_many(Tag, through = post_tags)]` --
+// mutual `through =` on the same join table, exercising the same Box'd
+// nested-spec plumbing belongs_to/has_many mutual recursion already needs
+// (`Post` belongs_to `Subreddit`, `Subreddit` has_many `Post`).
 #[autumn_web::model]
+#[has_many(Post, through = post_tags)]
+pub struct Tag {
+    #[id]
+    pub id: i64,
+    #[validate(length(min = 1, max = 40))]
+    pub name: String,
+    #[indexed]
+    pub slug: String,
+}
+
+#[autumn_web::model]
+#[belongs_to(User, fk = author_id)]
+#[belongs_to(Post)]
 pub struct Comment {
     #[id]
     pub id: i64,
@@ -88,25 +117,22 @@ pub struct Comment {
     pub created_at: chrono::NaiveDateTime,
 }
 
-// Manual model -- complex constraints.
-
-#[allow(dead_code)] // Used by generated API routes; not directly referenced in app code
-#[derive(Debug, Clone, diesel::Queryable, diesel::Selectable, serde::Serialize)]
-#[diesel(table_name = votes)]
+// `Vote` is an `#[autumn_web::model]` so `VoteRepository` (see
+// `crate::repositories`) can expose the typed grouped-aggregate roll-up
+// `sum_value_grouped_by_post_id` (#1364), which the front-page "Top posts by
+// votes" leaderboard uses as a replica-eligible top-N read.
+// A vote references *either* a post or a comment, so both FKs are nullable.
+#[autumn_web::model(table = "votes")]
 pub struct Vote {
+    #[id]
     pub id: i64,
+    #[indexed]
     pub user_id: i64,
+    #[indexed]
     pub post_id: Option<i64>,
+    #[indexed]
     pub comment_id: Option<i64>,
     pub value: i16,
+    #[default]
     pub created_at: chrono::NaiveDateTime,
-}
-
-#[derive(Debug, diesel::Insertable)]
-#[diesel(table_name = votes)]
-pub struct NewVote {
-    pub user_id: i64,
-    pub post_id: Option<i64>,
-    pub comment_id: Option<i64>,
-    pub value: i16,
 }

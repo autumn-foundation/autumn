@@ -8,12 +8,34 @@
 //! In dev mode, a Next.js-style error badge is injected into the HTML
 //! response for quick debugging.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use axum::response::{IntoResponse, Response};
 
+#[cfg(feature = "maud")]
 use crate::error_pages::dev_badge::{self, DevBadgeContext};
+#[cfg(feature = "maud")]
 use crate::error_pages::renderer::ErrorContext;
+#[cfg(feature = "maud")]
 use crate::error_pages::{self, SharedRenderer};
-use crate::middleware::exception_filter::{AutumnErrorInfo, ExceptionFilter};
+#[cfg(feature = "maud")]
+use crate::middleware::exception_filter::AutumnErrorInfo;
+#[cfg(feature = "maud")]
+use crate::middleware::exception_filter::ExceptionFilter;
 
 /// Exception filter that renders HTML error pages for browser requests.
 ///
@@ -22,12 +44,16 @@ use crate::middleware::exception_filter::{AutumnErrorInfo, ExceptionFilter};
 /// response is replaced with a styled HTML page.
 ///
 /// In dev profile, the HTML page includes a floating error badge overlay.
+///
+/// Only available when the `maud` feature is enabled.
+#[cfg(feature = "maud")]
 pub struct ErrorPageFilter {
     pub renderer: SharedRenderer,
     pub is_dev: bool,
     pub parameter_filter: crate::log::filter::ParameterFilter,
 }
 
+#[cfg(feature = "maud")]
 impl ExceptionFilter for ErrorPageFilter {
     fn filter(&self, error: &AutumnErrorInfo, response: Response) -> Response {
         let wants_html = response
@@ -39,6 +65,21 @@ impl ExceptionFilter for ErrorPageFilter {
             return response;
         }
 
+        // Preserve the headers already attached to the error response —
+        // `build_html_response` constructs a fresh response, so without this the
+        // rebuilt HTML error page would drop them. Two matter in particular:
+        //   * `X-Request-Id` (stamped by `RequestIdLayer`) — operators need it to
+        //     tie the page to their logs.
+        //   * CORS headers mirrored onto a timeout 503 by the request-timeout
+        //     middleware (`ProblemDetailsFilter` preserves these too). A
+        //     cross-origin HTML/HTMX request that times out would otherwise see an
+        //     opaque CORS failure instead of the styled error page.
+        // Body-representation headers (`Content-Type`/`Content-Length`/
+        // `Content-Encoding`/...) are dropped because this fresh, uncompressed
+        // HTML body sets its own — see `preserved_error_headers`.
+        let preserved_headers =
+            crate::middleware::exception_filter::preserved_error_headers(&response);
+
         let ctx = Self::build_error_context(error, &response, self.is_dev);
         let mut html_body =
             error_pages::render_error_page(self.renderer.as_ref(), error.status, &ctx)
@@ -48,7 +89,9 @@ impl ExceptionFilter for ErrorPageFilter {
             self.inject_dev_badge(&mut html_body, error, &ctx, &response);
         }
 
-        Self::build_html_response(error, html_body)
+        let mut html = Self::build_html_response(error, html_body);
+        html.headers_mut().extend(preserved_headers);
+        html
     }
 }
 
@@ -253,21 +296,116 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
     accept_prefers_html(req.headers())
 }
 
+/// Which representation the client's `Accept` header prefers.
+///
+/// Produced by the single canonical negotiator [`accept_preference`]; the
+/// public [`accept_prefers_html`] wrapper is defined in terms of it so all
+/// content negotiation in the crate shares one source of truth.
+// `pub` here is crate-visible only: the enclosing `error_page_filter` module is
+// itself `pub(crate)`, so this never escapes the crate (clippy::redundant_pub_crate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptPreference {
+    /// `text/html` wins (explicitly or via q-values).
+    Html,
+    /// `application/json` (or `application/problem+json`) wins.
+    Json,
+    /// Only `*/*` present — no concrete html/json preference.
+    Any,
+    /// No `Accept` header, or it was empty.
+    Unspecified,
+}
+
 /// Check whether an Accept header prefers an HTML response over JSON.
 pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
+    matches!(
+        accept_preference(headers),
+        AcceptPreference::Html | AcceptPreference::Any
+    )
+}
+
+/// Best `(q-value, list-index)` seen for each media type the crate negotiates
+/// on, parsed from a request's `Accept` header by the one canonical parser
+/// [`accept_qualities`].
+///
+/// `index` is the position of the winning entry in the comma-separated header
+/// (0-based), used to break q-value ties in favour of the earlier entry. Each
+/// field is `None` only when that media type was entirely absent from the
+/// header; a media type listed with `q=0` records `Some((0.0, index))` so an
+/// explicit "not acceptable" exclusion (RFC 7231 §5.3.1) stays distinguishable
+/// from a mere absence. Both [`accept_preference`] (legacy enum resolution) and
+/// the
+/// [`Negotiate`](crate::negotiate::Negotiate) responder (effective-q
+/// resolution) build on this shared parse, so the crate never forks its
+/// `Accept` parsing.
+// `pub` (not `pub(crate)`): the enclosing `error_page_filter` module is itself
+// `pub(crate)`, so these never escape the crate (clippy::redundant_pub_crate).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AcceptQualities {
+    /// Best match for `text/html`.
+    pub html: Option<(f32, usize)>,
+    /// Best match for the success JSON type `application/json` (only).
+    ///
+    /// Kept separate from [`Self::problem_json`] so the
+    /// [`Negotiate`](crate::negotiate::Negotiate) responder can negotiate the
+    /// success `application/json` body without treating the error-only
+    /// `application/problem+json` signal as accepting it.
+    pub json: Option<(f32, usize)>,
+    /// Best match for `application/problem+json`.
+    ///
+    /// `application/problem+json` is an **error-path** (Problem Details) signal,
+    /// not a success representation. The legacy
+    /// [`accept_preference`]/[`accept_prefers_html`] path folds it into the JSON
+    /// preference (so a client asking for problem+json still gets a JSON error
+    /// body rather than an HTML error page), but the `Negotiate` success
+    /// responder deliberately ignores it: advertising problem+json alone does
+    /// **not** count as accepting the `application/json` success body.
+    pub problem_json: Option<(f32, usize)>,
+    /// Best match for the `text/*` subtype wildcard.
+    ///
+    /// A media range like `text/*` covers `text/html` per RFC 7231 §5.3.2 but is
+    /// less specific than a concrete `text/html`. Recorded like the other slots
+    /// (max-q including `q=0`, plus list index) so the `Negotiate` responder can
+    /// slot it between the concrete type and the `*/*` wildcard. The legacy
+    /// `accept_preference`/`accept_prefers_html` path ignores it.
+    pub text_star: Option<(f32, usize)>,
+    /// Best match for the `application/*` subtype wildcard.
+    ///
+    /// A media range like `application/*` covers `application/json` per RFC 7231
+    /// §5.3.2 but is less specific than a concrete `application/json`. Recorded
+    /// like the other slots (max-q including `q=0`, plus list index) so the
+    /// `Negotiate` responder can slot it between the concrete type and the `*/*`
+    /// wildcard. The legacy `accept_preference`/`accept_prefers_html` path
+    /// ignores it.
+    pub application_star: Option<(f32, usize)>,
+    /// Best match for the `*/*` wildcard.
+    pub wildcard: Option<(f32, usize)>,
+}
+
+/// The one canonical `Accept` parser.
+///
+/// Scans the comma-separated `Accept` header once, recording the best
+/// `(q-value, list-index)` seen for `text/html`, for `application/json`, for
+/// `application/problem+json` (tracked in its own slot — an error-path signal
+/// that does not drive success JSON negotiation), for the `text/*` and
+/// `application/*` subtype wildcards, and for the `*/*` wildcard. Out-of-range
+/// q-values are clamped to `[0.0, 1.0]`. Entries with `q=0` are *retained*
+/// (recorded as `Some((0.0, index))`) so an explicit "not acceptable"
+/// exclusion survives; each consumer decides how to treat them.
+///
+/// Media-range tokens and the quality parameter name are matched
+/// case-insensitively per RFC 7231 §3.1.1.1: `Application/JSON` records the
+/// same slot as `application/json`, and `Q=` is honoured like `q=`.
+///
+/// This is the crate's single source of truth for `Accept` tokenisation; the
+/// two consumers apply their own *resolution policy* on top of the returned
+/// [`AcceptQualities`] (they differ only in policy, not parsing).
+pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // If no Accept header, default to JSON (API-first).
-    if accept.is_empty() {
-        return false;
-    }
-
-    let mut html: Option<(f32, usize)> = None;
-    let mut json: Option<(f32, usize)> = None;
-    let mut wildcard: Option<(f32, usize)> = None;
+    let mut qualities = AcceptQualities::default();
 
     for (index, raw_part) in accept.split(',').enumerate() {
         let part = raw_part.trim();
@@ -285,42 +423,148 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
                 continue;
             }
 
-            if let Some(value) = segment.strip_prefix("q=")
+            // Parameter names are case-insensitive (RFC 7231 §3.1.1.1), so the
+            // quality parameter may arrive as `q=` or `Q=`.
+            if let Some((name, value)) = segment.split_once('=')
+                && name.trim().eq_ignore_ascii_case("q")
                 && let Ok(parsed) = value.trim().parse::<f32>()
             {
                 q = parsed.clamp(0.0, 1.0);
             }
         }
-        if q <= 0.0 {
-            continue;
-        }
 
-        match mime {
-            "text/html" if html.is_none_or(|(existing_q, _)| q > existing_q) => {
-                html = Some((q, index));
-            }
-            "application/json" | "application/problem+json"
-                if json.is_none_or(|(existing_q, _)| q > existing_q) =>
-            {
-                json = Some((q, index));
-            }
-            "*/*" if wildcard.is_none_or(|(existing_q, _)| q > existing_q) => {
-                wildcard = Some((q, index));
-            }
-            _ => {}
+        // Record the entry even when `q == 0`: an explicit `q=0` means the type
+        // is *not acceptable* (RFC 7231 §5.3.1), which is distinct from the type
+        // being absent. Consumers that only care about positive preference (the
+        // legacy `accept_preference`/`accept_prefers_html` path) filter these
+        // `q == 0` slots back out; the `Negotiate` responder honours them as
+        // explicit exclusions.
+        // Media types and subtypes are case-insensitive (RFC 7231 §3.1.1.1), so
+        // `Application/JSON` must record the same slot as `application/json`.
+        // Compare without allocating a lowercased copy of the token.
+        if mime.eq_ignore_ascii_case("text/html")
+            && qualities.html.is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.html = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("application/json")
+            && qualities.json.is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.json = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("application/problem+json")
+            && qualities
+                .problem_json
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.problem_json = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("text/*")
+            && qualities
+                .text_star
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.text_star = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("application/*")
+            && qualities
+                .application_star
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.application_star = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("*/*")
+            && qualities
+                .wildcard
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.wildcard = Some((q, index));
         }
     }
 
+    qualities
+}
+
+/// Merge two `(q-value, list-index)` slots into the single best one — higher q
+/// wins, ties broken by the earlier list index — reproducing the behaviour of
+/// the original single-slot `accept_qualities`, where `application/json` and
+/// `application/problem+json` shared one slot updated by strictly-greater q.
+///
+/// Used by the legacy [`accept_preference`] path to fold the (now separate)
+/// `problem_json` slot back into the JSON signal. The `Negotiate` success
+/// responder does **not** call this: it negotiates on the `json` slot alone.
+fn combine_slots(a: Option<(f32, usize)>, b: Option<(f32, usize)>) -> Option<(f32, usize)> {
+    match (a, b) {
+        (Some((aq, ai)), Some((bq, bi))) => Some(if (aq - bq).abs() < f32::EPSILON {
+            // Equal q: the earlier list entry is the one the single-slot scan
+            // would have kept (it only replaced on strictly-greater q).
+            if ai <= bi { (aq, ai) } else { (bq, bi) }
+        } else if aq > bq {
+            (aq, ai)
+        } else {
+            (bq, bi)
+        }),
+        (a @ Some(_), None) => a,
+        (None, b) => b,
+    }
+}
+
+/// The one canonical q-value `Accept` negotiator (legacy enum resolution).
+///
+/// Returns the client's concrete representation preference. Empty or missing
+/// `Accept` yields [`AcceptPreference::Unspecified`]; a `*/*`-only header
+/// yields [`AcceptPreference::Any`]. When both `text/html` and
+/// `application/json` are present, the higher q-value wins, ties broken by
+/// earlier list position. Parsing is delegated to the shared
+/// [`accept_qualities`]; this function only applies the enum resolution policy.
+pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
+    // Distinguish a missing/empty `Accept` (no concrete preference at all) from
+    // one that is present but names no html/json/wildcard type. The shared
+    // parser collapses both to all-`None`, so the emptiness check stays here.
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if accept.is_empty() {
+        return AcceptPreference::Unspecified;
+    }
+
+    // The legacy enum negotiator predates type wildcards and intentionally does
+    // not consult the `text/*` / `application/*` slots — only the concrete types
+    // and the `*/*` wildcard — so `accept_prefers_html` stays byte-identical.
+    let AcceptQualities {
+        html,
+        json,
+        problem_json,
+        wildcard,
+        ..
+    } = accept_qualities(headers);
+
+    // Legacy resolution treats `application/problem+json` as a JSON signal (a
+    // problem+json client wants a JSON error body, not an HTML page). The shared
+    // parser now records it in its own slot, so recombine the two into one
+    // effective JSON signal here — higher q wins, ties broken by earlier list
+    // index — reproducing the original single-slot `(q, index)` semantics
+    // exactly so this path stays byte-identical.
+    let json = combine_slots(json, problem_json);
+
+    // Legacy resolution only cares about *positive* preference: a `q=0` slot
+    // (now retained by the shared parser) is treated as absent here, exactly
+    // reproducing the pre-`q=0`-aware behaviour of this enum negotiator.
+    let positive = |slot: Option<(f32, usize)>| slot.filter(|&(q, _)| q > 0.0);
+    let (html, json, wildcard) = (positive(html), positive(json), positive(wildcard));
+
     match (html, json, wildcard) {
         (Some((hq, hidx)), Some((jq, jidx)), _) => {
-            if (hq - jq).abs() < f32::EPSILON {
+            let html_wins = if (hq - jq).abs() < f32::EPSILON {
                 hidx < jidx
             } else {
                 hq > jq
+            };
+            if html_wins {
+                AcceptPreference::Html
+            } else {
+                AcceptPreference::Json
             }
         }
-        (Some(_), None, _) | (None, None, Some(_)) => true,
-        (None, Some(_), _) | (None, None, None) => false,
+        (Some(_), None, _) => AcceptPreference::Html,
+        (None, None, Some(_)) => AcceptPreference::Any,
+        (None, Some(_), _) | (None, None, None) => AcceptPreference::Json,
     }
 }
 
@@ -349,6 +593,7 @@ fn extract_path_params(pattern: &str, uri_path: &str) -> serde_json::Value {
 }
 
 /// Convert an inspector [`QueryRecord`] to the overlay's [`SqlQueryInfo`].
+#[cfg(feature = "maud")]
 fn query_record_to_sql_info(
     r: &crate::inspector::QueryRecord,
 ) -> crate::error_pages::dev_badge::SqlQueryInfo {
@@ -426,10 +671,16 @@ fn form_pairs_to_nested_json(pairs: Vec<(String, String)>) -> serde_json::Value 
 /// `"user.password"` → `["user", "password"]`
 /// `"a[b][c]"` → `["a", "b", "c"]`
 /// `"simple"` → `["simple"]`
+#[allow(
+    clippy::indexing_slicing,
+    reason = "pos is a valid byte index returned by str::find('['); both slices split on that boundary"
+)]
 fn bracket_key_segments(key: &str) -> Vec<String> {
     // Dot notation: split on '.' first (only if no brackets present)
     if key.contains('[') {
-        let pos = key.find('[').unwrap();
+        let Some(pos) = key.find('[') else {
+            return vec![key.to_owned()];
+        };
         let mut parts = vec![key[..pos].to_owned()];
         for seg in key[pos + 1..].split('[') {
             let seg = seg.trim_end_matches(']');
@@ -448,6 +699,10 @@ fn bracket_key_segments(key: &str) -> Vec<String> {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "path is guaranteed non-empty here and len >= 2 past the length guards below"
+)]
 fn form_insert_at_path(
     map: &mut serde_json::Map<String, serde_json::Value>,
     path: &[String],
@@ -501,6 +756,7 @@ pub async fn fallback_404_handler(method: axum::http::Method, uri: axum::http::U
         .into_response()
 }
 
+#[cfg(feature = "maud")]
 impl ErrorPageFilter {
     fn build_error_context(
         error: &AutumnErrorInfo,
@@ -705,6 +961,95 @@ mod tests {
         assert!(accepts_html(&req));
     }
 
+    #[test]
+    fn prefers_html_for_ac_tie_case() {
+        // Acceptance-criteria case: html has the higher q-value and wins.
+        let headers = header_map("application/json;q=0.9, text/html;q=1.0");
+        assert!(accept_prefers_html(&headers));
+        assert_eq!(accept_preference(&headers), AcceptPreference::Html);
+    }
+
+    /// Build a `HeaderMap` with a single `Accept` header for direct
+    /// [`accept_preference`] / [`accept_prefers_html`] assertions.
+    fn header_map(accept: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_str(accept).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn accept_preference_maps_cases_and_wrapper_is_unchanged() {
+        // Empty / missing header → Unspecified, wrapper → false.
+        let empty = axum::http::HeaderMap::new();
+        assert_eq!(accept_preference(&empty), AcceptPreference::Unspecified);
+        assert!(!accept_prefers_html(&empty));
+
+        // `*/*` only → Any, wrapper → true.
+        let any = header_map("*/*");
+        assert_eq!(accept_preference(&any), AcceptPreference::Any);
+        assert!(accept_prefers_html(&any));
+
+        // `text/html` → Html, wrapper → true.
+        let html = header_map("text/html");
+        assert_eq!(accept_preference(&html), AcceptPreference::Html);
+        assert!(accept_prefers_html(&html));
+
+        // `application/json` → Json, wrapper → false.
+        let json = header_map("application/json");
+        assert_eq!(accept_preference(&json), AcceptPreference::Json);
+        assert!(!accept_prefers_html(&json));
+    }
+
+    #[test]
+    fn accept_qualities_matches_media_types_case_insensitively() {
+        // Media types are case-insensitive (RFC 7231 §3.1.1.1): a mixed-case
+        // token must record the same slot as its lowercase form.
+        let json = accept_qualities(&header_map("Application/JSON"));
+        assert_eq!(json.json, Some((1.0, 0)));
+        assert_eq!(json.html, None);
+
+        let html = accept_qualities(&header_map("TEXT/HTML"));
+        assert_eq!(html.html, Some((1.0, 0)));
+        assert_eq!(html.json, None);
+
+        // Subtype wildcard is case-insensitive too.
+        let app_star = accept_qualities(&header_map("APPLICATION/*;q=1"));
+        assert_eq!(app_star.application_star, Some((1.0, 0)));
+    }
+
+    #[test]
+    fn accept_qualities_matches_q_parameter_case_insensitively() {
+        // Parameter names are case-insensitive: `Q=` must be honoured like `q=`.
+        let q = accept_qualities(&header_map("text/html;Q=0.9, application/json;Q=1.0"));
+        assert_eq!(q.html, Some((0.9, 0)));
+        assert_eq!(q.json, Some((1.0, 1)));
+    }
+
+    #[test]
+    fn accept_prefers_html_honours_case_insensitive_tokens() {
+        // Mixed-case JSON must not fall back to the HTML default.
+        assert!(!accept_prefers_html(&header_map("Application/JSON")));
+        assert_eq!(
+            accept_preference(&header_map("Application/JSON")),
+            AcceptPreference::Json
+        );
+
+        // Mixed-case HTML still prefers HTML.
+        assert!(accept_prefers_html(&header_map("TEXT/HTML")));
+        assert_eq!(
+            accept_preference(&header_map("TEXT/HTML")),
+            AcceptPreference::Html
+        );
+
+        // Uppercase Q honoured: JSON has the higher q and wins.
+        assert!(!accept_prefers_html(&header_map(
+            "text/html;Q=0.9, application/json;Q=1.0"
+        )));
+    }
+
     // ── Integration tests with the full middleware pipeline ──────
 
     use std::sync::Arc;
@@ -715,6 +1060,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::error::AutumnError;
+    #[cfg(feature = "maud")]
     use crate::error_pages;
     use crate::middleware::exception_filter::ExceptionFilterLayer;
 
@@ -784,6 +1130,119 @@ mod tests {
         assert!(
             body_str.contains("Page not found"),
             "should contain not found message"
+        );
+    }
+
+    #[tokio::test]
+    async fn html_error_page_preserves_mirrored_cors_and_request_id_headers() {
+        // A timeout 503 reaches the error-page filter already carrying the
+        // mirrored CORS headers and the request id, marked as wanting HTML.
+        // The HTML rebuild must not drop them, or a cross-origin browser/HTMX
+        // client sees an opaque CORS failure instead of the styled page.
+        let renderer = error_pages::default_renderer();
+        let filter = ErrorPageFilter {
+            renderer,
+            is_dev: false,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
+        };
+
+        let error = AutumnErrorInfo {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "request deadline exceeded".into(),
+            details: None,
+            problem_type: None,
+            backtrace_string: None,
+        };
+
+        let mut original = (StatusCode::SERVICE_UNAVAILABLE, "json body").into_response();
+        original.headers_mut().insert(
+            "access-control-allow-origin",
+            http::HeaderValue::from_static("https://app.example.com"),
+        );
+        original.headers_mut().insert(
+            "access-control-allow-credentials",
+            http::HeaderValue::from_static("true"),
+        );
+        original
+            .headers_mut()
+            .insert("x-request-id", http::HeaderValue::from_static("req-123"));
+        original.extensions_mut().insert(WantsHtml(true));
+
+        let response = filter.filter(&error, original);
+
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://app.example.com",
+            "mirrored CORS origin must survive the HTML rebuild"
+        );
+        assert_eq!(
+            response.headers()["access-control-allow-credentials"],
+            "true",
+            "mirrored CORS credentials flag must survive the HTML rebuild"
+        );
+        assert_eq!(
+            response.headers()["x-request-id"],
+            "req-123",
+            "request id must survive the HTML rebuild"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("<!DOCTYPE html>"), "should be HTML");
+    }
+
+    #[tokio::test]
+    async fn html_rebuild_drops_stale_content_encoding() {
+        // An inner response-transforming layer (e.g. a user `CompressionLayer`)
+        // may set `Content-Encoding: gzip` before the exception filter runs. The
+        // rebuilt HTML body is uncompressed, so the stale encoding header must be
+        // dropped or the browser fails to decode the page.
+        let renderer = error_pages::default_renderer();
+        let filter = ErrorPageFilter {
+            renderer,
+            is_dev: false,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
+        };
+
+        let error = AutumnErrorInfo {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "boom".into(),
+            details: None,
+            problem_type: None,
+            backtrace_string: None,
+        };
+
+        let mut original = (StatusCode::INTERNAL_SERVER_ERROR, "compressed json").into_response();
+        original.headers_mut().insert(
+            http::header::CONTENT_ENCODING,
+            http::HeaderValue::from_static("gzip"),
+        );
+        original
+            .headers_mut()
+            .insert("x-request-id", http::HeaderValue::from_static("req-9"));
+        original.extensions_mut().insert(WantsHtml(true));
+
+        let response = filter.filter(&error, original);
+
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::CONTENT_ENCODING),
+            "stale Content-Encoding must not ride along on the rebuilt HTML body"
+        );
+        assert_eq!(
+            response.headers()["x-request-id"],
+            "req-9",
+            "unrelated headers must still be preserved"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
         );
     }
 

@@ -73,6 +73,7 @@
 //!           </tbody>
 //!         </table>
 //!     "#.to_vec(),
+//!     ..Default::default()
 //! };
 //!
 //! resp.assert_ok()
@@ -168,6 +169,94 @@
 //!         .assert_status(201);
 //! }
 //! ```
+//!
+//! # Asserting channel broadcasts
+//!
+//! Opt in with `TestApp::record_broadcasts` to capture every channel
+//! publication a request makes — no hand-written spy needed — then assert on
+//! it with `TestClient::assert_broadcast`,
+//! `TestClient::assert_broadcast_count`,
+//! `TestClient::assert_no_broadcasts`, or read them back in order with
+//! `TestClient::broadcasts` / `TestClient::broadcasts_on`. Both raw
+//! `publish` text and `publish_html` HTML/OOB payloads are recorded. The
+//! recorder is scoped to the client, so parallel tests never leak into one
+//! another, and nothing is installed unless you call it.
+//!
+//! ```rust
+//! # #[cfg(feature = "ws")]
+//! # mod broadcast_example {
+//! use autumn_web::prelude::*;
+//! use autumn_web::test::TestApp;
+//!
+//! #[post("/notes")]
+//! async fn create_note(State(state): State<AppState>) -> &'static str {
+//!     state.broadcast().publish("notes", "created").unwrap();
+//!     "ok"
+//! }
+//!
+//! pub fn run() {
+//!     tokio::runtime::Runtime::new().unwrap().block_on(async {
+//!         let client = TestApp::new()
+//!             .routes(routes![create_note])
+//!             .record_broadcasts()
+//!             .build();
+//!
+//!         client.post("/notes").send().await.assert_ok();
+//!
+//!         client
+//!             .assert_broadcast_count("notes", 1)
+//!             .assert_broadcast("notes", |b| b.payload() == "created");
+//!     });
+//! }
+//! # }
+//! # #[cfg(feature = "ws")]
+//! # broadcast_example::run();
+//! ```
+//!
+//! # Testing authenticated routes
+//!
+//! [`TestClient`] carries a **cookie jar**: every response's `Set-Cookie` is
+//! stored and replayed on later requests from the same client, so a real
+//! `POST /login` → `GET /dashboard` flow works with zero manual header
+//! threading — exactly like a browser session.
+//!
+//! When you only need an authenticated *identity* (not the login endpoint
+//! under test), [`TestClient::acting_as`] mints the session directly, so a
+//! secured route can be tested in ≤2 lines of setup:
+//!
+//! ```rust
+//! # mod acting_as_example {
+//! use autumn_web::prelude::*;
+//! use autumn_web::test::TestApp;
+//!
+//! #[get("/dashboard")]
+//! #[secured]
+//! async fn dashboard() -> &'static str {
+//!     "welcome"
+//! }
+//!
+//! pub fn run() {
+//!     tokio::runtime::Runtime::new().unwrap().block_on(async {
+//!         let client = TestApp::new().routes(routes![dashboard]).build();
+//!         client.acting_as(42).await; // ← authenticated as user 42
+//!
+//!         client.get("/dashboard").send().await.assert_ok();
+//!     });
+//! }
+//! # }
+//! # acting_as_example::run();
+//! ```
+//!
+//! `acting_as` sets **identity only** — authorization still runs, so a user it
+//! acts as who lacks a required role or scope is still denied.
+//! [`TestClient::log_out`] clears the session cookie, reverting the client to
+//! an unauthenticated state. These helpers mirror the auth-testing story in
+//! other frameworks:
+//!
+//! | Autumn | Laravel | Rails | Django | Phoenix |
+//! |--------|---------|-------|--------|---------|
+//! | [`acting_as`](TestClient::acting_as) / [`login_as`](TestClient::login_as) | `actingAs` | `sign_in` | `force_login` | `log_in_user` |
+//! | [`log_out`](TestClient::log_out) | `Auth::logout` | `sign_out` | `logout` | `log_out_user` |
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -178,12 +267,422 @@ use crate::route::Route;
 
 use crate::state::AppState;
 
-#[cfg(feature = "db")]
+// Only the `test-support`-gated `TestDb` (a Postgres testcontainer helper) names
+// `AsyncPgConnection` by its short name now; the `TestClient` pool fields use the
+// `RuntimeConnection` alias, and the transactional establish path uses the fully
+// qualified path — so without `test-support` this import would be unused.
+#[cfg(all(feature = "db", feature = "test-support"))]
 use diesel_async::AsyncPgConnection;
-#[cfg(feature = "db")]
+// Used by the Postgres transactional establish path and by the `test-support`
+// `TestDb`; neither is compiled in a `--features sqlite` build without
+// `test-support`, so this import would otherwise be unused there.
+#[cfg(all(feature = "db", any(not(feature = "sqlite"), feature = "test-support")))]
 use diesel_async::RunQueryDsl;
 #[cfg(feature = "db")]
 use diesel_async::pooled_connection::deadpool::Pool;
+
+// ── Mail recording helpers ─────────────────────────────────────
+
+/// Snapshot of an email captured by the built-in test mail recorder.
+///
+/// Available on [`TestClient`] via [`TestClient::sent_mail()`] when the `mail`
+/// feature is enabled.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::test::TestApp;
+///
+/// let client = TestApp::new().config(cfg).routes(routes![handler]).build();
+/// client.post("/signup").json(&body).send().await.assert_ok();
+///
+/// // ≤ 3 lines to assert an email was sent:
+/// client.assert_email_count(1);
+/// client.assert_email_sent(|m| m.to.iter().any(|a| a == "alice@example.com"));
+/// client.assert_email_sent(|m| m.subject == "Welcome!");
+/// ```
+#[cfg(feature = "mail")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMail {
+    /// `From` header value (after mailer defaults are applied).
+    pub from: Option<String>,
+    /// `Reply-To` header value.
+    pub reply_to: Option<String>,
+    /// `To` recipients.
+    pub to: Vec<String>,
+    /// `Subject` header.
+    pub subject: String,
+    /// HTML body, if provided.
+    pub html: Option<String>,
+    /// Plain-text body, if provided.
+    pub text: Option<String>,
+    /// Files attached to this message, in declared order.
+    pub attachments: Vec<crate::mail::MailAttachment>,
+}
+
+#[cfg(feature = "mail")]
+impl From<&crate::mail::Mail> for SentMail {
+    fn from(m: &crate::mail::Mail) -> Self {
+        Self {
+            from: m.from.clone(),
+            reply_to: m.reply_to.clone(),
+            to: m.to.clone(),
+            subject: m.subject.clone(),
+            html: m.html.clone(),
+            text: m.text.clone(),
+            attachments: m.attachments.clone(),
+        }
+    }
+}
+
+/// Built-in per-`TestClient` recording mail interceptor.
+///
+/// Auto-installed by [`TestApp::build`] — no `.with_mail_interceptor()` needed.
+/// Composes with any user-supplied interceptor (the user's interceptor still runs).
+#[cfg(feature = "mail")]
+#[derive(Clone, Default)]
+struct MailRecorder {
+    mails: std::sync::Arc<std::sync::Mutex<Vec<SentMail>>>,
+}
+
+#[cfg(feature = "mail")]
+impl MailRecorder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get_sent(&self) -> Vec<SentMail> {
+        self.mails.lock().unwrap().clone()
+    }
+}
+
+#[cfg(feature = "mail")]
+impl crate::interceptor::MailInterceptor for MailRecorder {
+    fn intercept<'a>(
+        &'a self,
+        mail: &'a crate::mail::Mail,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+    > {
+        let snapshot = SentMail::from(mail);
+        let mails = std::sync::Arc::clone(&self.mails);
+        Box::pin(async move {
+            let result = next.await;
+            if result.is_ok() {
+                mails.lock().unwrap().push(snapshot);
+            }
+            result
+        })
+    }
+}
+
+/// Chains two [`MailInterceptor`](crate::interceptor::MailInterceptor)s so that
+/// `first` runs before `second`, both before the underlying transport.
+#[cfg(feature = "mail")]
+struct ChainedMailInterceptor {
+    first: std::sync::Arc<dyn crate::interceptor::MailInterceptor>,
+    second: std::sync::Arc<dyn crate::interceptor::MailInterceptor>,
+}
+
+#[cfg(feature = "mail")]
+impl crate::interceptor::MailInterceptor for ChainedMailInterceptor {
+    fn intercept<'a>(
+        &'a self,
+        mail: &'a crate::mail::Mail,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+    > {
+        let second_next = self.second.intercept(mail, next);
+        self.first.intercept(mail, second_next)
+    }
+}
+
+/// A single background-job enqueue captured by the built-in test job recorder.
+///
+/// Available on [`TestClient`] via [`TestClient::enqueued_jobs`]. The recorder
+/// is always on for [`TestApp`]-built clients — no `.with_job_interceptor()`
+/// boilerplate is required. Both the registered job `name` and the fully
+/// serialized `payload` (the exact `serde_json::Value` handed to the backend)
+/// are captured, so assertions can match on name alone or name-and-payload.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::test::TestApp;
+/// use serde_json::json;
+///
+/// let client = TestApp::new().plugin(MyJobs).routes(routes![signup]).build();
+/// client.post("/signup").json(&body).send().await.assert_ok();
+///
+/// client.assert_job_enqueued_with("send_welcome", json!({ "user_id": 7 }));
+/// ```
+#[derive(Clone, Debug)]
+pub struct RecordedJob {
+    /// The registered name of the enqueued job.
+    pub name: String,
+    /// The JSON payload the job was enqueued with (the real serialized args).
+    pub payload: serde_json::Value,
+}
+
+/// Built-in per-`TestApp` recording job interceptor.
+///
+/// Auto-installed by [`TestApp::build`] — no `.with_job_interceptor()` needed.
+/// Composes with any user-supplied interceptor (the user's interceptor still
+/// runs, after the recorder). Records every enqueue — across `enqueue`,
+/// `enqueue_after_commit`, and `enqueue_in_tx`, which all funnel through the
+/// same enqueue interceptor seam — in the order they were enqueued.
+#[derive(Clone, Default)]
+struct JobRecorder {
+    jobs: std::sync::Arc<std::sync::Mutex<Vec<RecordedJob>>>,
+}
+
+impl JobRecorder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn recorded(&self) -> Vec<RecordedJob> {
+        self.jobs.lock().unwrap().clone()
+    }
+
+    /// Take the captured jobs, leaving the recorder empty — used by
+    /// [`TestClient::perform_enqueued_jobs`] to drain the queue exactly once.
+    fn drain(&self) -> Vec<RecordedJob> {
+        std::mem::take(&mut *self.jobs.lock().unwrap())
+    }
+}
+
+impl crate::interceptor::JobInterceptor for JobRecorder {
+    fn intercept_enqueue<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a serde_json::Value,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+    {
+        let record = RecordedJob {
+            name: name.to_string(),
+            payload: payload.clone(),
+        };
+        let jobs = std::sync::Arc::clone(&self.jobs);
+        Box::pin(async move {
+            // Record the enqueue intent up front, then let delivery proceed so
+            // the app's real backend/worker still sees the job (mirroring how
+            // the mail recorder does not suppress the underlying transport).
+            jobs.lock().unwrap().push(record);
+            next.await
+        })
+    }
+
+    fn intercept_execute<'a>(
+        &'a self,
+        _name: &'a str,
+        _payload: &'a serde_json::Value,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+    {
+        // The recorder only observes enqueues; execution passes straight through.
+        next
+    }
+}
+
+/// Chains two [`JobInterceptor`](crate::interceptor::JobInterceptor)s so that
+/// `first` runs before `second`, both before the actual enqueue/execute.
+struct ChainedJobInterceptor {
+    first: std::sync::Arc<dyn crate::interceptor::JobInterceptor>,
+    second: std::sync::Arc<dyn crate::interceptor::JobInterceptor>,
+}
+
+impl crate::interceptor::JobInterceptor for ChainedJobInterceptor {
+    fn intercept_enqueue<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a serde_json::Value,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+    {
+        let second_next = self.second.intercept_enqueue(name, payload, next);
+        self.first.intercept_enqueue(name, payload, second_next)
+    }
+
+    fn intercept_execute<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a serde_json::Value,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+    {
+        let second_next = self.second.intercept_execute(name, payload, next);
+        self.first.intercept_execute(name, payload, second_next)
+    }
+}
+
+/// Outcome report returned by [`TestClient::perform_enqueued_jobs`].
+///
+/// Holds one `(job name, result)` entry per drained job, in the order the jobs
+/// were enqueued. Per-job handler errors are surfaced here rather than
+/// swallowed: inspect them with [`Self::failures`], or fail the test outright
+/// with [`Self::assert_all_succeeded`]. A captured job whose name has no
+/// registered handler is reported as a failure too — never silently skipped.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let report = client.perform_enqueued_jobs().await;
+/// report.assert_all_succeeded();
+/// ```
+#[derive(Debug)]
+pub struct PerformedJobs {
+    outcomes: Vec<(String, crate::AutumnResult<()>)>,
+}
+
+impl PerformedJobs {
+    /// Every performed job's `(name, result)`, in the order they were enqueued.
+    pub fn outcomes(&self) -> &[(String, crate::AutumnResult<()>)] {
+        &self.outcomes
+    }
+
+    /// The number of jobs that were drained and performed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    /// Whether no jobs were performed (the queue was empty).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.outcomes.is_empty()
+    }
+
+    /// The `(name, error)` pairs for every job whose handler returned `Err`
+    /// (or that had no registered handler).
+    #[must_use]
+    pub fn failures(&self) -> Vec<(&str, &crate::AutumnError)> {
+        self.outcomes
+            .iter()
+            .filter_map(|(name, result)| result.as_ref().err().map(|e| (name.as_str(), e)))
+            .collect()
+    }
+
+    /// Assert every performed job succeeded.
+    ///
+    /// # Panics
+    ///
+    /// Panics, listing each failing job's name and error, if any performed job
+    /// returned an error or had no registered handler.
+    pub fn assert_all_succeeded(&self) -> &Self {
+        let failures = self.failures();
+        assert!(
+            failures.is_empty(),
+            "expected all performed jobs to succeed, but {} failed:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .map(|(name, err)| format!("  - {name}: {err:?}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        self
+    }
+}
+
+/// Render a captured-job list for self-diagnosing assertion failures.
+fn format_recorded_jobs(jobs: &[RecordedJob]) -> String {
+    if jobs.is_empty() {
+        return "  (no jobs were enqueued)".to_string();
+    }
+    jobs.iter()
+        .map(|j| format!("  - {} {}", j.name, j.payload))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A single channel publication captured by the broadcast recorder.
+///
+/// Recorded by [`TestApp::record_broadcasts`] through the channels
+/// interceptor seam. Both raw `publish` text and `publish_html` HTML/OOB
+/// payloads are captured (they funnel through the same `ChannelMessage`).
+#[cfg(feature = "ws")]
+#[derive(Clone, Debug)]
+pub struct RecordedBroadcast {
+    /// The topic the message was published to.
+    pub topic: String,
+    /// The UTF-8 payload of the published `ChannelMessage`.
+    pub payload: String,
+}
+
+#[cfg(feature = "ws")]
+impl RecordedBroadcast {
+    /// The topic the message was published to.
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// The UTF-8 payload of the published message.
+    #[must_use]
+    pub fn payload(&self) -> &str {
+        &self.payload
+    }
+}
+
+/// Built-in per-`TestClient` recording channels interceptor.
+///
+/// Opt-in via [`TestApp::record_broadcasts`] — no interceptor is installed
+/// unless the builder is called (zero-cost when unused). Records every
+/// publication in order, including publishes to zero subscribers.
+#[cfg(feature = "ws")]
+#[derive(Clone, Default)]
+struct BroadcastRecorder {
+    events: std::sync::Arc<std::sync::Mutex<Vec<RecordedBroadcast>>>,
+}
+
+#[cfg(feature = "ws")]
+impl BroadcastRecorder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn recorded(&self) -> Vec<RecordedBroadcast> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+#[cfg(feature = "ws")]
+impl crate::interceptor::ChannelsInterceptor for BroadcastRecorder {
+    fn intercept_publish(
+        &self,
+        topic: &str,
+        msg: &crate::channels::ChannelMessage,
+        next: &dyn Fn(
+            &str,
+            &crate::channels::ChannelMessage,
+        ) -> Result<usize, crate::channels::ChannelPublishError>,
+    ) -> Result<usize, crate::channels::ChannelPublishError> {
+        let result = next(topic, msg);
+        // Record the publication even when it reached zero subscribers — the
+        // publish still happened and tests assert on intent, not delivery.
+        self.events.lock().unwrap().push(RecordedBroadcast {
+            topic: topic.into(),
+            payload: msg.as_str().into(),
+        });
+        result
+    }
+}
 
 // ── TestApp ────────────────────────────────────────────────────
 
@@ -217,15 +716,16 @@ pub struct TestApp {
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
     config: AutumnConfig,
     #[cfg(feature = "openapi")]
     openapi: Option<crate::openapi::OpenApiConfig>,
     #[cfg(feature = "mcp")]
     mcp: Option<crate::mcp::McpRuntime>,
     #[cfg(feature = "db")]
-    pool: Option<Pool<AsyncPgConnection>>,
+    pool: Option<Pool<crate::db::RuntimeConnection>>,
     #[cfg(feature = "db")]
-    replica_pool: Option<Pool<AsyncPgConnection>>,
+    replica_pool: Option<Pool<crate::db::RuntimeConnection>>,
     #[cfg(feature = "db")]
     transactional: bool,
     #[cfg(feature = "db")]
@@ -239,11 +739,20 @@ pub struct TestApp {
     forbidden_response_override: Option<crate::authorization::ForbiddenResponse>,
     #[cfg(feature = "mail")]
     mail_interceptor: Option<std::sync::Arc<dyn crate::interceptor::MailInterceptor>>,
+    #[cfg(feature = "mail")]
+    mail_recorder: MailRecorder,
     job_interceptor: Option<std::sync::Arc<dyn crate::interceptor::JobInterceptor>>,
+    /// Always-on job recorder capturing every enqueue. Composed ahead of any
+    /// user-supplied [`with_job_interceptor`](Self::with_job_interceptor).
+    job_recorder: JobRecorder,
     #[cfg(feature = "db")]
     db_interceptor: Option<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
     #[cfg(feature = "ws")]
     channels_interceptor: Option<std::sync::Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    /// Opt-in broadcast recorder, installed only when
+    /// [`record_broadcasts`](Self::record_broadcasts) is called.
+    #[cfg(feature = "ws")]
+    broadcast_recorder: Option<BroadcastRecorder>,
     #[cfg(feature = "oauth2")]
     http_interceptor: Option<std::sync::Arc<dyn crate::interceptor::HttpInterceptor>>,
     /// Shared mock registry installed into `AppState` during [`build`](Self::build)
@@ -253,7 +762,12 @@ pub struct TestApp {
     http_mock_registry: Option<std::sync::Arc<crate::http_client::MockRegistry>>,
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
+    listeners: Vec<crate::events::ListenerInfo>,
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
+    #[cfg(feature = "mail")]
+    suppression_store: Option<crate::mail::SuppressionStoreHandle>,
+    #[cfg(feature = "mail")]
+    mail_suppression_store: Option<crate::mail::suppression::SuppressionStoreHandle>,
     registered_plugins: std::collections::HashSet<String>,
     extensions: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send>>,
     /// Injected clock; `None` means use [`crate::time::SystemClock`].
@@ -292,6 +806,7 @@ impl TestApp {
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             config,
             #[cfg(feature = "openapi")]
             openapi: None,
@@ -309,18 +824,28 @@ impl TestApp {
             forbidden_response_override: None,
             #[cfg(feature = "mail")]
             mail_interceptor: None,
+            #[cfg(feature = "mail")]
+            mail_recorder: MailRecorder::new(),
             job_interceptor: None,
+            job_recorder: JobRecorder::new(),
             #[cfg(feature = "db")]
             db_interceptor: None,
             #[cfg(feature = "ws")]
             channels_interceptor: None,
+            #[cfg(feature = "ws")]
+            broadcast_recorder: None,
             #[cfg(feature = "oauth2")]
             http_interceptor: None,
             #[cfg(feature = "http-client")]
             http_mock_registry: None,
             state_initializers: Vec::new(),
             jobs: Vec::new(),
+            listeners: Vec::new(),
             exception_filters: Vec::new(),
+            #[cfg(feature = "mail")]
+            suppression_store: None,
+            #[cfg(feature = "mail")]
+            mail_suppression_store: None,
             registered_plugins: std::collections::HashSet::new(),
             extensions: std::collections::HashMap::new(),
             clock: None,
@@ -523,6 +1048,22 @@ impl TestApp {
         self
     }
 
+    /// Register a pre-static gate layer for this test application.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::static_gate`]: the layer runs
+    /// outermost (outside session and before the static cache lookup) so tests
+    /// can exercise auth-gating wiring that protects cached SSG/ISG pages.
+    #[must_use]
+    pub fn static_gate<L: crate::app::IntoAppLayer>(mut self, layer: L) -> Self {
+        self.static_gate_layers
+            .push(crate::app::CustomLayerRegistration {
+                type_id: std::any::TypeId::of::<L>(),
+                type_name: std::any::type_name::<L>(),
+                apply: Box::new(move |router| layer.apply_to(router)),
+            });
+        self
+    }
+
     /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for this
     /// test app.
     ///
@@ -562,14 +1103,48 @@ impl TestApp {
     /// against a standard axum Router.  The probe state returned by
     /// [`TestClient::probes`] will be in the default ready state; it is not
     /// connected to any handler in the supplied router.
+    ///
+    /// **Note:** [`TestClient::sent_mail`] will always return an empty list for
+    /// clients built this way.  The built-in mail recorder is wired in during
+    /// [`TestApp::build`]; because `from_router` receives an already-constructed
+    /// `AppState` (with the mailer already installed), the recorder cannot be
+    /// injected into its interceptor chain.  Use [`TestApp::new().merge(router).build()`](TestApp::merge)
+    /// to get recording support.
     #[must_use]
     pub fn from_router(router: axum::Router, state: AppState) -> TestClient {
+        let auth_session_key = state.auth_session_key().to_owned();
+        // Resolve the session cookie name from the router's config (installed in
+        // state extensions by `build()`), falling back to the framework default
+        // when it isn't present — so `log_out` clears the right cookie even when
+        // the app configured a custom `session.cookie_name`.
+        let session_cookie_name = state.extension::<AutumnConfig>().map_or_else(
+            || crate::session::SessionConfig::default().cookie_name,
+            |cfg| cfg.session.cookie_name.clone(),
+        );
         TestClient {
             router,
             probes: crate::probe::ProbeState::ready_for_test(),
             state,
             _job_runtime: None,
             clock_as_any: None,
+            #[cfg(feature = "mail")]
+            mail_recorder: None,
+            #[cfg(feature = "ws")]
+            broadcast_recorder: None,
+            job_recorder: None,
+            jobs: Vec::new(),
+            cookie_jar: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            // `from_router` receives an already-built router, so we have no
+            // handle to whatever session store (if any) it installed. The jar
+            // still works — cookies from real requests round-trip — but
+            // `acting_as` cannot mint a session and panics, mirroring how
+            // `sent_mail()` degrades for `from_router` clients.
+            session_store: None,
+            session_cookie_name,
+            auth_session_key,
+            session_signing_keys: None,
         }
     }
 
@@ -635,7 +1210,10 @@ impl TestApp {
         self.merge_routers.extend(app_builder.merge_routers);
         self.nest_routers.extend(app_builder.nest_routers);
         self.custom_layers.extend(app_builder.custom_layers);
+        self.static_gate_layers
+            .extend(app_builder.static_gate_layers);
         self.jobs.extend(app_builder.jobs);
+        self.listeners.extend(app_builder.listeners);
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
         self.health_indicators.extend(app_builder.health_indicators);
@@ -644,6 +1222,33 @@ impl TestApp {
         #[cfg(feature = "inbound-mail")]
         if let Some(router) = app_builder.inbound_mail_router {
             self.inbound_mail_router = Some(router);
+        }
+
+        // Carry a plugin-registered suppression store (List-Unsubscribe storage)
+        // into the test app so unsubscribe POSTs and send-time suppression behave
+        // under TestApp exactly as they do under AppBuilder::run.
+        #[cfg(feature = "mail")]
+        if let Some(handle) = app_builder.suppression_store {
+            self.suppression_store = Some(handle);
+        }
+
+        // Carry a plugin-registered bounce/complaint suppression store (issue
+        // #1247) into the test app so send-time suppression is consulted under
+        // TestApp exactly as under AppBuilder::run — otherwise a plugin/app that
+        // wired a PgSuppressionStore would silently test against the in-memory
+        // default and hide production failures (e.g. a missing table).
+        #[cfg(feature = "mail")]
+        if let Some(handle) = app_builder.mail_suppression_store {
+            self.mail_suppression_store = Some(handle);
+        }
+
+        // Carry a plugin's `mount_unsubscribe_endpoint()` opt-in: production copies
+        // this builder flag into config.mail before router assembly, so a plugin
+        // that mounts the default unsubscribe endpoint must mount it under TestApp
+        // too (otherwise /_autumn/unsubscribe 404s in tests but works in prod).
+        #[cfg(feature = "mail")]
+        if app_builder.mount_unsubscribe_endpoint {
+            self.config.mail.mount_unsubscribe_endpoint = true;
         }
 
         // Carry plugin-registered error reporters into the test app so
@@ -702,12 +1307,65 @@ impl TestApp {
         self
     }
 
+    /// Register a [`SuppressionStore`](crate::mail::SuppressionStore) so
+    /// List-Unsubscribe sends skip suppressed recipients and the unsubscribe
+    /// endpoint records opt-outs. Mirrors
+    /// [`AppBuilder::with_suppression_store`](crate::app::AppBuilder::with_suppression_store).
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_suppression_store(
+        mut self,
+        store: impl crate::mail::SuppressionStore + 'static,
+    ) -> Self {
+        self.suppression_store = Some(crate::mail::SuppressionStoreHandle::new(store));
+        self
+    }
+
+    /// Register a bounce/complaint
+    /// [`SuppressionStore`](crate::mail::suppression::SuppressionStore) so
+    /// [`Mailer::send`](crate::mail::Mailer::send) skips hard-bounced/complained
+    /// addresses under `TestApp` exactly as it does under `AppBuilder::run`.
+    /// Mirrors
+    /// [`AppBuilder::with_mail_suppression_store`](crate::app::AppBuilder::with_mail_suppression_store).
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_suppression_store(
+        mut self,
+        store: impl crate::mail::suppression::SuppressionStore + 'static,
+    ) -> Self {
+        self.mail_suppression_store =
+            Some(crate::mail::suppression::SuppressionStoreHandle::new(store));
+        self
+    }
+
+    /// Mount the framework's default one-click unsubscribe endpoint (opt-in).
+    /// Mirrors
+    /// [`AppBuilder::mount_unsubscribe_endpoint`](crate::app::AppBuilder::mount_unsubscribe_endpoint).
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub const fn mount_unsubscribe_endpoint(mut self) -> Self {
+        self.config.mail.mount_unsubscribe_endpoint = true;
+        self
+    }
+
     #[must_use]
     pub fn with_job_interceptor(
         mut self,
         interceptor: impl crate::interceptor::JobInterceptor,
     ) -> Self {
         self.job_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Register event listeners with the test app.
+    ///
+    /// Collect them with `listeners![..]`, exactly as in `AppBuilder::listeners`.
+    /// Durable listeners run under the in-process test job runtime; sync
+    /// listeners run in-request. Published events are always recorded, so
+    /// [`TestClient::assert_event_published`] works without standing up jobs.
+    #[must_use]
+    pub fn listeners(mut self, listeners: Vec<crate::events::ListenerInfo>) -> Self {
+        self.listeners.extend(listeners);
         self
     }
 
@@ -728,6 +1386,21 @@ impl TestApp {
         interceptor: impl crate::interceptor::ChannelsInterceptor,
     ) -> Self {
         self.channels_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Opt in to recording every channel broadcast published while requests
+    /// run, enabling [`TestClient::broadcasts`],
+    /// [`TestClient::broadcasts_on`], and the `assert_broadcast*` helpers.
+    ///
+    /// No interceptor is installed — and channel publishing is untouched —
+    /// unless this is called. Composes with a user-supplied
+    /// [`with_channels_interceptor`](Self::with_channels_interceptor): the
+    /// recorder runs first, then the user's interceptor.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn record_broadcasts(mut self) -> Self {
+        self.broadcast_recorder = Some(BroadcastRecorder::new());
         self
     }
 
@@ -812,7 +1485,7 @@ impl TestApp {
     /// Attach a database connection pool to the test app.
     #[cfg(feature = "db")]
     #[must_use]
-    pub fn with_db(mut self, pool: Pool<AsyncPgConnection>) -> Self {
+    pub fn with_db(mut self, pool: Pool<crate::db::RuntimeConnection>) -> Self {
         self.pool = Some(pool);
         self
     }
@@ -832,6 +1505,36 @@ impl TestApp {
     pub fn with_transactional_db(mut self, url: impl Into<String>) -> Self {
         self.transactional = true;
         self.transactional_url = Some(url.into());
+        self
+    }
+
+    /// Configure the application's horizontal shards programmatically, as if
+    /// they were declared via `[[database.shards]]` in `autumn.toml`.
+    ///
+    /// This is the escape hatch for tests that spin up shard databases at
+    /// runtime (e.g. one Postgres container per shard) and need to point the
+    /// app at them without writing a config file. Combine with
+    /// [`transactional`](Self::transactional) to get rolled-back shard writes.
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::test::TestApp;
+    /// use autumn_web::config::ShardConfig;
+    ///
+    /// # fn example(shard0: String, shard1: String) {
+    /// let client = TestApp::new()
+    ///     .with_transactional_db("postgres://localhost/control")
+    ///     .with_shards(vec![
+    ///         ShardConfig { name: "shard0".into(), primary_url: shard0, ..Default::default() },
+    ///         ShardConfig { name: "shard1".into(), primary_url: shard1, ..Default::default() },
+    ///     ])
+    ///     .build();
+    /// # let _ = client;
+    /// # }
+    /// ```
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_shards(mut self, shards: Vec<crate::config::ShardConfig>) -> Self {
+        self.config.database.shards = shards;
         self
     }
 
@@ -896,8 +1599,45 @@ impl TestApp {
     pub fn build(mut self) -> TestClient {
         // Reset the global cache to prevent cross-test contamination.
         crate::cache::clear_global_cache();
+        // Reset the global event bus so a prior test's listeners/recorder do not
+        // leak into this one (it is re-installed below).
+        crate::events::clear_global_event_bus();
 
-        #[cfg(feature = "db")]
+        // Postgres transactional test isolation (`begin_test_transaction` +
+        // SAVEPOINT rollback on a `max_size(1)` control pool) is Postgres-only;
+        // SQLite has no equivalent, so under the `sqlite` feature the harness
+        // uses the configured pool directly (no per-test rollback isolation).
+        #[cfg(all(feature = "db", feature = "sqlite"))]
+        let (pool, replica_pool, db_interceptor) = {
+            let _ = self.transactional;
+            // SQLite has no equivalent of the Postgres transactional-rollback
+            // isolation (`begin_test_transaction` + SAVEPOINT on a `max_size(1)`
+            // control pool), so a SQLite test DB gets a real pool but NOT
+            // per-test transactional isolation. Even so, `with_transactional_db`
+            // records an explicit SQLite database URL, and dropping it here would
+            // leave a `TestApp` built that way with no pool at all -- every route
+            // using the `Db` extractor would then return 503. So when no pool was
+            // attached via `with_db` but an explicit URL was given, build a plain
+            // (non-transactional) SQLite pool from it, reusing the runtime
+            // `create_pool` path so the pool matches production behavior.
+            let pool = if let Some(pool) = self.pool {
+                Some(pool)
+            } else if let Some(url) = self.transactional_url.as_deref() {
+                let mut db_config = self.config.database.clone();
+                db_config.primary_url = Some(url.to_owned());
+                Some(
+                    crate::db::create_pool(&db_config)
+                        .expect("failed to build SQLite test pool from with_transactional_db URL")
+                        .expect(
+                            "with_transactional_db URL did not yield a SQLite pool (empty URL?)",
+                        ),
+                )
+            } else {
+                None
+            };
+            (pool, self.replica_pool, self.db_interceptor)
+        };
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         let (pool, replica_pool, db_interceptor) = if self.transactional {
             let url = self.transactional_url.as_deref()
                 .or_else(|| self.config.database.effective_primary_url())
@@ -958,6 +1698,35 @@ impl TestApp {
             (self.pool, self.replica_pool, self.db_interceptor)
         };
 
+        // Mirror production router selection (see `setup_database`): when the
+        // test config enables directory routing, build a `DirectoryShardRouter`
+        // over the control pool so tests that pin tenants in
+        // `_autumn_shard_directory` route the same way production would.
+        #[cfg(feature = "db")]
+        let shard_router: std::sync::Arc<dyn crate::sharding::ShardRouter> =
+            match (self.config.database.directory_shard_router, &pool) {
+                (true, Some(control_pool)) => {
+                    let timeout_ms = self.config.database.statement_timeout.map_or(0, |d| {
+                        u64::try_from(d.as_millis())
+                            .unwrap_or(i32::MAX as u64)
+                            .min(i32::MAX as u64)
+                    });
+                    std::sync::Arc::new(
+                        crate::sharding::DirectoryShardRouter::new(control_pool.clone())
+                            .with_statement_timeout_ms(timeout_ms),
+                    )
+                }
+                // Production `setup_database` errors here (the directory router
+                // needs a control DB), so fail the test app the same way rather
+                // than silently routing by hash and passing a test the deployed
+                // app would fail.
+                (true, None) => panic!(
+                    "directory_shard_router is enabled but TestApp has no control database pool; \
+                     configure a control pool (with_db) or disable directory routing"
+                ),
+                (false, _) => std::sync::Arc::new(crate::sharding::HashShardRouter),
+            };
+
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
@@ -970,7 +1739,34 @@ impl TestApp {
             pool,
             #[cfg(feature = "db")]
             replica_pool,
+            // Build the shard set from the test config so handlers using
+            // the sharding extractors behave as they would in production.
+            // Pools are lazy, so this needs no running databases.
+            //
+            // Under transactional isolation each shard primary pool is built
+            // with `max_size(1)` and a `begin_test_transaction` hook (mirroring
+            // the control pool above) so writes routed to a shard are rolled
+            // back at the end of the test — the same isolation the control pool
+            // gets. Replicas are skipped; all shard reads run on the primary.
+            #[cfg(all(feature = "db", not(feature = "sqlite")))]
+            shards: if self.transactional {
+                crate::sharding::create_shard_set_transactional(
+                    &self.config.database,
+                    shard_router.clone(),
+                )
+                .expect("transactional test shard pools should build from config")
+            } else {
+                crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
+                    .expect("test shard pools should build from config")
+            },
+            // The transactional shard-set builder is Postgres-only (per-shard
+            // `begin_test_transaction` isolation); under the `sqlite` feature the
+            // harness always uses the plain builder (no shard rollback isolation).
+            #[cfg(all(feature = "db", feature = "sqlite"))]
+            shards: crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
+                .expect("test shard pools should build from config"),
             profile: self.config.profile.clone(),
+            role: self.config.role,
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,
             probes: probes.clone(),
@@ -997,6 +1793,7 @@ impl TestApp {
             clock: self
                 .clock
                 .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock)),
+            app_id: crate::state::AppState::next_app_id(),
         };
 
         for register in self.policy_registrations {
@@ -1010,30 +1807,81 @@ impl TestApp {
         state.insert_extension(self.config.clone());
 
         #[cfg(feature = "mail")]
-        if let Some(interceptor) = self.mail_interceptor {
-            state.insert_extension(interceptor);
-        }
-        if let Some(interceptor) = self.job_interceptor {
-            state.insert_extension(interceptor);
-        }
+        let mail_recorder_for_client = {
+            let recorder_for_client = self.mail_recorder.clone();
+            let recorder = std::sync::Arc::new(self.mail_recorder);
+            let effective: std::sync::Arc<dyn crate::interceptor::MailInterceptor> =
+                if let Some(user) = self.mail_interceptor {
+                    std::sync::Arc::new(ChainedMailInterceptor {
+                        first: recorder,
+                        second: user,
+                    })
+                } else {
+                    recorder
+                };
+            state.insert_extension(effective);
+            recorder_for_client
+        };
+        // Always install the job recorder so `enqueued_jobs`/`assert_job_*` and
+        // `perform_enqueued_jobs` work with no opt-in. The recorder runs first
+        // and composes with any user-supplied `with_job_interceptor` (which
+        // still runs, after the recorder). A single `Arc<dyn JobInterceptor>`
+        // extension is what the job runtime reads, so we chain rather than
+        // install two.
+        let job_recorder_for_client = {
+            let recorder_for_client = self.job_recorder.clone();
+            let recorder: std::sync::Arc<dyn crate::interceptor::JobInterceptor> =
+                std::sync::Arc::new(self.job_recorder);
+            let effective: std::sync::Arc<dyn crate::interceptor::JobInterceptor> =
+                if let Some(user) = self.job_interceptor {
+                    std::sync::Arc::new(ChainedJobInterceptor {
+                        first: recorder,
+                        second: user,
+                    })
+                } else {
+                    recorder
+                };
+            state.insert_extension(effective);
+            recorder_for_client
+        };
         #[cfg(feature = "db")]
         if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);
         }
         #[cfg(feature = "ws")]
-        if let Some(interceptor) = self.channels_interceptor {
-            state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                ),
-            ));
-            #[cfg(feature = "presence")]
-            {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
+        let broadcast_recorder_for_client = {
+            let mut interceptors: Vec<std::sync::Arc<dyn crate::interceptor::ChannelsInterceptor>> =
+                Vec::new();
+
+            // Recorder runs first so it observes every publish before any
+            // user-supplied interceptor can short-circuit the chain.
+            let recorder_for_client = self.broadcast_recorder.clone();
+            if let Some(recorder) = self.broadcast_recorder {
+                interceptors.push(std::sync::Arc::new(recorder));
             }
-        }
+            if let Some(interceptor) = self.channels_interceptor {
+                // Preserve the existing `insert_extension` behavior so the
+                // user's interceptor is discoverable from state.
+                state.insert_extension(interceptor.clone());
+                interceptors.push(interceptor);
+            }
+
+            // AC6: install nothing (and leave production `Channels` untouched)
+            // unless at least one interceptor was requested.
+            if !interceptors.is_empty() {
+                state.channels = crate::channels::Channels::with_shared_backend(
+                    std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
+                        state.channels.backend().clone(),
+                        interceptors,
+                    )),
+                );
+                #[cfg(feature = "presence")]
+                {
+                    state.presence = crate::presence::Presence::new(state.channels.clone());
+                }
+            }
+            recorder_for_client
+        };
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = self.http_interceptor {
             state.insert_extension(interceptor);
@@ -1041,6 +1889,15 @@ impl TestApp {
 
         #[cfg(feature = "mail")]
         {
+            if let Some(handle) = self.suppression_store.clone() {
+                state.insert_extension(handle);
+            }
+            // Mirror AppBuilder::run: register the bounce/complaint suppression
+            // handle before install_mailer so the test mailer actually consults
+            // it (install_mailer reads it back via the extension).
+            if let Some(handle) = self.mail_suppression_store.clone() {
+                state.insert_extension(handle);
+            }
             crate::mail::install_mailer(&state, &self.config.mail, false)
                 .expect("Failed to configure test mailer");
         }
@@ -1048,6 +1905,14 @@ impl TestApp {
         // Install HTTP client config so the Client extractor can read it.
         #[cfg(feature = "http-client")]
         state.insert_extension(self.config.http.clone());
+
+        // Register the shared reqwest::Client so Client::from_state reuses the
+        // connection pool in tests, mirroring the production build_state path.
+        #[cfg(feature = "http-client")]
+        state.insert_extension(crate::http_client::SharedReqwestClient {
+            client: crate::http_client::Client::build_inner(&self.config.http.client),
+            timeout_secs: self.config.http.client.timeout_secs,
+        });
 
         // Install mock registry when http_mock() was called.
         #[cfg(feature = "http-client")]
@@ -1071,9 +1936,35 @@ impl TestApp {
             }
         }
 
+        // Mirror production `AppBuilder` wiring: surface each configured shard's
+        // replica readiness as a `db:shard:<name>` indicator so `/ready`
+        // refreshes shard replica health (gating `fail_readiness` shards and
+        // marking healthy replicas ready for `ShardedDb` read routing).
+        #[cfg(feature = "db")]
+        if let Some(set) = state.shards() {
+            crate::sharding::register_shard_health_indicators(
+                set,
+                &state.health_indicator_registry,
+            );
+        }
+
         for initializer in self.state_initializers {
             initializer(&state);
         }
+
+        // Wire the event bus: always install a recorder so tests can assert on
+        // published events without a job runner, register the listener registry
+        // for the `Events` extractor, and fold durable listeners into the jobs
+        // started below so they dispatch through the in-process test runtime.
+        state.insert_extension(crate::events::EventRecorder::default());
+        let event_recorder = state
+            .extension::<crate::events::EventRecorder>()
+            .expect("event recorder just installed");
+        let event_registry =
+            crate::events::EventRegistry::from_listeners(std::mem::take(&mut self.listeners));
+        self.jobs.extend(event_registry.durable_job_infos());
+        state.insert_extension(event_registry.clone());
+        crate::events::init_global_event_bus(&event_registry, &state, Some(event_recorder));
 
         for job in &self.jobs {
             state.job_registry.register(&job.name);
@@ -1083,10 +1974,20 @@ impl TestApp {
             None
         } else {
             let shutdown = tokio_util::sync::CancellationToken::new();
-            crate::job::start_runtime(self.jobs.clone(), &state, &shutdown, &self.config.jobs)
-                .expect("Failed to start job runtime in test");
+            crate::job::start_runtime(
+                self.jobs.clone(),
+                &state,
+                &shutdown,
+                &self.config.jobs,
+                true,
+            )
+            .expect("Failed to start job runtime in test");
             Some(TestJobRuntime { shutdown })
         };
+
+        // Retain the registered job metadata so `perform_enqueued_jobs` can look
+        // up each captured job's handler by name and dispatch it directly.
+        let jobs_for_client = self.jobs.clone();
 
         #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
         let mut merge_routers = self.merge_routers;
@@ -1133,6 +2034,40 @@ impl TestApp {
             }
         }
 
+        // Explicitly build the session store the router's `SessionLayer` will
+        // use, so the client keeps a handle for `acting_as` to mint sessions
+        // (#1359). For the default in-memory backend we install a `MemoryStore`
+        // and pass it as the custom store; for other backends we leave it to
+        // config-driven selection (`None`) and the client's `session_store`
+        // handle stays `None`, so `acting_as` panics with a clear message.
+        let session_backed_by_memory = matches!(
+            self.config.session.backend,
+            crate::session::SessionBackend::Memory
+        );
+        let test_session_store: Option<std::sync::Arc<dyn crate::session::BoxedSessionStore>> =
+            if session_backed_by_memory {
+                Some(std::sync::Arc::new(crate::session::MemoryStore::new()))
+            } else {
+                None
+            };
+        let session_cookie_name = self.config.session.cookie_name.clone();
+        let auth_session_key = self.config.auth.session_key.clone();
+        // Mirror the router's session-cookie signing decision (router.rs): only
+        // thread signing keys when a secret is configured or in production.
+        let session_signing_keys = {
+            let is_production =
+                matches!(self.config.profile.as_deref(), Some("prod" | "production"));
+            if self.config.security.signing_secret.secret.is_some() || is_production {
+                Some(std::sync::Arc::new(
+                    crate::security::config::resolve_signing_keys(
+                        &self.config.security.signing_secret,
+                    ),
+                ))
+            } else {
+                None
+            }
+        };
+
         let router = crate::router::try_build_router_inner(
             self.routes,
             &self.config,
@@ -1143,8 +2078,10 @@ impl TestApp {
                 merge_routers,
                 nest_routers: self.nest_routers,
                 custom_layers: self.custom_layers,
+                static_gate_layers: self.static_gate_layers,
+                #[cfg(feature = "maud")]
                 error_page_renderer: None,
-                session_store: None,
+                session_store: test_session_store.clone(),
                 #[cfg(feature = "openapi")]
                 openapi: self.openapi,
                 #[cfg(feature = "mcp")]
@@ -1165,12 +2102,38 @@ impl TestApp {
         } else {
             router
         };
+        // Mirror production's outermost Server-Timing fallback (#1348): in
+        // production it is applied in `apply_startup_barrier`, outside the
+        // primary `ServerTimingLayer` and the late `/mcp` merge, and appends a
+        // `total` only for responses the primary never saw — short-circuits and
+        // the late-merged `/mcp` envelope. Without mirroring it here a
+        // `tools/call` would carry no outer `total` in tests, unlike production,
+        // so tests would not observe the real `/mcp` timing an operator sees.
+        // Applied outer to the access-log fallback, matching production order.
+        let router = if crate::config::server_timing_enabled(&self.config) {
+            router.layer(crate::middleware::ServerTimingLayer::fallback(true))
+        } else {
+            router
+        };
         TestClient {
             router,
             probes,
             state,
             _job_runtime: job_runtime,
             clock_as_any: self.clock_as_any,
+            #[cfg(feature = "mail")]
+            mail_recorder: Some(mail_recorder_for_client),
+            #[cfg(feature = "ws")]
+            broadcast_recorder: broadcast_recorder_for_client,
+            job_recorder: Some(job_recorder_for_client),
+            jobs: jobs_for_client,
+            cookie_jar: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_store: test_session_store,
+            session_cookie_name,
+            auth_session_key,
+            session_signing_keys,
         }
     }
 }
@@ -1219,7 +2182,60 @@ pub struct TestClient {
     _job_runtime: Option<TestJobRuntime>,
     /// Retained so `advance_clock` can downcast to [`crate::time::TickingClock`].
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// `None` when built via [`TestApp::from_router`], which bypasses recorder
+    /// wiring. `Some` for all clients produced by [`TestApp::build`].
+    #[cfg(feature = "mail")]
+    mail_recorder: Option<MailRecorder>,
+    /// `Some` only when [`TestApp::record_broadcasts`] opted in; otherwise
+    /// `None` (also for clients built via [`TestApp::from_router`]).
+    #[cfg(feature = "ws")]
+    broadcast_recorder: Option<BroadcastRecorder>,
+    /// Built-in job recorder. `None` for clients built via
+    /// [`TestApp::from_router`], which bypasses recorder wiring; `Some` for all
+    /// clients produced by [`TestApp::build`].
+    job_recorder: Option<JobRecorder>,
+    /// Registered job metadata, retained so [`TestClient::perform_enqueued_jobs`]
+    /// can dispatch each captured job through its handler. Empty for
+    /// [`TestApp::from_router`] clients.
+    jobs: Vec<crate::job::JobInfo>,
+    /// Per-client cookie jar (`name → value + optional expiry`). Every
+    /// response's `Set-Cookie` is folded in here, its `Max-Age`/`Expires`
+    /// recorded, and it is replayed on subsequent requests until it expires
+    /// against the client's clock, so a real
+    /// `POST /login` → `GET /dashboard` flow works with no manual header
+    /// threading. Shared with each [`RequestBuilder`] via a cloned `Arc`.
+    cookie_jar: CookieJar,
+    /// Handle to the session store the router's `SessionLayer` reads, so
+    /// [`TestClient::acting_as`] can mint an authenticated session directly.
+    /// `None` for clients built via [`TestApp::from_router`] or configured
+    /// with a non-memory session backend; `acting_as` panics for those.
+    session_store: Option<std::sync::Arc<dyn crate::session::BoxedSessionStore>>,
+    /// Name of the session cookie (`session.cookie_name`, default
+    /// `"autumn.sid"`); the cookie `acting_as` seeds and `log_out` clears.
+    session_cookie_name: String,
+    /// Session key the auth stack reads for identity (`auth.session_key`,
+    /// default `"user_id"`); the key `acting_as` writes.
+    auth_session_key: String,
+    /// Session cookie signing keys when `security.signing_secret` is set (or
+    /// in production), mirroring how the router signs session cookies. When
+    /// present, `acting_as` signs the seeded cookie so the `SessionLayer`
+    /// accepts it.
+    session_signing_keys: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>>,
 }
+
+/// A cookie stored in the jar: its value plus an optional absolute expiry.
+///
+/// `expires_at: None` is a session cookie that never client-expires; `Some(t)`
+/// records the instant (from `Max-Age`/`Expires`) past which the cookie must no
+/// longer be replayed, evaluated against the client's (possibly virtual) clock.
+#[derive(Clone)]
+struct StoredCookie {
+    value: String,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Shared per-client cookie store: cookie name → stored cookie (value + expiry).
+type CookieJar = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, StoredCookie>>>;
 
 struct TestJobRuntime {
     shutdown: tokio_util::sync::CancellationToken,
@@ -1237,6 +2253,35 @@ impl TestClient {
     #[must_use]
     pub const fn state(&self) -> &AppState {
         &self.state
+    }
+
+    /// Every recorded publication of event type `E`, deserialized.
+    ///
+    /// Events are recorded synchronously at publish time, so this works whether
+    /// or not the listeners (sync or durable) have run.
+    #[must_use]
+    pub fn published_events<E: crate::events::Event>(&self) -> Vec<E> {
+        self.state
+            .extension::<crate::events::EventRecorder>()
+            .map(|recorder| recorder.published::<E>())
+            .unwrap_or_default()
+    }
+
+    /// Assert that at least one event of type `E` was published during the test.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no event of type `E` was recorded.
+    pub fn assert_event_published<E: crate::events::Event>(&self) {
+        let count = self
+            .state
+            .extension::<crate::events::EventRecorder>()
+            .map_or(0, |recorder| recorder.count::<E>());
+        assert!(
+            count > 0,
+            "expected event `{}` to have been published, but none were recorded",
+            E::NAME,
+        );
     }
 
     /// Step the test clock forward by `duration`.
@@ -1288,40 +2333,633 @@ impl TestClient {
         &self.probes
     }
 
+    /// Returns all emails sent during this test, in the order they were sent.
+    ///
+    /// The built-in recorder is installed automatically — no
+    /// `.with_mail_interceptor(…)` call is required.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// client.post("/signup").json(&body).send().await.assert_ok();
+    /// let mail = &client.sent_mail()[0];
+    /// assert_eq!(mail.subject, "Welcome!");
+    /// ```
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn sent_mail(&self) -> Vec<SentMail> {
+        self.mail_recorder
+            .as_ref()
+            .expect("sent_mail() is not available on a TestClient built via from_router(); use TestApp::new().merge(router).build() instead")
+            .get_sent()
+    }
+
+    /// Asserts that exactly `n` emails were sent, panicking with a list of
+    /// what was actually sent on failure.
+    ///
+    /// Returns `&self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the count does not match.
+    #[cfg(feature = "mail")]
+    pub fn assert_email_count(&self, n: usize) -> &Self {
+        let sent = self.sent_mail();
+        assert_eq!(
+            sent.len(),
+            n,
+            "expected {n} email(s) to have been sent, got {};\nactually sent: {sent:#?}",
+            sent.len(),
+        );
+        self
+    }
+
+    /// Asserts that no emails were sent.
+    ///
+    /// Returns `&self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any emails were sent.
+    #[cfg(feature = "mail")]
+    pub fn assert_no_email_sent(&self) -> &Self {
+        self.assert_email_count(0)
+    }
+
+    /// Asserts that at least one sent email satisfies `predicate`, panicking
+    /// with a list of what was actually sent on failure.
+    ///
+    /// Returns `&self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no sent email matches.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// client
+    ///     .assert_email_sent(|m| m.to.iter().any(|a| a == "alice@example.com"))
+    ///     .assert_email_sent(|m| m.subject == "Welcome!");
+    /// ```
+    #[cfg(feature = "mail")]
+    pub fn assert_email_sent(&self, predicate: impl Fn(&SentMail) -> bool) -> &Self {
+        let sent = self.sent_mail();
+        assert!(
+            sent.iter().any(predicate),
+            "no sent email matched the predicate;\nactually sent: {sent:#?}",
+        );
+        self
+    }
+
+    // ── Broadcast recorder accessors & assertions (issue #1043) ──────────
+
+    /// Every recorded channel publication, in publish order.
+    ///
+    /// Requires opting in with [`TestApp::record_broadcasts`]. Captures both
+    /// raw `publish` text and `publish_html` HTML/OOB payloads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`TestApp::record_broadcasts`] was not called.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn broadcasts(&self) -> Vec<RecordedBroadcast> {
+        self.broadcast_recorder
+            .as_ref()
+            .expect(
+                "broadcasts() requires opting in via TestApp::record_broadcasts() before build()",
+            )
+            .recorded()
+    }
+
+    /// Recorded publications on `topic`, in publish order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`TestApp::record_broadcasts`] was not called.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn broadcasts_on(&self, topic: &str) -> Vec<RecordedBroadcast> {
+        self.broadcasts()
+            .into_iter()
+            .filter(|b| b.topic == topic)
+            .collect()
+    }
+
+    /// Builds a self-diagnosing failure message listing what was actually
+    /// published to `topic` and, grouped, to every other topic.
+    #[cfg(feature = "ws")]
+    fn broadcast_failure_message(&self, topic: &str, headline: &str) -> String {
+        use std::collections::BTreeMap;
+        use std::fmt::Write as _;
+        let all = self.broadcasts();
+        let on_topic: Vec<&str> = all
+            .iter()
+            .filter(|b| b.topic == topic)
+            .map(|b| b.payload.as_str())
+            .collect();
+
+        let mut others: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for b in &all {
+            if b.topic != topic {
+                others
+                    .entry(b.topic.as_str())
+                    .or_default()
+                    .push(b.payload.as_str());
+            }
+        }
+
+        let mut msg = format!("{headline}\n");
+        let _ = writeln!(
+            msg,
+            "published to {topic:?} ({} total): {on_topic:#?}",
+            on_topic.len(),
+        );
+        if others.is_empty() {
+            msg.push_str("no publications on any other topic");
+        } else {
+            let _ = write!(msg, "other topics published: {others:#?}");
+        }
+        msg
+    }
+
+    /// Asserts that at least one publication on `topic` satisfies `predicate`.
+    ///
+    /// Returns `&Self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no matching publication is found, dumping what *was*
+    /// published to `topic` and nearby topics.
+    #[cfg(feature = "ws")]
+    pub fn assert_broadcast(
+        &self,
+        topic: &str,
+        predicate: impl Fn(&RecordedBroadcast) -> bool,
+    ) -> &Self {
+        let matched = self.broadcasts_on(topic).iter().any(predicate);
+        assert!(
+            matched,
+            "{}",
+            self.broadcast_failure_message(
+                topic,
+                &format!("no broadcast on {topic:?} matched the predicate;"),
+            )
+        );
+        self
+    }
+
+    /// Asserts that exactly `n` publications were made to `topic`.
+    ///
+    /// Returns `&Self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the count does not match, dumping what *was* published to
+    /// `topic` and nearby topics.
+    #[cfg(feature = "ws")]
+    pub fn assert_broadcast_count(&self, topic: &str, n: usize) -> &Self {
+        let count = self.broadcasts_on(topic).len();
+        assert!(
+            count == n,
+            "{}",
+            self.broadcast_failure_message(
+                topic,
+                &format!("expected {n} broadcast(s) on {topic:?}, got {count};"),
+            )
+        );
+        self
+    }
+
+    /// Asserts that nothing was published to `topic`.
+    ///
+    /// Returns `&Self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any publication was made to `topic`, dumping what *was*
+    /// published to `topic` and nearby topics.
+    #[cfg(feature = "ws")]
+    pub fn assert_no_broadcasts(&self, topic: &str) -> &Self {
+        self.assert_broadcast_count(topic, 0)
+    }
+
+    // ── Background-job recorder ────────────────────────────────────
+
+    /// Every background-job enqueue captured by the built-in recorder, in the
+    /// order they were enqueued (across `enqueue`, `enqueue_after_commit`, and
+    /// `enqueue_in_tx`).
+    ///
+    /// The recorder is always on for [`TestApp::build`] clients — no opt-in.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a [`TestClient`] built via [`TestApp::from_router`],
+    /// which bypasses recorder wiring.
+    #[must_use]
+    pub fn enqueued_jobs(&self) -> Vec<RecordedJob> {
+        self.job_recorder
+            .as_ref()
+            .expect(
+                "enqueued_jobs() is not available on a TestClient built via from_router(); use TestApp::new().merge(router).build() instead",
+            )
+            .recorded()
+    }
+
+    /// Assert at least one job with the given registered `name` was enqueued.
+    ///
+    /// # Panics
+    ///
+    /// Panics, listing every job that *was* enqueued, if no enqueue with that
+    /// name was captured.
+    pub fn assert_job_enqueued(&self, name: &str) -> &Self {
+        let jobs = self.enqueued_jobs();
+        assert!(
+            jobs.iter().any(|j| j.name == name),
+            "expected a job named '{name}' to have been enqueued, but it was not.\nEnqueued jobs:\n{}",
+            format_recorded_jobs(&jobs)
+        );
+        self
+    }
+
+    /// Assert at least one job was enqueued with **both** the given registered
+    /// `name` and an exactly-equal JSON `payload`.
+    ///
+    /// # Panics
+    ///
+    /// Panics, listing every job that *was* enqueued, if no enqueue matched
+    /// both the name and payload.
+    // Takes the payload by value for call-site ergonomics — `json!({..})`
+    // reads cleanly without a leading `&`, mirroring the acceptance criteria.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn assert_job_enqueued_with(&self, name: &str, payload: serde_json::Value) -> &Self {
+        let jobs = self.enqueued_jobs();
+        // Strip the opt-in schema-version envelope (issue #1205) so payload
+        // assertions stay on clean args even for `#[job(version = N)]` jobs
+        // whose stored payload is wrapped as `{__autumn_schema_version, args}`.
+        assert!(
+            jobs.iter().any(|j| j.name == name
+                && *crate::payload_version::split_version(&j.payload).1 == payload),
+            "expected a job named '{name}' enqueued with payload {payload}, but no match was found.\nEnqueued jobs:\n{}",
+            format_recorded_jobs(&jobs)
+        );
+        self
+    }
+
+    /// Assert no jobs were enqueued at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics, listing every captured enqueue, if any job was enqueued.
+    pub fn assert_no_jobs_enqueued(&self) -> &Self {
+        let jobs = self.enqueued_jobs();
+        assert!(
+            jobs.is_empty(),
+            "expected no jobs to have been enqueued, but {} were:\n{}",
+            jobs.len(),
+            format_recorded_jobs(&jobs)
+        );
+        self
+    }
+
+    /// Drain every captured job and dispatch it through its registered handler,
+    /// awaiting each in enqueue order, so a test can assert the resulting side
+    /// effects synchronously.
+    ///
+    /// Each captured payload is handed to the same handler the runtime would
+    /// invoke, so the real deserialization path runs: a payload that cannot be
+    /// deserialized into the job's args surfaces as a per-job failure (not a
+    /// silent miss). The queue is emptied — a second call performs nothing
+    /// until more jobs are enqueued.
+    ///
+    /// Returns a [`PerformedJobs`] report carrying each job's `(name, result)`;
+    /// per-job handler errors (and captured jobs with no registered handler)
+    /// are surfaced there rather than swallowed. See
+    /// [`PerformedJobs::assert_all_succeeded`].
+    ///
+    /// # Note
+    ///
+    /// [`TestApp::build`] starts the in-process job worker by default, and that
+    /// worker *also* drains and runs the same enqueued jobs. Calling this method
+    /// therefore executes a job's side effect an **additional** time, on top of
+    /// the worker's own run. It is primarily for asserting that a job runs to
+    /// completion — surfacing handler/deserialization errors synchronously — not
+    /// for counting side effects. Any assertion on a side effect's *count* must
+    /// account for the worker's run as well (as the job-recorder integration
+    /// tests do: they settle the worker's run first, then attribute the next
+    /// increment to this call).
+    ///
+    /// The helper invokes each job's registered handler directly and does *not*
+    /// run it through a user-installed
+    /// [`JobInterceptor::intercept_execute`](crate::interceptor::JobInterceptor::intercept_execute),
+    /// so
+    /// execution-interceptor effects (context injection, metrics, error
+    /// injection) are exercised by the in-process worker path, not by this
+    /// helper.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a [`TestClient`] built via [`TestApp::from_router`].
+    pub async fn perform_enqueued_jobs(&self) -> PerformedJobs {
+        let recorder = self.job_recorder.as_ref().expect(
+            "perform_enqueued_jobs() is not available on a TestClient built via from_router(); use TestApp::new().merge(router).build() instead",
+        );
+        let drained = recorder.drain();
+        let mut outcomes = Vec::with_capacity(drained.len());
+        for job in drained {
+            let handler = self
+                .jobs
+                .iter()
+                .find(|info| info.name == job.name)
+                .map(|info| info.handler);
+            let result = match handler {
+                Some(handler) => (handler)(self.state.clone(), job.payload).await,
+                None => Err(crate::AutumnError::internal_server_error(
+                    std::io::Error::other(format!(
+                        "no registered handler for enqueued job '{}'; register it via AppBuilder::jobs()",
+                        job.name
+                    )),
+                )),
+            };
+            outcomes.push((job.name, result));
+        }
+        PerformedJobs { outcomes }
+    }
+
+    /// The app's configured N+1 detection threshold
+    /// (`dev.inspector_n_plus_one_threshold`), threaded into every
+    /// [`RequestBuilder`] so the resulting [`TestResponse`] can default
+    /// [`TestResponse::assert_no_n_plus_one`] to it.
+    fn n_plus_one_threshold(&self) -> usize {
+        self.state.config().dev.inspector_n_plus_one_threshold
+    }
+
     /// Start building a GET request.
     #[must_use]
     pub fn get(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::GET, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::GET,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
+        )
     }
 
     /// Start building a POST request.
     #[must_use]
     pub fn post(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::POST, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::POST,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
+        )
     }
 
     /// Start building a PUT request.
     #[must_use]
     pub fn put(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::PUT, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::PUT,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
+        )
     }
 
     /// Start building a DELETE request.
     #[must_use]
     pub fn delete(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::DELETE, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::DELETE,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
+        )
     }
 
     /// Start building a PATCH request.
     #[must_use]
     pub fn patch(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::PATCH, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::PATCH,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
+        )
     }
 
     /// Start building an OPTIONS request (e.g. a CORS preflight).
     #[must_use]
     pub fn options(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::OPTIONS, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::OPTIONS,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
+        )
+    }
+
+    // ── Authentication helpers (#1359) ─────────────────────────
+
+    /// Establish an authenticated session for `user_id` *without* calling the
+    /// login endpoint, then return `&Self` for chaining.
+    ///
+    /// Mints a fresh session containing the app's configured
+    /// `auth.session_key` (default `"user_id"`) set to `user_id`, saves it to
+    /// the session store the router reads, and seeds the cookie jar with the
+    /// session cookie. A subsequent request to a `#[secured]` / [`Auth`](crate::auth::Auth)-gated
+    /// route then extracts the same identity a real login would produce.
+    ///
+    /// This sets **identity only** — authorization still runs. A user acted-as
+    /// here who lacks a required role or scope is still denied.
+    ///
+    /// Analogous to Laravel's `actingAs`, Rails' `sign_in`, Django's
+    /// `force_login`, and Phoenix's `log_in_user`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the client has no handle to a session store — i.e. it was
+    /// built via [`TestApp::from_router`], or configured with a non-memory
+    /// session backend. Use [`TestApp::build`] with the default (memory)
+    /// session backend for `acting_as` support.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let client = TestApp::new().routes(routes![dashboard]).build();
+    /// client.acting_as(42).await;
+    /// client.get("/dashboard").send().await.assert_ok();
+    /// ```
+    pub async fn acting_as(&self, user_id: impl std::fmt::Display) -> &Self {
+        let store = self.session_store.as_ref().unwrap_or_else(|| {
+            panic!(
+                "acting_as requires a session store handle, which is only available on clients \
+                 built via `TestApp::build()` with the default in-memory session backend. \
+                 Clients from `TestApp::from_router` or configured with a non-memory backend \
+                 cannot mint sessions this way."
+            )
+        });
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mut data = std::collections::HashMap::new();
+        data.insert(self.auth_session_key.clone(), user_id.to_string());
+        store
+            .boxed_save(&session_id, data)
+            .await
+            .expect("failed to save acting_as session to the test session store");
+
+        // Match the router's cookie encoding: sign the id when signing keys
+        // are active, otherwise store the raw id.
+        let cookie_value = self.session_signing_keys.as_ref().map_or_else(
+            || session_id.clone(),
+            |keys| format!("{session_id}.{}", keys.sign(session_id.as_bytes())),
+        );
+        self.cookie_jar
+            .lock()
+            .expect("cookie jar mutex poisoned")
+            .insert(
+                self.session_cookie_name.clone(),
+                StoredCookie {
+                    value: cookie_value,
+                    expires_at: None,
+                },
+            );
+
+        self
+    }
+
+    /// Alias for [`acting_as`](Self::acting_as).
+    ///
+    /// Provided for readers coming from frameworks whose helper is spelled
+    /// `login_as` / `sign_in`.
+    ///
+    /// # Panics
+    ///
+    /// See [`acting_as`](Self::acting_as).
+    pub async fn login_as(&self, user_id: impl std::fmt::Display) -> &Self {
+        self.acting_as(user_id).await
+    }
+
+    /// Clear the session cookie from the jar, reverting the client to an
+    /// unauthenticated state, then return `&Self` for chaining.
+    ///
+    /// After `log_out`, a request to a secured route returns its
+    /// unauthenticated status (401 / redirect) again. The corresponding
+    /// server-side session (if any) is left to expire naturally.
+    ///
+    /// Analogous to Laravel's `Auth::logout`, Rails' `sign_out`, and Django's
+    /// `logout`.
+    pub fn log_out(&self) -> &Self {
+        self.cookie_jar
+            .lock()
+            .expect("cookie jar mutex poisoned")
+            .remove(&self.session_cookie_name);
+        self
+    }
+}
+
+/// Fold a single `Set-Cookie` header value into the cookie jar.
+///
+/// Stores `name=value` along with any absolute expiry parsed from the header's
+/// `Max-Age`/`Expires` attributes (so a live cookie stops being replayed once
+/// the clock passes it), or removes the cookie when the header marks it for
+/// immediate deletion (`Max-Age=0`, a non-positive `Max-Age`, or an `Expires`
+/// in the past — the encodings the session layer and CSRF layer use to clear
+/// cookies).
+///
+/// When both `Max-Age` and `Expires` are present, `Max-Age` wins (per
+/// RFC 6265). A live cookie with no expiry attributes is stored as a session
+/// cookie (`expires_at: None`) that never client-expires.
+///
+/// `now` is the reference instant for evaluating `Max-Age`/`Expires`; callers
+/// pass the framework's (possibly virtual) clock so a test that pins or
+/// advances time sees deterministic expiry.
+fn apply_set_cookie(
+    jar: &mut std::collections::HashMap<String, StoredCookie>,
+    header: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let mut parts = header.split(';');
+    let Some(pair) = parts.next() else {
+        return;
+    };
+    let Some((name, value)) = pair.split_once('=') else {
+        return;
+    };
+    let name = name.trim();
+    let value = value.trim();
+    if name.is_empty() {
+        return;
+    }
+
+    // The jar reliably recognizes Autumn's own cookie-clear encodings: an empty
+    // value (handled below) and a non-positive `Max-Age`, which the session and
+    // CSRF layers use to delete cookies. Third-party `Expires`-based deletions
+    // are only best-effort — an RFC 2822 timestamp in the past is honored, but
+    // other date encodings a foreign server might send are not fully parsed.
+    let mut deletes = false;
+    // Absolute expiry parsed from a positive `Max-Age`/future `Expires`. When
+    // both are present, `Max-Age` wins (RFC 6265), so track them separately and
+    // resolve at the end.
+    let mut max_age_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut expires_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut saw_max_age = false;
+    for attr in parts {
+        let attr = attr.trim();
+        // Both `Max-Age=` and `Expires=` are 8-byte ASCII prefixes; match them
+        // case-insensitively (`EXPIRES=` etc. are equally valid per RFC 6265).
+        let prefix = attr.get(..8);
+        if prefix.is_some_and(|p| p.eq_ignore_ascii_case("Max-Age=")) {
+            if let Ok(secs) = attr[8..].trim().parse::<i64>() {
+                saw_max_age = true;
+                if secs <= 0 {
+                    deletes = true;
+                } else {
+                    max_age_expiry = now.checked_add_signed(chrono::Duration::seconds(secs));
+                }
+            }
+        } else if prefix.is_some_and(|p| p.eq_ignore_ascii_case("Expires="))
+            && let Ok(when) = chrono::DateTime::parse_from_rfc2822(attr[8..].trim())
+        {
+            let when = when.with_timezone(&chrono::Utc);
+            if when <= now {
+                deletes = true;
+            } else {
+                expires_expiry = Some(when);
+            }
+        }
+    }
+
+    if deletes || value.is_empty() {
+        jar.remove(name);
+    } else {
+        // `Max-Age` takes precedence over `Expires` when both are present.
+        let expires_at = if saw_max_age {
+            max_age_expiry
+        } else {
+            expires_expiry
+        };
+        jar.insert(
+            name.to_owned(),
+            StoredCookie {
+                value: value.to_owned(),
+                expires_at,
+            },
+        );
     }
 }
 
@@ -1338,16 +2976,38 @@ pub struct RequestBuilder {
     uri: String,
     headers: Vec<(String, String)>,
     body: Body,
+    /// Shared with the originating [`TestClient`]: cookies are read from here
+    /// to compose the request `Cookie` header, and `Set-Cookie` from the
+    /// response is folded back in. `None` when the builder was constructed
+    /// without a client (not reachable through the public API today).
+    cookie_jar: Option<CookieJar>,
+    /// The originating client's clock, used to evaluate `Expires` when folding
+    /// `Set-Cookie` back into the jar. `None` falls back to [`chrono::Utc::now`].
+    clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
+    /// Default N+1 detection threshold (`dev.inspector_n_plus_one_threshold`),
+    /// propagated to the resulting [`TestResponse`] so
+    /// [`TestResponse::assert_no_n_plus_one`] can honour the app's config.
+    n_plus_one_threshold: usize,
 }
 
 impl RequestBuilder {
-    fn new(router: axum::Router, method: Method, uri: &str) -> Self {
+    fn new(
+        router: axum::Router,
+        method: Method,
+        uri: &str,
+        cookie_jar: CookieJar,
+        clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
+        n_plus_one_threshold: usize,
+    ) -> Self {
         Self {
             router,
             method,
             uri: uri.to_owned(),
             headers: Vec::new(),
             body: Body::empty(),
+            cookie_jar: Some(cookie_jar),
+            clock,
+            n_plus_one_threshold,
         }
     }
 
@@ -1398,7 +3058,42 @@ impl RequestBuilder {
     /// Fire the request through the full middleware pipeline and return
     /// a [`TestResponse`].
     pub async fn send(self) -> TestResponse {
+        // Captured for failure messages and the N+1 default threshold on the
+        // resulting `TestResponse`.
+        let request_method = self.method.to_string();
+        let request_path = self.uri.clone();
+        let n_plus_one_threshold = self.n_plus_one_threshold;
+
         let mut builder = Request::builder().method(self.method).uri(&self.uri);
+
+        // Replay the cookie jar: compose a `Cookie` header from stored cookies
+        // unless the caller already set one explicitly (an explicit header
+        // wins, so tests can still exercise raw cookie behavior).
+        let caller_set_cookie = self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("cookie"));
+        if !caller_set_cookie && let Some(jar) = &self.cookie_jar {
+            // Evaluate expiry against the same clock the jar folds `Set-Cookie`
+            // with, so a virtual-clock test sees cookies stop replaying once it
+            // advances past their `Max-Age`/`Expires`. Prune expired entries in
+            // passing so they don't linger.
+            let now = self
+                .clock
+                .as_ref()
+                .map_or_else(chrono::Utc::now, |c| c.now());
+            let cookie_header = {
+                let mut jar = jar.lock().expect("cookie jar mutex poisoned");
+                jar.retain(|_, cookie| cookie.expires_at.is_none_or(|t| t > now));
+                jar.iter()
+                    .map(|(name, cookie)| format!("{name}={}", cookie.value))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            if !cookie_header.is_empty() {
+                builder = builder.header(http::header::COOKIE, cookie_header);
+            }
+        }
 
         for (name, value) in &self.headers {
             builder = builder.header(name.as_str(), value.as_str());
@@ -1413,22 +3108,89 @@ impl RequestBuilder {
         // unconditionally.
         let service =
             tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), self.router);
-        let response = service.oneshot(request).await.expect("request failed");
 
-        let status = response.status();
-        let headers: Vec<(String, String)> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_owned()))
-            .collect();
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("failed to read response body");
+        // Drive the request under a per-request `REQUEST_QUERY_CAPTURE` scope so
+        // the connection-level `RequestQueryTimer` (installed at `Db::checkout`
+        // whenever this capture lane is active) records every SQL statement the
+        // handler issues into the capture sink — no manual `DbInterceptor`
+        // wiring required. This lane is independent of the `Server-Timing`
+        // timing accumulator (`REQUEST_DB_TIMINGS`), so query capture is
+        // unaffected by however `ServerTimingLayer` scopes (and nests) its
+        // per-scope DB metrics. `oneshot` runs on this same task, so the
+        // task-local is visible to the checkout. When the `db` feature is off
+        // there is no DB, so the captured query list is simply empty.
+        //
+        // The response body is drained (`to_bytes`) *inside* the scope so that
+        // handlers returning a lazy or streaming body (`Sse`, `Body::from_stream`,
+        // …) which perform DB work when the stream is polled still record those
+        // body-time checkouts into the capture sink. The sink is read only after
+        // the body is fully collected, so nothing is missed.
+        #[cfg(feature = "db")]
+        let (status, headers, body_bytes, queries) = {
+            let capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (status, headers, body_bytes) = crate::db::REQUEST_QUERY_CAPTURE
+                .scope(std::sync::Arc::clone(&capture), async move {
+                    let response = service.oneshot(request).await.expect("request failed");
+                    let status = response.status();
+                    let headers: Vec<(String, String)> = response
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_owned()))
+                        .collect();
+                    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("failed to read response body");
+                    (status, headers, body_bytes)
+                })
+                .await;
+            let queries = capture.lock().map(|v| v.clone()).unwrap_or_default();
+            (status, headers, body_bytes, queries)
+        };
+        #[cfg(not(feature = "db"))]
+        let (status, headers, body_bytes, queries): (
+            _,
+            _,
+            _,
+            Vec<crate::inspector::QueryRecord>,
+        ) = {
+            let response = service.oneshot(request).await.expect("request failed");
+            let status = response.status();
+            let headers: Vec<(String, String)> = response
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_owned()))
+                .collect();
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("failed to read response body");
+            (status, headers, body_bytes, Vec::new())
+        };
+
+        // Fold every `Set-Cookie` from the response back into the jar so the
+        // next request from the same client replays it. Cookies whose
+        // attributes mark them for deletion (`Max-Age=0` or a past `Expires`)
+        // are removed instead of stored.
+        if let Some(jar) = &self.cookie_jar {
+            let now = self
+                .clock
+                .as_ref()
+                .map_or_else(chrono::Utc::now, |c| c.now());
+            let mut jar = jar.lock().expect("cookie jar mutex poisoned");
+            for (name, value) in &headers {
+                if name.eq_ignore_ascii_case("set-cookie") {
+                    apply_set_cookie(&mut jar, value, now);
+                }
+            }
+        }
 
         TestResponse {
             status,
             headers,
             body: body_bytes.to_vec(),
+            queries,
+            request_method,
+            request_path,
+            n_plus_one_threshold,
         }
     }
 }
@@ -1446,8 +3208,10 @@ impl RequestBuilder {
 ///     .assert_body_contains("Alice");
 /// ```
 ///
-/// Fields are public so you can construct a `TestResponse` directly in unit
-/// tests that don't need a full HTTP round-trip:
+/// The `status`, `headers`, and `body` fields are public so you can construct a
+/// `TestResponse` directly in unit tests that don't need a full HTTP
+/// round-trip. Fill the remaining (query-capture) fields with
+/// `..Default::default()`:
 ///
 /// ```rust
 /// use autumn_web::test::TestResponse;
@@ -1460,6 +3224,7 @@ impl RequestBuilder {
 ///         ("x-request-id".into(), "abc-123".into()),
 ///     ],
 ///     body: br#"{"name":"Alice"}"#.to_vec(),
+///     ..Default::default()
 /// };
 ///
 /// resp.assert_ok()
@@ -1468,6 +3233,23 @@ impl RequestBuilder {
 ///
 /// assert_eq!(resp.header("x-request-id"), Some("abc-123"));
 /// ```
+///
+/// # Query-count and N+1 assertions
+///
+/// When the response was produced by [`RequestBuilder::send`] against a
+/// database-backed app, every SQL statement the handler issued is captured
+/// automatically (no manual interceptor wiring). Assert on it with
+/// [`TestResponse::query_count`], [`TestResponse::assert_max_queries`], and
+/// [`TestResponse::assert_no_n_plus_one`]:
+///
+/// ```rust,no_run
+/// # async fn ex(client: autumn_web::test::TestClient) {
+/// client.get("/posts").send().await
+///     .assert_ok()
+///     .assert_max_queries(3)   // fails, naming GET /posts, if > 3 queries ran
+///     .assert_no_n_plus_one(); // fails if a query repeats >= the dev threshold
+/// # }
+/// ```
 pub struct TestResponse {
     /// HTTP status code.
     pub status: StatusCode,
@@ -1475,6 +3257,38 @@ pub struct TestResponse {
     pub headers: Vec<(String, String)>,
     /// Raw response body bytes.
     pub body: Vec<u8>,
+    /// SQL queries captured while handling the request, in execution order.
+    ///
+    /// Populated automatically by [`RequestBuilder::send`] for
+    /// database-backed apps; empty for directly-constructed responses or when
+    /// the `db` feature is disabled. Prefer the [`TestResponse::queries`]
+    /// accessor for reading.
+    pub queries: Vec<crate::inspector::QueryRecord>,
+    /// HTTP method of the originating request, for assertion failure messages.
+    pub request_method: String,
+    /// Path of the originating request, for assertion failure messages.
+    pub request_path: String,
+    /// Default N+1 threshold (`dev.inspector_n_plus_one_threshold`) used by
+    /// [`TestResponse::assert_no_n_plus_one`].
+    pub n_plus_one_threshold: usize,
+}
+
+impl Default for TestResponse {
+    fn default() -> Self {
+        Self {
+            status: StatusCode::OK,
+            headers: Vec::new(),
+            body: Vec::new(),
+            queries: Vec::new(),
+            request_method: String::new(),
+            request_path: String::new(),
+            // Inherit the detector's default (5) — not a zero-filled `0`, which
+            // `inspector::detect_n_plus_one` treats as DISABLED — so the
+            // documented `TestResponse { .. ..Default::default() }` construction
+            // still catches N+1 patterns.
+            n_plus_one_threshold: crate::inspector::DEFAULT_N_PLUS_ONE_THRESHOLD,
+        }
+    }
 }
 
 impl TestResponse {
@@ -1834,12 +3648,117 @@ impl TestResponse {
         }
         self
     }
+
+    // ── Database query assertions (#1262) ──────────────────────
+
+    /// Number of SQL queries the request issued.
+    ///
+    /// Captured automatically by [`RequestBuilder::send`] for database-backed
+    /// apps; `0` for directly-constructed responses or when the `db` feature
+    /// is disabled.
+    #[must_use]
+    pub const fn query_count(&self) -> usize {
+        self.queries.len()
+    }
+
+    /// The SQL queries the request issued, in execution order.
+    ///
+    /// Lets a test assert on specific normalized SQL. Empty for
+    /// directly-constructed responses or when the `db` feature is disabled.
+    #[must_use]
+    pub fn queries(&self) -> &[crate::inspector::QueryRecord] {
+        &self.queries
+    }
+
+    /// A per-query listing for assertion failure messages: one line per query
+    /// (`#N  <elapsed>ms  <sql>`), followed by repetition counts per
+    /// normalized statement so the offending pattern is obvious.
+    fn query_report(&self) -> String {
+        use std::collections::BTreeMap;
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (i, q) in self.queries.iter().enumerate() {
+            let _ = write!(
+                out,
+                "\n  #{n:<3} {ms:>4}ms  {sql}",
+                n = i + 1,
+                ms = q.elapsed_ms,
+                sql = q.sql,
+            );
+        }
+        // Counts per normalized statement (stable, sorted for determinism).
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for q in &self.queries {
+            *counts
+                .entry(q.sql.split_whitespace().collect::<Vec<_>>().join(" "))
+                .or_insert(0) += 1;
+        }
+        if counts.len() != self.queries.len() {
+            out.push_str("\n  ── counts per statement ──");
+            for (sql, count) in &counts {
+                let _ = write!(out, "\n  {count}x  {sql}");
+            }
+        }
+        out
+    }
+
+    /// Assert the request issued at most `n` SQL queries.
+    ///
+    /// Passes when `query_count() <= n`. Panics otherwise with a message
+    /// naming the request (method + path), the expected and actual counts, and
+    /// the full query list.
+    #[track_caller]
+    pub fn assert_max_queries(&self, n: usize) -> &Self {
+        let actual = self.queries.len();
+        assert!(
+            actual <= n,
+            "assert_max_queries failed for {method} {path}: expected <= {n} queries, issued {actual}.{report}",
+            method = self.request_method,
+            path = self.request_path,
+            report = self.query_report(),
+        );
+        self
+    }
+
+    /// Assert the request contains no N+1 query pattern, using the app's
+    /// configured `dev.inspector_n_plus_one_threshold` (default 5).
+    ///
+    /// Reuses [`crate::inspector::detect_n_plus_one`]. Panics, naming the
+    /// request and the offending normalized query + repetition count, when a
+    /// single normalized statement was issued at least `threshold` times.
+    ///
+    /// Use [`TestResponse::assert_no_n_plus_one_with_threshold`] to override
+    /// the threshold explicitly.
+    #[track_caller]
+    pub fn assert_no_n_plus_one(&self) -> &Self {
+        self.assert_no_n_plus_one_with_threshold(self.n_plus_one_threshold)
+    }
+
+    /// Like [`TestResponse::assert_no_n_plus_one`] but with an explicit
+    /// repetition `threshold` instead of the configured default.
+    #[track_caller]
+    pub fn assert_no_n_plus_one_with_threshold(&self, threshold: usize) -> &Self {
+        match crate::inspector::detect_n_plus_one(&self.queries, threshold) {
+            Some(w) => panic!(
+                "assert_no_n_plus_one failed for {method} {path}: query repeated {count} times \
+                 (threshold {threshold}):\n  {sql}{report}",
+                method = self.request_method,
+                path = self.request_path,
+                count = w.count,
+                sql = w.sql_template,
+                report = self.query_report(),
+            ),
+            None => self,
+        }
+    }
 }
 
-#[cfg(feature = "db")]
+// Constructed only by the Postgres transactional test-isolation establish path,
+// which is cfg'd out under the `sqlite` feature — so gate these out too.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 struct TransactionalDbInterceptor;
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor {
     fn intercept_checkout<'a>(
         &'a self,
@@ -1909,13 +3828,15 @@ impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor 
     }
 }
 
-#[cfg(feature = "db")]
+// See `TransactionalDbInterceptor`: only the Postgres transactional establish
+// path composes interceptors, so this is dead under the `sqlite` feature.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 struct ComposedDbInterceptor {
     first: std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
     second: std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
 }
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
     fn intercept_checkout<'a>(
         &'a self,
@@ -2094,9 +4015,11 @@ mod tests {
     impl crate::plugin::Plugin for CleanupJobPlugin {
         fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
             app.jobs(vec![crate::job::JobInfo {
+                version: 1,
                 name: "cleanup_probe".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: cleanup_probe_job,
@@ -2136,6 +4059,7 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -2153,6 +4077,7 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -2170,6 +4095,7 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -2291,6 +4217,32 @@ mod tests {
         crate::job::clear_global_job_client();
     }
 
+    #[cfg(feature = "mail")]
+    #[test]
+    fn plugin_suppression_store_and_endpoint_optin_carry_into_test_app() {
+        struct SuppressionPlugin;
+        impl crate::plugin::Plugin for SuppressionPlugin {
+            fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
+                app.with_suppression_store(crate::mail::InMemorySuppressionStore::new())
+                    .mount_unsubscribe_endpoint()
+            }
+        }
+
+        // A plugin that wires List-Unsubscribe storage and opts into the default
+        // endpoint must propagate both into the TestApp, so unsubscribe POSTs /
+        // send-time suppression behave under TestApp exactly as in production
+        // without every test repeating the setup manually.
+        let app = TestApp::new().plugin(SuppressionPlugin);
+        assert!(
+            app.suppression_store.is_some(),
+            "plugin-registered suppression store must be carried into TestApp"
+        );
+        assert!(
+            app.config.mail.mount_unsubscribe_endpoint,
+            "plugin endpoint opt-in must be carried into TestApp config"
+        );
+    }
+
     /// End-to-end acceptance for issue #605: a plain `<form method="post">`
     /// carrying `_method=DELETE` reaches the declared DELETE handler when
     /// dispatched through the same router/middleware stack the production
@@ -2315,6 +4267,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         }];
@@ -2553,6 +4506,216 @@ mod tests {
             "framework security headers must wrap method-override rejections; \
              observed headers: {:?}",
             response.headers
+        );
+    }
+
+    // ── #1262: query-count / N+1 assertions (pure, no Postgres) ─────────
+    //
+    // These exercise the assertion *logic* on a directly-constructed
+    // `TestResponse`, so they run in the always-on CI lane without a database
+    // — the framework self-test that guarantees the assertions actually fire.
+
+    fn resp_with_queries(sqls: &[&str], threshold: usize) -> TestResponse {
+        TestResponse {
+            queries: sqls
+                .iter()
+                .map(|s| crate::inspector::QueryRecord {
+                    sql: (*s).to_owned(),
+                    params: Vec::new(),
+                    elapsed_ms: 1,
+                    location: String::new(),
+                })
+                .collect(),
+            request_method: "GET".to_owned(),
+            request_path: "/posts".to_owned(),
+            n_plus_one_threshold: threshold,
+            ..Default::default()
+        }
+    }
+
+    fn panic_message(err: &(dyn std::any::Any + Send)) -> String {
+        err.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn query_count_and_queries_reflect_captured_list() {
+        let resp = resp_with_queries(&["SELECT 1", "SELECT 2"], 5);
+        assert_eq!(resp.query_count(), 2);
+        assert_eq!(resp.queries().len(), 2);
+        assert_eq!(resp.queries()[0].sql, "SELECT 1");
+    }
+
+    /// Regression guard: the `REQUEST_QUERY_CAPTURE` scope must stay active
+    /// while a lazy/streaming response body is drained, so DB work performed
+    /// *during* body polling (as `Sse` / `Body::from_stream` handlers do) is
+    /// still captured. `service.oneshot` returns the response head without
+    /// polling the stream; `send()` drains the body with `to_bytes` — if that
+    /// drain happened after the scope closed, these body-time queries would be
+    /// recorded against an unset task-local and silently dropped, so
+    /// `query_count()` would under-report (here: read 0 instead of 3).
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn query_capture_stays_active_while_draining_streaming_body() {
+        use futures::StreamExt as _;
+
+        // Each streamed chunk records a DB query when it is polled. The stream is
+        // lazy: nothing runs until `to_bytes` polls it inside `send()`.
+        async fn stream_handler() -> axum::response::Response {
+            let body_stream = futures::stream::iter(0..3).map(|_| {
+                crate::db::record_request_db_query(
+                    std::time::Duration::from_millis(1),
+                    Some("SELECT 1"),
+                );
+                Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"x"))
+            });
+            axum::response::Response::new(Body::from_stream(body_stream))
+        }
+
+        let router = axum::Router::new().route("/stream", axum::routing::get(stream_handler));
+        let resp = RequestBuilder {
+            router,
+            method: Method::GET,
+            uri: "/stream".to_owned(),
+            headers: Vec::new(),
+            body: Body::empty(),
+            cookie_jar: None,
+            clock: None,
+            n_plus_one_threshold: 5,
+        }
+        .send()
+        .await;
+
+        resp.assert_ok();
+        assert_eq!(
+            resp.query_count(),
+            3,
+            "body-time DB queries must be captured while the streaming body is \
+             drained inside the active capture scope"
+        );
+    }
+
+    #[test]
+    fn assert_max_queries_passes_at_boundary() {
+        // len == n is within budget and must not panic.
+        resp_with_queries(&["SELECT 1", "SELECT 2"], 5).assert_max_queries(2);
+    }
+
+    #[test]
+    fn assert_max_queries_panics_when_exceeded() {
+        let resp = resp_with_queries(&["SELECT 1", "SELECT 2", "SELECT 3"], 5);
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resp.assert_max_queries(2);
+        }))
+        .expect_err("assert_max_queries must panic when the query count exceeds the limit");
+        let msg = panic_message(err.as_ref());
+        assert!(
+            msg.contains("GET /posts"),
+            "message names the request: {msg}"
+        );
+        assert!(
+            msg.contains("issued 3"),
+            "message reports the actual count: {msg}"
+        );
+        assert!(msg.contains("<= 2"), "message reports the limit: {msg}");
+    }
+
+    #[test]
+    fn assert_no_n_plus_one_passes_for_distinct_queries() {
+        // Three distinct statements: no normalized template repeats.
+        resp_with_queries(&["SELECT 1", "SELECT 2", "SELECT 3"], 2).assert_no_n_plus_one();
+    }
+
+    #[test]
+    fn assert_no_n_plus_one_panics_on_repetition() {
+        // Same statement modulo whitespace/case, repeated `threshold` times.
+        let resp = resp_with_queries(
+            &[
+                "SELECT * FROM comments WHERE post_id = $1",
+                "SELECT  * FROM comments WHERE post_id = $1",
+                "select * from comments where post_id = $1",
+            ],
+            3,
+        );
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resp.assert_no_n_plus_one();
+        }))
+        .expect_err("assert_no_n_plus_one must panic on an N+1 pattern");
+        let msg = panic_message(err.as_ref());
+        assert!(msg.contains("GET /posts"), "names the request: {msg}");
+        assert!(
+            msg.contains("3 times"),
+            "reports the repetition count: {msg}"
+        );
+        assert!(
+            msg.contains("select * from comments where post_id = $1"),
+            "reports the normalized SQL template: {msg}"
+        );
+    }
+
+    #[test]
+    fn assert_no_n_plus_one_with_threshold_overrides_default() {
+        // Two identical queries; the configured default threshold (10) does not
+        // fire, but an explicit override of 2 does.
+        let resp = resp_with_queries(&["SELECT 1", "SELECT 1"], 10);
+        resp.assert_no_n_plus_one(); // default threshold 10 -> passes
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resp.assert_no_n_plus_one_with_threshold(2);
+        }))
+        .expect_err("an explicit threshold override must be honoured");
+        assert!(
+            panic_message(err.as_ref()).contains("2 times"),
+            "override fires at the explicit threshold"
+        );
+    }
+
+    #[test]
+    fn default_test_response_inherits_detector_threshold() {
+        // A directly-constructed `TestResponse` must inherit the shared detector
+        // default (5), not a zero-filled `0` — otherwise `..Default::default()`
+        // would silently DISABLE N+1 detection.
+        assert_eq!(
+            TestResponse::default().n_plus_one_threshold,
+            crate::inspector::DEFAULT_N_PLUS_ONE_THRESHOLD,
+        );
+    }
+
+    #[test]
+    fn default_constructed_response_catches_n_plus_one() {
+        // Build a response purely via the documented `{ .., ..Default::default() }`
+        // pattern (no explicit threshold). With a zero-filled default this passed
+        // silently (0 == DISABLED); with the detector default (5) it must panic on
+        // the normalized template repeated to the threshold.
+        let resp = TestResponse {
+            queries: [
+                "SELECT * FROM comments WHERE post_id = $1",
+                "SELECT  * FROM comments WHERE post_id = $1",
+                "select * from comments where post_id = $1",
+                "SELECT * FROM  comments WHERE post_id = $1",
+                "Select * From comments Where post_id = $1",
+            ]
+            .iter()
+            .map(|s| crate::inspector::QueryRecord {
+                sql: (*s).to_owned(),
+                params: Vec::new(),
+                elapsed_ms: 1,
+                location: String::new(),
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resp.assert_no_n_plus_one();
+        }))
+        .expect_err(
+            "a default-constructed TestResponse must inherit the non-zero detector \
+             threshold and fire on an N+1 pattern",
+        );
+        assert!(
+            panic_message(err.as_ref()).contains("select * from comments where post_id = $1"),
+            "reports the normalized SQL template",
         );
     }
 }

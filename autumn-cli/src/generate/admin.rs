@@ -16,9 +16,9 @@ use std::path::Path;
 
 use super::dsl::{Field, FieldKind, parse_fields};
 use super::emit::Plan;
-use super::naming::{pascal, pluralize, snake};
+use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::schema_edit::add_mod_declaration;
-use super::{Flags, GenerateError, ensure_project_root};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// A parsed `--select FIELD=val1,val2,...` spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +130,20 @@ pub fn plan_admin_with_options(
     }
 
     let model_source = std::fs::read_to_string(&model_path).map_err(GenerateError::Io)?;
+
+    // Gate: the generated admin adapter and the admin plugin trait
+    // (`autumn-admin-plugin`) are i64-keyed (`get`/`update`/`delete` take
+    // `id: i64`, `table.find(id)`), so a UUID-keyed model would produce
+    // non-compiling admin code. Reject up-front, mirroring the scaffold gate.
+    if model_has_uuid_id(&model_source, &pascal_name) {
+        return Err(GenerateError::Config(format!(
+            "UUID primary keys are not yet supported for `generate admin`: the admin \
+             adapter and admin plugin trait are limited to i64 primary keys, so the \
+             generated admin for `{pascal_name}` would not compile. Regenerate the \
+             model without `--id uuid` (default BIGSERIAL key) to use the admin generator."
+        )));
+    }
+
     let lock_version_field = detect_lock_version_field(&model_source, &pascal_name);
 
     // Auto-detect at-rest encrypted columns from the model so the generated admin
@@ -167,6 +181,10 @@ pub fn plan_admin_with_options(
         admin_mod_path.clone(),
         add_mod_declaration(&read_or_empty(&admin_mod_path), &snake_name),
     );
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: admin_mod_path,
+        name: snake_name.clone(),
+    });
 
     // Smoke test: `tests/<snake>_admin.rs`
     plan.create(
@@ -186,27 +204,91 @@ pub fn plan_admin_with_options(
     Ok(plan)
 }
 
-/// CLI entry point for `autumn generate admin`.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &AdminOptions) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    let plan = plan_admin_with_options(&cwd, name, field_tokens, options);
-    match plan.and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
+/// Fallback destroy-only plan for `autumn destroy admin <name>` when the
+/// backing model file no longer exists — e.g. `autumn destroy model <name>`
+/// already ran first (issue #1048 PR review). `plan_admin_with_options`
+/// needs the model source to detect fields/lock-version/encrypted columns
+/// for rendering, which is meaningless (and impossible) once the model is
+/// gone, so it can't be reused here.
+///
+/// The two generated files' expected content is unknowable without the
+/// model, so they're recorded with an empty placeholder — real content
+/// (never empty) always counts as diverged, so they're only removed with
+/// `--force`, exactly like any other file destroy can't confirm is safe to
+/// delete. The `src/admin/mod.rs` declaration removal is unaffected: it's a
+/// pure text edit ([`crate::generate::emit::Revert::ModDecl`]) that never
+/// depended on the model's content.
+///
+/// # Errors
+/// Returns [`GenerateError`] when `project_root` isn't a valid project, or
+/// `name` fails validation.
+pub fn plan_admin_destroy_fallback(project_root: &Path, name: &str) -> Result<Plan, GenerateError> {
+    ensure_project_root(project_root)?;
+    // Unlike `plan_admin_with_options`, this path has no model-file-exists
+    // check to incidentally narrow what `name` can be — it's reached
+    // precisely because that file is gone — so an invalid name (path
+    // separators, `..`) must be rejected explicitly before it's used to
+    // build filesystem paths (issue #1048 PR review).
+    super::model::validate_resource_name(name)?;
+
+    let snake_name = snake(name);
+    let mut plan = Plan::new(project_root);
+
+    let admin_dir = project_root.join("src").join("admin");
+    plan.create(admin_dir.join(format!("{snake_name}.rs")), String::new());
+
+    let admin_mod_path = admin_dir.join("mod.rs");
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: admin_mod_path,
+        name: snake_name.clone(),
+    });
+
+    plan.create(
+        project_root
+            .join("tests")
+            .join(format!("{snake_name}_admin.rs")),
+        String::new(),
+    );
+
+    Ok(plan)
 }
 
-fn read_or_empty(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
+/// Returns true if the model struct `pascal_name` has a primary-key field `id`
+/// whose type is a UUID, written either fully-qualified (`uuid::Uuid`) or bare
+/// (`Uuid`). Parses the model AST (like [`detect_lock_version_field`]) so it is
+/// not fooled by spelling or module-qualification differences — a substring
+/// check would miss `pub id: Uuid`.
+fn model_has_uuid_id(model_source: &str, pascal_name: &str) -> bool {
+    let Ok(parsed) = syn::parse_file(model_source) else {
+        return false;
+    };
+    parsed.items.into_iter().any(|item| {
+        let syn::Item::Struct(item_struct) = item else {
+            return false;
+        };
+        if item_struct.ident != pascal_name {
+            return false;
+        }
+        let syn::Fields::Named(fields) = item_struct.fields else {
+            return false;
+        };
+        fields.named.into_iter().any(|field| {
+            let Some(ident) = field.ident else {
+                return false;
+            };
+            if ident != "id" {
+                return false;
+            }
+            let syn::Type::Path(type_path) = field.ty else {
+                return false;
+            };
+            type_path
+                .path
+                .segments
+                .last()
+                .is_some_and(|seg| seg.ident == "Uuid")
+        })
+    })
 }
 
 fn detect_lock_version_field(model_source: &str, pascal_name: &str) -> Option<String> {
@@ -285,9 +367,22 @@ fn detect_encrypted_fields(model_source: &str, pascal_name: &str) -> (Vec<String
 
 const fn admin_field_kind(field: &Field) -> &'static str {
     match field.kind {
-        FieldKind::String | FieldKind::Uuid => "AdminFieldKind::Text",
+        // `Enum`'s "AdminFieldKind::Text" here is never actually emitted:
+        // `render_fields_vec` always overrides an enum field with an explicit
+        // `AdminFieldKind::Select(...)` (issue #1030), the same way an
+        // explicit `--select` overrides this base kind today.
+        // `Decimal` renders as plain text, not `AdminFieldKind::Float`: the
+        // admin update handler coerces `Float` input through `f64` (see
+        // `coerce_form_value` in `autumn-admin-plugin`), which would
+        // reintroduce the exact binary-float rounding this field type exists
+        // to avoid. Routing it through `Text` leaves the raw decimal string
+        // untouched for `rust_decimal`'s exact `FromStr`/`Deserialize`.
+        FieldKind::String | FieldKind::Uuid | FieldKind::Enum | FieldKind::Decimal { .. } => {
+            "AdminFieldKind::Text"
+        }
         FieldKind::Text => "AdminFieldKind::TextArea",
-        FieldKind::I32 | FieldKind::I64 => "AdminFieldKind::Integer",
+        // A foreign-key id renders the same as any other integer column.
+        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "AdminFieldKind::Integer",
         FieldKind::Bool => "AdminFieldKind::Boolean",
         FieldKind::F32 | FieldKind::F64 => "AdminFieldKind::Float",
         FieldKind::NaiveDateTime | FieldKind::DateTime => "AdminFieldKind::DateTime",
@@ -552,16 +647,7 @@ fn render_select_kind(spec: &SelectSpec) -> String {
         .values
         .iter()
         .map(|v| {
-            let label = v
-                .split(['_', '-'])
-                .map(|word| {
-                    let mut chars = word.chars();
-                    chars.next().map_or_else(String::new, |c| {
-                        c.to_uppercase().collect::<String>() + chars.as_str()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+            let label = humanize_label(v);
             format!("SelectOption {{ value: \"{v}\".into(), label: \"{label}\".into() }}")
         })
         .collect::<Vec<_>>()
@@ -580,13 +666,29 @@ fn render_fields_vec(
         if options.exclude.contains(&f.name) || is_lock_version_field(f, lock_version_field) {
             continue;
         }
-        let select_spec = options.select.iter().find(|s| s.field == f.name);
+        // A closed-set `enum{...}` field is a `Select` widget by construction
+        // (issue #1030) — auto-derive one from its variants unless an
+        // explicit `--select` already overrides it (e.g. to curate a subset
+        // or relabel the options). One `effective_select` covers both
+        // sources so every downstream "is this field select-shaped" check
+        // only has to consult one place.
+        let effective_select: Option<SelectSpec> = options
+            .select
+            .iter()
+            .find(|s| s.field == f.name)
+            .cloned()
+            .or_else(|| {
+                f.is_enum().then(|| SelectSpec {
+                    field: f.name.clone(),
+                    values: f.variants.clone(),
+                })
+            });
         let kind_str: String =
             if options.hidden.contains(&f.name) || matches!(f.kind, FieldKind::Bytea) {
                 "AdminFieldKind::Hidden".into()
             } else if options.password.contains(&f.name) {
                 "AdminFieldKind::Password".into()
-            } else if let Some(spec) = select_spec {
+            } else if let Some(spec) = &effective_select {
                 render_select_kind(spec)
             } else {
                 admin_field_kind(f).into()
@@ -602,7 +704,7 @@ fn render_fields_vec(
         // Select, hidden, and encrypted fields are not text-searchable. An
         // encrypted column stores ciphertext envelopes, so an `ILIKE` against it
         // for plaintext would never match (#805) — omit it from search.
-        let is_select_or_hidden = select_spec.is_some() || options.hidden.contains(&f.name);
+        let is_select_or_hidden = effective_select.is_some() || options.hidden.contains(&f.name);
         if is_default_searchable(f)
             && !is_select_or_hidden
             && !admin_field_is_encrypted(options, &f.name)
@@ -907,7 +1009,13 @@ fn render_admin_smoke_test(
     } else {
         writable
             .iter()
-            .map(|f| format!("{}=test", f.name))
+            .map(|f| {
+                // An enum field is a closed set by construction, so the
+                // generic "test" sample value fails its own validation;
+                // use the field's own first declared variant instead.
+                let sample = f.variants.first().map_or("test", String::as_str);
+                format!("{}={sample}", f.name)
+            })
             .collect::<Vec<_>>()
             .join("&")
     };
@@ -1046,6 +1154,7 @@ fn render_admin_smoke_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1092,6 +1201,47 @@ mod tests {
         assert!(
             msg.contains("autumn generate model Post"),
             "error should suggest the fix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_admin_rejects_uuid_keyed_model() {
+        // The admin adapter + plugin trait are i64-keyed, so a UUID model would
+        // produce non-compiling admin code. plan_admin must reject it up-front —
+        // for both the fully-qualified and the bare `Uuid` spelling.
+        for id_ty in ["uuid::Uuid", "Uuid"] {
+            let model_source = format!(
+                "#[autumn_web::model]\n\
+                 pub struct Post {{\n\
+                 \x20   #[id]\n\
+                 \x20   pub id: {id_ty},\n\
+                 \x20   pub title: String,\n\
+                 }}\n"
+            );
+            let tmp = project_with_model_source("post", &model_source);
+            let err = plan_admin(tmp.path(), "Post", &[]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("UUID primary keys are not yet supported")
+                    && msg.contains("generate admin"),
+                "expected a UUID admin-gate error for id type `{id_ty}`, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_admin_allows_i64_keyed_model() {
+        // Regression guard: an ordinary i64 PK must NOT trip the UUID gate.
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub title: String,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        assert!(
+            plan_admin(tmp.path(), "Post", &[]).is_ok(),
+            "i64-keyed model must not be rejected by the UUID admin gate"
         );
     }
 
@@ -1733,6 +1883,83 @@ pub struct Account {
     }
 
     #[test]
+    fn enum_field_auto_derives_select_kind() {
+        // issue #1030: an `enum{...}` field is a closed set by construction,
+        // so it should render as a `Select` widget without needing an
+        // explicit `--select` flag repeating the same variant list.
+        let tmp = project_with_model("post");
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published,archived}".into()],
+            &AdminOptions::default(),
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(
+            admin.contains(
+                "AdminField::new(\"status\", AdminFieldKind::Select(vec![SelectOption { value: \"draft\".into(), label: \"Draft\".into() }, SelectOption { value: \"published\".into(), label: \"Published\".into() }, SelectOption { value: \"archived\".into(), label: \"Archived\".into() }]))"
+            ),
+            "got:\n{admin}"
+        );
+    }
+
+    #[test]
+    fn explicit_select_overrides_enum_auto_derivation() {
+        // A user-supplied `--select` should still win over the automatic
+        // derivation, e.g. to present a curated subset or different labels.
+        let tmp = project_with_model("post");
+        let options = AdminOptions {
+            select: vec![SelectSpec {
+                field: "status".into(),
+                values: vec!["draft".into(), "published".into()],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published,archived}".into()],
+            &options,
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(!admin.contains("\"archived\""), "got:\n{admin}");
+    }
+
+    #[test]
+    fn admin_smoke_test_uses_first_variant_for_enum_fields() {
+        // The generated create smoke test posts a sample value for every
+        // writable field; `status=test` fails the enum's own closed-set
+        // validation (`test` is not a declared variant), so the generated
+        // test would itself get a validation error instead of the expected
+        // redirect. Use the field's own first variant instead.
+        let tmp = project_with_model("post");
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published,archived}".into()],
+            &AdminOptions::default(),
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let smoke = fs::read_to_string(tmp.path().join("tests/post_admin.rs")).unwrap();
+        assert!(
+            smoke.contains("status=draft"),
+            "expected the enum's first variant in the sample form body; got:\n{smoke}"
+        );
+        assert!(
+            !smoke.contains("status=test"),
+            "must not submit an out-of-set sample value for an enum field; got:\n{smoke}"
+        );
+    }
+
+    #[test]
     fn select_option_bare_field_emits_empty_select() {
         let tmp = project_with_model("post");
         let options = AdminOptions {
@@ -1838,6 +2065,76 @@ pub struct Account {
         assert!(
             !admin.contains(".ilike("),
             "no ilike when there are no searchable fields"
+        );
+    }
+
+    // ── `plan_admin_destroy_fallback` (issue #1048 PR review) ───────────────
+
+    #[test]
+    fn destroy_admin_after_model_already_destroyed_still_removes_admin_outputs() {
+        // A common cleanup order — `destroy model Post` then `destroy admin
+        // Post` — must not strand `src/admin/post.rs`, its mod declaration,
+        // and its smoke test just because `plan_admin_with_options` can no
+        // longer read the (now-gone) model file.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+        assert!(tmp.path().join("tests/post_admin.rs").exists());
+
+        // Simulate `autumn destroy model Post` having already run.
+        fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(plan_admin(tmp.path(), "Post", &["title:String".into()]).is_err());
+
+        let fallback_plan = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap();
+        // Without --force: content is unverifiable (the model is gone), so
+        // it's treated as diverged and left in place rather than guessed at.
+        let err = fallback_plan
+            .revert(Flags {
+                dry_run: false,
+                force: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+
+        let fallback_plan = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap();
+        fallback_plan
+            .revert(Flags {
+                dry_run: false,
+                force: true,
+            })
+            .unwrap();
+        assert!(!tmp.path().join("src/admin/post.rs").exists());
+        assert!(!tmp.path().join("tests/post_admin.rs").exists());
+        assert!(
+            !fs::read_to_string(tmp.path().join("src/admin/mod.rs"))
+                .unwrap_or_default()
+                .contains("post"),
+            "the mod declaration removal doesn't depend on the model and must succeed too"
+        );
+    }
+
+    #[test]
+    fn plan_admin_destroy_fallback_fails_outside_project() {
+        let tmp = TempDir::new().unwrap();
+        let err = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap_err();
+        assert!(matches!(err, GenerateError::NotInProject));
+    }
+
+    #[test]
+    fn plan_admin_destroy_fallback_rejects_path_traversal_in_name() {
+        // issue #1048 PR review: unlike `plan_admin_with_options`, this
+        // fallback has no model-file-exists check to incidentally narrow
+        // `name` — it's reached precisely because that file is gone — so a
+        // name containing path separators must be rejected explicitly
+        // before it's used to build filesystem paths for deletion.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let err = plan_admin_destroy_fallback(tmp.path(), "../../foo").unwrap_err();
+        assert!(
+            matches!(err, GenerateError::InvalidName(..)),
+            "expected InvalidName, got {err:?}"
         );
     }
 }

@@ -39,7 +39,7 @@ Autumn ships a small CLI for project scaffolding and tooling setup. Install the
 published CLI from crates.io:
 
 ```bash
-cargo install autumn-cli --version 0.5.0
+cargo install autumn-cli --version 0.6.0
 ```
 
 For local development only, from an Autumn source checkout, install the CLI you
@@ -80,7 +80,7 @@ Sample output on a healthy system:
 🍂 autumn doctor
 
 ✅ rust_toolchain — rustc 1.88.0 ≥ MSRV 1.88.0
-✅ version_compat — autumn-cli 0.5.0 matches autumn-web 0.5.0
+✅ version_compat — autumn-cli 0.6.0 matches autumn-web 0.6.0
 ✅ autumn_toml — autumn.toml is valid
 ✅ db_connectivity — Postgres reachable at localhost:5432
 ✅ pending_migrations — no pending migrations
@@ -239,7 +239,7 @@ Probe endpoints are also available at `/live`, `/ready`, and `/startup`.
 The `/health` response looks like:
 
 ```json
-{ "status": "ok", "version": "0.5.0" }
+{ "status": "ok", "version": "0.6.0" }
 ```
 
 Press **Ctrl+C** to stop the server (graceful shutdown with a configurable
@@ -319,21 +319,20 @@ async fn list_items(Query(params): Query<Pagination>) -> String {
 
 Autumn uses [Diesel](https://diesel.rs/) with
 [diesel-async](https://github.com/weiznich/diesel_async) and
-[deadpool](https://docs.rs/deadpool) for async Postgres connections.
+[deadpool](https://docs.rs/deadpool) for async Postgres connections. Autumn
+drives Diesel for you — the steps below stand up and migrate the database using
+`autumn` commands end to end.
 
 ### 1. Install the Diesel CLI
+
+`autumn migrate` shells out to the Diesel CLI to apply migrations, so install it
+once:
 
 ```bash
 cargo install diesel_cli --no-default-features --features postgres
 ```
 
-### 2. Create a database
-
-```bash
-createdb my_app
-```
-
-### 3. Configure the connection
+### 2. Configure the connection
 
 Edit `autumn.toml` and uncomment the `[database]` section:
 
@@ -370,14 +369,25 @@ export AUTUMN_DATABASE__PRIMARY_URL="postgres://localhost/my_app"
 
 (Note the double underscore `__` separating section from field.)
 
+### 3. Create the database
+
+```bash
+autumn db create
+```
+
+`autumn db create` reads the connection you just configured and creates the
+database on its server. It is idempotent — run it again and it simply reports
+that the database already exists. (Need a clean slate while iterating on your
+schema? See `autumn db reset` below.)
+
 ### 4. Create a migration
 
 ```bash
-diesel setup --database-url postgres://localhost/my_app
-diesel migration generate create_todos
+autumn generate migration CreateTodos
 ```
 
-Edit the generated `up.sql`:
+This emits a timestamped migration directory under `migrations/` with `up.sql`
+and `down.sql` files. Edit the generated `up.sql`:
 
 ```sql
 CREATE TABLE todos (
@@ -397,11 +407,16 @@ DROP TABLE todos;
 Run it:
 
 ```bash
-diesel migration run --database-url postgres://localhost/my_app
+autumn migrate
 ```
 
-This also generates `src/schema.rs` with Diesel's table macro. If it doesn't
-appear, run `diesel print-schema > src/schema.rs`.
+`autumn migrate` applies every pending migration to the primary database and
+regenerates `src/schema.rs` with Diesel's table macro.
+
+> **Tip — reset the dev database.** While iterating on your schema, run
+> `autumn db reset` to drop, recreate, migrate, and (when a `src/bin/seed.rs`
+> exists) seed the database in a single step. It refuses to run against a
+> production profile unless you pass `--force`.
 
 ---
 
@@ -456,7 +471,7 @@ Add the required dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-autumn-web = "0.5"
+autumn-web = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -926,6 +941,8 @@ Autumn uses a five-layer configuration system:
 host = "127.0.0.1"          # default
 port = 3000                  # default
 shutdown_timeout_secs = 30   # default, seconds to drain in-flight requests
+# max_concurrent_requests = 256 # unset by default (unlimited); caps in-flight
+                               # requests, shedding the excess with a 503
 
 [database]
 primary_url = "postgres://user:pass@localhost:5432/my_app"
@@ -959,6 +976,7 @@ Every config field can be overridden via environment variables. The pattern is
 | `AUTUMN_SERVER__PORT`                | `server.port`          |
 | `AUTUMN_SERVER__HOST`                | `server.host`          |
 | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` |
+| `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` |
 | `AUTUMN_DATABASE__URL`               | `database.url`         |
 | `AUTUMN_DATABASE__PRIMARY_URL`       | `database.primary_url` |
 | `AUTUMN_DATABASE__REPLICA_URL`       | `database.replica_url` |
@@ -1032,6 +1050,68 @@ Merged/nested routers share the same `AppState` and still pass through Autumn's
 global middleware (including `X-Request-Id` response headers). Avoid defining
 the same method+path in both managed and raw routers -- Axum treats overlaps as
 an error during router construction.
+
+### Route collision diagnostics
+
+Autumn preflights route registration and refuses to start when it can already
+prove a collision. Instead of an Axum panic mid-mount, the framework returns a
+structured `RouterBuildError` **before any router is mounted**, so the failure
+mode is a clean error message that names the offending handlers rather than a
+half-configured process crashing at startup:
+
+- **`FrameworkRouteOverlap`** -- a user route lands on a path a framework route
+  already owns (probes, actuator, `X-Request-Id`, dev live-reload).
+- **`OpenApiPathCollision`** (feature `openapi`) -- an `openapi_json_path` or
+  `swagger_ui_path` collides with a `GET` route Autumn already owns; each side
+  is named so you can fix the config or the route.
+- **`DuplicateUserRoute`** (issue #1012) -- two user- or plugin-registered
+  routes resolve to the same `(method, path)` after `.scoped(prefix, …)` prefix
+  resolution (including `#[repository]`-generated API routes). The error names
+  **both** handlers, the HTTP method, and the path:
+
+  ```text
+  duplicate user route: "list_posts_v1" and "list_posts_v2" both resolve to
+  GET "/api/posts"; choose a different path for one of them or remove the
+  duplicate registration
+  ```
+
+  Distinct methods on the *same exact path* (`GET /admin` + `POST /admin`, or
+  `GET /users/{id}` + `POST /users/{id}`) are NOT flagged -- Axum merges them
+  into a single `MethodRouter` cleanly.
+- **`ConflictingRouteShape`** (issue #1012) -- two routes whose **different**
+  path templates resolve to overlapping shapes that Axum's matcher cannot tell
+  apart. Path-shape conflict detection is delegated to **matchit**, the exact
+  routing engine Axum 0.8 uses, so the preflight mirrors Axum's real accept/
+  reject behavior precisely -- including every edge case: capture-name
+  differences (`/users/{id}` vs `/users/{slug}`), a normal capture versus a
+  catch-all at the same position (`/u/{id}` vs `/u/{*rest}`), a catch-all
+  versus a dynamic *descendant* (`/cmd/{tool}/{sub}` vs `/cmd/{*path}`), and
+  mixed literal+capture segments (`/file.{ext}` vs `/file.{kind}`). Axum's
+  matchit router rejects the second template as a conflict *before* method
+  merging, so unlike an exact-duplicate path these can never coexist **regardless
+  of HTTP method** -- `GET /users/{id}` + `POST /users/{slug}` is still a
+  conflict. The error names **both** handlers and **both** original templates:
+
+  ```text
+  conflicting route shapes: "show_user" ("/users/{id}") and "create_user"
+  ("/users/{slug}") resolve to the same Axum path shape but use different path
+  templates; axum's matchit router rejects this as a route conflict regardless
+  of HTTP method — rename the captures so both use the same template, or make
+  their static paths distinct
+  ```
+
+  Because the check *is* matchit, it never over-flags what Axum would accept: a
+  static segment and a capture at the same position (`/users/me` +
+  `/users/{id}`) coexist, and escaped literal braces (`{{`/`}}`, e.g. the static
+  path `/{{foo}}`) are *not* captures, so `/{{foo}}` and `/{{bar}}` remain
+  distinct static routes and build cleanly.
+
+Opaque routers registered via `.merge(router)` or `.nest(prefix, router)`
+cannot be introspected through Axum's public API, so a collision that lives
+inside one of those routers still surfaces as an Axum startup panic. The
+duplicate-route preflight emits a `tracing::warn!` in that case ("check
+skipped") so operators know the check didn't cover that code path -- keep
+merged/nested raw routers on paths disjoint from your Autumn-managed routes.
 
 ---
 

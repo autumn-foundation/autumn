@@ -87,6 +87,7 @@ fn layout(title: &str, content: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src="/static/js/htmx.min.js" {}
             }
@@ -175,6 +176,7 @@ fn title_field_partial(form: &ChangesetForm<TodoForm>) -> Markup {
     html! {
         div id="title-field" data-autumn-field-wrapper="title" class="flex-1 flex flex-col gap-1" {
             input type="text" name="title"
+                  aria-label="Todo title"
                   value=(value)
                   placeholder="What needs to be done?"
                   autocomplete="off"
@@ -252,6 +254,30 @@ fn pagination_controls(page: &Page<Todo>, base_url: &str) -> Markup {
     }
 }
 
+fn todo_count_badge(total: i64, done: i64) -> Markup {
+    html! {
+        div id="todo-count" class="flex items-center justify-between mb-3 px-1" {
+            @if total > 0 {
+                p class="text-xs text-stone-400" {
+                    (total) " item"
+                    @if total != 1 { "s" }
+                    @if done > 0 {
+                        " \u{2022} " (done) " done this page"
+                    }
+                }
+            }
+            button
+                hx-post=(paths::start_export())
+                hx-target="#export-status"
+                hx-swap="outerHTML"
+                class="text-xs text-amber-700 hover:text-amber-900 underline" {
+                "Export CSV"
+            }
+        }
+        div id="export-status" {}
+    }
+}
+
 /// Render the full list page given a paginated todo result and an optional pending form.
 async fn list_page(
     mut db: Db,
@@ -259,7 +285,7 @@ async fn list_page(
     pending: &ChangesetForm<TodoForm>,
 ) -> AutumnResult<Markup> {
     let page_data = Todo::page(page_req, &mut db).await?;
-    let done_count = page_data.content.iter().filter(|t| t.completed).count();
+    let done_count = page_data.content.iter().filter(|t| t.completed).count() as i64;
 
     Ok(layout(
         "Autumn Todo App",
@@ -275,6 +301,8 @@ async fn list_page(
 
             (new_todo_form(pending))
 
+            (todo_count_badge(page_data.total_elements as i64, done_count))
+
             @if page_data.total_elements == 0 {
                 div class="text-center py-16" {
                     p class="text-stone-400 text-sm" {
@@ -282,15 +310,6 @@ async fn list_page(
                     }
                 }
             } @else {
-                div class="flex items-center justify-between mb-3 px-1" {
-                    p class="text-xs text-stone-400" {
-                        (page_data.total_elements) " item"
-                        @if page_data.total_elements != 1 { "s" }
-                        @if done_count > 0 {
-                            " \u{2022} " (done_count) " done this page"
-                        }
-                    }
-                }
                 ul id="todo-list" class="space-y-2" {
                     @for todo in &page_data.content {
                         (todo_item(todo))
@@ -455,12 +474,59 @@ pub async fn create(db: Db, form: ChangesetForm<TodoForm>) -> AutumnResult<impl 
     }
 }
 
+/// Kick off an async CSV export (issue #1373) and hand back an htmx fragment
+/// that polls the built-in tracked-job status route for progress and the
+/// eventual download link. The request itself returns immediately — the
+/// export runs as a background job instead of blocking this thread.
+#[post("/todos/export")]
+pub async fn start_export() -> AutumnResult<Markup> {
+    let handle =
+        crate::jobs::ExportTodosCsvJob::enqueue_tracked(crate::jobs::ExportTodosArgs {}).await?;
+    Ok(export_status_fragment(&handle.status_path()))
+}
+
+/// The self-polling fragment embedded by [`start_export`] and re-rendered by
+/// the built-in `GET /_autumn/jobs/{token}` route on every 2s poll.
+fn export_status_fragment(poll_path: &str) -> Markup {
+    html! {
+        div id="export-status"
+            hx-get=(poll_path)
+            hx-trigger="load"
+            hx-swap="outerHTML"
+            class="text-xs text-stone-400 mt-1" {
+            "Preparing export…"
+        }
+    }
+}
+
+fn page_request_from_hx(hx: &HxRequest) -> PageRequest {
+    if let Some(parsed_url) = hx
+        .current_url
+        .as_deref()
+        .and_then(|url| url::Url::parse(url).ok())
+    {
+        let mut page = None;
+        let mut size = None;
+        for (key, val) in parsed_url.query_pairs() {
+            if key == "page" {
+                page = val.parse::<u32>().ok();
+            } else if key == "size" {
+                size = val.parse::<u32>().ok();
+            }
+        }
+        if page.is_some() || size.is_some() {
+            return PageRequest::new(page.unwrap_or(1), size.unwrap_or(20));
+        }
+    }
+    PageRequest::default()
+}
+
 /// Toggle the completion status of a todo (htmx endpoint).
 ///
 /// Uses a single `UPDATE ... SET completed = NOT completed RETURNING *`
 /// query — one round-trip instead of three.
 #[post("/todos/{id}/toggle")]
-pub async fn toggle(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
+pub async fn toggle(id: Path<i64>, mut db: Db, hx: HxRequest) -> AutumnResult<impl IntoResponse> {
     let updated: Todo = diesel::update(todos::table.find(*id))
         .set(todos::completed.eq(diesel::dsl::not(todos::completed)))
         .returning(Todo::as_returning())
@@ -468,7 +534,18 @@ pub async fn toggle(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
         .await
         .map_err(AutumnError::not_found)?;
 
-    Ok(todo_item(&updated))
+    if hx.is_htmx {
+        let page_req = page_request_from_hx(&hx);
+        let page_data = Todo::page(&page_req, &mut db).await?;
+        let done_count = page_data.content.iter().filter(|t| t.completed).count() as i64;
+        let count_markup = todo_count_badge(page_data.total_elements as i64, done_count);
+
+        Ok(autumn_web::htmx::HtmxFragments::new(todo_item(&updated))
+            .oob("todo-count", count_markup)
+            .into_response())
+    } else {
+        Ok(todo_item(&updated).into_response())
+    }
 }
 
 /// Delete a todo by ID.
@@ -498,7 +575,14 @@ pub async fn delete_todo(
     }
 
     if hx.is_htmx {
-        Ok(String::new().into_response())
+        let page_req = page_request_from_hx(&hx);
+        let page_data = Todo::page(&page_req, &mut db).await?;
+        let done_count = page_data.content.iter().filter(|t| t.completed).count() as i64;
+        let count_markup = todo_count_badge(page_data.total_elements as i64, done_count);
+
+        Ok(autumn_web::htmx::HtmxFragments::oob_only()
+            .oob("todo-count", count_markup)
+            .into_response())
     } else {
         Ok(Redirect::to(&paths::list()).into_response())
     }
@@ -511,7 +595,8 @@ autumn_web::paths![
     create,
     validate_title,
     toggle,
-    delete_todo
+    delete_todo,
+    start_export
 ];
 
 #[cfg(test)]
@@ -527,6 +612,15 @@ mod tests {
         assert_eq!(paths::toggle(7), "/todos/7/toggle");
         assert_eq!(paths::delete_todo(3), "/todos/3");
         assert_eq!(paths::create(), "/todos");
+        assert_eq!(paths::start_export(), "/todos/export");
+    }
+
+    #[test]
+    fn export_status_fragment_polls_the_tracked_job_status_route() {
+        let html = export_status_fragment("/_autumn/jobs/abc123").into_string();
+        assert!(html.contains(r#"hx-get="/_autumn/jobs/abc123""#), "{html}");
+        assert!(html.contains(r#"hx-trigger="load""#), "{html}");
+        assert!(html.contains(r#"hx-swap="outerHTML""#), "{html}");
     }
 
     #[test]
@@ -844,5 +938,53 @@ mod mutant_tests {
         // Can we test the exact endpoint behavior easily without DB integration?
         // No, we need TestDb. Since we can't easily mock it, we'll write a note on why
         // we can't write a direct unit test here and what it might look like.
+    }
+
+    #[test]
+    fn test_page_request_from_hx_parsing() {
+        // Default when current_url is None
+        let hx_none = HxRequest {
+            current_url: None,
+            ..Default::default()
+        };
+        let req = page_request_from_hx(&hx_none);
+        assert_eq!(req.page(), 1);
+        assert_eq!(req.size(), 20);
+
+        // Default when current_url is invalid
+        let hx_invalid = HxRequest {
+            current_url: Some("invalid-url".to_string()),
+            ..Default::default()
+        };
+        let req = page_request_from_hx(&hx_invalid);
+        assert_eq!(req.page(), 1);
+        assert_eq!(req.size(), 20);
+
+        // Page parsed correctly
+        let hx_page = HxRequest {
+            current_url: Some("http://localhost:3000/todos?page=2".to_string()),
+            ..Default::default()
+        };
+        let req = page_request_from_hx(&hx_page);
+        assert_eq!(req.page(), 2);
+        assert_eq!(req.size(), 20);
+
+        // Size parsed correctly
+        let hx_size = HxRequest {
+            current_url: Some("http://localhost:3000/todos?size=10".to_string()),
+            ..Default::default()
+        };
+        let req = page_request_from_hx(&hx_size);
+        assert_eq!(req.page(), 1);
+        assert_eq!(req.size(), 10);
+
+        // Page and size parsed correctly
+        let hx_both = HxRequest {
+            current_url: Some("http://localhost:3000/todos?page=5&size=15".to_string()),
+            ..Default::default()
+        };
+        let req = page_request_from_hx(&hx_both);
+        assert_eq!(req.page(), 5);
+        assert_eq!(req.size(), 15);
     }
 }

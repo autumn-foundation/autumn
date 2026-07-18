@@ -36,6 +36,20 @@ use maud::{Markup, html};
 /// `<noscript>` version that uses `enctype="multipart/form-data"` and a
 /// standard handler.
 ///
+/// # Accessibility
+///
+/// The rendered `<input type="file">` carries an `aria-label` derived from
+/// `name` (e.g. `cover_image` becomes "Cover image"; an empty `name` falls back
+/// to "File upload") so the control always exposes an accessible name — file
+/// inputs have none by default.
+///
+/// Note that, per the ARIA accessible-name computation, this `aria-label` takes
+/// precedence over a visible `<label>` element wrapping the call, so the text of
+/// a caller-provided wrapping label will not become the control's accessible
+/// name. Callers who need a fully caller-controlled visible label should be
+/// aware of this; a typed file-field primitive with an explicit label parameter
+/// is planned (see issue #1933).
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -58,6 +72,16 @@ pub fn direct_upload_input(name: &str, presign_url: &str, accept: Option<&str>) 
             input
                 type="file"
                 name=(name)
+                aria-label=({
+                    if name.is_empty() {
+                        "File upload".to_string()
+                    } else {
+                        let humanized = name.replace('_', " ");
+                        let mut chars = humanized.chars();
+                        chars.next().map_or_else(String::new, |c| c.to_uppercase().collect::<String>())
+                            + chars.as_str()
+                    }
+                })
                 data-direct-upload-target="input"
                 accept=[accept] {}
             div
@@ -87,6 +111,7 @@ mod tests {
         assert!(html.contains("data-direct-upload-url=\"/uploads/presign\""));
         assert!(html.contains("name=\"cover_image\""));
         assert!(html.contains("type=\"file\""));
+        assert!(html.contains("aria-label=\"Cover image\""));
         assert!(html.contains("accept=\"image/*\""));
         assert!(html.contains("autumn-upload-progress"));
         assert!(

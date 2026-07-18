@@ -9,6 +9,8 @@ struct JobAttrs {
     name: Option<String>,
     max_attempts: Option<u32>,
     backoff_ms: Option<u64>,
+    /// Named queue this job is routed to; `None` defaults to `"default"`.
+    queue: Option<String>,
     /// `None` = unconfigured; `Some(false)` = explicit opt-out, which is an
     /// error when combined with other uniqueness attributes.
     unique: Option<bool>,
@@ -17,6 +19,11 @@ struct JobAttrs {
     unique_for_ms: Option<u64>,
     concurrency: Option<u32>,
     concurrency_key: Option<String>,
+    /// Declared schema version for this job's payload (issue #1205).
+    /// `None` = version 1 (un-versioned).
+    version: Option<u32>,
+    /// Optional payload-upgrade hook `fn(u32, Value) -> Result<Value, E>`.
+    upgrade: Option<syn::Path>,
 }
 
 fn parse_basic_arg(
@@ -32,6 +39,30 @@ fn parse_basic_arg(
     } else if meta.path.is_ident("backoff_ms") {
         let value: LitInt = meta.value()?.parse()?;
         result.backoff_ms = Some(value.base10_parse::<u64>()?);
+    } else if meta.path.is_ident("queue") {
+        let value: LitStr = meta.value()?.parse()?;
+        let queue = value.value().trim().to_string();
+        if queue.is_empty()
+            || !queue
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            return Err(meta.error(
+                "queue name must be non-empty and contain only lowercase letters, digits, \
+                 underscores, or hyphens (e.g. \"critical\", \"email-low\")",
+            ));
+        }
+        result.queue = Some(queue);
+    } else if meta.path.is_ident("version") {
+        let value: LitInt = meta.value()?.parse()?;
+        let version = value.base10_parse::<u32>()?;
+        if version == 0 {
+            return Err(meta.error("version must be greater than zero"));
+        }
+        result.version = Some(version);
+    } else if meta.path.is_ident("upgrade") {
+        let value: syn::Path = meta.value()?.parse()?;
+        result.upgrade = Some(value);
     } else {
         return Ok(false);
     }
@@ -125,6 +156,17 @@ fn validate_job_attrs(result: &mut JobAttrs) -> syn::Result<()> {
             "concurrency_key requires concurrency = N",
         ));
     }
+    // An `upgrade` hook is only ever invoked when the stored version is *older*
+    // than the current one, i.e. `version >= 2`. With `version` unset (1) the
+    // decode path never enters the upgrade loop, so the hook would be dead code
+    // while enqueue still paid to wrap the payload — a silent footgun. Reject it.
+    if result.upgrade.is_some() && result.version.unwrap_or(1) < 2 {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`upgrade` requires `version >= 2` (an upgrade hook only runs when a \
+             stored payload is older than the current version)",
+        ));
+    }
     let uniqueness_configured = result.unique_by.is_some()
         || result.unique_window.is_some()
         || result.unique_for_ms.is_some();
@@ -146,12 +188,15 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
         name: None,
         max_attempts: None,
         backoff_ms: None,
+        queue: None,
         unique: None,
         unique_by: None,
         unique_window: None,
         unique_for_ms: None,
         concurrency: None,
         concurrency_key: None,
+        version: None,
+        upgrade: None,
     };
 
     syn::meta::parser(|meta| {
@@ -162,8 +207,9 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected name, max_attempts, backoff_ms, unique, \
-                 unique_by, unique_window, unique_for_ms, concurrency, or concurrency_key",
+                "unsupported attribute: expected name, max_attempts, backoff_ms, queue, unique, \
+                 unique_by, unique_window, unique_for_ms, concurrency, concurrency_key, version, \
+                 or upgrade",
             ))
         }
     })
@@ -226,6 +272,7 @@ fn concurrency_tokens(attrs: &JobAttrs) -> TokenStream {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_job_args(attr) {
         Ok(a) => a,
@@ -242,13 +289,15 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error();
     }
 
-    if input_fn.sig.inputs.len() != 2 {
+    if input_fn.sig.inputs.len() != 2 && input_fn.sig.inputs.len() != 3 {
         return syn::Error::new_spanned(
             &input_fn.sig.ident,
-            "#[job] function must have signature async fn(AppState, Args)",
+            "#[job] function must have signature async fn(AppState, Args) or \
+             async fn(AppState, Args, JobContext)",
         )
         .to_compile_error();
     }
+    let takes_context = input_fn.sig.inputs.len() == 3;
 
     let mut inputs = input_fn.sig.inputs.iter();
     let _state_arg = inputs.next();
@@ -262,6 +311,13 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error();
         }
     };
+    if takes_context && !matches!(inputs.next(), Some(FnArg::Typed(_))) {
+        return syn::Error::new_spanned(
+            &input_fn.sig.ident,
+            "#[job] third argument must be a typed JobContext",
+        )
+        .to_compile_error();
+    }
 
     let fn_name = &input_fn.sig.ident;
     let companion_name = format_ident!("__autumn_job_info_{fn_name}");
@@ -269,8 +325,57 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let job_name = attrs.name.clone().unwrap_or_else(|| fn_name.to_string());
     let max_attempts = attrs.max_attempts.unwrap_or(0);
     let backoff_ms = attrs.backoff_ms.unwrap_or(0);
+    let queue = attrs.queue.clone().unwrap_or_else(|| "default".to_string());
     let uniqueness = uniqueness_tokens(&attrs);
     let concurrency = concurrency_tokens(&attrs);
+
+    // ── Versioned payloads (issue #1205) ─────────────────────────────────────
+    // Wrap args in the schema-version envelope only when the job opts in
+    // (declares version > 1 or an upgrade hook); otherwise store raw args so
+    // un-versioned jobs are byte-identical to pre-#1205 behavior.
+    let version = attrs.version.unwrap_or(1);
+    let should_wrap = version > 1 || attrs.upgrade.is_some();
+    let wrap_payload = if should_wrap {
+        quote! { let payload = ::autumn_web::payload_version::wrap(#version, payload); }
+    } else {
+        quote! {}
+    };
+    let upgrade_opt = attrs.upgrade.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |path| {
+            quote! { ::core::option::Option::Some(#path as ::autumn_web::payload_version::UpgradeFn) }
+        },
+    );
+
+    // Decode side (issue #1205). An opt-in (versioned) job decodes through the
+    // version-aware path, so a version/shape mismatch surfaces the precise
+    // `JobPayloadVersionError` naming the job type + versions. A default
+    // (unversioned) job keeps the exact pre-#1205 `from_value` path and error
+    // wording, guaranteeing zero behavior change for apps that never declare a
+    // version — and matching that its enqueue side stores raw args.
+    let decode_args = if should_wrap {
+        quote! {
+            let __autumn_upgrade: ::core::option::Option<::autumn_web::payload_version::UpgradeFn> = #upgrade_opt;
+            let args: #args_type = ::autumn_web::payload_version::decode_versioned(
+                #job_name,
+                #version,
+                __autumn_upgrade,
+                payload,
+            )
+                .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(e.to_string())))?;
+        }
+    } else {
+        quote! {
+            let args: #args_type = ::autumn_web::reexports::serde_json::from_value(payload)
+                .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args deserialization failed: {e}"))))?;
+        }
+    };
+
+    let handler_call = if takes_context {
+        quote! { #fn_name(state, args, ::autumn_web::job::JobContext::current()).await }
+    } else {
+        quote! { #fn_name(state, args).await }
+    };
 
     quote! {
         #input_fn
@@ -284,7 +389,50 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub async fn enqueue(args: #args_type) -> ::autumn_web::AutumnResult<()> {
                 let payload = ::autumn_web::reexports::serde_json::to_value(&args)
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                #wrap_payload
                 ::autumn_web::job::enqueue(#job_name, payload).await
+            }
+
+            /// Enqueue this job to run once after `delay` elapses.
+            pub async fn enqueue_in(args: #args_type, delay: ::core::time::Duration) -> ::autumn_web::AutumnResult<()> {
+                let payload = ::autumn_web::reexports::serde_json::to_value(&args)
+                    .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                #wrap_payload
+                ::autumn_web::job::enqueue_in(#job_name, payload, delay).await
+            }
+
+            /// Enqueue this job to run once at the absolute instant `when`.
+            pub async fn enqueue_at(
+                args: #args_type,
+                when: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+            ) -> ::autumn_web::AutumnResult<()> {
+                let payload = ::autumn_web::reexports::serde_json::to_value(&args)
+                    .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                #wrap_payload
+                ::autumn_web::job::enqueue_at(#job_name, payload, when).await
+            }
+
+            /// Enqueue this job and return a handle carrying a public,
+            /// unguessable token that grants anonymous (capability-only)
+            /// access to its tracked status via the built-in status route.
+            pub async fn enqueue_tracked(args: #args_type) -> ::autumn_web::AutumnResult<::autumn_web::job::TrackedJobHandle> {
+                let payload = ::autumn_web::reexports::serde_json::to_value(&args)
+                    .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                #wrap_payload
+                ::autumn_web::job::enqueue_tracked(#job_name, payload).await
+            }
+
+            /// Like [`Self::enqueue_tracked`], binding the tracked status to
+            /// `owner` so only a request matching that session/user may poll
+            /// it.
+            pub async fn enqueue_tracked_for(
+                args: #args_type,
+                owner: ::autumn_web::job::TrackedJobOwner,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::job::TrackedJobHandle> {
+                let payload = ::autumn_web::reexports::serde_json::to_value(&args)
+                    .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                #wrap_payload
+                ::autumn_web::job::enqueue_tracked_for(#job_name, payload, owner).await
             }
         }
 
@@ -294,13 +442,14 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: #job_name.to_string(),
                 max_attempts: #max_attempts,
                 initial_backoff_ms: #backoff_ms,
+                queue: #queue.to_string(),
                 uniqueness: #uniqueness,
                 concurrency: #concurrency,
+                version: #version,
                 handler: |state: ::autumn_web::AppState, payload: ::autumn_web::reexports::serde_json::Value| {
                     Box::pin(async move {
-                        let args: #args_type = ::autumn_web::reexports::serde_json::from_value(payload)
-                            .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args deserialization failed: {e}"))))?;
-                        #fn_name(state, args).await
+                        #decode_args
+                        #handler_call
                     })
                 },
             }
@@ -326,6 +475,45 @@ mod tests {
         assert_eq!(attrs.backoff_ms, Some(10));
         assert_eq!(attrs.unique, None);
         assert!(attrs.concurrency.is_none());
+    }
+
+    #[test]
+    fn parses_version_and_upgrade_attrs() {
+        let attrs =
+            parse(quote! { version = 2, upgrade = crate::jobs::upgrade_welcome }).expect("parse");
+        assert_eq!(attrs.version, Some(2));
+        let upgrade = attrs.upgrade.expect("upgrade path parsed");
+        assert!(quote!(#upgrade).to_string().contains("upgrade_welcome"));
+    }
+
+    #[test]
+    fn version_defaults_to_none_and_zero_is_rejected() {
+        let attrs = parse(quote! { name = "j" }).expect("parse");
+        assert_eq!(attrs.version, None);
+        assert!(attrs.upgrade.is_none());
+        assert!(
+            parse(quote! { version = 0 }).is_err(),
+            "zero version rejected"
+        );
+    }
+
+    #[test]
+    fn upgrade_requires_version_at_least_2() {
+        // An upgrade hook only fires when a stored payload is older than the
+        // current version, so `upgrade` without `version >= 2` is dead code and
+        // must be a compile error rather than a silent no-op.
+        let err = parse(quote! { upgrade = crate::jobs::up })
+            .err()
+            .expect("upgrade without version must be rejected");
+        assert!(err.to_string().contains("version >= 2"), "{err}");
+
+        let err = parse(quote! { version = 1, upgrade = crate::jobs::up })
+            .err()
+            .expect("upgrade with version = 1 must be rejected");
+        assert!(err.to_string().contains("version >= 2"), "{err}");
+
+        // version >= 2 with an upgrade hook is accepted.
+        assert!(parse(quote! { version = 2, upgrade = crate::jobs::up }).is_ok());
     }
 
     #[test]
@@ -414,6 +602,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_queue_arg() {
+        let attrs = parse(quote! { name = "send_email", queue = "critical" }).expect("parse");
+        assert_eq!(attrs.queue.as_deref(), Some("critical"));
+    }
+
+    #[test]
+    fn queue_defaults_to_none_when_unset() {
+        let attrs = parse(quote! { name = "send_email" }).expect("parse");
+        assert!(attrs.queue.is_none());
+    }
+
+    #[test]
+    fn rejects_empty_queue() {
+        assert!(parse(quote! { queue = "" }).is_err());
+        assert!(parse(quote! { queue = "   " }).is_err());
+    }
+
+    #[test]
+    fn expansion_carries_queue_into_job_info() {
+        let expanded = job_macro(
+            quote! { queue = "critical" },
+            quote! {
+                async fn reset_password(state: AppState, args: ResetArgs) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(expanded.contains("queue : \"critical\""), "{expanded}");
+    }
+
+    #[test]
+    fn expansion_defaults_queue_to_default() {
+        let expanded = job_macro(
+            quote! {},
+            quote! {
+                async fn plain(state: AppState, args: PlainArgs) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(expanded.contains("queue : \"default\""), "{expanded}");
+    }
+
+    #[test]
     fn expansion_carries_uniqueness_and_concurrency_into_job_info() {
         let expanded = job_macro(
             quote! { unique_by = "account_id", concurrency = 2, concurrency_key = "account_id" },
@@ -434,6 +668,42 @@ mod tests {
     }
 
     #[test]
+    fn expansion_generates_delayed_enqueue_helpers() {
+        let expanded = job_macro(
+            quote! { name = "reminder" },
+            quote! {
+                async fn reminder(state: AppState, args: ReminderArgs) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        // The per-job helper struct gains enqueue_in / enqueue_at alongside enqueue.
+        assert!(
+            expanded.contains("async fn enqueue_in"),
+            "missing enqueue_in: {expanded}"
+        );
+        assert!(
+            expanded.contains("async fn enqueue_at"),
+            "missing enqueue_at: {expanded}"
+        );
+        // They delegate to the module-level free functions with the job name.
+        assert!(
+            expanded.contains(":: autumn_web :: job :: enqueue_in"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains(":: autumn_web :: job :: enqueue_at"),
+            "{expanded}"
+        );
+        // enqueue_at takes a chrono UTC instant.
+        assert!(
+            expanded.contains("chrono :: DateTime"),
+            "enqueue_at should take a DateTime: {expanded}"
+        );
+    }
+
+    #[test]
     fn expansion_defaults_to_no_uniqueness_or_concurrency() {
         let expanded = job_macro(
             quote! {},
@@ -451,6 +721,122 @@ mod tests {
         assert!(
             expanded.contains("concurrency : :: std :: option :: Option :: None"),
             "{expanded}"
+        );
+    }
+
+    #[test]
+    fn job_macro_generates_enqueue_tracked_companions() {
+        let expanded = job_macro(
+            quote! { name = "export_orders" },
+            quote! {
+                async fn export_orders(state: AppState, args: ExportArgs) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            expanded.contains("async fn enqueue_tracked"),
+            "missing enqueue_tracked: {expanded}"
+        );
+        assert!(
+            expanded.contains("async fn enqueue_tracked_for"),
+            "missing enqueue_tracked_for: {expanded}"
+        );
+        assert!(
+            expanded
+                .contains(":: autumn_web :: job :: enqueue_tracked (\"export_orders\" , payload)"),
+            "enqueue_tracked companion should delegate to the module-level free function: {expanded}"
+        );
+        assert!(
+            expanded.contains(":: autumn_web :: job :: enqueue_tracked_for"),
+            "enqueue_tracked_for companion should delegate to the module-level free function: {expanded}"
+        );
+        assert!(
+            expanded.contains("TrackedJobHandle"),
+            "companions should return TrackedJobHandle: {expanded}"
+        );
+        assert!(
+            expanded.contains("TrackedJobOwner"),
+            "enqueue_tracked_for should accept a TrackedJobOwner: {expanded}"
+        );
+    }
+
+    #[test]
+    fn job_macro_accepts_three_arg_signature_and_passes_context_current() {
+        let expanded = job_macro(
+            quote! {},
+            quote! {
+                async fn export_orders(state: AppState, args: ExportArgs, ctx: JobContext) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            expanded.contains(":: autumn_web :: job :: JobContext :: current ()"),
+            "three-arg handler should be invoked with JobContext::current(): {expanded}"
+        );
+        assert!(
+            expanded.contains(
+                "export_orders (state , args , :: autumn_web :: job :: JobContext :: current ())"
+            ),
+            "generated handler closure should call the user fn with the context: {expanded}"
+        );
+    }
+
+    #[test]
+    fn job_macro_two_arg_expansion_does_not_reference_job_context() {
+        let expanded = job_macro(
+            quote! {},
+            quote! {
+                async fn plain(state: AppState, args: PlainArgs) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !expanded.contains("JobContext"),
+            "two-arg expansion must stay unchanged: {expanded}"
+        );
+        assert!(
+            expanded.contains("plain (state , args) . await"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn job_macro_rejects_one_arg_signature() {
+        let expanded = job_macro(
+            quote! {},
+            quote! {
+                async fn plain(state: AppState) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            expanded.contains("must have signature"),
+            "expected a compile error about the signature: {expanded}"
+        );
+    }
+
+    #[test]
+    fn job_macro_rejects_four_arg_signature() {
+        let expanded = job_macro(
+            quote! {},
+            quote! {
+                async fn plain(state: AppState, args: PlainArgs, ctx: JobContext, extra: u8) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            expanded.contains("must have signature"),
+            "expected a compile error about the signature: {expanded}"
         );
     }
 }

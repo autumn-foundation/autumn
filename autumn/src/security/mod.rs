@@ -141,8 +141,10 @@ pub mod captcha;
 pub(crate) mod config;
 pub(crate) mod csrf;
 pub(crate) mod headers;
+pub(crate) mod path;
 pub mod proxy;
 pub mod rate_limit;
+pub(crate) mod submit_token;
 pub(crate) mod trusted_proxies;
 
 // Re-export commonly used types at the module level.
@@ -154,13 +156,22 @@ pub use captcha::{
 };
 pub use config::{
     CspNonceConfig, CsrfConfig, HeadersConfig, KeyStrategy, RateLimitBackend, RateLimitConfig,
-    RateLimitTierConfig, SecurityConfig, TrustedProxiesConfig, UploadConfig,
-    default_content_security_policy, hmac_sha256_hex,
+    RateLimitNamedConfig, RateLimitTierConfig, SecurityConfig, SubmitTokenConfig,
+    TrustedProxiesConfig, UploadConfig, default_content_security_policy, hmac_sha256_hex,
 };
 #[cfg(feature = "redis")]
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
+// Exposed for autumn-cli's `autumn deploy` preflight to reuse the single source of truth for signing-secret validation; not yet a stable public API (may be promoted deliberately later).
+#[doc(hidden)]
+pub use config::{SigningSecretError, validate_signing_secret};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
 pub use headers::{CspNonce, SecurityHeadersLayer};
 pub use proxy::TrustedProxy;
-pub use rate_limit::{RateLimitExempt, RateLimitLayer, RateLimitOverride, RateLimitPrincipal};
+#[doc(hidden)]
+pub use rate_limit::{__check_throttle, __throttle_registry_reset, TEST_LOCK};
+pub use rate_limit::{
+    RateLimitEnvelopeCounted, RateLimitExempt, RateLimitLayer, RateLimitOverride,
+    RateLimitPrincipal, ThrottleSpec,
+};
+pub use submit_token::{SubmitFormField, SubmitToken, SubmitTokenLayer};
 pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity, TrustedProxiesLayer};

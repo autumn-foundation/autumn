@@ -4,6 +4,22 @@
 //! The Postgres backend uses advisory locks so each fleet-wide task tick is
 //! claimed by at most one replica under normal operation.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -270,7 +286,7 @@ pub fn coordinator_from_config(
     match config.backend {
         SchedulerBackend::InProcess => Ok(Arc::new(InProcessSchedulerCoordinator::new(replica_id))),
         SchedulerBackend::Postgres => {
-            #[cfg(feature = "db")]
+            #[cfg(all(feature = "db", not(feature = "sqlite")))]
             {
                 let pool = state.pool().cloned().ok_or_else(|| {
                     AutumnError::service_unavailable_msg(
@@ -282,6 +298,20 @@ pub fn coordinator_from_config(
                     replica_id,
                     config.key_prefix.clone(),
                 )))
+            }
+
+            // The Postgres advisory-lock scheduler coordinator is Postgres-only
+            // (it leases via `pg_advisory_lock`). Under the `sqlite` feature the
+            // runtime pool is a SQLite pool with no such primitive, so refuse
+            // rather than mis-type. Single-node SQLite runs the in-process
+            // coordinator (`scheduler.backend = "in_process"`, the default).
+            #[cfg(all(feature = "db", feature = "sqlite"))]
+            {
+                let _ = (state, replica_id);
+                Err(AutumnError::service_unavailable_msg(
+                    "scheduler.backend = \"postgres\" requires the Postgres backend and is \
+                     unsupported under the sqlite feature; use scheduler.backend = \"in_process\"",
+                ))
             }
 
             #[cfg(not(feature = "db"))]
@@ -320,7 +350,12 @@ pub fn advisory_lock_key(key_prefix: &str, task_name: &str, tick_key: &str) -> i
     hasher.update(tick_key.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "infallible: SHA-256 digest is always 32 bytes, so [..8] is in bounds"
+    )]
+    let head = &digest[..8];
+    bytes.copy_from_slice(head);
     i64::from_be_bytes(bytes)
 }
 

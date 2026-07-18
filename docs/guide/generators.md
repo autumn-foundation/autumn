@@ -8,9 +8,12 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate model`              | A `#[model]` struct, a Diesel `up.sql`/`down.sql` pair, a `schema.rs` entry      |
 | `autumn generate migration`          | A Diesel migration directory; columns are inferred when the name matches a verb |
 | `autumn generate task`               | A one-off operational `#[task]` skeleton under `tasks/`                         |
+| `autumn generate job`                | A `#[job]` background-job handler with args struct, `registered_jobs()` aggregator, and `.jobs(…)` wiring in `src/main.rs` |
+| `autumn generate channel`            | A real-time broadcast channel over the `Channels` API — an htmx SSE live view by default, or a raw `#[ws]` handler with `--ws` |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
+| `autumn generate tauri`              | A complete `src-tauri/` sidecar project so the app ships as a native desktop installer (see [Tauri guide](tauri.md)) |
 
 The generators only emit code that uses macros and conventions Autumn already
 ships (`#[model]`, `#[repository]`, `#[get]/#[post]`, the `i64`-PK convention,
@@ -21,14 +24,33 @@ ordinary user code that you should edit freely.
 ## Five commands to a working CRUD app
 
 This is the path that every other batteries-included framework boasts about.
-On a fresh machine with Rust and Postgres installed:
+On a fresh machine with Rust and Postgres installed, there is one one-time
+prerequisite: `autumn migrate` delegates to the Diesel CLI, so install it
+once with `cargo install diesel_cli --no-default-features --features postgres`.
 
 ```bash
 autumn new my-app
 cd my-app
 autumn generate scaffold Post title:String body:Text published:bool
+# Before migrating: configure the database (see the note below) and
+# create it if it does not exist yet:
+createdb my_app
 autumn migrate
 autumn dev
+```
+
+One file edit belongs between `generate` and `migrate`: the generated
+`autumn.toml` ships with the database section commented out (look for
+"Uncomment to configure database:"). Uncomment it and point `url` at your
+Postgres so both `autumn migrate` and the running app can reach the
+database — without it, `autumn migrate` exits with `✗ No database URL found.`.
+`autumn migrate` runs migrations against that database but does not create
+it, hence the `createdb my_app` above (any equivalent, such as
+`CREATE DATABASE` in psql, works too):
+
+```toml
+[database]
+url = "postgres://user:pass@localhost:5432/my_app"
 ```
 
 Visit <http://localhost:3000/posts> to see the generated index page.
@@ -54,10 +76,42 @@ set.
 | `at:NaiveDateTime`| `chrono::NaiveDateTime`         | `Timestamp`        | `TIMESTAMP`         |
 | `at:DateTime`     | `chrono::DateTime<chrono::Utc>` | `Timestamptz`      | `TIMESTAMPTZ`       |
 | `data:Bytea` *(or `Vec<u8>`)* | `Vec<u8>`           | `Bytea`            | `BYTEA`             |
+| `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
 
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
 emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
+
+### Validation and HTML5 constraints (`{…}` modifiers)
+
+Add a trailing `{…}` block to a field to declare constraints once and have
+them enforced on **both** sides — a server-side `#[validate(...)]` rule *and*
+the matching client-side HTML5 input attribute:
+
+```bash
+autumn generate scaffold Post \
+  'title:String{min=3,max=120}' \
+  'contact:String{email}' \
+  'homepage:String{url}' \
+  'age:i32{min=0,max=130}'
+```
+
+| Modifier                        | Applies to        | `#[validate(…)]`        | HTML5 attribute(s)        |
+| ------------------------------- | ----------------- | ----------------------- | ------------------------- |
+| `{min=N,max=N}` (String/Text)   | `String`/`Text`   | `length(min, max)`      | `minlength` / `maxlength` |
+| `{min=N,max=N}` (numeric)       | `i32`/`i64`/`f32`/`f64` | `range(min, max)` | `min` / `max` (`type="number"`) |
+| `{email}`                       | `String`/`Text`   | `email`                 | `type="email"`            |
+| `{url}`                         | `String`/`Text`   | `url`                   | `type="url"`              |
+
+The generated model field carries the `#[validate(...)]` attribute (so a bad
+submission is rejected through the existing changeset path as a **422 with
+inline per-field errors**, never a 500 or a silent store), and the generated
+form input carries the matching HTML5 attribute (so the browser blocks bad
+input before it hits the network). The `required` signal from a non-nullable
+column is preserved, and a rejected submission re-renders keeping the entered
+values. A misspelled modifier (e.g. `{maxx=5}`) fails the scaffold with an
+error naming the offending token. Quote the whole token in bash/zsh so the
+shell doesn't brace-expand the comma.
 
 Every generated table also includes:
 
@@ -65,6 +119,65 @@ Every generated table also includes:
   in Autumn).
 - `created_at TIMESTAMP NOT NULL DEFAULT NOW()` annotated `#[default]` on
   the model so it stays out of `NewX`.
+
+### Foreign keys with `references`
+
+`post:references` scaffolds a foreign-key column: the declared name is
+rewritten to end in `_id` (`post` -> `post_id`), the referenced table is
+derived by pluralising the base name (`post` -> `posts`, matching
+`naming::pluralize`), and the column is emitted as
+`post_id BIGINT NOT NULL REFERENCES posts(id)` with an automatic index
+(`CREATE INDEX idx_comments_post_id ON comments (post_id);`) — no `--index`
+flag required. Append `?` for a nullable foreign key
+(`post:references?` -> `post_id: Option<i64>`, column `NULL`):
+
+```bash
+autumn generate scaffold Comment body:Text post:references
+```
+
+If the referenced model doesn't exist yet (no `src/models/post.rs`, or a
+matching declaration in a single-file `src/models.rs`), the generator still
+scaffolds the column, constraint, and index — it just prints a warning that
+the referenced table is assumed to already exist.
+
+#### belongs_to dropdowns (populated from the parent)
+
+When the referenced model *does* exist, the scaffolded new/edit form renders
+the foreign key as a **populated `<select>`** — one `<option>` per parent row
+— instead of a text box demanding a raw numeric id, and the index/show views
+render the parent's **display value** rather than the raw `*_id` integer. No
+hand-editing required:
+
+```bash
+autumn generate model Post title:String
+autumn generate scaffold Comment body:Text post:references
+# → the new-comment form's "post" field is a dropdown of existing posts,
+#   labeled by each post's title; the comment index/show show the post title.
+```
+
+The **display column** is chosen by heuristic: a `name` or `title` column if
+present, otherwise the first `String`/`Text` column, falling back to the id
+only when the parent has no string column. Override it explicitly with a
+`{label:col}` modifier:
+
+```bash
+autumn generate scaffold Comment body:Text 'post:references{label:slug}'
+```
+
+A nullable reference (`post:references?`) renders a blank "— Unset —" first
+option so the selection can be cleared, and its index/show views render a dash
+when unset. (Index/show use a simple per-view fetch; the N+1-safe batched
+variant is issue #835.)
+
+`references` only supports the i64/BIGSERIAL primary-key convention. If the
+referenced model *is* found but was generated with `--id uuid`, the generator
+fails fast with an error instead of emitting a migration that would break at
+`autumn migrate` time with a `BIGINT`-vs-`UUID` type mismatch — hand-write
+the migration for a UUID foreign key instead.
+
+Composite foreign keys, cascade policy (`ON DELETE`/`ON UPDATE`), and runtime
+association traversal (`belongs_to`/`has_many`) are not in scope for this
+token — see issue #835 for the latter.
 
 ## `autumn generate model`
 
@@ -192,6 +305,86 @@ safe to apply because no running code references `body` any longer.
 The same two-step pattern applies to column type changes and to removing columns
 with foreign-key references.
 
+## Rolling back with `autumn migrate down`
+
+Every `autumn generate migration` run creates a `down.sql` file alongside
+`up.sql`. `autumn migrate down` is the command that honours it.
+
+```bash
+# Revert the most recently applied user migration (default: --steps 1):
+autumn migrate down
+
+# Revert the last 3 user migrations in newest-first order:
+autumn migrate down --steps 3
+
+# Revert user migrations until 20260101000000 is the latest applied.
+# VERSION must be a currently applied user migration; framework migrations are
+# forward-only and cannot be used as a boundary.
+autumn migrate down --to 20260101000000
+
+# Required when AUTUMN_ENV=prod:
+autumn migrate down --yes-i-mean-prod
+
+# Enable maintenance mode around the rollback, then disable it on success:
+autumn migrate --with-maintenance down
+```
+
+### Framework migrations are forward-only
+
+Framework-owned migrations (the ones Autumn ships internally) are **never**
+rolled back by `autumn migrate down`. They are listed separately in
+`autumn migrate status` and have no `down.sql`. This design is intentional —
+rolling back framework schema changes would break the framework features that
+depend on them.
+
+### Safety guards
+
+Before touching the database, `autumn migrate down` checks:
+
+1. **Production guard** — If `AUTUMN_ENV` is `prod` or `production`, the command
+   refuses unless `--yes-i-mean-prod` is passed. (An empty `AUTUMN_ENV` falls
+   back to the legacy `AUTUMN_PROFILE`.)
+2. **down.sql preflight** — Every migration in the plan must have a non-empty,
+   non-comment `down.sql`. If any are missing or blank, the command names them
+   and exits non-zero without touching the database. A migration recorded as
+   applied but no longer present locally is also surfaced as non-revertable
+   rather than silently skipped.
+
+Listing the applied migrations, building the plan, and reverting all happen
+while the migration advisory lock is held, so two concurrent `down` runs are
+serialized and neither double-reverts.
+
+### Sharded deployments
+
+Like `autumn migrate run`, `autumn migrate down` operates on the control
+database plus every configured shard by default, and honours `--shard <name>`
+and `--control-only` to scope to a single target. Targets are rolled back in
+order and the command is **fail-fast**: if a later target fails (for example a
+runtime `down.sql` error, or shards sitting at divergent migration states), the
+earlier targets have already been rolled back. Re-running `down` then plans
+from each target's current state, so scope the command with `--shard` /
+`--control-only` when you need to roll a single database back in isolation. (A
+missing or empty `down.sql` is caught by preflight before any target is
+mutated, since all targets share one `migrations/` directory.)
+
+`autumn migrate check` also classifies `down.sql` files (in addition to
+`up.sql`), so you can catch unsafe rollback SQL — such as `DROP TABLE` or a
+`DROP INDEX CONCURRENTLY` that is missing its `run_in_transaction = false`
+opt-out — before an incident.
+
+### Observability
+
+`autumn migrate status` shows rollback availability for every applied user
+migration:
+
+```
+  ✓ 20260101000000_create_posts
+  ✗ 20260102000000_add_body_to_posts  (no executable down.sql — not revertable)
+```
+
+This makes the rollback path visible before an incident, so you know which
+migrations can be safely reverted.
+
 ## `autumn generate task`
 
 For operational scripts that should run through the full Autumn app context.
@@ -225,6 +418,143 @@ pub async fn cleanup_users(TaskArgs(args): TaskArgs<CleanupUsersArgs>) -> Autumn
 Register the function with `.one_off_tasks(one_off_tasks![...])` before running
 it with `autumn task cleanup_users --dry-run`.
 
+## `autumn generate job`
+
+For background work that should survive process restarts, be retried on failure,
+and be visible in `/actuator/jobs`.
+
+```bash
+autumn generate job SendWelcomeEmail user_id:i64 email:String
+```
+
+Produces:
+
+```
+src/jobs/send_welcome_email.rs    # #[job] handler + SendWelcomeEmailArgs struct
+src/jobs/mod.rs                   # registered_jobs() aggregator (created or appended)
+src/main.rs                       # mod jobs; + .jobs(jobs::registered_jobs()) added in place
+```
+
+The generated `src/jobs/send_welcome_email.rs`:
+
+```rust
+use autumn_web::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendWelcomeEmailArgs {
+    pub user_id: i64,
+    pub email: String,
+}
+
+#[job(name = "send_welcome_email", max_attempts = 5, backoff_ms = 500)]
+pub async fn send_welcome_email(
+    _state: AppState,
+    args: SendWelcomeEmailArgs,
+) -> AutumnResult<()> {
+    // TODO: implement send_welcome_email
+    let _ = args;
+    Ok(())
+}
+```
+
+The `#[job]` macro generates a companion struct `SendWelcomeEmailJob` with:
+- `SendWelcomeEmailJob::NAME` — the job's registered name (`"send_welcome_email"`).
+- `SendWelcomeEmailJob::enqueue(args).await?` — at-least-once enqueue (use from most handlers).
+- `autumn_web::job::enqueue_on_conn(SendWelcomeEmailJob::NAME, args, conn).await?` — transactional enqueue (enqueues only if the surrounding DB transaction commits; use when the job outcome must be atomic with a DB write).
+
+The generated `src/jobs/mod.rs` aggregator:
+
+```rust
+pub mod send_welcome_email;
+
+#[must_use]
+pub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {
+    autumn_web::jobs![send_welcome_email::send_welcome_email]
+}
+```
+
+Running `autumn generate job` a second time with a different name augments `mod.rs` and `registered_jobs()` in place — it never duplicates an entry.
+
+The `.jobs(jobs::registered_jobs())` call added to `src/main.rs` wires the aggregator into the job runtime and automatically populates `/actuator/jobs` with every registered job.
+
+### Slow live job verification
+
+```bash
+cargo test -p autumn-cli --test generate generated_job_cargo_checks -- --ignored --exact
+```
+
+This scaffolds a fresh project, runs `autumn generate job`, and asserts that `cargo check --tests` passes with no hand-editing required.
+
+## `autumn generate channel`
+
+For a live feature (chat, notifications, a live-updating list) built entirely
+on Autumn's existing realtime stack — the `Channels` pub/sub API, SSE, and
+`#[ws]` upgrade routes. No new transport is invented; the generator only
+wires up what already ships.
+
+```bash
+autumn generate channel Chat
+```
+
+Produces:
+
+```
+src/channels/chat.rs      # GET /chat (live view), GET /chat/events (SSE), POST /chat/messages
+src/channels/mod.rs       # pub mod chat; (created or appended)
+src/main.rs               # mod channels; + routes![...] entries added in place
+tests/chat_channel.rs     # smoke test: publishes a message, asserts a subscriber receives it
+```
+
+SSE-over-htmx is the default transport — `GET /chat` renders a view wired to
+htmx's `sse-connect`/`sse-swap`, so browser tabs update live with **zero
+client JS authored by the user**:
+
+```rust
+#[get("/chat/events")]
+pub async fn chat_events(State(state): State<AppState>) -> impl IntoResponse {
+    autumn_web::sse::stream(&state, TOPIC)
+}
+
+#[post("/chat/messages")]
+pub async fn chat_publish(
+    State(state): State<AppState>,
+    Form(form): Form<ChatForm>,
+) -> AutumnResult<&'static str> {
+    let fragment = message_fragment(&form.message).into_string();
+    state.broadcast().publish(TOPIC, fragment)?;
+    Ok("published")
+}
+```
+
+Pass `--ws` to emit a raw `#[ws]` WebSocket handler instead, for clients that
+need a bidirectional socket rather than SSE + form posts:
+
+```bash
+autumn generate channel Chat --ws
+```
+
+Either transport adds the `"ws"` feature to the `autumn-web` dependency in
+`Cargo.toml` — channels, SSE, and `#[ws]` are all gated behind it.
+
+The generated smoke test is a real assertion, not a stub: it publishes
+through the in-process `TestApp`, subscribes to the same topic, and asserts
+the message arrives — no Postgres/Docker required, so it runs on every
+`cargo test`.
+
+### Slow live channel verification
+
+```bash
+cargo test -p autumn-cli --test generate generated_channel_cargo_checks -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_channel_ws_cargo_checks -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_channel_smoke_test_passes -- --ignored --exact
+```
+
+These scaffold a fresh project, run `autumn generate channel` (both
+transports), and assert `cargo check --tests` passes with no hand-editing —
+plus one gate that actually runs the generated smoke test with `cargo test`
+to confirm it passes on first run.
+
 ## `autumn generate scaffold`
 
 Everything `model` produces, plus:
@@ -235,10 +565,14 @@ Everything `model` produces, plus:
 - `src/routes/<plural>.rs` — Maud HTML handlers for `index`, `show`, `new_form`,
   `create`, `edit_form`, and `update`. (Skipped if `--api` is set).
 - `src/routes/mod.rs` — module aggregator. (Skipped if `--api` is set).
-- `tests/<snake>.rs` — a smoke test that hits `GET /<plural>` against
-  a running server and asserts a 2xx response (skipped unless
-  `AUTUMN_TEST_BASE_URL` is set). For `--api` scaffolds, this performs a JSON-based
-  CRUD round-trip.
+- `tests/<snake>.rs` — a real, in-process smoke test built on
+  `autumn_web::test::{TestApp, TestClient, TestDb}`: it boots a throwaway
+  Postgres database, fires a request at a stand-in for the scaffolded index
+  route, and asserts a real response — no running server, no env var, no
+  silent skip. `cargo test` reports it as `ignored` with an explicit reason
+  (Docker isn't assumed to be available); run `cargo test -- --ignored` to
+  execute it for real. `--api` scaffolds get the JSON equivalent, asserting
+  against `GET /api/<plural>`.
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
   with the same arguments is a no-op. By default, the scaffold registers only
@@ -473,6 +807,77 @@ Every generator accepts:
   collision. `mod.rs` and `schema.rs` are always treated as modify-in-place
   edits and don't trigger collisions.
 
+## `autumn db pull` — scaffold models from an existing database
+
+The generators above are greenfield: you describe a table with the `name:Type`
+DSL and they emit a brand-new one. If you already run a Postgres database,
+`autumn db pull` goes the other direction — it introspects your live schema and
+emits the matching Autumn artifacts, so you can adopt autumn-web incrementally
+instead of rewriting every table by hand.
+
+```bash
+# Pull every table in the public schema:
+autumn db pull
+
+# Pull specific tables, and also emit a #[repository] per table:
+autumn db pull posts comments --with-repository
+```
+
+It connects using the same resolution `autumn migrate` uses
+(`database.primary_url` / `database.url` in `autumn.toml`, or
+`AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` / `DATABASE_URL`), and
+for each selected table emits, through the same file-emission machinery as the
+other generators:
+
+- a `#[model]` struct in `src/models/<name>.rs`,
+- a `diesel::table!` block in `src/schema.rs`,
+- the `pub mod <name>;` aggregator line, and `mod models;` / `mod schema;`
+  declarations in `src/main.rs`,
+- optionally, a `#[repository(Model)]` trait in `src/repositories/<name>.rs`
+  (with `--with-repository`).
+
+This is **read-only**: no migration is written and no data is touched — the
+tables already exist. Column types are the inverse of the [field-type DSL
+table](#the-field-type-dsl) (`int8` → `i64`, `text` → `String`, `timestamptz`
+→ `chrono::DateTime`, …); nullable columns become `Option<T>`. The primary key
+is annotated `#[id]` and a `created_at` column is annotated `#[default]`, so a
+table created by `autumn generate model` and then re-derived by `db pull`
+produces a field-for-field equivalent model. A column whose SQL type is outside
+the supported set fails with an error naming the column rather than silently
+dropping it.
+
+`--dry-run`, `--force`, and collision-refusal behave exactly as in the
+`autumn generate` family: existing model/repository files are not clobbered
+without `--force`, and `mod.rs` / `schema.rs` are modified in place. Under
+`--force`, an existing `schema.rs` block for a pulled table is replaced with the
+freshly introspected one so the model and schema can't drift apart on a re-pull.
+
+Brownfield specifics:
+
+- **Framework tables are skipped.** An unscoped `autumn db pull` ignores
+  Autumn's own tables (`autumn_*` / `_autumn*`, `api_tokens`, …) so it works on
+  a database that has already run `autumn migrate`. Name a table explicitly to
+  pull it anyway.
+- **Defaults and read-only columns.** A `created_at` column with a database
+  default, and stored generated columns (`GENERATED ALWAYS AS … STORED`), are
+  annotated `#[default]` so they stay out of inserts/updates. An ordinary
+  column with a default (e.g. `status TEXT DEFAULT 'draft'`) stays settable.
+- **Irregular plurals.** When the table name isn't the model macro's naive
+  `Struct + "s"` inference (e.g. `people`, `categories`), `db pull` emits an
+  explicit `#[autumn_web::model(table = "...")]` so the model compiles against
+  the generated schema block.
+- **`--with-repository` requires the `id`/`i64` PK convention.** Tables keyed by
+  a `uuid`, a non-`id` column, or a composite key still get a model, but the
+  repository is skipped (the `#[repository]` macro assumes an `i64 id`).
+- **Unsupported shapes fail loudly.** Tables without a primary key, columns
+  whose names aren't valid identifiers (e.g. `type`), unmapped SQL types, and
+  two tables that collapse to the same model module all stop the pull with a
+  clear error instead of emitting broken code.
+
+Out of scope for `db pull`: foreign-key/association inference, generating routes
+or admin adapters, non-Postgres backends, and SQL views / materialized views /
+partitioned tables.
+
 ## What's intentionally not here
 
 The generators are deliberately scoped to one resource per invocation and
@@ -487,7 +892,6 @@ you need them):
   project with its own release train, so core web generators do not depend on
   it.
 - Custom user-provided templates / template overrides.
-- Reverse generation (database → models).
 - Test scaffolding beyond the single smoke test.
 - Multi-resource scaffolds (`autumn generate scaffold Blog Post Comment`).
   One resource per invocation; chaining is the user's job.
