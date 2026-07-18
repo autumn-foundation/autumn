@@ -36,9 +36,9 @@ on:
         type: string
         default: "nbg1"
       kamal_proxy_version:
-        description: "kamal-proxy image tag to install during host bootstrap"
+        description: "kamal-proxy image tag to install during host bootstrap (pin a released tag, not latest)"
         type: string
-        default: "latest"
+        default: "v0.9.2"
   schedule:
     # 04:17 UTC nightly — off-peak, jittered minute to avoid the top-of-hour herd.
     - cron: "17 4 * * *"
@@ -206,7 +206,7 @@ jobs:
         env:
           AUTUMN_BIN: ${{ github.workspace }}/target/release/autumn
           SSH_PORT: "22"
-          KAMAL_PROXY_VERSION: ${{ inputs.kamal_proxy_version || 'latest' }}
+          KAMAL_PROXY_VERSION: ${{ inputs.kamal_proxy_version || 'v0.9.2' }}
         run: |
           chmod +x scripts/deploy-real-vps-validate.sh
           ./scripts/deploy-real-vps-validate.sh
