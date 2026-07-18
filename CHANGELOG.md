@@ -10,9 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **media:** autumn-media gained a full **Rooms** primitive (#1974) — a
-  `/api/media/rooms` signaling API with create/join/leave/roster, a short-lived
-  per-participant `SessionToken` (uuid v4, constant-time verify, default 300s
-  TTL, redacted `Debug`, never serialized into the roster), a WHIP publish URL
+  `/api/media/rooms` signaling API with create/join/leave/roster, a
+  per-participant `SessionToken` (uuid v4, constant-time **value-only** verify,
+  redacted `Debug`, never serialized into the roster) with an advisory
+  `token_expires_at` (default 300s TTL) that is **not currently enforced** — a
+  valid token keeps authorizing room lifecycle/roster ops until the participant
+  is removed or the process restarts — a WHIP publish URL
   plus per-peer WHEP subscribe URLs, a `RoomService` `AppState` extension, and a
   durable `compose_room_recording` grid workflow (`FfmpegRoomCompositeCommand`,
   xstack/hstack video + amix audio, a `#[job]` on the `media` queue). Isolation

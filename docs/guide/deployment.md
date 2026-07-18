@@ -401,9 +401,9 @@ enabled = true                 # off by default; the controller is a no-op when 
 # The listen ports below default to MediaMTX's standard values; override only if
 # you also change the app-side *_base URLs to match.
 # api_port = 9997        # control API
-# rtmp_port = 1935       # RTMP/WHIP ingest
+# rtmp_port = 1935       # RTMP ingest only (OBS / RTMP encoders)
 # hls_port = 8888        # HLS playback
-# webrtc_port = 8889     # WebRTC/WHEP playback
+# webrtc_port = 8889     # WebRTC: WHIP publish (browser + room) AND WHEP/WebRTC playback
 # playback_port = 9996   # recording playback
 # webrtc_local_udp = 8189
 # config_path = "/etc/mediamtx/mediamtx.yml"   # where the rendered config is written
@@ -414,20 +414,24 @@ enabled = true                 # off by default; the controller is a no-op when 
 # bin = "/usr/bin/ffmpeg"  # concrete path; verified by the deploy-time FFmpeg preflight
 ```
 
-When `enabled = true`, `autumn deploy`:
+When `enabled = true`, `autumn deploy up`:
 
-1. Renders `mediamtx.yml` (LL-HLS window, fmp4 recording under `recordings_dir`,
-   WebRTC config, and a `~^room/.+$` path matcher for autumn-media Rooms) plus
-   the systemd unit, then runs `daemon-reload && enable --now && restart`.
-2. Runs **four fail-closed host preflight checks before touching the host** —
+1. Runs **four fail-closed host preflight checks before touching the host** —
    FFmpeg resolves (the concrete `[media.ffmpeg] bin`), the MediaMTX binary is
    executable, the recordings directory is writable, and the MediaMTX ports are
    free — plus a pure-config precheck that the configured MediaMTX listener ports
    are distinct, and **aborts the deploy** if the host cannot serve media, rather
-   than shipping a half-provisioned box.
+   than shipping a half-provisioned box. These checks require a live host
+   executor and run **only at `deploy up`**.
+2. After the app cutover succeeds, renders `mediamtx.yml` (LL-HLS window, fmp4
+   recording under `recordings_dir`, WebRTC config, and a `~^room/.+$` path
+   matcher for autumn-media Rooms) plus the systemd unit, then runs
+   `daemon-reload && enable --now && restart`.
 
-`autumn deploy plan` surfaces the media unit, its provisioning steps, and the
-CSP origins your app must allow. The three browser-facing MediaMTX origins
+`autumn deploy plan` is a pure dry-run: it surfaces the media unit, its
+provisioning steps, the names of the host preflight checks that **will** run at
+`deploy up`, and the CSP origins your app must allow — but it holds no host
+executor, so it **does not** probe MediaMTX/FFmpeg or validate ports remotely. The three browser-facing MediaMTX origins
 (WebRTC `:8889`, HLS `:8888`, playback `:9996`) must appear in your
 `connect-src` / `media-src` (and `frame-src` for WebRTC) CSP; in production they
 collapse to your public MediaMTX origin, and your object-store origin must also
@@ -450,8 +454,8 @@ be allowed in `media-src` for recorded playback.
 **Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
 installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
 a host-bootstrap step), and wiring the four host preflight checks into the offline
-`autumn doctor` CLI (they run only in the executor-holding `deploy up` / `deploy
-plan` paths today).
+`autumn doctor` CLI (they run only in the executor-holding `deploy up` path today;
+`deploy plan` names them but never executes them).
 
 ### How the deploy path is validated in CI
 
