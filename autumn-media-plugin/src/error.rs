@@ -26,6 +26,22 @@ pub enum MediaError {
     )]
     PartialS3Credentials,
 
+    /// The S3 backend was selected without an explicit `public_base_url`, and
+    /// the configured endpoint is not Tigris — so the
+    /// `https://{bucket}.t3.tigrisfiles.io/…` public-base convention does not
+    /// apply. Deriving a public URL from an arbitrary private S3 endpoint is
+    /// unreliable, so a generic (non-Tigris) S3 backend must set
+    /// `media.storage.public_base_url` explicitly. `bucket` is a caller
+    /// configuration value (not a secret).
+    #[error(
+        "media.storage.public_base_url is required for a generic (non-Tigris) \
+         S3 backend (bucket `{bucket}`): set it to the bucket's public base URL"
+    )]
+    MissingPublicBaseUrl {
+        /// The S3 bucket configured without a resolvable public base.
+        bucket: String,
+    },
+
     /// A caller-supplied storage key contained a dot-only (`.`/`..`) or empty
     /// path segment.
     ///
@@ -153,7 +169,11 @@ pub enum MediaError {
 }
 
 /// Maximum number of stderr bytes carried in [`MediaError::FfmpegNonZeroExit`].
-const STDERR_TAIL_MAX_BYTES: usize = 2048;
+///
+/// Also used by the encode primitives to bound the tail buffer they retain while
+/// streaming a child's stderr, so the transient in-memory buffer is capped at the
+/// same size this helper would ultimately surface.
+pub(crate) const STDERR_TAIL_MAX_BYTES: usize = 2048;
 
 /// Render the last ~2 KiB of an `FFmpeg` stderr stream as a `String`.
 ///

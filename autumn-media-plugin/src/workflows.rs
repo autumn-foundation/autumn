@@ -36,6 +36,7 @@ use crate::encode::{
     FfmpegHighlightCommand, FfmpegPosterCommand, FfmpegPreviewSpriteCommand,
     FfmpegRoomCompositeCommand, PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH,
     PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS, build_preview_webvtt,
+    validate_room_composite_input_count,
 };
 use crate::error::MediaError;
 use crate::sink::{MediaArtifact, MediaArtifactFile, MediaArtifactKind, MediaArtifactSinkExt};
@@ -603,8 +604,42 @@ async fn run_room_composite(
         workflow_id,
         source_id,
     } = args;
+    // Reject a malformed job (fewer than two / more than six source paths)
+    // against the same `2..=6` band `FfmpegRoomCompositeCommand::run()` enforces
+    // *before* spawning any `ffprobe`, so a bad queued job can never fan out one
+    // probe child process per supplied path only to be rejected afterwards.
+    validate_room_composite_input_count(source_paths.len())?;
     let (output_path, ephemeral) = staged_output(storage, &output_key, "mp4")?;
-    let command = FfmpegRoomCompositeCommand::new(ffmpeg_bin, source_paths, output_path.clone());
+    // Detect, per input, whether it carries an audio stream so the composite
+    // mixes only the inputs that actually have audio. Probing is async I/O and
+    // lives here in the caller; `FfmpegRoomCompositeCommand::args()` stays a pure
+    // function of the resulting flags. See `probe_has_audio` for the fail-safe
+    // policy (a probe failure degrades to "no audio", never a crash).
+    let ffprobe_bin = resolve_ffprobe_bin(ffmpeg_bin);
+    // Probe every input concurrently rather than serializing one `ffprobe`
+    // spawn after another. The probes are independent async I/O; awaiting the
+    // handles in spawn order preserves input order so `audio_present[i]` still
+    // aligns with `source_paths[i]`. `probe_has_audio` is itself fail-safe (a
+    // probe error yields `false`), and a task-join failure (e.g. a panic)
+    // degrades to `false` the same way, so a probe outage never aborts the job.
+    let probes: Vec<_> = source_paths
+        .iter()
+        .map(|path| {
+            let ffprobe_bin = ffprobe_bin.clone();
+            let path = path.clone();
+            tokio::spawn(async move { probe_has_audio(&ffprobe_bin, &path).await })
+        })
+        .collect();
+    let mut audio_present = Vec::with_capacity(probes.len());
+    for probe in probes {
+        audio_present.push(probe.await.unwrap_or(false));
+    }
+    let command = FfmpegRoomCompositeCommand::new(
+        ffmpeg_bin,
+        source_paths,
+        output_path.clone(),
+        audio_present,
+    );
     let bytes = run_blocking(move || command.run()).await?;
     let file = persist_and_cleanup(
         storage,
@@ -623,6 +658,58 @@ async fn run_room_composite(
         secondary: None,
         metadata: BTreeMap::new(),
     })
+}
+
+/// Resolve the `ffprobe` binary from the configured `ffmpeg` binary path.
+///
+/// Prefers a sibling `ffprobe` next to the configured `ffmpeg` (they ship
+/// together), i.e. the same directory with the file name swapped. When the
+/// `ffmpeg` path carries no directory component (a bare `ffmpeg` resolved via
+/// `PATH`) or the sibling does not exist, falls back to plain `ffprobe` on
+/// `PATH`.
+fn resolve_ffprobe_bin(ffmpeg_bin: &str) -> std::ffi::OsString {
+    let candidate = Path::new(ffmpeg_bin).with_file_name("ffprobe");
+    let has_dir = candidate
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if has_dir && candidate.exists() {
+        candidate.into_os_string()
+    } else {
+        std::ffi::OsString::from("ffprobe")
+    }
+}
+
+/// Probe whether `path` carries at least one audio stream.
+///
+/// Runs `ffprobe -v error -select_streams a -show_entries stream=index -of
+/// csv=p=0 <file>` and treats non-empty stdout as "has audio".
+///
+/// **Fail-safe policy:** any probe failure (spawn error, non-zero exit, or a
+/// path with no audio) resolves to `false` ("assume no audio"). This is the
+/// only direction that **cannot crash the composite job**: a `false` merely
+/// drops that input from the `amix`, so at worst a probe outage yields a silent
+/// (but successful) grid. Returning `true` on failure would be unsafe — if the
+/// input truly had no audio, the filtergraph would reference a missing `[i:a]`
+/// stream and `FFmpeg` would fail, which is exactly the crash this replaces.
+async fn probe_has_audio(ffprobe_bin: &std::ffi::OsStr, path: &Path) -> bool {
+    let output = tokio::process::Command::new(ffprobe_bin)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => !out.stdout.iter().all(u8::is_ascii_whitespace),
+        _ => false,
+    }
 }
 
 /// Run a blocking encode closure off the async runtime.
@@ -765,8 +852,9 @@ mod tests {
         FinalizeRecordingJobArgs, MediaWorkflowDelegate, MediaWorkflowDelegateExt,
         MediaWorkflowRequest, MediaWorkflows, PreviewJobArgs, RoomCompositeJobArgs,
         ThumbnailJobArgs, TranscodeJobArgs, compose_room_recording, extract_thumbnail,
-        media_job_infos, persist_and_cleanup, staged_output,
+        media_job_infos, persist_and_cleanup, run_room_composite, staged_output,
     };
+    use crate::error::MediaError;
     use crate::sink::MediaArtifactSinkExt;
     use crate::sink::tests::CountingSink;
     use crate::storage::MediaStorage;
@@ -1074,6 +1162,29 @@ mod tests {
         assert!(result.is_err(), "missing sources must fail the job");
         assert_eq!(sink.failed.load(Ordering::SeqCst), 1);
         assert_eq!(sink.completed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn room_composite_rejects_more_than_six_paths_before_probing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = local_storage(temp.path());
+        // Seven paths (over the 2..=6 mesh-room band). A bogus ffmpeg bin means
+        // its sibling `ffprobe` cannot resolve either, so if this reached the
+        // probe loop it would spawn seven child processes; the input-count guard
+        // must reject first and return the same `2..=6` cap error `run()` uses.
+        let sources: Vec<PathBuf> = (0..7)
+            .map(|i| temp.path().join(format!("missing-{i}.mp4")))
+            .collect();
+        let args = room_composite_args(sources);
+        let result = run_room_composite("/nonexistent/ffmpeg-bin", &storage, args).await;
+        assert!(
+            matches!(
+                result,
+                Err(MediaError::FfmpegSourceMissing { ref path })
+                    if path.contains("at most six")
+            ),
+            "a >6-path job must be rejected by the input-count cap before probing, got {result:?}"
+        );
     }
 
     #[test]

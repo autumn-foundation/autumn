@@ -147,7 +147,9 @@ impl MediaStorage {
     /// resolution — no generic `auto` default; the Tigris `auto` region is set
     /// by the `from_arroyo_env` shim); an unset S3 public base is derived from
     /// the bucket + key prefix via the Tigris convention
-    /// ([`default_tigris_public_base`]); an unset local public base becomes
+    /// ([`default_tigris_public_base`]) **only for a Tigris endpoint** — a
+    /// generic (non-Tigris) S3 backend with no explicit public base is a
+    /// configuration error (see below); an unset local public base becomes
     /// `/media`. An unset S3 endpoint stays `None` (the SDK default) — no Tigris
     /// endpoint is hard-coded generically here (the `from_arroyo_env` shim is
     /// where the Tigris endpoint default lives).
@@ -155,8 +157,10 @@ impl MediaStorage {
     /// # Errors
     ///
     /// Returns [`MediaError::MissingBucket`] when the S3 backend is selected
-    /// without a bucket, and [`MediaError::PartialS3Credentials`] when exactly
-    /// one of the access-key / secret-key pair is set.
+    /// without a bucket, [`MediaError::PartialS3Credentials`] when exactly one
+    /// of the access-key / secret-key pair is set, and
+    /// [`MediaError::MissingPublicBaseUrl`] when a generic (non-Tigris) S3
+    /// backend is selected without an explicit `public_base_url`.
     pub fn from_config(cfg: &MediaStorageConfig) -> Result<Self, MediaError> {
         use crate::config::MediaStorageBackend;
 
@@ -188,14 +192,30 @@ impl MediaStorage {
                 // shim, not this generic path.
                 let region = non_empty(cfg.region.as_deref()).map(ToOwned::to_owned);
                 let key_prefix = cfg.key_prefix.trim_matches('/').to_owned();
-                let public_base_url = non_empty(cfg.public_base_url.as_deref()).map_or_else(
-                    || default_tigris_public_base(&bucket, &key_prefix),
-                    ToOwned::to_owned,
-                );
+                let endpoint_url = non_empty(cfg.endpoint_url.as_deref()).map(ToOwned::to_owned);
+
+                // Resolve the public base URL. An explicit value always wins.
+                // Without one, the `https://{bucket}.t3.tigrisfiles.io/{prefix}`
+                // Tigris convention ([`default_tigris_public_base`]) is applied
+                // ONLY for a Tigris endpoint (the arroyo/Tigris-compat path,
+                // whose `from_arroyo_env` shim sets the endpoint to
+                // `https://t3.storage.dev`). A generic (non-Tigris) S3 backend —
+                // AWS/R2/MinIO, or one on the SDK default endpoint — must set
+                // `public_base_url` explicitly: deriving a public URL from an
+                // arbitrary private S3 endpoint is unreliable, so fail fast with
+                // an actionable error instead of advertising a wrong
+                // `tigrisfiles.io` URL.
+                let public_base_url = match non_empty(cfg.public_base_url.as_deref()) {
+                    Some(explicit) => explicit.to_owned(),
+                    None if is_tigris_endpoint(endpoint_url.as_deref()) => {
+                        default_tigris_public_base(&bucket, &key_prefix)
+                    }
+                    None => return Err(MediaError::MissingPublicBaseUrl { bucket }),
+                };
 
                 Ok(Self::S3(S3MediaStorage {
                     bucket,
-                    endpoint_url: non_empty(cfg.endpoint_url.as_deref()).map(ToOwned::to_owned),
+                    endpoint_url,
                     region,
                     access_key_id: access_key_id.unwrap_or_default().to_owned(),
                     secret_access_key: secret_access_key.unwrap_or_default().to_owned(),
@@ -561,6 +581,50 @@ pub fn default_tigris_public_base(bucket: &str, key_prefix: &str) -> String {
     )
 }
 
+/// Whether an S3 endpoint URL points at Tigris — the only S3 target for which
+/// the `https://{bucket}.t3.tigrisfiles.io/{prefix}` public-base convention
+/// ([`default_tigris_public_base`]) is correct.
+///
+/// The arroyo/Tigris compatibility path (`MediaConfig::from_arroyo_env`) sets
+/// the S3 endpoint to `https://t3.storage.dev`, and Tigris public buckets live
+/// under `*.tigrisfiles.io`; both host families are recognized. A generic S3
+/// backend (AWS, Cloudflare R2, `MinIO`, …) — or an S3 backend with no endpoint
+/// at all (the AWS SDK default) — is not Tigris, so the Tigris public-base
+/// default must not be applied to it.
+fn is_tigris_endpoint(endpoint_url: Option<&str>) -> bool {
+    let Some(endpoint) = endpoint_url else {
+        return false;
+    };
+    let host = endpoint_host(endpoint);
+    host == "t3.storage.dev"
+        || host.ends_with(".t3.storage.dev")
+        || host == "tigrisfiles.io"
+        || host.ends_with(".tigrisfiles.io")
+}
+
+/// Extract the lowercased host from a URL-ish string for [`is_tigris_endpoint`]:
+/// scheme (`…://`), any userinfo (`user@`), a trailing `:port`, and the path /
+/// query / fragment are all stripped. Best-effort — a value with no recognizable
+/// host yields an empty string (which is never Tigris).
+fn endpoint_host(endpoint: &str) -> String {
+    let after_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    host_port
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
 /// Join an object-key prefix and a key, slash-trimming both. An empty prefix
 /// yields the slash-trimmed key alone.
 #[must_use]
@@ -681,11 +745,16 @@ mod tests {
     use crate::config::{MediaStorageBackend, MediaStorageConfig};
 
     fn s3_config(bucket: Option<&str>) -> MediaStorageConfig {
+        // A valid *generic* S3 config: it carries an explicit `public_base_url`
+        // so `from_config` never needs (and never applies) the Tigris fallback.
+        // Tests that specifically exercise the Tigris public-base fallback clear
+        // this and set a Tigris endpoint instead.
         MediaStorageConfig {
             backend: MediaStorageBackend::S3,
             bucket: bucket.map(ToOwned::to_owned),
             access_key_id: Some("AKIA".to_owned()),
             secret_access_key: Some("secret".to_owned()),
+            public_base_url: Some("https://cdn.example.com".to_owned()),
             ..MediaStorageConfig::default()
         }
     }
@@ -752,6 +821,50 @@ mod tests {
             default_tigris_public_base("my-bucket", ""),
             "https://my-bucket.t3.tigrisfiles.io"
         );
+    }
+
+    // ── is_tigris_endpoint / endpoint_host ───────────────────────────────────
+
+    #[test]
+    fn is_tigris_endpoint_recognizes_tigris_hosts() {
+        // The endpoint the arroyo/Tigris-compat shim sets.
+        assert!(is_tigris_endpoint(Some("https://t3.storage.dev")));
+        // Case-insensitive, port and path stripped.
+        assert!(is_tigris_endpoint(Some("HTTPS://T3.Storage.Dev:443/")));
+        // Tigris public bucket host family.
+        assert!(is_tigris_endpoint(Some(
+            "https://my-bucket.t3.tigrisfiles.io"
+        )));
+        assert!(is_tigris_endpoint(Some("https://tigrisfiles.io")));
+    }
+
+    #[test]
+    fn is_tigris_endpoint_rejects_generic_and_absent() {
+        // No endpoint (SDK default) is not Tigris.
+        assert!(!is_tigris_endpoint(None));
+        // Generic S3 / R2 / MinIO endpoints are not Tigris.
+        assert!(!is_tigris_endpoint(Some(
+            "https://s3.us-east-1.amazonaws.com"
+        )));
+        assert!(!is_tigris_endpoint(Some(
+            "https://abc123.r2.cloudflarestorage.com"
+        )));
+        assert!(!is_tigris_endpoint(Some("http://127.0.0.1:9000")));
+        // A look-alike host must not be mistaken for Tigris.
+        assert!(!is_tigris_endpoint(Some(
+            "https://tigrisfiles.io.evil.example.com"
+        )));
+        assert!(!is_tigris_endpoint(Some("https://nottigrisfiles.io")));
+    }
+
+    #[test]
+    fn endpoint_host_strips_scheme_userinfo_port_and_path() {
+        assert_eq!(endpoint_host("https://t3.storage.dev"), "t3.storage.dev");
+        assert_eq!(
+            endpoint_host("https://user@t3.storage.dev:443/path?q=1#f"),
+            "t3.storage.dev"
+        );
+        assert_eq!(endpoint_host("T3.STORAGE.DEV"), "t3.storage.dev");
     }
 
     // ── object_key ───────────────────────────────────────────────────────────
@@ -1179,16 +1292,26 @@ mod tests {
 
     #[test]
     fn from_config_s3_with_bucket_no_region_and_tigris_base() {
-        let storage = MediaStorage::from_config(&s3_config(Some("my-bucket"))).unwrap();
+        // The Tigris/arroyo-compat path: a Tigris endpoint and no explicit
+        // public base → the `tigrisfiles.io` fallback is applied (unchanged
+        // behavior). The fallback is gated on the endpoint being Tigris.
+        let mut cfg = s3_config(Some("my-bucket"));
+        cfg.public_base_url = None;
+        cfg.endpoint_url = Some("https://t3.storage.dev".to_owned());
+        let storage = MediaStorage::from_config(&cfg).unwrap();
         match storage {
             MediaStorage::S3(config) => {
                 assert_eq!(config.bucket, "my-bucket");
                 // blank region stays None on the generic path (ambient-resolved);
                 // no `auto` default here — that is Tigris/arroyo-only.
                 assert_eq!(config.region, None);
-                // unset endpoint stays None (SDK default)
-                assert_eq!(config.endpoint_url, None);
-                // unset public base → tigris fallback using the "media" prefix
+                // the Tigris endpoint is threaded through verbatim
+                assert_eq!(
+                    config.endpoint_url.as_deref(),
+                    Some("https://t3.storage.dev")
+                );
+                // unset public base + Tigris endpoint → tigris fallback using the
+                // "media" prefix
                 assert_eq!(
                     config.public_base_url,
                     "https://my-bucket.t3.tigrisfiles.io/media"
@@ -1196,6 +1319,77 @@ mod tests {
             }
             MediaStorage::Local { .. } => panic!("expected s3 backend"),
         }
+    }
+
+    #[test]
+    fn from_config_s3_tigris_public_host_endpoint_also_defaults() {
+        // A `*.tigrisfiles.io` endpoint is likewise recognized as Tigris, so the
+        // public-base fallback applies with no explicit base.
+        let mut cfg = s3_config(Some("my-bucket"));
+        cfg.public_base_url = None;
+        cfg.endpoint_url = Some("https://my-bucket.t3.tigrisfiles.io".to_owned());
+        let MediaStorage::S3(config) = MediaStorage::from_config(&cfg).unwrap() else {
+            panic!("expected s3 backend");
+        };
+        assert_eq!(
+            config.public_base_url,
+            "https://my-bucket.t3.tigrisfiles.io/media"
+        );
+    }
+
+    #[test]
+    fn from_config_s3_generic_endpoint_no_public_base_errors() {
+        // A generic (non-Tigris) S3 endpoint without an explicit public base is
+        // a configuration error — never a wrong `tigrisfiles.io` URL.
+        let mut cfg = s3_config(Some("my-bucket"));
+        cfg.public_base_url = None;
+        cfg.endpoint_url = Some("https://s3.us-east-1.amazonaws.com".to_owned());
+        let error = MediaStorage::from_config(&cfg).unwrap_err();
+        assert!(
+            matches!(error, MediaError::MissingPublicBaseUrl { .. }),
+            "expected MissingPublicBaseUrl, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("public_base_url"),
+            "error must name public_base_url: {error}"
+        );
+    }
+
+    #[test]
+    fn from_config_s3_no_endpoint_no_public_base_errors() {
+        // The AWS SDK default endpoint (no endpoint configured) is generic too:
+        // without an explicit public base it errors rather than falling back to
+        // the Tigris convention.
+        let mut cfg = s3_config(Some("my-bucket"));
+        cfg.public_base_url = None;
+        cfg.endpoint_url = None;
+        let error = MediaStorage::from_config(&cfg).unwrap_err();
+        assert!(
+            matches!(error, MediaError::MissingPublicBaseUrl { .. }),
+            "expected MissingPublicBaseUrl, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("public_base_url"),
+            "error must name public_base_url: {error}"
+        );
+    }
+
+    #[test]
+    fn from_config_s3_generic_endpoint_with_public_base_uses_it_verbatim() {
+        // A generic S3 backend WITH an explicit public base uses it verbatim —
+        // never a derived tigris URL.
+        let mut cfg = s3_config(Some("my-bucket"));
+        cfg.endpoint_url = Some("https://s3.us-east-1.amazonaws.com".to_owned());
+        cfg.public_base_url = Some("https://cdn.example.com/assets".to_owned());
+        let MediaStorage::S3(config) = MediaStorage::from_config(&cfg).unwrap() else {
+            panic!("expected s3 backend");
+        };
+        assert_eq!(config.public_base_url, "https://cdn.example.com/assets");
+        assert!(
+            !config.public_base_url.contains("tigrisfiles.io"),
+            "generic backend must not derive a tigris URL: {}",
+            config.public_base_url
+        );
     }
 
     #[test]

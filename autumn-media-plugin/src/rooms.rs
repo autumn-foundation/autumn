@@ -39,8 +39,9 @@
 //! (a created-but-never-joined room is only reaped when its last participant
 //! leaves), [`InMemoryRoomStore`] caps the registry at [`MAX_ROOMS`] rooms and
 //! rejects further creation with [`RoomError::RegistryFull`] (mapped to a
-//! transient `503`). Empty/idle-room reaping remains recorded future work (see
-//! *Known limitations*) — the cap is a backstop, not a substitute for the host
+//! transient `503`). The background reaper ([`spawn_room_reaper_loop`]) also
+//! reclaims idle/created-never-joined rooms (see *Known limitations*), but the
+//! cap remains the hard backstop — neither is a substitute for the host
 //! auth/rate-limit layer.
 //!
 //! # Operator requirements
@@ -65,10 +66,24 @@
 //!
 //! # Known limitations
 //!
-//! - **No participant reaping**: a client that never sends leave holds its seat
-//!   until the process restarts — there is no automatic reaping of abandoned
-//!   participants or idle rooms. A stale-participant / idle-room reaper is
-//!   recorded future work.
+//! - **Best-effort participant reaping (no true liveness)**: an idle-room /
+//!   stale-participant reaper ([`spawn_room_reaper_loop`] →
+//!   [`RoomStore::reap_stale`]) reclaims seats and rooms that have gone quiet, so
+//!   a client that crashes or never sends leave no longer holds its seat until
+//!   process restart. It keys on `last_seen_at`, which is seeded at join and
+//!   refreshed **only** when the participant polls the member-gated roster — the
+//!   sole per-participant liveness signal this slice has (there is no heartbeat,
+//!   and `MediaMTX` does not verify the advisory token). This is an
+//!   *approximation*: a participant whose media is live but which has **stopped
+//!   polling the roster** for the whole idle TTL would be reaped from the store
+//!   even though it is connected. Reaping only removes the in-memory signaling
+//!   record (seat + advisory token); it does **not** tear down the participant's
+//!   live `MediaMTX` `WebRTC` path, so a wrongly-reaped participant keeps its
+//!   media flowing and can re-join — it simply stops appearing in peers' future
+//!   roster polls. A real client heartbeat (renewal-on-activity) or `MediaMTX`
+//!   token verification is the documented follow-up that would make this a true
+//!   liveness guarantee; the reaper is deliberately conservative (a generous
+//!   idle TTL, empty-room drops keyed on `created_at`) until then.
 //! - **Advisory token expiry**: `token_expires_at` is returned to the joiner but
 //!   is **not** enforced anywhere yet (`MediaMTX` does not verify these tokens),
 //!   so it never gates a lifecycle operation — a participant can always leave
@@ -302,6 +317,17 @@ struct RoomParticipant {
     /// must never gate a lifecycle operation (leave, roster auth). Verification
     /// is value-only (see [`verify_token`](Self::verify_token)).
     token_expires_at: DateTime<Utc>,
+    /// Liveness clock for the idle-participant reaper (see [`reap_stale`]).
+    ///
+    /// Seeded to `joined_at` and **refreshed to `now` every time this
+    /// participant is observed polling the member-gated roster** (see
+    /// [`RoomStore::roster`]) — the roster poll is the only per-participant
+    /// liveness signal this slice has (there is no heartbeat, and
+    /// `token_expires_at` is advisory). An actively-polling participant stays
+    /// fresh; one that has stopped polling ages out and is reclaimed. This is a
+    /// best-effort liveness *approximation*, not a guarantee — see the
+    /// module-level *Known limitations* note.
+    last_seen_at: DateTime<Utc>,
 }
 
 impl RoomParticipant {
@@ -396,6 +422,16 @@ pub struct JoinRecord {
     pub room: RoomSnapshot,
 }
 
+/// The outcome tallies of one [`reap_stale`](RoomStore::reap_stale) sweep.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReapStats {
+    /// Rooms dropped this sweep (emptied by reaping, or created-never-joined
+    /// rooms that lingered past the idle TTL).
+    pub rooms_reaped: usize,
+    /// Participants evicted this sweep (idle past the horizon).
+    pub participants_reaped: usize,
+}
+
 /// The pluggable room-state store — the swap seam for a shared/durable backend.
 ///
 /// Every method keys on the `(namespace, room_id)` pair and **fails closed**: a
@@ -475,6 +511,22 @@ pub trait RoomStore: Send + Sync {
         room_id: &str,
         auth_token: &str,
     ) -> Result<RoomSnapshot, RoomError>;
+
+    /// Reclaim stale participants and idle rooms, returning what was reaped.
+    ///
+    /// Walks every room and evicts each participant whose liveness clock
+    /// (`last_seen_at` — seeded at join, refreshed on every member roster poll)
+    /// is older than `idle_ttl`; a room emptied by that eviction — or an empty
+    /// created-never-joined room older than `idle_ttl` — is dropped. `now` is
+    /// **injected** (never the wall clock) so the sweep is deterministically
+    /// testable. Reaping keys strictly on the `(namespace, room_id)` map and
+    /// never moves state across namespaces (fail-closed tenant isolation).
+    ///
+    /// This is a legitimate store concern (the store owns the seat lifecycle),
+    /// so it lives on the trait seam: a future shared/durable [`RoomStore`] must
+    /// implement its own equivalent reclamation. It is intentionally synchronous
+    /// to match the rest of the trait.
+    fn reap_stale(&self, now: DateTime<Utc>, idle_ttl: Duration) -> ReapStats;
 }
 
 /// Capacity backstop on the number of rooms an [`InMemoryRoomStore`] holds.
@@ -607,6 +659,7 @@ impl RoomStore for InMemoryRoomStore {
             joined_at: now,
             token: token.clone(),
             token_expires_at: now + token_ttl,
+            last_seen_at: now,
         };
         // The stored record is the single source of truth for the advisory
         // expiry surfaced in the join response.
@@ -656,24 +709,155 @@ impl RoomStore for InMemoryRoomStore {
         room_id: &str,
         auth_token: &str,
     ) -> Result<RoomSnapshot, RoomError> {
-        let rooms = self.rooms.read().expect("room store lock poisoned");
+        // A write lock (not a shared read) because a successful member read
+        // doubles as the liveness signal: it refreshes the matching
+        // participant's `last_seen_at`, so an actively-polling participant is
+        // never reclaimed by the idle reaper. Contention is negligible (≤ 6
+        // seats per room), so serializing roster reads costs nothing here.
+        let mut rooms = self.rooms.write().expect("room store lock poisoned");
         let room = rooms
-            .get(&(namespace.to_owned(), room_id.to_owned()))
+            .get_mut(&(namespace.to_owned(), room_id.to_owned()))
             .ok_or(RoomError::RoomNotFound)?;
         // Member-gate, fail-closed: a caller whose token matches no current
         // member gets the same `RoomNotFound` as a nonexistent room, so a
-        // non-member cannot probe room existence or their own membership.
-        if !room
-            .participants
-            .values()
-            .any(|participant| participant.verify_token(auth_token))
-        {
+        // non-member cannot probe room existence or their own membership. On a
+        // match, touch that member's liveness clock (see `reap_stale`).
+        let now = Utc::now();
+        let mut is_member = false;
+        for participant in room.participants.values_mut() {
+            if participant.verify_token(auth_token) {
+                participant.last_seen_at = now;
+                is_member = true;
+                break;
+            }
+        }
+        if !is_member {
             return Err(RoomError::RoomNotFound);
         }
         let snapshot = room.snapshot();
         drop(rooms);
         Ok(snapshot)
     }
+
+    fn reap_stale(&self, now: DateTime<Utc>, idle_ttl: Duration) -> ReapStats {
+        let mut stats = ReapStats::default();
+        let mut rooms = self.rooms.write().expect("room store lock poisoned");
+        // `retain` keys strictly on the `(namespace, room_id)` map and mutates
+        // each room in place, so state never moves between namespaces —
+        // tenant isolation is preserved by construction.
+        rooms.retain(|_key, room| {
+            let before = room.participants.len();
+            // Evict any participant idle past the horizon (last observed —
+            // via join or a roster poll — more than `idle_ttl` ago).
+            room.participants.retain(|_id, participant| {
+                now.signed_duration_since(participant.last_seen_at) < idle_ttl
+            });
+            let reaped = before - room.participants.len();
+            stats.participants_reaped += reaped;
+            if room.participants.is_empty() {
+                // Drop the room when it (a) just emptied via reaping, or (b) is
+                // a created-never-joined room that has lingered past the idle
+                // TTL. Gating (b) on `created_at` age avoids reaping a room in
+                // the brief create→first-join window. Dropping an empty room can
+                // never harm a live participant.
+                let drop_room =
+                    reaped > 0 || now.signed_duration_since(room.created_at) >= idle_ttl;
+                if drop_room {
+                    stats.rooms_reaped += 1;
+                    return false;
+                }
+            }
+            true
+        });
+        stats
+    }
+}
+
+// ── Idle-room / stale-participant reaper loop ─────────────────────────────────
+
+/// Default seconds between reaper sweeps.
+const ROOM_REAPER_INTERVAL_SECONDS: u64 = 60;
+
+/// Default participant idle TTL (and empty-room grace), in seconds.
+///
+/// 15 minutes — deliberately generous. The default room token TTL is only 300s
+/// (5 min), and a live client re-polls the member-gated roster every few seconds
+/// for peer discovery, refreshing its `last_seen_at`; 15 min is 3× the token TTL
+/// and far longer than any reasonable poll cadence, so an actively-connected
+/// participant is never reclaimed — only a client that has stopped polling for a
+/// full 15 minutes (crashed / abandoned / never sent leave) ages out.
+const ROOM_IDLE_TTL_SECONDS: u64 = 900;
+
+/// Upper bound (10 years, in seconds) applied to the reaper idle-TTL before it
+/// is turned into a [`chrono::Duration`]. `chrono::Duration::seconds` panics on
+/// values that overflow its internal millisecond representation, so a hostile /
+/// fat-fingered `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS` is clamped here rather
+/// than crashing the reaper spawn.
+const MAX_REAPER_TTL_SECONDS: i64 = 315_360_000;
+
+/// Read a positive `u64` from `key`, falling back to `default` on
+/// unset / blank / unparseable / zero. Keeps the reaper tunable without
+/// threading a field through `MediaConfig` (a documented follow-up).
+fn env_positive_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default)
+}
+
+/// Clamp a raw idle-TTL seconds value into a chrono [`Duration`].
+///
+/// `chrono::Duration::seconds` panics on values that overflow its internal
+/// higher-precision (millisecond) representation, so a hostile / fat-fingered
+/// `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS` (up to `u64::MAX`) is clamped to
+/// [`MAX_REAPER_TTL_SECONDS`] rather than crashing the reaper spawn.
+fn clamp_reaper_ttl(idle_ttl_secs: u64) -> Duration {
+    Duration::seconds(
+        i64::try_from(idle_ttl_secs)
+            .unwrap_or(MAX_REAPER_TTL_SECONDS)
+            .min(MAX_REAPER_TTL_SECONDS),
+    )
+}
+
+/// Spawn the background idle-room / stale-participant reaper for `store`.
+///
+/// Ticks every `AUTUMN_MEDIA__ROOM_REAPER_INTERVAL_SECONDS` (default
+/// [`ROOM_REAPER_INTERVAL_SECONDS`], 60s) and reclaims participants/rooms idle
+/// past `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS` (default [`ROOM_IDLE_TTL_SECONDS`],
+/// 900s). Both env overrides fall back to their default on an unset / blank /
+/// unparseable / zero value. Mirrors
+/// [`spawn_retention_sweep_loop`](crate::retention::spawn_retention_sweep_loop):
+/// `tokio::spawn` + `tokio::time::interval` with `MissedTickBehavior::Skip`, one
+/// independent tick each period, never panics. The clock is read per tick and
+/// handed to the deterministically-testable [`RoomStore::reap_stale`].
+///
+/// Promoting the interval / idle-TTL knobs to `MediaConfig` is a documented
+/// follow-up; they live as env-overridable constants here to keep this hardening
+/// slice out of the config-load surface.
+pub fn spawn_room_reaper_loop(store: Arc<dyn RoomStore>) {
+    let interval_secs = env_positive_u64(
+        "AUTUMN_MEDIA__ROOM_REAPER_INTERVAL_SECONDS",
+        ROOM_REAPER_INTERVAL_SECONDS,
+    );
+    let idle_ttl_secs =
+        env_positive_u64("AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS", ROOM_IDLE_TTL_SECONDS);
+    let idle_ttl = clamp_reaper_ttl(idle_ttl_secs);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let stats = store.reap_stale(Utc::now(), idle_ttl);
+            if stats.rooms_reaped > 0 || stats.participants_reaped > 0 {
+                tracing::info!(
+                    rooms_reaped = stats.rooms_reaped,
+                    participants_reaped = stats.participants_reaped,
+                    "media rooms: reaped stale participants / idle rooms"
+                );
+            }
+        }
+    });
 }
 
 // ── Service (URL composition + AppState extension) ────────────────────────────
@@ -1058,16 +1242,18 @@ fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        InMemoryRoomStore, JoinRequest, LeaveRequest, RoomError, RoomService, RoomStore,
-        SessionToken, bearer_token, room_participant_path, room_route_infos, rooms_create,
-        rooms_join, rooms_roster, validate_room_segment,
+        InMemoryRoomStore, JoinRequest, LeaveRequest, MAX_REAPER_TTL_SECONDS, ReapStats, Room,
+        RoomError, RoomParticipant, RoomService, RoomStore, SessionToken, bearer_token,
+        clamp_reaper_ttl, room_participant_path, room_route_infos, rooms_create, rooms_join,
+        rooms_roster, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
     use autumn_web::AppState;
     use autumn_web::reexports::axum::extract::{Path, State};
     use autumn_web::reexports::http::HeaderMap;
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, Utc};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     // ── Fixtures ─────────────────────────────────────────────────────────────
@@ -1084,6 +1270,21 @@ mod tests {
             Duration::seconds(300),
             6,
         )
+    }
+
+    // ── Reaper TTL clamp ─────────────────────────────────────────────────────
+
+    #[test]
+    fn reaper_ttl_clamps_overflowing_value_without_panicking() {
+        // A sane operator value passes through unchanged.
+        assert_eq!(clamp_reaper_ttl(900), Duration::seconds(900));
+        // A hostile / fat-fingered value that would overflow
+        // `chrono::Duration::seconds`'s internal millisecond representation is
+        // clamped to the 10-year maximum instead of panicking.
+        assert_eq!(
+            clamp_reaper_ttl(u64::MAX),
+            Duration::seconds(MAX_REAPER_TTL_SECONDS)
+        );
     }
 
     // ── Segment guard ────────────────────────────────────────────────────────
@@ -1359,6 +1560,7 @@ mod tests {
             joined_at: now,
             token: SessionToken("secret-token-value".to_owned()),
             token_expires_at: now - Duration::seconds(1),
+            last_seen_at: now,
         };
         assert!(
             participant.verify_token("secret-token-value"),
@@ -1634,5 +1836,245 @@ mod tests {
     /// Wrap a value in an axum `Json` extractor for direct handler calls.
     fn axum_json<T>(value: T) -> autumn_web::reexports::axum::Json<T> {
         autumn_web::reexports::axum::Json(value)
+    }
+
+    // ── Idle-room / stale-participant reaper ─────────────────────────────────
+    //
+    // The reaper keys on each participant's `last_seen_at` and each room's
+    // `created_at` against an INJECTED `now`, so these tests build store state
+    // with explicit timestamps (mirroring how `retention.rs` controls file
+    // mtimes) and never touch the wall clock in the assertion — fully
+    // deterministic, no sleeps. Constructing the private `Room` /
+    // `RoomParticipant` from the child test module follows the existing
+    // `participant_verify_token_*` test's precedent.
+
+    /// Insert a room with explicit `created_at` and `(participant_id, token,
+    /// last_seen_at)` seats directly into the store registry.
+    fn seed_room(
+        store: &InMemoryRoomStore,
+        namespace: &str,
+        room_id: &str,
+        created_at: DateTime<Utc>,
+        seats: &[(&str, &str, DateTime<Utc>)],
+    ) {
+        let mut participants = HashMap::new();
+        for (id, token, last_seen_at) in seats {
+            participants.insert(
+                (*id).to_owned(),
+                RoomParticipant {
+                    id: (*id).to_owned(),
+                    display_name: None,
+                    joined_at: *last_seen_at,
+                    token: SessionToken((*token).to_owned()),
+                    token_expires_at: *last_seen_at,
+                    last_seen_at: *last_seen_at,
+                },
+            );
+        }
+        store.rooms.write().unwrap().insert(
+            (namespace.to_owned(), room_id.to_owned()),
+            Room {
+                id: room_id.to_owned(),
+                namespace: namespace.to_owned(),
+                max_participants: 6,
+                created_at,
+                participants,
+            },
+        );
+    }
+
+    /// The current participant count for a room, or `None` if the room is gone.
+    fn seat_count(store: &InMemoryRoomStore, namespace: &str, room_id: &str) -> Option<usize> {
+        store
+            .rooms
+            .read()
+            .unwrap()
+            .get(&(namespace.to_owned(), room_id.to_owned()))
+            .map(|room| room.participants.len())
+    }
+
+    #[test]
+    fn reap_evicts_stale_participant_but_keeps_a_fresh_one_and_the_room() {
+        // (a) + (b): a participant past the horizon is evicted while a fresh
+        // co-tenant is kept, and the room (still non-empty) survives.
+        let store = InMemoryRoomStore::new(6);
+        let now = Utc::now();
+        let ttl = Duration::minutes(30);
+        seed_room(
+            &store,
+            "",
+            "room-1",
+            now - Duration::hours(2),
+            &[
+                ("stale", "tok-stale", now - Duration::hours(1)),
+                ("fresh", "tok-fresh", now - Duration::minutes(5)),
+            ],
+        );
+
+        let stats = store.reap_stale(now, ttl);
+
+        assert_eq!(stats.participants_reaped, 1);
+        assert_eq!(stats.rooms_reaped, 0);
+        assert_eq!(seat_count(&store, "", "room-1"), Some(1));
+        // The kept seat is the fresh one.
+        assert!(store.roster("", "room-1", "tok-fresh").is_ok());
+        assert!(matches!(
+            store.roster("", "room-1", "tok-stale"),
+            Err(RoomError::RoomNotFound)
+        ));
+    }
+
+    #[test]
+    fn reap_drops_a_room_emptied_by_reaping() {
+        // (c): a room whose only participant ages out is dropped.
+        let store = InMemoryRoomStore::new(6);
+        let now = Utc::now();
+        seed_room(
+            &store,
+            "",
+            "room-1",
+            now - Duration::hours(2),
+            &[("stale", "tok", now - Duration::hours(1))],
+        );
+
+        let stats = store.reap_stale(now, Duration::minutes(30));
+
+        assert_eq!(stats.participants_reaped, 1);
+        assert_eq!(stats.rooms_reaped, 1);
+        assert_eq!(
+            seat_count(&store, "", "room-1"),
+            None,
+            "emptied room dropped"
+        );
+    }
+
+    #[test]
+    fn reap_drops_created_never_joined_room_past_ttl_but_keeps_a_fresh_empty_room() {
+        // (d): an empty (created-never-joined) room lingering past the idle TTL
+        // is dropped; a freshly-created empty room within the TTL is kept (so a
+        // room in the create→first-join window is never reaped out from under a
+        // joiner).
+        let store = InMemoryRoomStore::new(6);
+        let now = Utc::now();
+        let ttl = Duration::minutes(30);
+        seed_room(&store, "", "old-empty", now - Duration::hours(1), &[]);
+        seed_room(&store, "", "new-empty", now - Duration::minutes(5), &[]);
+
+        let stats = store.reap_stale(now, ttl);
+
+        assert_eq!(stats.rooms_reaped, 1);
+        assert_eq!(stats.participants_reaped, 0);
+        assert_eq!(
+            seat_count(&store, "", "old-empty"),
+            None,
+            "lingering empty room dropped"
+        );
+        assert_eq!(
+            seat_count(&store, "", "new-empty"),
+            Some(0),
+            "a just-created empty room within the TTL survives"
+        );
+    }
+
+    #[test]
+    fn reap_never_crosses_namespaces() {
+        // (e): reaping a stale room in namespace "a" leaves an identically-named
+        // fresh room in namespace "b" untouched — tenant isolation holds.
+        let store = InMemoryRoomStore::new(6);
+        let now = Utc::now();
+        let ttl = Duration::minutes(30);
+        seed_room(
+            &store,
+            "a",
+            "shared-id",
+            now - Duration::hours(2),
+            &[("stale", "tok-a", now - Duration::hours(1))],
+        );
+        seed_room(
+            &store,
+            "b",
+            "shared-id",
+            now - Duration::minutes(1),
+            &[("fresh", "tok-b", now - Duration::minutes(1))],
+        );
+
+        let stats = store.reap_stale(now, ttl);
+
+        assert_eq!(stats.rooms_reaped, 1);
+        assert_eq!(stats.participants_reaped, 1);
+        assert_eq!(
+            seat_count(&store, "a", "shared-id"),
+            None,
+            "ns a room reaped"
+        );
+        assert_eq!(
+            seat_count(&store, "b", "shared-id"),
+            Some(1),
+            "same room_id in ns b is untouched"
+        );
+    }
+
+    #[test]
+    fn reap_on_a_clean_store_is_a_zero_count_no_op() {
+        // (f): nothing to reap → default (all-zero) stats, no state change.
+        let store = InMemoryRoomStore::new(6);
+        let now = Utc::now();
+        seed_room(
+            &store,
+            "",
+            "room-1",
+            now - Duration::minutes(1),
+            &[("fresh", "tok", now - Duration::minutes(1))],
+        );
+
+        let stats = store.reap_stale(now, Duration::minutes(30));
+
+        assert_eq!(stats, ReapStats::default());
+        assert_eq!(seat_count(&store, "", "room-1"), Some(1));
+
+        // And a truly empty store is likewise a no-op.
+        let empty = InMemoryRoomStore::new(6);
+        assert_eq!(
+            empty.reap_stale(Utc::now(), Duration::minutes(30)),
+            ReapStats::default()
+        );
+    }
+
+    #[test]
+    fn roster_poll_refreshes_last_seen_so_an_active_participant_survives_a_sweep() {
+        // Liveness touch: a participant that would otherwise be reaped survives
+        // because it polled the member-gated roster. Both seats start stale
+        // (last_seen an hour ago); polling the roster with A's token refreshes
+        // A's `last_seen_at` to *now*, so a reap at *now* keeps A and evicts B.
+        let store = InMemoryRoomStore::new(6);
+        let stale = Utc::now() - Duration::hours(1);
+        seed_room(
+            &store,
+            "",
+            "room-1",
+            Utc::now() - Duration::hours(2),
+            &[("active", "tok-a", stale), ("idle", "tok-b", stale)],
+        );
+
+        // A polls the roster — this is the liveness signal.
+        assert!(store.roster("", "room-1", "tok-a").is_ok());
+
+        // Reap as of now with a 30-minute TTL: A was just touched (fresh), B is
+        // still an hour idle (stale).
+        let stats = store.reap_stale(Utc::now(), Duration::minutes(30));
+
+        assert_eq!(
+            stats.participants_reaped, 1,
+            "only the un-polled seat is reaped"
+        );
+        assert_eq!(stats.rooms_reaped, 0);
+        assert!(
+            store.roster("", "room-1", "tok-a").is_ok(),
+            "the actively-polling participant survived the sweep"
+        );
+        assert!(matches!(
+            store.roster("", "room-1", "tok-b"),
+            Err(RoomError::RoomNotFound)
+        ));
     }
 }

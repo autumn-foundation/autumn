@@ -66,9 +66,9 @@ pub use retention::{
 };
 pub use rooms::{
     InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse, LeaveRequest, ParticipantView,
-    PublishTarget, RoomError, RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore,
+    PublishTarget, ReapStats, RoomError, RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore,
     SessionToken, SubscribeTarget, room_participant_path, room_route_infos, room_router,
-    validate_room_segment,
+    spawn_room_reaper_loop, validate_room_segment,
 };
 pub use sink::{
     MediaArtifact, MediaArtifactFile, MediaArtifactKind, MediaArtifactSink, MediaArtifactSinkExt,
@@ -104,9 +104,9 @@ pub mod prelude {
         newest_recording_files_since, recording_segments_covering_window, slugify,
     };
     pub use crate::{
-        InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, RoomError, RoomService,
-        RoomSnapshot, RoomStore, SessionToken, room_participant_path, room_route_infos,
-        room_router, validate_room_segment,
+        InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, ReapStats, RoomError,
+        RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
+        room_route_infos, room_router, spawn_room_reaper_loop, validate_room_segment,
     };
     pub use crate::{
         IngestStatus, MediaMtxClient, MediaUrls, StreamQualityStats, StreamStatus, ViewerCount,
@@ -370,6 +370,10 @@ impl Plugin for MediaPlugin {
     /// `server.strict_config = true` boots without core rejecting `[media]` as
     /// an unknown key, then mounts the room/broadcast routers, installs the
     /// service extensions, and spawns the retention/background loops.
+    // `build` is a long, linear plugin-assembly routine (config validation,
+    // room wiring + reaper, storage/workflow install, retention loop); it reads
+    // best as one top-to-bottom sequence rather than fragmented across helpers.
+    #[allow(clippy::too_many_lines)]
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
             config,
@@ -419,9 +423,17 @@ impl Plugin for MediaPlugin {
         // via the same `on_startup` abort but its own specific message.
         // The storage backend keeps its own degrade path below (unchanged), so
         // this only fails fast on the room cap and room namespace.
-        if let Some(message) = room_max_participants_error(room_max_participants)
-            .or_else(|| room_namespace_error(config.room_namespace.as_deref()))
-        {
+        //
+        // Gated on `enable_rooms`: a broadcast-only plugin (`with_broadcast()`
+        // without `with_rooms()`) mounts no room router / `RoomService`, so a
+        // stray/irrelevant room setting — or a room env override — must never
+        // abort boot and take the broadcast path down with it. The rooms path
+        // keeps the existing fail-fast (see `room_config_boot_error`).
+        if let Some(message) = room_config_boot_error(
+            enable_rooms,
+            room_max_participants,
+            config.room_namespace.as_deref(),
+        ) {
             tracing::error!(
                 room_max_participants,
                 ceiling = DEFAULT_ROOM_MAX_PARTICIPANTS,
@@ -453,8 +465,12 @@ impl Plugin for MediaPlugin {
         // served and audit-visible under `api_prefix`.
         let mut app = app;
         if enable_rooms {
+            // Hold a handle to the store so the idle-room / stale-participant
+            // reaper can sweep the same registry the `RoomService` serves.
+            let room_store: Arc<dyn rooms::RoomStore> =
+                Arc::new(rooms::InMemoryRoomStore::new(room_max_participants));
             let room_service = rooms::RoomService::new(
-                Arc::new(rooms::InMemoryRoomStore::new(room_max_participants)),
+                room_store.clone(),
                 transport::MediaUrls::from_config(&config.mediamtx),
                 config.room_namespace.clone().unwrap_or_default(),
                 chrono::Duration::seconds(i64::from(config.room_token_ttl_seconds)),
@@ -465,6 +481,15 @@ impl Plugin for MediaPlugin {
                 .declare_plugin_routes(rooms::room_route_infos(&api_prefix))
                 .state_initializer(move |state| {
                     state.insert_extension(room_service);
+                })
+                // Spawn from `on_startup` so the reaper shares the running app's
+                // tokio runtime (matching the retention sweep below).
+                .on_startup(move |_state| {
+                    let store = room_store.clone();
+                    async move {
+                        rooms::spawn_room_reaper_loop(store);
+                        Ok(())
+                    }
                 });
         }
 
@@ -569,6 +594,32 @@ fn room_namespace_error(namespace: Option<&str>) -> Option<String> {
     Some(format!(
         "media.room_namespace {ns:?} is not a valid room path segment: use only ASCII letters, digits, '_' or '-' (no '/', '.', or empty)"
     ))
+}
+
+/// Resolve the fail-fast boot error for room configuration, gated on rooms
+/// actually being enabled.
+///
+/// Room config (the `room_max_participants` seat count and the
+/// `room_namespace` path segment) is only load-bearing when a room router /
+/// [`rooms::RoomService`] is mounted — i.e. when `enable_rooms` is true. A
+/// broadcast-only plugin (`with_broadcast()` without `with_rooms()`) serves no
+/// room requests, so an out-of-range `room_max_participants` or an invalid
+/// `room_namespace` (e.g. a stray value or a `media.room_namespace` env
+/// override) is inert and must **not** abort boot — otherwise an irrelevant
+/// room setting becomes a full broadcast outage. When `enable_rooms` is false
+/// this returns `None` unconditionally; when it is true the existing
+/// [`room_max_participants_error`] / [`room_namespace_error`] fail-fast checks
+/// apply exactly as before.
+fn room_config_boot_error(
+    enable_rooms: bool,
+    room_max_participants: usize,
+    room_namespace: Option<&str>,
+) -> Option<String> {
+    if !enable_rooms {
+        return None;
+    }
+    room_max_participants_error(room_max_participants)
+        .or_else(|| room_namespace_error(room_namespace))
 }
 
 /// Recordings root an Arroyo deployment uses when `ARROYO_RECORDINGS_ROOT` is
@@ -796,6 +847,52 @@ mod room_namespace_tests {
         let ok = MediaPlugin::new().with_rooms().room_namespace("tenant-a");
         assert_eq!(ok.config.room_namespace.as_deref(), Some("tenant-a"));
         assert!(room_namespace_error(ok.config.room_namespace.as_deref()).is_none());
+    }
+}
+
+// ── Room-config fail-fast gated on rooms being enabled (Codex P2) ────────────
+//
+// The boot-time room-config abort must be conditional on `enable_rooms`: a
+// broadcast-only plugin mounts no room router / `RoomService`, so a stray or
+// invalid room setting (an out-of-range `room_max_participants`, a bad
+// `room_namespace` env override) is inert and must never abort boot and take
+// the broadcast path down with it. Rooms-enabled keeps the existing fail-fast.
+
+#[cfg(test)]
+mod room_config_gate_tests {
+    use super::{MediaPlugin, room_config_boot_error};
+
+    #[test]
+    fn broadcast_only_ignores_invalid_room_config() {
+        // `with_broadcast()` without `with_rooms()` → rooms disabled. An invalid
+        // room cap (0) or namespace ("bad/ns") is irrelevant and must NOT abort
+        // boot, so no failing startup hook is installed and broadcast stays up.
+        assert!(!MediaPlugin::new().with_broadcast().enable_rooms);
+        assert!(room_config_boot_error(false, 0, None).is_none());
+        assert!(room_config_boot_error(false, 50, Some("bad/ns")).is_none());
+        assert!(room_config_boot_error(false, 4, Some("tenant-a")).is_none());
+    }
+
+    #[test]
+    fn rooms_enabled_still_fails_fast_on_invalid_room_config() {
+        // `with_rooms()` → rooms enabled. The same invalid settings that a
+        // broadcast-only plugin ignores must still abort boot on the rooms path,
+        // preserving the pre-existing fail-fast (naming the offending value).
+        assert!(MediaPlugin::new().with_rooms().enable_rooms);
+
+        let bad_cap = room_config_boot_error(true, 0, None)
+            .expect("rooms-enabled must fail fast on room_max_participants = 0");
+        assert!(bad_cap.contains('0'), "names the offending cap: {bad_cap}");
+
+        let bad_ns = room_config_boot_error(true, 4, Some("bad/ns"))
+            .expect("rooms-enabled must fail fast on an invalid room_namespace");
+        assert!(
+            bad_ns.contains("bad/ns"),
+            "names the offending namespace: {bad_ns}"
+        );
+
+        // A valid room config on the rooms path boots cleanly (no abort).
+        assert!(room_config_boot_error(true, 4, Some("tenant-a")).is_none());
     }
 }
 
