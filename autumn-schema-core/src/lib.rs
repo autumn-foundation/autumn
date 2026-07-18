@@ -314,10 +314,14 @@ impl ColumnType {
     /// 1. [`from_pg_udt`](Self::from_pg_udt) — the shared mapped surface
     ///    (`text`/`int4`/`int8`/`bool`/`float4`/`float8`/`uuid`/`timestamp`/
     ///    `timestamptz`/`bytea`).
-    /// 2. `numeric` / `decimal` **with** a precision (and scale) available →
-    ///    [`Decimal`](Self::Decimal). A bare `numeric` with no precision carries
-    ///    no `(p, s)` to reconstruct, so it falls through to `Opaque` rather than
-    ///    guessing.
+    /// 2. `numeric` / `decimal` **with** an in-`u8`-range precision (and scale)
+    ///    available → [`Decimal`](Self::Decimal). A bare `numeric` with no
+    ///    precision carries no `(p, s)` to reconstruct, so it falls through to
+    ///    `Opaque` rather than guessing; and an out-of-range precision/scale (a
+    ///    valid Postgres `NUMERIC(1000, 0)` or a negative scale that does not fit
+    ///    the `u8` fields) is likewise preserved as [`Opaque`](Self::Opaque) with a
+    ///    faithfully-reconstructed `numeric(...)` type string rather than silently
+    ///    clamped to `NUMERIC(255, 0)`.
     /// 3. `jsonb` → [`Attachment`](Self::Attachment). Autumn only ever emits
     ///    `jsonb` for an [`Attachment`](Self::Attachment) column, so a pulled
     ///    `jsonb` column is round-tripped as an attachment. (This is the
@@ -341,11 +345,23 @@ impl ColumnType {
         if matches!(udt, "numeric" | "decimal")
             && let Some(precision) = numeric_precision
         {
-            let precision = u8::try_from(precision).unwrap_or(u8::MAX);
-            let scale = numeric_scale
-                .and_then(|s| u8::try_from(s).ok())
-                .unwrap_or(0);
-            return Self::Decimal { precision, scale };
+            // Map to `Decimal` ONLY when both precision and scale fit the `u8`
+            // fields — never silently clamp an out-of-range `NUMERIC(1000, 0)` (or
+            // a negative/oversized scale) down to `NUMERIC(255, 0)`. An out-of-
+            // range value is instead preserved as `Opaque` with a faithfully-
+            // reconstructed type string, so the down migration re-adds the true
+            // type verbatim (`Opaque`'s `sql_type` emits `pg_type` unchanged).
+            let precision_u8 = u8::try_from(precision).ok().filter(|&p| p >= 1);
+            let scale_u8 = numeric_scale.map_or(Some(0), |scale| u8::try_from(scale).ok());
+            if let (Some(precision), Some(scale)) = (precision_u8, scale_u8) {
+                return Self::Decimal { precision, scale };
+            }
+            return Self::Opaque {
+                pg_type: match numeric_scale {
+                    None | Some(0) => format!("numeric({precision})"),
+                    Some(scale) => format!("numeric({precision},{scale})"),
+                },
+            };
         }
         if udt == "jsonb" {
             return Self::Attachment;
@@ -924,6 +940,41 @@ mod tests {
             ColumnType::from_pg_introspection("numeric", None, None),
             ColumnType::Opaque {
                 pg_type: "numeric".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn from_pg_introspection_out_of_range_numeric_is_opaque_not_clamped() {
+        // A valid Postgres `NUMERIC(1000, 0)` does not fit the `u8` Decimal fields;
+        // it must be preserved as `Opaque` carrying the true type string, NOT
+        // silently clamped to `NUMERIC(255, 0)`.
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", Some(1000), Some(0)),
+            ColumnType::Opaque {
+                pg_type: "numeric(1000)".to_owned()
+            }
+        );
+        // An out-of-range precision with a non-zero scale keeps both.
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", Some(1000), Some(500)),
+            ColumnType::Opaque {
+                pg_type: "numeric(1000,500)".to_owned()
+            }
+        );
+        // A negative scale does not fit `u8` → preserved verbatim, not clamped.
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", Some(10), Some(-2)),
+            ColumnType::Opaque {
+                pg_type: "numeric(10,-2)".to_owned()
+            }
+        );
+        // In-range values are unaffected (round-trip parity).
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", Some(12), Some(2)),
+            ColumnType::Decimal {
+                precision: 12,
+                scale: 2
             }
         );
     }
