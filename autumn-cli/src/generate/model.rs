@@ -260,7 +260,7 @@ pub fn plan_model_with_options(
         (up_sql, drop_table_sql(&table))
     } else {
         let language = metadata.search_language().unwrap_or("english");
-        let search_up = add_search_up_sql_for(backend, &table, language, metadata.searchable());
+        let search_up = add_search_up_sql_for(backend, &table, language, metadata.searchable())?;
         let search_down = add_search_down_sql_for(backend, &table);
         (
             format!("{up_sql}\n{search_up}"),

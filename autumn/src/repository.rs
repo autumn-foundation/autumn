@@ -565,11 +565,10 @@ pub trait AutumnSearchableModel {
 /// never an unfiltered scan.
 #[must_use]
 pub fn sqlite_fts5_match_query(input: &str) -> Option<String> {
-    let mut out = String::new();
+    // Worst case (no embedded quotes to double): every byte kept plus the two
+    // surrounding quotes of a single token — pre-size to avoid reallocation.
+    let mut out = String::with_capacity(input.len() + 2);
     for token in input.split_whitespace() {
-        if token.is_empty() {
-            continue;
-        }
         if !out.is_empty() {
             out.push(' ');
         }

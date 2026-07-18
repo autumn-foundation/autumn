@@ -3760,15 +3760,26 @@ fn is_section_boundary(trimmed: &str, section: &str) -> bool {
 ///   `language` is unused on that arm (it selects the tokenizer, not a Postgres
 ///   text-search dictionary). The generated repository (`#[repository(...,
 ///   searchable)]`) queries this table with `MATCH` + `bm25()` ranking.
-#[must_use]
+///
+/// # Errors
+/// On the `SQLite` arm, returns [`GenerateError::Config`] when a `#[searchable]`
+/// field uses an FTS5-reserved column name (`rowid`/`rank`, or one colliding
+/// with the generated `<table>__fts` table) — `SQLite` would otherwise reject
+/// the generated `CREATE VIRTUAL TABLE … fts5(…)` only at `autumn migrate` time.
+/// The Postgres arm never errors.
 pub fn add_search_up_sql_for(
     backend: DatabaseBackend,
     table: &str,
     language: &str,
     fields: &[(String, char)],
-) -> String {
+) -> Result<String, GenerateError> {
     match backend {
-        DatabaseBackend::Sqlite => sqlite_add_search_up_sql(table, fields),
+        DatabaseBackend::Sqlite => {
+            // FTS5 rejects reserved indexed-column names at migrate time; catch
+            // them at generate time instead (issue #1910, epic #1614 AC #4).
+            reject_reserved_sqlite_search_columns(table, fields)?;
+            Ok(sqlite_add_search_up_sql(table, fields))
+        }
         DatabaseBackend::Postgres => {
             let mut out = String::new();
             let _ = writeln!(
@@ -3806,9 +3817,64 @@ pub fn add_search_up_sql_for(
                 out,
                 "CREATE INDEX idx_{table}_search_vector ON {table} USING gin(search_vector);"
             );
-            out
+            Ok(out)
         }
     }
+}
+
+/// True iff `column` is a name FTS5 forbids for an indexed column of the
+/// generated `<table>__fts` external-content table (issue #1910).
+///
+/// FTS5 reserves the column names `rowid` and `rank` (the auto rowid alias and
+/// the ranking pseudo-column) and forbids a column named the same as the FTS
+/// table itself (that identifier is the table's special "command" column). All
+/// three are matched **case-insensitively** — `SQLite` rejects `RANK`/`RowId`
+/// exactly as `rank`/`rowid`. Quoting the identifier does **not** help: these
+/// are special FTS5 names, not merely SQL keywords, so `SQLite` returns a
+/// `reserved fts5 column name` error (or a `vtable constructor failed` error
+/// for the self-collision) at `CREATE VIRTUAL TABLE` time.
+#[must_use]
+fn is_fts5_reserved_search_column(column: &str, fts_table: &str) -> bool {
+    column.eq_ignore_ascii_case("rowid")
+        || column.eq_ignore_ascii_case("rank")
+        || column.eq_ignore_ascii_case(fts_table)
+}
+
+/// Reject, at generate time, a `#[searchable]` field whose column name FTS5
+/// reserves as an indexed column on the `SQLite` backend (issue #1910; epic
+/// #1614 AC #4 "map or reject-at-generate").
+///
+/// Now that the `SQLite` search arm emits real `CREATE VIRTUAL TABLE
+/// "<table>__fts" USING fts5(<cols>, …)` DDL, a model that marks a text field
+/// named `rank`/`rowid` (or one colliding with the `<table>__fts` name) as
+/// `#[searchable]` would generate DDL that only fails at `autumn migrate` time
+/// with a `reserved fts5 column name` error. Catch it here with an actionable
+/// message naming the offending field instead. The Postgres path is unaffected
+/// (its `search_vector` generated column indexes the same fields with no such
+/// reservation), so this guard is `SQLite`-only by construction — it is called
+/// solely from the `SQLite` arm of [`add_search_up_sql_for`].
+///
+/// # Errors
+/// Returns [`GenerateError::Config`] on the first offending field.
+fn reject_reserved_sqlite_search_columns(
+    table: &str,
+    fields: &[(String, char)],
+) -> Result<(), GenerateError> {
+    let fts_table = format!("{table}__fts");
+    for (field, _) in fields {
+        if is_fts5_reserved_search_column(field, &fts_table) {
+            return Err(GenerateError::Config(format!(
+                "the #[searchable] field '{field}' on table '{table}' uses an FTS5-reserved \
+                 column name: SQLite would reject the generated `CREATE VIRTUAL TABLE \
+                 \"{fts_table}\" USING fts5(...)` search index because FTS5 reserves the column \
+                 names `rowid` and `rank` and forbids a column named the same as the FTS table \
+                 (`{fts_table}`) — matched case-insensitively, and quoting the identifier does \
+                 not help. Rename the field, or drop #[searchable] from it, to generate SQLite \
+                 FTS5 search. (Postgres full-text search is unaffected.)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Backend-aware `down.sql` companion to [`add_search_up_sql_for`].
@@ -7360,7 +7426,8 @@ pub struct Post {
             "posts",
             "english",
             &[("title".to_string(), 'A'), ("body".to_string(), 'B')],
-        );
+        )
+        .expect("postgres search DDL never errors");
         assert!(sql.contains("coalesce(\"title\"::text, '')"));
         assert!(sql.contains("coalesce(\"body\"::text, '')"));
     }
@@ -7375,7 +7442,8 @@ pub struct Post {
             "posts",
             "english",
             &[("title".to_string(), 'A'), ("body".to_string(), 'B')],
-        );
+        )
+        .expect("valid searchable columns generate FTS5 DDL");
         assert!(
             up.contains(
                 "CREATE VIRTUAL TABLE \"posts__fts\" USING fts5(\"title\", \"body\", \
@@ -7425,6 +7493,57 @@ pub struct Post {
     }
 
     #[test]
+    fn test_add_search_up_sql_sqlite_rejects_fts5_reserved_column_names() {
+        // #1910 / #1614 AC #4: FTS5 reserves `rowid`/`rank` (and forbids a column
+        // named the same as the `<table>__fts` table). A #[searchable] field with
+        // such a name must be rejected at GENERATE time with an actionable message
+        // — not silently emitted to fail only at `autumn migrate` time. Reserved
+        // names are matched case-insensitively, and quoting does not save them.
+        for reserved in ["rowid", "rank", "RANK", "RowId", "posts__fts"] {
+            let err = add_search_up_sql_for(
+                DatabaseBackend::Sqlite,
+                "posts",
+                "english",
+                &[("title".to_string(), 'A'), (reserved.to_string(), 'B')],
+            )
+            .expect_err(&format!("reserved column `{reserved}` must be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(reserved) && msg.contains("FTS5-reserved"),
+                "message must name the offending field `{reserved}` and the reason: {msg}"
+            );
+            assert!(
+                msg.contains("Rename the field") && msg.contains("#[searchable]"),
+                "message must be actionable (rename / drop #[searchable]): {msg}"
+            );
+        }
+
+        // A normal searchable field still generates the FTS5 DDL (guard is not a
+        // blanket rejection), and Postgres never sees this reservation.
+        let up = add_search_up_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            "english",
+            &[("rank_note".to_string(), 'A'), ("body".to_string(), 'B')],
+        )
+        .expect("non-reserved columns (even `rank_note`) still generate FTS5 DDL");
+        assert!(
+            up.contains("CREATE VIRTUAL TABLE \"posts__fts\" USING fts5(\"rank_note\", \"body\", "),
+            "up: {up}"
+        );
+        // The Postgres arm indexes a field literally named `rank` with no error —
+        // the reservation is FTS5-only and must not weaken the pg path.
+        let pg = add_search_up_sql_for(
+            DatabaseBackend::Postgres,
+            "posts",
+            "english",
+            &[("rank".to_string(), 'A')],
+        )
+        .expect("postgres search DDL never errors on a `rank` column");
+        assert!(pg.contains("coalesce(\"rank\"::text, '')"), "pg: {pg}");
+    }
+
+    #[test]
     fn test_singularize_ves_plurals() {
         assert_eq!(singularize("wolves"), "wolf");
         assert_eq!(singularize("leaves"), "leaf");
@@ -7442,7 +7561,8 @@ pub struct Post {
             "posts",
             "english'; DROP TABLE posts;--",
             &[("title".to_string(), 'A')],
-        );
+        )
+        .expect("postgres search DDL never errors");
         assert!(sql.contains("to_tsvector('englishDROPTABLEposts'::regconfig"));
 
         let sql_qualified = add_search_up_sql_for(
@@ -7450,7 +7570,8 @@ pub struct Post {
             "posts",
             "pg_catalog.english",
             &[("title".to_string(), 'A')],
-        );
+        )
+        .expect("postgres search DDL never errors");
         assert!(sql_qualified.contains("to_tsvector('pg_catalog.english'::regconfig"));
     }
 

@@ -212,7 +212,7 @@ pub fn plan_migration_with_options(
             };
 
             (
-                add_search_up_sql_for(backend, table, &language, &fts_fields),
+                add_search_up_sql_for(backend, table, &language, &fts_fields)?,
                 add_search_down_sql_for(backend, table),
             )
         }
