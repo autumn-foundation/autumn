@@ -788,6 +788,13 @@ const ROOM_REAPER_INTERVAL_SECONDS: u64 = 60;
 /// full 15 minutes (crashed / abandoned / never sent leave) ages out.
 const ROOM_IDLE_TTL_SECONDS: u64 = 900;
 
+/// Upper bound (10 years, in seconds) applied to the reaper idle-TTL before it
+/// is turned into a [`chrono::Duration`]. `chrono::Duration::seconds` panics on
+/// values that overflow its internal millisecond representation, so a hostile /
+/// fat-fingered `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS` is clamped here rather
+/// than crashing the reaper spawn.
+const MAX_REAPER_TTL_SECONDS: i64 = 315_360_000;
+
 /// Read a positive `u64` from `key`, falling back to `default` on
 /// unset / blank / unparseable / zero. Keeps the reaper tunable without
 /// threading a field through `MediaConfig` (a documented follow-up).
@@ -797,6 +804,20 @@ fn env_positive_u64(key: &str, default: u64) -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(default)
+}
+
+/// Clamp a raw idle-TTL seconds value into a chrono [`Duration`].
+///
+/// `chrono::Duration::seconds` panics on values that overflow its internal
+/// higher-precision (millisecond) representation, so a hostile / fat-fingered
+/// `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS` (up to `u64::MAX`) is clamped to
+/// [`MAX_REAPER_TTL_SECONDS`] rather than crashing the reaper spawn.
+fn clamp_reaper_ttl(idle_ttl_secs: u64) -> Duration {
+    Duration::seconds(
+        i64::try_from(idle_ttl_secs)
+            .unwrap_or(MAX_REAPER_TTL_SECONDS)
+            .min(MAX_REAPER_TTL_SECONDS),
+    )
 }
 
 /// Spawn the background idle-room / stale-participant reaper for `store`.
@@ -821,10 +842,7 @@ pub fn spawn_room_reaper_loop(store: Arc<dyn RoomStore>) {
     );
     let idle_ttl_secs =
         env_positive_u64("AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS", ROOM_IDLE_TTL_SECONDS);
-    // `idle_ttl_secs` is a positive u64 ≤ a sane operator value, so the cast to
-    // the chrono `Duration` seconds (i64) never overflows in practice; clamp
-    // defensively rather than panicking.
-    let idle_ttl = Duration::seconds(i64::try_from(idle_ttl_secs).unwrap_or(i64::MAX));
+    let idle_ttl = clamp_reaper_ttl(idle_ttl_secs);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1224,9 +1242,10 @@ fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        InMemoryRoomStore, JoinRequest, LeaveRequest, ReapStats, Room, RoomError, RoomParticipant,
-        RoomService, RoomStore, SessionToken, bearer_token, room_participant_path,
-        room_route_infos, rooms_create, rooms_join, rooms_roster, validate_room_segment,
+        InMemoryRoomStore, JoinRequest, LeaveRequest, MAX_REAPER_TTL_SECONDS, ReapStats, Room,
+        RoomError, RoomParticipant, RoomService, RoomStore, SessionToken, bearer_token,
+        clamp_reaper_ttl, room_participant_path, room_route_infos, rooms_create, rooms_join,
+        rooms_roster, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
@@ -1251,6 +1270,21 @@ mod tests {
             Duration::seconds(300),
             6,
         )
+    }
+
+    // ── Reaper TTL clamp ─────────────────────────────────────────────────────
+
+    #[test]
+    fn reaper_ttl_clamps_overflowing_value_without_panicking() {
+        // A sane operator value passes through unchanged.
+        assert_eq!(clamp_reaper_ttl(900), Duration::seconds(900));
+        // A hostile / fat-fingered value that would overflow
+        // `chrono::Duration::seconds`'s internal millisecond representation is
+        // clamped to the 10-year maximum instead of panicking.
+        assert_eq!(
+            clamp_reaper_ttl(u64::MAX),
+            Duration::seconds(MAX_REAPER_TTL_SECONDS)
+        );
     }
 
     // ── Segment guard ────────────────────────────────────────────────────────

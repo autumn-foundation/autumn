@@ -610,9 +610,23 @@ async fn run_room_composite(
     // function of the resulting flags. See `probe_has_audio` for the fail-safe
     // policy (a probe failure degrades to "no audio", never a crash).
     let ffprobe_bin = resolve_ffprobe_bin(ffmpeg_bin);
-    let mut audio_present = Vec::with_capacity(source_paths.len());
-    for path in &source_paths {
-        audio_present.push(probe_has_audio(&ffprobe_bin, path).await);
+    // Probe every input concurrently rather than serializing one `ffprobe`
+    // spawn after another. The probes are independent async I/O; awaiting the
+    // handles in spawn order preserves input order so `audio_present[i]` still
+    // aligns with `source_paths[i]`. `probe_has_audio` is itself fail-safe (a
+    // probe error yields `false`), and a task-join failure (e.g. a panic)
+    // degrades to `false` the same way, so a probe outage never aborts the job.
+    let probes: Vec<_> = source_paths
+        .iter()
+        .map(|path| {
+            let ffprobe_bin = ffprobe_bin.clone();
+            let path = path.clone();
+            tokio::spawn(async move { probe_has_audio(&ffprobe_bin, &path).await })
+        })
+        .collect();
+    let mut audio_present = Vec::with_capacity(probes.len());
+    for probe in probes {
+        audio_present.push(probe.await.unwrap_or(false));
     }
     let command = FfmpegRoomCompositeCommand::new(
         ffmpeg_bin,
