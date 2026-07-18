@@ -861,7 +861,14 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
     // Ambient load (the operator's shell profile, `dev` by default): used ONLY to
     // read `[deploy]` and compute `resolved` — in particular `resolved.profile`,
     // the profile the deployed service will actually boot under (default `prod`).
-    let ambient_config = AutumnConfig::load().map_err(|e| DeployError::Config(e.to_string()))?;
+    // Lenient-unknown-roots load (#2063): the deploy CLI structurally cannot
+    // know an app's plugin set (no AppBuilder, no plugin-crate dep), so it must
+    // NOT fail-close on a plugin-owned top-level config table (e.g. `[media]`)
+    // under `strict_config`. It keeps strict validation of every core section
+    // it DOES own; app boot — which knows the plugin set via the `config_section`
+    // seam — remains the strict gate for plugin roots.
+    let ambient_config = AutumnConfig::load_lenient_unknown_roots()
+        .map_err(|e| DeployError::Config(e.to_string()))?;
     let deploy_cfg = ambient_config.deploy.unwrap_or_default();
     let resolved = ResolvedDeployConfig::resolve(&deploy_cfg, &resolve_project_name())
         .map_err(DeployError::Config)?;
@@ -1155,7 +1162,11 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 /// matching `AutumnConfig::load()`.
 fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, DeployError> {
     let forced = deploy_profile_env_overlay(&resolved.profile)?;
-    AutumnConfig::load_with_env(&forced).map_err(|e| DeployError::Config(e.to_string()))
+    // Lenient unknown top-level roots (#2063): keep strict validation of the
+    // core sections the CLI knows while accepting plugin-owned roots (e.g.
+    // `[media]`) as opaque — app boot stays the authoritative strict gate.
+    AutumnConfig::load_with_env_lenient_unknown_roots(&forced)
+        .map_err(|e| DeployError::Config(e.to_string()))
 }
 
 /// Build the profile-aware env overlay that [`load_runtime_config`] resolves the
