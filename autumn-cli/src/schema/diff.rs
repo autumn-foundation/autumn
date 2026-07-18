@@ -1185,45 +1185,19 @@ fn indexes_equivalent(a: &Index, b: &Index) -> bool {
 
 /// Whether `index` depends on column `col` — i.e. Postgres would automatically
 /// drop the index (and any constraint it backs) when `col` is dropped via
-/// `ALTER TABLE … DROP COLUMN`. True when the index lists `col` among its indexed
-/// `columns`, or when its raw `definition` references `col` as a word-bounded SQL
-/// identifier (so `email` matches `lower(email)` / `(email)` but not `emailer`).
+/// `ALTER TABLE … DROP COLUMN`. True iff `col` is in the index's `columns`.
 ///
-/// The token match on the `definition` text is a best-effort mirror of Postgres's
-/// cascade (see the introspect.rs "Deferred blind spots"): it detects the common
-/// expression/partial-index shapes without fully parsing the index expression.
-/// Both `project_plan_target` (snapshot projection) and [`emit_down_sql_pg`]
-/// (rollback restore) use this single test so they cannot drift.
+/// For a retained (`definition`-carrying) expression/partial/constraint-owned index
+/// `columns` is the **exact `pg_depend` dependent-column set** captured by
+/// introspection (key, expression-referenced, AND predicate columns — the same set
+/// Postgres cascades on a `DROP COLUMN`), so membership is an exact match rather
+/// than a `definition`-text scan (which could false-positive on a column name that
+/// merely appears in a string literal, e.g. a partial index `WHERE kind = 'email'`
+/// while dropping an unrelated `email` column). Both `project_plan_target` (snapshot
+/// projection) and [`emit_down_sql_pg`] (rollback restore) use this single test so
+/// they cannot drift.
 pub fn index_depends_on_column(index: &Index, col: &str) -> bool {
     index.columns.iter().any(|c| c == col)
-        || index
-            .definition
-            .as_deref()
-            .is_some_and(|def| sql_token_references(def, col))
-}
-
-/// Whether `haystack` contains `needle` as a word-bounded token, where a "word"
-/// character is `[A-Za-z0-9_]`. Hand-rolled (no `regex` dependency) so a column
-/// name matches `lower(email)` / `(email)` / `email DESC` but never a longer
-/// identifier such as `emailer` or `user_email`.
-fn sql_token_references(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let bytes = haystack.as_bytes();
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut from = 0;
-    while let Some(rel) = haystack[from..].find(needle) {
-        let start = from + rel;
-        let end = start + needle.len();
-        let before_ok = start == 0 || !is_word(bytes[start - 1]);
-        let after_ok = end >= bytes.len() || !is_word(bytes[end]);
-        if before_ok && after_ok {
-            return true;
-        }
-        from = start + 1;
-    }
-    false
 }
 
 ///
@@ -6730,35 +6704,47 @@ PRAGMA foreign_keys=ON;
 
     // -- Part B: rollback restores a cascade-dropped retained index ----------
 
-    /// The `index_depends_on_column` word-boundary contract: a column name matches
-    /// `columns` membership and its word-bounded appearance in an expression
-    /// `definition`, but never a longer identifier that merely contains it.
+    /// The `index_depends_on_column` contract: dependency is EXACT `columns`
+    /// membership (the introspected `pg_depend` set), never a `definition`-text
+    /// scan. A column name that merely appears in the `definition` string — e.g.
+    /// as a string literal in a partial-index predicate — is NOT a dependency, so
+    /// the projection can't wrongly prune an index Postgres actually keeps.
     #[test]
-    fn index_dependency_detection_is_word_bounded() {
+    fn index_dependency_detection_is_exact_column_membership() {
+        // A partial index on `id` whose predicate string literal mentions `email`,
+        // but which does NOT depend on the `email` column (its `pg_depend` set is
+        // just `id`). Dropping `email` must NOT be read as a dependency.
+        let partial = Index {
+            name: "t_id_email_kind".to_owned(),
+            columns: vec!["id".to_owned()],
+            unique: false,
+            definition: Some(
+                "CREATE INDEX t_id_email_kind ON t (id) WHERE kind = 'email'".to_owned(),
+            ),
+        };
+        assert!(
+            !index_depends_on_column(&partial, "email"),
+            "a column name in a definition string literal is NOT a dependency (no false positive)"
+        );
+        assert!(
+            index_depends_on_column(&partial, "id"),
+            "the true dependent column (in `columns`) IS a dependency"
+        );
+
+        // An expression index carrying its exact `pg_depend` dependent set.
         let expr = Index {
             name: "u_lower_email".to_owned(),
-            columns: vec![],
+            columns: vec!["email".to_owned()],
             unique: false,
             definition: Some("CREATE INDEX u_lower_email ON users (lower(email))".to_owned()),
         };
         assert!(
             index_depends_on_column(&expr, "email"),
-            "matches lower(email)"
+            "the expression-referenced `email` is captured in `columns`"
         );
         assert!(
             !index_depends_on_column(&expr, "mail"),
-            "must not match a substring inside the token"
-        );
-
-        let emailer = Index {
-            name: "u_emailer".to_owned(),
-            columns: vec![],
-            unique: false,
-            definition: Some("CREATE INDEX u_emailer ON users (emailer)".to_owned()),
-        };
-        assert!(
-            !index_depends_on_column(&emailer, "email"),
-            "`email` must not match the longer identifier `emailer`"
+            "a column absent from `columns` is not a dependency"
         );
 
         let plain = Index {

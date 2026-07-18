@@ -81,15 +81,17 @@
 //!   the `ALTER TABLE … DROP COLUMN` (the up path emits no `DROP INDEX`). The
 //!   snapshot projection prunes it to match (so `doctor` / `pull --dry-run` do not
 //!   false-drift) and the down migration recreates it from its verbatim
-//!   `definition`. Two nuances are deferred: **(i)** a cascade-removed brownfield
-//!   `UNIQUE`/`EXCLUDE` *constraint* is restored on rollback as a unique *index*
-//!   (via its `pg_get_indexdef` definition), not as the original named
-//!   `CONSTRAINT` — functional uniqueness is preserved, exact constraint-object
-//!   reconstruction is deferred; **(ii)** whether a column is *depended on* by an
-//!   expression index is detected best-effort — `columns` membership plus a
-//!   word-bounded token match of the column name in the `definition` text (so
-//!   `email` matches `lower(email)` but not `emailer`), not a full parse of the
-//!   index expression.
+//!   `definition`. Whether a column is *depended on* is now detected **exactly**:
+//!   a retained index carries in its [`Index::columns`] the precise `pg_depend`
+//!   dependent-column set (key, expression-referenced, AND predicate columns) —
+//!   the authoritative cascade set Postgres itself uses — so the diff engine tests
+//!   dependency by exact set membership, never a `definition`-text scan (which
+//!   could false-positive on a column name appearing in a string literal). One
+//!   nuance remains deferred: a cascade-removed brownfield `UNIQUE`/`EXCLUDE`
+//!   *constraint* is restored on rollback as a unique *index* (via its
+//!   `pg_get_indexdef` definition), not as the original named `CONSTRAINT` —
+//!   functional uniqueness is preserved, exact constraint-object reconstruction is
+//!   deferred.
 //!
 //! Errors are **credential-safe** by construction: no variant ever embeds the
 //! resolved database URL (only a parsed host/port on the connection-error path,
@@ -246,9 +248,22 @@ struct IndexRow {
     /// model DSL cannot express it, so it is retained verbatim.
     #[diesel(sql_type = diesel::sql_types::Bool)]
     is_constraint: bool,
-    /// Comma-joined resolvable ordinary column names, in key order (may be empty).
+    /// Comma-joined resolvable ordinary *key* column names, in key order (may be
+    /// empty for an all-expression index). Used to populate a *simple* index's
+    /// `Index.columns` for round-trip parity.
     #[diesel(sql_type = diesel::sql_types::Text)]
     columns: String,
+    /// Comma-joined set of every column this index *depends on* — key columns,
+    /// expression-referenced columns, AND predicate (`WHERE`) columns per
+    /// `pg_depend`, combined via `UNION` with the backing constraint's `conkey`
+    /// columns for a constraint-owned index (whose column dependency routes through
+    /// `pg_constraint`, not a direct index→column `pg_depend` row). Together this
+    /// is exactly what Postgres cascade-drops with an `ALTER TABLE … DROP COLUMN`.
+    /// Sorted by name (deterministic). Used to populate a *definition*-carrying
+    /// index's `Index.columns` so the diff engine's column-dependency detection is
+    /// exact (no string scan).
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    dep_columns: String,
 }
 
 #[derive(QueryableByName)]
@@ -389,7 +404,13 @@ fn fetch_primary_keys(
 /// ORDINALITY` subquery; `has_expression` flags any `0` key, `is_partial`
 /// flags an `indpred`, and `is_constraint` flags an index backing a
 /// `pg_constraint` (UNIQUE/EXCLUDE), so the builder can classify each index as
-/// simple-representable vs. preserved-verbatim.
+/// simple-representable vs. preserved-verbatim. A second correlated subquery
+/// aggregates `dep_columns` — the exact set of columns the index depends on (key,
+/// expression-referenced, AND predicate columns via **`pg_depend`**, combined via
+/// `UNION` with the backing constraint's `conkey` columns for a constraint-owned
+/// index), the
+/// authoritative cascade set Postgres itself uses for `DROP COLUMN` — so a retained
+/// index's column-dependency detection is exact, not a string scan.
 fn fetch_indexes(
     conn: &mut PgConnection,
     tables: &[String],
@@ -410,7 +431,26 @@ fn fetch_indexes(
                 WITH ORDINALITY AS k(attnum, ord) \
            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
            WHERE k.attnum > 0 \
-         ), '') AS columns \
+         ), '') AS columns, \
+         COALESCE(( \
+           SELECT string_agg(DISTINCT attname, ',' ORDER BY attname) FROM ( \
+             SELECT a.attname \
+             FROM pg_depend d \
+             JOIN pg_attribute a \
+               ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid \
+             WHERE d.classid = 'pg_class'::regclass \
+               AND d.objid = i.indexrelid \
+               AND d.refclassid = 'pg_class'::regclass \
+               AND d.refobjid = i.indrelid \
+               AND d.refobjsubid > 0 \
+             UNION \
+             SELECT a.attname \
+             FROM pg_constraint c \
+             JOIN unnest(c.conkey) AS ck(attnum) ON TRUE \
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ck.attnum \
+             WHERE c.conindid = i.indexrelid AND ck.attnum > 0 \
+           ) deps \
+         ), '') AS dep_columns \
          FROM pg_index i \
          JOIN pg_class t ON t.oid = i.indrelid \
          JOIN pg_class ic ON ic.oid = i.indexrelid \
@@ -540,7 +580,7 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
     let mut indexes = Vec::with_capacity(rows.len());
     let mut unique_columns = std::collections::BTreeSet::new();
     for row in rows {
-        let columns: Vec<String> = row
+        let key_columns: Vec<String> = row
             .columns
             .split(',')
             .filter(|c| !c.is_empty())
@@ -551,18 +591,31 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
         // column's `unique` flag whether or not it backs a constraint (the flag
         // is accurate either way and is never diffed).
         let simple = !row.is_partial && !row.has_expression;
-        if simple && row.is_unique && columns.len() == 1 {
-            unique_columns.insert(columns[0].clone());
+        if simple && row.is_unique && key_columns.len() == 1 {
+            unique_columns.insert(key_columns[0].clone());
         }
         // Retain (preserve verbatim, never drop) any index the model DSL cannot
         // express: an expression or partial index, OR a constraint-owned index
         // (UNIQUE/EXCLUDE) whose backing constraint Postgres won't let us drop.
         // A plain, non-constraint index keeps `definition: None` so its JSON is
         // unchanged and the model round-trip stays clean.
-        let definition = if simple && !row.is_constraint {
-            None
+        //
+        // For a SIMPLE index `Index.columns` stays the ordered key columns (exact
+        // round-trip parity; the `pg_depend` set equals the key columns anyway).
+        // For a DEFINITION-carrying index (expression / partial / constraint-owned),
+        // `Index.columns` is the exact `pg_depend` dependent-column set — key,
+        // expression-referenced, AND predicate columns — the set the diff engine
+        // uses for exact cascade/dependency detection (no string scan).
+        let (columns, definition) = if simple && !row.is_constraint {
+            (key_columns, None)
         } else {
-            Some(row.definition.clone())
+            let dep_columns: Vec<String> = row
+                .dep_columns
+                .split(',')
+                .filter(|c| !c.is_empty())
+                .map(str::to_owned)
+                .collect();
+            (dep_columns, Some(row.definition.clone()))
         };
         indexes.push(Index {
             name: row.index_name.clone(),
@@ -722,13 +775,18 @@ mod tests {
     }
 
     /// Build a one-per-index [`IndexRow`] for tests. `columns` is the comma-joined
-    /// resolvable-column string the SQL aggregation produces. `is_constraint` is
-    /// left `false` (an ordinary/model-style or expression/partial index); use
-    /// [`constraint_index_row`] for a constraint-owned index.
+    /// resolvable *key*-column string the SQL aggregation produces; `dep_columns`
+    /// is the comma-joined `pg_depend` dependent-column set (key + expression +
+    /// predicate columns). For a simple index the two are equal; for an
+    /// expression/partial index they differ (empty/partial key columns, full
+    /// dependent set). `is_constraint` is left `false` (an ordinary/model-style or
+    /// expression/partial index); use [`constraint_index_row`] for a
+    /// constraint-owned index.
     fn index_row(
         index_name: &str,
         is_unique: bool,
         columns: &str,
+        dep_columns: &str,
         is_partial: bool,
         has_expression: bool,
         definition: &str,
@@ -742,12 +800,14 @@ mod tests {
             has_expression,
             is_constraint: false,
             columns: columns.to_owned(),
+            dep_columns: dep_columns.to_owned(),
         }
     }
 
     /// Build a constraint-owned (non-primary, non-partial, non-expression)
     /// [`IndexRow`] — the auto-created index behind a brownfield column/table-level
-    /// `UNIQUE`/`EXCLUDE` constraint (`is_constraint == true`).
+    /// `UNIQUE`/`EXCLUDE` constraint (`is_constraint == true`). The `pg_depend`
+    /// dependent set of such an index equals its key columns.
     fn constraint_index_row(
         index_name: &str,
         is_unique: bool,
@@ -756,7 +816,9 @@ mod tests {
     ) -> IndexRow {
         IndexRow {
             is_constraint: true,
-            ..index_row(index_name, is_unique, columns, false, false, definition)
+            ..index_row(
+                index_name, is_unique, columns, columns, false, false, definition,
+            )
         }
     }
 
@@ -765,6 +827,7 @@ mod tests {
         let rows = vec![index_row(
             "idx_accounts_email_unique",
             true,
+            "email",
             "email",
             false,
             false,
@@ -786,6 +849,7 @@ mod tests {
             "idx_comments_post_id",
             false,
             "post_id",
+            "post_id",
             false,
             false,
             "CREATE INDEX idx_comments_post_id ON public.comments USING btree (post_id)",
@@ -804,6 +868,7 @@ mod tests {
         let rows = vec![index_row(
             "idx_memberships_org_user",
             true,
+            "org_id,user_id",
             "org_id,user_id",
             false,
             false,
@@ -832,7 +897,8 @@ mod tests {
         let rows = vec![index_row(
             "users_lower_email_idx",
             false,
-            "", // no resolvable ordinary columns
+            "",      // no resolvable ordinary KEY columns (all-expression)
+            "email", // but `pg_depend` records the expression-referenced column
             false,
             true,
             def,
@@ -840,7 +906,10 @@ mod tests {
         let (indexes, unique_cols) = collapse_indexes(&rows);
         assert_eq!(indexes.len(), 1, "expression index preserved, not dropped");
         assert_eq!(indexes[0].name, "users_lower_email_idx");
-        assert!(indexes[0].columns.is_empty());
+        // A definition-carrying index carries its exact `pg_depend` dependent set,
+        // so the expression-referenced `email` column is captured for exact
+        // cascade/dependency detection.
+        assert_eq!(indexes[0].columns, vec!["email".to_owned()]);
         assert_eq!(indexes[0].definition.as_deref(), Some(def));
         assert!(unique_cols.is_empty());
     }
@@ -854,14 +923,20 @@ mod tests {
         let rows = vec![index_row(
             "users_active_idx",
             false,
-            "email",
+            "email",            // key column
+            "deleted_at,email", // `pg_depend` set: predicate + key column (sorted)
             true,
             false,
             def,
         )];
         let (indexes, unique_cols) = collapse_indexes(&rows);
         assert_eq!(indexes.len(), 1);
-        assert_eq!(indexes[0].columns, vec!["email".to_owned()]);
+        // A partial index depends on BOTH its key column and its predicate column;
+        // the exact `pg_depend` set (which cascades on `DROP COLUMN`) is captured.
+        assert_eq!(
+            indexes[0].columns,
+            vec!["deleted_at".to_owned(), "email".to_owned()]
+        );
         assert_eq!(indexes[0].definition.as_deref(), Some(def));
         assert!(
             unique_cols.is_empty(),
@@ -906,6 +981,7 @@ mod tests {
             "idx_users_email_unique",
             true,
             "email",
+            "email",
             false,
             false,
             def,
@@ -947,6 +1023,7 @@ mod tests {
         let indexes = vec![index_row(
             "idx_comments_post_id",
             false,
+            "post_id",
             "post_id",
             false,
             false,
