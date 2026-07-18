@@ -604,7 +604,22 @@ async fn run_room_composite(
         source_id,
     } = args;
     let (output_path, ephemeral) = staged_output(storage, &output_key, "mp4")?;
-    let command = FfmpegRoomCompositeCommand::new(ffmpeg_bin, source_paths, output_path.clone());
+    // Detect, per input, whether it carries an audio stream so the composite
+    // mixes only the inputs that actually have audio. Probing is async I/O and
+    // lives here in the caller; `FfmpegRoomCompositeCommand::args()` stays a pure
+    // function of the resulting flags. See `probe_has_audio` for the fail-safe
+    // policy (a probe failure degrades to "no audio", never a crash).
+    let ffprobe_bin = resolve_ffprobe_bin(ffmpeg_bin);
+    let mut audio_present = Vec::with_capacity(source_paths.len());
+    for path in &source_paths {
+        audio_present.push(probe_has_audio(&ffprobe_bin, path).await);
+    }
+    let command = FfmpegRoomCompositeCommand::new(
+        ffmpeg_bin,
+        source_paths,
+        output_path.clone(),
+        audio_present,
+    );
     let bytes = run_blocking(move || command.run()).await?;
     let file = persist_and_cleanup(
         storage,
@@ -623,6 +638,58 @@ async fn run_room_composite(
         secondary: None,
         metadata: BTreeMap::new(),
     })
+}
+
+/// Resolve the `ffprobe` binary from the configured `ffmpeg` binary path.
+///
+/// Prefers a sibling `ffprobe` next to the configured `ffmpeg` (they ship
+/// together), i.e. the same directory with the file name swapped. When the
+/// `ffmpeg` path carries no directory component (a bare `ffmpeg` resolved via
+/// `PATH`) or the sibling does not exist, falls back to plain `ffprobe` on
+/// `PATH`.
+fn resolve_ffprobe_bin(ffmpeg_bin: &str) -> std::ffi::OsString {
+    let candidate = Path::new(ffmpeg_bin).with_file_name("ffprobe");
+    let has_dir = candidate
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if has_dir && candidate.exists() {
+        candidate.into_os_string()
+    } else {
+        std::ffi::OsString::from("ffprobe")
+    }
+}
+
+/// Probe whether `path` carries at least one audio stream.
+///
+/// Runs `ffprobe -v error -select_streams a -show_entries stream=index -of
+/// csv=p=0 <file>` and treats non-empty stdout as "has audio".
+///
+/// **Fail-safe policy:** any probe failure (spawn error, non-zero exit, or a
+/// path with no audio) resolves to `false` ("assume no audio"). This is the
+/// only direction that **cannot crash the composite job**: a `false` merely
+/// drops that input from the `amix`, so at worst a probe outage yields a silent
+/// (but successful) grid. Returning `true` on failure would be unsafe — if the
+/// input truly had no audio, the filtergraph would reference a missing `[i:a]`
+/// stream and `FFmpeg` would fail, which is exactly the crash this replaces.
+async fn probe_has_audio(ffprobe_bin: &std::ffi::OsStr, path: &Path) -> bool {
+    let output = tokio::process::Command::new(ffprobe_bin)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => !out.stdout.iter().all(u8::is_ascii_whitespace),
+        _ => false,
+    }
 }
 
 /// Run a blocking encode closure off the async runtime.

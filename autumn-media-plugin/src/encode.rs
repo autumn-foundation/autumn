@@ -800,35 +800,45 @@ const ROOM_COMPOSITE_MAX_INPUTS: usize = 6;
 /// cap); one input per participant, so — unlike the clip/poster encoders — it
 /// never concatenates.
 ///
-/// # Audio-stream assumption
+/// # Per-input audio detection
 ///
-/// This composite assumes **each participant recording carries an audio
-/// stream**: the `-filter_complex` graph references every input's audio and
-/// mixes them with `amix`, so a **video-only participant recording (no audio
-/// stream) is not supported for composition this slice** — `FFmpeg` would fail
-/// on the missing stream. The **per-participant recordings themselves are
-/// unaffected**; this limitation is only about the composited grid output.
-/// Robust handling (per-input audio detection / silence synthesis) is recorded
-/// future work on the epic.
+/// Not every participant recording carries an audio stream (a viewer who
+/// published video-only, a muted camera-only guest, etc.), so the composite is
+/// **audio-aware**: it is told, per input, whether an audio stream is present
+/// via the `audio_present` flags (`len() == input_paths.len()`). The
+/// `-filter_complex` graph mixes (`amix`) **only** the inputs that actually have
+/// audio, and when **no** input has audio it emits a silent video grid (no
+/// `amix`, no `[aout]`, and `args()` omits `-map [aout]`/`-c:a aac`) — so a
+/// video-only participant no longer makes `FFmpeg` fail on a missing `[i:a]`
+/// stream. Probing is done by the caller (see `run_room_composite`); `args()`
+/// stays a **pure, synchronous, no-I/O** function of these fields, reading
+/// `audio_present` rather than performing any probe itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FfmpegRoomCompositeCommand {
     ffmpeg_bin: String,
     input_paths: Vec<PathBuf>,
     output_path: PathBuf,
+    /// One flag per `input_path` (same length/order): `true` when that
+    /// recording carries an audio stream that should be mixed into the output.
+    audio_present: Vec<bool>,
 }
 
 impl FfmpegRoomCompositeCommand {
-    /// Build a room-composite command. One `input_path` per participant.
+    /// Build a room-composite command. One `input_path` per participant, and one
+    /// `audio_present` flag per input (same order) recording whether that input
+    /// carries an audio stream to mix.
     #[must_use]
     pub fn new(
         ffmpeg_bin: impl Into<String>,
         input_paths: Vec<PathBuf>,
         output_path: impl Into<PathBuf>,
+        audio_present: Vec<bool>,
     ) -> Self {
         Self {
             ffmpeg_bin: ffmpeg_bin.into(),
             input_paths,
             output_path: output_path.into(),
+            audio_present,
         }
     }
 
@@ -840,24 +850,34 @@ impl FfmpegRoomCompositeCommand {
     #[must_use]
     pub fn args(&self) -> Vec<OsString> {
         let n = self.input_paths.len();
+        // Whether the composited output carries an audio track at all: true iff
+        // at least one input has an audio stream. When false, the filtergraph
+        // produces no `[aout]`, so we must not `-map` it or set an audio codec.
+        let has_audio_out = self.audio_present.iter().any(|&present| present);
         let mut args = vec![OsString::from("-y")];
         for path in &self.input_paths {
             args.push(OsString::from("-i"));
             args.push(path.as_os_str().to_owned());
         }
         args.push(OsString::from("-filter_complex"));
-        args.push(OsString::from(room_composite_filtergraph(n)));
+        args.push(OsString::from(room_composite_filtergraph(
+            n,
+            &self.audio_present,
+        )));
+        args.extend([OsString::from("-map"), OsString::from("[vout]")]);
+        if has_audio_out {
+            args.extend([OsString::from("-map"), OsString::from("[aout]")]);
+        }
         args.extend([
-            OsString::from("-map"),
-            OsString::from("[vout]"),
-            OsString::from("-map"),
-            OsString::from("[aout]"),
             OsString::from("-c:v"),
             OsString::from("libx264"),
             OsString::from("-preset"),
             OsString::from("veryfast"),
-            OsString::from("-c:a"),
-            OsString::from("aac"),
+        ]);
+        if has_audio_out {
+            args.extend([OsString::from("-c:a"), OsString::from("aac")]);
+        }
+        args.extend([
             OsString::from("-movflags"),
             OsString::from("+faststart"),
             self.output_path.as_os_str().to_owned(),
@@ -911,28 +931,50 @@ const fn room_composite_grid_dims(n: usize) -> (usize, usize) {
     }
 }
 
-/// Build the `-filter_complex` graph: one letterboxed `scale`/`pad` per input,
-/// an `xstack` grid of them, and an `amix` of every audio track.
-fn room_composite_filtergraph(n: usize) -> String {
+/// Build the `-filter_complex` graph: one letterboxed `scale`/`pad` per input
+/// and an `xstack` grid of them (always every `[i:v]`), plus an `amix` of only
+/// the inputs whose `audio_present` flag is set.
+///
+/// The video half is unconditional. The audio half is driven by `audio_present`
+/// (one flag per input, same order):
+/// - **≥ 2 inputs with audio** → `[i:a]…amix=inputs=K:normalize=1[aout]` over
+///   just those `K` inputs.
+/// - **exactly 1 input with audio** → `[k:a]amix=inputs=1:normalize=1[aout]`.
+///   `amix=inputs=1` is valid `FFmpeg` and keeps the output labeled `[aout]`, so
+///   `args()` maps audio identically regardless of how many inputs had audio.
+/// - **0 inputs with audio** → no `amix` and no `[aout]` at all (silent grid);
+///   `args()` correspondingly omits `-map [aout]`/`-c:a aac`.
+fn room_composite_filtergraph(n: usize, audio_present: &[bool]) -> String {
     use std::fmt::Write as _;
 
     let (cols, _rows) = room_composite_grid_dims(n);
     let (w, h) = (ROOM_COMPOSITE_CELL_WIDTH, ROOM_COMPOSITE_CELL_HEIGHT);
     let mut parts = Vec::new();
     let mut video_labels = String::new();
-    let mut audio_labels = String::new();
     for i in 0..n {
         parts.push(format!(
             "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
         ));
         let _ = write!(video_labels, "[v{i}]");
-        let _ = write!(audio_labels, "[{i}:a]");
     }
     let layout = room_composite_layout(cols, n);
     parts.push(format!(
         "{video_labels}xstack=inputs={n}:layout={layout}[vout]"
     ));
-    parts.push(format!("{audio_labels}amix=inputs={n}:normalize=1[aout]"));
+
+    let audio_inputs: Vec<usize> = (0..n)
+        .filter(|&i| audio_present.get(i).copied().unwrap_or(false))
+        .collect();
+    if !audio_inputs.is_empty() {
+        let mut audio_labels = String::new();
+        for &i in &audio_inputs {
+            let _ = write!(audio_labels, "[{i}:a]");
+        }
+        parts.push(format!(
+            "{audio_labels}amix=inputs={}:normalize=1[aout]",
+            audio_inputs.len()
+        ));
+    }
     parts.join(";")
 }
 
@@ -1489,6 +1531,7 @@ mod tests {
             "ffmpeg",
             vec![PathBuf::from("/rec/a.mp4"), PathBuf::from("/rec/b.mp4")],
             "/out/room.mp4",
+            vec![true, true],
         );
         let args = lossy(&cmd.args());
         assert_eq!(args.first().map(String::as_str), Some("-y"));
@@ -1521,6 +1564,7 @@ mod tests {
                 PathBuf::from("/rec/d.mp4"),
             ],
             "/out/room.mp4",
+            vec![true, true, true, true],
         );
         let args = lossy(&cmd.args());
         assert_eq!(args.iter().filter(|a| *a == "-i").count(), 4);
@@ -1534,6 +1578,107 @@ mod tests {
              [v0][v1][v2][v3]xstack=inputs=4:layout=0_0|w0_0|0_h0|w0_h0[vout];\
              [0:a][1:a][2:a][3:a]amix=inputs=4:normalize=1[aout]"
         );
+    }
+
+    #[test]
+    fn room_composite_mixes_only_inputs_with_audio() {
+        // Three inputs, middle one is video-only: amix must reference [0:a] and
+        // [2:a] only, with inputs=2 (not 3), while the video half still xstacks
+        // all three [i:v].
+        let cmd = FfmpegRoomCompositeCommand::new(
+            "ffmpeg",
+            vec![
+                PathBuf::from("/rec/a.mp4"),
+                PathBuf::from("/rec/b.mp4"),
+                PathBuf::from("/rec/c.mp4"),
+            ],
+            "/out/room.mp4",
+            vec![true, false, true],
+        );
+        let args = lossy(&cmd.args());
+        let fc = args.iter().position(|a| a == "-filter_complex").unwrap();
+        let graph = &args[fc + 1];
+        // Video half references every input.
+        assert!(graph.contains("[0:v]scale="));
+        assert!(graph.contains("[1:v]scale="));
+        assert!(graph.contains("[2:v]scale="));
+        assert!(graph.contains("[v0][v1][v2]xstack=inputs=3:"));
+        // Audio half mixes only inputs 0 and 2.
+        assert!(
+            graph.contains("[0:a][2:a]amix=inputs=2:normalize=1[aout]"),
+            "graph was: {graph}"
+        );
+        assert!(
+            !graph.contains("[1:a]"),
+            "video-only input must not be mixed"
+        );
+        // Output still carries audio.
+        assert!(
+            args.windows(2).any(|w| w[0] == "-map" && w[1] == "[aout]"),
+            "audio must be mapped to output"
+        );
+        assert_windowed(&args, "-c:a", "aac");
+    }
+
+    #[test]
+    fn room_composite_single_audio_uses_amix_inputs_one() {
+        // Only the second input has audio: amix=inputs=1 over [1:a] keeps the
+        // labeled [aout] so args() maps audio uniformly.
+        let cmd = FfmpegRoomCompositeCommand::new(
+            "ffmpeg",
+            vec![
+                PathBuf::from("/rec/a.mp4"),
+                PathBuf::from("/rec/b.mp4"),
+                PathBuf::from("/rec/c.mp4"),
+            ],
+            "/out/room.mp4",
+            vec![false, true, false],
+        );
+        let args = lossy(&cmd.args());
+        let fc = args.iter().position(|a| a == "-filter_complex").unwrap();
+        let graph = &args[fc + 1];
+        // Video half still references all three inputs.
+        assert!(graph.contains("[v0][v1][v2]xstack=inputs=3:"));
+        assert!(
+            graph.contains("[1:a]amix=inputs=1:normalize=1[aout]"),
+            "graph was: {graph}"
+        );
+        assert!(!graph.contains("[0:a]"));
+        assert!(!graph.contains("[2:a]"));
+        assert!(
+            args.windows(2).any(|w| w[0] == "-map" && w[1] == "[aout]"),
+            "audio must be mapped to output"
+        );
+        assert_windowed(&args, "-c:a", "aac");
+    }
+
+    #[test]
+    fn room_composite_all_video_only_emits_silent_grid() {
+        // Every input is video-only: no amix, no [aout], and args() must omit
+        // -map [aout] and -c:a aac entirely — a valid silent video grid.
+        let cmd = FfmpegRoomCompositeCommand::new(
+            "ffmpeg",
+            vec![PathBuf::from("/rec/a.mp4"), PathBuf::from("/rec/b.mp4")],
+            "/out/room.mp4",
+            vec![false, false],
+        );
+        let args = lossy(&cmd.args());
+        let fc = args.iter().position(|a| a == "-filter_complex").unwrap();
+        assert_eq!(
+            args[fc + 1],
+            "[0:v]scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1[v0];\
+             [1:v]scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1[v1];\
+             [v0][v1]xstack=inputs=2:layout=0_0|w0_0[vout]"
+        );
+        // Video is still mapped and encoded.
+        assert_windowed(&args, "-map", "[vout]");
+        assert_windowed(&args, "-c:v", "libx264");
+        // No audio anywhere.
+        assert!(!args.iter().any(|a| a == "[aout]"), "no [aout] map");
+        assert!(!args.iter().any(|a| a == "-c:a"), "no audio codec");
+        // Exactly one -map (the video), not two.
+        assert_eq!(args.iter().filter(|a| *a == "-map").count(), 1);
+        assert_eq!(args.last().map(String::as_str), Some("/out/room.mp4"));
     }
 
     #[test]
@@ -1551,8 +1696,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let only = dir.path().join("solo.mp4");
         File::create(&only).unwrap();
-        let cmd =
-            FfmpegRoomCompositeCommand::new("ffmpeg", vec![only], dir.path().join("room.mp4"));
+        let cmd = FfmpegRoomCompositeCommand::new(
+            "ffmpeg",
+            vec![only],
+            dir.path().join("room.mp4"),
+            vec![true],
+        );
         // A one-participant composite is meaningless; run() must reject it
         // before spawning FFmpeg.
         assert!(matches!(
@@ -1573,7 +1722,9 @@ mod tests {
                 path
             })
             .collect();
-        let cmd = FfmpegRoomCompositeCommand::new("ffmpeg", sources, dir.path().join("room.mp4"));
+        let audio = vec![true; sources.len()];
+        let cmd =
+            FfmpegRoomCompositeCommand::new("ffmpeg", sources, dir.path().join("room.mp4"), audio);
         assert!(matches!(
             cmd.run(),
             Err(super::MediaError::FfmpegSourceMissing { .. })
