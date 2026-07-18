@@ -1088,6 +1088,137 @@ pub struct Member {
     assert_no_secret_leak(&doc_out, &doc_err);
 }
 
+/// A brownfield `SERIAL PRIMARY KEY` (int4) column must be introspected faithfully:
+/// its `nextval(...)` sequence default is PRESERVED (not stripped like the int8
+/// `BIGSERIAL` id shape), so a recreation of the table reconstructs it as `SERIAL`
+/// (auto-increment) rather than a plain `INTEGER PRIMARY KEY` that silently loses the
+/// sequence. The faithful-representation acceptance is a byte-stable re-pull plus a
+/// clean `doctor`, and the preserved `nextval` default visible in the snapshot.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_preserves_int4_serial_primary_key() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_int4_serial_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // A brownfield table whose primary key is an int4 `SERIAL` (not `BIGSERIAL`),
+    // authored via a raw migration so Postgres records the `nextval(...)` default.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_counters",
+        "CREATE TABLE counters (id SERIAL PRIMARY KEY, label TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT NOW());",
+        "DROP TABLE counters;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the int4 SERIAL id's sequence default must survive (NOT be stripped like
+    // the int8 BIGSERIAL id shape), so the emitter can reconstruct it as `SERIAL`.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("counters"),
+        "the brownfield table is captured: {snap}"
+    );
+    assert!(
+        snap.contains("nextval"),
+        "the int4 SERIAL PK's nextval default is PRESERVED (not stripped): {snap}"
+    );
+
+    // A re-pull of the same database is byte-for-byte stable (no int4-serial drift).
+    let snap_before = snap;
+    let (pull2_out, pull2_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull2_out, &pull2_err);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("snapshot after second pull");
+    assert_eq!(
+        snap_before, snap_after,
+        "a re-pull of the same database must be byte-for-byte stable (int4 serial faithful)"
+    );
+
+    // doctor agrees the database still matches the pulled baseline (no drift from the
+    // preserved int4 SERIAL primary key).
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports the DB matches the snapshot with the int4 SERIAL PK:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
+/// A **partial** unique index (`… ON accounts(email) WHERE …`) enforces uniqueness
+/// only for rows matching its predicate, so it must NOT be treated as satisfying a
+/// model `#[unique] email` (which demands table-wide uniqueness). Unlike a full
+/// brownfield `UNIQUE` constraint (which DOES satisfy `#[unique]` — see
+/// `schema_diff_model_unique_matches_pulled_constraint_index`), the model diff here
+/// must emit the unique `AddIndex`, which the policy guard then refuses on the
+/// pre-existing `email` column with `UniqueIndexRequiresDedup` — the decisive signal
+/// that the partial index did NOT suppress the model `#[unique]`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_diff_partial_unique_index_does_not_satisfy_model_unique() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_partial_unique_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // Brownfield `accounts(id, email, created_at)` with a PARTIAL unique index on
+    // `email` (only enforces uniqueness where `email <> ''`). `created_at TIMESTAMP
+    // NOT NULL DEFAULT NOW()` matches the column the managed-model parser synthesizes
+    // for `Account` below, so the diff isolates the unique-index behavior.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_accounts",
+        "CREATE TABLE accounts (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT NOW());\n\
+         CREATE UNIQUE INDEX accounts_email_active_key ON accounts (email) WHERE email <> '';",
+        "DROP TABLE accounts;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the partial unique index is retained verbatim and flagged partial.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("accounts_email_active_key"),
+        "the partial unique index is retained by name: {snap}"
+    );
+    assert!(
+        snap.contains("\"is_partial\"") && snap.contains("WHERE"),
+        "the pulled index is flagged partial and keeps its predicate: {snap}"
+    );
+
+    // The natural model declares `#[unique]` on email. A PARTIAL unique index does
+    // NOT enforce table-wide uniqueness, so the diff must NOT be suppressed — it emits
+    // the unique AddIndex, which the guard refuses on the pre-existing column.
+    write_models(
+        &project,
+        "
+#[autumn_web::model(managed)]
+pub struct Account {
+    #[id]
+    pub id: i64,
+    #[unique]
+    pub email: String,
+}
+",
+    );
+    let (mdiff_out, mdiff_err) = run_autumn_fail(&project, &["schema", "diff"], &envs);
+    let combined = format!("{mdiff_out}{mdiff_err}");
+    assert!(
+        combined.contains("cannot add unique index") && combined.contains("accounts"),
+        "a partial unique index must NOT satisfy the model #[unique]; the diff must emit \
+         the unique AddIndex (guard-refused on the pre-existing column):\n{combined}"
+    );
+    assert_no_secret_leak(&mdiff_out, &mdiff_err);
+}
+
 /// `SQLite` introspection is a future slice: `schema pull` against a `SQLite` URL
 /// is refused loudly (no Docker needed — the refusal happens before any
 /// connection), names `SQLite`, and writes no snapshot.

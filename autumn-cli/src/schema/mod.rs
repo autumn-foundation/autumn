@@ -1718,6 +1718,8 @@ mod tests {
             unique: true,
             // A constraint-owned unique index, retained verbatim by `schema pull`.
             definition: Some("CREATE UNIQUE INDEX users_email_key ON users (email)".to_string()),
+            is_partial: false,
+            key_columns: Vec::new(),
         }];
         table
     }
@@ -1778,6 +1780,8 @@ mod tests {
             definition: Some(
                 "CREATE INDEX users_lower_handle_idx ON users (lower(handle))".to_string(),
             ),
+            is_partial: false,
+            key_columns: Vec::new(),
         }];
         let projected = project_plan_target(&[table], &drop_email_plan());
         let users = projected

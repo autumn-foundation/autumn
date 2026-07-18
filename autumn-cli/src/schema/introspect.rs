@@ -275,6 +275,17 @@ struct IndexRow {
     /// `Index.columns` for round-trip parity.
     #[diesel(sql_type = diesel::sql_types::Text)]
     columns: String,
+    /// Comma-joined **key** column names in key order — the first `indnkeyatts`
+    /// index attributes, EXCLUDING any non-key `INCLUDE` columns, and **empty when
+    /// any key position is an expression** (an `indkey` `0` inside the key range).
+    /// This is the exact set the index's uniqueness is enforced over: distinct from
+    /// `columns` (which folds in `INCLUDE` columns for a covering index) and from
+    /// `dep_columns` (the full cascade dependency set). Used to populate
+    /// `Index.key_columns` so the diff can decide — offline, with no DB — whether a
+    /// baseline unique index actually enforces a model `#[unique]`'s exact column set
+    /// (a partial or expression index does not).
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    key_columns: String,
     /// Comma-joined set of every column this index *depends on* — key columns,
     /// expression-referenced columns, AND predicate (`WHERE`) columns per
     /// `pg_depend`, combined via `UNION` with the backing constraint's `conkey`
@@ -426,7 +437,11 @@ fn fetch_primary_keys(
 /// ORDINALITY` subquery; `has_expression` flags any `0` key, `is_partial`
 /// flags an `indpred`, and `is_constraint` flags an index backing a
 /// `pg_constraint` (UNIQUE/EXCLUDE), so the builder can classify each index as
-/// simple-representable vs. preserved-verbatim. A second correlated subquery
+/// simple-representable vs. preserved-verbatim. A separate `key_columns` projection
+/// aggregates only the first `indnkeyatts` (true KEY) attributes — excluding
+/// `INCLUDE` columns and yielding empty for an expression key — which is the exact
+/// set an index's uniqueness is enforced over (used to decide, offline, whether a
+/// baseline unique index satisfies a model `#[unique]`). A second correlated subquery
 /// aggregates `dep_columns` — the exact set of columns the index depends on (key,
 /// expression-referenced, AND predicate columns via **`pg_depend`**, combined via
 /// `UNION` with the backing constraint's `conkey` columns for a constraint-owned
@@ -455,6 +470,16 @@ fn fetch_indexes(
            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
            WHERE k.attnum > 0 \
          ), '') AS columns, \
+         CASE \
+           WHEN 0 = ANY((string_to_array(i.indkey::text, ' ')::int[])[1:i.indnkeyatts]) \
+             THEN '' \
+           ELSE COALESCE(( \
+             SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
+             FROM unnest((string_to_array(i.indkey::text, ' ')::int[])[1:i.indnkeyatts]) \
+                  WITH ORDINALITY AS k(attnum, ord) \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+           ), '') \
+         END AS key_columns, \
          COALESCE(( \
            SELECT string_agg(DISTINCT attname, ',' ORDER BY attname) FROM ( \
              SELECT a.attname \
@@ -641,8 +666,11 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
         // `Index.columns` is the exact `pg_depend` dependent-column set — key,
         // expression-referenced, AND predicate columns — the set the diff engine
         // uses for exact cascade/dependency detection (no string scan).
-        let (columns, definition) = if simple && !row.is_constraint {
-            (key_columns, None)
+        let (columns, definition, key_cols) = if simple && !row.is_constraint {
+            // A plain simple index's key columns ARE its `columns`, so recording
+            // `key_columns` separately would be redundant JSON noise — leave it empty
+            // and let the diff derive the key set from `columns` for such indexes.
+            (key_columns, None, Vec::new())
         } else {
             let dep_columns: Vec<String> = row
                 .dep_columns
@@ -650,13 +678,26 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
                 .filter(|c| !c.is_empty())
                 .map(str::to_owned)
                 .collect();
-            (dep_columns, Some(row.definition.clone()))
+            // For a `definition`-carrying index (expression / partial / covering /
+            // constraint-owned) the KEY columns are recorded explicitly: they differ
+            // from `columns` (which is the full cascade dependency set here) and are
+            // EMPTY for an expression key, which is exactly the signal the diff uses to
+            // refuse to treat such an index as satisfying a model `#[unique]`.
+            let key_cols: Vec<String> = row
+                .key_columns
+                .split(',')
+                .filter(|c| !c.is_empty())
+                .map(str::to_owned)
+                .collect();
+            (dep_columns, Some(row.definition.clone()), key_cols)
         };
         indexes.push(Index {
             name: row.index_name.clone(),
             columns,
             unique: row.is_unique,
             definition,
+            is_partial: row.is_partial,
+            key_columns: key_cols,
         });
     }
     (indexes, unique_columns)
@@ -667,9 +708,10 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
 ///
 /// - `NULL` (no default) → `None`.
 /// - `now()` / `CURRENT_TIMESTAMP` → [`ColumnDefault::Now`].
-/// - a `nextval(...)` serial default on a single-column integer primary key →
+/// - a `nextval(...)` serial default on a single-column **int8** primary key →
 ///   `None` (a `BIGSERIAL`-shaped id has no explicit default in the model IR;
-///   see [`normalize_serial_pk_default`]).
+///   see [`normalize_serial_pk_default`]). An **int4** `SERIAL` PK keeps its
+///   `nextval(...)` default so the emitter can reconstruct it as `SERIAL`.
 /// - anything else → [`ColumnDefault::Sql`] verbatim (e.g. a UUID PK's
 ///   `gen_random_uuid()`, which the model parser records identically).
 fn normalize_default(
@@ -695,11 +737,18 @@ fn normalize_default(
 }
 
 /// Whether a raw (lower-cased) default is the auto-increment sequence default of
-/// a single-column integer primary key — i.e. the shape the model IR represents
-/// as an [`Int64`](ColumnType::Int64) PK with **no** default. Such a default is
-/// stripped to `None` so an introspected `BIGSERIAL` id round-trips against the
-/// model parser (whose `pk_kind_for` requires `default.is_none()` for a
+/// a single-column **`BIGSERIAL`** (int8) primary key — i.e. the shape the model IR
+/// represents as an [`Int64`](ColumnType::Int64) PK with **no** default. Such a
+/// default is stripped to `None` so an introspected `BIGSERIAL` id round-trips
+/// against the model parser (whose `pk_kind_for` requires `default.is_none()` for a
 /// `BigSerial` PK).
+///
+/// A single-column **`SERIAL`** (int4) PK is deliberately **not** stripped: the
+/// model IR has no default-less int4-PK shape, so keeping the `nextval(...)` default
+/// is what lets the DDL emitter recognize it (via `pk_kind_for`) and reconstruct it
+/// as `SERIAL PRIMARY KEY` — recreating it as a plain `INTEGER PRIMARY KEY` would
+/// silently drop the sequence. A plain int PK with no default stays default-less and
+/// so recreates as a plain integer PK (no auto-increment).
 fn normalize_serial_pk_default(
     lowered_default: &str,
     ty: &ColumnType,
@@ -708,7 +757,7 @@ fn normalize_serial_pk_default(
 ) -> bool {
     is_primary_key
         && primary_key.len() == 1
-        && matches!(ty, ColumnType::Int32 | ColumnType::Int64)
+        && matches!(ty, ColumnType::Int64)
         && lowered_default.starts_with("nextval(")
 }
 
@@ -777,7 +826,7 @@ mod tests {
 
     #[test]
     fn normalize_serial_pk_default_stripped_to_none() {
-        // A `nextval(...)` default on a single-column int PK → None (BIGSERIAL id).
+        // A `nextval(...)` default on a single-column int8 PK → None (BIGSERIAL id).
         let pk = vec!["id".to_owned()];
         let d = normalize_default(
             Some("nextval('posts_id_seq'::regclass)"),
@@ -785,7 +834,37 @@ mod tests {
             true,
             &pk,
         );
-        assert_eq!(d, None, "serial PK default must be stripped to None");
+        assert_eq!(d, None, "int8 serial PK default must be stripped to None");
+    }
+
+    #[test]
+    fn normalize_int4_serial_pk_default_is_kept() {
+        // A `nextval(...)` default on a single-column int4 PK is a brownfield
+        // `SERIAL PRIMARY KEY` — its default is PRESERVED (not stripped) so the DDL
+        // emitter can reconstruct it as `SERIAL` rather than a plain `INTEGER`.
+        let pk = vec!["id".to_owned()];
+        let d = normalize_default(
+            Some("nextval('counters_id_seq'::regclass)"),
+            &ColumnType::Int32,
+            true,
+            &pk,
+        );
+        assert_eq!(
+            d,
+            Some(ColumnDefault::Sql(
+                "nextval('counters_id_seq'::regclass)".to_owned()
+            )),
+            "int4 SERIAL PK default must be preserved, not stripped"
+        );
+    }
+
+    #[test]
+    fn normalize_int4_pk_without_default_stays_none() {
+        // A plain int4 PK with NO default stays default-less → a plain integer PK
+        // (no auto-increment), never mistaken for a SERIAL.
+        let pk = vec!["id".to_owned()];
+        let d = normalize_default(None, &ColumnType::Int32, true, &pk);
+        assert_eq!(d, None, "a plain int4 PK carries no default");
     }
 
     #[test]
@@ -836,6 +915,14 @@ mod tests {
             has_include: false,
             is_constraint: false,
             columns: columns.to_owned(),
+            // Mirror the SQL `key_columns`: empty when any key position is an
+            // expression, otherwise the (non-INCLUDE) key columns — which, for these
+            // `has_include: false` fixtures, are exactly `columns`.
+            key_columns: if has_expression {
+                String::new()
+            } else {
+                columns.to_owned()
+            },
             dep_columns: dep_columns.to_owned(),
         }
     }

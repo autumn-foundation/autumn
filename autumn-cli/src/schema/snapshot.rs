@@ -333,12 +333,16 @@ mod tests {
             columns: vec!["created_at".to_owned()],
             unique: false,
             definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
         posts.indexes.push(Index {
             name: "idx_posts_author_id".to_owned(),
             columns: vec!["author_id".to_owned()],
             unique: false,
             definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
         posts.checks.push(CheckConstraint {
             name: Some("posts_body_len".to_owned()),

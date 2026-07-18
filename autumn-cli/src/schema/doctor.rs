@@ -1139,6 +1139,8 @@ mod tests {
                 "CREATE INDEX idx_posts_lower_created ON posts (lower(created_at::text))"
                     .to_owned(),
             ),
+            is_partial: false,
+            key_columns: Vec::new(),
         });
         let snapshot = vec![snapshot_table];
         // Live DB lacks the expression index entirely.

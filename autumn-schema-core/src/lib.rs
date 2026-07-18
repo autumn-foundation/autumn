@@ -430,8 +430,15 @@ impl ColumnType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IdKind {
     /// `BIGSERIAL PRIMARY KEY` (PG) / `INTEGER PRIMARY KEY AUTOINCREMENT`
-    /// (`SQLite`) — a sequential auto-increment integer.
+    /// (`SQLite`) — a sequential auto-increment 64-bit integer.
     BigSerial,
+    /// `SERIAL PRIMARY KEY` (PG) / `INTEGER PRIMARY KEY AUTOINCREMENT`
+    /// (`SQLite`) — a sequential auto-increment 32-bit integer. The model DSL
+    /// never produces this (its `#[id]` is always `BigSerial` or `Uuid`); it
+    /// exists so a **brownfield** `SERIAL PRIMARY KEY` (int4) column introspected
+    /// by `schema pull` recreates as `SERIAL` (auto-increment) rather than a plain
+    /// `INTEGER PRIMARY KEY` that silently loses the sequence.
+    Serial,
     /// `UUID PRIMARY KEY DEFAULT gen_random_uuid()` (PG) / `TEXT PRIMARY KEY`
     /// (`SQLite`) — a non-enumerable UUID.
     Uuid,
@@ -443,6 +450,7 @@ impl IdKind {
     pub const fn rust_type(self) -> &'static str {
         match self {
             Self::BigSerial => "i64",
+            Self::Serial => "i32",
             Self::Uuid => "uuid::Uuid",
         }
     }
@@ -453,6 +461,7 @@ impl IdKind {
     pub const fn diesel_type(self, backend: Backend) -> &'static str {
         match (self, backend) {
             (Self::BigSerial, _) => "Int8",
+            (Self::Serial, _) => "Int4",
             (Self::Uuid, Backend::Postgres) => "Uuid",
             (Self::Uuid, Backend::Sqlite) => "Text",
         }
@@ -464,7 +473,10 @@ impl IdKind {
     pub const fn pk_sql(self, backend: Backend) -> &'static str {
         match (self, backend) {
             (Self::BigSerial, Backend::Postgres) => "BIGSERIAL PRIMARY KEY",
-            (Self::BigSerial, Backend::Sqlite) => "INTEGER PRIMARY KEY AUTOINCREMENT",
+            (Self::Serial, Backend::Postgres) => "SERIAL PRIMARY KEY",
+            (Self::BigSerial | Self::Serial, Backend::Sqlite) => {
+                "INTEGER PRIMARY KEY AUTOINCREMENT"
+            }
             (Self::Uuid, Backend::Postgres) => "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
             (Self::Uuid, Backend::Sqlite) => "TEXT PRIMARY KEY",
         }
@@ -557,6 +569,37 @@ pub struct Index {
     /// field existed (see the `#[serde(default, skip_serializing_if)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<String>,
+    /// Whether the index carries a `WHERE` predicate (a **partial** index). A
+    /// partial unique index only enforces uniqueness for the rows matching its
+    /// predicate, so it must NOT be treated as satisfying a model `#[unique]`
+    /// (which demands table-wide uniqueness). Introspection sets this from
+    /// `pg_index.indpred IS NOT NULL`; the model parser never emits a partial
+    /// index. Defaults to `false` and is skipped when serializing so ordinary
+    /// indexes stay byte-identical to pre-existing snapshots.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_partial: bool,
+    /// The index's real **key** columns, in key order — the columns whose values
+    /// uniqueness is enforced over — EXCLUDING any non-key `INCLUDE` columns, and
+    /// **empty** when any key position is an expression (e.g. `lower(email)`). It
+    /// is distinct from [`columns`](Self::columns): for a `definition`-carrying
+    /// index `columns` is the full dependency set (key + `INCLUDE` + expression- +
+    /// predicate-referenced columns, used for cascade detection), whereas
+    /// `key_columns` is only what the index's uniqueness is keyed on. Populated by
+    /// introspection for `definition`-carrying indexes; for a plain simple index it
+    /// is left empty (its key columns are exactly `columns`, so recording them again
+    /// would be redundant JSON noise). An empty `key_columns` on an
+    /// expression/`definition` index deliberately signals "no plain key column set"
+    /// so such an index cannot satisfy a model `#[unique]`. Defaults to empty and is
+    /// skipped when serializing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_columns: Vec<String>,
+}
+
+/// `serde` `skip_serializing_if` helper: whether a bool is `false` (so a
+/// default-`false` flag is omitted from the serialized form).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Index {
@@ -569,6 +612,8 @@ impl Index {
             columns,
             unique,
             definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         }
     }
 }
@@ -1066,6 +1111,7 @@ mod tests {
     #[test]
     fn id_kind_rust_type() {
         assert_eq!(IdKind::BigSerial.rust_type(), "i64");
+        assert_eq!(IdKind::Serial.rust_type(), "i32");
         assert_eq!(IdKind::Uuid.rust_type(), "uuid::Uuid");
     }
 
@@ -1080,6 +1126,14 @@ mod tests {
             "INTEGER PRIMARY KEY AUTOINCREMENT"
         );
         assert_eq!(
+            IdKind::Serial.pk_sql(Backend::Postgres),
+            "SERIAL PRIMARY KEY"
+        );
+        assert_eq!(
+            IdKind::Serial.pk_sql(Backend::Sqlite),
+            "INTEGER PRIMARY KEY AUTOINCREMENT"
+        );
+        assert_eq!(
             IdKind::Uuid.pk_sql(Backend::Postgres),
             "UUID PRIMARY KEY DEFAULT gen_random_uuid()"
         );
@@ -1090,6 +1144,8 @@ mod tests {
     fn id_kind_diesel_type_both_backends() {
         assert_eq!(IdKind::BigSerial.diesel_type(Backend::Postgres), "Int8");
         assert_eq!(IdKind::BigSerial.diesel_type(Backend::Sqlite), "Int8");
+        assert_eq!(IdKind::Serial.diesel_type(Backend::Postgres), "Int4");
+        assert_eq!(IdKind::Serial.diesel_type(Backend::Sqlite), "Int4");
         assert_eq!(IdKind::Uuid.diesel_type(Backend::Postgres), "Uuid");
         assert_eq!(IdKind::Uuid.diesel_type(Backend::Sqlite), "Text");
     }
@@ -1119,6 +1175,8 @@ mod tests {
             columns: vec!["author_id".to_owned()],
             unique: false,
             definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
         table.checks.push(CheckConstraint {
             name: Some("posts_status_check".to_owned()),

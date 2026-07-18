@@ -584,6 +584,8 @@ fn build_table(
             columns: vec![field_name.clone()],
             unique: false,
             definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
     }
     for field_name in &unique_index_fields {
@@ -593,6 +595,8 @@ fn build_table(
             columns: vec![field_name.clone()],
             unique: true,
             definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
     }
 
