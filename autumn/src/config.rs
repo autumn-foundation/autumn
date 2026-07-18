@@ -3390,14 +3390,17 @@ impl AutumnConfig {
             let count = opaque_roots.len();
             eprintln!(
                 "deploy config: accepting {count} unknown top-level config section(s) as \
-                 opaque (validated at app boot): {roots} — if one of these is a typo it \
-                 will be rejected when the app starts."
+                 opaque — the deployed app runs the authoritative strict check, so each must \
+                 be a section the app declares (e.g. a plugin config table) or the app will \
+                 reject it at boot: {roots}. A typo here will make the app fail to start."
             );
             tracing::warn!(
                 unknown_top_level_roots = roots.as_str(),
                 count,
-                "deploy config: accepting unknown top-level config section(s) as opaque; \
-                 app boot remains the strict gate for plugin-owned roots (#2063)"
+                "deploy config: accepting unknown top-level config section(s) as opaque; the \
+                 deployed app runs the authoritative strict check, so each must be a section \
+                 the app declares (e.g. a plugin config table) or it will reject it at boot — \
+                 a typo here will make the app fail to start (#2063)"
             );
         }
 
