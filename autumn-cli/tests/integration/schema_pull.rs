@@ -627,6 +627,75 @@ pub struct Account {
     assert_no_secret_leak(&mdiff_out, &mdiff_err);
 }
 
+/// A range-based `EXCLUDE` constraint (`EXCLUDE USING gist (during WITH &&)`) is
+/// backed by a gist index Postgres auto-creates. Retaining ONLY the backing
+/// `CREATE INDEX` (`pg_get_indexdef`) would NOT enforce the exclusion on a
+/// rollback/recreation — overlapping rows would become possible, a data-integrity
+/// loss. `schema pull` must therefore retain the REAL constraint recreation via the
+/// index `definition` — `ALTER TABLE … ADD CONSTRAINT … EXCLUDE USING …`
+/// (`pg_get_constraintdef`) — so the snapshot round-trips the actual exclusion. A
+/// re-pull is byte-stable and `schema doctor` reports no drift.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_retains_exclude_constraint_as_real_constraint() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_exclude_constraint_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // A table with a range EXCLUDE constraint. `tstzrange WITH &&` needs no
+    // extension (gist supports range types out of the box), so no `CREATE EXTENSION`
+    // is required. `created_at TIMESTAMP NOT NULL DEFAULT NOW()` matches the column
+    // the managed-model parser would synthesize; the EXCLUDE itself is unmodellable.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_reservations",
+        "CREATE TABLE reservations (id BIGSERIAL PRIMARY KEY, during tstzrange NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT NOW(), EXCLUDE USING gist (during WITH &&));",
+        "DROP TABLE reservations;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the EXCLUDE constraint must be retained as the real ADD CONSTRAINT form,
+    // NOT the bare backing CREATE INDEX.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+
+    assert!(
+        snap.contains("EXCLUDE USING gist"),
+        "the EXCLUDE constraint is retained via its ADD CONSTRAINT … EXCLUDE USING … definition: {snap}"
+    );
+    assert!(
+        snap.contains("ADD CONSTRAINT"),
+        "the retained definition is the real constraint recreation (ALTER TABLE … ADD CONSTRAINT): {snap}"
+    );
+    assert!(
+        snap.contains("\"definition\""),
+        "the raw definition field is serialized for the EXCLUDE constraint index: {snap}"
+    );
+
+    // A second pull round-trips clean against the just-pulled baseline (byte-stable).
+    let snap_before = snap;
+    let (pull2_out, pull2_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull2_out, &pull2_err);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("snapshot after second pull");
+    assert_eq!(
+        snap_before, snap_after,
+        "a re-pull of the same database must be byte-for-byte stable (no EXCLUDE-constraint drift)"
+    );
+
+    // doctor agrees the DB matches the pulled baseline (retained EXCLUDE is stable).
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports the DB matches the snapshot with the EXCLUDE constraint:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
 /// Brownfield adoption with the natural `#[unique]` annotation (the P2 fix): after
 /// `schema pull` retains the constraint-owned `accounts_email_key` index, the user
 /// writes the natural model `Account { id, email }` and DOES declare `#[unique]` on

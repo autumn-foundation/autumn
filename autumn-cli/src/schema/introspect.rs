@@ -72,23 +72,30 @@
 //! - **Enum `CHECK` constraints**: enum recovery from `CHECK` expressions is a
 //!   later slice; a `TEXT`-with-`CHECK` column pulls back as plain
 //!   [`Text`](ColumnType::Text).
-//! - **Constraint-vs-index reconciliation for constraint-owned indexes**: a
-//!   brownfield `UNIQUE`/`EXCLUDE` constraint is retained by its *index*
-//!   definition (`pg_get_indexdef`, a valid `CREATE UNIQUE INDEX …`), not by the
-//!   originating `ALTER TABLE … ADD CONSTRAINT`. So if the authoritative path
-//!   (`pull --dry-run`) ever rendered a recreation it would emit the
-//!   `CREATE UNIQUE INDEX` form rather than re-adding the constraint. A model that
+//! - **Constraint-vs-index reconciliation for constraint-owned indexes**: an
+//!   **EXCLUDE** constraint (`pg_constraint.contype = 'x'`) IS preserved as the real
+//!   constraint: its retained `definition` is the
+//!   `ALTER TABLE … ADD CONSTRAINT <name> <pg_get_constraintdef>` form
+//!   (`EXCLUDE USING <method> (…)`), so a recreation
+//!   re-establishes the actual exclusion rather than a plain index that would fail
+//!   to enforce it (which would let overlapping rows through — a data-integrity
+//!   loss). A brownfield `UNIQUE` (or PK) constraint-owned index, by contrast, is
+//!   still retained by its *index* definition (`pg_get_indexdef`, a valid
+//!   `CREATE UNIQUE INDEX …`), not by the originating
+//!   `ALTER TABLE … ADD CONSTRAINT` — a recreation emits the `CREATE UNIQUE INDEX` form, which enforces
+//!   the same uniqueness, so exact constraint-*object* reconstruction for
+//!   unique/PK constraints remains the documented deferral. A model that
 //!   *also* declares `#[unique]` on a column already covered by a brownfield
-//!   `UNIQUE` constraint is now **recognized as satisfied** by the existing unique
+//!   `UNIQUE` constraint is **recognized as satisfied** by the existing unique
 //!   index: `diff_indexes` (model-diff path) treats a desired unique index whose
 //!   exact column set is already enforced by any baseline `unique` index — including
 //!   the retained constraint index — as fulfilled, so it emits **no** redundant
 //!   `AddIndex` (and no `DropIndex`), and the plan is clean rather than tripping
 //!   `guard_plan`'s unique-index dedup refusal. (This resolves the earlier
 //!   "additively creates a redundant `idx_<table>_<col>_unique` index" caveat.)
-//!   Full constraint↔index reconciliation is otherwise deferred; the load-bearing
-//!   property this slice guarantees is only that the generated migration no longer
-//!   *fails* with a rejected `DROP INDEX`.
+//!   Full unique/PK constraint↔index reconciliation is otherwise deferred; the
+//!   load-bearing property this slice guarantees is only that the generated
+//!   migration no longer *fails* with a rejected `DROP INDEX`.
 //! - **Cascade-dropped retained indexes on a dropped column**: when a model
 //!   removes a column that a retained (`definition`-carrying) expression / partial
 //!   / constraint-owned index depends on, Postgres cascade-drops that index with
@@ -101,11 +108,13 @@
 //!   the authoritative cascade set Postgres itself uses — so the diff engine tests
 //!   dependency by exact set membership, never a `definition`-text scan (which
 //!   could false-positive on a column name appearing in a string literal). One
-//!   nuance remains deferred: a cascade-removed brownfield `UNIQUE`/`EXCLUDE`
+//!   nuance remains deferred: a cascade-removed brownfield `UNIQUE` (or PK)
 //!   *constraint* is restored on rollback as a unique *index* (via its
 //!   `pg_get_indexdef` definition), not as the original named `CONSTRAINT` —
 //!   functional uniqueness is preserved, exact constraint-object reconstruction is
-//!   deferred.
+//!   deferred. (An **EXCLUDE** constraint is not subject to this deferral: it is
+//!   restored as the real `ADD CONSTRAINT … EXCLUDE USING …`, per the reconciliation
+//!   note above.)
 //!
 //! Errors are **credential-safe** by construction: no variant ever embeds the
 //! resolved database URL (only a parsed host/port on the connection-error path,
@@ -270,6 +279,24 @@ struct IndexRow {
     /// model DSL cannot express it, so it is retained verbatim.
     #[diesel(sql_type = diesel::sql_types::Bool)]
     is_constraint: bool,
+    /// The backing constraint's `pg_constraint.contype` (`'u'` unique, `'x'`
+    /// EXCLUDE), or `''` when the index backs no constraint. An `'x'` EXCLUDE index
+    /// must be retained as its real `ADD CONSTRAINT` (not just the backing
+    /// `CREATE INDEX`), because a plain index does not enforce the exclusion — see
+    /// [`collapse_indexes`].
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    constraint_type: String,
+    /// The backing constraint's name (`pg_constraint.conname`), or `''` when the
+    /// index backs no constraint. Used to build the `ALTER TABLE … ADD CONSTRAINT
+    /// <name> …` recreation for an EXCLUDE constraint.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    constraint_name: String,
+    /// The backing constraint's canonical definition (`pg_get_constraintdef`), or
+    /// `''` when the index backs no constraint. For an EXCLUDE constraint this is
+    /// `EXCLUDE USING <method> (…)`, which the `ALTER TABLE … ADD CONSTRAINT` form
+    /// wraps into a valid, exclusion-enforcing recreation statement.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    constraint_def: String,
     /// Comma-joined resolvable ordinary *key* column names, in key order (may be
     /// empty for an all-expression index). Used to populate a *simple* index's
     /// `Index.columns` for round-trip parity.
@@ -436,7 +463,10 @@ fn fetch_primary_keys(
 /// aggregated in true key order via a correlated `unnest(indkey) WITH
 /// ORDINALITY` subquery; `has_expression` flags any `0` key, `is_partial`
 /// flags an `indpred`, and `is_constraint` flags an index backing a
-/// `pg_constraint` (UNIQUE/EXCLUDE), so the builder can classify each index as
+/// `pg_constraint` (UNIQUE/EXCLUDE) — with `constraint_type` (`pg_constraint.contype`),
+/// `constraint_name` (`conname`), and `constraint_def` (`pg_get_constraintdef`) so an
+/// EXCLUDE constraint can be recreated as the real constraint rather than a bare
+/// backing index — so the builder can classify each index as
 /// simple-representable vs. preserved-verbatim. A separate `key_columns` projection
 /// aggregates only the first `indnkeyatts` (true KEY) attributes — excluding
 /// `INCLUDE` columns and yielding empty for an expression key — which is the exact
@@ -463,6 +493,9 @@ fn fetch_indexes(
          (0 = ANY(string_to_array(i.indkey::text, ' ')::int[])) AS has_expression, \
          (i.indnkeyatts < i.indnatts) AS has_include, \
          EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid) AS is_constraint, \
+         COALESCE((SELECT c.contype::text FROM pg_constraint c WHERE c.conindid = i.indexrelid LIMIT 1), '') AS constraint_type, \
+         COALESCE((SELECT c.conname FROM pg_constraint c WHERE c.conindid = i.indexrelid LIMIT 1), '') AS constraint_name, \
+         COALESCE((SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c WHERE c.conindid = i.indexrelid LIMIT 1), '') AS constraint_def, \
          COALESCE(( \
            SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
            FROM unnest(string_to_array(i.indkey::text, ' ')::int[]) \
@@ -631,6 +664,17 @@ fn build_table(
 ///   that Postgres would reject. A single-column constraint-owned unique index
 ///   still sets the owning column's `unique` flag (accurate, and the flag is not
 ///   diffed) — that classification is independent of constraint ownership.
+///
+///   An **EXCLUDE** constraint (`pg_constraint.contype = 'x'`) is a special case:
+///   its backing `CREATE INDEX` (`pg_get_indexdef`) does NOT enforce the exclusion,
+///   so retaining only the plain index would let overlapping rows through on a
+///   rollback/recreation (a data-integrity loss). For an EXCLUDE index the retained
+///   `definition` is therefore the REAL constraint recreation —
+///   `ALTER TABLE <table> ADD CONSTRAINT <conname> <pg_get_constraintdef>` (whose
+///   `pg_get_constraintdef` is `EXCLUDE USING <method> (…)`) — so `index_sql`'s
+///   verbatim emission restores the actual exclusion constraint. A UNIQUE/PK
+///   constraint-owned index keeps its `pg_get_indexdef` (`CREATE UNIQUE INDEX`)
+///   recreation, which enforces the same uniqueness (the documented deferral).
 fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSet<String>) {
     let mut indexes = Vec::with_capacity(rows.len());
     let mut unique_columns = std::collections::BTreeSet::new();
@@ -678,18 +722,39 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
                 .filter(|c| !c.is_empty())
                 .map(str::to_owned)
                 .collect();
-            // For a `definition`-carrying index (expression / partial / covering /
-            // constraint-owned) the KEY columns are recorded explicitly: they differ
-            // from `columns` (which is the full cascade dependency set here) and are
-            // EMPTY for an expression key, which is exactly the signal the diff uses to
-            // refuse to treat such an index as satisfying a model `#[unique]`.
-            let key_cols: Vec<String> = row
-                .key_columns
-                .split(',')
-                .filter(|c| !c.is_empty())
-                .map(str::to_owned)
-                .collect();
-            (dep_columns, Some(row.definition.clone()), key_cols)
+            if row.is_constraint && row.constraint_type == "x" {
+                // An EXCLUDE constraint (`pg_constraint.contype = 'x'`) is backed by
+                // an index, but the backing `CREATE INDEX` (pg_get_indexdef) alone
+                // does NOT enforce the exclusion — recreating only the plain index on
+                // rollback would silently allow overlapping rows (a data-integrity
+                // loss). Retain the REAL constraint instead: `pg_get_constraintdef`
+                // yields `EXCLUDE USING <method> (…)`, which the `ALTER TABLE … ADD
+                // CONSTRAINT <name> …` form wraps into a valid, exclusion-enforcing
+                // statement (`index_sql` emits `definition` verbatim). The table is
+                // referenced by its bare name, matching the rest of the emitter
+                // (`index_sql`'s plain branch / `CREATE TABLE`). `key_columns` is left
+                // empty: an EXCLUDE index is not `unique`, so it never participates in
+                // the model `#[unique]` coverage check.
+                let definition = format!(
+                    "ALTER TABLE {} ADD CONSTRAINT {} {}",
+                    row.table_name, row.constraint_name, row.constraint_def
+                );
+                (dep_columns, Some(definition), Vec::new())
+            } else {
+                // For a `definition`-carrying index (expression / partial / covering /
+                // unique-constraint-owned) the KEY columns are recorded explicitly:
+                // they differ from `columns` (which is the full cascade dependency set
+                // here) and are EMPTY for an expression key, which is exactly the
+                // signal the diff uses to refuse to treat such an index as satisfying a
+                // model `#[unique]`.
+                let key_cols: Vec<String> = row
+                    .key_columns
+                    .split(',')
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                (dep_columns, Some(row.definition.clone()), key_cols)
+            }
         };
         indexes.push(Index {
             name: row.index_name.clone(),
@@ -914,6 +979,9 @@ mod tests {
             has_expression,
             has_include: false,
             is_constraint: false,
+            constraint_type: String::new(),
+            constraint_name: String::new(),
+            constraint_def: String::new(),
             columns: columns.to_owned(),
             // Mirror the SQL `key_columns`: empty when any key position is an
             // expression, otherwise the (non-INCLUDE) key columns — which, for these
@@ -939,8 +1007,40 @@ mod tests {
     ) -> IndexRow {
         IndexRow {
             is_constraint: true,
+            // A UNIQUE constraint (`contype = 'u'`) — the EXCLUDE (`'x'`) path is
+            // exercised by [`exclude_constraint_index_row`].
+            constraint_type: "u".to_owned(),
             ..index_row(
                 index_name, is_unique, columns, columns, false, false, definition,
+            )
+        }
+    }
+
+    /// Build an EXCLUDE-constraint-owned (`contype = 'x'`) [`IndexRow`]. The
+    /// `constraint_def` is the `pg_get_constraintdef` text (`EXCLUDE USING <method>
+    /// (…)`); the backing index `definition` is a plain `CREATE INDEX` Postgres
+    /// auto-created, which alone would NOT enforce the exclusion.
+    fn exclude_constraint_index_row(
+        index_name: &str,
+        constraint_name: &str,
+        dep_columns: &str,
+        index_definition: &str,
+        constraint_def: &str,
+    ) -> IndexRow {
+        IndexRow {
+            is_constraint: true,
+            constraint_type: "x".to_owned(),
+            constraint_name: constraint_name.to_owned(),
+            constraint_def: constraint_def.to_owned(),
+            // An EXCLUDE index is never `unique`.
+            ..index_row(
+                index_name,
+                false,
+                dep_columns,
+                dep_columns,
+                false,
+                false,
+                index_definition,
             )
         }
     }
@@ -1089,6 +1189,60 @@ mod tests {
         assert!(
             unique_cols.contains("email"),
             "single-column constraint-owned unique still sets the column unique flag"
+        );
+    }
+
+    #[test]
+    fn collapse_indexes_exclude_constraint_retained_as_real_constraint() {
+        // A range EXCLUDE constraint (`EXCLUDE USING gist (during WITH &&)`) is
+        // backed by a gist index Postgres auto-creates. Retaining ONLY that backing
+        // `CREATE INDEX` would NOT enforce the exclusion on a rollback/recreation
+        // (overlapping rows become possible — a data-integrity loss), so the retained
+        // `definition` must be the REAL constraint recreation: `ALTER TABLE … ADD
+        // CONSTRAINT … EXCLUDE USING …`, not a `CREATE INDEX`.
+        let index_def =
+            "CREATE INDEX reservations_during_excl ON public.reservations USING gist (during)";
+        let constraint_def = "EXCLUDE USING gist (during WITH &&)";
+        let rows = vec![exclude_constraint_index_row(
+            "reservations_during_excl",
+            "reservations_during_excl",
+            "during",
+            index_def,
+            constraint_def,
+        )];
+        let (indexes, unique_cols) = collapse_indexes(&rows);
+        assert_eq!(indexes.len(), 1);
+        let idx = &indexes[0];
+        let def = idx
+            .definition
+            .as_deref()
+            .expect("EXCLUDE constraint must be retained via a definition");
+        assert!(
+            def.contains("ADD CONSTRAINT reservations_during_excl")
+                && def.contains("EXCLUDE USING gist"),
+            "EXCLUDE index must be recreated as the real ADD CONSTRAINT … EXCLUDE form, got: {def}"
+        );
+        assert!(
+            !def.starts_with("CREATE INDEX") && !def.contains("CREATE INDEX"),
+            "the retained definition must NOT be the bare backing CREATE INDEX, got: {def}"
+        );
+        assert_eq!(
+            def,
+            // The fixture's table_name is "t"; the ALTER uses the bare table name
+            // form the emitter uses elsewhere (`index_sql` plain branch / CREATE TABLE).
+            "ALTER TABLE t ADD CONSTRAINT reservations_during_excl EXCLUDE USING gist (during WITH &&)",
+            "the ALTER TABLE must use the bare table name form the emitter uses elsewhere"
+        );
+        // Dependency (cascade) set is still populated; not unique; key_columns empty.
+        assert_eq!(idx.columns, vec!["during".to_owned()]);
+        assert!(!idx.unique, "an EXCLUDE index is not unique");
+        assert!(
+            idx.key_columns.is_empty(),
+            "EXCLUDE index leaves key_columns empty (not a #[unique] candidate)"
+        );
+        assert!(
+            unique_cols.is_empty(),
+            "an EXCLUDE constraint sets no column unique flag"
         );
     }
 
