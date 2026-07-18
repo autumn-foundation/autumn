@@ -897,6 +897,7 @@ fn build_table(
             is_pk,
             primary_key,
             row.owns_sequence,
+            row.is_identity.eq_ignore_ascii_case("YES"),
         );
         // Identity marker: preserve a `GENERATED { ALWAYS | BY DEFAULT } AS
         // IDENTITY` column's generation clause verbatim so it round-trips a pull
@@ -1186,19 +1187,38 @@ fn serial_kind_for(
     is_primary_key: bool,
     primary_key: &[String],
     owns_sequence: bool,
+    is_identity: bool,
 ) -> Option<SerialKind> {
-    if !is_primary_key || primary_key.len() != 1 || !owns_sequence {
+    // The serial-vs-plain distinction only applies to a single-column INTEGER
+    // primary key. A composite/non-PK column, a non-integer PK (e.g. a UUID id), or
+    // a `GENERATED … AS IDENTITY` column (whose id-generation is carried by the
+    // separate `identity` marker) leaves this `None` — "not applicable", which the
+    // diff treats as compatible.
+    if !is_primary_key
+        || primary_key.len() != 1
+        || is_identity
+        || !matches!(ty, ColumnType::Int32 | ColumnType::Int64)
+    {
         return None;
     }
-    let lowered = raw_default?.trim().to_ascii_lowercase();
-    if !lowered.starts_with("nextval(") {
-        return None;
+    // An owned `nextval(...)` default is a `SERIAL`/`BIGSERIAL` id (distinguished by
+    // int4 vs int8). Computed from the RAW default (before `normalize_default`
+    // strips an int8 owned-serial default to `None`).
+    if owns_sequence
+        && raw_default
+            .map(|d| d.trim().to_ascii_lowercase())
+            .is_some_and(|d| d.starts_with("nextval("))
+    {
+        return Some(match ty {
+            ColumnType::Int32 => SerialKind::Serial,
+            _ => SerialKind::BigSerial,
+        });
     }
-    match ty {
-        ColumnType::Int64 => Some(SerialKind::BigSerial),
-        ColumnType::Int32 => Some(SerialKind::Serial),
-        _ => None,
-    }
+    // A single-column integer PK that owns no sequence is a genuine plain,
+    // manually-assigned id. Emit an EXPLICIT `Plain` marker (never `None`, which is
+    // reserved for legacy/unknown) so a plain-int-PK ↔ serial mismatch surfaces as
+    // drift while a legacy snapshot (marker absent) stays compatible.
+    Some(SerialKind::Plain)
 }
 
 // ===========================================================================
@@ -1280,6 +1300,20 @@ pub fn introspect_sqlite(url: &str) -> Result<Vec<Table>, IntrospectError> {
     use diesel::{Connection as _, SqliteConnection};
 
     let target = sqlite_target(url);
+    // Guard against SQLite's create-if-missing behavior: `establish` on a
+    // nonexistent file SUCCEEDS against a brand-new EMPTY database, so a typo'd or
+    // missing DB path would otherwise pull ZERO tables and (on a non-dry-run pull)
+    // silently overwrite the checked-in snapshot with an empty one. For a plain
+    // file-backed target, require the file to already exist. `:memory:` and `file:`
+    // URI forms (which may legitimately encode `mode=`/shared-cache/`:memory:`
+    // semantics) are exempt — they are not plain filesystem paths and are left to
+    // diesel to open.
+    if target != ":memory:"
+        && !target.starts_with("file:")
+        && !std::path::Path::new(&target).exists()
+    {
+        return Err(IntrospectError::ConnectionSqlite { path: target });
+    }
     let mut conn = SqliteConnection::establish(&target)
         .map_err(|_| IntrospectError::ConnectionSqlite { path: target })?;
     sqlite::introspect(&mut conn)
@@ -1414,7 +1448,13 @@ mod sqlite {
     }
 
     /// List app tables (name + `CREATE TABLE` SQL), excluding `SQLite` internal
-    /// tables, the Diesel migrations table, and framework-owned tables.
+    /// tables, the Diesel migrations table, framework-owned tables, and **FTS5
+    /// search-index tables** — the `CREATE VIRTUAL TABLE "<table>__fts" USING fts5(…)`
+    /// index a `--searchable` model generates (issue #1910) plus its internal shadow
+    /// tables (`<vtab>_data`/`_idx`/`_content`/`_docsize`/`_config`). Those are stored
+    /// in `sqlite_master` as `type = 'table'` with non-`sqlite_` names, but the model
+    /// parser never emits them, so pulling them as managed application tables would
+    /// make a follow-up `schema diff`/doctor report/drop the search-index state.
     fn list_tables(
         conn: &mut SqliteConnection,
     ) -> Result<Vec<(String, Option<String>)>, IntrospectError> {
@@ -1424,11 +1464,44 @@ mod sqlite {
         )
         .load(conn)
         .map_err(|e| query_err(&e))?;
+        // Virtual tables (their `sql` starts with `CREATE VIRTUAL TABLE`) are never
+        // model-expressible; collect them so their FTS5 shadow tables can be
+        // excluded alongside the vtab itself.
+        let virtual_tables: Vec<String> = rows
+            .iter()
+            .filter(|r| r.sql.as_deref().is_some_and(is_create_virtual_table))
+            .map(|r| r.name.clone())
+            .collect();
         Ok(rows
             .into_iter()
-            .filter(|r| !super::is_framework_table(&r.name))
+            .filter(|r| {
+                !super::is_framework_table(&r.name)
+                    && !is_virtual_or_fts5_shadow_table(&r.name, &virtual_tables)
+            })
             .map(|r| (r.name, r.sql))
             .collect())
+    }
+
+    /// Whether `sql` is a `CREATE VIRTUAL TABLE …` statement (an FTS5 search index or
+    /// any other module-backed vtab) — none of which the model parser can express.
+    fn is_create_virtual_table(sql: &str) -> bool {
+        sql.trim_start()
+            .to_ascii_uppercase()
+            .starts_with("CREATE VIRTUAL TABLE")
+    }
+
+    /// The FTS5 internal shadow-table suffixes appended to the virtual-table name.
+    const FTS5_SHADOW_SUFFIXES: [&str; 5] = ["_data", "_idx", "_content", "_docsize", "_config"];
+
+    /// Whether `name` is one of the `virtual_tables` itself or one of its FTS5 shadow
+    /// tables (`<vtab>` + a [`FTS5_SHADOW_SUFFIXES`] suffix).
+    fn is_virtual_or_fts5_shadow_table(name: &str, virtual_tables: &[String]) -> bool {
+        virtual_tables.iter().any(|vtab| {
+            name == vtab
+                || FTS5_SHADOW_SUFFIXES
+                    .iter()
+                    .any(|suffix| name == format!("{vtab}{suffix}"))
+        })
     }
 
     /// Fetch every column of every table in one batched `pragma_table_info` join.
@@ -1491,8 +1564,19 @@ mod sqlite {
         Ok(by_index)
     }
 
-    /// Fetch single-column foreign keys (`seq = 0`) of every table in one batched
+    /// Fetch **single-column** foreign keys of every table in one batched
     /// `pragma_foreign_key_list` join.
+    ///
+    /// `pragma_foreign_key_list` returns one row PER referencing column, grouped by
+    /// the `id` column and ordered by `seq`; a composite (multi-column) FK spans
+    /// several rows sharing the same `id`. The IR [`ForeignKey`] is single-column
+    /// only, and the model parser never emits a composite FK, so — matching the
+    /// fail-closed posture of the Postgres arm (which defers composite FKs) — a
+    /// composite FK is **omitted entirely** here rather than flattened to a wrong
+    /// single-column FK (which would cause spurious drift / an incorrect recreate).
+    /// The `fkl.id NOT IN (… seq > 0 …)` predicate drops every `id` group that has
+    /// any `seq > 0` row, keeping only genuinely single-column FKs (the surviving
+    /// `seq = 0` rows).
     fn fetch_foreign_keys(
         conn: &mut SqliteConnection,
     ) -> Result<BTreeMap<String, Vec<ForeignKeyRow>>, IntrospectError> {
@@ -1500,7 +1584,9 @@ mod sqlite {
             "SELECT m.name AS table_name, fkl.\"table\" AS foreign_table, \
              fkl.\"from\" AS column_name, fkl.\"to\" AS foreign_column \
              FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) fkl \
-             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND fkl.seq = 0",
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND fkl.seq = 0 \
+             AND fkl.id NOT IN ( \
+               SELECT fkl2.id FROM pragma_foreign_key_list(m.name) fkl2 WHERE fkl2.seq > 0)",
         )
         .load(conn)
         .map_err(|e| query_err(&e))?;
@@ -1546,9 +1632,17 @@ mod sqlite {
     /// Normalize a raw `SQLite` `dflt_value` into a [`ColumnDefault`]. Recovers the
     /// Autumn `Timestamp` convention default (`CURRENT_TIMESTAMP` → [`Now`]) and
     /// preserves anything else verbatim.
+    ///
+    /// `pragma_table_info.dflt_value` reports the literal keyword `NULL` (bareword,
+    /// any case) for a `DEFAULT NULL` clause — which is semantically "no default",
+    /// the same as a column with no `DEFAULT` at all. Capturing it as a real
+    /// `Sql("NULL")` default would create spurious drift against a model column that
+    /// simply has no default, so a bareword `NULL` maps to `None`. A **quoted**
+    /// `'NULL'` (the 4-character text value) is a genuine string default and is
+    /// preserved verbatim — only the unquoted keyword means "no default".
     fn sqlite_default(raw: Option<&str>) -> Option<ColumnDefault> {
         let raw = raw?.trim();
-        if raw.is_empty() {
+        if raw.is_empty() || raw.eq_ignore_ascii_case("NULL") {
             return None;
         }
         if raw.eq_ignore_ascii_case("CURRENT_TIMESTAMP") {
@@ -1624,15 +1718,20 @@ mod sqlite {
             column.primary_key = is_pk;
             column.unique = unique_columns.contains(row.column_name.as_str());
             column.default = default;
-            // Serial marker: a single-column INTEGER PK of an AUTOINCREMENT table is
-            // the Autumn `BigSerial` id (SQLite has one 64-bit rowid — always
-            // BigSerial), symmetric with what the model parser records.
-            if is_pk
-                && single_pk
-                && autoincrement
-                && matches!(affinity(&row.decl_type), Affinity::Integer)
-            {
-                column.serial = Some(SerialKind::BigSerial);
+            // Serial marker (three-state): a single-column INTEGER PK of an
+            // AUTOINCREMENT table is the Autumn `BigSerial` id (SQLite has one 64-bit
+            // rowid — always BigSerial), symmetric with what the model parser
+            // records. A single-column INTEGER PK WITHOUT `AUTOINCREMENT` is a
+            // genuine plain, manually-assigned id → an EXPLICIT `Plain` marker (never
+            // `None`, which is reserved for legacy/unknown snapshots) so a
+            // plain-int-PK ↔ `BigSerial`-model mismatch surfaces as drift while a
+            // legacy snapshot stays compatible.
+            if is_pk && single_pk && matches!(affinity(&row.decl_type), Affinity::Integer) {
+                column.serial = Some(if autoincrement {
+                    SerialKind::BigSerial
+                } else {
+                    SerialKind::Plain
+                });
             }
             if let Some(fk) = fk_by_column.get(row.column_name.as_str()) {
                 let foreign_column = fk.foreign_column.clone().unwrap_or_else(|| "id".to_owned());
@@ -1652,6 +1751,16 @@ mod sqlite {
     /// `collapse_indexes`). A partial or expression index is retained verbatim via its
     /// `CREATE INDEX` SQL; a plain index is representable by its columns. The primary
     /// key auto-index (`origin = 'pk'`) is skipped (the PK is modeled separately).
+    ///
+    /// A `UNIQUE`-constraint auto-index (`origin = 'u'`, e.g. an inline `col TEXT
+    /// UNIQUE` or a table-level `UNIQUE(a, b)` — named `sqlite_autoindex_<table>_<n>`)
+    /// has **no** standalone `CREATE INDEX` statement in `sqlite_master` and therefore
+    /// **cannot be `DROP INDEX`ed** — it is owned by the constraint. It is treated
+    /// like the Postgres arm's constraint-owned unique index: retained verbatim via a
+    /// synthesized `definition` (so a *model* diff never emits an undroppable
+    /// `DropIndex` for a brownfield inline-`UNIQUE`), with its `key_columns` recorded
+    /// (so it still covers a matching `#[unique]` model, yielding a clean round-trip).
+    /// A single-column `origin = 'u'` also marks the column `unique = true`.
     fn collapse_indexes(
         table_name: &str,
         rows: &[IndexRow],
@@ -1671,6 +1780,27 @@ mod sqlite {
                 cols.iter().filter_map(|c| c.column_name.clone()).collect();
             let is_unique = row.is_unique != 0;
             let is_partial = row.partial != 0;
+
+            // A UNIQUE-constraint auto-index (`origin = 'u'`) is owned by the
+            // constraint and cannot be dropped independently; retain it verbatim via
+            // a synthesized definition and record its key columns (see the fn note).
+            if row.origin == "u" {
+                if is_unique && !has_expression && key_columns.len() == 1 {
+                    unique_columns.insert(key_columns[0].clone());
+                }
+                let definition =
+                    synthesized_unique_constraint_ddl(&row.index_name, table_name, &key_columns);
+                indexes.push(Index {
+                    name: row.index_name.clone(),
+                    columns: key_columns.clone(),
+                    unique: is_unique,
+                    definition: Some(definition),
+                    is_partial,
+                    key_columns,
+                });
+                continue;
+            }
+
             let simple = !is_partial && !has_expression;
             if simple && is_unique && key_columns.len() == 1 {
                 unique_columns.insert(key_columns[0].clone());
@@ -1688,6 +1818,20 @@ mod sqlite {
             });
         }
         (indexes, unique_columns)
+    }
+
+    /// Reconstruct a deterministic `CREATE UNIQUE INDEX` statement for a
+    /// `UNIQUE`-constraint auto-index (which has no stored SQL of its own), used only
+    /// as the retained index's `definition` identity token — it is never emitted as
+    /// real DDL (the index is retained, never recreated). Deterministic so a re-pull
+    /// is byte-stable and two authoritative introspections compare equal.
+    fn synthesized_unique_constraint_ddl(name: &str, table: &str, cols: &[String]) -> String {
+        let col_list = cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("CREATE UNIQUE INDEX \"{name}\" ON \"{table}\" ({col_list})")
     }
 
     #[cfg(test)]
@@ -1742,6 +1886,23 @@ mod sqlite {
             );
         }
 
+        #[test]
+        fn default_bareword_null_is_no_default_but_quoted_null_is_preserved() {
+            // A `DEFAULT NULL` clause surfaces as the bareword keyword `NULL`
+            // (any case, possibly padded), which is semantically "no default" — it
+            // must map to `None` so it never drifts against a model column that has
+            // no default.
+            assert_eq!(sqlite_default(Some("NULL")), None);
+            assert_eq!(sqlite_default(Some("null")), None);
+            assert_eq!(sqlite_default(Some("  Null  ")), None);
+            // A QUOTED `'NULL'` is the real 4-character text value, a genuine string
+            // default — it must survive verbatim.
+            assert_eq!(
+                sqlite_default(Some("'NULL'")),
+                Some(ColumnDefault::Sql("'NULL'".to_owned()))
+            );
+        }
+
         fn col_row(
             name: &str,
             decl: &str,
@@ -1793,14 +1954,17 @@ mod sqlite {
         }
 
         #[test]
-        fn build_table_plain_integer_pk_is_not_serial() {
+        fn build_table_plain_integer_pk_is_marked_plain() {
             // Without AUTOINCREMENT in the table SQL, an INTEGER PK is a plain rowid
-            // alias, not an Autumn BigSerial id → serial marker stays None.
+            // alias, not an Autumn BigSerial id → an EXPLICIT `Plain` marker (three-
+            // state: never `None`, which is reserved for legacy/unknown snapshots),
+            // so it drifts against a `BigSerial` model while a legacy snapshot stays
+            // compatible.
             let columns = vec![col_row("id", "INTEGER", 0, None, 1)];
             let table_sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY)";
             let table = build_table("posts", table_sql, &columns, &[], &BTreeMap::new(), &[]);
             let id = table.columns.iter().find(|c| c.name == "id").unwrap();
-            assert!(id.serial.is_none());
+            assert_eq!(id.serial, Some(SerialKind::Plain));
         }
 
         #[test]
@@ -1877,6 +2041,85 @@ mod sqlite {
                 indexes[0].definition.as_deref().unwrap().contains("WHERE"),
                 "a partial index is retained verbatim via its CREATE INDEX SQL"
             );
+        }
+
+        #[test]
+        fn collapse_indexes_unique_constraint_autoindex_is_retained_not_droppable() {
+            // A `col TEXT UNIQUE` inline constraint produces a `sqlite_autoindex_*`
+            // (origin = 'u') with NO standalone CREATE INDEX SQL. It must be retained
+            // via a synthesized definition (so a model diff never emits an undroppable
+            // DropIndex) and carry its key columns (so it covers a matching
+            // `#[unique]` model), and mark the column unique.
+            let rows = vec![IndexRow {
+                table_name: "accounts".to_owned(),
+                index_name: "sqlite_autoindex_accounts_1".to_owned(),
+                is_unique: 1,
+                origin: "u".to_owned(),
+                partial: 0,
+                index_sql: None,
+            }];
+            let mut index_columns = BTreeMap::new();
+            index_columns.insert(
+                (
+                    "accounts".to_owned(),
+                    "sqlite_autoindex_accounts_1".to_owned(),
+                ),
+                vec![IndexColumnRow {
+                    table_name: "accounts".to_owned(),
+                    index_name: "sqlite_autoindex_accounts_1".to_owned(),
+                    seqno: 0,
+                    column_name: Some("email".to_owned()),
+                }],
+            );
+            let (indexes, unique_cols) = collapse_indexes("accounts", &rows, &index_columns);
+            assert_eq!(indexes.len(), 1);
+            assert!(unique_cols.contains("email"), "the column is marked unique");
+            let idx = &indexes[0];
+            assert!(idx.unique);
+            assert_eq!(
+                idx.key_columns,
+                vec!["email".to_owned()],
+                "key columns recorded"
+            );
+            let def = idx.definition.as_deref().expect(
+                "a constraint autoindex carries a synthesized definition (retained, not droppable)",
+            );
+            assert!(
+                def.contains("CREATE UNIQUE INDEX") && def.contains("email"),
+                "definition reconstructs the constraint index: {def}"
+            );
+        }
+
+        #[test]
+        fn create_virtual_table_and_fts5_shadow_detection() {
+            assert!(is_create_virtual_table(
+                "CREATE VIRTUAL TABLE \"posts__fts\" USING fts5(\"title\")"
+            ));
+            assert!(is_create_virtual_table(
+                "  create virtual table x using fts5(a)"
+            ));
+            assert!(!is_create_virtual_table(
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY)"
+            ));
+
+            let vtabs = vec!["posts__fts".to_owned()];
+            // The vtab itself and each FTS5 shadow table are excluded.
+            for shadow in [
+                "posts__fts",
+                "posts__fts_data",
+                "posts__fts_idx",
+                "posts__fts_content",
+                "posts__fts_docsize",
+                "posts__fts_config",
+            ] {
+                assert!(
+                    is_virtual_or_fts5_shadow_table(shadow, &vtabs),
+                    "{shadow} must be excluded"
+                );
+            }
+            // A real application table (and a lookalike that is not a shadow) is kept.
+            assert!(!is_virtual_or_fts5_shadow_table("posts", &vtabs));
+            assert!(!is_virtual_or_fts5_shadow_table("posts__fts_other", &vtabs));
         }
     }
 }
@@ -2047,7 +2290,8 @@ mod tests {
                 &ColumnType::Int64,
                 true,
                 &pk,
-                true
+                true,
+                false
             ),
             Some(SerialKind::BigSerial)
         );
@@ -2058,27 +2302,31 @@ mod tests {
                 &ColumnType::Int32,
                 true,
                 &pk,
-                true
+                true,
+                false
             ),
             Some(SerialKind::Serial)
         );
-        // A plain BIGINT PRIMARY KEY (no default, no owned sequence) → None: this is
-        // the crux — it is NOT a BigSerial, and now the IR can tell them apart.
+        // A plain BIGINT PRIMARY KEY (no default, no owned sequence) → the EXPLICIT
+        // `Plain` marker (three-state): it is NOT a BigSerial, and the IR now tells
+        // them apart, while a legacy/unknown snapshot (marker absent) stays `None`.
         assert_eq!(
-            serial_kind_for(None, &ColumnType::Int64, true, &pk, false),
-            None
+            serial_kind_for(None, &ColumnType::Int64, true, &pk, false, false),
+            Some(SerialKind::Plain)
         );
-        // A shared/custom (non-owned) sequence default → None (not a conventional
-        // owned serial).
+        // A shared/custom (non-owned) sequence default is still a single-column
+        // integer PK with no OWNED sequence → the explicit `Plain` marker (it is not
+        // a conventional owned serial).
         assert_eq!(
             serial_kind_for(
                 Some("nextval('global_ids'::regclass)"),
                 &ColumnType::Int64,
                 true,
                 &pk,
+                false,
                 false
             ),
-            None
+            Some(SerialKind::Plain)
         );
         // A non-PK serial column → None (not an id).
         assert_eq!(
@@ -2087,8 +2335,20 @@ mod tests {
                 &ColumnType::Int64,
                 false,
                 &[],
-                true
+                true,
+                false
             ),
+            None
+        );
+        // A UUID PK → None (the serial-vs-plain distinction is integer-only).
+        assert_eq!(
+            serial_kind_for(None, &ColumnType::Uuid, true, &pk, false, false),
+            None
+        );
+        // A GENERATED … AS IDENTITY integer PK → None (its id-generation is carried
+        // by the separate `identity` marker, never the serial marker).
+        assert_eq!(
+            serial_kind_for(None, &ColumnType::Int64, true, &pk, false, true),
             None
         );
     }

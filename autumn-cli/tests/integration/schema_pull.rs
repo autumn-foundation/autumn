@@ -1759,8 +1759,8 @@ fn column_json<'a>(table: &'a serde_json::Value, column: &str) -> &'a serde_json
 /// FIDELITY (#1975): the IR now distinguishes a plain, manually-assigned `BIGINT
 /// PRIMARY KEY` (no owned sequence) from an owned-sequence `BIGSERIAL` id — both of
 /// which previously collapsed to an indistinguishable `Int64` PK with no default. A
-/// pulled `BIGSERIAL` carries `serial: BigSerial`; a plain `BIGINT PK` carries no
-/// serial marker. Consequently a model (whose `#[id]` is always `BigSerial`)
+/// pulled `BIGSERIAL` carries `serial: BigSerial`; a plain `BIGINT PK` carries the
+/// explicit `serial: Plain` marker. Consequently a model (whose `#[id]` is always `BigSerial`)
 /// round-trips clean against the `BIGSERIAL` table but shows a refused primary-key
 /// change against the plain `BIGINT PK` table.
 #[tokio::test]
@@ -1798,9 +1798,11 @@ async fn schema_pull_distinguishes_plain_bigint_pk_from_bigserial() {
         "a BIGSERIAL id must carry the serial marker: {serial_id}"
     );
     let plain_id = column_json(&tables["plain_ids"], "id");
-    assert!(
-        plain_id.get("serial").is_none(),
-        "a plain BIGINT PRIMARY KEY must carry NO serial marker: {plain_id}"
+    assert_eq!(
+        plain_id["serial"].as_str(),
+        Some("Plain"),
+        "a plain BIGINT PRIMARY KEY must carry the EXPLICIT Plain marker (three-state: \
+         never absent, which is reserved for legacy/unknown snapshots): {plain_id}"
     );
 
     // A re-pull is byte-for-byte stable (the markers round-trip).

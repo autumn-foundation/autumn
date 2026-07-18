@@ -536,6 +536,19 @@ pub enum SerialKind {
     /// model `#[id]` convention. On `SQLite` this is an `INTEGER PRIMARY KEY
     /// AUTOINCREMENT` column.
     BigSerial,
+    /// A **plain**, manually-assigned single-column integer primary key with **no**
+    /// owned sequence — a genuine `INTEGER`/`BIGINT PRIMARY KEY` (Postgres) or a
+    /// non-`AUTOINCREMENT` `INTEGER PRIMARY KEY` (`SQLite`). Emitted **only** by
+    /// database introspection.
+    ///
+    /// It is deliberately distinct from `None`: `None` means the marker is *unknown*
+    /// — a snapshot written before this field existed (serde default) — whereas
+    /// `Plain` is an **explicit** "introspected, and it genuinely owns no sequence"
+    /// signal. The diff treats `None` on either side as compatible (never drift), so
+    /// a legacy snapshot keeps round-tripping clean; a `Plain` vs `BigSerial`
+    /// mismatch (both explicit) still surfaces as real drift. The model parser never
+    /// emits `Plain` (its `#[id]` is always `BigSerial` or `Uuid`).
+    Plain,
 }
 
 /// A foreign-key relationship carried by a [`Column`] (see [`Column::references`]).

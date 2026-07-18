@@ -327,6 +327,28 @@ pub enum SchemaChange {
         column: String,
     },
 
+    /// A same-named column whose `GENERATED … AS IDENTITY` clause changed between
+    /// two authoritative introspections — e.g. the live database dropped the
+    /// identity (`GENERATED ALWAYS AS IDENTITY` → a plain column) or flipped its
+    /// generation (`ALWAYS` ↔ `BY DEFAULT`). A non-emittable marker: [`guard_plan`]
+    /// refuses any plan containing it (with **no override**).
+    ///
+    /// It exists so an identity-generation change surfaces as real drift in the
+    /// introspection diff (doctor's `database-schema-drift` and `pull --dry-run`)
+    /// instead of being silently ignored — changing an identity clause requires
+    /// `ADD`/`DROP`/`SET GENERATED …`, an exotic, out-of-scope operation this slice
+    /// does not auto-emit (mirroring the serial-PK id-generation refusal). It is
+    /// produced **only** in an authoritative diff (`definitions_authoritative`):
+    /// the model parser cannot express an identity clause, so in a model diff a
+    /// desired `identity: None` is "unknown, retained" (never drift), exactly like a
+    /// baseline `definition` index the DSL cannot describe.
+    IdentityChange {
+        /// The owning table name.
+        table: String,
+        /// The column whose identity clause changed.
+        column: String,
+    },
+
     /// A managed table is dropped while a **retained** table still holds a
     /// baseline foreign key pointing at it (e.g. drop `users` while
     /// `posts.user_id REFERENCES users(id)` survives). A non-emittable marker:
@@ -491,6 +513,21 @@ pub enum DiffError {
         /// The owning table name.
         table: String,
         /// The column whose FK target changed.
+        column: String,
+    },
+
+    /// A column's `GENERATED … AS IDENTITY` clause changed between two authoritative
+    /// introspections (unsupported this slice, **no override** — see
+    /// [`SchemaChange::IdentityChange`]).
+    #[error(
+        "identity-generation change on `{table}.{column}` is not supported in this slice: \
+         changing or dropping a `GENERATED … AS IDENTITY` clause requires an \
+         `ADD`/`DROP`/`SET GENERATED` migration this engine does not auto-emit."
+    )]
+    IdentityChange {
+        /// The owning table name.
+        table: String,
+        /// The column whose identity clause changed.
         column: String,
     },
 
@@ -1047,7 +1084,7 @@ fn diff_table(
     // likewise a primary-key change: converting one into the other requires
     // creating/dropping an owned sequence, which is deliberately out of scope for
     // an auto-generated migration, so it is refused through the same marker.
-    if base.primary_key != want.primary_key || single_pk_serial(base) != single_pk_serial(want) {
+    if base.primary_key != want.primary_key || serial_kinds_conflict(base, want) {
         changes.push(SchemaChange::PrimaryKeyChange {
             table: want.name.clone(),
         });
@@ -1070,7 +1107,7 @@ fn diff_table(
                 table: want.name.clone(),
                 column: want_col.clone(),
             }),
-            Some(base_col) => diff_column(&want.name, base_col, want_col, changes),
+            Some(base_col) => diff_column(&want.name, base_col, want_col, opts, changes),
         }
     }
 
@@ -1091,7 +1128,13 @@ fn diff_table(
 }
 
 /// Diff a single same-named column (keyed on name, never position).
-fn diff_column(table: &str, base: &Column, want: &Column, changes: &mut Vec<SchemaChange>) {
+fn diff_column(
+    table: &str,
+    base: &Column,
+    want: &Column,
+    opts: DiffOptions,
+    changes: &mut Vec<SchemaChange>,
+) {
     if base.ty != want.ty {
         changes.push(SchemaChange::AlterColumnType {
             table: table.to_owned(),
@@ -1159,6 +1202,23 @@ fn diff_column(table: &str, base: &Column, want: &Column, changes: &mut Vec<Sche
                 column: want.name.clone(),
             }),
         }
+    }
+
+    // Identity clause: an id-generation change (`GENERATED ALWAYS AS IDENTITY` →
+    // plain, or `ALWAYS` ↔ `BY DEFAULT`) is compared ONLY in an authoritative diff
+    // (both sides introspected — doctor's `database-schema-drift` and
+    // `pull --dry-run`). The model parser cannot express an identity clause, so in a
+    // model diff a desired `identity: None` is "unknown, retained" (never drift),
+    // exactly like a baseline `definition` index the DSL cannot describe — comparing
+    // it there would spuriously refuse every model against an identity-column DB.
+    // In an authoritative diff both sides carry the clause faithfully, so a genuine
+    // change surfaces as the refused `IdentityChange` marker instead of being
+    // silently dropped.
+    if opts.definitions_authoritative && base.identity != want.identity {
+        changes.push(SchemaChange::IdentityChange {
+            table: table.to_owned(),
+            column: want.name.clone(),
+        });
     }
 }
 
@@ -1486,6 +1546,12 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(DiffError::ForeignKeyChange { table, column });
     }
 
+    // 2a. Identity-generation change — no override (needs ADD/DROP/SET GENERATED,
+    //     out of scope this slice). Only produced by an authoritative diff.
+    if let Some(err) = find_identity_change_block(plan) {
+        return Err(err);
+    }
+
     // 2b. Foreign key added to a pre-existing column — no override. A baseline
     //     `references: None` is *unknown* (the parser cannot see an association
     //     FK), so the DB may already carry the `<table>_<column>_fkey` constraint;
@@ -1644,6 +1710,18 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
     }
 
     Ok(())
+}
+
+/// The [`DiffError::IdentityChange`] refusal for the first
+/// [`SchemaChange::IdentityChange`] marker in `plan`, if any.
+fn find_identity_change_block(plan: &MigrationPlan) -> Option<DiffError> {
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::IdentityChange { table, column } => Some(DiffError::IdentityChange {
+            table: table.clone(),
+            column: column.clone(),
+        }),
+        _ => None,
+    })
 }
 
 /// The [`DiffError::DropTableInboundReference`] refusal for the first
@@ -2176,6 +2254,7 @@ const fn change_table_name(change: &SchemaChange) -> &str {
         | SchemaChange::AddCheck { table, .. }
         | SchemaChange::PrimaryKeyChange { table }
         | SchemaChange::ForeignKeyChange { table, .. }
+        | SchemaChange::IdentityChange { table, .. }
         | SchemaChange::DropTableBlockedByInboundFk { table, .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { table, .. }
         | SchemaChange::AddForeignKeyToExistingColumn { table, .. }
@@ -2810,6 +2889,7 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         // Non-emittable markers; the guard refuses them before emission is reached.
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
+        | SchemaChange::IdentityChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
         | SchemaChange::AddForeignKeyToExistingColumn { .. }
@@ -2896,6 +2976,7 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
         // in the command flow. Render nothing defensively rather than panicking.
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
+        | SchemaChange::IdentityChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
         | SchemaChange::AddForeignKeyToExistingColumn { .. }
@@ -2983,6 +3064,7 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
         }
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
+        | SchemaChange::IdentityChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
         | SchemaChange::AddForeignKeyToExistingColumn { .. }
@@ -3171,16 +3253,38 @@ fn single_pk_column(table: &Table) -> Option<(&Column, IdKind)> {
 }
 
 /// The [`SerialKind`] marker of a table's single-column primary key, or `None` for
-/// a composite PK, no PK, or a non-serial (plain / UUID) single PK. Used by
+/// a composite PK, no PK, a UUID single PK, or a legacy/unknown snapshot (the marker
+/// predates the field). A plain integer PK carries `Some(Plain)`; an owned-sequence
+/// id carries `Some(Serial)`/`Some(BigSerial)`. Used by [`serial_kinds_conflict`] /
 /// [`diff_table`] to detect a plain-int-PK ↔ serial-PK id-generation change (which
-/// is refused like any other primary-key change). Two matching serial ids compare
-/// equal, so a model↔database round-trip of a `BIGSERIAL` id stays clean.
+/// is refused like any other primary-key change) while a legacy `None` never drifts.
 fn single_pk_serial(table: &Table) -> Option<SerialKind> {
     if table.primary_key.len() != 1 {
         return None;
     }
     let name = &table.primary_key[0];
     table.columns.iter().find(|c| &c.name == name)?.serial
+}
+
+/// Whether the two tables' single-column-PK [`SerialKind`] markers CONFLICT — i.e.
+/// both sides carry an **explicit** marker and they differ.
+///
+/// The marker is three-state: `None` is *unknown* (a snapshot written before the
+/// field existed — serde default — or a non-integer/composite PK), while
+/// `Some(_)` is an explicit introspected/parsed id-generation strategy. A conflict
+/// is flagged ONLY when both sides are `Some(_)` and differ, so:
+///   * a legacy snapshot (`None`) vs the parser's `Some(BigSerial)` → NO drift
+///     (backward-compatibility: an existing project's pre-marker snapshot keeps
+///     round-tripping clean instead of a spurious refused primary-key change);
+///   * a fresh `BIGSERIAL` pull (`Some(BigSerial)`) vs model `Some(BigSerial)` →
+///     no drift;
+///   * a genuine plain-`BIGINT`-PK pull (`Some(Plain)`) vs model `Some(BigSerial)`
+///     → drift (fidelity preserved).
+fn serial_kinds_conflict(base: &Table, want: &Table) -> bool {
+    matches!(
+        (single_pk_serial(base), single_pk_serial(want)),
+        (Some(a), Some(b)) if a != b
+    )
 }
 
 /// Derive the id-generation strategy for a single-column PK:
@@ -3311,6 +3415,9 @@ fn describe_change(change: &SchemaChange) -> String {
         SchemaChange::ForeignKeyChange { table, column } => {
             format!("! FOREIGN KEY RETARGET on {table}.{column} (refused)")
         }
+        SchemaChange::IdentityChange { table, column } => {
+            format!("! IDENTITY CHANGE on {table}.{column} (refused)")
+        }
         SchemaChange::DropTableBlockedByInboundFk {
             table,
             referencing_table,
@@ -3401,6 +3508,104 @@ mod tests {
         allow_destructive: false,
         definitions_authoritative: true,
     };
+
+    /// `posts` with an explicit `serial` marker on its `id` PK (index 0).
+    fn posts_with_id_serial(kind: Option<SerialKind>) -> Table {
+        let mut t = posts_with(vec![]);
+        t.columns[0].serial = kind;
+        t
+    }
+
+    // -- serial-marker three-state compatibility -----------------------------
+
+    #[test]
+    fn serial_marker_legacy_none_is_compatible_with_parser_bigserial() {
+        // A pre-marker (legacy) snapshot deserializes `id.serial = None`; the parser
+        // marks the model `#[id]` as `Some(BigSerial)`. This must NOT flag a
+        // primary-key change — otherwise every existing project breaks until it
+        // rewrites its snapshot. Verified in BOTH diff modes.
+        let legacy = vec![posts_with_id_serial(None)];
+        let model = posts_with_id_serial(Some(SerialKind::BigSerial));
+        for opts in [DEFAULT_OPTS, AUTHORITATIVE] {
+            let plan = diff_schema(&legacy, &parsed(vec![model.clone()], vec![]), opts);
+            assert!(
+                !plan
+                    .changes
+                    .iter()
+                    .any(|c| matches!(c, SchemaChange::PrimaryKeyChange { .. })),
+                "legacy None vs Some(BigSerial) must be compatible ({opts:?}): {:?}",
+                plan.changes
+            );
+        }
+    }
+
+    #[test]
+    fn serial_marker_matching_bigserial_is_clean() {
+        let base = vec![posts_with_id_serial(Some(SerialKind::BigSerial))];
+        let want = posts_with_id_serial(Some(SerialKind::BigSerial));
+        let plan = diff_schema(&base, &parsed(vec![want], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.is_empty(),
+            "matching markers: {:?}",
+            plan.changes
+        );
+    }
+
+    #[test]
+    fn serial_marker_plain_conflicts_with_bigserial() {
+        // A genuine plain-BIGINT-PK pull (`Some(Plain)`) vs a `BigSerial` model —
+        // BOTH explicit — is a real id-generation change → refused primary-key change
+        // (fidelity preserved).
+        let base = vec![posts_with_id_serial(Some(SerialKind::Plain))];
+        let want = posts_with_id_serial(Some(SerialKind::BigSerial));
+        let plan = diff_schema(&base, &parsed(vec![want], vec![]), DEFAULT_OPTS);
+        assert_eq!(
+            plan.changes,
+            vec![SchemaChange::PrimaryKeyChange {
+                table: "posts".to_owned(),
+            }]
+        );
+    }
+
+    // -- identity-clause drift -----------------------------------------------
+
+    #[test]
+    fn identity_change_flagged_only_in_authoritative_diff() {
+        // Two both-present introspections whose `id` identity clause differs
+        // (`ALWAYS` dropped to a plain column). In an authoritative diff (doctor /
+        // pull --dry-run) this is real drift → the refused `IdentityChange` marker;
+        // in a model diff the parser cannot express identity, so a desired `None` is
+        // "unknown, retained" (never drift).
+        let mut base_id = posts_with_id_serial(Some(SerialKind::BigSerial));
+        base_id.columns[0].identity = Some("ALWAYS".to_owned());
+        let base = vec![base_id];
+        let want = posts_with_id_serial(Some(SerialKind::BigSerial)); // identity: None
+
+        let auth = diff_schema(&base, &parsed(vec![want.clone()], vec![]), AUTHORITATIVE);
+        assert!(
+            auth.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::IdentityChange { table, column } if table == "posts" && column == "id"
+            )),
+            "authoritative diff flags the identity change: {:?}",
+            auth.changes
+        );
+        // The refused marker is rejected by the guard (no override).
+        assert!(matches!(
+            guard_plan(&auth, AUTHORITATIVE).unwrap_err(),
+            DiffError::IdentityChange { .. }
+        ));
+
+        let model = diff_schema(&base, &parsed(vec![want], vec![]), DEFAULT_OPTS);
+        assert!(
+            !model
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::IdentityChange { .. })),
+            "model diff never flags an identity change: {:?}",
+            model.changes
+        );
+    }
 
     // -- 13.1 structural diff ------------------------------------------------
 
