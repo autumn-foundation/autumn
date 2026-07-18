@@ -1261,6 +1261,16 @@ fn serial_kind_for(
 //   AUTOINCREMENT id is always recorded as `BigSerial` (there is no int4 serial).
 // - **FK on-update/on-delete actions, composite FKs, expression/collation index
 //   attributes**: same deferrals as the Postgres arm.
+// - **Composite inline `UNIQUE(a, b)` constraints**: a table-level UNIQUE-constraint
+//   auto-index (`sqlite_autoindex_*`) cannot be recorded — its name is un-creatable
+//   (`SQLite` refuses `CREATE … "sqlite_…"`) and the IR has no table-level
+//   unique-constraint node — so a composite inline `UNIQUE` is skipped (a
+//   single-column inline `UNIQUE` IS captured, as the column's `unique` flag). Rare
+//   brownfield shape; not tracked in the snapshot.
+// - **Generated columns' expressions**: generated columns are PRESERVED (read via
+//   `pragma_table_xinfo`, never dropped), but their `GENERATED ALWAYS AS (...)`
+//   expression is not captured — a generated column round-trips as an ordinary column
+//   of its declared type. Full verbatim re-emission is future work.
 
 /// Resolve a `sqlite:`/`sqlite://`/`file:` URL (or a bare path) to the concrete
 /// target [`diesel::SqliteConnection::establish`] expects, mirroring autumn-web's
@@ -1364,6 +1374,13 @@ mod sqlite {
         /// position.
         #[diesel(sql_type = Integer)]
         pk: i32,
+        /// `PRAGMA table_xinfo.hidden` — `0` = ordinary column, `1` = hidden column
+        /// (virtual-table / `WITHOUT ROWID` internal — not a user column), `2` =
+        /// `VIRTUAL` generated column, `3` = `STORED` generated column. Read via
+        /// `table_xinfo` (NOT `table_info`, which OMITS generated columns entirely and
+        /// would silently drop them from the pull).
+        #[diesel(sql_type = Integer)]
+        hidden: i32,
     }
 
     #[derive(QueryableByName)]
@@ -1504,14 +1521,21 @@ mod sqlite {
         })
     }
 
-    /// Fetch every column of every table in one batched `pragma_table_info` join.
+    /// Fetch every column of every table in one batched `pragma_table_xinfo` join.
+    ///
+    /// Uses `table_xinfo` (not `table_info`) BECAUSE the latter OMITS generated
+    /// columns, so a pull would silently drop them and a recreate would omit the
+    /// column (a fail-closed violation). `table_xinfo` includes them with a `hidden`
+    /// discriminator so [`build_table`] can preserve generated columns instead of
+    /// dropping them.
     fn fetch_columns(
         conn: &mut SqliteConnection,
     ) -> Result<BTreeMap<String, Vec<ColumnRow>>, IntrospectError> {
         let rows: Vec<ColumnRow> = sql_query(
             "SELECT m.name AS table_name, ti.name AS column_name, ti.type AS decl_type, \
-             ti.\"notnull\" AS not_null, ti.dflt_value AS dflt_value, ti.pk AS pk \
-             FROM sqlite_master m JOIN pragma_table_info(m.name) ti \
+             ti.\"notnull\" AS not_null, ti.dflt_value AS dflt_value, ti.pk AS pk, \
+             ti.hidden AS hidden \
+             FROM sqlite_master m JOIN pragma_table_xinfo(m.name) ti \
              WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
              ORDER BY m.name, ti.cid",
         )
@@ -1707,6 +1731,18 @@ mod sqlite {
             .collect();
 
         for row in columns {
+            // `hidden = 1` is an internal hidden column (virtual-table / rowid
+            // machinery), never a user column — skip it. `hidden = 2` (VIRTUAL) / `3`
+            // (STORED) are GENERATED columns: they are included (via `table_xinfo`) so
+            // they are NEVER silently dropped from the pull. NOTE (DEFERRED): the
+            // generation EXPRESSION is not captured here, so a generated column
+            // round-trips as an ordinary column of its declared type — enough to keep
+            // it in the snapshot (doctor/dry-run see it, a recreate no longer omits
+            // it), but full generated-column fidelity (verbatim `GENERATED ALWAYS AS
+            // (...)` re-emission) is future work.
+            if row.hidden == 1 {
+                continue;
+            }
             let is_pk = row.pk > 0;
             let default = sqlite_default(row.dflt_value.as_deref());
             let ty = sqlite_column_type(&row.decl_type, default.as_ref());
@@ -1752,15 +1788,22 @@ mod sqlite {
     /// `CREATE INDEX` SQL; a plain index is representable by its columns. The primary
     /// key auto-index (`origin = 'pk'`) is skipped (the PK is modeled separately).
     ///
-    /// A `UNIQUE`-constraint auto-index (`origin = 'u'`, e.g. an inline `col TEXT
-    /// UNIQUE` or a table-level `UNIQUE(a, b)` — named `sqlite_autoindex_<table>_<n>`)
-    /// has **no** standalone `CREATE INDEX` statement in `sqlite_master` and therefore
-    /// **cannot be `DROP INDEX`ed** — it is owned by the constraint. It is treated
-    /// like the Postgres arm's constraint-owned unique index: retained verbatim via a
-    /// synthesized `definition` (so a *model* diff never emits an undroppable
-    /// `DropIndex` for a brownfield inline-`UNIQUE`), with its `key_columns` recorded
-    /// (so it still covers a matching `#[unique]` model, yielding a clean round-trip).
-    /// A single-column `origin = 'u'` also marks the column `unique = true`.
+    /// A `UNIQUE`-constraint auto-index (`origin = 'u'`, named
+    /// `sqlite_autoindex_<table>_<n>`) has **no** standalone `CREATE INDEX` statement
+    /// and is owned by the constraint — it cannot be `DROP INDEX`ed, and `SQLite`
+    /// refuses to `CREATE` any object named `sqlite_*`, so it must **never** appear as
+    /// an [`Index`] in the IR (the emitter would try to re-`CREATE` it by name on a
+    /// table rebuild / `DropTable` rollback and produce illegal `CREATE … "sqlite_…"`
+    /// DDL). Instead:
+    /// * a **single-column** inline `col TEXT UNIQUE` is represented purely as the
+    ///   column's `unique = true` flag (no [`Index`] object) — a matching `#[unique]`
+    ///   model is recognized as already satisfied (clean diff, no `DropIndex`, no
+    ///   `sqlite_`-named `CREATE`);
+    /// * a **composite** table-level `UNIQUE(a, b)` cannot be represented (the IR has
+    ///   no table-level unique-constraint node, and the model DSL cannot express it),
+    ///   so it is **skipped entirely** rather than synthesized as a `sqlite_`-named
+    ///   index (DEFERRED: composite inline-`UNIQUE` fidelity — a rare brownfield shape
+    ///   — is not tracked in the snapshot; see the module note).
     fn collapse_indexes(
         table_name: &str,
         rows: &[IndexRow],
@@ -1781,23 +1824,13 @@ mod sqlite {
             let is_unique = row.is_unique != 0;
             let is_partial = row.partial != 0;
 
-            // A UNIQUE-constraint auto-index (`origin = 'u'`) is owned by the
-            // constraint and cannot be dropped independently; retain it verbatim via
-            // a synthesized definition and record its key columns (see the fn note).
+            // A UNIQUE-constraint auto-index (`origin = 'u'`) is NEVER emitted as an
+            // Index (its `sqlite_*` name is un-creatable and un-droppable). A single
+            // column becomes the column's `unique` flag; a composite one is skipped.
             if row.origin == "u" {
                 if is_unique && !has_expression && key_columns.len() == 1 {
                     unique_columns.insert(key_columns[0].clone());
                 }
-                let definition =
-                    synthesized_unique_constraint_ddl(&row.index_name, table_name, &key_columns);
-                indexes.push(Index {
-                    name: row.index_name.clone(),
-                    columns: key_columns.clone(),
-                    unique: is_unique,
-                    definition: Some(definition),
-                    is_partial,
-                    key_columns,
-                });
                 continue;
             }
 
@@ -1818,20 +1851,6 @@ mod sqlite {
             });
         }
         (indexes, unique_columns)
-    }
-
-    /// Reconstruct a deterministic `CREATE UNIQUE INDEX` statement for a
-    /// `UNIQUE`-constraint auto-index (which has no stored SQL of its own), used only
-    /// as the retained index's `definition` identity token — it is never emitted as
-    /// real DDL (the index is retained, never recreated). Deterministic so a re-pull
-    /// is byte-stable and two authoritative introspections compare equal.
-    fn synthesized_unique_constraint_ddl(name: &str, table: &str, cols: &[String]) -> String {
-        let col_list = cols
-            .iter()
-            .map(|c| format!("\"{c}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("CREATE UNIQUE INDEX \"{name}\" ON \"{table}\" ({col_list})")
     }
 
     #[cfg(test)]
@@ -1917,6 +1936,16 @@ mod sqlite {
                 not_null,
                 dflt_value: dflt.map(str::to_owned),
                 pk,
+                hidden: 0,
+            }
+        }
+
+        /// A `ColumnRow` with an explicit `table_xinfo.hidden` discriminator (`2` =
+        /// VIRTUAL generated, `3` = STORED generated, `1` = internal hidden).
+        fn col_row_hidden(name: &str, decl: &str, hidden: i32) -> ColumnRow {
+            ColumnRow {
+                hidden,
+                ..col_row(name, decl, 0, None, 0)
             }
         }
 
@@ -1965,6 +1994,33 @@ mod sqlite {
             let table = build_table("posts", table_sql, &columns, &[], &BTreeMap::new(), &[]);
             let id = table.columns.iter().find(|c| c.name == "id").unwrap();
             assert_eq!(id.serial, Some(SerialKind::Plain));
+        }
+
+        #[test]
+        fn build_table_preserves_generated_columns_and_skips_internal_hidden() {
+            // `table_xinfo` surfaces generated columns (hidden 2 = VIRTUAL, 3 =
+            // STORED); they must be PRESERVED (never silently dropped), while a truly
+            // internal hidden column (hidden = 1) is skipped.
+            let columns = vec![
+                col_row("id", "INTEGER", 0, None, 1),
+                col_row("first", "TEXT", 1, None, 0),
+                col_row_hidden("full_stored", "TEXT", 3),
+                col_row_hidden("full_virtual", "TEXT", 2),
+                col_row_hidden("internal", "TEXT", 1),
+            ];
+            let table_sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY, first TEXT NOT NULL, \
+                             full_stored TEXT GENERATED ALWAYS AS (first) STORED, \
+                             full_virtual TEXT GENERATED ALWAYS AS (first) VIRTUAL)";
+            let table = build_table("posts", table_sql, &columns, &[], &BTreeMap::new(), &[]);
+            let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+            assert!(
+                names.contains(&"full_stored") && names.contains(&"full_virtual"),
+                "generated columns must be preserved, not dropped: {names:?}"
+            );
+            assert!(
+                !names.contains(&"internal"),
+                "an internal hidden column (hidden = 1) is skipped: {names:?}"
+            );
         }
 
         #[test]
@@ -2044,12 +2100,12 @@ mod sqlite {
         }
 
         #[test]
-        fn collapse_indexes_unique_constraint_autoindex_is_retained_not_droppable() {
-            // A `col TEXT UNIQUE` inline constraint produces a `sqlite_autoindex_*`
-            // (origin = 'u') with NO standalone CREATE INDEX SQL. It must be retained
-            // via a synthesized definition (so a model diff never emits an undroppable
-            // DropIndex) and carry its key columns (so it covers a matching
-            // `#[unique]` model), and mark the column unique.
+        fn collapse_indexes_single_col_unique_autoindex_becomes_column_flag_not_index() {
+            // A single-column `col TEXT UNIQUE` inline constraint produces a
+            // `sqlite_autoindex_*` (origin = 'u') with NO standalone CREATE INDEX SQL.
+            // Its `sqlite_*` name is un-creatable AND un-droppable, so it must produce
+            // NO Index object (only the column's `unique` flag) — otherwise the
+            // emitter would try to re-CREATE / DROP `sqlite_autoindex_*` on a rebuild.
             let rows = vec![IndexRow {
                 table_name: "accounts".to_owned(),
                 index_name: "sqlite_autoindex_accounts_1".to_owned(),
@@ -2072,21 +2128,59 @@ mod sqlite {
                 }],
             );
             let (indexes, unique_cols) = collapse_indexes("accounts", &rows, &index_columns);
-            assert_eq!(indexes.len(), 1);
-            assert!(unique_cols.contains("email"), "the column is marked unique");
-            let idx = &indexes[0];
-            assert!(idx.unique);
-            assert_eq!(
-                idx.key_columns,
-                vec!["email".to_owned()],
-                "key columns recorded"
-            );
-            let def = idx.definition.as_deref().expect(
-                "a constraint autoindex carries a synthesized definition (retained, not droppable)",
+            assert!(
+                indexes.is_empty(),
+                "a UNIQUE-constraint autoindex is NEVER an Index (its sqlite_* name is \
+                 un-creatable/un-droppable): {indexes:?}"
             );
             assert!(
-                def.contains("CREATE UNIQUE INDEX") && def.contains("email"),
-                "definition reconstructs the constraint index: {def}"
+                unique_cols.contains("email"),
+                "it is represented purely as the column's unique flag"
+            );
+        }
+
+        #[test]
+        fn collapse_indexes_composite_unique_autoindex_is_skipped() {
+            // A composite table-level `UNIQUE(a, b)` autoindex (origin = 'u') cannot be
+            // represented (no table-level unique node in the IR, un-creatable name), so
+            // it is skipped entirely — never synthesized as a `sqlite_`-named index.
+            let rows = vec![IndexRow {
+                table_name: "memberships".to_owned(),
+                index_name: "sqlite_autoindex_memberships_1".to_owned(),
+                is_unique: 1,
+                origin: "u".to_owned(),
+                partial: 0,
+                index_sql: None,
+            }];
+            let mut index_columns = BTreeMap::new();
+            index_columns.insert(
+                (
+                    "memberships".to_owned(),
+                    "sqlite_autoindex_memberships_1".to_owned(),
+                ),
+                vec![
+                    IndexColumnRow {
+                        table_name: "memberships".to_owned(),
+                        index_name: "sqlite_autoindex_memberships_1".to_owned(),
+                        seqno: 0,
+                        column_name: Some("org_id".to_owned()),
+                    },
+                    IndexColumnRow {
+                        table_name: "memberships".to_owned(),
+                        index_name: "sqlite_autoindex_memberships_1".to_owned(),
+                        seqno: 1,
+                        column_name: Some("user_id".to_owned()),
+                    },
+                ],
+            );
+            let (indexes, unique_cols) = collapse_indexes("memberships", &rows, &index_columns);
+            assert!(
+                indexes.is_empty(),
+                "composite UNIQUE autoindex is skipped: {indexes:?}"
+            );
+            assert!(
+                unique_cols.is_empty(),
+                "a composite UNIQUE marks no single column unique"
             );
         }
 

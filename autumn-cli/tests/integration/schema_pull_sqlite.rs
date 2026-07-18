@@ -86,6 +86,26 @@ pub struct Post {
 }
 ";
 
+/// A model exercising the AFFINITY-collapsing `SQLite` type surface (issue #1975): a
+/// `bool`, `i32`, `i64`, `f32`, `f64`, and a plain (non-`CURRENT_TIMESTAMP`)
+/// `Timestamp` field. The emitter renders `bool`/`i32`/`i64` → `INTEGER`,
+/// `f32`/`f64` → `REAL`, and the plain `Timestamp` → `TEXT`, so a pull cannot
+/// recover the original variant — WITHOUT affinity-aware diffing every one of these
+/// would drift on every pull. The `schema diff` must be EMPTY.
+const AFFINITY_MODEL: &str = r"
+#[autumn_web::model(managed)]
+pub struct Metric {
+    #[id]
+    pub id: i64,
+    pub enabled: bool,
+    pub small: i32,
+    pub big: i64,
+    pub ratio32: f32,
+    pub ratio64: f64,
+    pub scheduled_at: chrono::NaiveDateTime,
+}
+";
+
 /// THE ACCEPTANCE: a schema built from `#[model]` structs, migrated into a live
 /// `SQLite` file, then `schema pull`ed back, produces a snapshot a subsequent
 /// `schema diff` reports as EMPTY — the `SQLite`-introspected snapshot is byte-faithful
@@ -184,6 +204,56 @@ fn schema_pull_round_trips_models_through_a_sqlite_file() {
     assert!(
         doc_out.contains("database schema matches the snapshot baseline"),
         "doctor reports the SQLite DB matches the snapshot:\n{doc_out}"
+    );
+}
+
+/// THE AFFINITY ACCEPTANCE (issue #1975): a model whose `bool`/`i32`/`i64`/`f32`/
+/// `f64`/plain-`Timestamp` fields the `SQLite` emitter COLLAPSES onto shared declared
+/// types (`INTEGER`/`REAL`/`TEXT`) migrates into a temp-file `SQLite` DB, is
+/// `schema pull`ed back, and `schema diff` reports NO changes — the affinity-aware
+/// type comparison treats the pulled `Int64`/`Float64`/`Text` as equivalent to the
+/// model's `Bool`/`Int32`/`Float32`/`Timestamp`. Before the fix this drifted on
+/// every pull.
+#[test]
+fn schema_pull_affinity_collapsed_types_round_trip_clean() {
+    let (_tmp, project) = fresh_project("pull_sqlite_affinity");
+    let db_path = project.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    write_models(&project, AFFINITY_MODEL);
+    std::fs::write(project.join("empty_models.rs"), "").expect("empty models");
+    run_autumn_ok(
+        &project,
+        &[
+            "schema",
+            "snapshot",
+            "--from",
+            "empty_models.rs",
+            "--backend",
+            "sqlite",
+        ],
+        &envs,
+    );
+    run_autumn_ok(
+        &project,
+        &["schema", "diff", "--write-migration", "--name", "init"],
+        &envs,
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+
+    // THE ACCEPTANCE: the affinity-collapsed types round-trip to an EMPTY diff.
+    let (diff_out, _) = run_autumn_ok(&project, &["schema", "diff"], &envs);
+    assert!(
+        diff_out.contains("No schema changes"),
+        "affinity-collapsed SQLite types must round-trip clean:\n{diff_out}"
+    );
+    // doctor agrees (bidirectional drift check) — no spurious type-change drift.
+    let (doc_out, _) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor sees no drift for the affinity-collapsed types:\n{doc_out}"
     );
 }
 
@@ -333,6 +403,47 @@ fn schema_pull_brownfield_inline_unique_round_trips_clean() {
         !combined.contains("DROP INDEX") && !combined.to_uppercase().contains("SQLITE_AUTOINDEX"),
         "the undroppable UNIQUE-constraint auto-index is never dropped:\n{combined}"
     );
+
+    // The rebuild / DropTable-rollback path must NEVER emit a `CREATE … "sqlite_…"`
+    // (SQLite refuses to create `sqlite_`-prefixed objects). Drop the model entirely
+    // so the migration's up = DROP TABLE and down = CREATE TABLE accounts (restored
+    // from the pulled baseline) — then assert neither leg emits any `sqlite_`-named
+    // statement.
+    write_models(&project, "");
+    run_autumn_ok(
+        &project,
+        &[
+            "schema",
+            "diff",
+            "--write-migration",
+            "--name",
+            "drop_accounts",
+            "--allow-destructive",
+        ],
+        &envs,
+    );
+    let mig_dir = std::fs::read_dir(project.join("migrations"))
+        .expect("migrations dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_drop_accounts"))
+        })
+        .expect("drop_accounts migration written");
+    let up = std::fs::read_to_string(mig_dir.join("up.sql")).expect("up.sql");
+    let down = std::fs::read_to_string(mig_dir.join("down.sql")).expect("down.sql");
+    for (leg, sql) in [("up", &up), ("down", &down)] {
+        assert!(
+            !sql.to_lowercase().contains("sqlite_"),
+            "the {leg} leg must emit no `sqlite_`-named statement (un-creatable):\n{sql}"
+        );
+    }
+    assert!(
+        down.contains("CREATE TABLE accounts"),
+        "the down leg restores the accounts table: {down}"
+    );
 }
 
 /// CONTRACT (Codex review): FTS5 search-index tables — the `CREATE VIRTUAL TABLE
@@ -383,6 +494,51 @@ fn schema_pull_excludes_fts5_search_tables() {
     assert!(
         combined.contains("No schema changes"),
         "a searchable app pulls clean (FTS tables excluded):\n{combined}"
+    );
+}
+
+/// CONTRACT (Codex review): a generated column (`GENERATED ALWAYS AS (...)
+/// STORED`/`VIRTUAL`) must NOT be silently dropped by the pull — `pragma_table_info`
+/// omits generated columns (a fail-closed violation), so the pull reads
+/// `pragma_table_xinfo` and preserves them.
+#[test]
+fn schema_pull_preserves_generated_columns() {
+    let (_tmp, project) = fresh_project("pull_sqlite_generated");
+    let db_path = project.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_generated",
+        "CREATE TABLE people (\
+           id INTEGER PRIMARY KEY AUTOINCREMENT, \
+           first TEXT NOT NULL, \
+           last TEXT NOT NULL, \
+           full_stored TEXT GENERATED ALWAYS AS (first || ' ' || last) STORED, \
+           full_virtual TEXT GENERATED ALWAYS AS (first || ' ' || last) VIRTUAL);\n",
+        "DROP TABLE people;\n",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    let people = table_json(&snap, "people");
+    for gen_col in ["full_stored", "full_virtual"] {
+        // `column_json` panics if the column is absent — asserting it is preserved.
+        let _ = column_json(&people, gen_col);
+    }
+
+    // A re-pull is byte-for-byte stable, and doctor sees no drift.
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("second pull");
+    assert_eq!(snap, snap_after, "a re-pull is byte-stable");
+    let (doc_out, _) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor is clean with generated columns preserved:\n{doc_out}"
     );
 }
 

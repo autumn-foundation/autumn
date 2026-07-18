@@ -156,7 +156,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use autumn_schema_core::{
-    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, IdKind, Index, SerialKind, Table,
+    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, IdKind, Index, SerialKind,
+    SqliteAffinity, Table,
 };
 
 use crate::schema::parse::ParsedSchema;
@@ -824,7 +825,7 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
             // Present on both sides — diff only Autumn-managed tables.
             (Some(base), Some(want)) => {
                 if want.managed {
-                    diff_table(base, want, desired, opts, &mut changes);
+                    diff_table(base, want, desired, opts, backend, &mut changes);
                 }
             }
             // Desired only — create it if Autumn owns it. But if the parser
@@ -1075,6 +1076,7 @@ fn diff_table(
     want: &Table,
     desired: &ParsedSchema,
     opts: DiffOptions,
+    backend: Backend,
     changes: &mut Vec<SchemaChange>,
 ) {
     // A primary-key change is refused wholesale (guarded); emit only the marker
@@ -1107,7 +1109,7 @@ fn diff_table(
                 table: want.name.clone(),
                 column: want_col.clone(),
             }),
-            Some(base_col) => diff_column(&want.name, base_col, want_col, opts, changes),
+            Some(base_col) => diff_column(&want.name, base_col, want_col, opts, backend, changes),
         }
     }
 
@@ -1128,14 +1130,50 @@ fn diff_table(
 }
 
 /// Diff a single same-named column (keyed on name, never position).
+/// Whether two column types are equivalent for drift purposes on `backend`.
+///
+/// On **Postgres** this is exact [`ColumnType`] equality — `INTEGER` vs `BIGINT`
+/// (int4 vs int8) is a genuine, distinct type change that must still diff.
+///
+/// On **`SQLite`** the emitter renders several distinct IR types to the same
+/// declared type (`Int32`/`Int64`/`Bool` → `INTEGER`, `Float32`/`Float64` →
+/// `REAL`, `Text`/`Uuid`/`Timestamp`/`TimestampTz`/`Decimal`/`Attachment`/`Enum` →
+/// `TEXT`, `Bytes` → `BLOB`), and a pull cannot recover the original variant — so
+/// comparing by exact `ColumnType` would report a spurious type change (and a
+/// table-recreate) for every `bool`/`i32`/`f32`/plain-`Timestamp` column on every
+/// pull. Instead they are compared by [`SqliteAffinity`] class, so a matching
+/// model↔pull round-trips CLEAN while a genuine class change (e.g. `INTEGER`→`TEXT`)
+/// still drifts. An [`Opaque`](ColumnType::Opaque) type (a verbatim, pull-only type
+/// with no clean class) or the ambiguous [`Numeric`](SqliteAffinity::Numeric)
+/// catch-all falls back to exact equality so distinct verbatim types are never
+/// conflated. This rule is strictly `SQLite`-gated and never affects the pg lane.
+fn column_types_equivalent(base: &ColumnType, want: &ColumnType, backend: Backend) -> bool {
+    if base == want {
+        return true;
+    }
+    if backend != Backend::Sqlite {
+        return false;
+    }
+    // An Opaque (verbatim, pull-only) type must match exactly — never conflate two
+    // distinct raw types by affinity.
+    if matches!(base, ColumnType::Opaque { .. }) || matches!(want, ColumnType::Opaque { .. }) {
+        return false;
+    }
+    let base_class = base.sqlite_affinity();
+    // Only the four unambiguous storage classes collapse; the NUMERIC catch-all
+    // requires exact equality (already failed the `base == want` check above).
+    base_class == want.sqlite_affinity() && base_class != SqliteAffinity::Numeric
+}
+
 fn diff_column(
     table: &str,
     base: &Column,
     want: &Column,
     opts: DiffOptions,
+    backend: Backend,
     changes: &mut Vec<SchemaChange>,
 ) {
-    if base.ty != want.ty {
+    if !column_types_equivalent(&base.ty, &want.ty, backend) {
         changes.push(SchemaChange::AlterColumnType {
             table: table.to_owned(),
             column: want.name.clone(),
@@ -1334,6 +1372,22 @@ pub fn index_depends_on_column(index: &Index, col: &str) -> bool {
 /// a wrongful suppression.
 fn baseline_unique_index_covers(base: &Table, want_columns: &[String]) -> bool {
     let want_set: BTreeSet<&str> = want_columns.iter().map(String::as_str).collect();
+    // A single-column baseline `column.unique = true` fully enforces uniqueness of
+    // that column. This covers the SQLite brownfield inline-`col TEXT UNIQUE` case:
+    // its constraint auto-index (`sqlite_autoindex_*`) is deliberately NOT recorded
+    // as an `Index` (its name is un-creatable/un-droppable — see
+    // `introspect::sqlite::collapse_indexes`), so the column flag is the ONLY signal
+    // that the model's `#[unique]` is already satisfied. (On Postgres the constraint
+    // ALSO produces a retained unique index, so this clause is redundant-but-correct
+    // there.)
+    if want_columns.len() == 1
+        && base
+            .columns
+            .iter()
+            .any(|c| c.unique && c.name == want_columns[0])
+    {
+        return true;
+    }
     base.indexes.iter().any(|idx| {
         if !idx.unique || idx.is_partial {
             return false;
@@ -3313,6 +3367,19 @@ fn serial_kinds_conflict(base: &Table, want: &Table) -> bool {
 /// swaps its UUID-generation behavior for `gen_random_uuid()` or adds a default
 /// where none existed.
 fn pk_kind_for(column: &Column) -> Option<IdKind> {
+    // An EXPLICIT `Plain` serial marker (a brownfield plain `BIGINT`/`INTEGER
+    // PRIMARY KEY` with no owned sequence — populated by both introspectors, never
+    // by the model parser) must NOT reconstruct as `BIGSERIAL`/`AUTOINCREMENT`: that
+    // would fabricate auto-increment (and a `sqlite_sequence` row) on a table
+    // rebuild or `DropTable` rollback, silently changing id-generation behavior. The
+    // `None` path renders it as an ordinary integer column plus a table-level
+    // `PRIMARY KEY (col)` clause — a plain PK with no sequence/AUTOINCREMENT. A
+    // legacy/unknown `None` marker keeps the historical `BigSerial` behavior for
+    // back-compat (`serial_kinds_conflict` treats a legacy `None` as compatible, so
+    // this only ever fires for an explicitly-`Plain`-marked pull).
+    if column.serial == Some(SerialKind::Plain) {
+        return None;
+    }
     match &column.ty {
         ColumnType::Int64 if column.default.is_none() => Some(IdKind::BigSerial),
         ColumnType::Int32 if is_nextval_default(column) => Some(IdKind::Serial),
@@ -5458,6 +5525,132 @@ mod tests {
         assert_eq!(pk_kind_for(&none), None);
     }
 
+    #[test]
+    fn pk_kind_for_honors_plain_serial_marker() {
+        // An explicit `Some(Plain)` Int64 PK must NOT reconstruct as BigSerial (that
+        // would fabricate auto-increment on a rebuild/rollback).
+        let mut plain = col("id", ColumnType::Int64);
+        plain.primary_key = true;
+        plain.serial = Some(SerialKind::Plain);
+        assert_eq!(pk_kind_for(&plain), None, "a Plain PK is a plain column");
+
+        // A `BigSerial`-marked (or legacy `None`) Int64 PK keeps the BigSerial shape.
+        let mut big = col("id", ColumnType::Int64);
+        big.primary_key = true;
+        big.serial = Some(SerialKind::BigSerial);
+        assert_eq!(pk_kind_for(&big), Some(IdKind::BigSerial));
+        let mut legacy = col("id", ColumnType::Int64);
+        legacy.primary_key = true; // serial: None (legacy/unknown)
+        assert_eq!(pk_kind_for(&legacy), Some(IdKind::BigSerial));
+    }
+
+    #[test]
+    fn plain_pk_reconstructs_without_bigserial_or_autoincrement() {
+        for (backend, forbidden) in [
+            (Backend::Postgres, "BIGSERIAL"),
+            (Backend::Sqlite, "AUTOINCREMENT"),
+        ] {
+            let mut t = Table::new("ledger", backend);
+            let mut id = col("id", ColumnType::Int64);
+            id.primary_key = true;
+            id.serial = Some(SerialKind::Plain);
+            t.primary_key.push("id".to_owned());
+            t.columns.push(id);
+            let body = render_create_table_body("ledger", &t, backend);
+            assert!(
+                !body.contains(forbidden),
+                "a Plain PK must not render {forbidden} on {backend:?}: {body}"
+            );
+            assert!(
+                body.contains("PRIMARY KEY (id)"),
+                "a Plain PK renders a table-level primary key on {backend:?}: {body}"
+            );
+        }
+    }
+
+    // -- SQLite affinity-aware type comparison -------------------------------
+
+    #[test]
+    fn sqlite_type_comparison_is_affinity_aware_but_pg_stays_exact() {
+        // On SQLite, types that collapse to the same declared type are equivalent.
+        for (a, b) in [
+            (ColumnType::Int32, ColumnType::Int64),
+            (ColumnType::Int64, ColumnType::Bool),
+            (ColumnType::Float32, ColumnType::Float64),
+            (ColumnType::Text, ColumnType::Timestamp),
+            (ColumnType::Timestamp, ColumnType::TimestampTz),
+        ] {
+            assert!(
+                column_types_equivalent(&a, &b, Backend::Sqlite),
+                "{a:?} and {b:?} share a SQLite affinity class"
+            );
+            // Postgres keeps exact equality — these are genuinely distinct there.
+            assert!(
+                !column_types_equivalent(&a, &b, Backend::Postgres),
+                "{a:?} vs {b:?} must still differ on Postgres"
+            );
+        }
+        // A genuine class change still drifts on SQLite.
+        assert!(!column_types_equivalent(
+            &ColumnType::Int64,
+            &ColumnType::Text,
+            Backend::Sqlite
+        ));
+        assert!(!column_types_equivalent(
+            &ColumnType::Bytes,
+            &ColumnType::Text,
+            Backend::Sqlite
+        ));
+        // Opaque (verbatim) types require exact equality even on SQLite.
+        let a = ColumnType::Opaque {
+            pg_type: "citext".to_owned(),
+        };
+        let b = ColumnType::Opaque {
+            pg_type: "hstore".to_owned(),
+        };
+        assert!(!column_types_equivalent(&a, &b, Backend::Sqlite));
+        assert!(column_types_equivalent(&a, &a.clone(), Backend::Sqlite));
+    }
+
+    #[test]
+    fn sqlite_diff_no_alter_within_affinity_class_but_drifts_across() {
+        // Baseline `views: Int64` (pulled), model `views: Int32` — same INTEGER class
+        // on SQLite → NO AlterColumnType.
+        let mut base = Table::new("posts", Backend::Sqlite);
+        base.managed = true;
+        base.columns.push(col("views", ColumnType::Int64));
+        let mut want = Table::new("posts", Backend::Sqlite);
+        want.managed = true;
+        want.columns.push(col("views", ColumnType::Int32));
+        let plan = diff_schema(
+            std::slice::from_ref(&base),
+            &parsed(vec![want], vec![]),
+            AUTHORITATIVE,
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::AlterColumnType { .. })),
+            "same-class INTEGER change must not drift on SQLite: {:?}",
+            plan.changes
+        );
+
+        // A cross-class change (Int64 → Text) still drifts.
+        let mut want2 = Table::new("posts", Backend::Sqlite);
+        want2.managed = true;
+        want2.columns.push(col("views", ColumnType::Text));
+        let plan2 = diff_schema(&[base], &parsed(vec![want2], vec![]), AUTHORITATIVE);
+        assert!(
+            plan2
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::AlterColumnType { .. })),
+            "a cross-class change must still drift on SQLite: {:?}",
+            plan2.changes
+        );
+    }
+
     /// A convention UUID PK (`DEFAULT gen_random_uuid()`) renders the `IdKind::Uuid`
     /// shape verbatim — the `gen_random_uuid()` default is not double-emitted.
     #[test]
@@ -7507,34 +7700,37 @@ PRAGMA foreign_keys=ON;
 
     /// The `SQLite` counterpart to `type_change_on_referencing_fk_column_is_refused`:
     /// the FK-bound-type-change guard is `Postgres`-only, so on `SQLite` an FK
-    /// column's type change (`posts.author_id` `Int32` → `Int64`, still
+    /// column's type change (`posts.author_id` `Int64` → `Text`, still
     /// `REFERENCES users(id)`) is NOT refused — it flows to the table-recreate,
     /// which applies the new type, preserves the inline `REFERENCES`, and emits the
-    /// FK type-consistency advisory naming the column. The `Postgres` plan with the
-    /// same change still refuses with `TypeChangeOnForeignKeyColumn` (the backend
+    /// FK type-consistency advisory naming the column. (A GENUINE cross-affinity-class
+    /// change is used because on `SQLite` a same-class change like `Int32` → `Int64`
+    /// is now a no-op — both are `INTEGER` affinity — see the affinity-aware
+    /// comparison in [`column_types_equivalent`].) The `Postgres` plan with an int4→
+    /// int8 change still refuses with `TypeChangeOnForeignKeyColumn` (the backend
     /// contrast).
     #[test]
     fn sqlite_fk_column_type_change_recreates_with_advisory() {
         let baseline = vec![
             sqlite_users_table(),
-            sqlite_posts_with_author(ColumnType::Int32),
+            sqlite_posts_with_author(ColumnType::Int64),
         ];
         let desired = vec![
             sqlite_users_table(),
-            sqlite_posts_with_author(ColumnType::Int64),
+            sqlite_posts_with_author(ColumnType::Text),
         ];
         let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), ALLOW);
 
-        // The plan is a SQLite plan carrying the real type change AND the blocked
-        // marker appended alongside it.
+        // The plan is a SQLite plan carrying the real (cross-class) type change AND
+        // the blocked marker appended alongside it.
         assert_eq!(plan.backend, Backend::Sqlite);
         assert!(
             plan.changes.iter().any(|c| matches!(
                 c,
                 SchemaChange::AlterColumnType { table, column, to, .. }
-                    if table == "posts" && column == "author_id" && *to == ColumnType::Int64
+                    if table == "posts" && column == "author_id" && *to == ColumnType::Text
             )),
-            "the real AlterColumnType (→ Int64) rides in the plan: {:?}",
+            "the real AlterColumnType (→ Text) rides in the plan: {:?}",
             plan.changes
         );
         assert!(
@@ -7556,8 +7752,8 @@ PRAGMA foreign_keys=ON;
         let ctx = SchemaContext::from_tables(&desired, &baseline);
         let up = emit_up_sql_with_context(&plan, &ctx).expect("emit sqlite rebuild");
         assert!(
-            up.contains("author_id INTEGER NULL REFERENCES users(id)"),
-            "the recreate expresses author_id with its (widened) type and keeps the \
+            up.contains("author_id TEXT NULL REFERENCES users(id)"),
+            "the recreate expresses author_id with its (changed) type and keeps the \
              inline REFERENCES: {up}"
         );
         assert!(

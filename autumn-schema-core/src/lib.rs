@@ -44,6 +44,51 @@ pub enum Backend {
     Sqlite,
 }
 
+/// A `SQLite` **type-affinity class** — the five storage-affinity buckets `SQLite`
+/// assigns a column from its declared type (`SQLite` docs §3.1).
+///
+/// Because `SQLite` stores only the declared-type string, distinct IR
+/// [`ColumnType`]s that the emitter renders to the same declared type share an
+/// affinity class and are indistinguishable after a pull; the diff compares by this
+/// class on the `SQLite` backend (see [`ColumnType::sqlite_affinity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteAffinity {
+    /// Declared type contains `INT` (e.g. `INTEGER`, `BIGINT`).
+    Integer,
+    /// Declared type contains `CHAR`, `CLOB`, or `TEXT`.
+    Text,
+    /// Declared type contains `BLOB`, or is empty.
+    Blob,
+    /// Declared type contains `REAL`, `FLOA`, or `DOUB`.
+    Real,
+    /// Anything else (e.g. `NUMERIC`, `DECIMAL`) — the ambiguous catch-all.
+    Numeric,
+}
+
+/// Compute the `SQLite` type-affinity class of a declared-type string.
+///
+/// Follows `SQLite`'s canonical affinity-determination algorithm (docs §3.1),
+/// matched in order (case-insensitively): contains `INT` →
+/// [`Integer`](SqliteAffinity::Integer); contains `CHAR`/`CLOB`/`TEXT` →
+/// [`Text`](SqliteAffinity::Text); contains `BLOB` or empty →
+/// [`Blob`](SqliteAffinity::Blob); contains `REAL`/`FLOA`/`DOUB` →
+/// [`Real`](SqliteAffinity::Real); otherwise [`Numeric`](SqliteAffinity::Numeric).
+#[must_use]
+pub fn sqlite_affinity(declared_type: &str) -> SqliteAffinity {
+    let t = declared_type.to_ascii_uppercase();
+    if t.contains("INT") {
+        SqliteAffinity::Integer
+    } else if t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT") {
+        SqliteAffinity::Text
+    } else if t.is_empty() || t.contains("BLOB") {
+        SqliteAffinity::Blob
+    } else if t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB") {
+        SqliteAffinity::Real
+    } else {
+        SqliteAffinity::Numeric
+    }
+}
+
 /// A logical, dialect-independent column type.
 ///
 /// This is the canonical vocabulary the IR speaks in; the concrete Rust type,
@@ -241,6 +286,25 @@ impl ColumnType {
                 Self::Opaque { pg_type } => pg_type.clone(),
             },
         }
+    }
+
+    /// The `SQLite` **type-affinity class** of this column type, derived from the
+    /// declared type the emitter renders on `SQLite` ([`sql_type`](Self::sql_type)
+    /// with [`Backend::Sqlite`]) via [`sqlite_affinity`].
+    ///
+    /// Because `SQLite` stores only the declared-type STRING (and applies affinity
+    /// rules), the emitter collapses several distinct IR types onto the same
+    /// declared type — `Int32`/`Int64`/`Bool` → `INTEGER`, `Float32`/`Float64` →
+    /// `REAL`, `Text`/`Uuid`/`Timestamp`/`TimestampTz`/`Decimal`/`Attachment`/`Enum`
+    /// → `TEXT`, `Bytes` → `BLOB` — so a pulled `SQLite` snapshot cannot recover the
+    /// original variant. The diff uses THIS class (not exact [`ColumnType`]
+    /// equality) on the `SQLite` backend so a matching model↔pull round-trips clean
+    /// while a genuine class change (e.g. `INTEGER`→`TEXT`) still drifts. Deriving it
+    /// from the rendered declared type keeps it automatically consistent with
+    /// whatever the emitter produces.
+    #[must_use]
+    pub fn sqlite_affinity(&self) -> SqliteAffinity {
+        sqlite_affinity(&self.sql_type(Backend::Sqlite))
     }
 
     /// Whether this type's rendered Rust model type has a working diesel
@@ -959,6 +1023,47 @@ mod tests {
                 expected,
                 "sqlite sql_type for {ct:?}"
             );
+        }
+    }
+
+    #[test]
+    fn sqlite_affinity_of_declared_type_follows_the_canonical_algorithm() {
+        for (decl, expected) in [
+            ("INTEGER", SqliteAffinity::Integer),
+            ("BIGINT", SqliteAffinity::Integer),
+            ("TINYINT", SqliteAffinity::Integer),
+            ("VARCHAR(255)", SqliteAffinity::Text),
+            ("CLOB", SqliteAffinity::Text),
+            ("TEXT", SqliteAffinity::Text),
+            ("", SqliteAffinity::Blob),
+            ("BLOB", SqliteAffinity::Blob),
+            ("REAL", SqliteAffinity::Real),
+            ("FLOAT", SqliteAffinity::Real),
+            ("DOUBLE PRECISION", SqliteAffinity::Real),
+            ("NUMERIC", SqliteAffinity::Numeric),
+            ("DECIMAL(10,2)", SqliteAffinity::Numeric),
+            ("BOOLEAN", SqliteAffinity::Numeric),
+        ] {
+            assert_eq!(sqlite_affinity(decl), expected, "affinity of {decl:?}");
+        }
+    }
+
+    #[test]
+    fn column_type_sqlite_affinity_class_collapses_the_emitter_groups() {
+        use SqliteAffinity::{Blob, Integer, Real, Text};
+        for (ct, expected) in [
+            (ColumnType::Int32, Integer),
+            (ColumnType::Int64, Integer),
+            (ColumnType::Bool, Integer),
+            (ColumnType::Float32, Real),
+            (ColumnType::Float64, Real),
+            (ColumnType::Text, Text),
+            (ColumnType::Uuid, Text),
+            (ColumnType::Timestamp, Text),
+            (ColumnType::TimestampTz, Text),
+            (ColumnType::Bytes, Blob),
+        ] {
+            assert_eq!(ct.sqlite_affinity(), expected, "affinity class of {ct:?}");
         }
     }
 
