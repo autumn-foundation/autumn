@@ -26,12 +26,15 @@
 //!   [`DeployExecutor`](super::exec::DeployExecutor), so the remote command
 //!   sequence is assertable against a recording fake with no live host. It
 //!   no-ops (empty op vector) when the section is not `enabled`.
-//! - Three fail-closed doctor checks — [`ffmpeg_preflight`],
-//!   [`recordings_dir_writable`], and [`mediamtx_ports_available`] — run over the
-//!   same executor and return the shared [`PreflightCheck`] type, so a media host
-//!   can be graded the same way `autumn deploy check` grades the app host. An
-//!   unverifiable result (transport error, unparseable output) reports a clear
-//!   failure — never a silent pass.
+//! - Four fail-closed doctor checks — [`ffmpeg_preflight`],
+//!   [`mediamtx_binary_preflight`], [`recordings_dir_writable`], and
+//!   [`mediamtx_ports_available`] — run over the same executor and return the
+//!   shared [`PreflightCheck`] type, so a media host can be graded the same way
+//!   `autumn deploy check` grades the app host. The binary preflight runs before
+//!   cutover so a host missing the (deferred-provisioned) `MediaMTX` binary fails
+//!   fast instead of committing the app and then failing the post-cutover
+//!   restart. An unverifiable result (transport error, unparseable output)
+//!   reports a clear failure — never a silent pass.
 //!
 //! ## `FFmpeg` path verification (concrete literals only)
 //!
@@ -370,8 +373,14 @@ pub fn render_mediamtx_yml(cfg: &MediaMtxHostConfig) -> String {
          metrics: no\n\
          pprof: no\n\
          \n\
+         # The control API is the server-side control plane: the co-located app\n\
+         # reaches it at 127.0.0.1:{api} and it is intentionally excluded from the\n\
+         # browser-facing CSP origins, so bind it to loopback only rather than\n\
+         # every interface. The viewer/ingest listeners below (RTMP, HLS,\n\
+         # WebRTC/WHEP, playback) stay bound on all interfaces so encoders and\n\
+         # browsers can reach them.\n\
          api: true\n\
-         apiAddress: :{api}\n\
+         apiAddress: 127.0.0.1:{api}\n\
          \n\
          playback: true\n\
          playbackAddress: :{playback}\n\
@@ -609,6 +618,8 @@ pub const CHECK_FFMPEG_PREFLIGHT: &str = "media_ffmpeg_preflight";
 pub const CHECK_RECORDINGS_DIR_WRITABLE: &str = "media_recordings_dir_writable";
 /// The check name for the `MediaMTX` port-availability probe.
 pub const CHECK_MEDIAMTX_PORTS_AVAILABLE: &str = "media_mediamtx_ports_available";
+/// The check name for the `MediaMTX` binary-executable preflight.
+pub const CHECK_MEDIAMTX_BINARY: &str = "media_mediamtx_binary";
 
 /// Remediation hint shown when `FFmpeg` does not resolve.
 const FFMPEG_HINT: &str =
@@ -619,6 +630,9 @@ const RECORDINGS_HINT: &str =
 /// Remediation hint shown when a `MediaMTX` port is occupied or unverifiable.
 const PORTS_HINT: &str =
     "Free the conflicting MediaMTX ports on the host (or stop the service already bound to them)";
+/// Remediation hint shown when the `MediaMTX` binary is missing / not executable.
+const MEDIAMTX_BINARY_HINT: &str = "Install the MediaMTX binary at `[media.mediamtx] binary_path` on the host — a host-bootstrap \
+     prerequisite (download/version-pin the Go binary, exactly as autumn does for kamal-proxy)";
 
 /// Remediation hint shown when `[media.ffmpeg] bin` is env/interpolation
 /// indirected and therefore deferred to the service's own runtime resolution.
@@ -999,13 +1013,64 @@ fn join_ports(ports: &[u16]) -> String {
         .join(", ")
 }
 
-/// Collect the three `MediaMTX` host doctor checks against a live executor.
+/// Grade that the configured `MediaMTX` binary exists and is executable on the
+/// host.
 ///
-/// Runs the `FFmpeg` preflight (against `ffmpeg_bin`), the recordings-dir probe,
-/// and the port-availability probe — returning the shared [`PreflightCheck`]
-/// results so a caller that already holds a [`DeployExecutor`] can grade a media
-/// host the same way `autumn deploy check` grades the app host. `ffmpeg_bin` is
-/// the resolved `[media.ffmpeg] bin` (the plugin's default is `/usr/bin/ffmpeg`).
+/// The binary is a **host-bootstrap prerequisite** — the Go binary is
+/// downloaded / version-pinned by host bootstrap (see the module rustdoc), never
+/// provisioned by this module, exactly as autumn treats kamal-proxy. This check
+/// verifies it is present before cutover.
+///
+/// **Why this must run in the pre-cutover preflight:** [`provision_media_host`]
+/// (which writes the unit and runs `systemctl … restart`) is deliberately
+/// deferred until AFTER the app deploy commits. Without this check a host missing
+/// the binary passes the other three checks, the app cuts over, and only THEN
+/// does the deferred `systemctl restart` fail on the missing `ExecStart` —
+/// leaving the new release live without its media daemon. Verifying `binary_path`
+/// up front turns that into a clean, fail-closed preflight failure before any
+/// cutover, symmetric with [`ffmpeg_preflight`].
+///
+/// Runs `test -x <binary_path>` over the executor — non-mutating. Fail-closed: a
+/// missing/not-executable binary (non-zero exit → transport error) and any other
+/// transport failure both report a clear failure naming `binary_path`.
+#[must_use]
+pub fn mediamtx_binary_preflight(
+    exec: &impl DeployExecutor,
+    cfg: &MediaMtxHostConfig,
+) -> PreflightCheck {
+    let bin = &cfg.binary_path;
+    let cmd = RemoteCommand::new(
+        "media-mediamtx-binary",
+        format!("test -x {}", super::exec::shell_quote(bin)),
+    );
+    match exec.run(&cmd) {
+        Ok(_) => PreflightCheck {
+            name: CHECK_MEDIAMTX_BINARY,
+            passed: true,
+            detail: format!("MediaMTX binary `{bin}` exists and is executable"),
+            hint: None,
+        },
+        Err(err) => PreflightCheck {
+            name: CHECK_MEDIAMTX_BINARY,
+            passed: false,
+            detail: format!(
+                "MediaMTX binary `{bin}` is missing or not executable: {err} — MediaMTX cannot \
+                 start, so the post-cutover `systemctl restart` would fail; the binary is a \
+                 host-bootstrap prerequisite (download/version-pin it, like kamal-proxy)"
+            ),
+            hint: Some(MEDIAMTX_BINARY_HINT),
+        },
+    }
+}
+
+/// Collect the four `MediaMTX` host doctor checks against a live executor.
+///
+/// Runs the `FFmpeg` preflight (against `ffmpeg_bin`), the `MediaMTX`
+/// binary-executable preflight, the recordings-dir probe, and the
+/// port-availability probe — returning the shared [`PreflightCheck`] results so a
+/// caller that already holds a [`DeployExecutor`] can grade a media host the same
+/// way `autumn deploy check` grades the app host. `ffmpeg_bin` is the resolved
+/// `[media.ffmpeg] bin` (the plugin's default is `/usr/bin/ffmpeg`).
 #[must_use]
 pub fn collect_media_doctor_checks(
     exec: &impl DeployExecutor,
@@ -1014,6 +1079,7 @@ pub fn collect_media_doctor_checks(
 ) -> Vec<PreflightCheck> {
     vec![
         ffmpeg_preflight(exec, ffmpeg_bin),
+        mediamtx_binary_preflight(exec, cfg),
         recordings_dir_writable(exec, cfg),
         mediamtx_ports_available(exec, cfg),
     ]
@@ -1196,12 +1262,50 @@ unit_name = \"mediamtx-prod\"
     #[test]
     fn rendered_yml_contains_every_port() {
         let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
-        assert!(yml.contains("apiAddress: :9997"), "api port: {yml}");
+        // The control API binds loopback-only (Finding M) — server-side control
+        // plane for the co-located app, excluded from browser-facing CSP origins.
+        assert!(
+            yml.contains("apiAddress: 127.0.0.1:9997"),
+            "api port: {yml}"
+        );
         assert!(yml.contains("playbackAddress: :9996"), "playback: {yml}");
         assert!(yml.contains("rtmpAddress: :1935"), "rtmp: {yml}");
         assert!(yml.contains("hlsAddress: :8888"), "hls: {yml}");
         assert!(yml.contains("webrtcAddress: :8889"), "webrtc: {yml}");
         assert!(yml.contains("webrtcLocalUDPAddress: :8189"), "udp: {yml}");
+    }
+
+    #[test]
+    fn rendered_yml_binds_api_to_loopback_but_leaves_public_listeners_open() {
+        // Finding M: the control API is the server-side control plane (the
+        // co-located app reaches it at 127.0.0.1) and is excluded from the
+        // browser-facing CSP origins, so it must NOT listen on every interface.
+        let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
+        assert!(
+            yml.contains("apiAddress: 127.0.0.1:9997"),
+            "control API must bind loopback only: {yml}"
+        );
+        assert!(
+            !yml.contains("apiAddress: :9997"),
+            "control API must NOT bind all interfaces: {yml}"
+        );
+        // The viewer/ingest-facing listeners MUST stay bound on all interfaces so
+        // encoders and browsers can reach them — none is loopback-bound.
+        for public in [
+            "rtmpAddress: :1935",
+            "hlsAddress: :8888",
+            "webrtcAddress: :8889",
+            "playbackAddress: :9996",
+        ] {
+            assert!(yml.contains(public), "public listener {public}: {yml}");
+        }
+        assert!(
+            !yml.contains("rtmpAddress: 127.0.0.1")
+                && !yml.contains("hlsAddress: 127.0.0.1")
+                && !yml.contains("webrtcAddress: 127.0.0.1")
+                && !yml.contains("playbackAddress: 127.0.0.1"),
+            "no public listener may be loopback-bound: {yml}"
+        );
     }
 
     #[test]
@@ -1262,7 +1366,7 @@ unit_name = \"mediamtx-prod\"
             ..MediaMtxHostConfig::default()
         };
         let yml = render_mediamtx_yml(&cfg);
-        assert!(yml.contains("apiAddress: :19997"));
+        assert!(yml.contains("apiAddress: 127.0.0.1:19997"));
         assert!(yml.contains("hlsAddress: :18888"));
         assert!(yml.contains("recordPath: /data/rec/%path/"));
         assert!(yml.contains("recordDeleteAfter: 24h"));
@@ -1588,6 +1692,88 @@ unit_name = \"mediamtx-prod\"
         assert_eq!(exec.labels(), vec!["media-ffmpeg-preflight"]);
     }
 
+    // ── Doctor: MediaMTX binary preflight (Finding N) ────────────────────────
+    //
+    // Provisioning (`systemctl … restart`) is deferred until AFTER the app
+    // cutover commits, so a host missing the MediaMTX binary must be caught by a
+    // non-mutating `test -x <binary_path>` check BEFORE cutover — otherwise the
+    // app commits and the deferred restart then fails on the missing `ExecStart`.
+
+    #[test]
+    fn mediamtx_binary_preflight_passes_when_executable() {
+        // `test -x` exits zero → Ok → pass.
+        let exec = RecordingExecutor::new();
+        let check = mediamtx_binary_preflight(&exec, &MediaMtxHostConfig::default());
+        assert!(check.passed, "detail: {}", check.detail);
+        assert_eq!(check.name, CHECK_MEDIAMTX_BINARY);
+        assert_eq!(exec.labels(), vec!["media-mediamtx-binary"]);
+        // Non-mutating: it only runs `test -x`, never a mutating command.
+        assert!(check.hint.is_none());
+    }
+
+    #[test]
+    fn mediamtx_binary_preflight_fails_when_missing_or_not_executable() {
+        // A missing / non-executable binary makes `test -x` exit non-zero → the
+        // fake surfaces a transport error → fail-closed, naming binary_path and
+        // the deferred-restart consequence.
+        let exec = RecordingExecutor::failing_on("media-mediamtx-binary");
+        let cfg = MediaMtxHostConfig::default();
+        let check = mediamtx_binary_preflight(&exec, &cfg);
+        assert!(!check.passed);
+        assert_eq!(check.name, CHECK_MEDIAMTX_BINARY);
+        assert!(
+            check.detail.contains(&cfg.binary_path),
+            "detail must name binary_path: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("systemctl restart"),
+            "detail must state the post-cutover restart would fail: {}",
+            check.detail
+        );
+        assert!(check.hint.is_some());
+    }
+
+    #[test]
+    fn mediamtx_binary_preflight_uses_test_x_and_shell_quotes_the_path() {
+        // Verify the exact non-mutating command shape (shell-quoted binary_path).
+        struct CaptureExec {
+            cmd: RefCell<Option<String>>,
+        }
+        impl DeployExecutor for CaptureExec {
+            fn run(&self, cmd: &RemoteCommand) -> Result<CommandOutput, DeployExecError> {
+                *self.cmd.borrow_mut() = Some(cmd.shell.clone());
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+            fn upload(
+                &self,
+                _local: &Path,
+                _remote_path: &str,
+                _mode: Option<u32>,
+            ) -> Result<(), DeployExecError> {
+                Ok(())
+            }
+        }
+        let exec = CaptureExec {
+            cmd: RefCell::new(None),
+        };
+        let cfg = MediaMtxHostConfig {
+            binary_path: "/opt/media mtx/mediamtx".to_owned(),
+            ..MediaMtxHostConfig::default()
+        };
+        let _ = mediamtx_binary_preflight(&exec, &cfg);
+        let cmd = exec.cmd.borrow().clone().expect("command ran");
+        assert!(cmd.starts_with("test -x "), "must be `test -x`: {cmd}");
+        // Path with a space must be shell-quoted so it stays one argument.
+        assert!(
+            cmd.contains("'/opt/media mtx/mediamtx'"),
+            "binary_path must be shell-quoted: {cmd}"
+        );
+    }
+
     // ── Doctor: recordings dir writable ──────────────────────────────────────
 
     #[test]
@@ -1839,7 +2025,7 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
     }
 
     #[test]
-    fn collect_runs_all_three_checks_in_order() {
+    fn collect_runs_all_four_checks_in_order() {
         let exec = RecordingExecutor::new()
             .with_stdout("media-ffmpeg-preflight", "ffmpeg version 6.1")
             .with_stdout(
@@ -1848,12 +2034,16 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
             );
         let checks =
             collect_media_doctor_checks(&exec, &MediaMtxHostConfig::default(), "/usr/bin/ffmpeg");
-        assert_eq!(checks.len(), 3);
+        assert_eq!(checks.len(), 4);
         assert!(checks.iter().all(|c| c.passed), "all should pass");
         assert_eq!(
             exec.labels(),
             vec![
                 "media-ffmpeg-preflight",
+                // The MediaMTX binary preflight (Finding N) runs before cutover,
+                // symmetric with the FFmpeg preflight, so a host missing the
+                // deferred-provisioned binary fails fast.
+                "media-mediamtx-binary",
                 "media-recordings-dir",
                 // The ports check is a single process-aware `ss -tulnp` scan; the
                 // old `systemctl is-active` gate was removed (Finding D).
