@@ -9,10 +9,11 @@ Autumn supports **two production database tiers**, and you pick one per app:
   self-hosted single-binary app via [`autumn deploy`](./deployment.md).
 - **Postgres** — a networked server you run alongside the app. This is the
   scale-out tier: it unlocks [read replicas](./repositories.md),
-  [native sharding](./sharding.md), multi-replica
-  [scheduled tasks](./scheduled-multi-replica.md), and
-  [Postgres full-text search](./full-text-search.md) — the features that only
+  [native sharding](./sharding.md), and multi-replica
+  [scheduled tasks](./scheduled-multi-replica.md) — the features that only
   make sense when more than one process talks to the same data.
+  ([Full-text search](./full-text-search.md) is **not** in this list — it now
+  works on both backends, see below.)
 
 Both tiers run the **same battery** — models and repositories, embedded
 migrations with the production-safety classifier, durable `#[job]` background
@@ -107,7 +108,7 @@ not a rewrite.
 | One host, write volume comfortably below a single serialized writer | **SQLite** |
 | Multiple replicas / multiple hosts sharing data | **Postgres** |
 | Read replicas, sharding, or heavy write concurrency | **Postgres** |
-| You need Postgres FTS, `LISTEN/NOTIFY`, or advisory-lock leader election | **Postgres** |
+| You need Postgres-specific FTS features (language-stemming dictionaries), `LISTEN/NOTIFY`, or advisory-lock leader election | **Postgres** |
 
 ---
 
@@ -133,9 +134,9 @@ buckets on SQLite:
 | Capability | Postgres | SQLite (eventual) | Mechanism / behavior on SQLite | Status (today) |
 | --- | :---: | :---: | --- | --- |
 | Core models / CRUD / repositories | ✅ | ✅ | Same repository API and query path on the SQLite runtime pool. | ✅ **Available now** (behind the `sqlite` feature) |
-| Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | **Startup** migrations apply on **file-backed** SQLite through diesel's `MigrationHarness` (unlocked); an **in-memory** target with registered migrations is refused at boot (the migrated schema is lost before the runtime pool anchors it). The `autumn migrate` CLI up/down still routes through the Postgres advisory-lock path (`hold_migration_lock` → `PgConnection`), so it is not available for a `sqlite://` URL yet. | ⚠️ **Partial** — startup migrations apply on file-backed SQLite (MigrationHarness; in-memory + migrations boot-refused); `autumn migrate` CLI up/down is Postgres-only (planned) |
+| Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | **Startup** migrations apply on **file-backed** SQLite through diesel's `MigrationHarness` (unlocked); an **in-memory** target with registered migrations is refused at boot (the migrated schema is lost before the runtime pool anchors it). The `autumn migrate` CLI up/down still routes through the Postgres advisory-lock path (`hold_migration_lock` → `PgConnection`), so it is not available for a `sqlite://` URL yet. (The separate **declarative** `autumn schema migrate` verb — see [Declarative schema](./declarative-schema.md) — *does* apply pending migrations on SQLite, unlocked, **but only when the CLI was built with the non-default `sqlite` cargo feature** — the default/published `autumn` binary is Postgres-only and stops with a "rebuild with `--features sqlite`" error.) | ⚠️ **Partial** — startup migrations apply on file-backed SQLite (MigrationHarness; in-memory + migrations boot-refused); the classic `autumn migrate` CLI up/down is Postgres-only (planned) |
 | `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Offline SQL-file safety linter (reads no DB URL, so it does not fail on a `sqlite://` target); its safety rules target Postgres migration semantics — there is no SQLite-specific classification yet. | ⚠️ **Partial** — the linter runs (no DB connection), but its rules are Postgres-oriented; no SQLite-specific classification |
-| Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Startup migrations run **unlocked** — no advisory lock and no `BEGIN IMMEDIATE` reservation. Concurrent same-host starts are not serialized by an explicit reservation; they rely on SQLite's single-writer semantics plus the pool `busy_timeout`. | ⚠️ **Not serialized** — no advisory lock / no `BEGIN IMMEDIATE`; explicit reservation is a known gap (planned) |
+| Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Startup migrations run **unlocked** — no advisory lock and no `BEGIN IMMEDIATE` reservation on the migration path. Concurrent same-host starts are not serialized by an explicit reservation; they rely on SQLite's single-writer semantics plus the pool `busy_timeout`. (Note: application **write-RMW** sites *do* issue `BEGIN IMMEDIATE` since #1996 — this row is only about the migration path.) | ⚠️ **Not serialized** — no advisory lock / no migration-path `BEGIN IMMEDIATE`; explicit reservation is a known gap (planned) |
 | Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** |
 | Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | ⛔ **Planned — #1907** |
 | `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** |
@@ -147,7 +148,7 @@ buckets on SQLite:
 | `autumn deploy` data-file persistence | ✅ | ✅ | SQLite data file treated as **persistent state**; deploy/rollback never clobbers it. | ⛔ **Planned — #1909** |
 | Read replicas (`replica_url`) | ✅ | ⛔ | **Boot-refuse.** No networked replicas on a single-file DB — out of scope. | ✅ **Available now — boot-refuse** |
 | Sharding / shard directory | ✅ | ⛔ | **Boot-refuse.** Native sharding is Postgres-only. | ✅ **Available now — boot-refuse** |
-| Postgres FTS scaffold (`--search`, `tsvector`) | ✅ | ⛔ | **Rejected at generate time.** `tsvector` has no SQLite equivalent; FTS5 is a later slice (#1910). | ✅ **Available now — reject at generate** |
+| Full-text search (`--searchable` / `#[searchable]`) | ✅ `tsvector` + GIN | ✅ FTS5 | **Available now on both backends.** Postgres uses a `tsvector` generated column + GIN index; SQLite uses an external-content **FTS5** virtual table with `unicode61` tokenization and `bm25` ranking (weights from `#[searchable(weight=…)]`). The `--searchable` / `#[searchable]` scaffold generates on both (#1910 / #2047). | ✅ **Available now** |
 | Streaming replication (Litestream-style) | n/a | ⛔ | Out of scope; snapshot backup is the durability story. | Contract (out of scope) |
 | Multi-writer / networked SQLite (LiteFS, rqlite) | n/a | ⛔ | Out of scope; single-host, single-writer only. | Contract (out of scope) |
 
@@ -183,7 +184,6 @@ published support contract**. Available **today**:
   - `Uuid` / `Decimal` / `Attachment` / `DateTime<Utc>` / `Enum` field kinds —
     #1924.
   - `--id uuid` primary keys — #1905.
-  - `--search` / FTS scaffold — #1910.
   - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
     paths).
   - `DROP INDEX` emitted before `DROP COLUMN` on the forward **and** rollback
@@ -311,15 +311,19 @@ Additional generator shapes are refused on SQLite:
 - **`--id uuid` primary keys** are rejected at generate time — the SQLite primary
   key is `INTEGER PRIMARY KEY AUTOINCREMENT`, and a UUID primary key has no
   working conversion yet. Tracked in #1905.
-- **`--search` / FTS scaffold** is rejected at generate time — Postgres FTS uses a
-  `tsvector` generated column and a GIN index, which SQLite lacks. SQLite FTS5 is
-  a later slice. Tracked in #1910.
 - **`generate auth` / `generate mailer`** are rejected on a SQLite app at
   generate time — their scaffolds emit Postgres-shaped models and store code with
   no working SQLite mapping yet, so they are refused before any files are written
   rather than emitted as output that breaks on SQLite. This is a **generate-time**
   refusal only — `generate destroy`/revert of an existing scaffold still works.
   Tracked in #1927.
+
+> **Full-text search now generates on SQLite (#2047).** The `--searchable` /
+> `#[searchable]` scaffold — historically rejected at generate time on SQLite —
+> now emits a backend-appropriate index on both backends: a `tsvector` generated
+> column + GIN index on Postgres, and an external-content **FTS5** virtual table
+> (`unicode61` tokenization, `bm25` ranking) on SQLite. See
+> [Full-text search](./full-text-search.md#6-sqlite-fts5).
 
 > **Scaffold smoke tests are still Postgres-shaped.** The generated-scaffold smoke
 > test (including the duplicate-`unique` rejection) uses
@@ -354,8 +358,7 @@ A few SQLite-specific mechanics apply when the generator emits migrations:
 
 These are Postgres-only by design. They are not missing features to be filed as
 bugs; they are the scale-out tier's reason to exist, and every one of them
-**fails fast at boot** (or, for the FTS scaffold, at generate time) with an
-actionable message:
+**fails fast at boot** with an actionable message:
 
 - **Read replicas** (`replica_url` / replica routing) — a single file has no
   networked replica to route reads to.
@@ -365,14 +368,23 @@ actionable message:
   snapshot [backups](#backup-restore-scrub-retention) for durability instead.
 - **Multi-writer clustering / networked SQLite** (LiteFS, rqlite,
   libsql/Turso) — the tier is single-host, single-writer only.
-- **Postgres full-text search** (the `--search` scaffold, `tsvector` columns,
-  GIN indexes) — rejected at generate time because `tsvector` has no SQLite
-  column type. SQLite FTS5 is a later slice, not this one; see
-  [Full-text search](./full-text-search.md).
-- **Scoped / searchable repositories** (`--search` / full-text-search repos) are Postgres-only and are not generated on the SQLite backend.
-- **Version-history (`jsonb`) columns** rely on Postgres `jsonb` semantics and are not supported on the SQLite runtime.
-- **A server-side statement timeout** has no SQLite equivalent; long-running statements are bounded by `busy_timeout` (lock contention) only, not a wall-clock cap.
-- **Explicit `BEGIN IMMEDIATE` write reservation** is not issued anywhere in the migration path today — migration serialization is not implemented via one (it is planned) — and general application transactions use SQLite's default deferred behaviour.
+- **A server-side statement timeout** has no SQLite equivalent — diesel's async
+  `SqliteConnection` exposes no interrupt hook — so a non-zero
+  `database.statement_timeout` on a `sqlite` URL is now **refused at boot**
+  (`PoolError::UnsupportedBackend`, #2034) rather than silently ignored;
+  long-running statements are otherwise bounded by `busy_timeout` (lock
+  contention) only, not a wall-clock cap.
+
+> **Now supported on SQLite (previously listed here).** Full-text search
+> (the `--searchable` / `#[searchable]` scaffold) is available via **FTS5** (#2047),
+> searchable repositories generate and run on SQLite, and **version-history**
+> (`versioned = true`) columns are supported on the SQLite runtime with JSON
+> stored as `TEXT` (#2034). A single-record write-RMW site also issues an
+> explicit **`BEGIN IMMEDIATE`** write reservation on SQLite (via
+> `scoped_immediate_transaction`, through diesel's `AnsiTransactionManager`, so
+> nested transactions become savepoints) — #2034 / #2038. The one remaining
+> `BEGIN IMMEDIATE` gap is the **startup migration path**, which still applies
+> unlocked with no explicit reservation (planned).
 
 ---
 
@@ -387,8 +399,9 @@ never as a runtime surprise on some unlucky code path days later.
   Postgres-only job/scheduler backend, a multi-replica lock) fails at boot with
   an actionable diagnostic.
 - A **generator** that would emit output which compiles on Postgres but breaks
-  on SQLite (for example the `tsvector` FTS scaffold) is rejected at **generate
-  time**, with the reason stated — never silent output that fails later.
+  on SQLite (for example a `Uuid` / `Decimal` field kind or an `--id uuid`
+  primary key) is rejected at **generate time**, with the reason stated — never
+  silent output that fails later.
 
 So the operational rule is simple: if a SQLite app boots, every feature it is
 configured to use is supported on SQLite. There is no third state where an
@@ -405,6 +418,7 @@ unsupported feature lurks until first use.
 - [Migrations](./migrations.md) — the classifier, checksums, and advisory-lock
   serialization this guide contrasts against.
 - [Jobs](./jobs.md) and [Multi-replica scheduled tasks](./scheduled-multi-replica.md).
-- [Sharding](./sharding.md), [Repositories](./repositories.md), and
-  [Full-text search](./full-text-search.md) — the Postgres-only scale-out
-  features.
+- [Sharding](./sharding.md) and [Repositories](./repositories.md) — the
+  Postgres-only scale-out features.
+- [Full-text search](./full-text-search.md) — available now on **both**
+  backends (Postgres `tsvector`/`GIN`, SQLite FTS5).
