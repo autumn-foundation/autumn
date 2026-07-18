@@ -311,6 +311,12 @@ impl ColumnType {
     ///
     /// Resolution order:
     ///
+    /// 0. A **length-limited character type** — `varchar` (`character varying`) or
+    ///    `bpchar` (`character`/`char`) **with** a `character_maximum_length` — is
+    ///    preserved as [`Opaque`](Self::Opaque) carrying `varchar(n)` / `char(n)`
+    ///    so the DB-enforced length limit survives recreation rather than being
+    ///    flattened to an unconstrained `TEXT`. An unbounded `varchar` (length
+    ///    `None`, or `text`, which never carries a length) falls through to `Text`.
     /// 1. [`from_pg_udt`](Self::from_pg_udt) — the shared mapped surface
     ///    (`text`/`int4`/`int8`/`bool`/`float4`/`float8`/`uuid`/`timestamp`/
     ///    `timestamptz`/`bytea`).
@@ -338,7 +344,32 @@ impl ColumnType {
         udt: &str,
         numeric_precision: Option<i32>,
         numeric_scale: Option<i32>,
+        character_maximum_length: Option<i32>,
     ) -> Self {
+        // Fail-closed floor for length-limited character types. `VARCHAR(32)` and
+        // `CHAR(2)` report `udt_name` `varchar` / `bpchar`, which `from_pg_udt`
+        // otherwise collapses to `Text`, silently dropping the DB-enforced length
+        // limit (recreation would emit an unconstrained `TEXT`). When a length
+        // modifier is present, preserve the column verbatim as `Opaque` carrying a
+        // valid Postgres type string (`Opaque`'s `sql_type` emits `pg_type`
+        // unchanged), checked BEFORE the `from_pg_udt` mapped return. An unbounded
+        // `varchar` (or `text`, which never carries a length) has `None` here and
+        // maps to `Text` exactly as before.
+        if let Some(length) = character_maximum_length {
+            match udt {
+                "varchar" => {
+                    return Self::Opaque {
+                        pg_type: format!("varchar({length})"),
+                    };
+                }
+                "bpchar" => {
+                    return Self::Opaque {
+                        pg_type: format!("char({length})"),
+                    };
+                }
+                _ => {}
+            }
+        }
         if let Some(mapped) = Self::from_pg_udt(udt) {
             return mapped;
         }
@@ -956,7 +987,7 @@ mod tests {
             ("bytea", ColumnType::Bytes),
         ] {
             assert_eq!(
-                ColumnType::from_pg_introspection(udt, None, None),
+                ColumnType::from_pg_introspection(udt, None, None, None),
                 expected,
                 "from_pg_introspection for {udt}"
             );
@@ -966,7 +997,7 @@ mod tests {
     #[test]
     fn from_pg_introspection_numeric_with_precision_is_decimal() {
         assert_eq!(
-            ColumnType::from_pg_introspection("numeric", Some(12), Some(2)),
+            ColumnType::from_pg_introspection("numeric", Some(12), Some(2), None),
             ColumnType::Decimal {
                 precision: 12,
                 scale: 2
@@ -974,7 +1005,7 @@ mod tests {
         );
         // `decimal` alias, and a scale that defaults to 0 when NULL.
         assert_eq!(
-            ColumnType::from_pg_introspection("decimal", Some(8), None),
+            ColumnType::from_pg_introspection("decimal", Some(8), None, None),
             ColumnType::Decimal {
                 precision: 8,
                 scale: 0
@@ -982,7 +1013,7 @@ mod tests {
         );
         // A bare `numeric` with no precision cannot be reconstructed → Opaque.
         assert_eq!(
-            ColumnType::from_pg_introspection("numeric", None, None),
+            ColumnType::from_pg_introspection("numeric", None, None, None),
             ColumnType::Opaque {
                 pg_type: "numeric".to_owned()
             }
@@ -995,28 +1026,28 @@ mod tests {
         // it must be preserved as `Opaque` carrying the true type string, NOT
         // silently clamped to `NUMERIC(255, 0)`.
         assert_eq!(
-            ColumnType::from_pg_introspection("numeric", Some(1000), Some(0)),
+            ColumnType::from_pg_introspection("numeric", Some(1000), Some(0), None),
             ColumnType::Opaque {
                 pg_type: "numeric(1000)".to_owned()
             }
         );
         // An out-of-range precision with a non-zero scale keeps both.
         assert_eq!(
-            ColumnType::from_pg_introspection("numeric", Some(1000), Some(500)),
+            ColumnType::from_pg_introspection("numeric", Some(1000), Some(500), None),
             ColumnType::Opaque {
                 pg_type: "numeric(1000,500)".to_owned()
             }
         );
         // A negative scale does not fit `u8` → preserved verbatim, not clamped.
         assert_eq!(
-            ColumnType::from_pg_introspection("numeric", Some(10), Some(-2)),
+            ColumnType::from_pg_introspection("numeric", Some(10), Some(-2), None),
             ColumnType::Opaque {
                 pg_type: "numeric(10,-2)".to_owned()
             }
         );
         // In-range values are unaffected (round-trip parity).
         assert_eq!(
-            ColumnType::from_pg_introspection("numeric", Some(12), Some(2)),
+            ColumnType::from_pg_introspection("numeric", Some(12), Some(2), None),
             ColumnType::Decimal {
                 precision: 12,
                 scale: 2
@@ -1025,9 +1056,39 @@ mod tests {
     }
 
     #[test]
+    fn from_pg_introspection_length_limited_char_types_are_opaque() {
+        // `VARCHAR(32)` / `CHAR(2)` report `udt_name` `varchar` / `bpchar`, which
+        // `from_pg_udt` would otherwise flatten to `Text`, dropping the length
+        // limit. With a length modifier present they are preserved verbatim as
+        // `Opaque` carrying valid Postgres DDL, checked before the mapped return.
+        assert_eq!(
+            ColumnType::from_pg_introspection("varchar", None, None, Some(32)),
+            ColumnType::Opaque {
+                pg_type: "varchar(32)".to_owned()
+            }
+        );
+        assert_eq!(
+            ColumnType::from_pg_introspection("bpchar", None, None, Some(2)),
+            ColumnType::Opaque {
+                pg_type: "char(2)".to_owned()
+            }
+        );
+        // An unbounded `varchar` (length `None`) and `text` (never length-carrying)
+        // behave exactly as before → `Text`.
+        assert_eq!(
+            ColumnType::from_pg_introspection("varchar", None, None, None),
+            ColumnType::Text
+        );
+        assert_eq!(
+            ColumnType::from_pg_introspection("text", None, None, None),
+            ColumnType::Text
+        );
+    }
+
+    #[test]
     fn from_pg_introspection_jsonb_is_attachment() {
         assert_eq!(
-            ColumnType::from_pg_introspection("jsonb", None, None),
+            ColumnType::from_pg_introspection("jsonb", None, None, None),
             ColumnType::Attachment
         );
     }
@@ -1036,7 +1097,7 @@ mod tests {
     fn from_pg_introspection_unknown_types_are_preserved_opaque() {
         for udt in ["inet", "citext", "macaddr", "tsvector", "point"] {
             assert_eq!(
-                ColumnType::from_pg_introspection(udt, None, None),
+                ColumnType::from_pg_introspection(udt, None, None, None),
                 ColumnType::Opaque {
                     pg_type: udt.to_owned()
                 },
@@ -1047,7 +1108,7 @@ mod tests {
 
     #[test]
     fn opaque_sql_type_round_trips_the_raw_name_verbatim() {
-        let ct = ColumnType::from_pg_introspection("inet", None, None);
+        let ct = ColumnType::from_pg_introspection("inet", None, None, None);
         // The raw Postgres type name is emitted verbatim on both backends, so a
         // pulled snapshot never loses the type.
         assert_eq!(ct.sql_type(Backend::Postgres), "inet");

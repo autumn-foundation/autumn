@@ -1484,6 +1484,75 @@ async fn schema_pull_preserves_domain_column_as_opaque() {
     assert_no_secret_leak(&doc_out, &doc_err);
 }
 
+/// Fail-closed floor for length-limited character types: a `VARCHAR(32)` /
+/// `CHAR(2)` column reports `udt_name` `varchar` / `bpchar`, which the shared
+/// mapped surface would otherwise flatten to `Text`, silently dropping the
+/// DB-enforced length limit (recreation would emit an unconstrained `TEXT`). Pull
+/// must preserve the length verbatim as `Opaque` carrying `varchar(32)` /
+/// `char(2)`, while an unbounded `TEXT` column stays `Text`. Re-pull is byte-stable
+/// and doctor is clean.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_preserves_length_limited_char_columns_as_opaque() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_varchar_opaque_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_labels",
+        "CREATE TABLE labels (id BIGSERIAL PRIMARY KEY, code VARCHAR(32) NOT NULL, \
+         kind CHAR(2) NOT NULL, note TEXT, created_at TIMESTAMP NOT NULL DEFAULT NOW());",
+        "DROP TABLE labels;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the length-limited columns are preserved as Opaque{varchar(32)} /
+    // Opaque{char(2)}, never flattened to Text; the unbounded `note` stays Text.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("\"name\": \"code\"") && snap.contains("\"pg_type\": \"varchar(32)\""),
+        "VARCHAR(32) is preserved as Opaque varchar(32) (NOT Text): {snap}"
+    );
+    assert!(
+        snap.contains("\"name\": \"kind\"") && snap.contains("\"pg_type\": \"char(2)\""),
+        "CHAR(2) is preserved as Opaque char(2) (NOT Text): {snap}"
+    );
+    // `note` (unbounded TEXT) must map to Text, not Opaque.
+    let note_idx = snap
+        .find("\"name\": \"note\"")
+        .expect("note column present");
+    let note_slice = &snap[note_idx..];
+    assert!(
+        note_slice.contains("\"Text\""),
+        "the unbounded TEXT column stays Text: {snap}"
+    );
+
+    // Re-pull is byte-for-byte stable.
+    let snap_before = snap;
+    let (pull2_out, pull2_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull2_out, &pull2_err);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("snapshot after second pull");
+    assert_eq!(
+        snap_before, snap_after,
+        "a re-pull of the same database must be byte-for-byte stable (no varchar-length drift)"
+    );
+
+    // doctor agrees the DB matches the pulled baseline.
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports the DB matches the snapshot with the length-limited columns:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
 /// Fix 3 (fail-closed floor for cross-schema FK targets): a FK referencing a table
 /// outside `public` (`REFERENCES auth.accounts(id)`) must be recorded
 /// schema-qualified (`auth.accounts`) so recreation emits `REFERENCES

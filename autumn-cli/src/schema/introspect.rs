@@ -124,6 +124,12 @@
 //!   deferred. (An **EXCLUDE** constraint is not subject to this deferral: it is
 //!   restored as the real `ADD CONSTRAINT … EXCLUDE USING …`, per the reconciliation
 //!   note above.)
+//! - **CHECK constraint `NO INHERIT` / `NOT VALID` suffixes**: dropped on
+//!   recreation (the predicate is preserved; the suffix is not modeled).
+//! - **`GENERATED ... AS IDENTITY` columns**: pulled as ordinary integer columns
+//!   (their identity metadata from `information_schema.columns.is_identity` is not
+//!   modeled); recreation emits a plain column / loses the identity — identity
+//!   modeling is deferred alongside owned sequences.
 //!
 //! Errors are **credential-safe** by construction: no variant ever embeds the
 //! resolved database URL (only a parsed host/port on the connection-error path,
@@ -239,6 +245,13 @@ struct ColumnRow {
     numeric_precision: Option<i32>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     numeric_scale: Option<i32>,
+    /// The declared length limit for a `varchar(n)` / `char(n)` column (`NULL` for
+    /// an unbounded `varchar`, `text`, or any non-character type). When set on a
+    /// non-domain `varchar`/`bpchar` column it is preserved verbatim as
+    /// [`ColumnType::Opaque`] so the DB-enforced length survives recreation rather
+    /// than being flattened to an unconstrained `TEXT`.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    character_maximum_length: Option<i32>,
     /// The Postgres DOMAIN name backing this column, or `NULL` when the column's
     /// type is not a domain. When set, the column's type is preserved verbatim as
     /// [`ColumnType::Opaque`] (schema-qualified via `domain_schema`) so the
@@ -428,17 +441,18 @@ fn fetch_columns(
     conn: &mut PgConnection,
     tables: &[String],
 ) -> Result<BTreeMap<String, Vec<ColumnRow>>, IntrospectError> {
-    // `numeric_precision` / `numeric_scale` are the `information_schema`
-    // `cardinal_number` domain, not a plain `int4`. Decoding that domain as diesel
-    // `Nullable<Integer>` on the wire is unproven (no sibling query reads them), and
-    // if it does not present as `int4` the whole column query would error and every
-    // pull would fail. Cast both to a plain `integer` in SQL so the output type is
-    // guaranteed `int4` regardless of the domain. The `AS <name>` aliases keep the
-    // result column names aligned with the `ColumnRow` field bindings.
+    // `numeric_precision` / `numeric_scale` / `character_maximum_length` are the
+    // `information_schema` `cardinal_number` domain, not a plain `int4`. Decoding
+    // that domain as diesel `Nullable<Integer>` on the wire is unproven (no sibling
+    // query reads them), and if it does not present as `int4` the whole column query
+    // would error and every pull would fail. Cast each to a plain `integer` in SQL so
+    // the output type is guaranteed `int4` regardless of the domain. The `AS <name>`
+    // aliases keep the result column names aligned with the `ColumnRow` field bindings.
     let query = format!(
         "SELECT table_name, column_name, udt_name, is_nullable, column_default, \
          numeric_precision::integer AS numeric_precision, \
          numeric_scale::integer AS numeric_scale, \
+         character_maximum_length::integer AS character_maximum_length, \
          domain_name, domain_schema FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name IN ({}) \
          ORDER BY table_name, ordinal_position",
@@ -665,20 +679,66 @@ fn fetch_checks(
 }
 
 /// Strip a `pg_get_constraintdef` CHECK definition (`CHECK ((price >= 0))`) to the
-/// inner predicate (`price >= 0`) the emitter re-wraps in `CHECK (...)`. Removes
-/// the leading `CHECK ` keyword and exactly one balanced outer paren pair; a
-/// definition that does not match the expected shape is returned trimmed verbatim
-/// (never silently dropped).
+/// inner predicate (`price >= 0`) the emitter re-wraps in `CHECK (...)`. Removes the
+/// leading `CHECK ` keyword, then extracts **only** the span inside the FIRST
+/// balanced outer paren pair — so a trailing suffix such as `NOT VALID` or
+/// `NO INHERIT` (which `pg_get_constraintdef` appends after the predicate) is
+/// dropped rather than left inside the re-wrapped `CHECK (...)`, where it would
+/// produce syntactically invalid / semantically altered DDL on recreation. The
+/// dropped suffix is a documented deferral (see the "Deferred blind spots" note):
+/// on a recreated (dropped, empty) table a `NOT VALID` check is trivially satisfied
+/// and `NO INHERIT` only affects table inheritance, so the re-wrap stays valid and
+/// behavior-equivalent. A definition that does not match the expected `CHECK (...)`
+/// shape is returned trimmed verbatim (never silently dropped).
 fn strip_check_wrapper(definition: &str) -> String {
     let trimmed = definition.trim();
-    let inner = trimmed
+    let Some(rest) = trimmed
         .strip_prefix("CHECK ")
         .or_else(|| trimmed.strip_prefix("CHECK"))
-        .map_or(trimmed, str::trim);
-    inner
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .map_or_else(|| inner.to_owned(), |unwrapped| unwrapped.trim().to_owned())
+        .map(str::trim_start)
+    else {
+        return trimmed.to_owned();
+    };
+    let bytes = rest.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return trimmed.to_owned();
+    }
+    // Scan the first balanced `(...)` span, tracking paren depth (ignoring parens
+    // inside single-quoted string literals, where Postgres escapes an embedded
+    // quote by doubling it). The inner predicate is everything between the outer
+    // parens; any trailing suffix after the matching close paren is discarded.
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'\'' => in_string = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // `rest[0]` is `(` and `rest[i]` is `)` — both ASCII, so the
+                        // slice boundaries fall on char boundaries.
+                        return rest[1..i].trim().to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    // Unbalanced parens — the input never matched the expected shape.
+    trimmed.to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +785,7 @@ fn build_table(
                     &row.udt_name,
                     row.numeric_precision,
                     row.numeric_scale,
+                    row.character_maximum_length,
                 )
             },
             |domain| {
@@ -1458,6 +1519,7 @@ mod tests {
                 column_default: Some("nextval('comments_id_seq'::regclass)".to_owned()),
                 numeric_precision: None,
                 numeric_scale: None,
+                character_maximum_length: None,
                 domain_name: None,
                 domain_schema: None,
             },
@@ -1469,6 +1531,7 @@ mod tests {
                 column_default: None,
                 numeric_precision: None,
                 numeric_scale: None,
+                character_maximum_length: None,
                 domain_name: None,
                 domain_schema: None,
             },
@@ -1518,6 +1581,7 @@ mod tests {
             column_default: None,
             numeric_precision: None,
             numeric_scale: None,
+            character_maximum_length: None,
             domain_name: None,
             domain_schema: None,
         }];
@@ -1546,6 +1610,7 @@ mod tests {
                 column_default: None,
                 numeric_precision: None,
                 numeric_scale: None,
+                character_maximum_length: None,
                 domain_name: Some("email_dom".to_owned()),
                 domain_schema: Some("public".to_owned()),
             },
@@ -1558,6 +1623,7 @@ mod tests {
                 column_default: None,
                 numeric_precision: None,
                 numeric_scale: None,
+                character_maximum_length: None,
                 domain_name: None,
                 domain_schema: None,
             },
@@ -1580,6 +1646,103 @@ mod tests {
     }
 
     #[test]
+    fn build_table_preserves_length_limited_char_columns_as_opaque() {
+        // `VARCHAR(32)` / `CHAR(2)` report `udt_name` `varchar` / `bpchar` with a
+        // `character_maximum_length`. The fail-closed floor must preserve the length
+        // verbatim as `Opaque` (`varchar(32)` / `char(2)`), NOT flatten to `Text`
+        // and drop the DB-enforced limit. Unbounded `varchar` / `text` stay `Text`.
+        let columns = vec![
+            ColumnRow {
+                table_name: "labels".to_owned(),
+                column_name: "code".to_owned(),
+                udt_name: "varchar".to_owned(),
+                is_nullable: "NO".to_owned(),
+                column_default: None,
+                numeric_precision: None,
+                numeric_scale: None,
+                character_maximum_length: Some(32),
+                domain_name: None,
+                domain_schema: None,
+            },
+            ColumnRow {
+                table_name: "labels".to_owned(),
+                column_name: "kind".to_owned(),
+                udt_name: "bpchar".to_owned(),
+                is_nullable: "NO".to_owned(),
+                column_default: None,
+                numeric_precision: None,
+                numeric_scale: None,
+                character_maximum_length: Some(2),
+                domain_name: None,
+                domain_schema: None,
+            },
+            ColumnRow {
+                table_name: "labels".to_owned(),
+                column_name: "note".to_owned(),
+                udt_name: "text".to_owned(),
+                is_nullable: "YES".to_owned(),
+                column_default: None,
+                numeric_precision: None,
+                numeric_scale: None,
+                character_maximum_length: None,
+                domain_name: None,
+                domain_schema: None,
+            },
+        ];
+        let table = build_table("labels", &columns, &[], &[], &[], &[]);
+        let code = table.columns.iter().find(|c| c.name == "code").unwrap();
+        assert_eq!(
+            code.ty,
+            ColumnType::Opaque {
+                pg_type: "varchar(32)".to_owned()
+            },
+            "VARCHAR(32) is preserved as Opaque, not flattened to Text"
+        );
+        let kind = table.columns.iter().find(|c| c.name == "kind").unwrap();
+        assert_eq!(
+            kind.ty,
+            ColumnType::Opaque {
+                pg_type: "char(2)".to_owned()
+            },
+            "CHAR(2) is preserved as Opaque, not flattened to Text"
+        );
+        let note = table.columns.iter().find(|c| c.name == "note").unwrap();
+        assert_eq!(
+            note.ty,
+            ColumnType::Text,
+            "an unbounded text column stays Text"
+        );
+    }
+
+    #[test]
+    fn build_table_domain_precedence_over_length_floor() {
+        // A domain column reports its base type (e.g. `varchar`) in `udt_name` and
+        // can carry a `character_maximum_length`, but the domain floor must win:
+        // the column is preserved as the domain type, not `varchar(n)`.
+        let columns = vec![ColumnRow {
+            table_name: "labels".to_owned(),
+            column_name: "code".to_owned(),
+            udt_name: "varchar".to_owned(),
+            is_nullable: "NO".to_owned(),
+            column_default: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            character_maximum_length: Some(32),
+            domain_name: Some("code_dom".to_owned()),
+            domain_schema: Some("public".to_owned()),
+        }];
+        let table = build_table("labels", &columns, &[], &[], &[], &[]);
+        let code = table.columns.iter().find(|c| c.name == "code").unwrap();
+        assert_eq!(
+            code.ty,
+            ColumnType::Opaque {
+                pg_type: "code_dom".to_owned()
+            },
+            "the domain floor takes precedence over the length floor"
+        );
+    }
+
+    #[test]
     fn build_table_qualifies_non_public_domain_column() {
         // A domain in a non-`public` schema is schema-qualified so recreation
         // references the correct domain type.
@@ -1591,6 +1754,7 @@ mod tests {
             column_default: None,
             numeric_precision: None,
             numeric_scale: None,
+            character_maximum_length: None,
             domain_name: Some("email_dom".to_owned()),
             domain_schema: Some("otherschema".to_owned()),
         }];
@@ -1617,6 +1781,7 @@ mod tests {
             column_default: None,
             numeric_precision: None,
             numeric_scale: None,
+            character_maximum_length: None,
             domain_name: None,
             domain_schema: None,
         }];
@@ -1651,6 +1816,7 @@ mod tests {
             column_default: None,
             numeric_precision: None,
             numeric_scale: None,
+            character_maximum_length: None,
             domain_name: None,
             domain_schema: None,
         }];
@@ -1682,6 +1848,7 @@ mod tests {
             column_default: None,
             numeric_precision: None,
             numeric_scale: None,
+            character_maximum_length: None,
             domain_name: None,
             domain_schema: None,
         }];
@@ -1709,6 +1876,7 @@ mod tests {
             column_default: None,
             numeric_precision: None,
             numeric_scale: None,
+            character_maximum_length: None,
             domain_name: None,
             domain_schema: None,
         }];
@@ -1728,5 +1896,24 @@ mod tests {
         );
         // A shape that doesn't match is returned trimmed verbatim (never dropped).
         assert_eq!(strip_check_wrapper("price >= 0"), "price >= 0");
+    }
+
+    #[test]
+    fn strip_check_wrapper_drops_trailing_suffixes() {
+        // `pg_get_constraintdef` can append `NOT VALID` / `NO INHERIT` after the
+        // predicate; the suffix must be dropped so the emitter's `CHECK ({expr})`
+        // re-wrap stays valid — never left inside the parens.
+        assert_eq!(
+            strip_check_wrapper("CHECK ((price >= 0)) NOT VALID"),
+            "(price >= 0)"
+        );
+        assert_eq!(strip_check_wrapper("CHECK (x > 0) NO INHERIT"), "x > 0");
+        // No suffix → unchanged.
+        assert_eq!(strip_check_wrapper("CHECK (a = 1)"), "a = 1");
+        // A paren inside a string literal never miscounts the balanced span.
+        assert_eq!(
+            strip_check_wrapper("CHECK (label <> ')') NOT VALID"),
+            "label <> ')'"
+        );
     }
 }
