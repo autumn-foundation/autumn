@@ -87,7 +87,9 @@
 
 use std::path::Path;
 
-use autumn_schema_core::{Backend, Column, ColumnDefault, ColumnType, ForeignKey, Index, Table};
+use autumn_schema_core::{
+    Backend, Column, ColumnDefault, ColumnType, ForeignKey, Index, SerialKind, Table,
+};
 
 use crate::generate::naming;
 
@@ -571,6 +573,23 @@ fn build_table(
         table.columns.push(created);
     }
 
+    // (3) Mark the single-column `BigSerial` convention id (an `Int64` PK with no
+    // explicit default — the synthesized `id` or an `#[id]` `i64` field) with the
+    // serial marker, SYMMETRICALLY with what database introspection records for a
+    // `BIGSERIAL` column. Without this the model side would carry `serial: None`
+    // while a pulled `BIGSERIAL` carries `Some(BigSerial)`, making an otherwise-clean
+    // model↔database round-trip diff spuriously report a primary-key change. A UUID
+    // PK (or a composite PK) is left `None`, matching introspection.
+    if let [pk_name] = table.primary_key.as_slice() {
+        let pk_name = pk_name.clone();
+        if let Some(pk) = table.columns.iter_mut().find(|c| c.name == pk_name)
+            && matches!(pk.ty, ColumnType::Int64)
+            && pk.default.is_none()
+        {
+            pk.serial = Some(SerialKind::BigSerial);
+        }
+    }
+
     // Index emission, mirroring `schema_edit::create_table_sql_*`:
     //  - every `references` column gets an auto-index (already folded into
     //    `plain_index_fields`);
@@ -764,6 +783,9 @@ mod tests {
         expected.managed = false;
         let mut id = Column::new("id", ColumnType::Int64);
         id.primary_key = true;
+        // The convention `BigSerial` id carries the serial marker (symmetric with
+        // what a pulled `BIGSERIAL` records), so a round-trip diff stays clean.
+        id.serial = Some(SerialKind::BigSerial);
         expected.columns.push(id);
         expected.columns.push(Column::new("name", ColumnType::Text));
         let mut created = Column::new("created_at", ColumnType::Timestamp);

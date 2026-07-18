@@ -156,7 +156,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use autumn_schema_core::{
-    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, IdKind, Index, Table,
+    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, IdKind, Index, SerialKind, Table,
 };
 
 use crate::schema::parse::ParsedSchema;
@@ -1041,8 +1041,13 @@ fn diff_table(
     changes: &mut Vec<SchemaChange>,
 ) {
     // A primary-key change is refused wholesale (guarded); emit only the marker
-    // and skip the rest of this table's diff.
-    if base.primary_key != want.primary_key {
+    // and skip the rest of this table's diff. A change to the id-generation
+    // strategy of the single-column PK (a plain `BIGINT PRIMARY KEY` becoming a
+    // `BIGSERIAL`, or vice versa — surfaced by the [`SerialKind`] marker) is
+    // likewise a primary-key change: converting one into the other requires
+    // creating/dropping an owned sequence, which is deliberately out of scope for
+    // an auto-generated migration, so it is refused through the same marker.
+    if base.primary_key != want.primary_key || single_pk_serial(base) != single_pk_serial(want) {
         changes.push(SchemaChange::PrimaryKeyChange {
             table: want.name.clone(),
         });
@@ -3163,6 +3168,19 @@ fn single_pk_column(table: &Table) -> Option<(&Column, IdKind)> {
     let name = &table.primary_key[0];
     let column = table.columns.iter().find(|c| &c.name == name)?;
     pk_kind_for(column).map(|kind| (column, kind))
+}
+
+/// The [`SerialKind`] marker of a table's single-column primary key, or `None` for
+/// a composite PK, no PK, or a non-serial (plain / UUID) single PK. Used by
+/// [`diff_table`] to detect a plain-int-PK ↔ serial-PK id-generation change (which
+/// is refused like any other primary-key change). Two matching serial ids compare
+/// equal, so a model↔database round-trip of a `BIGSERIAL` id stays clean.
+fn single_pk_serial(table: &Table) -> Option<SerialKind> {
+    if table.primary_key.len() != 1 {
+        return None;
+    }
+    let name = &table.primary_key[0];
+    table.columns.iter().find(|c| &c.name == name)?.serial
 }
 
 /// Derive the id-generation strategy for a single-column PK:
