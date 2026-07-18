@@ -363,6 +363,13 @@ impl Plugin for MediaPlugin {
         Cow::Borrowed("autumn-media-plugin")
     }
 
+    /// Applies the plugin to the [`AppBuilder`].
+    ///
+    /// Declares the plugin-owned `[media]` top-level config section (via
+    /// [`AppBuilder::config_section`]) so a host app with
+    /// `server.strict_config = true` boots without core rejecting `[media]` as
+    /// an unknown key, then mounts the room/broadcast routers, installs the
+    /// service extensions, and spawns the retention/background loops.
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
             config,
@@ -377,6 +384,15 @@ impl Plugin for MediaPlugin {
             recordings_root,
             retention_defer,
         } = self;
+
+        // Declare the plugin-owned `[media]` top-level config table so a host app
+        // running `server.strict_config = true` boots cleanly instead of failing
+        // with `unknown key "media"`. `MediaConfig` is still read from raw TOML
+        // (see `MediaConfig::from_autumn_toml`); this only tells core's strict
+        // unknown-key check that `[media]` is a known, opaque section the plugin
+        // owns and validates itself. Applied first so every return path below
+        // (including the early room-misconfig abort) carries the declaration.
+        let app = app.config_section("media");
 
         let retention_days = retention_days.unwrap_or(config.recording.retention_days);
 
@@ -923,6 +939,25 @@ mod conformance_tests {
             result.status,
             CheckStatus::Fail,
             "expected collision to be detected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_section_tests {
+    use super::MediaPlugin;
+
+    // #1974 item 7: `MediaPlugin::build` must declare its `[media]` top-level
+    // config section on the builder so a host app with
+    // `server.strict_config = true` boots without core rejecting `[media]` as an
+    // unknown key. Registering the real plugin and asserting the section is
+    // declared proves the wiring end-to-end (not just a stand-in).
+    #[test]
+    fn build_declares_media_config_section() {
+        let builder = autumn_web::app().plugin(MediaPlugin::new());
+        assert!(
+            builder.has_config_section("media"),
+            "MediaPlugin::build must declare the [media] config section for strict_config"
         );
     }
 }
