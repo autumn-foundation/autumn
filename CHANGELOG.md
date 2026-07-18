@@ -34,9 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   systemd unit** when a project opts in with `[media.mediamtx] enabled = true`
   (#1974) — it renders `mediamtx.yml` and the unit, then runs
   `daemon-reload && enable --now && restart`, exactly as it already provisions
-  kamal-proxy. Three fail-closed host preflight checks run **before** the host is
-  touched (FFmpeg resolves, the recordings directory is writable, the MediaMTX
-  ports are free) and **abort the deploy** if the host cannot serve media.
+  kamal-proxy. Four fail-closed host preflight checks run **before** the host is
+  touched (FFmpeg resolves, the MediaMTX binary is executable, the recordings
+  directory is writable, and the MediaMTX ports are free) — plus a pure-config
+  precheck that the configured MediaMTX listener ports are distinct (five checks
+  total via `collect_media_doctor_checks`) — and **abort the deploy** if the host
+  cannot serve media. A missing or non-executable MediaMTX binary is one of the
+  prerequisites that can block `deploy up`.
   `autumn deploy plan` surfaces the media unit, its provisioning steps, and the
   required `connect-src`/`media-src`/`frame-src` CSP origins. The
   `[media.mediamtx]` / `[media.ffmpeg]` deploy config is read straight from the
