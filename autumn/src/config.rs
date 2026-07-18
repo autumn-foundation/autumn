@@ -2892,14 +2892,20 @@ impl AutumnConfig {
                         _ => {}
                     }
                     path.pop();
-                } else if path.is_empty() && plugin_config_roots.contains(k) {
-                    // A plugin has declared this TOP-LEVEL root as its own config
-                    // section (via `AppBuilder::config_section`). It is known AND
-                    // opaque: accept it and do NOT descend — the plugin, not core,
-                    // owns validation of its subtree. The `path.is_empty()` guard
-                    // keeps this strictly root-level, so a key that merely shares
-                    // a plugin-root name while nested inside a known section is
-                    // still validated normally (fail-closed). Deliberately NOT
+                } else if schema_path.is_empty() && plugin_config_roots.contains(k) {
+                    // A plugin has declared this root as its own config section
+                    // (via `AppBuilder::config_section`). It is known AND opaque:
+                    // accept it and do NOT descend — the plugin, not core, owns
+                    // validation of its subtree. The `schema_path.is_empty()` guard
+                    // fires whenever `valid_keys` is the ROOT schema set
+                    // (`schema.get("")`) — that is, both at the true top-level root
+                    // (`[media]`, path `[]`) AND under a profile prefix
+                    // (`[profile.prod.media]`, path `["profile","prod"]`), since
+                    // Autumn validates `[profile.<name>.<key>]` overrides against
+                    // the root schema. It stays strictly root-level: a key that
+                    // merely shares a plugin-root name while nested inside a known
+                    // section (e.g. `[database.media]`, `schema_path == "database"`)
+                    // is still validated normally (fail-closed). Deliberately NOT
                     // added to `valid_keys`, which would make the walk recurse and
                     // flag every one of the plugin's children as unknown.
                 } else {
@@ -8190,6 +8196,59 @@ mod tests {
         assert!(
             res.is_ok(),
             "enforce_all must NOT flag children of a registered opaque root: {res:?}"
+        );
+    }
+
+    // A registered plugin root set through the inline PROFILE layer
+    // (`[profile.prod.media]`) is opaque too. Autumn validates
+    // `[profile.<name>.<key>]` overrides against the ROOT schema (that's why
+    // `[profile.prod.database]` is accepted), so a registered root must be opaque
+    // under a profile prefix exactly as it is at the true root — otherwise a
+    // strict-profiled media app still can't boot. Even with `enforce_all` the
+    // arbitrary nested children are never descended into.
+    #[test]
+    fn profile_prefixed_registered_plugin_root_is_opaque_under_enforce_all() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[profile.prod.media]\nwholly_made_up = true\n\
+             [profile.prod.media.deeply.nested]\nalso_bogus = 42\n",
+        )
+        .unwrap();
+
+        let env = strict_prod_env(temp.path(), true);
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &plugin_roots(&["media"]));
+        assert!(
+            res.is_ok(),
+            "a registered [media] root must be opaque under a profile prefix \
+             ([profile.prod.media]) even with enforce_all: {res:?}"
+        );
+    }
+
+    // The profile-prefix opacity is NOT a blanket allow of profile subtrees: a
+    // genuinely-unknown root under a profile prefix
+    // (`[profile.prod.definitely_not_a_root]`) still hard-fails, because it is
+    // validated against the root schema and is not a registered plugin root.
+    #[test]
+    fn strict_config_rejects_profile_prefixed_unknown_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[profile.prod.definitely_not_a_root]\nx = 1\n",
+        )
+        .unwrap();
+
+        let env = strict_prod_env(temp.path(), false);
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &plugin_roots(&["media"]));
+        assert!(
+            res.is_err(),
+            "a profile-prefixed genuinely-unknown root must still hard-fail even \
+             with [media] registered (the fix must not blanket-allow profile subtrees)"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("definitely_not_a_root"),
+            "error should name the unknown root: {err_str}"
         );
     }
 
