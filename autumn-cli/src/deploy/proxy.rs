@@ -483,7 +483,7 @@ impl ProxyController for KamalProxyController {
                  rm -f {snap}; \
                  if [ \"$new\" = \"$old\" ]; then exit 0; fi; \
                  if ! systemctl is-active --quiet kamal-proxy.service; then exit 0; fi; \
-                 systemctl restart kamal-proxy.service; \
+                 systemctl restart kamal-proxy.service || exit 1; \
                  n=0; \
                  until {reregister}; do \
                  n=$((n+1)); \
