@@ -9,10 +9,11 @@ Autumn supports **two production database tiers**, and you pick one per app:
   self-hosted single-binary app via [`autumn deploy`](./deployment.md).
 - **Postgres** — a networked server you run alongside the app. This is the
   scale-out tier: it unlocks [read replicas](./repositories.md),
-  [native sharding](./sharding.md), multi-replica
-  [scheduled tasks](./scheduled-multi-replica.md), and
-  [Postgres full-text search](./full-text-search.md) — the features that only
+  [native sharding](./sharding.md), and multi-replica
+  [scheduled tasks](./scheduled-multi-replica.md) — the features that only
   make sense when more than one process talks to the same data.
+  ([Full-text search](./full-text-search.md) is **not** in this list — it now
+  works on both backends, see below.)
 
 Both tiers run the **same battery** — models and repositories, embedded
 migrations with the production-safety classifier, durable `#[job]` background
@@ -417,6 +418,7 @@ unsupported feature lurks until first use.
 - [Migrations](./migrations.md) — the classifier, checksums, and advisory-lock
   serialization this guide contrasts against.
 - [Jobs](./jobs.md) and [Multi-replica scheduled tasks](./scheduled-multi-replica.md).
-- [Sharding](./sharding.md), [Repositories](./repositories.md), and
-  [Full-text search](./full-text-search.md) — the Postgres-only scale-out
-  features.
+- [Sharding](./sharding.md) and [Repositories](./repositories.md) — the
+  Postgres-only scale-out features.
+- [Full-text search](./full-text-search.md) — available now on **both**
+  backends (Postgres `tsvector`/`GIN`, SQLite FTS5).

@@ -31,11 +31,15 @@ converges the database on (1). `autumn schema migrate` applies pending migration
 files to (3). `autumn schema pull` reads (3) back into (2). `autumn schema
 doctor` reports on how all three line up.
 
-Every command resolves the backend the same way — an explicit `--backend
-pg|sqlite`, else the project's configured backend (from `autumn.toml` / the
-resolved database URL). The snapshot is **provider-locked**: a command targeting
-one backend refuses to act on a snapshot tagged for another, so a SQLite snapshot
-can never be diffed or overwritten as Postgres by accident.
+The offline, model-facing commands — `snapshot`, `diff`, and `pull` — accept an
+explicit `--backend pg|sqlite` to override the dialect; without it they fall back
+to the project's configured backend (from `autumn.toml` / the resolved database
+URL). The database-facing commands — `migrate` and `doctor` — have **no
+`--backend` flag**: they take `--profile` (and `doctor` also `--json`) and derive
+the backend from that profile's database URL. The snapshot is
+**provider-locked**: a command targeting one backend refuses to act on a snapshot
+tagged for another, so a SQLite snapshot can never be diffed or overwritten as
+Postgres by accident.
 
 ---
 
