@@ -162,6 +162,29 @@ pub struct ParsedSchema {
     pub diagnostics: Vec<SchemaDiagnostic>,
 }
 
+impl ParsedSchema {
+    /// Wrap an already-materialized set of [`Table`]s as a desired-state
+    /// [`ParsedSchema`] with no diagnostics.
+    ///
+    /// The `#[model]` parser is not the only producer of a desired state: the
+    /// [`crate::schema::introspect`] database-introspection path builds
+    /// [`Table`]s directly from a live Postgres catalog. Both feed the same
+    /// [`crate::schema::diff::diff_schema`] engine (which takes a `&ParsedSchema`
+    /// as its desired side), so this adapter lets an introspected table set be
+    /// diffed against a snapshot baseline without inventing a fake model source.
+    /// There are no parser diagnostics for an introspected schema (every column
+    /// is resolved — an unmappable type becomes
+    /// [`ColumnType::Opaque`](autumn_schema_core::ColumnType::Opaque) rather than
+    /// being skipped), so the `diagnostics` vec is empty.
+    #[must_use]
+    pub const fn from_tables(tables: Vec<Table>) -> Self {
+        Self {
+            tables,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
 /// Parse a single Rust source string, returning one [`Table`] per `#[model]`
 /// struct plus any per-field diagnostics.
 ///
@@ -560,6 +583,9 @@ fn build_table(
             name: format!("idx_{table_name}_{field_name}"),
             columns: vec![field_name.clone()],
             unique: false,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
     }
     for field_name in &unique_index_fields {
@@ -568,6 +594,9 @@ fn build_table(
             name: format!("idx_{table_name}_{field_name}_unique"),
             columns: vec![field_name.clone()],
             unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
     }
 

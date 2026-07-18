@@ -415,6 +415,26 @@ pub struct DiffOptions {
     /// by [`guard_plan`]. When `true`, both are permitted (the rename is treated
     /// as an independent drop+add).
     pub allow_destructive: bool,
+
+    /// Whether the DESIRED side can authoritatively express expression/partial
+    /// indexes (an [`Index`] carrying a raw `definition`).
+    ///
+    /// `false` (the **default**) is the *model diff* case (`schema diff` /
+    /// `--write-migration`, and doctor's model-vs-snapshot `compute_drift`): the
+    /// desired side is parsed from the model DSL, which can only ever produce a
+    /// plain `Index { definition: None, .. }` — it *cannot* express an
+    /// expression/partial index. A baseline index carrying a `definition` is
+    /// therefore an unmodellable/adopted construct, and [`diff_indexes`] **retains**
+    /// it (never `DropIndex`/replace) — exactly like an unmanaged/adopted table.
+    /// This retention is independent of `allow_destructive`: the declarative tool
+    /// never drops what it cannot express.
+    ///
+    /// `true` is the *introspection diff* case (doctor's
+    /// `database-schema-drift` `compute_db_schema_drift`, and `pull --dry-run`),
+    /// where BOTH sides are complete introspections, so a `definition` index IS
+    /// authoritative — a dropped/changed expression index is real drift and is
+    /// still reported (via [`indexes_equivalent`]).
+    pub definitions_authoritative: bool,
 }
 
 /// Why a computed plan is refused for emission (policy, not structure).
@@ -742,7 +762,6 @@ pub enum EmitError {
 /// pure diff does not consult it.
 #[must_use]
 pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions) -> MigrationPlan {
-    let _ = opts;
     let backend = plan_backend(baseline, desired);
     let mut changes = Vec::new();
 
@@ -768,7 +787,7 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
             // Present on both sides — diff only Autumn-managed tables.
             (Some(base), Some(want)) => {
                 if want.managed {
-                    diff_table(base, want, desired, &mut changes);
+                    diff_table(base, want, desired, opts, &mut changes);
                 }
             }
             // Desired only — create it if Autumn owns it. But if the parser
@@ -1014,7 +1033,13 @@ fn column_participates_in_fk(
 
 /// Diff a table present on both sides (already known Autumn-managed on the
 /// desired side), pushing column / index / check changes.
-fn diff_table(base: &Table, want: &Table, desired: &ParsedSchema, changes: &mut Vec<SchemaChange>) {
+fn diff_table(
+    base: &Table,
+    want: &Table,
+    desired: &ParsedSchema,
+    opts: DiffOptions,
+    changes: &mut Vec<SchemaChange>,
+) {
     // A primary-key change is refused wholesale (guarded); emit only the marker
     // and skip the rest of this table's diff.
     if base.primary_key != want.primary_key {
@@ -1056,7 +1081,7 @@ fn diff_table(base: &Table, want: &Table, desired: &ParsedSchema, changes: &mut 
         }
     }
 
-    diff_indexes(&want.name, base, want, &skipped, changes);
+    diff_indexes(&want.name, base, want, &skipped, opts, changes);
     diff_checks(&want.name, base, want, changes);
 }
 
@@ -1144,11 +1169,145 @@ fn diff_column(table: &str, base: &Column, want: &Column, changes: &mut Vec<Sche
 /// column. This mirrors the `DropColumn` suppression in [`diff_table`]. A composite
 /// index touching even one skipped column is suppressed whole, since the parser
 /// cannot authoritatively say it was removed.
+/// Whether two same-named indexes are equivalent for drift purposes. When either
+/// carries a raw `definition` (an expression/partial index preserved verbatim by
+/// introspection), they are compared by that canonical `pg_get_indexdef` text and
+/// `unique` — the `columns` list is only a partial, display-oriented view of such
+/// an index. Otherwise (ordinary column indexes) they compare by `columns` +
+/// `unique`, identical to the pre-`definition` behavior.
+fn indexes_equivalent(a: &Index, b: &Index) -> bool {
+    if a.definition.is_some() || b.definition.is_some() {
+        a.definition == b.definition && a.unique == b.unique
+    } else {
+        a.columns == b.columns && a.unique == b.unique
+    }
+}
+
+/// Whether `index` depends on column `col` — i.e. Postgres would automatically
+/// drop the index (and any constraint it backs) when `col` is dropped via
+/// `ALTER TABLE … DROP COLUMN`. True iff `col` is in the index's `columns`.
+///
+/// For a retained (`definition`-carrying) expression/partial/constraint-owned index
+/// `columns` is the **exact `pg_depend` dependent-column set** captured by
+/// introspection (key, expression-referenced, AND predicate columns — the same set
+/// Postgres cascades on a `DROP COLUMN`), so membership is an exact match rather
+/// than a `definition`-text scan (which could false-positive on a column name that
+/// merely appears in a string literal, e.g. a partial index `WHERE kind = 'email'`
+/// while dropping an unrelated `email` column). Both `project_plan_target` (snapshot
+/// projection) and [`emit_down_sql_pg`] (rollback restore) use this single test so
+/// they cannot drift.
+pub fn index_depends_on_column(index: &Index, col: &str) -> bool {
+    index.columns.iter().any(|c| c == col)
+}
+
+///
+/// ## Unmodellable (expression/partial) indexes
+///
+/// An [`Index`] carrying a raw `definition` (an expression or partial index,
+/// preserved verbatim by `schema pull` introspection) **cannot be produced by the
+/// model parser** — `#[indexed]`/`#[unique]` only ever yield
+/// `Index { definition: None, .. }`. So in a *model diff*
+/// (`opts.definitions_authoritative == false`) a baseline `definition` index is an
+/// adopted construct the desired side is simply unable to describe, and it is
+/// **retained** — never `DropIndex`'d or replaced — exactly like an
+/// unmanaged/adopted table. This retention is independent of `allow_destructive`:
+/// the declarative tool never drops what it cannot express. In an *introspection
+/// diff* (`opts.definitions_authoritative == true`, from
+/// [`compute_db_schema_drift`](super::doctor::compute_db_schema_drift) and
+/// `pull --dry-run`) BOTH sides are complete introspections, so a `definition`
+/// index IS authoritative and a dropped/changed one is reported as real drift via
+/// [`indexes_equivalent`]. Plain (`definition: None`) indexes are diffed
+/// identically in both modes — a model may always ADD a brand-new plain index.
+///
+/// ## Model `#[unique]` satisfied by an existing unique index (brownfield adoption)
+///
+/// In a *model diff* only, a desired UNIQUE index whose name is absent from the
+/// baseline is nonetheless treated as **already satisfied** when the baseline
+/// carries some `unique` index (under ANY name — including a `definition`-carrying
+/// constraint index a brownfield `UNIQUE` produced, e.g. `accounts_email_key`)
+/// over the **exact same column set** ([`baseline_unique_index_covers`]). This is
+/// the brownfield-adoption case: the user pulls `email TEXT UNIQUE`, then writes
+/// the natural model `Account { id, email }` with `#[unique]` on `email`. The
+/// parser emits `idx_accounts_email_unique` (a differently-named unique index over
+/// `{email}`); without this recognition `diff_indexes` would emit a redundant
+/// `AddIndex`, which `guard_plan`'s dedup refusal would then reject on a populated
+/// table — leaving the user unable to keep the annotation. Instead the desired
+/// unique index is suppressed (no `AddIndex`, and no `DropIndex` for the retained
+/// baseline index), so the model resolves to a clean, empty diff. Uniqueness must
+/// match: a desired unique index over `{email}` is NOT satisfied by a baseline
+/// *non-unique* index over `{email}` (it still emits `AddIndex`). Authoritative
+/// diffs are unaffected — a brownfield constraint index shares its name on both
+/// introspected sides and already matches by name, so real drift stays intact.
+/// Whether the baseline table already carries a `unique` index whose covered
+/// column set is **exactly** `want_columns` (order-insensitive) — used only in the
+/// model-diff path to recognize that a desired `#[unique]` index is already
+/// enforced by a differently-named brownfield constraint/unique index.
+///
+/// ## Why exact **key**-set-equality on a FULL, NON-PARTIAL index
+///
+/// Only a baseline unique index that actually enforces table-wide uniqueness of the
+/// desired columns may suppress the `AddIndex`. Two catalog shapes look like they
+/// cover the set but do **not**, and are deliberately rejected:
+///
+/// - A **partial** unique index (`… ON t(email) WHERE …`) enforces uniqueness only
+///   for rows matching its predicate — duplicates can exist outside it — so it does
+///   NOT guarantee the model's table-wide `#[unique] email`. Rejected via
+///   [`Index::is_partial`].
+/// - An **expression** unique index (`UNIQUE (lower(email))`) enforces uniqueness of
+///   the *expression*, not the column, so it does NOT guarantee `#[unique] email`
+///   either. Introspection records an expression index with an EMPTY
+///   [`Index::key_columns`], which is rejected.
+///
+/// The comparison is therefore against the index's real **key** columns
+/// ([`Index::key_columns`]), which excludes a covering index's non-key `INCLUDE`
+/// columns — so `UNIQUE(a) INCLUDE(b)` (key `{a}`) satisfies `#[unique] a` but not
+/// `#[unique] {a, b}`. For a plain simple index introspection leaves `key_columns`
+/// empty (its key columns are exactly [`Index::columns`]); such a `definition`-less
+/// index falls back to comparing `columns`. A `definition`-carrying index with an
+/// empty `key_columns` is an expression index (or an older snapshot we cannot vouch
+/// for) and never satisfies — the conservative direction (emit the `AddIndex`), not
+/// a wrongful suppression.
+fn baseline_unique_index_covers(base: &Table, want_columns: &[String]) -> bool {
+    let want_set: BTreeSet<&str> = want_columns.iter().map(String::as_str).collect();
+    base.indexes.iter().any(|idx| {
+        if !idx.unique || idx.is_partial {
+            return false;
+        }
+        // Effective KEY columns: an explicit `key_columns` (recorded for every
+        // `definition`-carrying index; empty ⇒ expression key ⇒ reject) wins;
+        // otherwise, for a plain `definition`-less index, its `columns` ARE its key
+        // columns. A `definition`-carrying index with no recorded key columns cannot
+        // be vouched for and is rejected.
+        let key: BTreeSet<&str> = if !idx.key_columns.is_empty() {
+            idx.key_columns.iter().map(String::as_str).collect()
+        } else if idx.definition.is_none() {
+            idx.columns.iter().map(String::as_str).collect()
+        } else {
+            return false;
+        };
+        key == want_set
+    })
+}
+
+/// The single suppression predicate shared by **both** [`diff_indexes`] branches
+/// (the same-name match and the desired-only `AddIndex`), so they can never
+/// drift: a desired UNIQUE index is already satisfied — and may be suppressed —
+/// only when SOME baseline index provides **full** coverage, i.e. a non-partial,
+/// non-expression unique index over exactly its key columns (see
+/// [`baseline_unique_index_covers`]). A non-unique desired index is never
+/// suppressed by this rule, and a merely same-named baseline index that is
+/// partial, an expression index (empty key columns), or keyed on a different
+/// column set does **not** count as coverage.
+fn baseline_satisfies_desired_unique(base: &Table, want_idx: &Index) -> bool {
+    want_idx.unique && baseline_unique_index_covers(base, &want_idx.columns)
+}
+
 fn diff_indexes(
     table: &str,
     base: &Table,
     want: &Table,
     skipped: &BTreeSet<String>,
+    opts: DiffOptions,
     changes: &mut Vec<SchemaChange>,
 ) {
     let base_by_name: BTreeMap<&str, &Index> =
@@ -1158,33 +1317,90 @@ fn diff_indexes(
 
     for want_idx in &want.indexes {
         match base_by_name.get(want_idx.name.as_str()) {
-            None => changes.push(SchemaChange::AddIndex {
-                table: table.to_owned(),
-                index: want_idx.clone(),
-            }),
-            Some(base_idx) if *base_idx != want_idx => {
-                changes.push(SchemaChange::DropIndex {
-                    table: table.to_owned(),
-                    index: (*base_idx).clone(),
-                });
+            None => {
+                // In a MODEL diff (`!definitions_authoritative`), a desired UNIQUE
+                // index whose column SET is already enforced by an existing baseline
+                // unique index — under ANY name, including a `definition`-carrying
+                // constraint index a brownfield `UNIQUE` produced (`accounts_email_key`)
+                // — is already satisfied. The differently-named baseline index enforces
+                // the exact uniqueness the model's `#[unique]` asks for, so emitting an
+                // `AddIndex` here would be redundant AND would trip `guard_plan`'s
+                // unique-index-on-populated-table dedup refusal, blocking the user from
+                // ever keeping the annotation. Suppress it (and leave the retained
+                // baseline index in place — no `DropIndex`). Matching is by EXACT column
+                // set (see [`baseline_unique_index_covers`]). Authoritative diffs are
+                // untouched: a brownfield constraint index has the same name on both
+                // sides there and already matches by name, so real drift stays detected.
+                if !opts.definitions_authoritative
+                    && baseline_satisfies_desired_unique(base, want_idx)
+                {
+                    continue;
+                }
                 changes.push(SchemaChange::AddIndex {
                     table: table.to_owned(),
                     index: want_idx.clone(),
                 });
             }
-            Some(_) => {}
+            Some(base_idx) => {
+                // A same-named pair where EITHER carries a `definition`: in a model
+                // diff the desired side cannot express the definition, so retain
+                // the baseline index (emit nothing) rather than emit a destructive
+                // DropIndex + plain replacement. In an introspection diff both
+                // sides are authoritative, so fall through to the equivalence check.
+                let involves_definition =
+                    base_idx.definition.is_some() || want_idx.definition.is_some();
+                if involves_definition && !opts.definitions_authoritative {
+                    // Model diff: the desired side cannot express B's
+                    // definition, so the same-named definition-carrying baseline
+                    // index B is retained (the drop loop below skips a name still
+                    // present in `want`). But a unique D whose uniqueness B does
+                    // NOT fully cover — B is partial, an expression index (empty
+                    // key columns), or keyed on a different column set — leaves
+                    // the model's table-wide `#[unique]` UNENFORCED even though a
+                    // conventionally-named index exists. Emit `AddIndex(D)` so the
+                    // full unique index is created ALONGSIDE the retained B;
+                    // suppress D only when SOME baseline index fully covers it
+                    // (or D is non-unique).
+                    if want_idx.unique && !baseline_satisfies_desired_unique(base, want_idx) {
+                        changes.push(SchemaChange::AddIndex {
+                            table: table.to_owned(),
+                            index: want_idx.clone(),
+                        });
+                    }
+                    continue;
+                }
+                if !indexes_equivalent(base_idx, want_idx) {
+                    changes.push(SchemaChange::DropIndex {
+                        table: table.to_owned(),
+                        index: (*base_idx).clone(),
+                    });
+                    changes.push(SchemaChange::AddIndex {
+                        table: table.to_owned(),
+                        index: want_idx.clone(),
+                    });
+                }
+            }
         }
     }
 
     for base_idx in &base.indexes {
-        if !want_by_name.contains_key(base_idx.name.as_str())
-            && !base_idx.columns.iter().any(|c| skipped.contains(c))
+        if want_by_name.contains_key(base_idx.name.as_str())
+            || base_idx.columns.iter().any(|c| skipped.contains(c))
         {
-            changes.push(SchemaChange::DropIndex {
-                table: table.to_owned(),
-                index: base_idx.clone(),
-            });
+            continue;
         }
+        // A baseline-only `definition` index has no same-named desired index, and
+        // in a model diff the desired side could not have expressed it anyway —
+        // retain it (never DropIndex), independent of `allow_destructive`. In an
+        // introspection diff it is authoritative, so a genuinely-dropped
+        // expression/partial index still drops.
+        if base_idx.definition.is_some() && !opts.definitions_authoritative {
+            continue;
+        }
+        changes.push(SchemaChange::DropIndex {
+            table: table.to_owned(),
+            index: base_idx.clone(),
+        });
     }
 }
 
@@ -1802,7 +2018,7 @@ pub fn emit_down_sql_with_context(
     ctx: &SchemaContext,
 ) -> Result<String, EmitError> {
     match plan.backend {
-        Backend::Postgres => emit_down_sql_pg(plan),
+        Backend::Postgres => emit_down_sql_pg(plan, ctx),
         Backend::Sqlite => emit_down_sql_sqlite(plan, ctx),
     }
 }
@@ -1824,18 +2040,84 @@ fn emit_up_sql_pg(plan: &MigrationPlan) -> Result<String, EmitError> {
 
 /// The Postgres reverse path: changes reversed and individually inverted, with
 /// `-- irreversible:` markers where data cannot round-trip.
-fn emit_down_sql_pg(plan: &MigrationPlan) -> Result<String, EmitError> {
+///
+/// A `DropColumn` on a column covered by a RETAINED (`definition`-carrying)
+/// baseline index — the expression/partial/constraint-owned indexes `schema pull`
+/// preserves and the model diff never `DropIndex`'s — cascade-drops that index in
+/// Postgres along with the column (the up path is a bare `ALTER TABLE … DROP
+/// COLUMN`, never a failing `DROP INDEX` on a constraint-backed index). So after
+/// re-adding the column the down path must recreate each such index from its
+/// verbatim `definition`, else rollback silently loses the uniqueness/index. This
+/// needs the baseline shapes carried in `ctx`; ordinary model-managed indexes are
+/// restored via their own `DropIndex → AddIndex` inversion and are skipped here.
+///
+/// Recreation is **delayed and deduped**: a retained index can depend on more than
+/// one dropped column (e.g. a partial index
+/// `... ON t (lower(email)) WHERE tenant_id IS NOT NULL` when the model drops BOTH
+/// `email` and `tenant_id`). Recreating it inline after re-adding only the *first*
+/// dependent column would (a) fail — the other dependent column is still absent, so
+/// Postgres rejects the `CREATE INDEX` — and (b) re-emit the same `CREATE INDEX`
+/// again for the second column. So the down path first emits ALL the column
+/// re-adds (and every other reversed change), then recreates each cascade-dropped
+/// retained index EXACTLY ONCE, keyed by `(table, index name)`, after all of its
+/// dropped columns have been restored.
+fn emit_down_sql_pg(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String, EmitError> {
     let mut ordered = up_ordered(&plan.changes)?;
     ordered.reverse();
     let mut groups = Vec::new();
+    // Per-table set of columns this migration drops (and the down path re-adds),
+    // gathered so a multi-column retained index is recreated only after ALL its
+    // dependent dropped columns are back.
+    let mut dropped_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for change in ordered {
         let sql = emit_change_down(change, plan.backend)?;
         let sql = sql.trim_end();
         if !sql.is_empty() {
             groups.push(sql.to_owned());
         }
+        if let SchemaChange::DropColumn { table, column } = change {
+            dropped_by_table
+                .entry(table.clone())
+                .or_default()
+                .insert(column.name.clone());
+        }
+    }
+    // Every column re-add is now emitted. Recreate each retained index whose
+    // dependent-column set intersects this table's dropped columns — once per
+    // (table, index name) — so a multi-column index is created exactly once, after
+    // all of its dropped columns are restored.
+    for (table, dropped) in &dropped_by_table {
+        for idx in retained_indexes_depending_on_any(ctx, table, dropped) {
+            groups.push(index_sql(table, idx).trim_end().to_owned());
+        }
     }
     Ok(join_groups(&groups))
+}
+
+/// The RETAINED (`definition`-carrying) baseline indexes of `table` whose
+/// dependent-column set intersects `dropped_columns` — the
+/// expression/partial/constraint-owned indexes Postgres cascade-drops when ANY of
+/// those columns is dropped and that carry no `DropIndex` in the plan, so the down
+/// migration must recreate them verbatim. Each qualifying index appears once (the
+/// baseline lists each index once), so a retained index depending on two dropped
+/// columns is returned — and thus recreated — exactly once. Returns empty when the
+/// table is absent from `ctx.baseline` (e.g. context-free emit).
+fn retained_indexes_depending_on_any<'a>(
+    ctx: &'a SchemaContext,
+    table: &str,
+    dropped_columns: &BTreeSet<String>,
+) -> Vec<&'a Index> {
+    ctx.baseline.get(table).map_or_else(Vec::new, |t| {
+        t.indexes
+            .iter()
+            .filter(|i| {
+                i.definition.is_some()
+                    && dropped_columns
+                        .iter()
+                        .any(|c| index_depends_on_column(i, c))
+            })
+            .collect()
+    })
 }
 
 /// The change kinds whose `SQLite` realisation is a full table recreate: the
@@ -2829,7 +3111,17 @@ fn render_column_def(column: &Column, backend: Backend) -> String {
 }
 
 /// `CREATE [UNIQUE] INDEX {name} ON {table} ({cols});`.
+///
+/// When the index carries a raw `definition` (an expression/partial index
+/// preserved verbatim by introspection), that full `pg_get_indexdef` statement is
+/// emitted verbatim — with exactly one trailing `;` appended, since
+/// `pg_get_indexdef` output has none — instead of reconstructing a
+/// `CREATE INDEX … (columns)` form that cannot express the expression/predicate.
 fn index_sql(table: &str, index: &Index) -> String {
+    if let Some(def) = &index.definition {
+        let def = def.trim_end().trim_end_matches(';');
+        return format!("{def};");
+    }
     let unique = if index.unique { "UNIQUE " } else { "" };
     format!(
         "CREATE {unique}INDEX {} ON {table} ({});",
@@ -2874,15 +3166,61 @@ fn single_pk_column(table: &Table) -> Option<(&Column, IdKind)> {
 }
 
 /// Derive the id-generation strategy for a single-column PK:
-///   `Int64` PK, no default            → `BigSerial`
-///   `Uuid`  PK                        → `Uuid`
+///   `Int64` PK, no default                      → `BigSerial`
+///   `Int32` PK, `nextval(...)` default           → `Serial` (a brownfield `SERIAL` id)
+///   `Uuid`  PK, `gen_random_uuid()` default      → `Uuid`
 /// Any other PK column → `None` (rendered normally with a table-level clause).
-const fn pk_kind_for(column: &Column) -> Option<IdKind> {
+///
+/// The `Int32`/`Serial` case only ever arises for a **brownfield-introspected**
+/// table: the model DSL never produces an int4 PK, so this cannot conflict with a
+/// model diff. Introspection deliberately preserves the `nextval(...)` default on an
+/// int4 PK (see `introspect::normalize_serial_pk_default`) precisely so it is
+/// recognized here and recreated as `SERIAL PRIMARY KEY` (auto-increment) rather
+/// than a plain `INTEGER PRIMARY KEY`. An int4 PK with NO default falls through to
+/// `None` → a plain integer PK (no auto-increment), which is correct.
+///
+/// The `Uuid` convention is likewise **default-gated**: the `IdKind::Uuid` shape
+/// renders `UUID PRIMARY KEY DEFAULT gen_random_uuid()`, so it is only applied when
+/// the pulled column's stored default is *exactly* that convention (the value the
+/// model parser records — see `parse::convention_default` — so the round-trip stays
+/// clean). A brownfield UUID PK whose default is a different expression (e.g.
+/// `uuid_generate_v4()`) or is absent entirely falls through to `None`: it renders
+/// as an ordinary `UUID` column preserving its real default (or lack of one), with
+/// its primary key expressed via the trailing table-level `PRIMARY KEY (col)` clause
+/// — so recreation (e.g. the down migration for a dropped table) never silently
+/// swaps its UUID-generation behavior for `gen_random_uuid()` or adds a default
+/// where none existed.
+fn pk_kind_for(column: &Column) -> Option<IdKind> {
     match &column.ty {
         ColumnType::Int64 if column.default.is_none() => Some(IdKind::BigSerial),
-        ColumnType::Uuid => Some(IdKind::Uuid),
+        ColumnType::Int32 if is_nextval_default(column) => Some(IdKind::Serial),
+        ColumnType::Uuid if is_convention_uuid_default(column) => Some(IdKind::Uuid),
         _ => None,
     }
+}
+
+/// Whether a UUID primary-key column's stored default is *exactly* the Autumn model
+/// convention `gen_random_uuid()` — the value `parse::convention_default` records for
+/// a Postgres UUID `#[id]` and the string introspection preserves verbatim
+/// (`normalize_default` keeps it as-is). Only then may the DDL emitter collapse the
+/// column into the `IdKind::Uuid` shape (`UUID PRIMARY KEY DEFAULT
+/// gen_random_uuid()`); a UUID PK with any other default — or none — is rendered as an
+/// ordinary column so its true generation behavior is never silently rewritten.
+fn is_convention_uuid_default(column: &Column) -> bool {
+    matches!(
+        &column.default,
+        Some(ColumnDefault::Sql(sql)) if sql.trim() == "gen_random_uuid()"
+    )
+}
+
+/// Whether a column's default is a `nextval(...)` sequence default (a `SERIAL`
+/// auto-increment default), which the DDL emitter reconstructs by suppressing the
+/// explicit default and rendering the `SERIAL`/`BIGSERIAL` keyword instead.
+fn is_nextval_default(column: &Column) -> bool {
+    matches!(
+        &column.default,
+        Some(ColumnDefault::Sql(sql)) if sql.trim_start().to_ascii_lowercase().starts_with("nextval(")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3035,9 +3373,15 @@ mod tests {
 
     const DEFAULT_OPTS: DiffOptions = DiffOptions {
         allow_destructive: false,
+        definitions_authoritative: false,
     };
     const ALLOW: DiffOptions = DiffOptions {
         allow_destructive: true,
+        definitions_authoritative: false,
+    };
+    const AUTHORITATIVE: DiffOptions = DiffOptions {
+        allow_destructive: false,
+        definitions_authoritative: true,
     };
 
     // -- 13.1 structural diff ------------------------------------------------
@@ -3161,6 +3505,9 @@ mod tests {
             name: "idx_posts_body".to_owned(),
             columns: vec!["body".to_owned()],
             unique: false,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         };
         // desired gains the index.
         let base = vec![posts_with(vec![col("body", ColumnType::Text)])];
@@ -3189,6 +3536,596 @@ mod tests {
                 table: "posts".to_owned(),
                 index: idx,
             }]
+        );
+    }
+
+    /// A `definition`-carrying (expression/partial) index that the model DSL can
+    /// never express: an expression index on `lower(email)`.
+    fn expr_index() -> Index {
+        Index {
+            name: "idx_posts_lower_body".to_owned(),
+            columns: vec!["body".to_owned()],
+            unique: false,
+            definition: Some("CREATE INDEX idx_posts_lower_body ON posts (lower(body))".to_owned()),
+            is_partial: false,
+            key_columns: Vec::new(),
+        }
+    }
+
+    /// Model diff (`DEFAULT_OPTS`, `definitions_authoritative: false`): a
+    /// baseline-only `definition` index absent from the desired (model) side is
+    /// **retained** — the model DSL cannot express it, so its absence is a parser
+    /// gap, not a removal. NO `DropIndex` is emitted.
+    #[test]
+    fn model_diff_retains_baseline_only_definition_index() {
+        let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
+        base_table.indexes.push(expr_index());
+        let want = parsed(
+            vec![posts_with(vec![col("body", ColumnType::Text)])],
+            vec![],
+        );
+        let plan = diff_schema(&[base_table], &want, DEFAULT_OPTS);
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "model diff must retain (not drop) an unmodellable definition index; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Model diff: a baseline constraint-owned index (a brownfield `UNIQUE`
+    /// constraint's auto-created index, retained by `schema pull` via its
+    /// `definition`) absent from the desired (model) side is **retained** — no
+    /// `DropIndex`. This is the load-bearing case: Postgres rejects dropping an
+    /// index that backs a constraint, so emitting a `DROP INDEX` would produce a
+    /// failing migration. Retention is purely `definition`-based, so the same code
+    /// path that preserves expression/partial indexes preserves this one.
+    #[test]
+    fn model_diff_retains_constraint_owned_unique_index() {
+        let constraint_idx = Index {
+            name: "users_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX users_email_key ON public.users USING btree (email)"
+                    .to_owned(),
+            ),
+            is_partial: false,
+            key_columns: vec!["email".to_owned()],
+        };
+        let mut base_table = posts_with(vec![col("email", ColumnType::Text)]);
+        base_table.indexes.push(constraint_idx);
+        let want = parsed(
+            vec![posts_with(vec![col("email", ColumnType::Text)])],
+            vec![],
+        );
+        let plan = diff_schema(&[base_table], &want, DEFAULT_OPTS);
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "model diff must retain (not drop) a constraint-owned index; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Brownfield adoption (the P2 fix): a table pulled with `email TEXT UNIQUE`
+    /// retains the constraint-owned unique index Postgres named `accounts_email_key`
+    /// (`definition: Some(..)`, `unique`, columns `[email]`). The user then writes
+    /// the natural model `Account { id, email }` with `#[unique]` on `email`, whose
+    /// parser emits a differently-named unique index `idx_accounts_email_unique`
+    /// over `[email]` (`definition: None`). A model diff must recognize the existing
+    /// unique index as already satisfying the desired `#[unique]` — emitting NEITHER
+    /// an `AddIndex` (which `guard_plan` would reject on a populated table) NOR a
+    /// `DropIndex` for the retained constraint index. The plan must be clean.
+    #[test]
+    fn model_diff_existing_unique_index_satisfies_model_unique_by_columns() {
+        let constraint_idx = Index {
+            name: "accounts_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX accounts_email_key ON public.accounts USING btree (email)"
+                    .to_owned(),
+            ),
+            is_partial: false,
+            key_columns: vec!["email".to_owned()],
+        };
+        let mut base_table = posts_with(vec![col("email", ColumnType::Text)]);
+        base_table.indexes.push(constraint_idx);
+
+        // Desired (model): the parser-emitted, differently-named unique index.
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert!(
+            plan.changes.is_empty(),
+            "existing unique index over the same column set must satisfy the model \
+             #[unique]; expected a clean plan, got {:?}",
+            plan.changes
+        );
+        // And the whole plan must pass the policy guard (no dedup refusal).
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "clean plan must not trip guard_plan"
+        );
+    }
+
+    /// The satisfaction is uniqueness-aware: a desired UNIQUE index over `[email]`
+    /// is NOT satisfied by a baseline **non-unique** index over `[email]`, so the
+    /// `AddIndex` is still emitted (the uniqueness is genuinely new).
+    #[test]
+    fn model_diff_nonunique_baseline_does_not_satisfy_unique_model_index() {
+        let nonunique = Index {
+            name: "idx_posts_email".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: false,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        let mut base_table = posts_with(vec![col("email", ColumnType::Text)]);
+        base_table.indexes.push(nonunique);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AddIndex { index, .. } if index.name == "idx_posts_email_unique"
+            )),
+            "a unique model index over a column with only a non-unique baseline index \
+             must still emit AddIndex; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Authoritative mode (doctor drift / `pull --dry-run`, both sides introspected)
+    /// is unaffected: a differently-named desired unique index is NOT suppressed by a
+    /// column-set match, so real drift (a renamed/added unique index) is still
+    /// detected. There the brownfield constraint index has the same name on both
+    /// sides and would match by name; a genuinely new name is genuine drift.
+    #[test]
+    fn authoritative_diff_still_emits_add_for_differently_named_unique_index() {
+        let constraint_idx = Index {
+            name: "accounts_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX accounts_email_key ON public.accounts USING btree (email)"
+                    .to_owned(),
+            ),
+            is_partial: false,
+            key_columns: vec!["email".to_owned()],
+        };
+        let mut base_table = posts_with(vec![col("email", ColumnType::Text)]);
+        base_table.indexes.push(constraint_idx);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            AUTHORITATIVE,
+        );
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AddIndex { index, .. } if index.name == "idx_posts_email_unique"
+            )),
+            "authoritative diff must still emit AddIndex for a differently-named unique \
+             index (column-set suppression is model-diff-only); got {:?}",
+            plan.changes
+        );
+    }
+
+    /// A **partial** unique index (`… ON t(email) WHERE …`) enforces uniqueness only
+    /// for rows matching its predicate, so it does NOT satisfy a model `#[unique]
+    /// email` (table-wide) — even though its key columns equal `{email}`. The
+    /// `AddIndex` must still be emitted.
+    #[test]
+    fn baseline_partial_unique_index_does_not_satisfy_model_unique() {
+        let partial = Index {
+            name: "accounts_email_active_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX accounts_email_active_key ON accounts (email) WHERE active"
+                    .to_owned(),
+            ),
+            is_partial: true,
+            key_columns: vec!["email".to_owned()],
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(partial);
+        assert!(
+            !baseline_unique_index_covers(&base, &["email".to_owned()]),
+            "a partial unique index must NOT satisfy a table-wide #[unique]"
+        );
+
+        // End-to-end: the model #[unique] still emits an AddIndex (not suppressed).
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+        let plan = diff_schema(&[base], &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AddIndex { index, .. } if index.name == "idx_posts_email_unique"
+            )),
+            "partial baseline unique index must not suppress the model AddIndex; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// An **expression** unique index (`UNIQUE (lower(email))`) enforces uniqueness of
+    /// the expression, not the column, so it does NOT satisfy `#[unique] email`.
+    /// Introspection records it with an EMPTY `key_columns` (its dependency `columns`
+    /// still names `email`), which must be rejected — the `AddIndex` is emitted.
+    #[test]
+    fn baseline_expression_unique_index_does_not_satisfy_model_unique() {
+        let expr = Index {
+            name: "accounts_lower_email_key".to_owned(),
+            // `columns` is the pg_depend dependency set (references `email`)...
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX accounts_lower_email_key ON accounts (lower(email))"
+                    .to_owned(),
+            ),
+            is_partial: false,
+            // ...but its KEY is an expression, so no plain key columns are recorded.
+            key_columns: Vec::new(),
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(expr);
+        assert!(
+            !baseline_unique_index_covers(&base, &["email".to_owned()]),
+            "an expression unique index (empty key_columns) must NOT satisfy #[unique]"
+        );
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+        let plan = diff_schema(&[base], &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AddIndex { index, .. } if index.name == "idx_posts_email_unique"
+            )),
+            "expression baseline unique index must not suppress the model AddIndex; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Regression guard for the last commit's fix: a plain, FULL, non-partial unique
+    /// constraint index whose key columns exactly equal the target STILL satisfies the
+    /// model `#[unique]` (no `AddIndex`). Covers both a `definition`-carrying
+    /// constraint index (key columns recorded) and a plain `definition`-less unique
+    /// index (key columns derived from `columns`).
+    #[test]
+    fn baseline_full_unique_constraint_index_still_satisfies_model_unique() {
+        // (c1) constraint-owned (definition-carrying) unique index, key == [email].
+        let constraint = Index {
+            name: "accounts_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX accounts_email_key ON accounts (email)".to_owned(),
+            ),
+            is_partial: false,
+            key_columns: vec!["email".to_owned()],
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(constraint);
+        assert!(
+            baseline_unique_index_covers(&base, &["email".to_owned()]),
+            "a full non-partial unique constraint index over the exact key set must satisfy #[unique]"
+        );
+
+        // (c2) plain definition-less unique index: key columns derived from `columns`.
+        let plain = Index {
+            name: "idx_accounts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        let mut base2 = posts_with(vec![col("email", ColumnType::Text)]);
+        base2.indexes.push(plain);
+        assert!(
+            baseline_unique_index_covers(&base2, &["email".to_owned()]),
+            "a plain full unique index must satisfy #[unique] via its columns"
+        );
+    }
+
+    /// Retention holds even under `--allow-destructive`: the declarative tool
+    /// never drops a construct it cannot express.
+    #[test]
+    fn model_diff_retains_definition_index_even_with_allow_destructive() {
+        let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
+        base_table.indexes.push(expr_index());
+        let want = parsed(
+            vec![posts_with(vec![col("body", ColumnType::Text)])],
+            vec![],
+        );
+        let plan = diff_schema(&[base_table], &want, ALLOW);
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "--allow-destructive must still retain an unmodellable definition index; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Model diff: a baseline `definition` index sharing a NAME with a desired
+    /// (model-parsed, `definition: None`) index is **retained** — no
+    /// `DropIndex`/replacement that would clobber the expression/partial index with
+    /// a plain column index.
+    #[test]
+    fn model_diff_retains_definition_index_sharing_name_with_plain_desired() {
+        // Baseline: an expression index named `idx_posts_body`.
+        let base_expr = Index {
+            name: "idx_posts_body".to_owned(),
+            columns: vec!["body".to_owned()],
+            unique: false,
+            definition: Some("CREATE INDEX idx_posts_body ON posts (lower(body))".to_owned()),
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
+        base_table.indexes.push(base_expr);
+
+        // Desired (model): a plain column index of the SAME name (definition: None).
+        let mut want_table = posts_with(vec![col("body", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_body".to_owned(),
+            columns: vec!["body".to_owned()],
+            unique: false,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert!(
+            plan.changes.is_empty(),
+            "model diff must retain the definition index and emit no drop/replace; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// A model-parsed unique index over `[email]` on the `posts` table, carrying
+    /// the parser's conventional name `idx_posts_email_unique` (`definition: None`).
+    fn desired_posts_email_unique() -> Index {
+        Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        }
+    }
+
+    /// Fix 1 (a): a baseline **partial** unique index that happens to carry the
+    /// model's conventional name (`idx_posts_email_unique`) hits the same-NAME
+    /// match branch but does NOT provide table-wide coverage. It must NOT suppress
+    /// the model's `#[unique]` — the full unique `AddIndex` is emitted — while the
+    /// partial index (definition-carrying) is itself RETAINED (no `DropIndex`).
+    #[test]
+    fn model_diff_same_named_partial_unique_does_not_suppress_and_retains_partial() {
+        let partial = Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX idx_posts_email_unique ON posts (email) \
+                 WHERE email IS NOT NULL"
+                    .to_owned(),
+            ),
+            is_partial: true,
+            key_columns: vec!["email".to_owned()],
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(partial);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(desired_posts_email_unique());
+        let plan = diff_schema(&[base], &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AddIndex { index, .. }
+                    if index.name == "idx_posts_email_unique" && index.definition.is_none()
+            )),
+            "a same-named PARTIAL unique index must not suppress the model's full \
+             #[unique]; got {:?}",
+            plan.changes
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "the retained partial index must not be dropped; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Fix 1 (b): a baseline **expression** unique index (empty `key_columns`)
+    /// carrying the model's conventional name must NOT suppress the model's
+    /// `#[unique]` — the full unique `AddIndex` is emitted, and the expression
+    /// index is retained (no `DropIndex`).
+    #[test]
+    fn model_diff_same_named_expression_unique_does_not_suppress() {
+        let expr = Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX idx_posts_email_unique ON posts (lower(email))".to_owned(),
+            ),
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(expr);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(desired_posts_email_unique());
+        let plan = diff_schema(&[base], &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AddIndex { index, .. }
+                    if index.name == "idx_posts_email_unique" && index.definition.is_none()
+            )),
+            "a same-named EXPRESSION unique index must not suppress the model's \
+             #[unique]; got {:?}",
+            plan.changes
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "the retained expression index must not be dropped; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Fix 1 (c) regression guard: a baseline **full plain** unique index
+    /// (`definition: None`) over exactly the model's key, sharing its name, STILL
+    /// suppresses the model `#[unique]` — a clean, empty plan (no `AddIndex`, no
+    /// `DropIndex`).
+    #[test]
+    fn model_diff_same_named_full_plain_unique_still_suppresses() {
+        let plain_index = Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(plain_index);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(desired_posts_email_unique());
+        let plan = diff_schema(&[base], &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.is_empty(),
+            "a same-named FULL plain unique index over the same key must still \
+             suppress the model #[unique]; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Fix 1 (d): a baseline **full constraint** (definition-carrying) unique index
+    /// over exactly the model's key, sharing its name, fully covers the model
+    /// `#[unique]` — so it is retained and the model index is suppressed (empty
+    /// plan). This exercises the same-NAME branch's "B fully covers → suppress D"
+    /// path.
+    #[test]
+    fn model_diff_same_named_full_constraint_unique_suppresses() {
+        let constraint = Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX idx_posts_email_unique ON posts USING btree (email)"
+                    .to_owned(),
+            ),
+            is_partial: false,
+            key_columns: vec!["email".to_owned()],
+        };
+        let mut base = posts_with(vec![col("email", ColumnType::Text)]);
+        base.indexes.push(constraint);
+
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(desired_posts_email_unique());
+        let plan = diff_schema(&[base], &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        assert!(
+            plan.changes.is_empty(),
+            "a same-named FULL constraint unique index that fully covers the key \
+             must suppress the model #[unique] (retained, no add); got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Introspection diff (`AUTHORITATIVE`, `definitions_authoritative: true`): a
+    /// baseline-only `definition` index absent from the desired side IS a genuine
+    /// drop and MUST emit `DropIndex` — this proves doctor's `database-schema-drift`
+    /// / `pull --dry-run` still catches a dropped expression/partial index.
+    #[test]
+    fn authoritative_diff_drops_baseline_only_definition_index() {
+        let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
+        base_table.indexes.push(expr_index());
+        let want = parsed(
+            vec![posts_with(vec![col("body", ColumnType::Text)])],
+            vec![],
+        );
+        let plan = diff_schema(&[base_table], &want, AUTHORITATIVE);
+        assert_eq!(
+            plan.changes,
+            vec![SchemaChange::DropIndex {
+                table: "posts".to_owned(),
+                index: expr_index(),
+            }],
+            "authoritative introspection diff must report a dropped definition index as drift"
         );
     }
 
@@ -3412,6 +4349,9 @@ mod tests {
             name: "idx_posts_status".to_owned(),
             columns: vec!["status".to_owned()],
             unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
         let want = parsed(
             vec![posts_with(vec![])],
@@ -3439,6 +4379,9 @@ mod tests {
             name: "idx_posts_body".to_owned(),
             columns: vec!["body".to_owned()],
             unique: false,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         };
         let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
         base_table.indexes.push(idx.clone());
@@ -3475,6 +4418,9 @@ mod tests {
             name: "idx_posts_author_status".to_owned(),
             columns: vec!["author_id".to_owned(), "status".to_owned()],
             unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
         // desired retains `author_id` but the enum `status` is skipped (diagnostic),
         // so the parser never sees the composite index either.
@@ -3766,6 +4712,9 @@ mod tests {
                     name: format!("idx_{}", "x".repeat(70)),
                     columns: vec!["body".to_owned()],
                     unique: false,
+                    definition: None,
+                    is_partial: false,
+                    key_columns: Vec::new(),
                 },
             }],
         };
@@ -3789,6 +4738,9 @@ mod tests {
                     name: format!("idx_{}", "x".repeat(70)),
                     columns: vec!["body".to_owned()],
                     unique: false,
+                    definition: None,
+                    is_partial: false,
+                    key_columns: Vec::new(),
                 },
             }],
         };
@@ -3815,6 +4767,9 @@ mod tests {
                         name: dup.clone(),
                         columns: vec!["foo".to_owned()],
                         unique: true,
+                        definition: None,
+                        is_partial: false,
+                        key_columns: Vec::new(),
                     },
                 },
                 SchemaChange::AddIndex {
@@ -3823,6 +4778,9 @@ mod tests {
                         name: dup.clone(),
                         columns: vec!["foo_unique".to_owned()],
                         unique: false,
+                        definition: None,
+                        is_partial: false,
+                        key_columns: Vec::new(),
                     },
                 },
             ],
@@ -3857,11 +4815,17 @@ mod tests {
                 name: dup.clone(),
                 columns: vec!["foo".to_owned()],
                 unique: true,
+                definition: None,
+                is_partial: false,
+                key_columns: Vec::new(),
             },
             Index {
                 name: dup.clone(),
                 columns: vec!["foo_unique".to_owned()],
                 unique: false,
+                definition: None,
+                is_partial: false,
+                key_columns: Vec::new(),
             },
         ];
         let plan = MigrationPlan {
@@ -3889,6 +4853,9 @@ mod tests {
                         name: "idx_posts_foo".to_owned(),
                         columns: vec!["foo".to_owned()],
                         unique: false,
+                        definition: None,
+                        is_partial: false,
+                        key_columns: Vec::new(),
                     },
                 },
                 SchemaChange::AddIndex {
@@ -3897,6 +4864,9 @@ mod tests {
                         name: "idx_posts_bar".to_owned(),
                         columns: vec!["bar".to_owned()],
                         unique: false,
+                        definition: None,
+                        is_partial: false,
+                        key_columns: Vec::new(),
                     },
                 },
             ],
@@ -3922,6 +4892,9 @@ mod tests {
                     name: "idx_posts_email_unique".to_owned(),
                     columns: vec!["email".to_owned()],
                     unique: true,
+                    definition: None,
+                    is_partial: false,
+                    key_columns: Vec::new(),
                 },
             }],
         };
@@ -3968,6 +4941,9 @@ mod tests {
                         name: "idx_posts_email_unique".to_owned(),
                         columns: vec!["email".to_owned()],
                         unique: true,
+                        definition: None,
+                        is_partial: false,
+                        key_columns: Vec::new(),
                     },
                 },
             ],
@@ -3988,6 +4964,9 @@ mod tests {
             name: "idx_posts_email_unique".to_owned(),
             columns: vec!["email".to_owned()],
             unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         }];
         let plan = MigrationPlan {
             backend: Backend::Postgres,
@@ -4011,6 +4990,9 @@ mod tests {
                     name: "idx_posts_email".to_owned(),
                     columns: vec!["email".to_owned()],
                     unique: false,
+                    definition: None,
+                    is_partial: false,
+                    key_columns: Vec::new(),
                 },
             }],
         };
@@ -4211,6 +5193,10 @@ mod tests {
         let mut t = Table::new("posts", Backend::Postgres);
         let mut id = col("id", ColumnType::Uuid);
         id.primary_key = true;
+        // The model convention default — the exact string `parse::convention_default`
+        // records and introspection preserves — is required for the `IdKind::Uuid`
+        // shape to render.
+        id.default = Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()));
         t.primary_key.push("id".to_owned());
         t.columns.push(id);
         let plan = MigrationPlan {
@@ -4221,6 +5207,166 @@ mod tests {
         assert!(
             up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
             "uuid PK: {up}"
+        );
+    }
+
+    #[test]
+    fn pk_kind_for_uuid_is_gated_on_the_convention_default() {
+        // Convention `gen_random_uuid()` default → the `IdKind::Uuid` shape.
+        let mut conv = col("id", ColumnType::Uuid);
+        conv.primary_key = true;
+        conv.default = Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()));
+        assert_eq!(pk_kind_for(&conv), Some(IdKind::Uuid));
+        // A leading/trailing whitespace variant still resolves (trim-tolerant).
+        let mut conv_ws = col("id", ColumnType::Uuid);
+        conv_ws.primary_key = true;
+        conv_ws.default = Some(ColumnDefault::Sql("  gen_random_uuid()  ".to_owned()));
+        assert_eq!(pk_kind_for(&conv_ws), Some(IdKind::Uuid));
+
+        // A non-convention default (`uuid_generate_v4()`) → None (ordinary column).
+        let mut v4 = col("id", ColumnType::Uuid);
+        v4.primary_key = true;
+        v4.default = Some(ColumnDefault::Sql("uuid_generate_v4()".to_owned()));
+        assert_eq!(pk_kind_for(&v4), None);
+
+        // No default → None (ordinary column; the PK is expressed table-level).
+        let mut none = col("id", ColumnType::Uuid);
+        none.primary_key = true;
+        assert_eq!(pk_kind_for(&none), None);
+    }
+
+    /// A convention UUID PK (`DEFAULT gen_random_uuid()`) renders the `IdKind::Uuid`
+    /// shape verbatim — the `gen_random_uuid()` default is not double-emitted.
+    #[test]
+    fn create_table_convention_uuid_pk_renders_id_kind_shape() {
+        let mut t = Table::new("sessions", Backend::Postgres);
+        let mut id = col("id", ColumnType::Uuid);
+        id.primary_key = true;
+        id.default = Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()));
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        let body = render_create_table_body("sessions", &t, Backend::Postgres);
+        assert!(
+            body.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
+            "convention UUID PK renders the IdKind::Uuid shape: {body}"
+        );
+        // Exactly one `gen_random_uuid()` — the explicit column default is not also
+        // appended alongside the `IdKind::Uuid` shape's own default.
+        assert_eq!(
+            body.matches("gen_random_uuid()").count(),
+            1,
+            "the convention default is emitted exactly once: {body}"
+        );
+    }
+
+    /// A UUID PK with NO default must NOT gain a `gen_random_uuid()` default on
+    /// recreation: it renders as an ordinary `UUID` column plus a table-level
+    /// `PRIMARY KEY (id)` clause, preserving "no default".
+    #[test]
+    fn create_table_uuid_pk_without_default_renders_ordinary_column_with_pk() {
+        let mut t = Table::new("tokens", Backend::Postgres);
+        let mut id = col("id", ColumnType::Uuid);
+        id.primary_key = true;
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        t.columns.push(col("label", ColumnType::Text));
+        let body = render_create_table_body("tokens", &t, Backend::Postgres);
+        assert!(
+            body.contains("id UUID NOT NULL"),
+            "no-default UUID PK renders as an ordinary UUID column: {body}"
+        );
+        assert!(
+            !body.contains("gen_random_uuid()"),
+            "no default must be invented on recreation: {body}"
+        );
+        assert!(
+            body.contains("PRIMARY KEY (id)"),
+            "the PK is still expressed via the table-level clause: {body}"
+        );
+    }
+
+    /// A brownfield UUID PK whose default is a NON-convention expression
+    /// (`uuid_generate_v4()`) renders that default verbatim — recreation preserves the
+    /// real UUID-generation behavior rather than silently swapping it for
+    /// `gen_random_uuid()`.
+    #[test]
+    fn create_table_uuid_pk_with_non_convention_default_renders_it_verbatim() {
+        let mut t = Table::new("tokens", Backend::Postgres);
+        let mut id = col("id", ColumnType::Uuid);
+        id.primary_key = true;
+        id.default = Some(ColumnDefault::Sql("uuid_generate_v4()".to_owned()));
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        let body = render_create_table_body("tokens", &t, Backend::Postgres);
+        assert!(
+            body.contains("id UUID NOT NULL DEFAULT uuid_generate_v4()"),
+            "the real non-convention default renders verbatim: {body}"
+        );
+        assert!(
+            !body.contains("gen_random_uuid()"),
+            "the convention default is never substituted: {body}"
+        );
+        assert!(
+            body.contains("PRIMARY KEY (id)"),
+            "the PK is still expressed via the table-level clause: {body}"
+        );
+    }
+
+    /// A brownfield single-column `Int32` PK whose default is a `nextval(...)`
+    /// sequence (a `SERIAL PRIMARY KEY`) recreates as `SERIAL PRIMARY KEY` — the
+    /// explicit default is suppressed and auto-increment is preserved, mirroring the
+    /// `Int64` → `BIGSERIAL` path. It must NOT render `INTEGER … DEFAULT nextval`.
+    #[test]
+    fn create_table_int4_serial_pk_renders_serial() {
+        let mut t = Table::new("counters", Backend::Postgres);
+        let mut id = col("id", ColumnType::Int32);
+        id.primary_key = true;
+        id.default = Some(ColumnDefault::Sql(
+            "nextval('counters_id_seq'::regclass)".to_owned(),
+        ));
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        t.columns.push(col("label", ColumnType::Text));
+        let body = render_create_table_body("counters", &t, Backend::Postgres);
+        assert!(
+            body.contains("id SERIAL PRIMARY KEY"),
+            "int4 SERIAL PK renders SERIAL: {body}"
+        );
+        assert!(
+            !body.contains("nextval") && !body.contains("id INTEGER"),
+            "the explicit nextval default is suppressed (no INTEGER … DEFAULT nextval): {body}"
+        );
+    }
+
+    /// A single-column `Int32` PK with NO default is a plain integer PK (no
+    /// auto-increment): it renders `INTEGER` with a table-level `PRIMARY KEY` clause,
+    /// never `SERIAL`.
+    #[test]
+    fn create_table_int4_pk_without_default_renders_plain_integer() {
+        let mut t = Table::new("counters", Backend::Postgres);
+        let mut id = col("id", ColumnType::Int32);
+        id.primary_key = true;
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        let body = render_create_table_body("counters", &t, Backend::Postgres);
+        assert!(
+            !body.contains("SERIAL"),
+            "a plain int4 PK must not become SERIAL: {body}"
+        );
+        assert!(
+            body.contains("id INTEGER NOT NULL") && body.contains("PRIMARY KEY (id)"),
+            "a plain int4 PK renders a plain INTEGER column with a table-level PRIMARY KEY: {body}"
+        );
+    }
+
+    /// The existing `Int64` PK path is unchanged: `BIGSERIAL PRIMARY KEY`.
+    #[test]
+    fn create_table_int8_pk_still_renders_bigserial() {
+        let t = posts_with(vec![col("body", ColumnType::Text)]);
+        let body = render_create_table_body("posts", &t, Backend::Postgres);
+        assert!(
+            body.contains("id BIGSERIAL PRIMARY KEY"),
+            "int8 PK renders BIGSERIAL: {body}"
         );
     }
 
@@ -4481,6 +5627,9 @@ mod tests {
             name: "idx_posts_author_id".to_owned(),
             columns: vec!["author_id".to_owned()],
             unique: false,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
         let plan = diff_schema(&base, &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
         let up = emit_up_sql(&plan).expect("emit");
@@ -4532,6 +5681,9 @@ mod tests {
                 name: "idx_posts_slug_unique".to_owned(),
                 columns: vec!["slug".to_owned()],
                 unique: true,
+                definition: None,
+                is_partial: false,
+                key_columns: Vec::new(),
             },
         );
         assert_eq!(
@@ -4547,6 +5699,9 @@ mod tests {
                     name: "idx_posts_slug".to_owned(),
                     columns: vec!["slug".to_owned()],
                     unique: false,
+                    definition: None,
+                    is_partial: false,
+                    key_columns: Vec::new(),
                 },
             }],
         };
@@ -4572,6 +5727,9 @@ mod tests {
                         name: "idx_posts_new".to_owned(),
                         columns: vec!["new".to_owned()],
                         unique: false,
+                        definition: None,
+                        is_partial: false,
+                        key_columns: Vec::new(),
                     },
                 },
                 SchemaChange::AddColumn {
@@ -4607,11 +5765,17 @@ mod tests {
             name: "idx_posts_slug".to_owned(),
             columns: vec!["slug".to_owned()],
             unique: false,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         };
         let new = Index {
             name: "idx_posts_slug".to_owned(),
             columns: vec!["slug".to_owned()],
             unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         };
         let mut base_table = posts_with(vec![col("slug", ColumnType::Text)]);
         base_table.indexes.push(old);
@@ -4664,6 +5828,9 @@ mod tests {
                         name: "idx_posts_old".to_owned(),
                         columns: vec!["old".to_owned()],
                         unique: false,
+                        definition: None,
+                        is_partial: false,
+                        key_columns: Vec::new(),
                     },
                 },
                 SchemaChange::AddIndex {
@@ -4672,6 +5839,9 @@ mod tests {
                         name: "idx_posts_new".to_owned(),
                         columns: vec!["new".to_owned()],
                         unique: false,
+                        definition: None,
+                        is_partial: false,
+                        key_columns: Vec::new(),
                     },
                 },
             ],
@@ -4784,6 +5954,9 @@ mod tests {
             name: "idx_posts_body".to_owned(),
             columns: vec!["body".to_owned()],
             unique: false,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
         let plan = MigrationPlan {
             backend: Backend::Postgres,
@@ -4884,6 +6057,9 @@ mod tests {
                         name: "idx_posts_bio".to_owned(),
                         columns: vec!["bio".to_owned()],
                         unique: false,
+                        definition: None,
+                        is_partial: false,
+                        key_columns: Vec::new(),
                     },
                 },
             ],
@@ -4971,6 +6147,9 @@ mod tests {
             name: "idx_posts_body".to_owned(),
             columns: vec!["body".to_owned()],
             unique: false,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         };
         let baseline = sqlite_table(
             "posts",
@@ -5486,9 +6665,13 @@ PRAGMA foreign_keys=ON;
         };
         let baseline = uuid_table("posts");
         let desired = uuid_table("posts");
+        // A default-less UUID PK is no longer the `IdKind::Uuid` convention shape
+        // (that is gated on the `gen_random_uuid()` default): it resolves to `None`
+        // and is rendered as an ordinary column with a table-level PK. Either way it
+        // is not an autoincrement PK, so no sequence preservation is emitted.
         assert!(
-            matches!(single_pk_column(&desired), Some((_, IdKind::Uuid))),
-            "the fixture PK resolves to Uuid"
+            single_pk_column(&desired).is_none(),
+            "a default-less UUID PK is not the IdKind::Uuid convention shape"
         );
         for leg in [RebuildLeg::Up, RebuildLeg::Down] {
             let sql = render_sqlite_rebuild("posts", &desired, &baseline, leg, &[]);
@@ -6377,6 +7560,244 @@ PRAGMA foreign_keys=ON;
             *tables,
             vec!["a".to_owned(), "b".to_owned()],
             "names the cycle"
+        );
+    }
+
+    // -- Part B: rollback restores a cascade-dropped retained index ----------
+
+    /// The `index_depends_on_column` contract: dependency is EXACT `columns`
+    /// membership (the introspected `pg_depend` set), never a `definition`-text
+    /// scan. A column name that merely appears in the `definition` string — e.g.
+    /// as a string literal in a partial-index predicate — is NOT a dependency, so
+    /// the projection can't wrongly prune an index Postgres actually keeps.
+    #[test]
+    fn index_dependency_detection_is_exact_column_membership() {
+        // A partial index on `id` whose predicate string literal mentions `email`,
+        // but which does NOT depend on the `email` column (its `pg_depend` set is
+        // just `id`). Dropping `email` must NOT be read as a dependency.
+        let partial = Index {
+            name: "t_id_email_kind".to_owned(),
+            columns: vec!["id".to_owned()],
+            unique: false,
+            definition: Some(
+                "CREATE INDEX t_id_email_kind ON t (id) WHERE kind = 'email'".to_owned(),
+            ),
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        assert!(
+            !index_depends_on_column(&partial, "email"),
+            "a column name in a definition string literal is NOT a dependency (no false positive)"
+        );
+        assert!(
+            index_depends_on_column(&partial, "id"),
+            "the true dependent column (in `columns`) IS a dependency"
+        );
+
+        // An expression index carrying its exact `pg_depend` dependent set.
+        let expr = Index {
+            name: "u_lower_email".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: false,
+            definition: Some("CREATE INDEX u_lower_email ON users (lower(email))".to_owned()),
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        assert!(
+            index_depends_on_column(&expr, "email"),
+            "the expression-referenced `email` is captured in `columns`"
+        );
+        assert!(
+            !index_depends_on_column(&expr, "mail"),
+            "a column absent from `columns` is not a dependency"
+        );
+
+        let plain = Index {
+            name: "u_email".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        assert!(
+            index_depends_on_column(&plain, "email"),
+            "columns membership counts as a dependency"
+        );
+    }
+
+    #[test]
+    fn drop_column_up_drops_column_and_down_restores_retained_index() {
+        // Baseline `users(id, email)` with a RETAINED constraint-owned unique
+        // index on `email` (definition-carrying, no paired DropIndex). The model
+        // removes `email`, so the plan carries only a DropColumn.
+        let mut email_col = col("email", ColumnType::Text);
+        email_col.nullable = false;
+        let mut baseline = posts_ref_table("users", email_col);
+        baseline.indexes.push(Index {
+            name: "users_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some("CREATE UNIQUE INDEX users_email_key ON users (email)".to_owned()),
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+        // Desired side: `email` removed. `diff_indexes` retains the definition
+        // index (no DropIndex), so the plan is a lone DropColumn.
+        let desired = posts_ref_table("users", col("keep", ColumnType::Text));
+        let plan = diff_schema(
+            std::slice::from_ref(&baseline),
+            &parsed(vec![desired.clone()], vec![]),
+            ALLOW,
+        );
+        assert!(
+            plan.changes.iter().any(
+                |c| matches!(c, SchemaChange::DropColumn { column, .. } if column.name == "email")
+            ),
+            "plan must drop `email`: {:?}",
+            plan.changes
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { index, .. } if index.name == "users_email_key")),
+            "the retained definition index must NOT get a DropIndex: {:?}",
+            plan.changes
+        );
+
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+
+        // UP: a bare DROP COLUMN (Postgres cascade-drops the index), never a
+        // failing DROP INDEX on the constraint-backed index.
+        assert!(
+            up.contains("ALTER TABLE users DROP COLUMN email"),
+            "up must drop the column: {up}"
+        );
+        assert!(
+            !up.contains("DROP INDEX users_email_key"),
+            "up must NOT emit DROP INDEX for the cascade-dropped retained index: {up}"
+        );
+
+        // DOWN: re-add the column, THEN recreate the retained index verbatim.
+        assert!(
+            down.contains("ADD COLUMN email"),
+            "down must re-add the column: {down}"
+        );
+        assert!(
+            down.contains("CREATE UNIQUE INDEX users_email_key ON users (email)"),
+            "down must restore the cascade-dropped retained index: {down}"
+        );
+        let readd_at = down.find("ADD COLUMN email").expect("re-add present");
+        let index_at = down
+            .find("CREATE UNIQUE INDEX users_email_key")
+            .expect("index restore present");
+        assert!(
+            readd_at < index_at,
+            "column must be re-added before its dependent index is recreated: {down}"
+        );
+        // No regression: a single-column retained index is restored EXACTLY ONCE.
+        assert_eq!(
+            down.matches("CREATE UNIQUE INDEX users_email_key").count(),
+            1,
+            "the single-column retained index must be recreated exactly once: {down}"
+        );
+    }
+
+    /// A retained index depending on TWO columns, both dropped, must have its
+    /// recreation DELAYED until BOTH columns are restored and emitted EXACTLY ONCE
+    /// (never once per dependent dropped column). Recreating it inline after the
+    /// first re-add would fail (the second dependent column is still absent) and
+    /// duplicate the `CREATE INDEX`.
+    #[test]
+    fn drop_two_columns_down_restores_multicol_retained_index_once_after_both() {
+        // Baseline `users(id, keep, email, tenant_id)` with a RETAINED partial +
+        // expression index depending on BOTH `email` and `tenant_id`
+        // (definition-carrying, no paired DropIndex).
+        let mut baseline = Table::new("users", Backend::Postgres);
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        baseline.primary_key.push("id".to_owned());
+        baseline.columns.push(id);
+        baseline.columns.push(col("keep", ColumnType::Text));
+        let mut email = col("email", ColumnType::Text);
+        email.nullable = false;
+        baseline.columns.push(email);
+        baseline.columns.push(col("tenant_id", ColumnType::Int64));
+        baseline.indexes.push(Index {
+            name: "users_active".to_owned(),
+            // The exact `pg_depend` dependent set: expression column + predicate
+            // column (sorted by name, as introspection records it).
+            columns: vec!["email".to_owned(), "tenant_id".to_owned()],
+            unique: false,
+            definition: Some(
+                "CREATE INDEX users_active ON users (lower(email)) WHERE tenant_id IS NOT NULL"
+                    .to_owned(),
+            ),
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+
+        // Desired side: BOTH `email` and `tenant_id` removed. The model diff
+        // retains the definition index (no DropIndex), so the plan is two
+        // DropColumns.
+        let mut desired = Table::new("users", Backend::Postgres);
+        let mut did = col("id", ColumnType::Int64);
+        did.primary_key = true;
+        desired.primary_key.push("id".to_owned());
+        desired.columns.push(did);
+        desired.columns.push(col("keep", ColumnType::Text));
+
+        let plan = diff_schema(
+            std::slice::from_ref(&baseline),
+            &parsed(vec![desired.clone()], vec![]),
+            ALLOW,
+        );
+        assert_eq!(
+            plan.changes
+                .iter()
+                .filter(|c| matches!(c, SchemaChange::DropColumn { .. }))
+                .count(),
+            2,
+            "plan must drop both columns: {:?}",
+            plan.changes
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { index, .. } if index.name == "users_active")),
+            "the retained definition index must NOT get a DropIndex: {:?}",
+            plan.changes
+        );
+
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+
+        // DOWN re-adds BOTH columns and recreates the index EXACTLY ONCE.
+        let email_at = down.find("ADD COLUMN email").expect("email re-add present");
+        let tenant_at = down
+            .find("ADD COLUMN tenant_id")
+            .expect("tenant_id re-add present");
+        assert_eq!(
+            down.matches("CREATE INDEX users_active").count(),
+            1,
+            "the multi-column retained index must be recreated exactly once (deduped): {down}"
+        );
+        let index_at = down
+            .find("CREATE INDEX users_active")
+            .expect("index restore present");
+        assert!(
+            email_at < index_at && tenant_at < index_at,
+            "both dependent columns must be re-added BEFORE the index is recreated: {down}"
         );
     }
 }
