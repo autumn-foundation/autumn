@@ -270,14 +270,36 @@ pub fn run(
             run_all_targets(&targets, &migrations_dir, with_maintenance, wait);
         }
         MigrateAction::Status => {
+            // `show_status` shells out to `diesel migration list`, and the
+            // rollback/framework status readers use the Postgres migration
+            // connection — none of which is wired for the SQLite backend (the
+            // #2058 port covers `migrate` up/down only). A `sqlite://` target
+            // therefore gets a clear provider-appropriate message here instead of
+            // reaching the `diesel` subprocess and dying with a raw OS error (the
+            // `diesel` CLI preflight was deliberately skipped for all-SQLite runs).
+            let mut sqlite_unsupported = false;
             for (label, url) in &targets {
                 eprintln!("\u{2500}\u{2500} {label} \u{2500}\u{2500}");
+                if is_sqlite_target(url) {
+                    eprintln!(
+                        "  \u{2717} `autumn migrate status` is not supported under the SQLite \
+                         backend. The #2058 port covers `autumn migrate` (up) and \
+                         `autumn migrate down` only \u{2014} run those to apply or roll back a \
+                         `sqlite://` database."
+                    );
+                    eprintln!();
+                    sqlite_unsupported = true;
+                    continue;
+                }
                 show_status(url, &migrations_dir);
                 show_rollback_availability(url, &migrations_dir);
                 // Shard targets only require the shard framework migrations, so
                 // report against that set instead of the full control-plane one.
                 show_framework_status(url, label.starts_with("shard:"));
                 eprintln!();
+            }
+            if sqlite_unsupported {
+                std::process::exit(1);
             }
         }
         MigrateAction::Check | MigrateAction::Down(_) | MigrateAction::Baseline(_) => {

@@ -130,3 +130,40 @@ fn migrate_up_then_down_against_a_sqlite_file() {
         "posts table exists again after re-apply"
     );
 }
+
+/// `autumn migrate status` is Postgres-only (it shells out to `diesel migration
+/// list` and reads the Postgres migration connection). Under the `SQLite` backend
+/// it must fail with a CLEAR provider-appropriate message rather than reaching
+/// the `diesel` subprocess and dying with a raw "No such file or directory" OS
+/// error — the `diesel` CLI preflight is deliberately skipped for all-SQLite runs
+/// (issue #2058, codex P2).
+#[test]
+fn migrate_status_under_sqlite_is_a_clear_provider_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let migration = root.join("migrations/20990101000000_create_posts");
+    std::fs::create_dir_all(&migration).expect("mkdir migrations");
+    std::fs::write(
+        migration.join("up.sql"),
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL);\n",
+    )
+    .expect("write up.sql");
+    std::fs::write(migration.join("down.sql"), "DROP TABLE posts;\n").expect("write down.sql");
+
+    let db_path = root.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_out, err, code) = run_autumn(root, &["migrate", "status"], &envs);
+    assert_eq!(code, Some(1), "status under sqlite exits non-zero: {err}");
+    assert!(
+        err.contains("not supported under the SQLite backend"),
+        "status under sqlite gives a provider-appropriate message: {err}"
+    );
+    // It must NOT reach the `diesel` subprocess (the bug it replaces).
+    assert!(
+        !err.contains("diesel migration list") && !err.contains("os error 2"),
+        "status under sqlite must not invoke the diesel subprocess: {err}"
+    );
+}
