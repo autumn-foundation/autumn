@@ -44,7 +44,12 @@ SSH_PORT="${SSH_PORT:-22}"
 PUBLIC_PORT="${PUBLIC_PORT:-80}"
 APP_NAME="${APP_NAME:-rvpsapp}"
 : "${SIGNING_SECRET:?SIGNING_SECRET is required}"
-KAMAL_PROXY_VERSION="${KAMAL_PROXY_VERSION:-latest}"
+# Pin to a specific released tag, not `latest`: the CLI surface drifts across
+# releases (e.g. v0.9.2 dropped the `version` subcommand), so a mutable `latest`
+# makes this a non-deterministic test. Production does NOT pin kamal-proxy (it
+# defers binary provisioning to host bootstrap), so this pin is the test's own
+# reproducibility choice — bump it deliberately when validating a newer proxy.
+KAMAL_PROXY_VERSION="${KAMAL_PROXY_VERSION:-v0.9.2}"
 ONBOARD_BUDGET_SECS="${ONBOARD_BUDGET_SECS:-900}"
 
 BASE_URL="http://${TARGET_HOST}:${PUBLIC_PORT}"
@@ -127,7 +132,13 @@ stop_prober() { touch "${WORK}/prober.stop"; wait "$1" 2>/dev/null || true; rm -
 # no-op exit 0. Compiled fully static so it runs on the stock VM regardless of
 # its glibc.
 compile_app() { # <version> <out>
-  local version="$1" out="$2" src="${WORK}/app_${version}.rs"
+  # NOTE: keep these as separate `local` statements. A single
+  # `local version="$1" ... src="...${version}..."` expands ${version} (a later
+  # word) BEFORE `local` binds it (an earlier word in the same statement), so
+  # under `set -u` it aborts with `version: unbound variable`.
+  local version="$1"
+  local out="$2"
+  local src="${WORK}/app_${version}.rs"
   cat > "${src}" <<RUST
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -205,7 +216,9 @@ rssh 'set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update -qq;
       docker cp "$cid:/usr/local/bin/kamal-proxy" /usr/local/bin/kamal-proxy;
       docker rm -f "$cid" >/dev/null;
       chmod 755 /usr/local/bin/kamal-proxy;
-      /usr/local/bin/kamal-proxy version || true' \
+      /usr/local/bin/kamal-proxy --help >/dev/null 2>&1 \
+        && echo "kamal-proxy binary present and runnable" \
+        || echo "kamal-proxy --help probe failed (non-fatal informational check)"' \
   || fail "host bootstrap failed"
 # pam_systemd is deliberately LEFT ENABLED (unlike the container fixture) so the
 # ssh sessions the deploy opens get XDG_RUNTIME_DIR=/run/user/0 — the real-host
