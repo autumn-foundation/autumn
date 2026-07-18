@@ -851,7 +851,7 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
     // from the project `autumn.toml` string (like the media plugin reads
     // `[media]`), so it needs no `AutumnConfig`/plugin coupling and defaults to
     // disabled — a non-media project is byte-for-byte unaffected.
-    let (media_cfg, ffmpeg_bin) = load_media_host_config();
+    let (media_cfg, ffmpeg_bin) = load_media_host_config()?;
 
     match action {
         // `plan` is a pure dry-run over `resolved` alone — it never grades or
@@ -880,10 +880,20 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
 /// Reads the raw `autumn.toml` string and deserializes only the `[media]`
 /// subtree (mirroring how `autumn-media-plugin` reads its own config), so it
 /// bypasses `autumn-web`'s strict `AutumnConfig` schema and adds no dependency on
-/// the plugin. A missing or unparseable file yields the disabled default plus
-/// the default `FFmpeg` path, so a project that does not use autumn-media is
-/// unaffected.
-fn load_media_host_config() -> (media::MediaMtxHostConfig, String) {
+/// the plugin. A missing file (or one that cannot be read) yields the disabled
+/// default plus the default `FFmpeg` path, so a project that does not use
+/// autumn-media is unaffected.
+///
+/// **Fails closed on invalid media config.** A `[media.mediamtx]` /
+/// `[media.ffmpeg]` table that is *present but does not deserialize* (a
+/// wrong-typed value) is an error, not a silent fallback: it returns
+/// [`DeployError::Config`] so `deploy plan`/`deploy up` abort with a clear
+/// message instead of proceeding WITHOUT provisioning a media-enabled app's
+/// `MediaMTX` daemon. The disabled default is reserved for the genuinely *absent*
+/// case — `from_toml_str` / `ffmpeg_bin_from_toml_str` map a missing table to
+/// `Ok(default)` and a present-but-invalid table to `Err`, so a non-media
+/// project stays unaffected while a broken media config can never be swallowed.
+fn load_media_host_config() -> Result<(media::MediaMtxHostConfig, String), DeployError> {
     let disabled = || {
         (
             media::MediaMtxHostConfig::default(),
@@ -891,15 +901,23 @@ fn load_media_host_config() -> (media::MediaMtxHostConfig, String) {
         )
     };
     let Some(path) = first_dir_with_file(&manifest_project_dirs(), "autumn.toml") else {
-        return disabled();
+        return Ok(disabled());
     };
     let Ok(contents) = std::fs::read_to_string(&path) else {
-        return disabled();
+        return Ok(disabled());
     };
-    let cfg = media::MediaMtxHostConfig::from_toml_str(&contents).unwrap_or_default();
-    let bin = media::ffmpeg_bin_from_toml_str(&contents)
-        .unwrap_or_else(|_| media::DEFAULT_FFMPEG_BIN.to_owned());
-    (cfg, bin)
+    // `from_toml_str` parses the whole `[media]` subtree (both `mediamtx` and the
+    // sibling `ffmpeg` table), so a type error in *either* surfaces here — the
+    // second `ffmpeg_bin_from_toml_str` parse is a defensive companion. Propagate
+    // rather than `.unwrap_or_default()` so a malformed media config aborts the
+    // deploy instead of silently disabling MediaMTX provisioning.
+    let cfg = media::MediaMtxHostConfig::from_toml_str(&contents).map_err(|e| {
+        DeployError::Config(format!("invalid [media] config in {}: {e}", path.display()))
+    })?;
+    let bin = media::ffmpeg_bin_from_toml_str(&contents).map_err(|e| {
+        DeployError::Config(format!("invalid [media] config in {}: {e}", path.display()))
+    })?;
+    Ok((cfg, bin))
 }
 
 /// An [`Env`] that forces `AUTUMN_ENV` to a specific deploy profile while

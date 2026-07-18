@@ -63,8 +63,6 @@
 //!   fake, and are collected by [`collect_media_doctor_checks`] for a caller that
 //!   already holds a live [`DeployExecutor`].
 
-use std::collections::BTreeSet;
-
 use serde::Deserialize;
 
 use super::PreflightCheck;
@@ -268,11 +266,18 @@ pub fn ffmpeg_bin_from_toml_str(toml_str: &str) -> Result<String, toml::de::Erro
 impl MediaMtxHostConfig {
     /// Deserialize the `[media.mediamtx]` section out of a raw `autumn.toml`
     /// string. A file with no `[media.mediamtx]` table yields
-    /// [`MediaMtxHostConfig::default`] (disabled).
+    /// [`MediaMtxHostConfig::default`] (disabled), so a non-media project reads
+    /// as "controller off".
+    ///
+    /// Fail-closed contract: an *absent* table maps to `Ok(default)`, but a table
+    /// that is *present with an ill-typed value* is a hard `Err` — the caller
+    /// must abort rather than fall back to the disabled default, otherwise a
+    /// media-enabled app would deploy WITHOUT provisioning `MediaMTX`.
     ///
     /// # Errors
     ///
-    /// Returns the [`toml::de::Error`] when the string does not parse.
+    /// Returns the [`toml::de::Error`] when the string does not parse or a
+    /// present `[media.mediamtx]` / `[media.ffmpeg]` value has the wrong type.
     pub fn from_toml_str(toml_str: &str) -> Result<Self, toml::de::Error> {
         let root: MediaTomlRoot = toml::from_str(toml_str)?;
         Ok(root.media.mediamtx)
@@ -624,69 +629,93 @@ fn mediamtx_required_ports(cfg: &MediaMtxHostConfig) -> Vec<u16> {
     ]
 }
 
-/// Parse the set of listening local ports out of `ss -H -tuln` output.
+/// A listening socket parsed from `ss -H -tulnp`: the local port plus the owning
+/// process name (`None` when `ss` could not attribute the socket — e.g. the
+/// `users:(("name",…))` column is absent because the caller lacked privilege).
+type ListeningSocket = (u16, Option<String>);
+
+/// Parse the listening sockets out of `ss -H -tulnp` output as
+/// `(port, owner_process)` pairs.
 ///
-/// Each line's 5th column (index 4: `Netid State Recv-Q Send-Q Local Peer`) is
+/// Each line's 5th column (index 4: `Netid State Recv-Q Send-Q Local Peer …`) is
 /// the `Local Address:Port` — the port is the tail after the last `:` (covers
-/// IPv4 `0.0.0.0:8888`, IPv6 `[::]:8888`, and `*:8888`). Lines that do not
-/// parse are skipped. Pure — unit-tested against captured `ss` output.
+/// IPv4 `0.0.0.0:8888`, IPv6 `[::]:8888`, and `*:8888`). The owning process is
+/// read from the trailing `users:(("<name>",pid=…,fd=…))` column (added by `-p`),
+/// or `None` when that column is absent. Lines whose port does not parse are
+/// skipped. Pure — unit-tested against captured `ss` output.
 #[must_use]
-fn parse_listening_ports(ss_output: &str) -> BTreeSet<u16> {
+fn parse_listening_sockets(ss_output: &str) -> Vec<ListeningSocket> {
     ss_output
         .lines()
         .filter_map(|line| {
             let local = line.split_whitespace().nth(4)?;
-            let port_str = local.rsplit(':').next()?;
-            port_str.parse::<u16>().ok()
+            let port = local.rsplit(':').next()?.parse::<u16>().ok()?;
+            Some((port, process_name_from_ss_line(line)))
         })
         .collect()
 }
 
-/// Grade that the `MediaMTX` ports are free on the host (no conflicting service is
+/// Extract the owning process name from an `ss -p` line's
+/// `users:(("<name>",pid=…,fd=…))` column, if present. Returns the first process
+/// name (a socket shared by several PIDs of the same binary lists them all, but
+/// the first name is the owning binary). `None` when the column is absent.
+#[must_use]
+fn process_name_from_ss_line(line: &str) -> Option<String> {
+    // `…users:(("mediamtx",pid=10,fd=7))` → the text after the opening `"`.
+    let after_quote = line.split_once("users:((\"")?.1;
+    let name = after_quote.split_once('"')?.0;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// The managed `MediaMTX` process name, derived from the configured binary path's
+/// basename (`/usr/local/bin/mediamtx` → `mediamtx`). This is the `comm` `ss`
+/// reports for our own daemon; the kernel truncates `comm` to 15 chars, which the
+/// short `mediamtx` name never hits.
+#[must_use]
+fn managed_process_name(cfg: &MediaMtxHostConfig) -> &str {
+    cfg.binary_path
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(cfg.binary_path.as_str())
+}
+
+/// Grade that the `MediaMTX` ports are free on the host (no *foreign* service is
 /// already bound to them).
 ///
-/// **Redeploy-safe:** first consults `systemctl is-active <unit>.service`. When the
-/// managed `MediaMTX` unit is already `active`, the required ports are legitimately
-/// held by *our own* service, so the check passes with an informational note and
-/// skips the scan — otherwise the 2nd+ `deploy up` would abort on a self-conflict
-/// even though the service is healthy. Only a literal `active` counts; any other
-/// state (inactive / failed / activating, or an absent unit → non-zero exit →
-/// transport error) falls through to the strict scan below.
+/// **Process-aware, redeploy-safe on changed ports.** It always runs the port
+/// scan — `ss -H -tulnp` (the `-p` adds the owning-process column) over the
+/// executor — and classifies each configured target port by *who* holds it, not
+/// merely whether it is occupied:
 ///
-/// On a fresh host (unit inactive/absent) it runs `ss -H -tuln` over the executor
-/// and parses the listening TCP/UDP ports, reporting a clear failure listing any
-/// required port already in use by a **foreign** service. Fail-closed: if `ss`
-/// cannot run, or its output does not parse into any recognizable ports, the check
-/// fails with a "could not verify" message rather than passing blind.
+/// - No listener → the port is free → pass.
+/// - Every listener owned by *our own* managed `MediaMTX` (process basename of
+///   [`MediaMtxHostConfig::binary_path`]) → a same-port redeploy, not a conflict
+///   → pass (informational note).
+/// - A listener owned by any *other* process, **or** a listener whose owner
+///   cannot be attributed (empty process column — e.g. insufficient privilege) →
+///   conflict → fail-closed. `autumn deploy` runs as root managing systemd, so
+///   `-p` attribution is normally available; an unattributable listener on a
+///   target port is deliberately treated as a conflict rather than assumed benign.
+///
+/// This replaces an earlier blanket `systemctl is-active` skip, which passed a
+/// running unit without scanning at all — so a redeploy that *changed* a `MediaMTX`
+/// port could not detect a foreign service already bound to the new port (the old
+/// unit only holds the old ports). The per-port ownership check keeps the
+/// same-port redeploy self-conflict passing while still catching that case.
+///
+/// Fail-closed: if `ss` cannot run, or its output does not parse into any
+/// recognizable listener, the check fails with a "could not verify" message
+/// rather than passing blind.
 #[must_use]
 pub fn mediamtx_ports_available(
     exec: &impl DeployExecutor,
     cfg: &MediaMtxHostConfig,
 ) -> PreflightCheck {
-    // Redeploy-safe gate: a managed unit that is already `active` holds these
-    // ports itself, so treat that as a pass and skip the strict scan. Self-
-    // contained (one extra command over the same executor) so it stays correct on
-    // both the `deploy up` and any doctor path.
-    let unit = format!("{}.service", cfg.unit_name);
-    let is_active = RemoteCommand::new(
-        "media-ports-isactive",
-        format!("systemctl is-active {}", super::exec::shell_quote(&unit)),
-    );
-    if let Ok(out) = exec.run(&is_active)
-        && out.stdout.trim() == "active"
-    {
-        return PreflightCheck {
-            name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
-            passed: true,
-            detail: format!(
-                "managed MediaMTX unit `{unit}` is already running; its ports are held by \
-                 our own service — skipping port-conflict scan"
-            ),
-            hint: None,
-        };
-    }
-
-    let cmd = RemoteCommand::new("media-ports", "ss -H -tuln".to_owned());
+    // `-p` attaches the owning-process column so a target port held by our own
+    // managed MediaMTX (a same-port redeploy) is distinguished from a foreign
+    // conflict. Deploy runs as root, so `-p` attribution is available.
+    let cmd = RemoteCommand::new("media-ports", "ss -H -tulnp".to_owned());
     let output = match exec.run(&cmd) {
         Ok(out) => out.stdout,
         Err(err) => {
@@ -699,11 +728,11 @@ pub fn mediamtx_ports_available(
         }
     };
 
-    let listening = parse_listening_ports(&output);
-    // Fail-closed: a non-empty `ss` run that yields zero parseable ports means we
+    let sockets = parse_listening_sockets(&output);
+    // Fail-closed: a non-empty `ss` run that yields zero parseable sockets means we
     // could not actually read the host's listener state — treat it as
     // unverifiable rather than a pass.
-    if listening.is_empty() && !output.trim().is_empty() {
+    if sockets.is_empty() && !output.trim().is_empty() {
         return PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
             passed: false,
@@ -714,30 +743,69 @@ pub fn mediamtx_ports_available(
         };
     }
 
-    let occupied: Vec<u16> = mediamtx_required_ports(cfg)
-        .into_iter()
-        .filter(|p| listening.contains(p))
-        .collect();
-
-    if occupied.is_empty() {
-        PreflightCheck {
-            name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
-            passed: true,
-            detail: "all MediaMTX ports are free on the host".to_owned(),
-            hint: None,
+    let ours = managed_process_name(cfg);
+    let mut conflicts: Vec<u16> = Vec::new();
+    let mut held_by_us: Vec<u16> = Vec::new();
+    for port in mediamtx_required_ports(cfg) {
+        let mut has_listener = false;
+        let mut all_ours = true;
+        for (socket_port, owner) in &sockets {
+            if *socket_port != port {
+                continue;
+            }
+            has_listener = true;
+            // A listener owned by our own mediamtx is fine; a foreign process OR
+            // an unattributable listener (owner `None`) is a conflict → fail-closed.
+            if owner.as_deref() != Some(ours) {
+                all_ours = false;
+            }
         }
-    } else {
-        let list = occupied
+        if !has_listener {
+            continue; // free
+        }
+        if all_ours {
+            held_by_us.push(port);
+        } else {
+            conflicts.push(port);
+        }
+    }
+    conflicts.sort_unstable();
+    conflicts.dedup();
+
+    if !conflicts.is_empty() {
+        let list = conflicts
             .iter()
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        PreflightCheck {
+        return PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
             passed: false,
-            detail: format!("MediaMTX port(s) already in use on the host: {list}"),
+            detail: format!(
+                "MediaMTX port(s) already in use by another service on the host: {list}"
+            ),
             hint: Some(PORTS_HINT),
-        }
+        };
+    }
+
+    let detail = if held_by_us.is_empty() {
+        "all MediaMTX ports are free on the host".to_owned()
+    } else {
+        let list = held_by_us
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "MediaMTX ports are available; port(s) {list} are already held by our own managed \
+             MediaMTX (same-port redeploy)"
+        )
+    };
+    PreflightCheck {
+        name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
+        passed: true,
+        detail,
+        hint: None,
     }
 }
 
@@ -898,6 +966,30 @@ unit_name = \"mediamtx-prod\"
         let bin =
             ffmpeg_bin_from_toml_str("[media.ffmpeg]\nbin = \"/opt/ffmpeg\"\n").expect("parses");
         assert_eq!(bin, "/opt/ffmpeg");
+    }
+
+    #[test]
+    fn from_toml_str_fails_closed_on_malformed_mediamtx_section() {
+        // Finding C: a PRESENT `[media.mediamtx]` with an ill-typed value is a hard
+        // error, so the caller must abort rather than silently disable provisioning.
+        // `enabled` as a string, not a bool:
+        assert!(
+            MediaMtxHostConfig::from_toml_str("[media.mediamtx]\nenabled = \"yes\"\n").is_err()
+        );
+        // A port field as a non-number:
+        assert!(
+            MediaMtxHostConfig::from_toml_str("[media.mediamtx]\napi_port = \"nope\"\n").is_err()
+        );
+    }
+
+    #[test]
+    fn media_config_fails_closed_on_malformed_ffmpeg_section() {
+        // Finding C: a malformed `[media.ffmpeg]` is also a hard error — both
+        // deploy-side parsers deserialize the whole `[media]` subtree, so neither
+        // can be tricked into the disabled default by a broken ffmpeg table.
+        let toml = "[media.ffmpeg]\nbin = 123\n";
+        assert!(ffmpeg_bin_from_toml_str(toml).is_err());
+        assert!(MediaMtxHostConfig::from_toml_str(toml).is_err());
     }
 
     // ── mediamtx.yml rendering ───────────────────────────────────────────────
@@ -1170,93 +1262,110 @@ unit_name = \"mediamtx-prod\"
     // ── Doctor: mediamtx ports available ─────────────────────────────────────
 
     #[test]
-    fn parse_listening_ports_extracts_ipv4_ipv6_and_star() {
+    fn parse_listening_sockets_extracts_port_and_owner() {
         let ss = "\
-tcp   LISTEN 0 128  0.0.0.0:22    0.0.0.0:*
-tcp   LISTEN 0 128  [::]:8888     [::]:*
+tcp   LISTEN 0 128  0.0.0.0:8888  0.0.0.0:*  users:((\"mediamtx\",pid=10,fd=5))
+tcp   LISTEN 0 128  [::]:22       [::]:*     users:((\"sshd\",pid=5,fd=3))
 udp   UNCONN 0 0    *:8189        *:*
 ";
-        let ports = parse_listening_ports(ss);
-        assert!(ports.contains(&22));
-        assert!(ports.contains(&8888));
-        assert!(ports.contains(&8189));
-        assert_eq!(ports.len(), 3);
+        let sockets = parse_listening_sockets(ss);
+        assert!(sockets.contains(&(8888, Some("mediamtx".to_owned()))));
+        assert!(sockets.contains(&(22, Some("sshd".to_owned()))));
+        // The UDP row has no `users:` column → unattributable owner.
+        assert!(sockets.contains(&(8189, None)));
+        assert_eq!(sockets.len(), 3);
     }
 
     #[test]
     fn ports_available_passes_when_ports_free() {
         // ss shows only sshd — none of MediaMTX's ports are taken.
-        let exec = RecordingExecutor::new()
-            .with_stdout("media-ports", "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n");
+        let exec = RecordingExecutor::new().with_stdout(
+            "media-ports",
+            "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n",
+        );
         let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
         assert!(check.passed, "detail: {}", check.detail);
         assert_eq!(check.name, CHECK_MEDIAMTX_PORTS_AVAILABLE);
+        assert!(check.detail.contains("free"), "detail: {}", check.detail);
     }
 
     #[test]
-    fn ports_available_fails_when_port_occupied() {
-        // Something is already bound to the HLS port (8888).
+    fn ports_available_fails_when_foreign_process_holds_port() {
+        // Finding D (b): a foreign process (nginx) is bound to the HLS port (8888).
         let exec = RecordingExecutor::new().with_stdout(
             "media-ports",
-            "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\ntcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:*\n",
+            "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n\
+             tcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:* users:((\"nginx\",pid=99,fd=6))\n",
         );
-        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
-        assert!(!check.passed);
-        assert!(check.detail.contains("8888"), "detail: {}", check.detail);
-        assert!(check.hint.is_some());
-    }
-
-    #[test]
-    fn ports_available_passes_when_managed_unit_already_active() {
-        // Finding A (redeploy-safe): the managed unit is already running, so its
-        // ports show as occupied — but the is-active gate treats that as a pass
-        // and never scans, so a 2nd+ `deploy up` is not aborted by a self-conflict.
-        let exec = RecordingExecutor::new()
-            .with_stdout("media-ports-isactive", "active\n")
-            // Even with every MediaMTX port "busy", the scan is skipped.
-            .with_stdout(
-                "media-ports",
-                "tcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:*\ntcp LISTEN 0 128 0.0.0.0:1935 0.0.0.0:*\n",
-            );
-        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
-        assert!(check.passed, "detail: {}", check.detail);
-        assert!(
-            check.detail.contains("already running"),
-            "detail: {}",
-            check.detail
-        );
-        // The strict `ss` scan must NOT have run — the is-active gate short-circuits.
-        assert_eq!(exec.labels(), vec!["media-ports-isactive"]);
-    }
-
-    #[test]
-    fn ports_available_still_fails_closed_on_foreign_listener_when_unit_inactive() {
-        // Finding A: with the managed unit INACTIVE, a foreign listener on a
-        // required port must still fail — the redeploy gate never weakens the
-        // genuine fresh-host conflict path.
-        let exec = RecordingExecutor::new()
-            .with_stdout("media-ports-isactive", "inactive\n")
-            .with_stdout(
-                "media-ports",
-                "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\ntcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:*\n",
-            );
         let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
         assert!(!check.passed, "detail: {}", check.detail);
         assert!(check.detail.contains("8888"), "detail: {}", check.detail);
+        assert!(check.detail.contains("another service"));
         assert!(check.hint.is_some());
-        // The scan ran after the is-active check reported a non-active state.
-        assert_eq!(exec.labels(), vec!["media-ports-isactive", "media-ports"]);
     }
 
     #[test]
-    fn ports_available_scans_when_is_active_errors_absent_unit() {
-        // An absent unit → `systemctl is-active` exits non-zero → transport error
-        // → the gate falls through to the strict scan (fail-closed preserved).
-        let exec = RecordingExecutor::failing_on("media-ports-isactive")
-            .with_stdout("media-ports", "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n");
+    fn ports_available_passes_when_our_mediamtx_owns_all_ports() {
+        // Finding D (a): every required port is held by OUR managed mediamtx (a
+        // same-port redeploy) — not a conflict, so the check passes and never
+        // aborts the 2nd+ `deploy up`.
+        let exec = RecordingExecutor::new().with_stdout(
+            "media-ports",
+            "tcp LISTEN 0 128 0.0.0.0:9997 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=3))\n\
+             tcp LISTEN 0 128 0.0.0.0:1935 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=4))\n\
+             tcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=5))\n\
+             tcp LISTEN 0 128 0.0.0.0:8889 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=6))\n\
+             tcp LISTEN 0 128 0.0.0.0:9996 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=7))\n\
+             udp UNCONN 0 0 0.0.0.0:8189 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=8))\n",
+        );
         let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
         assert!(check.passed, "detail: {}", check.detail);
-        assert_eq!(exec.labels(), vec!["media-ports-isactive", "media-ports"]);
+        assert!(
+            check.detail.contains("our own managed"),
+            "detail: {}",
+            check.detail
+        );
+        // No is-active gate anymore: only the single `ss` scan runs.
+        assert_eq!(exec.labels(), vec!["media-ports"]);
+    }
+
+    #[test]
+    fn ports_available_fails_when_changed_port_held_by_foreign_service() {
+        // Finding D core: a redeploy that MOVED the HLS port to 8080, where a
+        // foreign service is already bound. The old managed unit only held the old
+        // ports, so a process-aware scan of the NEW target port must still fail —
+        // exactly the case the removed is-active skip missed.
+        let cfg = MediaMtxHostConfig {
+            hls_port: 8080,
+            ..MediaMtxHostConfig::default()
+        };
+        let exec = RecordingExecutor::new().with_stdout(
+            "media-ports",
+            // Our mediamtx still holds its OTHER (unchanged) ports, but the
+            // newly-configured HLS port 8080 is held by a foreign nginx.
+            "tcp LISTEN 0 128 0.0.0.0:9997 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=3))\n\
+             tcp LISTEN 0 128 0.0.0.0:1935 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=4))\n\
+             tcp LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:((\"nginx\",pid=99,fd=6))\n",
+        );
+        let check = mediamtx_ports_available(&exec, &cfg);
+        assert!(!check.passed, "detail: {}", check.detail);
+        assert!(check.detail.contains("8080"), "detail: {}", check.detail);
+    }
+
+    #[test]
+    fn ports_available_fails_closed_on_unattributable_listener() {
+        // Finding D (e): a listener on a required port whose owner cannot be
+        // attributed (no `users:` column — e.g. insufficient privilege) is treated
+        // as a conflict, not assumed benign. Deploy runs as root so this is rare,
+        // but fail-closed is the safe default.
+        let exec = RecordingExecutor::new().with_stdout(
+            "media-ports",
+            "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n\
+             tcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:*\n",
+        );
+        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
+        assert!(!check.passed, "detail: {}", check.detail);
+        assert!(check.detail.contains("8888"), "detail: {}", check.detail);
     }
 
     #[test]
@@ -1281,7 +1390,10 @@ udp   UNCONN 0 0    *:8189        *:*
     fn collect_runs_all_three_checks_in_order() {
         let exec = RecordingExecutor::new()
             .with_stdout("media-ffmpeg-preflight", "ffmpeg version 6.1")
-            .with_stdout("media-ports", "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n");
+            .with_stdout(
+                "media-ports",
+                "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n",
+            );
         let checks =
             collect_media_doctor_checks(&exec, &MediaMtxHostConfig::default(), "/usr/bin/ffmpeg");
         assert_eq!(checks.len(), 3);
@@ -1291,9 +1403,8 @@ udp   UNCONN 0 0    *:8189        *:*
             vec![
                 "media-ffmpeg-preflight",
                 "media-recordings-dir",
-                // The ports check first consults `systemctl is-active` (the
-                // redeploy-safe gate) before the strict `ss` scan.
-                "media-ports-isactive",
+                // The ports check is a single process-aware `ss -tulnp` scan; the
+                // old `systemctl is-active` gate was removed (Finding D).
                 "media-ports"
             ]
         );
