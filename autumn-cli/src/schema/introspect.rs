@@ -1838,14 +1838,44 @@ mod sqlite {
         false
     }
 
-    /// Replace the CONTENTS (and delimiters) of `SQLite` string literals (`'…'`) and
-    /// quoted identifiers (`"…"`, `` `…` ``, `[…]`) with spaces, preserving all other
-    /// text positionally, so a keyword scan never matches inside a name or literal.
-    /// Doubled-delimiter escapes (`''`, `""`, ``` `` ```) keep the quote open. Pure.
+    /// Replace the CONTENTS (and delimiters) of `SQLite` string literals (`'…'`),
+    /// quoted identifiers (`"…"`, `` `…` ``, `[…]`), AND SQL comments (`-- …` to
+    /// end-of-line, `/* … */` block — `SQLite` preserves comments in
+    /// `sqlite_master.sql`) with spaces, preserving all other text positionally, so a
+    /// keyword scan never matches inside a name, literal, or comment. Doubled-delimiter
+    /// escapes (`''`, `""`, ``` `` ```) keep the quote open; block comments do not
+    /// nest (matching `SQLite`). Pure.
     fn neutralize_sqlite_literals_and_quoted_idents(sql: &str) -> String {
         let mut out = String::with_capacity(sql.len());
         let mut chars = sql.chars().peekable();
         while let Some(c) = chars.next() {
+            // `-- …` line comment → blank to end of line (the newline is preserved).
+            if c == '-' && chars.peek() == Some(&'-') {
+                out.push(' ');
+                while let Some(&n) = chars.peek() {
+                    if n == '\n' {
+                        break;
+                    }
+                    chars.next();
+                    out.push(' ');
+                }
+                continue;
+            }
+            // `/* … */` block comment (non-nesting) → blank through the closing `*/`.
+            if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                out.push(' ');
+                out.push(' ');
+                let mut prev_star = false;
+                for n in chars.by_ref() {
+                    out.push(' ');
+                    if prev_star && n == '/' {
+                        break;
+                    }
+                    prev_star = n == '*';
+                }
+                continue;
+            }
             let close = match c {
                 '\'' => Some('\''),
                 '"' => Some('"'),
@@ -2202,6 +2232,18 @@ mod sqlite {
             ));
             assert!(!table_sql_has_autoincrement_keyword(
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, [AUTOINCREMENT] TEXT)"
+            ));
+            // A block comment mentioning the keyword is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY /* AUTOINCREMENT */)"
+            ));
+            // A line comment mentioning the keyword is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY -- AUTOINCREMENT\n)"
+            ));
+            // A genuine keyword AFTER a block comment still matches.
+            assert!(table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER /* pk */ PRIMARY KEY AUTOINCREMENT)"
             ));
         }
 

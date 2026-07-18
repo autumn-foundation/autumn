@@ -905,6 +905,7 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
             SchemaChange::PrimaryKeyChange { .. }
             | SchemaChange::ForeignKeyChange { .. }
             | SchemaChange::IdentityChange { .. }
+            | SchemaChange::UniqueChange { .. }
             | SchemaChange::DropTableBlockedByInboundFk { .. }
             | SchemaChange::AlterColumnTypeBlockedByFk { .. }
             | SchemaChange::AddForeignKeyToExistingColumn { .. }

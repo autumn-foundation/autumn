@@ -350,6 +350,27 @@ pub enum SchemaChange {
         column: String,
     },
 
+    /// A same-named column whose single-column `UNIQUE` (the `Column.unique` flag)
+    /// changed between two authoritative introspections — e.g. the live database
+    /// dropped a `col TEXT UNIQUE` to a plain `col TEXT`. A non-emittable marker:
+    /// [`guard_plan`] refuses any plan containing it (with **no override**).
+    ///
+    /// It exists so a change to an inline single-column `UNIQUE` — which the `SQLite`
+    /// introspector folds into `Column.unique` (its constraint auto-index is
+    /// deliberately NOT recorded as an [`Index`], so the flag is the ONLY signal) —
+    /// surfaces as real drift in the introspection diff (doctor's
+    /// `database-schema-drift` and `pull --dry-run`) instead of being silently
+    /// ignored. It is produced **only** in an authoritative diff
+    /// (`definitions_authoritative`): in a model diff a `#[unique]` is expressed as an
+    /// [`Index`] (diffed by [`diff_indexes`]), not the column flag, so comparing the
+    /// flag there would double-count.
+    UniqueChange {
+        /// The owning table name.
+        table: String,
+        /// The column whose `UNIQUE` flag changed.
+        column: String,
+    },
+
     /// A managed table is dropped while a **retained** table still holds a
     /// baseline foreign key pointing at it (e.g. drop `users` while
     /// `posts.user_id REFERENCES users(id)` survives). A non-emittable marker:
@@ -529,6 +550,20 @@ pub enum DiffError {
         /// The owning table name.
         table: String,
         /// The column whose identity clause changed.
+        column: String,
+    },
+
+    /// A column's inline single-column `UNIQUE` (`Column.unique`) changed between two
+    /// authoritative introspections (unsupported this slice, **no override** — see
+    /// [`SchemaChange::UniqueChange`]).
+    #[error(
+        "unique-constraint change on `{table}.{column}` is not supported in this slice: \
+         adding or dropping an inline column `UNIQUE` requires a manual migration."
+    )]
+    UniqueChange {
+        /// The owning table name.
+        table: String,
+        /// The column whose `UNIQUE` flag changed.
         column: String,
     },
 
@@ -1258,6 +1293,20 @@ fn diff_column(
             column: want.name.clone(),
         });
     }
+
+    // Inline single-column `UNIQUE` (`Column.unique`): compared ONLY in an
+    // authoritative diff (both sides introspected). The SQLite introspector folds an
+    // inline `col TEXT UNIQUE` into this flag (its constraint auto-index is not
+    // recorded as an `Index`), so the flag is the ONLY drift signal there — without
+    // this, a live DB dropping the `UNIQUE` diffs clean in doctor / `pull --dry-run`.
+    // In a MODEL diff a `#[unique]` is expressed as an `Index` (handled by
+    // `diff_indexes`), not this flag, so comparing it there would double-count.
+    if opts.definitions_authoritative && base.unique != want.unique {
+        changes.push(SchemaChange::UniqueChange {
+            table: table.to_owned(),
+            column: want.name.clone(),
+        });
+    }
 }
 
 /// Diff a table's indexes by name. A same-named index whose shape changed is a
@@ -1466,6 +1515,43 @@ fn baseline_satisfies_desired_unique(base: &Table, want_idx: &Index) -> bool {
     want_idx.unique && baseline_unique_index_covers(base, &want_idx.columns)
 }
 
+/// The full (non-partial) unique KEY column set of `idx`, or `None` when `idx` is not
+/// a vouchable full-unique index (non-unique, partial, or an expression key with no
+/// recorded key columns). Mirrors the key resolution in
+/// [`baseline_unique_index_covers`].
+fn full_unique_key_columns(idx: &Index) -> Option<BTreeSet<&str>> {
+    if !idx.unique || idx.is_partial {
+        return None;
+    }
+    if !idx.key_columns.is_empty() {
+        Some(idx.key_columns.iter().map(String::as_str).collect())
+    } else if idx.definition.is_none() {
+        Some(idx.columns.iter().map(String::as_str).collect())
+    } else {
+        None
+    }
+}
+
+/// Whether a baseline-only index `base_idx` (in a MODEL diff) is the covering index
+/// for a desired `#[unique]` requirement whose own `AddIndex` was suppressed as
+/// already-satisfied — i.e. the SAME uniqueness enforced under a DIFFERENT name (a
+/// pulled `accounts_email_uq` vs the model's `idx_accounts_email_unique`). Such an
+/// index must be RETAINED: dropping it would remove the only enforcement while the
+/// model's matching `AddIndex` stays suppressed. The symmetric counterpart to
+/// [`baseline_satisfies_desired_unique`] (which suppresses the add side).
+fn base_index_covers_suppressed_model_unique(base: &Table, base_idx: &Index, want: &Table) -> bool {
+    let Some(base_key) = full_unique_key_columns(base_idx) else {
+        return false;
+    };
+    want.indexes.iter().any(|w| {
+        // A same-named desired index is matched by name (not suppressed by coverage),
+        // so only a DIFFERENTLY-named desired unique over the same key set counts.
+        w.unique
+            && !base.indexes.iter().any(|b| b.name == w.name)
+            && full_unique_key_columns(w).is_some_and(|wk| wk == base_key)
+    })
+}
+
 fn diff_indexes(
     table: &str,
     base: &Table,
@@ -1579,15 +1665,24 @@ fn diff_indexes(
             && dropped_columns
                 .iter()
                 .any(|c| index_depends_on_column(base_idx, c, backend));
-        // A baseline-only `definition` index has no same-named desired index, and
-        // in a model diff the desired side could not have expressed it anyway —
-        // retain it (never DropIndex), independent of `allow_destructive`. In an
-        // introspection diff it is authoritative, so a genuinely-dropped
-        // expression/partial index still drops.
-        if base_idx.definition.is_some()
-            && !opts.definitions_authoritative
+        // Retain (never DropIndex) — in a MODEL diff, and only when the index is not
+        // being orphaned by a SQLite column drop — when EITHER:
+        //   (a) it carries a `definition` the model DSL cannot express (an
+        //       expression/partial/constraint-owned index), OR
+        //   (b) it is a plain unique index that COVERS a model `#[unique]` whose own
+        //       `AddIndex` was suppressed as already-satisfied (the SAME uniqueness
+        //       under a different name — e.g. a pulled `accounts_email_uq` vs the
+        //       model's `idx_accounts_email_unique`). Dropping it would remove the
+        //       ONLY uniqueness enforcement with no replacement — a silent
+        //       data-integrity loss. This is the symmetric counterpart to the add
+        //       branch's `baseline_satisfies_desired_unique` suppression.
+        // In an introspection diff both sides are authoritative (indexes match by
+        // name), so neither retention applies and a genuinely-dropped index drops.
+        let retain = !opts.definitions_authoritative
             && !orphaned_by_column_drop
-        {
+            && (base_idx.definition.is_some()
+                || base_index_covers_suppressed_model_unique(base, base_idx, want));
+        if retain {
             continue;
         }
         changes.push(SchemaChange::DropIndex {
@@ -1674,9 +1769,9 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(DiffError::ForeignKeyChange { table, column });
     }
 
-    // 2a. Identity-generation change — no override (needs ADD/DROP/SET GENERATED,
-    //     out of scope this slice). Only produced by an authoritative diff.
-    if let Some(err) = find_identity_change_block(plan) {
+    // 2a / 2a'. Identity-generation and inline-UNIQUE changes — no override; both
+    //           are produced ONLY by an authoritative diff (drift detection).
+    if let Some(err) = find_identity_change_block(plan).or_else(|| find_unique_change_block(plan)) {
         return Err(err);
     }
 
@@ -1845,6 +1940,18 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
 fn find_identity_change_block(plan: &MigrationPlan) -> Option<DiffError> {
     plan.changes.iter().find_map(|c| match c {
         SchemaChange::IdentityChange { table, column } => Some(DiffError::IdentityChange {
+            table: table.clone(),
+            column: column.clone(),
+        }),
+        _ => None,
+    })
+}
+
+/// The [`DiffError::UniqueChange`] refusal for the first
+/// [`SchemaChange::UniqueChange`] marker in `plan`, if any.
+fn find_unique_change_block(plan: &MigrationPlan) -> Option<DiffError> {
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::UniqueChange { table, column } => Some(DiffError::UniqueChange {
             table: table.clone(),
             column: column.clone(),
         }),
@@ -2385,6 +2492,7 @@ const fn change_table_name(change: &SchemaChange) -> &str {
         | SchemaChange::PrimaryKeyChange { table }
         | SchemaChange::ForeignKeyChange { table, .. }
         | SchemaChange::IdentityChange { table, .. }
+        | SchemaChange::UniqueChange { table, .. }
         | SchemaChange::DropTableBlockedByInboundFk { table, .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { table, .. }
         | SchemaChange::AddForeignKeyToExistingColumn { table, .. }
@@ -3028,6 +3136,7 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
+        | SchemaChange::UniqueChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
         | SchemaChange::AddForeignKeyToExistingColumn { .. }
@@ -3115,6 +3224,7 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
+        | SchemaChange::UniqueChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
         | SchemaChange::AddForeignKeyToExistingColumn { .. }
@@ -3203,6 +3313,7 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
+        | SchemaChange::UniqueChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
         | SchemaChange::AddForeignKeyToExistingColumn { .. }
@@ -3569,6 +3680,9 @@ fn describe_change(change: &SchemaChange) -> String {
         SchemaChange::IdentityChange { table, column } => {
             format!("! IDENTITY CHANGE on {table}.{column} (refused)")
         }
+        SchemaChange::UniqueChange { table, column } => {
+            format!("! UNIQUE CHANGE on {table}.{column} (refused)")
+        }
         SchemaChange::DropTableBlockedByInboundFk {
             table,
             referencing_table,
@@ -3754,6 +3868,43 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, SchemaChange::IdentityChange { .. })),
             "model diff never flags an identity change: {:?}",
+            model.changes
+        );
+    }
+
+    /// P2 (authoritative Column.unique): a live DB dropping a single-column inline
+    /// `UNIQUE` (folded into `Column.unique`, with NO recorded Index) surfaces as
+    /// `UniqueChange` drift in the authoritative diff (doctor / pull --dry-run), but
+    /// is NOT flagged in a model diff (where `#[unique]` is an Index, not the flag).
+    #[test]
+    fn unique_flag_change_flagged_only_in_authoritative_diff() {
+        let mut base_email = col("email", ColumnType::Text);
+        base_email.unique = true; // snapshot: email is UNIQUE
+        let base = vec![posts_with(vec![base_email])];
+        let want_col = col("email", ColumnType::Text); // live: unique dropped
+        let want = posts_with(vec![want_col]);
+
+        let auth = diff_schema(&base, &parsed(vec![want.clone()], vec![]), AUTHORITATIVE);
+        assert!(
+            auth.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::UniqueChange { table, column } if table == "posts" && column == "email"
+            )),
+            "authoritative diff flags the dropped inline UNIQUE: {:?}",
+            auth.changes
+        );
+        assert!(matches!(
+            guard_plan(&auth, AUTHORITATIVE).unwrap_err(),
+            DiffError::UniqueChange { .. }
+        ));
+
+        let model = diff_schema(&base, &parsed(vec![want], vec![]), DEFAULT_OPTS);
+        assert!(
+            !model
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::UniqueChange { .. })),
+            "model diff never flags a Column.unique change: {:?}",
             model.changes
         );
     }
@@ -4036,6 +4187,77 @@ mod tests {
         assert!(
             guard_plan(&plan, DEFAULT_OPTS).is_ok(),
             "clean plan must not trip guard_plan"
+        );
+    }
+
+    /// P1 (retain covering unique): a baseline **definition-less** unique index under
+    /// a NON-model name (`accounts_email_uq`) that covers the model's `#[unique]`
+    /// (whose own `AddIndex` is suppressed as already-satisfied) must be RETAINED — a
+    /// `DropIndex` would remove the only uniqueness enforcement with no replacement.
+    /// The plan must be clean (no `DropIndex`, no `AddIndex`).
+    #[test]
+    fn model_diff_retains_differently_named_covering_unique_index() {
+        let covering = Index {
+            name: "accounts_email_uq".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None, // a plain CREATE UNIQUE INDEX, not a constraint index
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        let mut base_table = posts_with(vec![col("email", ColumnType::Text)]);
+        base_table.indexes.push(covering);
+        // Model `#[unique] email` → a differently-named unique index.
+        let mut want_table = posts_with(vec![col("email", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_email_unique".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert!(
+            plan.changes.is_empty(),
+            "a differently-named covering unique index is RETAINED and the model's \
+             matching AddIndex suppressed (same uniqueness, different name): {:?}",
+            plan.changes
+        );
+    }
+
+    /// The retention is coverage-scoped: a baseline unique index the model does NOT
+    /// cover (no matching `#[unique]`) still DROPS — the user removed the annotation.
+    #[test]
+    fn model_diff_unmatched_baseline_unique_index_still_drops() {
+        let orphan = Index {
+            name: "posts_nickname_uq".to_owned(),
+            columns: vec!["nickname".to_owned()],
+            unique: true,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        };
+        let mut base_table = posts_with(vec![col("nickname", ColumnType::Text)]);
+        base_table.indexes.push(orphan);
+        // Model keeps the column but declares NO `#[unique]` on it.
+        let want_table = posts_with(vec![col("nickname", ColumnType::Text)]);
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::DropIndex { index, .. } if index.name == "posts_nickname_uq"
+            )),
+            "an unmatched baseline unique index must still drop: {:?}",
+            plan.changes
         );
     }
 
