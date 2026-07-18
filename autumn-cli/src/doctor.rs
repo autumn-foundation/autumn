@@ -5945,21 +5945,32 @@ fn resolve_deploy_doctor_config(
     (deploy_cfg, None)
 }
 
-/// Strict-load guard mirroring what `autumn deploy check` does
+/// Load guard mirroring what `autumn deploy check` does
 /// (`deploy.rs::load_runtime_config`): attempt to load the full runtime
 /// [`autumn_web::config::AutumnConfig`] under the DEPLOY profile via the SAME
-/// `AutumnConfig::load_with_env` call, using the profile-forced env overlay
-/// (`deploy::deploy_profile_env_overlay`) the caller already built.
+/// `AutumnConfig::load_with_env_lenient_unknown_roots` call, using the
+/// profile-forced env overlay (`deploy::deploy_profile_env_overlay`) the caller
+/// already built.
 ///
 /// `run()`'s deploy value graders build the merged TOML table with
 /// [`get_merged_toml_table_runtime`], whose profile-override read swallows a
 /// parse/IO error with `.ok()` — so a MALFORMED or unreadable
 /// `autumn-<profile>.toml` override is silently DROPPED and doctor grades only
 /// the base values, PASSING `--strict`. `autumn deploy check`, by contrast,
-/// loads `AutumnConfig::load_with_env` under the deploy profile and FAILS on the
-/// same override. This guard closes that gap: when the deploy-profile load
-/// errors it returns a FAILING `deploy_config` check reporting the load error;
-/// when it succeeds it returns `None` and the existing value grading proceeds.
+/// loads the config under the deploy profile and FAILS on the same override.
+/// This guard closes that gap: when the deploy-profile load errors it returns a
+/// FAILING `deploy_config` check reporting the load error; when it succeeds it
+/// returns `None` and the existing value grading proceeds.
+///
+/// Lenient toward unknown top-level roots (#2063): as of the deploy CLI's move
+/// to `AutumnConfig::load_with_env_lenient_unknown_roots`
+/// (`deploy.rs::load_runtime_config`), `autumn deploy check`/`up` accept a
+/// plugin-owned top-level root (e.g. `[media]`) as opaque and defer to app boot.
+/// This guard MUST use the SAME lenient loader so `doctor --strict` and `deploy
+/// check` agree: a plugin root that passes `deploy check` no longer FAILS the
+/// doctor deploy-config check. Malformed TOML and typos inside a KNOWN/core
+/// section stay fatal in the lenient loader, so those still fail here exactly as
+/// they fail `deploy check`.
 ///
 /// Additive: on a well-formed, deployable config the load succeeds — that is
 /// exactly what lets `autumn deploy check` pass — so this never newly fails a
@@ -5968,7 +5979,7 @@ fn deploy_profile_config_load_check(
     deploy_profile_raw: &str,
     env: &dyn autumn_web::config::Env,
 ) -> Option<CheckResult> {
-    match autumn_web::config::AutumnConfig::load_with_env(env) {
+    match autumn_web::config::AutumnConfig::load_with_env_lenient_unknown_roots(env) {
         Ok(_) => None,
         Err(err) => Some(CheckResult {
             name: "deploy_config",
@@ -6376,16 +6387,20 @@ pub fn run(opts: DoctorOptions) {
                 Ok(e) => Box::new(e),
                 Err(_) => Box::new(autumn_web::config::OsEnv),
             };
-        // STRICT-LOAD GUARD (Codex review): the value graders below build
+        // LOAD GUARD (Codex review): the value graders below build
         // `merged_deploy_toml` via `get_merged_toml_table_runtime`, whose
         // profile-override read swallows a parse/IO error with `.ok()` — so a
         // MALFORMED or unreadable `autumn-<profile>.toml` override is silently
         // DROPPED and doctor would grade only the base values and PASS `--strict`,
-        // while `autumn deploy check` (which loads `AutumnConfig::load_with_env`
-        // under the deploy profile) FAILS on the same file. Mirror `deploy check`'s
-        // exact load here — through the SAME profile-forced `deploy_denv` overlay
-        // `load_runtime_config` uses — and surface any error as a failing
-        // `deploy_config` check so the two agree. On a well-formed (deployable)
+        // while `autumn deploy check` (which loads the config under the deploy
+        // profile) FAILS on the same file. Mirror `deploy check`'s exact load
+        // here — the SAME lenient loader
+        // (`AutumnConfig::load_with_env_lenient_unknown_roots`, #2063) through the
+        // SAME profile-forced `deploy_denv` overlay `load_runtime_config` uses —
+        // and surface any error as a failing `deploy_config` check so the two
+        // agree: a plugin-owned top-level root like `[media]` that passes `deploy
+        // check` no longer FAILS `doctor --strict`, while malformed TOML and
+        // known-section typos stay fatal in both. On a well-formed (deployable)
         // config the load succeeds, so this never newly fails a valid override;
         // the existing value grading below proceeds unchanged.
         if let Some(check) =
@@ -15400,8 +15415,8 @@ redirect_uri = "http://localhost/callback"
     /// `get_merged_toml_table_runtime`, whose profile-override read uses `.ok()`,
     /// so a MALFORMED `autumn-<profile>.toml` is silently dropped — doctor would
     /// then grade only the base values and PASS `--strict`, while `autumn deploy
-    /// check` (which loads `AutumnConfig::load_with_env` under the deploy profile)
-    /// FAILS on the same file. `deploy_profile_config_load_check` closes that gap:
+    /// check` (which loads the config under the deploy profile) FAILS on the same
+    /// file. `deploy_profile_config_load_check` closes that gap:
     /// a malformed deploy-profile override FAILS the `deploy_config` check; a
     /// well-formed one does NOT newly fail. Uses an `AUTUMN_MANIFEST_DIR`-scoped
     /// `MockEnv` (the same mechanism the runtime's own config tests use) so
@@ -15460,6 +15475,61 @@ redirect_uri = "http://localhost/callback"
         assert!(
             deploy_profile_config_load_check("prod", &env).is_none(),
             "a well-formed autumn-prod.toml must not newly fail the deploy_config check"
+        );
+    }
+
+    /// Codex review (P2, #2067): the deploy CLI now loads config leniently toward
+    /// unknown top-level roots (`deploy.rs::load_runtime_config` uses
+    /// `AutumnConfig::load_with_env_lenient_unknown_roots`), so `autumn deploy
+    /// check`/`up` accept a plugin-owned root like `[media]` under `strict_config`
+    /// and defer to app boot. `deploy_profile_config_load_check` must mirror that
+    /// SAME lenient loader, or `doctor --strict` would turn the very config
+    /// `deploy check` passes into a FAILING `deploy_config` check — the two
+    /// deploy workflows disagreeing. This asserts a `[media]` + `strict_config`
+    /// project does NOT fail the doctor deploy-config guard, while a typo inside a
+    /// KNOWN section (`[database] primry_url`) still FAILS it (leniency is scoped
+    /// to unknown top-level roots only, matching the loader-level guarantee).
+    #[test]
+    fn plugin_owned_root_does_not_fail_deploy_config_load_check_but_known_typo_does() {
+        use autumn_web::config::MockEnv;
+        let dir = tempfile::tempdir().unwrap();
+        // `[deploy] profile = "prod"`, `strict_config` on, plus a plugin-owned
+        // `[media]` top-level root the CLI cannot know about — exactly the case
+        // #2067 made lenient for `autumn deploy check`.
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nstrict_config = true\n\n\
+             [deploy]\nhost = \"deploy.example.com\"\nprofile = \"prod\"\n\n\
+             [media]\nmediamtx_host = \"cdn.example\"\n",
+        )
+        .unwrap();
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap())
+            .with("AUTUMN_ENV", "prod");
+
+        // The plugin root must NOT fail the doctor deploy-config guard — this is
+        // the config `autumn deploy check` passes, so `doctor --strict` must agree.
+        assert!(
+            deploy_profile_config_load_check("prod", &env).is_none(),
+            "a plugin-owned [media] top-level root under strict_config must not fail \
+             the deploy_config load check (it passes `autumn deploy check`)"
+        );
+
+        // But a typo INSIDE a known/core section stays fatal in the lenient loader,
+        // so the doctor guard still FAILS it — exactly as `autumn deploy check` does.
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nstrict_config = true\n\n\
+             [deploy]\nhost = \"deploy.example.com\"\nprofile = \"prod\"\n\n\
+             [database]\nprimry_url = \"postgres://localhost/db\"\n",
+        )
+        .unwrap();
+        let check = deploy_profile_config_load_check("prod", &env)
+            .expect("a known-section typo must still fail the deploy_config load check");
+        assert_eq!(check.name, "deploy_config");
+        assert!(
+            matches!(check.status, CheckStatus::Fail),
+            "the known-section typo must FAIL, not pass"
         );
     }
 
