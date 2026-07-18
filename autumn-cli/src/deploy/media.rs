@@ -21,8 +21,8 @@
 //!   renders the `/etc/systemd/system/<unit>.service` unit — both pure, so the
 //!   exact rendered text is unit-testable.
 //! - [`MediaMtxController::ensure_installed_ops`] emits the ordered
-//!   [`DeployOp`]s (write the yml, write the unit, `daemon-reload && enable
-//!   --now && restart`) driven over the injectable
+//!   [`DeployOp`]s (mkdir the config dir, write the yml, write the unit,
+//!   `daemon-reload && enable --now && restart`) driven over the injectable
 //!   [`DeployExecutor`](super::exec::DeployExecutor), so the remote command
 //!   sequence is assertable against a recording fake with no live host. It
 //!   no-ops (empty op vector) when the section is not `enabled`.
@@ -413,6 +413,24 @@ pub fn render_mediamtx_unit(cfg: &MediaMtxHostConfig) -> String {
     )
 }
 
+/// The parent directory of a remote unix path — everything before the last `/`,
+/// or `None` when the path has no parent segment (a bare filename, or a
+/// root-level path whose parent `/` always exists).
+///
+/// Used to `mkdir -p` a config file's directory before `scp` writes into it:
+/// [`super::exec::SshExecutor::upload`] shells out to `scp`, which does **not**
+/// create missing parent directories, so the default
+/// `config_path = /etc/mediamtx/mediamtx.yml` would otherwise fail at
+/// `media-write-config` on the first deploy (the `/etc/mediamtx` dir does not
+/// exist on a fresh host). Pure — unit-tested.
+#[must_use]
+fn parent_dir(path: &str) -> Option<&str> {
+    match path.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => Some(parent),
+        _ => None,
+    }
+}
+
 /// Provisions `MediaMTX` as a host systemd unit, modeled on
 /// [`super::proxy::KamalProxyController`].
 ///
@@ -444,10 +462,15 @@ impl MediaMtxController {
     /// Returns an **empty vector when the section is not `enabled`** — the
     /// controller is a no-op for an app that does not provision `MediaMTX`. When
     /// enabled it emits, in order:
-    /// 1. `WriteFile` the rendered `mediamtx.yml` to `config_path` (mode `0644`).
-    /// 2. `WriteFile` the rendered unit to `/etc/systemd/system/<unit>.service`
+    /// 1. `Run` `mkdir -p <config parent dir>` — `scp` (the upload transport)
+    ///    does not create parents, so the config dir must exist before op 2
+    ///    writes into it (omitted only for a parent-less `config_path`). The
+    ///    unit's parent (`/etc/systemd/system`) is a standard existing dir and
+    ///    needs no `mkdir`.
+    /// 2. `WriteFile` the rendered `mediamtx.yml` to `config_path` (mode `0644`).
+    /// 3. `WriteFile` the rendered unit to `/etc/systemd/system/<unit>.service`
     ///    (mode `0644`).
-    /// 3. `Run` `systemctl daemon-reload && systemctl enable --now <unit>.service
+    /// 4. `Run` `systemctl daemon-reload && systemctl enable --now <unit>.service
     ///    && systemctl restart <unit>.service` — idempotent, and the trailing
     ///    `restart` reloads the freshly-written config on a redeploy.
     #[must_use]
@@ -456,27 +479,37 @@ impl MediaMtxController {
             return Vec::new();
         }
         let unit = self.cfg.unit_name.clone();
-        vec![
-            DeployOp::WriteFile {
-                label: "media-write-config",
-                contents: FileContents::Plain(render_mediamtx_yml(&self.cfg)),
-                remote_path: self.cfg.config_path.clone(),
-                mode: Some(0o644),
-            },
-            DeployOp::WriteFile {
-                label: "media-write-unit",
-                contents: FileContents::Plain(render_mediamtx_unit(&self.cfg)),
-                remote_path: self.unit_path(),
-                mode: Some(0o644),
-            },
-            DeployOp::Run(RemoteCommand::new(
-                "media-install",
-                format!(
-                    "systemctl daemon-reload && systemctl enable --now {unit}.service && \
-                     systemctl restart {unit}.service",
-                ),
-            )),
-        ]
+        let mut ops = Vec::new();
+        // Create the config's parent dir before scp writes the file into it —
+        // `scp` never creates missing parents, so the default
+        // `/etc/mediamtx/mediamtx.yml` would fail at `media-write-config` on a
+        // fresh host without this. Skipped for a parent-less path (root/bare).
+        if let Some(parent) = parent_dir(&self.cfg.config_path) {
+            ops.push(DeployOp::Run(RemoteCommand::new(
+                "media-prepare-dirs",
+                format!("mkdir -p {}", super::exec::shell_quote(parent)),
+            )));
+        }
+        ops.push(DeployOp::WriteFile {
+            label: "media-write-config",
+            contents: FileContents::Plain(render_mediamtx_yml(&self.cfg)),
+            remote_path: self.cfg.config_path.clone(),
+            mode: Some(0o644),
+        });
+        ops.push(DeployOp::WriteFile {
+            label: "media-write-unit",
+            contents: FileContents::Plain(render_mediamtx_unit(&self.cfg)),
+            remote_path: self.unit_path(),
+            mode: Some(0o644),
+        });
+        ops.push(DeployOp::Run(RemoteCommand::new(
+            "media-install",
+            format!(
+                "systemctl daemon-reload && systemctl enable --now {unit}.service && \
+                 systemctl restart {unit}.service",
+            ),
+        )));
+        ops
     }
 }
 
@@ -612,19 +645,47 @@ fn parse_listening_ports(ss_output: &str) -> BTreeSet<u16> {
 /// Grade that the `MediaMTX` ports are free on the host (no conflicting service is
 /// already bound to them).
 ///
-/// Runs `ss -H -tuln` over the executor and parses the listening TCP/UDP ports.
-/// Reports a clear failure listing any required port already in use. Fail-closed:
-/// if `ss` cannot run, or its output does not parse into any recognizable ports,
-/// the check fails with a "could not verify" message rather than passing blind.
+/// **Redeploy-safe:** first consults `systemctl is-active <unit>.service`. When the
+/// managed `MediaMTX` unit is already `active`, the required ports are legitimately
+/// held by *our own* service, so the check passes with an informational note and
+/// skips the scan — otherwise the 2nd+ `deploy up` would abort on a self-conflict
+/// even though the service is healthy. Only a literal `active` counts; any other
+/// state (inactive / failed / activating, or an absent unit → non-zero exit →
+/// transport error) falls through to the strict scan below.
 ///
-/// Note: if `MediaMTX` is already running under this unit, its own ports show as
-/// occupied and this reports them as conflicts — run this check before enabling
-/// the unit (or expect a self-conflict once it is live).
+/// On a fresh host (unit inactive/absent) it runs `ss -H -tuln` over the executor
+/// and parses the listening TCP/UDP ports, reporting a clear failure listing any
+/// required port already in use by a **foreign** service. Fail-closed: if `ss`
+/// cannot run, or its output does not parse into any recognizable ports, the check
+/// fails with a "could not verify" message rather than passing blind.
 #[must_use]
 pub fn mediamtx_ports_available(
     exec: &impl DeployExecutor,
     cfg: &MediaMtxHostConfig,
 ) -> PreflightCheck {
+    // Redeploy-safe gate: a managed unit that is already `active` holds these
+    // ports itself, so treat that as a pass and skip the strict scan. Self-
+    // contained (one extra command over the same executor) so it stays correct on
+    // both the `deploy up` and any doctor path.
+    let unit = format!("{}.service", cfg.unit_name);
+    let is_active = RemoteCommand::new(
+        "media-ports-isactive",
+        format!("systemctl is-active {}", super::exec::shell_quote(&unit)),
+    );
+    if let Ok(out) = exec.run(&is_active)
+        && out.stdout.trim() == "active"
+    {
+        return PreflightCheck {
+            name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
+            passed: true,
+            detail: format!(
+                "managed MediaMTX unit `{unit}` is already running; its ports are held by \
+                 our own service — skipping port-conflict scan"
+            ),
+            hint: None,
+        };
+    }
+
     let cmd = RemoteCommand::new("media-ports", "ss -H -tuln".to_owned());
     let output = match exec.run(&cmd) {
         Ok(out) => out.stdout,
@@ -929,10 +990,17 @@ unit_name = \"mediamtx-prod\"
         };
         let controller = MediaMtxController::new(cfg);
         let ops = controller.ensure_installed_ops();
-        assert_eq!(ops.len(), 3);
+        assert_eq!(ops.len(), 4);
 
-        // op 0: write mediamtx.yml to config_path (0644), with rendered config.
-        match &ops[0] {
+        // op 0: mkdir -p the config's parent dir BEFORE scp writes into it.
+        let DeployOp::Run(mkdir) = &ops[0] else {
+            panic!("op 0 must be the mkdir Run op, got {:?}", ops[0]);
+        };
+        assert_eq!(mkdir.label, "media-prepare-dirs");
+        assert_eq!(mkdir.shell, "mkdir -p '/etc/mediamtx'");
+
+        // op 1: write mediamtx.yml to config_path (0644), with rendered config.
+        match &ops[1] {
             DeployOp::WriteFile {
                 label,
                 contents,
@@ -947,11 +1015,11 @@ unit_name = \"mediamtx-prod\"
                 };
                 assert!(yml.contains("~^room/.+$:"));
             }
-            other => panic!("op 0 must write the config, got {other:?}"),
+            other => panic!("op 1 must write the config, got {other:?}"),
         }
 
-        // op 1: write the unit to /etc/systemd/system/mediamtx.service (0644).
-        match &ops[1] {
+        // op 2: write the unit to /etc/systemd/system/mediamtx.service (0644).
+        match &ops[2] {
             DeployOp::WriteFile {
                 label,
                 contents,
@@ -966,12 +1034,12 @@ unit_name = \"mediamtx-prod\"
                 };
                 assert!(unit.contains("ExecStart=/usr/local/bin/mediamtx"));
             }
-            other => panic!("op 1 must write the unit, got {other:?}"),
+            other => panic!("op 2 must write the unit, got {other:?}"),
         }
 
-        // op 2: daemon-reload + enable --now + restart.
-        let DeployOp::Run(cmd) = &ops[2] else {
-            panic!("op 2 must be the install Run op");
+        // op 3: daemon-reload + enable --now + restart.
+        let DeployOp::Run(cmd) = &ops[3] else {
+            panic!("op 3 must be the install Run op");
         };
         assert_eq!(cmd.label, "media-install");
         assert_eq!(
@@ -994,11 +1062,54 @@ unit_name = \"mediamtx-prod\"
             "/etc/systemd/system/mediamtx-prod.service"
         );
         let ops = controller.ensure_installed_ops();
-        let DeployOp::Run(cmd) = &ops[2] else {
-            panic!("op 2 must be the install Run op");
+        let DeployOp::Run(cmd) = &ops[3] else {
+            panic!("op 3 must be the install Run op");
         };
         assert!(cmd.shell.contains("enable --now mediamtx-prod.service"));
         assert!(cmd.shell.contains("restart mediamtx-prod.service"));
+    }
+
+    #[test]
+    fn controller_mkdirs_config_parent_before_writing_config() {
+        // Finding B: `scp` never creates parent dirs, so a `mkdir -p` of the
+        // config's parent must precede the `media-write-config` upload.
+        let cfg = MediaMtxHostConfig {
+            enabled: true,
+            config_path: "/opt/media/etc/mediamtx.yml".to_owned(),
+            ..MediaMtxHostConfig::default()
+        };
+        let ops = MediaMtxController::new(cfg).ensure_installed_ops();
+
+        let mkdir_idx = ops
+            .iter()
+            .position(|op| op.label() == "media-prepare-dirs")
+            .expect("a media-prepare-dirs op must be emitted");
+        let write_idx = ops
+            .iter()
+            .position(|op| op.label() == "media-write-config")
+            .expect("a media-write-config op must be emitted");
+        assert!(
+            mkdir_idx < write_idx,
+            "mkdir must precede the config write (mkdir at {mkdir_idx}, write at {write_idx})"
+        );
+
+        let DeployOp::Run(mkdir) = &ops[mkdir_idx] else {
+            panic!("media-prepare-dirs must be a Run op");
+        };
+        // The parent is derived from `config_path`, not hardcoded (shell-quoted).
+        assert_eq!(mkdir.shell, "mkdir -p '/opt/media/etc'");
+    }
+
+    #[test]
+    fn parent_dir_extracts_parent_or_none() {
+        assert_eq!(
+            parent_dir("/etc/mediamtx/mediamtx.yml"),
+            Some("/etc/mediamtx")
+        );
+        assert_eq!(parent_dir("/opt/a/b/c.yml"), Some("/opt/a/b"));
+        // Root-level and bare-filename paths have no parent to create.
+        assert_eq!(parent_dir("/mediamtx.yml"), None);
+        assert_eq!(parent_dir("mediamtx.yml"), None);
     }
 
     // ── Doctor: ffmpeg preflight ─────────────────────────────────────────────
@@ -1096,6 +1207,59 @@ udp   UNCONN 0 0    *:8189        *:*
     }
 
     #[test]
+    fn ports_available_passes_when_managed_unit_already_active() {
+        // Finding A (redeploy-safe): the managed unit is already running, so its
+        // ports show as occupied — but the is-active gate treats that as a pass
+        // and never scans, so a 2nd+ `deploy up` is not aborted by a self-conflict.
+        let exec = RecordingExecutor::new()
+            .with_stdout("media-ports-isactive", "active\n")
+            // Even with every MediaMTX port "busy", the scan is skipped.
+            .with_stdout(
+                "media-ports",
+                "tcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:*\ntcp LISTEN 0 128 0.0.0.0:1935 0.0.0.0:*\n",
+            );
+        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
+        assert!(check.passed, "detail: {}", check.detail);
+        assert!(
+            check.detail.contains("already running"),
+            "detail: {}",
+            check.detail
+        );
+        // The strict `ss` scan must NOT have run — the is-active gate short-circuits.
+        assert_eq!(exec.labels(), vec!["media-ports-isactive"]);
+    }
+
+    #[test]
+    fn ports_available_still_fails_closed_on_foreign_listener_when_unit_inactive() {
+        // Finding A: with the managed unit INACTIVE, a foreign listener on a
+        // required port must still fail — the redeploy gate never weakens the
+        // genuine fresh-host conflict path.
+        let exec = RecordingExecutor::new()
+            .with_stdout("media-ports-isactive", "inactive\n")
+            .with_stdout(
+                "media-ports",
+                "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\ntcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:*\n",
+            );
+        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
+        assert!(!check.passed, "detail: {}", check.detail);
+        assert!(check.detail.contains("8888"), "detail: {}", check.detail);
+        assert!(check.hint.is_some());
+        // The scan ran after the is-active check reported a non-active state.
+        assert_eq!(exec.labels(), vec!["media-ports-isactive", "media-ports"]);
+    }
+
+    #[test]
+    fn ports_available_scans_when_is_active_errors_absent_unit() {
+        // An absent unit → `systemctl is-active` exits non-zero → transport error
+        // → the gate falls through to the strict scan (fail-closed preserved).
+        let exec = RecordingExecutor::failing_on("media-ports-isactive")
+            .with_stdout("media-ports", "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n");
+        let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
+        assert!(check.passed, "detail: {}", check.detail);
+        assert_eq!(exec.labels(), vec!["media-ports-isactive", "media-ports"]);
+    }
+
+    #[test]
     fn ports_available_fails_closed_when_ss_errors() {
         let exec = RecordingExecutor::failing_on("media-ports");
         let check = mediamtx_ports_available(&exec, &MediaMtxHostConfig::default());
@@ -1127,6 +1291,9 @@ udp   UNCONN 0 0    *:8189        *:*
             vec![
                 "media-ffmpeg-preflight",
                 "media-recordings-dir",
+                // The ports check first consults `systemctl is-active` (the
+                // redeploy-safe gate) before the strict `ss` scan.
+                "media-ports-isactive",
                 "media-ports"
             ]
         );
