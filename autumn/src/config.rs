@@ -3359,16 +3359,40 @@ impl AutumnConfig {
         let mut warn_only = Vec::new();
         let mut opaque_roots = Vec::new();
         for (path, sug, schema_parent) in errors {
-            // Deploy-CLI leniency (#2063): a genuinely-unknown TOP-LEVEL root
-            // (its schema parent is the document root `""`) is accepted as
-            // opaque rather than failing — it is almost certainly a
-            // plugin-owned config table (e.g. `[media]`) the CLI structurally
-            // cannot know about, and app boot stays the strict gate for it.
-            // ONLY the root is spared: an unknown key inside a KNOWN section
-            // (schema_parent != "") falls through to its normal classification
-            // below, so a `[database] primry_url` typo still hard-fails. The
+            // Deploy-CLI leniency (#2063/#2067): a genuinely-unknown TRUE
+            // top-level root — one sitting directly at the document root, i.e.
+            // whose ACTUAL path is a bare root key (no `profile.<name>` prefix)
+            // AND whose schema parent is the document root `""` — is accepted as
+            // opaque rather than failing. It is almost certainly a plugin-owned
+            // config table (e.g. `[media]`) the CLI structurally cannot know
+            // about, and app boot stays the strict gate for it.
+            //
+            // The gate is on the ACTUAL PATH being a true top-level root, NOT
+            // merely on `schema_parent.is_empty()`: `validate_toml_detailed`
+            // reports an EMPTY schema parent for a profile-prefixed section like
+            // `[profile.prod.media]` too (the profile prefix is stripped before
+            // root-schema validation, so `[profile.prod.media]` and top-level
+            // `[media]` both surface with schema parent `""` but distinct paths
+            // `"profile.prod.media"` vs `"media"`). Gating on the empty schema
+            // parent alone would wrongly soften a profile-prefixed plugin root
+            // and let `deploy check`/`up` pass — yet the deployed app, whose
+            // `config_section` seam (#2061) exempts ONLY the TRUE top-level
+            // `[media]` via `path.is_empty()`, still REJECTS `[profile.prod.media]`
+            // at boot. Requiring `!path.contains('.')` here mirrors that
+            // `path.is_empty()` exemption, so deploy and app boot AGREE: both
+            // accept top-level `[media]`, both reject `[profile.prod.media]`.
+            //
+            // A profile-prefixed root therefore no longer matches this branch
+            // and falls through to the normal (hard, since schema_parent `""` ∈
+            // PRE_1890_STRICT_PARENTS) classification below → strict rejection at
+            // deploy, matching app boot. ONLY a true root is spared: an unknown
+            // key inside a KNOWN section (schema_parent != "") also falls
+            // through, so a `[database] primry_url` typo still hard-fails. The
             // app-boot path passes `Strict`, so its behavior is unchanged.
-            if root_policy == UnknownRootPolicy::LenientWarn && schema_parent.is_empty() {
+            if root_policy == UnknownRootPolicy::LenientWarn
+                && schema_parent.is_empty()
+                && !path.contains('.')
+            {
                 opaque_roots.push(path);
                 continue;
             }
@@ -8271,6 +8295,65 @@ mod tests {
         assert!(
             AutumnConfig::load_with_env_lenient_unknown_roots(&env).is_err(),
             "malformed TOML must still fail under the lenient CLI load"
+        );
+    }
+
+    // #2067: the lenient deploy-CLI load must NOT soften a PROFILE-PREFIXED
+    // unknown root like `[profile.prod.media]`. Its schema parent is empty
+    // (the profile prefix is stripped before root-schema validation), but its
+    // actual path (`profile.prod.media`) is not a true top-level root — so it
+    // stays strict and hard-fails, exactly as the deployed app rejects it at
+    // boot (the `config_section` seam exempts ONLY the true top-level `[media]`
+    // via `path.is_empty()`). Otherwise deploy would pass while remote boot
+    // fails.
+    #[test]
+    fn deploy_cli_lenient_still_rejects_profile_prefixed_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[server]\nstrict_config = true\n\n[profile.prod.media]\nmediamtx_host = \"cdn.example\"\n",
+        )
+        .unwrap();
+        let env = strict_prod_env_2063(temp.path());
+
+        let res = AutumnConfig::load_with_env_lenient_unknown_roots(&env);
+        assert!(
+            res.is_err(),
+            "a profile-prefixed root ([profile.prod.media]) must stay strict under \
+             the lenient CLI load — it is not a true top-level root and the deployed \
+             app rejects it at boot: {res:?}"
+        );
+        let err = format!("{:?}", res.err().unwrap());
+        assert!(
+            err.contains("media"),
+            "error should name the profile-prefixed root: {err}"
+        );
+    }
+
+    // #2067: the profile-prefix strictness is not media-specific — a
+    // profile-prefixed genuinely-unknown NON-plugin root
+    // (`[profile.prod.definitely_unknown]`) also stays a hard error under the
+    // lenient CLI load; only TRUE top-level roots are ever softened.
+    #[test]
+    fn deploy_cli_lenient_still_rejects_profile_prefixed_unknown_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[server]\nstrict_config = true\n\n[profile.prod.definitely_unknown]\nx = 1\n",
+        )
+        .unwrap();
+        let env = strict_prod_env_2063(temp.path());
+
+        let res = AutumnConfig::load_with_env_lenient_unknown_roots(&env);
+        assert!(
+            res.is_err(),
+            "a profile-prefixed unknown root must stay strict under the lenient CLI \
+             load: {res:?}"
+        );
+        let err = format!("{:?}", res.err().unwrap());
+        assert!(
+            err.contains("definitely_unknown"),
+            "error should name the profile-prefixed unknown root: {err}"
         );
     }
 
