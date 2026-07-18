@@ -389,9 +389,10 @@ fn run_snapshot(
 /// `--backend` override) — mirrors `schema migrate` / `schema doctor`, so the
 /// three commands can never derive the backend inconsistently for one profile.
 ///
-/// Postgres only in this slice: a resolved `SQLite` backend is refused loudly (no
-/// partial support, no partial write). Before writing, a **provider-lock** guard
-/// refuses to clobber an existing snapshot tagged for another backend.
+/// Both backends are supported: a resolved `SQLite` backend introspects via
+/// [`introspect::introspect_sqlite`] on the `sqlite` build (and is refused loudly on
+/// a default Postgres-only build). Before writing, a **provider-lock** guard refuses
+/// to clobber an existing snapshot tagged for another backend.
 fn run_pull(
     profile: Option<&str>,
     out: Option<&Path>,
@@ -430,16 +431,6 @@ fn pull_at(
         Backend::from,
     );
 
-    // SQLite introspection is a future slice of #1975 — fail loud, never partial.
-    if backend == Backend::Sqlite {
-        return Err(
-            "`autumn schema pull` currently supports Postgres only — SQLite database \
-             introspection is a future slice of the declarative-schema work (#1975). No \
-             snapshot was written."
-                .to_string(),
-        );
-    }
-
     let out_path = out.map_or_else(
         || project_root.join(SNAPSHOT_DEFAULT_PATH),
         Path::to_path_buf,
@@ -464,8 +455,26 @@ fn pull_at(
         ));
     }
 
-    // Introspect the live database into the IR.
-    let tables = introspect::introspect_postgres(&url).map_err(|e| e.to_string())?;
+    // Introspect the live database into the IR, dispatching on the resolved
+    // backend. Each arm references only its own connection type — the SQLite arm is
+    // compiled only under the `sqlite` backend-flip (see `introspect_sqlite`); a
+    // default (Postgres) build that somehow resolves a SQLite backend fails loudly
+    // rather than silently mis-introspecting.
+    let tables = match backend {
+        Backend::Postgres => introspect::introspect_postgres(&url).map_err(|e| e.to_string())?,
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => introspect::introspect_sqlite(&url).map_err(|e| e.to_string())?,
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite => {
+            return Err(
+                "`autumn schema pull` detected a SQLite backend, but this CLI build targets \
+                 Postgres only. Rebuild with `--features sqlite` to introspect a SQLite \
+                 database (the sqlite backend-flip must never be co-built with the default \
+                 Postgres backend). No snapshot was written."
+                    .to_string(),
+            );
+        }
+    };
     let snapshot = SchemaSnapshot::new(backend, tables);
 
     if dry_run {
@@ -1062,7 +1071,7 @@ mod tests {
     {{
       "name": "posts",
       "columns": [
-        {{ "name": "id", "ty": "Int64", "nullable": false, "primary_key": true, "unique": false, "default": null, "references": null }},
+        {{ "name": "id", "ty": "Int64", "nullable": false, "primary_key": true, "unique": false, "default": null, "references": null, "serial": "BigSerial" }},
         {{ "name": "title", "ty": "Text", "nullable": false, "primary_key": false, "unique": false, "default": null, "references": null }},
         {{ "name": "created_at", "ty": "Timestamp", "nullable": false, "primary_key": false, "unique": false, "default": "Now", "references": null }}
       ],

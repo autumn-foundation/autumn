@@ -20,8 +20,11 @@
 //!
 //! The pending-migrations check is Postgres-specific (it consumes the pg
 //! `pending_migrations` status API). A non-Postgres backend is reported as a
-//! skipped WARN rather than failing — doctor references no `SQLite` symbol and so
-//! compiles identically with or without the `sqlite` feature.
+//! skipped WARN rather than failing. The database-schema-drift check introspects
+//! the live database: on a default (Postgres-only) build a `SQLite` backend is
+//! skipped, while a `--features sqlite` build additionally references
+//! [`introspect_sqlite`](super::introspect::introspect_sqlite) so it can diff a live
+//! `SQLite` database too.
 
 use std::path::Path;
 
@@ -31,6 +34,8 @@ use serde::Serialize;
 
 use super::diff::{DiffOptions, MigrationPlan, diff_schema};
 use super::introspect::introspect_postgres;
+#[cfg(feature = "sqlite")]
+use super::introspect::introspect_sqlite;
 use super::parse::{ParsedSchema, parse_models_path};
 use super::snapshot::{SNAPSHOT_DEFAULT_PATH, SnapshotError, load_snapshot};
 
@@ -112,7 +117,12 @@ enum PendingState {
 enum DbSchemaState {
     /// No database URL is configured — the check is skipped.
     NotConfigured,
-    /// The backend/build cannot run this check (e.g. non-Postgres backend).
+    /// The backend/build cannot run this check (a `SQLite` backend on a default
+    /// Postgres-only build). Constructed only off the `sqlite` lane — on a `sqlite`
+    /// build both backends introspect, so this state is unreachable there (the
+    /// variant stays part of the type's vocabulary and is still matched in the check
+    /// renderer).
+    #[cfg_attr(feature = "sqlite", allow(dead_code))]
     Skipped(String),
     /// No readable snapshot baseline to diff the database against.
     SnapshotMissing,
@@ -280,9 +290,10 @@ fn probe_pending(url: &str, migrations_dir: &Path) -> PendingState {
 /// Probe the live database schema and diff it against the checked-in snapshot.
 ///
 /// Offline-safe by construction (mirrors [`gather_pending`]): no URL →
-/// [`DbSchemaState::NotConfigured`]; a non-Postgres backend →
-/// [`DbSchemaState::Skipped`] (introspection is Postgres-only in this slice); a
-/// missing/unreadable snapshot → [`DbSchemaState::SnapshotMissing`]; a
+/// [`DbSchemaState::NotConfigured`]; a `SQLite` backend on a default (Postgres-only)
+/// build → [`DbSchemaState::Skipped`] (the `SQLite` introspector is compiled only under
+/// the `sqlite` feature); a missing/unreadable snapshot →
+/// [`DbSchemaState::SnapshotMissing`]; a
 /// connect/query failure → [`DbSchemaState::Unreachable`] (a WARN, never an
 /// error — doctor must stay runnable offline). Only when all of those pass does
 /// it diff the introspected tables (desired) against the snapshot tables
@@ -295,19 +306,39 @@ fn gather_db_schema_drift(
     let Some(url) = crate::migrate::resolve_primary_url(profile) else {
         return DbSchemaState::NotConfigured;
     };
-    if local.detected_backend != Backend::Postgres {
-        return DbSchemaState::Skipped(format!(
-            "database-schema drift check is Postgres-only; detected {:?} backend",
+    match local.detected_backend {
+        Backend::Postgres => gather_db_schema_drift_with(project_root, &url, introspect_postgres),
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => gather_db_schema_drift_with(project_root, &url, introspect_sqlite),
+        // On a default (Postgres-only) build the SQLite arm is not compiled, so a
+        // SQLite backend is skipped rather than failing doctor — introspection is
+        // Postgres-only on this build.
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite => DbSchemaState::Skipped(format!(
+            "database-schema drift check is Postgres-only on this build; detected {:?} backend \
+             (rebuild with `--features sqlite` to check SQLite drift)",
             local.detected_backend
-        ));
+        )),
     }
+}
+
+/// Reload the snapshot baseline and diff it against the live database via
+/// `introspect` (a backend-specific introspector). Shared by the Postgres and `SQLite`
+/// arms of [`gather_db_schema_drift`] so both keep the identical offline-safe posture:
+/// a missing snapshot → [`DbSchemaState::SnapshotMissing`]; a connect/query failure →
+/// [`DbSchemaState::Unreachable`] (a WARN, never a hard failure).
+fn gather_db_schema_drift_with(
+    project_root: &Path,
+    url: &str,
+    introspect: impl Fn(&str) -> Result<Vec<Table>, super::introspect::IntrospectError>,
+) -> DbSchemaState {
     // Reload the snapshot baseline from disk (offline, cheap). A missing or
     // unreadable snapshot means there is nothing to diff the database against.
     let snapshot_path = project_root.join(SNAPSHOT_DEFAULT_PATH);
     let Ok(snapshot) = load_snapshot(&snapshot_path) else {
         return DbSchemaState::SnapshotMissing;
     };
-    match introspect_postgres(&url) {
+    match introspect(url) {
         Ok(tables) => {
             let drift = compute_db_schema_drift(&snapshot.tables, &tables);
             if drift.is_clean() {
@@ -697,7 +728,7 @@ mod tests {
     {{
       "name": "posts",
       "columns": [
-        {{ "name": "id", "ty": "Int64", "nullable": false, "primary_key": true, "unique": false, "default": null, "references": null }},
+        {{ "name": "id", "ty": "Int64", "nullable": false, "primary_key": true, "unique": false, "default": null, "references": null, "serial": "BigSerial" }},
         {{ "name": "title", "ty": "Text", "nullable": false, "primary_key": false, "unique": false, "default": null, "references": null }},
         {{ "name": "created_at", "ty": "Timestamp", "nullable": false, "primary_key": false, "unique": false, "default": "Now", "references": null }}
       ],
