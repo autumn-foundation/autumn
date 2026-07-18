@@ -361,16 +361,19 @@ fn schema_pull_omits_composite_fk_and_ignores_default_null() {
     );
 }
 
-/// CONTRACT (Codex review): a brownfield inline `col TEXT UNIQUE` constraint pulls
-/// as a retained (non-droppable) `sqlite_autoindex_*` unique index, so a matching
-/// `#[unique]` model round-trips to an EMPTY diff — the undroppable auto-index is
-/// never `DROP INDEX`ed (which `SQLite` rejects).
+/// CONTRACT (Codex review, #1975 option A): a brownfield single-column inline
+/// `col TEXT UNIQUE` folds into `Column.unique` (its un-creatable/un-droppable
+/// `sqlite_autoindex_*` is never an Index). A matching `#[unique]` model round-trips
+/// to an EMPTY diff (coverage-suppressed — no `AddIndex`, no `guard_plan` refusal, no
+/// `sqlite_`-named / `DROP INDEX`), AND a rebuild / `DropTable` rollback RE-EMITS
+/// inline `UNIQUE` so uniqueness is never silently dropped.
 #[test]
-fn schema_pull_brownfield_inline_unique_round_trips_clean() {
+fn schema_pull_brownfield_inline_unique_round_trips_and_preserves_uniqueness() {
     let (_tmp, project) = fresh_project("pull_sqlite_inline_unique");
     let db_path = project.join("app.db");
     let url = format!("sqlite://{}", db_path.display());
     let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
 
     write_models(&project, "");
     write_raw_migration(
@@ -385,8 +388,14 @@ fn schema_pull_brownfield_inline_unique_round_trips_clean() {
     run_autumn_ok(&project, &["schema", "migrate"], &envs);
     run_autumn_ok(&project, &["schema", "pull"], &envs);
 
-    // A natural model matching the brownfield table (the inline UNIQUE becomes
-    // `#[unique]`, which the parser emits as `idx_accounts_email_unique`).
+    // The inline UNIQUE is folded to Column.unique — never a sqlite_autoindex Index.
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        !snap.to_lowercase().contains("sqlite_autoindex"),
+        "the un-creatable constraint auto-index is never an Index: {snap}"
+    );
+
+    // A `#[unique] email` model round-trips CLEAN (coverage-suppressed).
     write_models(
         &project,
         "#[autumn_web::model(managed)]\npub struct Account {\n    #[id]\n    pub id: i64,\n    \
@@ -397,18 +406,15 @@ fn schema_pull_brownfield_inline_unique_round_trips_clean() {
     assert_eq!(code, Some(0), "the diff must succeed:\n{combined}");
     assert!(
         combined.contains("No schema changes"),
-        "a brownfield inline-UNIQUE table round-trips clean against the matching model:\n{combined}"
+        "the model #[unique] is already satisfied (clean diff, no AddIndex):\n{combined}"
     );
     assert!(
         !combined.contains("DROP INDEX") && !combined.to_uppercase().contains("SQLITE_AUTOINDEX"),
-        "the undroppable UNIQUE-constraint auto-index is never dropped:\n{combined}"
+        "no undroppable auto-index is dropped:\n{combined}"
     );
 
-    // The rebuild / DropTable-rollback path must NEVER emit a `CREATE … "sqlite_…"`
-    // (SQLite refuses to create `sqlite_`-prefixed objects). Drop the model entirely
-    // so the migration's up = DROP TABLE and down = CREATE TABLE accounts (restored
-    // from the pulled baseline) — then assert neither leg emits any `sqlite_`-named
-    // statement.
+    // The DropTable rollback re-emits the table WITH inline UNIQUE (uniqueness
+    // preserved) and never names a `sqlite_`-prefixed object.
     write_models(&project, "");
     run_autumn_ok(
         &project,
@@ -437,12 +443,14 @@ fn schema_pull_brownfield_inline_unique_round_trips_clean() {
     for (leg, sql) in [("up", &up), ("down", &down)] {
         assert!(
             !sql.to_lowercase().contains("sqlite_"),
-            "the {leg} leg must emit no `sqlite_`-named statement (un-creatable):\n{sql}"
+            "the {leg} leg must emit no `sqlite_`-named statement:\n{sql}"
         );
     }
     assert!(
-        down.contains("CREATE TABLE accounts"),
-        "the down leg restores the accounts table: {down}"
+        down.contains("CREATE TABLE accounts")
+            && down.to_uppercase().contains("EMAIL TEXT")
+            && down.to_uppercase().contains("UNIQUE"),
+        "the down leg restores accounts WITH the inline UNIQUE (uniqueness preserved):\n{down}"
     );
 }
 

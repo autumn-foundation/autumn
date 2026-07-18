@@ -350,27 +350,6 @@ pub enum SchemaChange {
         column: String,
     },
 
-    /// A same-named column whose single-column `UNIQUE` (the `Column.unique` flag)
-    /// changed between two authoritative introspections — e.g. the live database
-    /// dropped a `col TEXT UNIQUE` to a plain `col TEXT`. A non-emittable marker:
-    /// [`guard_plan`] refuses any plan containing it (with **no override**).
-    ///
-    /// It exists so a change to an inline single-column `UNIQUE` — which the `SQLite`
-    /// introspector folds into `Column.unique` (its constraint auto-index is
-    /// deliberately NOT recorded as an [`Index`], so the flag is the ONLY signal) —
-    /// surfaces as real drift in the introspection diff (doctor's
-    /// `database-schema-drift` and `pull --dry-run`) instead of being silently
-    /// ignored. It is produced **only** in an authoritative diff
-    /// (`definitions_authoritative`): in a model diff a `#[unique]` is expressed as an
-    /// [`Index`] (diffed by [`diff_indexes`]), not the column flag, so comparing the
-    /// flag there would double-count.
-    UniqueChange {
-        /// The owning table name.
-        table: String,
-        /// The column whose `UNIQUE` flag changed.
-        column: String,
-    },
-
     /// A managed table is dropped while a **retained** table still holds a
     /// baseline foreign key pointing at it (e.g. drop `users` while
     /// `posts.user_id REFERENCES users(id)` survives). A non-emittable marker:
@@ -550,20 +529,6 @@ pub enum DiffError {
         /// The owning table name.
         table: String,
         /// The column whose identity clause changed.
-        column: String,
-    },
-
-    /// A column's inline single-column `UNIQUE` (`Column.unique`) changed between two
-    /// authoritative introspections (unsupported this slice, **no override** — see
-    /// [`SchemaChange::UniqueChange`]).
-    #[error(
-        "unique-constraint change on `{table}.{column}` is not supported in this slice: \
-         adding or dropping an inline column `UNIQUE` requires a manual migration."
-    )]
-    UniqueChange {
-        /// The owning table name.
-        table: String,
-        /// The column whose `UNIQUE` flag changed.
         column: String,
     },
 
@@ -1293,20 +1258,11 @@ fn diff_column(
             column: want.name.clone(),
         });
     }
-
-    // Inline single-column `UNIQUE` (`Column.unique`): compared ONLY in an
-    // authoritative diff (both sides introspected). The SQLite introspector folds an
-    // inline `col TEXT UNIQUE` into this flag (its constraint auto-index is not
-    // recorded as an `Index`), so the flag is the ONLY drift signal there — without
-    // this, a live DB dropping the `UNIQUE` diffs clean in doctor / `pull --dry-run`.
-    // In a MODEL diff a `#[unique]` is expressed as an `Index` (handled by
-    // `diff_indexes`), not this flag, so comparing it there would double-count.
-    if opts.definitions_authoritative && base.unique != want.unique {
-        changes.push(SchemaChange::UniqueChange {
-            table: table.to_owned(),
-            column: want.name.clone(),
-        });
-    }
+    // NOTE: `Column.unique` is deliberately NOT diffed. On Postgres a single-column
+    // unique is ALSO recorded as an `Index`, so a uniqueness change surfaces through
+    // `diff_indexes` (comparing the flag too would double-report). On SQLite a
+    // brownfield inline `col TEXT UNIQUE` is not modeled at all (#1975 deferral — see
+    // `introspect::sqlite::collapse_indexes`), so there is no flag to diff.
 }
 
 /// Diff a table's indexes by name. A same-named index whose shape changed is a
@@ -1468,12 +1424,12 @@ fn baseline_unique_index_covers(base: &Table, want_columns: &[String]) -> bool {
     let want_set: BTreeSet<&str> = want_columns.iter().map(String::as_str).collect();
     // A single-column baseline `column.unique = true` fully enforces uniqueness of
     // that column. This covers the SQLite brownfield inline-`col TEXT UNIQUE` case:
-    // its constraint auto-index (`sqlite_autoindex_*`) is deliberately NOT recorded
-    // as an `Index` (its name is un-creatable/un-droppable — see
-    // `introspect::sqlite::collapse_indexes`), so the column flag is the ONLY signal
-    // that the model's `#[unique]` is already satisfied. (On Postgres the constraint
-    // ALSO produces a retained unique index, so this clause is redundant-but-correct
-    // there.)
+    // its constraint auto-index (`sqlite_autoindex_*`) is deliberately folded into the
+    // column flag (not recorded as an `Index` — its name is un-creatable/un-droppable,
+    // see `introspect::sqlite::collapse_indexes`), so the flag is the signal that the
+    // model's `#[unique]` is already satisfied (no redundant `AddIndex` that
+    // `guard_plan` would refuse on a populated table). On Postgres the constraint ALSO
+    // produces a retained unique index, so this clause is redundant-but-correct there.
     if want_columns.len() == 1
         && base
             .columns
@@ -1769,9 +1725,9 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(DiffError::ForeignKeyChange { table, column });
     }
 
-    // 2a / 2a'. Identity-generation and inline-UNIQUE changes — no override; both
-    //           are produced ONLY by an authoritative diff (drift detection).
-    if let Some(err) = find_identity_change_block(plan).or_else(|| find_unique_change_block(plan)) {
+    // 2a. Identity-generation change — no override (needs ADD/DROP/SET GENERATED,
+    //     out of scope this slice). Only produced by an authoritative diff.
+    if let Some(err) = find_identity_change_block(plan) {
         return Err(err);
     }
 
@@ -1940,18 +1896,6 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
 fn find_identity_change_block(plan: &MigrationPlan) -> Option<DiffError> {
     plan.changes.iter().find_map(|c| match c {
         SchemaChange::IdentityChange { table, column } => Some(DiffError::IdentityChange {
-            table: table.clone(),
-            column: column.clone(),
-        }),
-        _ => None,
-    })
-}
-
-/// The [`DiffError::UniqueChange`] refusal for the first
-/// [`SchemaChange::UniqueChange`] marker in `plan`, if any.
-fn find_unique_change_block(plan: &MigrationPlan) -> Option<DiffError> {
-    plan.changes.iter().find_map(|c| match c {
-        SchemaChange::UniqueChange { table, column } => Some(DiffError::UniqueChange {
             table: table.clone(),
             column: column.clone(),
         }),
@@ -2492,7 +2436,6 @@ const fn change_table_name(change: &SchemaChange) -> &str {
         | SchemaChange::PrimaryKeyChange { table }
         | SchemaChange::ForeignKeyChange { table, .. }
         | SchemaChange::IdentityChange { table, .. }
-        | SchemaChange::UniqueChange { table, .. }
         | SchemaChange::DropTableBlockedByInboundFk { table, .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { table, .. }
         | SchemaChange::AddForeignKeyToExistingColumn { table, .. }
@@ -3136,7 +3079,6 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
-        | SchemaChange::UniqueChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
         | SchemaChange::AddForeignKeyToExistingColumn { .. }
@@ -3224,7 +3166,6 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
-        | SchemaChange::UniqueChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
         | SchemaChange::AddForeignKeyToExistingColumn { .. }
@@ -3313,7 +3254,6 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
-        | SchemaChange::UniqueChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
         | SchemaChange::AddForeignKeyToExistingColumn { .. }
@@ -3365,7 +3305,15 @@ fn render_create_table_body(name: &str, table: &Table, backend: Backend) -> Stri
         {
             lines.push(format!("    {} {}", col.name, kind.pk_sql(backend)));
         } else {
-            lines.push(format!("    {}", render_column_def(col, backend)));
+            // Render inline `UNIQUE` for a `Column.unique` column whose uniqueness is
+            // NOT already owned by a separate index (the SQLite inline-`UNIQUE` fold),
+            // so a rebuild/rollback preserves it without double-emitting for a model
+            // `#[unique]` field (which has a covering named index).
+            let render_unique = col.unique && !column_covered_by_unique_index(table, &col.name);
+            lines.push(format!(
+                "    {}",
+                render_column_def(col, backend, render_unique)
+            ));
         }
     }
 
@@ -3422,7 +3370,10 @@ fn emit_add_column(table: &str, column: &Column, backend: Backend) -> Result<Str
     let _ = writeln!(
         out,
         "ALTER TABLE {table} ADD COLUMN {};",
-        render_column_def(column, backend)
+        // ADD COLUMN never renders inline UNIQUE: a model `#[unique]` column arrives
+        // with a separate `AddIndex` that owns the uniqueness (SQLite column changes
+        // go through the table-rebuild path, not ADD COLUMN).
+        render_column_def(column, backend, false)
     );
     Ok(out)
 }
@@ -3430,13 +3381,23 @@ fn emit_add_column(table: &str, column: &Column, backend: Backend) -> Result<Str
 /// Render a column definition body: `{name} {type} {NOT NULL|NULL} [REFERENCES
 /// t(c)] [DEFAULT d]`. Shared by `CREATE TABLE` (non-PK columns) and `ADD
 /// COLUMN`.
-fn render_column_def(column: &Column, backend: Backend) -> String {
+fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> String {
     let mut def = format!(
         "{} {} {}",
         column.name,
         column.ty.sql_type(backend),
         nullability(column.nullable)
     );
+    // Inline single-column `UNIQUE` — rendered ONLY when the caller says so. It is
+    // emitted for a `Column.unique` column that is NOT already covered by a separate
+    // unique `Index` in the table (the SQLite brownfield inline-`UNIQUE` fold, whose
+    // constraint auto-index is deliberately not an `Index`). For a model `#[unique]`
+    // field — which carries BOTH `Column.unique` AND a covering named `Index` — the
+    // caller passes `false`, so the index owns the uniqueness and it is never
+    // double-emitted (zero golden churn).
+    if render_unique {
+        def.push_str(" UNIQUE");
+    }
     if let Some(fk) = &column.references {
         let _ = write!(def, " REFERENCES {}({})", fk.table, fk.column);
     }
@@ -3444,6 +3405,16 @@ fn render_column_def(column: &Column, backend: Backend) -> String {
         let _ = write!(def, " DEFAULT {}", default_sql(default, backend));
     }
     def
+}
+
+/// Whether some unique, non-partial `Index` in `table` keys on **exactly** the single
+/// column `col` — i.e. the column's uniqueness is already owned by a separate index,
+/// so it must NOT also be rendered as an inline `UNIQUE` (double-emit).
+fn column_covered_by_unique_index(table: &Table, col: &str) -> bool {
+    table
+        .indexes
+        .iter()
+        .any(|idx| full_unique_key_columns(idx).is_some_and(|k| k.len() == 1 && k.contains(col)))
 }
 
 /// `CREATE [UNIQUE] INDEX {name} ON {table} ({cols});`.
@@ -3680,9 +3651,6 @@ fn describe_change(change: &SchemaChange) -> String {
         SchemaChange::IdentityChange { table, column } => {
             format!("! IDENTITY CHANGE on {table}.{column} (refused)")
         }
-        SchemaChange::UniqueChange { table, column } => {
-            format!("! UNIQUE CHANGE on {table}.{column} (refused)")
-        }
         SchemaChange::DropTableBlockedByInboundFk {
             table,
             referencing_table,
@@ -3868,43 +3836,6 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, SchemaChange::IdentityChange { .. })),
             "model diff never flags an identity change: {:?}",
-            model.changes
-        );
-    }
-
-    /// P2 (authoritative Column.unique): a live DB dropping a single-column inline
-    /// `UNIQUE` (folded into `Column.unique`, with NO recorded Index) surfaces as
-    /// `UniqueChange` drift in the authoritative diff (doctor / pull --dry-run), but
-    /// is NOT flagged in a model diff (where `#[unique]` is an Index, not the flag).
-    #[test]
-    fn unique_flag_change_flagged_only_in_authoritative_diff() {
-        let mut base_email = col("email", ColumnType::Text);
-        base_email.unique = true; // snapshot: email is UNIQUE
-        let base = vec![posts_with(vec![base_email])];
-        let want_col = col("email", ColumnType::Text); // live: unique dropped
-        let want = posts_with(vec![want_col]);
-
-        let auth = diff_schema(&base, &parsed(vec![want.clone()], vec![]), AUTHORITATIVE);
-        assert!(
-            auth.changes.iter().any(|c| matches!(
-                c,
-                SchemaChange::UniqueChange { table, column } if table == "posts" && column == "email"
-            )),
-            "authoritative diff flags the dropped inline UNIQUE: {:?}",
-            auth.changes
-        );
-        assert!(matches!(
-            guard_plan(&auth, AUTHORITATIVE).unwrap_err(),
-            DiffError::UniqueChange { .. }
-        ));
-
-        let model = diff_schema(&base, &parsed(vec![want], vec![]), DEFAULT_OPTS);
-        assert!(
-            !model
-                .changes
-                .iter()
-                .any(|c| matches!(c, SchemaChange::UniqueChange { .. })),
-            "model diff never flags a Column.unique change: {:?}",
             model.changes
         );
     }

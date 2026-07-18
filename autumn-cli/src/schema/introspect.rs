@@ -1280,12 +1280,16 @@ fn serial_kind_for(
 //   AUTOINCREMENT id is always recorded as `BigSerial` (there is no int4 serial).
 // - **FK on-update/on-delete actions, composite FKs, expression/collation index
 //   attributes**: same deferrals as the Postgres arm.
-// - **Composite inline `UNIQUE(a, b)` constraints**: a table-level UNIQUE-constraint
-//   auto-index (`sqlite_autoindex_*`) cannot be recorded — its name is un-creatable
-//   (`SQLite` refuses `CREATE … "sqlite_…"`) and the IR has no table-level
-//   unique-constraint node — so a composite inline `UNIQUE` is skipped (a
-//   single-column inline `UNIQUE` IS captured, as the column's `unique` flag). Rare
-//   brownfield shape; not tracked in the snapshot.
+// - **Composite inline `UNIQUE(a, b)` constraints (#1975)**: a table-level
+//   `UNIQUE(a, b)` produces a `sqlite_autoindex_*` auto-index whose name is
+//   un-creatable (`SQLite` refuses `CREATE … "sqlite_…"`) and un-droppable, and the
+//   IR has no table-level unique-constraint node — so it is skipped entirely (a rare
+//   brownfield shape; the live constraint is untouched). A SINGLE-column inline
+//   `col TEXT UNIQUE` IS modeled (folded into `Column.unique`, rendered inline on
+//   rebuild/rollback so uniqueness is preserved). Deferred narrow edge: an
+//   authoritative diff does not surface a MANUALLY-dropped single-column inline
+//   `UNIQUE` (the fold's `Column.unique` change is not diffed — on Postgres the
+//   equivalent drift is caught via the index diff).
 // - **Generated columns' expressions**: generated columns are PRESERVED (read via
 //   `pragma_table_xinfo`, never dropped), but their `GENERATED ALWAYS AS (...)`
 //   expression is not captured — a generated column round-trips as an ordinary column
@@ -1537,7 +1541,9 @@ mod sqlite {
         #[diesel(sql_type = Text)]
         column_name: String,
         /// The referenced column; `NULL` when the FK targets the referenced table's
-        /// PK implicitly (recovered as `id`, the Autumn convention).
+        /// PK implicitly (`REFERENCES parent` with no column) — then resolved to the
+        /// parent's actual single-column PK, or the FK is omitted if the parent has a
+        /// composite / no single-column PK.
         #[diesel(sql_type = Nullable<Text>)]
         foreign_column: Option<String>,
     }
@@ -1559,6 +1565,9 @@ mod sqlite {
         let indexes_by_table = fetch_indexes(conn)?;
         let index_columns = fetch_index_columns(conn)?;
         let fks_by_table = fetch_foreign_keys(conn)?;
+        // Each table's single-column primary key (absent for composite / PK-less
+        // tables), used to resolve an implicit `REFERENCES parent` FK target.
+        let single_col_pks = single_column_pks(&columns_by_table);
 
         let mut out = Vec::with_capacity(tables.len());
         for (name, table_sql) in &tables {
@@ -1569,9 +1578,27 @@ mod sqlite {
                 indexes_by_table.get(name).map_or(&[][..], Vec::as_slice),
                 &index_columns,
                 fks_by_table.get(name).map_or(&[][..], Vec::as_slice),
+                &single_col_pks,
             ));
         }
         Ok(out)
+    }
+
+    /// Map each table to its SINGLE-column primary-key column name, if it has exactly
+    /// one. Composite-PK (or PK-less) tables are deliberately ABSENT — an implicit
+    /// `REFERENCES parent` FK (`SQLite` reports `.to = NULL`) to such a parent has no
+    /// unambiguous target column and is omitted rather than guessed.
+    fn single_column_pks(
+        columns_by_table: &BTreeMap<String, Vec<ColumnRow>>,
+    ) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for (table, cols) in columns_by_table {
+            let mut pk_cols = cols.iter().filter(|c| c.pk > 0);
+            if let (Some(first), None) = (pk_cols.next(), pk_cols.next()) {
+                out.insert(table.clone(), first.column_name.clone());
+            }
+        }
+        out
     }
 
     /// List app tables (name + `CREATE TABLE` SQL), excluding `SQLite` internal
@@ -1915,6 +1942,7 @@ mod sqlite {
         indexes: &[IndexRow],
         index_columns: &BTreeMap<IndexKey, Vec<IndexColumnRow>>,
         foreign_keys: &[ForeignKeyRow],
+        single_col_pks: &BTreeMap<String, String>,
     ) -> Table {
         let mut table = Table::new(name, Backend::Sqlite);
         table.managed = true;
@@ -1980,8 +2008,20 @@ mod sqlite {
                 });
             }
             if let Some(fk) = fk_by_column.get(row.column_name.as_str()) {
-                let foreign_column = fk.foreign_column.clone().unwrap_or_else(|| "id".to_owned());
-                column.references = Some(ForeignKey::new(fk.foreign_table.clone(), foreign_column));
+                // An implicit `REFERENCES parent` (SQLite reports `to = NULL`) targets
+                // the parent's PRIMARY KEY — resolve the parent's actual single-column
+                // PK rather than guessing `id`. A parent with a composite (or no)
+                // single-column PK is unresolvable, so the FK is OMITTED (fail-closed)
+                // rather than recorded with a wrong target that would re-emit wrong on
+                // rebuild/rollback and never drift.
+                let foreign_column = fk.foreign_column.clone().or_else(|| {
+                    // Implicit target → the parent's actual single-column PK.
+                    single_col_pks.get(&fk.foreign_table).cloned()
+                });
+                if let Some(foreign_column) = foreign_column {
+                    column.references =
+                        Some(ForeignKey::new(fk.foreign_table.clone(), foreign_column));
+                }
             }
             table.columns.push(column);
         }
@@ -1999,21 +2039,18 @@ mod sqlite {
     /// key auto-index (`origin = 'pk'`) is skipped (the PK is modeled separately).
     ///
     /// A `UNIQUE`-constraint auto-index (`origin = 'u'`, named
-    /// `sqlite_autoindex_<table>_<n>`) has **no** standalone `CREATE INDEX` statement
-    /// and is owned by the constraint — it cannot be `DROP INDEX`ed, and `SQLite`
-    /// refuses to `CREATE` any object named `sqlite_*`, so it must **never** appear as
-    /// an [`Index`] in the IR (the emitter would try to re-`CREATE` it by name on a
-    /// table rebuild / `DropTable` rollback and produce illegal `CREATE … "sqlite_…"`
-    /// DDL). Instead:
-    /// * a **single-column** inline `col TEXT UNIQUE` is represented purely as the
-    ///   column's `unique = true` flag (no [`Index`] object) — a matching `#[unique]`
-    ///   model is recognized as already satisfied (clean diff, no `DropIndex`, no
-    ///   `sqlite_`-named `CREATE`);
-    /// * a **composite** table-level `UNIQUE(a, b)` cannot be represented (the IR has
-    ///   no table-level unique-constraint node, and the model DSL cannot express it),
-    ///   so it is **skipped entirely** rather than synthesized as a `sqlite_`-named
-    ///   index (DEFERRED: composite inline-`UNIQUE` fidelity — a rare brownfield shape
-    ///   — is not tracked in the snapshot; see the module note).
+    /// `sqlite_autoindex_<table>_<n>`) is **never** recorded as an [`Index`] — its
+    /// `sqlite_*` name is un-creatable (`SQLite` refuses to `CREATE` a
+    /// `sqlite_`-prefixed object) and un-droppable, so re-emitting it by name on a
+    /// rebuild / `DropTable` rollback would produce illegal DDL. Instead a
+    /// **single-column** inline `col TEXT UNIQUE` is folded into the column's
+    /// `unique = true` flag: a matching `#[unique]` model is recognized as already
+    /// satisfied ([`baseline_unique_index_covers`], no `AddIndex` / no guard refusal),
+    /// and the emitter renders it as inline `UNIQUE` on a rebuild/rollback
+    /// ([`render_create_table_body`]) so uniqueness is preserved. A **composite**
+    /// table-level `UNIQUE(a, b)` has no single-column flag and no recreatable IR form,
+    /// so it is skipped entirely (DEFERRED, #1975 — a rare brownfield shape; the live
+    /// constraint is untouched).
     fn collapse_indexes(
         table_name: &str,
         rows: &[IndexRow],
@@ -2025,6 +2062,20 @@ mod sqlite {
             if row.origin == "pk" {
                 continue;
             }
+            // A UNIQUE-constraint auto-index (`origin = 'u'`) is NEVER an Index; a
+            // single-column one folds into the column's `unique` flag, a composite one
+            // is skipped (see the fn note).
+            if row.origin == "u" {
+                let cols = index_columns
+                    .get(&(table_name.to_owned(), row.index_name.clone()))
+                    .map_or(&[][..], Vec::as_slice);
+                let key_columns: Vec<String> =
+                    cols.iter().filter_map(|c| c.column_name.clone()).collect();
+                if row.is_unique != 0 && key_columns.len() == 1 {
+                    unique_columns.insert(key_columns[0].clone());
+                }
+                continue;
+            }
             let cols = index_columns
                 .get(&(table_name.to_owned(), row.index_name.clone()))
                 .map_or(&[][..], Vec::as_slice);
@@ -2033,16 +2084,6 @@ mod sqlite {
                 cols.iter().filter_map(|c| c.column_name.clone()).collect();
             let is_unique = row.is_unique != 0;
             let is_partial = row.partial != 0;
-
-            // A UNIQUE-constraint auto-index (`origin = 'u'`) is NEVER emitted as an
-            // Index (its `sqlite_*` name is un-creatable and un-droppable). A single
-            // column becomes the column's `unique` flag; a composite one is skipped.
-            if row.origin == "u" {
-                if is_unique && !has_expression && key_columns.len() == 1 {
-                    unique_columns.insert(key_columns[0].clone());
-                }
-                continue;
-            }
 
             let simple = !is_partial && !has_expression;
             if simple && is_unique && key_columns.len() == 1 {
@@ -2170,7 +2211,15 @@ mod sqlite {
             let table_sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, \
                              title TEXT NOT NULL, body TEXT NULL, \
                              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)";
-            let table = build_table("posts", table_sql, &columns, &[], &BTreeMap::new(), &[]);
+            let table = build_table(
+                "posts",
+                table_sql,
+                &columns,
+                &[],
+                &BTreeMap::new(),
+                &[],
+                &BTreeMap::new(),
+            );
             assert_eq!(table.primary_key, vec!["id".to_owned()]);
 
             let id = table.columns.iter().find(|c| c.name == "id").unwrap();
@@ -2201,7 +2250,15 @@ mod sqlite {
             // compatible.
             let columns = vec![col_row("id", "INTEGER", 0, None, 1)];
             let table_sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY)";
-            let table = build_table("posts", table_sql, &columns, &[], &BTreeMap::new(), &[]);
+            let table = build_table(
+                "posts",
+                table_sql,
+                &columns,
+                &[],
+                &BTreeMap::new(),
+                &[],
+                &BTreeMap::new(),
+            );
             let id = table.columns.iter().find(|c| c.name == "id").unwrap();
             assert_eq!(id.serial, Some(SerialKind::Plain));
         }
@@ -2260,6 +2317,7 @@ mod sqlite {
                 &[],
                 &BTreeMap::new(),
                 &[],
+                &BTreeMap::new(),
             );
             let id = table.columns.iter().find(|c| c.name == "id").unwrap();
             assert_eq!(id.serial, Some(SerialKind::Plain));
@@ -2280,7 +2338,15 @@ mod sqlite {
             let table_sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY, first TEXT NOT NULL, \
                              full_stored TEXT GENERATED ALWAYS AS (first) STORED, \
                              full_virtual TEXT GENERATED ALWAYS AS (first) VIRTUAL)";
-            let table = build_table("posts", table_sql, &columns, &[], &BTreeMap::new(), &[]);
+            let table = build_table(
+                "posts",
+                table_sql,
+                &columns,
+                &[],
+                &BTreeMap::new(),
+                &[],
+                &BTreeMap::new(),
+            );
             let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
             assert!(
                 names.contains(&"full_stored") && names.contains(&"full_virtual"),
@@ -2290,6 +2356,85 @@ mod sqlite {
                 !names.contains(&"internal"),
                 "an internal hidden column (hidden = 1) is skipped: {names:?}"
             );
+        }
+
+        #[test]
+        fn build_table_resolves_implicit_fk_target_from_parent_pk() {
+            let columns = vec![
+                col_row("id", "INTEGER", 0, None, 1),
+                col_row("parent_code", "TEXT", 1, None, 0),
+                col_row("orphan_ref", "TEXT", 1, None, 0),
+            ];
+            // Two implicit FKs (`foreign_column = None`): one to a parent with a real
+            // single-column non-`id` PK (`code`), one to a composite-PK parent.
+            let fks = vec![
+                ForeignKeyRow {
+                    table_name: "children".to_owned(),
+                    foreign_table: "parents".to_owned(),
+                    column_name: "parent_code".to_owned(),
+                    foreign_column: None,
+                },
+                ForeignKeyRow {
+                    table_name: "children".to_owned(),
+                    foreign_table: "composite_parent".to_owned(),
+                    column_name: "orphan_ref".to_owned(),
+                    foreign_column: None,
+                },
+            ];
+            // `parents` has a single-column PK `code`; `composite_parent` is absent
+            // (composite/unresolvable).
+            let mut single_col_pks = BTreeMap::new();
+            single_col_pks.insert("parents".to_owned(), "code".to_owned());
+            let table = build_table(
+                "children",
+                "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_code TEXT NOT NULL \
+                 REFERENCES parents, orphan_ref TEXT NOT NULL REFERENCES composite_parent)",
+                &columns,
+                &[],
+                &BTreeMap::new(),
+                &fks,
+                &single_col_pks,
+            );
+            // The implicit FK resolves to the parent's REAL single-column PK, not `id`.
+            let parent_code = table
+                .columns
+                .iter()
+                .find(|c| c.name == "parent_code")
+                .unwrap();
+            let fk = parent_code.references.as_ref().expect("FK resolved");
+            assert_eq!(fk.table, "parents");
+            assert_eq!(fk.column, "code", "resolved to the real PK, not `id`");
+            // The FK to a composite/unresolvable parent is OMITTED (not guessed `id`).
+            let orphan = table
+                .columns
+                .iter()
+                .find(|c| c.name == "orphan_ref")
+                .unwrap();
+            assert!(
+                orphan.references.is_none(),
+                "an implicit FK to a composite/unresolvable-PK parent is omitted"
+            );
+        }
+
+        #[test]
+        fn single_column_pks_excludes_composite_and_pkless() {
+            let mut columns_by_table = BTreeMap::new();
+            columns_by_table.insert(
+                "parents".to_owned(),
+                vec![col_row("code", "TEXT", 1, None, 1)],
+            );
+            columns_by_table.insert(
+                "composite".to_owned(),
+                vec![
+                    col_row("a", "INTEGER", 1, None, 1),
+                    col_row("b", "INTEGER", 1, None, 2),
+                ],
+            );
+            columns_by_table.insert("pkless".to_owned(), vec![col_row("x", "TEXT", 0, None, 0)]);
+            let pks = single_column_pks(&columns_by_table);
+            assert_eq!(pks.get("parents").map(String::as_str), Some("code"));
+            assert!(!pks.contains_key("composite"), "composite PK excluded");
+            assert!(!pks.contains_key("pkless"), "PK-less table excluded");
         }
 
         #[test]
@@ -2369,88 +2514,48 @@ mod sqlite {
         }
 
         #[test]
-        fn collapse_indexes_single_col_unique_autoindex_becomes_column_flag_not_index() {
-            // A single-column `col TEXT UNIQUE` inline constraint produces a
-            // `sqlite_autoindex_*` (origin = 'u') with NO standalone CREATE INDEX SQL.
-            // Its `sqlite_*` name is un-creatable AND un-droppable, so it must produce
-            // NO Index object (only the column's `unique` flag) — otherwise the
-            // emitter would try to re-CREATE / DROP `sqlite_autoindex_*` on a rebuild.
-            let rows = vec![IndexRow {
-                table_name: "accounts".to_owned(),
-                index_name: "sqlite_autoindex_accounts_1".to_owned(),
-                is_unique: 1,
-                origin: "u".to_owned(),
-                partial: 0,
-                index_sql: None,
-            }];
-            let mut index_columns = BTreeMap::new();
-            index_columns.insert(
-                (
-                    "accounts".to_owned(),
-                    "sqlite_autoindex_accounts_1".to_owned(),
-                ),
-                vec![IndexColumnRow {
-                    table_name: "accounts".to_owned(),
-                    index_name: "sqlite_autoindex_accounts_1".to_owned(),
-                    seqno: 0,
-                    column_name: Some("email".to_owned()),
-                }],
-            );
-            let (indexes, unique_cols) = collapse_indexes("accounts", &rows, &index_columns);
-            assert!(
-                indexes.is_empty(),
-                "a UNIQUE-constraint autoindex is NEVER an Index (its sqlite_* name is \
-                 un-creatable/un-droppable): {indexes:?}"
-            );
-            assert!(
-                unique_cols.contains("email"),
-                "it is represented purely as the column's unique flag"
-            );
-        }
-
-        #[test]
-        fn collapse_indexes_composite_unique_autoindex_is_skipped() {
-            // A composite table-level `UNIQUE(a, b)` autoindex (origin = 'u') cannot be
-            // represented (no table-level unique node in the IR, un-creatable name), so
-            // it is skipped entirely — never synthesized as a `sqlite_`-named index.
-            let rows = vec![IndexRow {
-                table_name: "memberships".to_owned(),
-                index_name: "sqlite_autoindex_memberships_1".to_owned(),
-                is_unique: 1,
-                origin: "u".to_owned(),
-                partial: 0,
-                index_sql: None,
-            }];
-            let mut index_columns = BTreeMap::new();
-            index_columns.insert(
-                (
-                    "memberships".to_owned(),
-                    "sqlite_autoindex_memberships_1".to_owned(),
-                ),
-                vec![
-                    IndexColumnRow {
-                        table_name: "memberships".to_owned(),
-                        index_name: "sqlite_autoindex_memberships_1".to_owned(),
-                        seqno: 0,
-                        column_name: Some("org_id".to_owned()),
-                    },
-                    IndexColumnRow {
-                        table_name: "memberships".to_owned(),
-                        index_name: "sqlite_autoindex_memberships_1".to_owned(),
-                        seqno: 1,
-                        column_name: Some("user_id".to_owned()),
-                    },
-                ],
-            );
-            let (indexes, unique_cols) = collapse_indexes("memberships", &rows, &index_columns);
-            assert!(
-                indexes.is_empty(),
-                "composite UNIQUE autoindex is skipped: {indexes:?}"
-            );
-            assert!(
-                unique_cols.is_empty(),
-                "a composite UNIQUE marks no single column unique"
-            );
+        fn collapse_indexes_unique_constraint_autoindex_folds_or_skips() {
+            // A `sqlite_autoindex_*` (origin = 'u') is NEVER an Index (un-creatable /
+            // un-droppable name). A SINGLE-column one folds into the column's `unique`
+            // flag; a COMPOSITE one is skipped entirely (no flag either).
+            for (cols, expect_flag) in [(vec!["email"], Some("email")), (vec!["a", "b"], None)] {
+                let rows = vec![IndexRow {
+                    table_name: "t".to_owned(),
+                    index_name: "sqlite_autoindex_t_1".to_owned(),
+                    is_unique: 1,
+                    origin: "u".to_owned(),
+                    partial: 0,
+                    index_sql: None,
+                }];
+                let mut index_columns = BTreeMap::new();
+                index_columns.insert(
+                    ("t".to_owned(), "sqlite_autoindex_t_1".to_owned()),
+                    cols.iter()
+                        .enumerate()
+                        .map(|(i, c)| IndexColumnRow {
+                            table_name: "t".to_owned(),
+                            index_name: "sqlite_autoindex_t_1".to_owned(),
+                            seqno: i32::try_from(i).unwrap(),
+                            column_name: Some((*c).to_owned()),
+                        })
+                        .collect(),
+                );
+                let (indexes, unique_cols) = collapse_indexes("t", &rows, &index_columns);
+                assert!(
+                    indexes.is_empty(),
+                    "a UNIQUE-constraint autoindex is never an Index: {indexes:?}"
+                );
+                match expect_flag {
+                    Some(c) => assert!(
+                        unique_cols.contains(c),
+                        "single-column inline UNIQUE folds into the column flag"
+                    ),
+                    None => assert!(
+                        unique_cols.is_empty(),
+                        "a composite UNIQUE marks no single column unique: {unique_cols:?}"
+                    ),
+                }
+            }
         }
 
         #[test]
