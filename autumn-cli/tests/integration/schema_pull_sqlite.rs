@@ -497,6 +497,92 @@ fn schema_pull_excludes_fts5_search_tables() {
     );
 }
 
+/// CONTRACT (Codex review): `AUTOINCREMENT` is matched as a KEYWORD, not a substring
+/// — a table whose NAME contains the `autoincrement` substring but whose PK is a plain
+/// `INTEGER PRIMARY KEY` pulls as `Some(Plain)` (never `BigSerial`), round-trips clean
+/// (doctor), and its rebuild/rollback DDL never fabricates an `AUTOINCREMENT`.
+#[test]
+fn schema_pull_autoincrement_substring_name_is_not_serial() {
+    let (_tmp, project) = fresh_project("pull_sqlite_ai_name");
+    let db_path = project.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_ai_name",
+        "CREATE TABLE autoincrement_events (\
+           id INTEGER PRIMARY KEY, \
+           name TEXT NOT NULL, \
+           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\n",
+        "DROP TABLE autoincrement_events;\n",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    let events = table_json(&snap, "autoincrement_events");
+    let id = column_json(&events, "id");
+    assert_eq!(
+        id["serial"].as_str(),
+        Some("Plain"),
+        "a plain INTEGER PK in an `autoincrement`-named table is Plain, not BigSerial: {id}"
+    );
+
+    // Re-pull byte-stable + doctor clean.
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("second pull");
+    assert_eq!(snap, snap_after, "a re-pull is byte-stable");
+    let (doc_out, _) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor is clean:\n{doc_out}"
+    );
+
+    // Dropping the table: the down leg recreates it WITHOUT a fabricated AUTOINCREMENT.
+    write_models(&project, "");
+    run_autumn_ok(
+        &project,
+        &[
+            "schema",
+            "diff",
+            "--write-migration",
+            "--name",
+            "drop_ai",
+            "--allow-destructive",
+        ],
+        &envs,
+    );
+    let mig_dir = std::fs::read_dir(project.join("migrations"))
+        .expect("migrations dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_drop_ai"))
+        })
+        .expect("drop_ai migration written");
+    let down = std::fs::read_to_string(mig_dir.join("down.sql")).expect("down.sql");
+    // NOTE: the table NAME contains the `autoincrement` substring, so assert on the
+    // KEYWORD form (`… KEY AUTOINCREMENT`), not the bare substring. A plain PK renders
+    // a table-level `PRIMARY KEY (id)`, never a column-level `AUTOINCREMENT`.
+    assert!(
+        down.contains("CREATE TABLE autoincrement_events"),
+        "the rollback recreates the table: {down}"
+    );
+    assert!(
+        !down.to_uppercase().contains("KEY AUTOINCREMENT"),
+        "the rollback must NOT fabricate a column-level AUTOINCREMENT:\n{down}"
+    );
+    assert!(
+        down.contains("PRIMARY KEY (id)"),
+        "the plain PK is recreated as a table-level PRIMARY KEY (id):\n{down}"
+    );
+}
+
 /// CONTRACT (Codex review): a generated column (`GENERATED ALWAYS AS (...)
 /// STORED`/`VIRTUAL`) must NOT be silently dropped by the pull — `pragma_table_info`
 /// omits generated columns (a fail-closed violation), so the pull reads

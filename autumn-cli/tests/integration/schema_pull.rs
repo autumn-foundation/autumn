@@ -1285,6 +1285,74 @@ async fn schema_pull_preserves_shared_sequence_int8_primary_key() {
     assert_no_secret_leak(&doc_out, &doc_err);
 }
 
+/// FIDELITY (brownfield repoint): a column that still OWNS an old sequence (its
+/// original `BIGSERIAL` `events_id_seq`) but whose default was REPOINTED to a
+/// DIFFERENT sequence (`ALTER COLUMN id SET DEFAULT nextval('global_ids')`) must have
+/// its `nextval('global_ids')` default PRESERVED — the `owns_sequence` probe ties
+/// ownership to the sequence the default actually allocates from, so it does NOT
+/// strip the default to a fresh owned `BIGSERIAL` (which would abandon `global_ids`
+/// and silently change ID allocation). The column classifies as a plain PK carrying a
+/// shared-sequence default (`serial` marker NOT `BigSerial`).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_preserves_repointed_shared_sequence_default() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_repointed_seq_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // `events` starts as BIGSERIAL (owns `events_id_seq`), then its default is
+    // repointed to a standalone `global_ids` while `events_id_seq` stays owned.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_repoint",
+        "CREATE TABLE events (id BIGSERIAL PRIMARY KEY, label TEXT NOT NULL);\n\
+         CREATE SEQUENCE global_ids;\n\
+         ALTER TABLE events ALTER COLUMN id SET DEFAULT nextval('global_ids');",
+        "DROP TABLE events;\nDROP SEQUENCE global_ids;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    let tables = snapshot_columns(&snap);
+    let id = column_json(&tables["events"], "id");
+
+    // The repointed default is PRESERVED verbatim (NOT stripped to None).
+    assert!(
+        snap.contains("global_ids"),
+        "the repointed nextval('global_ids') default is preserved (not stripped): {snap}"
+    );
+    let default_sql = id["default"]["Sql"].as_str().unwrap_or_default();
+    assert!(
+        default_sql.contains("global_ids"),
+        "the id column keeps its nextval('global_ids') default: {id}"
+    );
+    // The column is NOT a conventional owned BigSerial (its default no longer draws
+    // from the sequence it owns).
+    assert_ne!(
+        id["serial"].as_str(),
+        Some("BigSerial"),
+        "a repointed-default PK is NOT a BigSerial: {id}"
+    );
+
+    // Re-pull byte-stable + doctor clean.
+    let (pull2_out, pull2_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull2_out, &pull2_err);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("second pull");
+    assert_eq!(snap, snap_after, "a re-pull must be byte-for-byte stable");
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor is clean with the preserved repointed-sequence default:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
 /// A brownfield single-column **UUID** primary key whose default is NOT the Autumn
 /// convention `gen_random_uuid()` — here a UUID PK with **no** default at all — must
 /// pull back preserving "no default", NOT the convention `gen_random_uuid()`. The

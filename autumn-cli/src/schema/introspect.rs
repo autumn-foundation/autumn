@@ -286,16 +286,18 @@ struct ColumnRow {
     /// Only qualifies the emitted type when it is not `public`.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     domain_schema: Option<String>,
-    /// Whether this column **owns** the sequence backing its `nextval(...)`
-    /// default — the conventional `SERIAL`/`BIGSERIAL` shape, where Postgres links
-    /// the sequence to the column with an `OWNED BY` auto-dependency (`pg_depend`
-    /// `deptype = 'a'`). A `nextval(...)` default over a *shared*/custom sequence
-    /// that is **not** owned by the column reports `false`, so its raw default is
-    /// preserved verbatim rather than collapsed to a fresh owned `BIGSERIAL` on
+    /// Whether this column **owns the same sequence its `nextval(...)` default
+    /// allocates from** — the conventional `SERIAL`/`BIGSERIAL` shape, where the
+    /// sequence is both `OWNED BY` the column (`pg_depend` `deptype = 'a'`) AND the
+    /// sequence the column's default expression references (`pg_attrdef`
+    /// `deptype = 'n'`). A `nextval(...)` default over a *shared*/custom sequence the
+    /// column does not own — OR a column that still owns an OLD sequence but whose
+    /// default was repointed to a DIFFERENT one — reports `false`, so its raw default
+    /// is preserved verbatim rather than collapsed to a fresh owned `BIGSERIAL` on
     /// recreation (which would silently change ID-allocation behavior — see
     /// [`normalize_serial_pk_default`]). Detected via long-standing catalogs only
-    /// (`pg_depend` / `pg_class` / `pg_attribute`), so it is version-safe on every
-    /// supported Postgres (no PG15+ catalog columns).
+    /// (`pg_depend` / `pg_attrdef` / `pg_class` / `pg_attribute`), so it is
+    /// version-safe on every supported Postgres (no PG15+ catalog columns).
     #[diesel(sql_type = diesel::sql_types::Bool)]
     owns_sequence: bool,
     /// `information_schema.columns.is_identity` (`'YES'`/`'NO'`) — whether the
@@ -498,15 +500,25 @@ fn fetch_columns(
     // the output type is guaranteed `int4` regardless of the domain. The `AS <name>`
     // aliases keep the result column names aligned with the `ColumnRow` field bindings.
     //
-    // `owns_sequence` is an `EXISTS` over `pg_depend`: a serial column OWNS its
-    // sequence through an `OWNED BY` auto-dependency — a `pg_depend` row whose
-    // `deptype = 'a'` links a sequence (`pg_class.relkind = 'S'`, as `objid`) to
-    // this exact column (`refobjid = <table oid>`, `refobjsubid = <column
-    // attnum>`, `refclassid = classid = 'pg_class'::regclass`). This is the
-    // conventional `SERIAL`/`BIGSERIAL` shape. A `nextval(...)` default over a
-    // shared/custom sequence NOT owned by the column has no such row, so
-    // `owns_sequence` is `false` and the raw default is preserved. `pg_depend`
-    // exists in every supported Postgres, so this never breaks older servers.
+    // `owns_sequence` is an `EXISTS` over `pg_depend` that is `true` only when the
+    // column OWNS the SAME sequence its `nextval(...)` default allocates from — the
+    // conventional `SERIAL`/`BIGSERIAL` shape. It ties TWO dependencies to one
+    // sequence:
+    //   * OWNED BY (`deptype = 'a'`): a `pg_depend` row linking a sequence
+    //     (`pg_class.relkind = 'S'`, as `objid`) to this exact column
+    //     (`refobjid = <table oid>`, `refobjsubid = <column attnum>`).
+    //   * used-by-default (`deptype = 'n'`): a `pg_depend` row from the column's
+    //     default expression (`pg_attrdef`, `classid = 'pg_attrdef'::regclass`) to
+    //     that SAME sequence (`refobjid = seq.oid`).
+    // Requiring BOTH on the same sequence closes the brownfield hole where a column
+    // still owns an old sequence (`t_id_seq`, `deptype = 'a'`) but its default was
+    // repointed to a different one (`DEFAULT nextval('global_ids')`): the used-by
+    // dependency then targets `global_ids`, not the owned `t_id_seq`, so `EXISTS` is
+    // `false`, the raw `nextval('global_ids')` default is preserved verbatim (never
+    // stripped to a fresh owned `BIGSERIAL`), and the column classifies as
+    // `Some(Plain)`. A plain shared/custom-sequence PK (owns nothing) likewise has no
+    // `deptype = 'a'` row → `false` → preserved. `pg_depend`/`pg_attrdef` exist in
+    // every supported Postgres, so this never breaks older servers.
     let query = format!(
         "SELECT c.table_name, c.column_name, c.udt_name, c.is_nullable, c.column_default, \
          c.numeric_precision::integer AS numeric_precision, \
@@ -516,19 +528,24 @@ fn fetch_columns(
          c.is_identity, c.identity_generation, \
          EXISTS ( \
            SELECT 1 \
-           FROM pg_depend dep \
-           JOIN pg_class seq ON seq.oid = dep.objid AND seq.relkind = 'S' \
-           JOIN pg_class tbl ON tbl.oid = dep.refobjid \
+           FROM pg_class tbl \
            JOIN pg_namespace tn ON tn.oid = tbl.relnamespace \
            JOIN pg_attribute att \
-             ON att.attrelid = dep.refobjid AND att.attnum = dep.refobjsubid \
-           WHERE dep.classid = 'pg_class'::regclass \
-             AND dep.refclassid = 'pg_class'::regclass \
-             AND dep.deptype = 'a' \
-             AND dep.refobjsubid > 0 \
-             AND tn.nspname = 'public' \
+             ON att.attrelid = tbl.oid AND att.attname = c.column_name \
+           JOIN pg_attrdef ad ON ad.adrelid = tbl.oid AND ad.adnum = att.attnum \
+           JOIN pg_depend owned \
+             ON owned.refobjid = tbl.oid AND owned.refobjsubid = att.attnum \
+             AND owned.refclassid = 'pg_class'::regclass \
+             AND owned.classid = 'pg_class'::regclass \
+             AND owned.deptype = 'a' \
+           JOIN pg_class seq ON seq.oid = owned.objid AND seq.relkind = 'S' \
+           JOIN pg_depend usedby \
+             ON usedby.objid = ad.oid AND usedby.classid = 'pg_attrdef'::regclass \
+             AND usedby.refobjid = seq.oid AND usedby.refclassid = 'pg_class'::regclass \
+             AND usedby.deptype = 'n' \
+           WHERE tn.nspname = 'public' \
              AND tbl.relname = c.table_name \
-             AND att.attname = c.column_name \
+             AND att.attnum > 0 \
          ) AS owns_sequence \
          FROM information_schema.columns c \
          WHERE c.table_schema = 'public' AND c.table_name IN ({}) \
@@ -1138,14 +1155,16 @@ fn normalize_default(
 /// `BIGSERIAL` id round-trips against the model parser (whose `pk_kind_for` requires
 /// `default.is_none()` for a `BigSerial` PK).
 ///
-/// **Ownership is load-bearing**: only a *conventional* serial — where Postgres
-/// links the sequence to the column via an `OWNED BY` auto-dependency
-/// (`owns_sequence == true`, sourced from `pg_depend` `deptype = 'a'`) — is the
-/// default-less `BIGSERIAL` shape. A brownfield int8 PK backed by a **shared/custom**
-/// sequence it does NOT own (`id BIGINT PRIMARY KEY DEFAULT nextval('global_ids')`)
-/// is deliberately **not** stripped: stripping it would make recreation/rollback
-/// emit a fresh owned `BIGSERIAL` (a NEW sequence) instead of continuing to allocate
-/// from `global_ids` — a silent, wrong ID-allocation change. Its raw
+/// **Ownership is load-bearing**: only a *conventional* serial — where the column
+/// owns the SAME sequence its default allocates from (`owns_sequence == true`,
+/// requiring both the `OWNED BY` `deptype = 'a'` link AND the default's `pg_attrdef`
+/// `deptype = 'n'` reference to point at one sequence) — is the default-less
+/// `BIGSERIAL` shape. A brownfield int8 PK backed by a **shared/custom** sequence it
+/// does NOT own (`id BIGINT PRIMARY KEY DEFAULT nextval('global_ids')`), OR one that
+/// still owns an old sequence but whose default was repointed to a different one, is
+/// deliberately **not** stripped: stripping it would make recreation/rollback emit a
+/// fresh owned `BIGSERIAL` (a NEW sequence) instead of continuing to allocate from
+/// the sequence the default names — a silent, wrong ID-allocation change. Its raw
 /// `nextval(...)` default is preserved verbatim instead.
 ///
 /// A single-column **`SERIAL`** (int4) PK is deliberately **not** stripped (this
@@ -1790,6 +1809,74 @@ mod sqlite {
         }
     }
 
+    /// Whether the table's `CREATE TABLE` SQL declares an `AUTOINCREMENT` primary key.
+    ///
+    /// Detects the `AUTOINCREMENT` **keyword** as a word-bounded token, AFTER
+    /// neutralizing string literals (`'…'`) and quoted identifiers (`"…"`, `` `…` ``,
+    /// `[…]`), so neither a NAME containing the substring (`autoincrement_events`) nor
+    /// a string literal (`DEFAULT 'AUTOINCREMENT'`) nor a quoted identifier
+    /// (`"AUTOINCREMENT"`) is ever mistaken for the keyword. `SQLite`'s grammar only
+    /// permits the `AUTOINCREMENT` keyword inside an `INTEGER PRIMARY KEY
+    /// AUTOINCREMENT` column definition, so a genuine word-bounded keyword occurrence
+    /// unambiguously marks the table as auto-incrementing.
+    fn table_sql_has_autoincrement_keyword(table_sql: &str) -> bool {
+        const KW: &str = "AUTOINCREMENT";
+        let stripped = neutralize_sqlite_literals_and_quoted_idents(table_sql).to_ascii_uppercase();
+        let bytes = stripped.as_bytes();
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut from = 0;
+        while let Some(rel) = stripped[from..].find(KW) {
+            let start = from + rel;
+            let end = start + KW.len();
+            let before_ok = start == 0 || !is_word(bytes[start - 1]);
+            let after_ok = end == bytes.len() || !is_word(bytes[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    }
+
+    /// Replace the CONTENTS (and delimiters) of `SQLite` string literals (`'…'`) and
+    /// quoted identifiers (`"…"`, `` `…` ``, `[…]`) with spaces, preserving all other
+    /// text positionally, so a keyword scan never matches inside a name or literal.
+    /// Doubled-delimiter escapes (`''`, `""`, ``` `` ```) keep the quote open. Pure.
+    fn neutralize_sqlite_literals_and_quoted_idents(sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len());
+        let mut chars = sql.chars().peekable();
+        while let Some(c) = chars.next() {
+            let close = match c {
+                '\'' => Some('\''),
+                '"' => Some('"'),
+                '`' => Some('`'),
+                '[' => Some(']'),
+                _ => None,
+            };
+            let Some(close) = close else {
+                out.push(c);
+                continue;
+            };
+            out.push(' '); // opening delimiter
+            while let Some(n) = chars.next() {
+                if n == close {
+                    // A doubled delimiter is an escape (not for the `[…]` form) — stay
+                    // inside the quote.
+                    if close != ']' && chars.peek() == Some(&close) {
+                        chars.next();
+                        out.push(' ');
+                        out.push(' ');
+                        continue;
+                    }
+                    break;
+                }
+                out.push(' ');
+            }
+            out.push(' '); // closing delimiter
+        }
+        out
+    }
+
     /// Assemble one [`Table`] from its pre-fetched `SQLite` catalog rows. Pure.
     fn build_table(
         name: &str,
@@ -1812,8 +1899,10 @@ mod sqlite {
         table.primary_key = pk_cols.into_iter().map(|(_, n)| n).collect();
         let single_pk = table.primary_key.len() == 1;
         // AUTOINCREMENT lives in the table's CREATE SQL (sqlite_sequence is empty
-        // until the first insert, so it cannot be relied on).
-        let autoincrement = table_sql.to_ascii_uppercase().contains("AUTOINCREMENT");
+        // until the first insert, so it cannot be relied on). Matched as a KEYWORD
+        // token, not a substring, so a table/column name or literal containing the
+        // substring never misclassifies a plain rowid PK as a serial.
+        let autoincrement = table_sql_has_autoincrement_keyword(table_sql);
 
         let (ir_indexes, unique_columns) = collapse_indexes(name, indexes, index_columns);
         let fk_by_column: BTreeMap<&str, &ForeignKeyRow> = foreign_keys
@@ -2083,6 +2172,53 @@ mod sqlite {
             let columns = vec![col_row("id", "INTEGER", 0, None, 1)];
             let table_sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY)";
             let table = build_table("posts", table_sql, &columns, &[], &BTreeMap::new(), &[]);
+            let id = table.columns.iter().find(|c| c.name == "id").unwrap();
+            assert_eq!(id.serial, Some(SerialKind::Plain));
+        }
+
+        #[test]
+        fn autoincrement_keyword_is_tokenized_not_substring_matched() {
+            assert!(table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            ));
+            assert!(table_sql_has_autoincrement_keyword(
+                "create table t (id integer primary key   autoincrement )"
+            ));
+            // A table NAME containing the substring is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE autoincrement_events (id INTEGER PRIMARY KEY)"
+            ));
+            // A column NAME containing the substring is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (autoincrement_flag INTEGER, id INTEGER PRIMARY KEY)"
+            ));
+            // A string-literal default equal to the keyword is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, kind TEXT DEFAULT 'AUTOINCREMENT')"
+            ));
+            // A quoted identifier equal to the keyword is NOT a match.
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (\"AUTOINCREMENT\" INTEGER, id INTEGER PRIMARY KEY)"
+            ));
+            assert!(!table_sql_has_autoincrement_keyword(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, [AUTOINCREMENT] TEXT)"
+            ));
+        }
+
+        #[test]
+        fn build_table_autoincrement_substring_name_is_plain_not_serial() {
+            // A plain INTEGER PK in a table whose NAME contains the `autoincrement`
+            // substring must be `Some(Plain)`, never mis-flagged BigSerial.
+            let columns = vec![col_row("id", "INTEGER", 0, None, 1)];
+            let table_sql = "CREATE TABLE autoincrement_events (id INTEGER PRIMARY KEY)";
+            let table = build_table(
+                "autoincrement_events",
+                table_sql,
+                &columns,
+                &[],
+                &BTreeMap::new(),
+                &[],
+            );
             let id = table.columns.iter().find(|c| c.name == "id").unwrap();
             assert_eq!(id.serial, Some(SerialKind::Plain));
         }
