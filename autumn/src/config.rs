@@ -2892,7 +2892,7 @@ impl AutumnConfig {
                         _ => {}
                     }
                     path.pop();
-                } else if path.is_empty() && plugin_config_roots.contains(k) {
+                } else if path.is_empty() && plugin_config_roots.contains(k) && val.is_table() {
                     // A plugin has declared this TOP-LEVEL root as its own config
                     // section (via `AppBuilder::config_section`). It is known AND
                     // opaque: accept it and do NOT descend — the plugin, not core,
@@ -2901,6 +2901,15 @@ impl AutumnConfig {
                     // path `[]`), so a key that merely shares a plugin-root name
                     // while nested inside a known section is still validated
                     // normally (fail-closed).
+                    //
+                    // The `val.is_table()` guard keeps the exemption TABLE-only:
+                    // `config_section` declares a top-level config TABLE (`[media]`),
+                    // so a registered root written as a scalar or array
+                    // (`media = "enabled"`, `media = ["a", "b"]`) is a malformed
+                    // section — nothing would deserialize it and the app would boot
+                    // on default plugin config. A non-table value therefore does NOT
+                    // match here and falls through to the normal unknown-root strict
+                    // rejection below, failing loudly instead of booting on defaults.
                     //
                     // A profile-prefixed plugin root (`[profile.<env>.media]`,
                     // path `["profile","<env>"]`) is deliberately NOT exempted and
@@ -2975,13 +2984,19 @@ impl AutumnConfig {
                         _ => {}
                     }
                     path.pop();
-                } else if plugin_config_roots.contains(k) {
+                } else if plugin_config_roots.contains(k) && val.is_table() {
                     // A plugin has declared this top-level root as its own config
                     // section (via `AppBuilder::config_section`). It is known AND
                     // opaque: accept it and do NOT descend — the plugin, not core,
                     // owns validation of its subtree. Deliberately NOT injected
                     // into `root_keys`, which would make the walk recurse and flag
                     // every one of the plugin's children as unknown.
+                    //
+                    // The `val.is_table()` guard keeps the exemption TABLE-only
+                    // (`config_section` declares a top-level `[media]` TABLE): a
+                    // registered root written as a scalar/array is malformed and
+                    // falls through to the unknown-root strict rejection below
+                    // instead of being silently exempted and booting on defaults.
                 } else {
                     let mut closest: Option<&str> = None;
                     let mut min_dist = usize::MAX;
@@ -8138,6 +8153,53 @@ mod tests {
         assert!(
             res.is_ok(),
             "a registered [media] root must boot under strict_config: {res:?}"
+        );
+    }
+
+    // A registered plugin root written as a NON-TABLE (scalar or array) is a
+    // malformed section, not the opaque `[media]` TABLE `config_section`
+    // declares. It must NOT be exempted: nothing would deserialize it and the
+    // app would boot silently on default plugin config, so it stays a strict
+    // unknown-root HARD failure instead. Only a table-shaped `[media]` is opaque.
+    #[test]
+    fn strict_config_rejects_non_table_registered_plugin_root() {
+        // Scalar misspelling of a registered root (`media = "enabled"` instead of
+        // the `[media]` table) must hard-fail under strict_config.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("autumn.toml"), "media = \"enabled\"\n").unwrap();
+
+        let env = strict_prod_env(temp.path(), false);
+        let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &plugin_roots(&["media"]));
+        assert!(
+            res.is_err(),
+            "a scalar-valued registered root (media = \"enabled\") must hard-fail \
+             under strict_config, not be exempted as an opaque table: {res:?}"
+        );
+        assert!(
+            format!("{:?}", res.err().unwrap()).contains("media"),
+            "error should name the malformed media root"
+        );
+
+        // Array-valued registered root (`media = ["a", "b"]`) is likewise
+        // malformed and must hard-fail.
+        let temp_arr = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_arr.path().join("autumn.toml"),
+            "media = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+
+        let env_arr = strict_prod_env(temp_arr.path(), false);
+        let res_arr =
+            AutumnConfig::load_with_env_and_plugin_roots(&env_arr, &plugin_roots(&["media"]));
+        assert!(
+            res_arr.is_err(),
+            "an array-valued registered root (media = [\"a\", \"b\"]) must hard-fail \
+             under strict_config, not be exempted as an opaque table: {res_arr:?}"
+        );
+        assert!(
+            format!("{:?}", res_arr.err().unwrap()).contains("media"),
+            "error should name the malformed media array root"
         );
     }
 
