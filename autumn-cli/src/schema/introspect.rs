@@ -16,9 +16,13 @@
 //!   Postgres type as [`ColumnType::Opaque`] rather than dropping the column —
 //!   introspection never silently loses a column.
 //! - **Serial/UUID PK round-trip**: a single-column integer PK whose default is a
-//!   `nextval(...)` sequence is a `BIGSERIAL`-shaped id, which the model IR
-//!   represents as an [`Int64`](ColumnType::Int64) PK with **no** default — so the
-//!   `nextval` default is stripped to `None`. A single-column UUID PK keeps its
+//!   `nextval(...)` sequence **that the column owns** is a `BIGSERIAL`-shaped id,
+//!   which the model IR represents as an [`Int64`](ColumnType::Int64) PK with **no**
+//!   default — so the `nextval` default is stripped to `None`. Ownership is required:
+//!   a brownfield int8 PK backed by a *shared/custom* sequence it does not own
+//!   (`id BIGINT PRIMARY KEY DEFAULT nextval('global_ids')`) keeps its raw default
+//!   verbatim, so recreation continues allocating from that sequence rather than
+//!   minting a fresh owned `BIGSERIAL`. A single-column UUID PK keeps its
 //!   `gen_random_uuid()` default (the model parser records the same), so the two
 //!   agree. See [`normalize_default`] / [`normalize_serial_pk_default`].
 //! - **Uniqueness**: a single-column unique index sets the owning column's
@@ -130,6 +134,15 @@
 //!   (their identity metadata from `information_schema.columns.is_identity` is not
 //!   modeled); recreation emits a plain column / loses the identity — identity
 //!   modeling is deferred alongside owned sequences.
+//! - **PG15+ `NULLS NOT DISTINCT` unique indexes**: pulled as ordinary unique
+//!   indexes; the `NULLS NOT DISTINCT` clause is not preserved (detecting it needs
+//!   the PG15+ `pg_index.indnullsnotdistinct` catalog column, which would break
+//!   introspection on PG13/14). Deferred.
+//! - **Stored/virtual `GENERATED ALWAYS AS (...) STORED` generated columns**: pulled
+//!   as ordinary columns; the generation expression
+//!   (`information_schema.columns.generation_expression`) is not modeled, so
+//!   recreation drops the computed-value behavior. Deferred alongside
+//!   identity/owned-sequence modeling.
 //!
 //! Errors are **credential-safe** by construction: no variant ever embeds the
 //! resolved database URL (only a parsed host/port on the connection-error path,
@@ -262,6 +275,18 @@ struct ColumnRow {
     /// Only qualifies the emitted type when it is not `public`.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     domain_schema: Option<String>,
+    /// Whether this column **owns** the sequence backing its `nextval(...)`
+    /// default — the conventional `SERIAL`/`BIGSERIAL` shape, where Postgres links
+    /// the sequence to the column with an `OWNED BY` auto-dependency (`pg_depend`
+    /// `deptype = 'a'`). A `nextval(...)` default over a *shared*/custom sequence
+    /// that is **not** owned by the column reports `false`, so its raw default is
+    /// preserved verbatim rather than collapsed to a fresh owned `BIGSERIAL` on
+    /// recreation (which would silently change ID-allocation behavior — see
+    /// [`normalize_serial_pk_default`]). Detected via long-standing catalogs only
+    /// (`pg_depend` / `pg_class` / `pg_attribute`), so it is version-safe on every
+    /// supported Postgres (no PG15+ catalog columns).
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    owns_sequence: bool,
 }
 
 #[derive(QueryableByName)]
@@ -448,14 +473,41 @@ fn fetch_columns(
     // would error and every pull would fail. Cast each to a plain `integer` in SQL so
     // the output type is guaranteed `int4` regardless of the domain. The `AS <name>`
     // aliases keep the result column names aligned with the `ColumnRow` field bindings.
+    //
+    // `owns_sequence` is an `EXISTS` over `pg_depend`: a serial column OWNS its
+    // sequence through an `OWNED BY` auto-dependency — a `pg_depend` row whose
+    // `deptype = 'a'` links a sequence (`pg_class.relkind = 'S'`, as `objid`) to
+    // this exact column (`refobjid = <table oid>`, `refobjsubid = <column
+    // attnum>`, `refclassid = classid = 'pg_class'::regclass`). This is the
+    // conventional `SERIAL`/`BIGSERIAL` shape. A `nextval(...)` default over a
+    // shared/custom sequence NOT owned by the column has no such row, so
+    // `owns_sequence` is `false` and the raw default is preserved. `pg_depend`
+    // exists in every supported Postgres, so this never breaks older servers.
     let query = format!(
-        "SELECT table_name, column_name, udt_name, is_nullable, column_default, \
-         numeric_precision::integer AS numeric_precision, \
-         numeric_scale::integer AS numeric_scale, \
-         character_maximum_length::integer AS character_maximum_length, \
-         domain_name, domain_schema FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name IN ({}) \
-         ORDER BY table_name, ordinal_position",
+        "SELECT c.table_name, c.column_name, c.udt_name, c.is_nullable, c.column_default, \
+         c.numeric_precision::integer AS numeric_precision, \
+         c.numeric_scale::integer AS numeric_scale, \
+         c.character_maximum_length::integer AS character_maximum_length, \
+         c.domain_name, c.domain_schema, \
+         EXISTS ( \
+           SELECT 1 \
+           FROM pg_depend dep \
+           JOIN pg_class seq ON seq.oid = dep.objid AND seq.relkind = 'S' \
+           JOIN pg_class tbl ON tbl.oid = dep.refobjid \
+           JOIN pg_namespace tn ON tn.oid = tbl.relnamespace \
+           JOIN pg_attribute att \
+             ON att.attrelid = dep.refobjid AND att.attnum = dep.refobjsubid \
+           WHERE dep.classid = 'pg_class'::regclass \
+             AND dep.refclassid = 'pg_class'::regclass \
+             AND dep.deptype = 'a' \
+             AND dep.refobjsubid > 0 \
+             AND tn.nspname = 'public' \
+             AND tbl.relname = c.table_name \
+             AND att.attname = c.column_name \
+         ) AS owns_sequence \
+         FROM information_schema.columns c \
+         WHERE c.table_schema = 'public' AND c.table_name IN ({}) \
+         ORDER BY c.table_name, c.ordinal_position",
         quoted_in_list(tables)
     );
     let rows: Vec<ColumnRow> = sql_query(query)
@@ -801,7 +853,13 @@ fn build_table(
         column.nullable = row.is_nullable.eq_ignore_ascii_case("YES");
         column.primary_key = is_pk;
         column.unique = unique_columns.contains(row.column_name.as_str());
-        column.default = normalize_default(row.column_default.as_deref(), &ty, is_pk, primary_key);
+        column.default = normalize_default(
+            row.column_default.as_deref(),
+            &ty,
+            is_pk,
+            primary_key,
+            row.owns_sequence,
+        );
         if let Some(fk) = fk_by_column.get(row.column_name.as_str()) {
             // Fail-closed floor for cross-schema FK targets: a FK to a table
             // outside `public` (`REFERENCES auth.users(id)`) must be stored
@@ -973,10 +1031,15 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
 ///
 /// - `NULL` (no default) → `None`.
 /// - `now()` / `CURRENT_TIMESTAMP` → [`ColumnDefault::Now`].
-/// - a `nextval(...)` serial default on a single-column **int8** primary key →
-///   `None` (a `BIGSERIAL`-shaped id has no explicit default in the model IR;
-///   see [`normalize_serial_pk_default`]). An **int4** `SERIAL` PK keeps its
-///   `nextval(...)` default so the emitter can reconstruct it as `SERIAL`.
+/// - a `nextval(...)` serial default on a single-column **int8** primary key whose
+///   sequence is **owned** by the column → `None` (a `BIGSERIAL`-shaped id has no
+///   explicit default in the model IR; see [`normalize_serial_pk_default`]). An
+///   **int4** `SERIAL` PK keeps its `nextval(...)` default so the emitter can
+///   reconstruct it as `SERIAL`.
+/// - a `nextval(...)` default over a **shared/custom** sequence NOT owned by the
+///   column (`owns_sequence == false`) → preserved verbatim as
+///   [`ColumnDefault::Sql`], so recreation continues to allocate from that
+///   sequence instead of minting a fresh owned `BIGSERIAL`.
 /// - anything else → [`ColumnDefault::Sql`] verbatim (e.g. a UUID PK's
 ///   `gen_random_uuid()`, which the model parser records identically).
 fn normalize_default(
@@ -984,6 +1047,7 @@ fn normalize_default(
     ty: &ColumnType,
     is_primary_key: bool,
     primary_key: &[String],
+    owns_sequence: bool,
 ) -> Option<ColumnDefault> {
     let raw = raw?.trim();
     if raw.is_empty() {
@@ -994,36 +1058,51 @@ fn normalize_default(
         return Some(ColumnDefault::Now);
     }
     // A serial (`nextval(...)`) default on a single-column integer PK is the
-    // BIGSERIAL id shape — the model IR carries no explicit default for it.
-    if normalize_serial_pk_default(&lowered, ty, is_primary_key, primary_key) {
+    // BIGSERIAL id shape ONLY when the column owns its sequence — the model IR
+    // carries no explicit default for it. A shared/custom (non-owned) sequence
+    // default falls through and is preserved verbatim below.
+    if normalize_serial_pk_default(&lowered, ty, is_primary_key, primary_key, owns_sequence) {
         return None;
     }
     Some(ColumnDefault::Sql(raw.to_owned()))
 }
 
 /// Whether a raw (lower-cased) default is the auto-increment sequence default of
-/// a single-column **`BIGSERIAL`** (int8) primary key — i.e. the shape the model IR
-/// represents as an [`Int64`](ColumnType::Int64) PK with **no** default. Such a
-/// default is stripped to `None` so an introspected `BIGSERIAL` id round-trips
-/// against the model parser (whose `pk_kind_for` requires `default.is_none()` for a
-/// `BigSerial` PK).
+/// a single-column **`BIGSERIAL`** (int8) primary key **that owns its sequence** —
+/// i.e. the shape the model IR represents as an [`Int64`](ColumnType::Int64) PK with
+/// **no** default. Such a default is stripped to `None` so an introspected
+/// `BIGSERIAL` id round-trips against the model parser (whose `pk_kind_for` requires
+/// `default.is_none()` for a `BigSerial` PK).
 ///
-/// A single-column **`SERIAL`** (int4) PK is deliberately **not** stripped: the
-/// model IR has no default-less int4-PK shape, so keeping the `nextval(...)` default
-/// is what lets the DDL emitter recognize it (via `pk_kind_for`) and reconstruct it
-/// as `SERIAL PRIMARY KEY` — recreating it as a plain `INTEGER PRIMARY KEY` would
-/// silently drop the sequence. A plain int PK with no default stays default-less and
-/// so recreates as a plain integer PK (no auto-increment).
+/// **Ownership is load-bearing**: only a *conventional* serial — where Postgres
+/// links the sequence to the column via an `OWNED BY` auto-dependency
+/// (`owns_sequence == true`, sourced from `pg_depend` `deptype = 'a'`) — is the
+/// default-less `BIGSERIAL` shape. A brownfield int8 PK backed by a **shared/custom**
+/// sequence it does NOT own (`id BIGINT PRIMARY KEY DEFAULT nextval('global_ids')`)
+/// is deliberately **not** stripped: stripping it would make recreation/rollback
+/// emit a fresh owned `BIGSERIAL` (a NEW sequence) instead of continuing to allocate
+/// from `global_ids` — a silent, wrong ID-allocation change. Its raw
+/// `nextval(...)` default is preserved verbatim instead.
+///
+/// A single-column **`SERIAL`** (int4) PK is deliberately **not** stripped (this
+/// function only ever matches [`Int64`](ColumnType::Int64)): the model IR has no
+/// default-less int4-PK shape, so keeping the `nextval(...)` default is what lets the
+/// DDL emitter recognize it (via `pk_kind_for`) and reconstruct it as `SERIAL PRIMARY
+/// KEY` — recreating it as a plain `INTEGER PRIMARY KEY` would silently drop the
+/// sequence. A plain int PK with no default stays default-less and so recreates as a
+/// plain integer PK (no auto-increment).
 fn normalize_serial_pk_default(
     lowered_default: &str,
     ty: &ColumnType,
     is_primary_key: bool,
     primary_key: &[String],
+    owns_sequence: bool,
 ) -> bool {
     is_primary_key
         && primary_key.len() == 1
         && matches!(ty, ColumnType::Int64)
         && lowered_default.starts_with("nextval(")
+        && owns_sequence
 }
 
 #[cfg(test)]
@@ -1069,50 +1148,86 @@ mod tests {
 
     #[test]
     fn normalize_default_now_variants() {
-        let now = normalize_default(Some("now()"), &ColumnType::Timestamp, false, &[]);
+        let now = normalize_default(Some("now()"), &ColumnType::Timestamp, false, &[], false);
         assert_eq!(now, Some(ColumnDefault::Now));
         let ct = normalize_default(
             Some("CURRENT_TIMESTAMP"),
             &ColumnType::TimestampTz,
             false,
             &[],
+            false,
         );
         assert_eq!(ct, Some(ColumnDefault::Now));
     }
 
     #[test]
     fn normalize_default_null_is_none() {
-        assert_eq!(normalize_default(None, &ColumnType::Text, false, &[]), None);
         assert_eq!(
-            normalize_default(Some("  "), &ColumnType::Text, false, &[]),
+            normalize_default(None, &ColumnType::Text, false, &[], false),
+            None
+        );
+        assert_eq!(
+            normalize_default(Some("  "), &ColumnType::Text, false, &[], false),
             None
         );
     }
 
     #[test]
     fn normalize_serial_pk_default_stripped_to_none() {
-        // A `nextval(...)` default on a single-column int8 PK → None (BIGSERIAL id).
+        // (a) A `nextval(...)` default on a single-column int8 PK that OWNS its
+        // sequence (the conventional `BIGSERIAL` shape) → None (BIGSERIAL id).
         let pk = vec!["id".to_owned()];
         let d = normalize_default(
             Some("nextval('posts_id_seq'::regclass)"),
             &ColumnType::Int64,
             true,
             &pk,
+            true, // owns its sequence — conventional BIGSERIAL
         );
-        assert_eq!(d, None, "int8 serial PK default must be stripped to None");
+        assert_eq!(
+            d, None,
+            "int8 serial PK default (owned sequence) must be stripped to None"
+        );
+    }
+
+    #[test]
+    fn normalize_int8_serial_pk_shared_sequence_default_is_preserved() {
+        // (b) A `nextval(...)` default on a single-column int8 PK backed by a
+        // SHARED/custom sequence the column does NOT own
+        // (`id BIGINT PRIMARY KEY DEFAULT nextval('global_ids')`) must be PRESERVED
+        // verbatim — stripping it would make recreation mint a fresh owned
+        // `BIGSERIAL` (a new sequence) instead of continuing to allocate from
+        // `global_ids`, silently changing ID-allocation behavior.
+        let pk = vec!["id".to_owned()];
+        let d = normalize_default(
+            Some("nextval('global_ids'::regclass)"),
+            &ColumnType::Int64,
+            true,
+            &pk,
+            false, // does NOT own the sequence — shared/custom
+        );
+        assert_eq!(
+            d,
+            Some(ColumnDefault::Sql(
+                "nextval('global_ids'::regclass)".to_owned()
+            )),
+            "int8 PK default over a non-owned (shared) sequence must be preserved verbatim"
+        );
     }
 
     #[test]
     fn normalize_int4_serial_pk_default_is_kept() {
-        // A `nextval(...)` default on a single-column int4 PK is a brownfield
+        // (c) A `nextval(...)` default on a single-column int4 PK is a brownfield
         // `SERIAL PRIMARY KEY` — its default is PRESERVED (not stripped) so the DDL
-        // emitter can reconstruct it as `SERIAL` rather than a plain `INTEGER`.
+        // emitter can reconstruct it as `SERIAL` rather than a plain `INTEGER`. This
+        // holds regardless of ownership (only int8 owned serials are stripped).
         let pk = vec!["id".to_owned()];
         let d = normalize_default(
             Some("nextval('counters_id_seq'::regclass)"),
             &ColumnType::Int32,
             true,
             &pk,
+            true, // even an owned int4 serial keeps its default (int4 is never stripped)
         );
         assert_eq!(
             d,
@@ -1128,28 +1243,37 @@ mod tests {
         // A plain int4 PK with NO default stays default-less → a plain integer PK
         // (no auto-increment), never mistaken for a SERIAL.
         let pk = vec!["id".to_owned()];
-        let d = normalize_default(None, &ColumnType::Int32, true, &pk);
+        let d = normalize_default(None, &ColumnType::Int32, true, &pk, false);
         assert_eq!(d, None, "a plain int4 PK carries no default");
     }
 
     #[test]
     fn normalize_serial_default_on_non_pk_is_kept_as_sql() {
-        // A sequence default on a NON-pk column is not the id shape — keep it.
+        // A sequence default on a NON-pk column is not the id shape — keep it (even
+        // when the column owns the sequence, i.e. a non-PK `SERIAL` column).
         let d = normalize_default(
             Some("nextval('counter_seq'::regclass)"),
             &ColumnType::Int64,
             false,
             &[],
+            true,
         );
         assert!(matches!(d, Some(ColumnDefault::Sql(_))));
     }
 
     #[test]
     fn normalize_uuid_pk_default_is_kept_as_sql() {
-        // A UUID PK keeps its gen_random_uuid() default (the model parser records
-        // the same), so the two agree on a round-trip.
+        // (d) A UUID PK keeps its gen_random_uuid() default (the model parser records
+        // the same), so the two agree on a round-trip — unaffected by the ownership
+        // signal (UUID PKs have no sequence).
         let pk = vec!["id".to_owned()];
-        let d = normalize_default(Some("gen_random_uuid()"), &ColumnType::Uuid, true, &pk);
+        let d = normalize_default(
+            Some("gen_random_uuid()"),
+            &ColumnType::Uuid,
+            true,
+            &pk,
+            false,
+        );
         assert_eq!(d, Some(ColumnDefault::Sql("gen_random_uuid()".to_owned())));
     }
 
@@ -1522,6 +1646,9 @@ mod tests {
                 character_maximum_length: None,
                 domain_name: None,
                 domain_schema: None,
+                // The conventional BIGSERIAL id owns its sequence, so the nextval
+                // default is stripped to None below.
+                owns_sequence: true,
             },
             ColumnRow {
                 table_name: "comments".to_owned(),
@@ -1534,6 +1661,7 @@ mod tests {
                 character_maximum_length: None,
                 domain_name: None,
                 domain_schema: None,
+                owns_sequence: false,
             },
         ];
         let pk = vec!["id".to_owned()];
@@ -1584,6 +1712,7 @@ mod tests {
             character_maximum_length: None,
             domain_name: None,
             domain_schema: None,
+            owns_sequence: false,
         }];
         let table = build_table("widgets", &columns, &[], &[], &[], &[]);
         let addr = table.columns.iter().find(|c| c.name == "addr").unwrap();
@@ -1613,6 +1742,7 @@ mod tests {
                 character_maximum_length: None,
                 domain_name: Some("email_dom".to_owned()),
                 domain_schema: Some("public".to_owned()),
+                owns_sequence: false,
             },
             // A non-domain column (`domain_name` NULL) maps exactly as before.
             ColumnRow {
@@ -1626,6 +1756,7 @@ mod tests {
                 character_maximum_length: None,
                 domain_name: None,
                 domain_schema: None,
+                owns_sequence: false,
             },
         ];
         let table = build_table("contacts", &columns, &[], &[], &[], &[]);
@@ -1663,6 +1794,7 @@ mod tests {
                 character_maximum_length: Some(32),
                 domain_name: None,
                 domain_schema: None,
+                owns_sequence: false,
             },
             ColumnRow {
                 table_name: "labels".to_owned(),
@@ -1675,6 +1807,7 @@ mod tests {
                 character_maximum_length: Some(2),
                 domain_name: None,
                 domain_schema: None,
+                owns_sequence: false,
             },
             ColumnRow {
                 table_name: "labels".to_owned(),
@@ -1687,6 +1820,7 @@ mod tests {
                 character_maximum_length: None,
                 domain_name: None,
                 domain_schema: None,
+                owns_sequence: false,
             },
         ];
         let table = build_table("labels", &columns, &[], &[], &[], &[]);
@@ -1730,6 +1864,7 @@ mod tests {
             character_maximum_length: Some(32),
             domain_name: Some("code_dom".to_owned()),
             domain_schema: Some("public".to_owned()),
+            owns_sequence: false,
         }];
         let table = build_table("labels", &columns, &[], &[], &[], &[]);
         let code = table.columns.iter().find(|c| c.name == "code").unwrap();
@@ -1757,6 +1892,7 @@ mod tests {
             character_maximum_length: None,
             domain_name: Some("email_dom".to_owned()),
             domain_schema: Some("otherschema".to_owned()),
+            owns_sequence: false,
         }];
         let table = build_table("contacts", &columns, &[], &[], &[], &[]);
         let email = table.columns.iter().find(|c| c.name == "email").unwrap();
@@ -1784,6 +1920,7 @@ mod tests {
             character_maximum_length: None,
             domain_name: None,
             domain_schema: None,
+            owns_sequence: false,
         }];
         let fks = vec![ForeignKeyRow {
             table_name: "sessions".to_owned(),
@@ -1819,6 +1956,7 @@ mod tests {
             character_maximum_length: None,
             domain_name: None,
             domain_schema: None,
+            owns_sequence: false,
         }];
         let fks = vec![ForeignKeyRow {
             table_name: "comments".to_owned(),
@@ -1851,6 +1989,7 @@ mod tests {
             character_maximum_length: None,
             domain_name: None,
             domain_schema: None,
+            owns_sequence: false,
         }];
         let checks = vec![CheckRow {
             table_name: "products".to_owned(),
@@ -1879,6 +2018,7 @@ mod tests {
             character_maximum_length: None,
             domain_name: None,
             domain_schema: None,
+            owns_sequence: false,
         }];
         let table = build_table("products", &columns, &[], &[], &[], &[]);
         assert!(
