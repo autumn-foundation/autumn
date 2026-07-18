@@ -896,22 +896,22 @@ mod tests {
         let registry = TenantCellRegistry::default();
         let handle = TenantCellHandle::new(registry.clone(), "tenant1".to_string(), 1000);
 
-        let registry_debug = format!("{:?}", registry);
+        let registry_debug = format!("{registry:?}");
         assert!(registry_debug.contains("TenantCellRegistry"));
         assert!(registry_debug.contains("cells: 0"));
 
-        let handle_debug = format!("{:?}", handle);
+        let handle_debug = format!("{handle:?}");
         assert!(handle_debug.contains("TenantCellHandle"));
         assert!(handle_debug.contains("tenant1"));
         assert!(handle_debug.contains("materialized: false"));
 
         let cell = handle.cell();
-        let handle_debug_after = format!("{:?}", handle);
+        let handle_debug_after = format!("{handle:?}");
         assert!(handle_debug_after.contains("materialized: true"));
 
         let charge = cell.try_charge(10).unwrap();
         assert_eq!(charge.bytes(), 10);
-        let charge_debug = format!("{:?}", charge);
+        let charge_debug = format!("{charge:?}");
         assert!(charge_debug.contains("Charge"));
         assert!(charge_debug.contains("tenant1"));
         assert!(charge_debug.contains("bytes: 10"));
