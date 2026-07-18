@@ -542,6 +542,94 @@ fn schema_pull_preserves_generated_columns() {
     );
 }
 
+/// CONTRACT (Codex review): a retained `SQLite` partial index references its
+/// WHERE-predicate column only in its verbatim `definition`. Dropping that column
+/// must PRUNE the index (not leave an orphan that references a missing column), so
+/// the generated table-rebuild migration APPLIES cleanly — `SQLite` would otherwise
+/// reject the rebuild that recreates `... WHERE deleted_at IS NULL` on a table with
+/// no `deleted_at`.
+#[test]
+fn schema_pull_dropping_partial_index_predicate_column_prunes_the_index() {
+    let (_tmp, project) = fresh_project("pull_sqlite_partial_idx");
+    let db_path = project.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_partial",
+        "CREATE TABLE notes (\
+           id INTEGER PRIMARY KEY AUTOINCREMENT, \
+           email TEXT NOT NULL, \
+           deleted_at TEXT, \
+           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\n\
+         CREATE INDEX notes_email_active ON notes (email) WHERE deleted_at IS NULL;\n",
+        "DROP TABLE notes;\n",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+
+    // A model that DROPS `deleted_at` (the partial index's predicate column). The
+    // model cannot express the partial index, so it is retained — and the column drop
+    // must prune it during the rebuild.
+    write_models(
+        &project,
+        "#[autumn_web::model(managed)]\npub struct Note {\n    #[id]\n    pub id: i64,\n    \
+         pub email: String,\n}\n",
+    );
+    run_autumn_ok(
+        &project,
+        &[
+            "schema",
+            "diff",
+            "--write-migration",
+            "--name",
+            "drop_deleted_at",
+            "--allow-destructive",
+        ],
+        &envs,
+    );
+
+    // The generated up.sql must NOT recreate the orphaned partial index.
+    let mig_dir = std::fs::read_dir(project.join("migrations"))
+        .expect("migrations dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_drop_deleted_at"))
+        })
+        .expect("drop migration written");
+    let up = std::fs::read_to_string(mig_dir.join("up.sql")).expect("up.sql");
+    // The orphaned partial index is DROPPED (before the column drop), never left
+    // referencing the missing column nor recreated with its `WHERE deleted_at` clause.
+    assert!(
+        up.contains("DROP INDEX") && up.contains("notes_email_active"),
+        "the partial index depending on the dropped column is dropped first:\n{up}"
+    );
+    assert!(
+        !up.contains("CREATE INDEX \"notes_email_active\"")
+            && !up.contains("CREATE INDEX notes_email_active"),
+        "the orphaned partial index is NOT recreated:\n{up}"
+    );
+    // `DROP INDEX` must precede the `DROP COLUMN` (SQLite rejects DROP COLUMN while a
+    // live index references the column).
+    if let (Some(di), Some(dc)) = (up.find("DROP INDEX"), up.find("DROP COLUMN")) {
+        assert!(di < dc, "DROP INDEX must come before DROP COLUMN:\n{up}");
+    }
+
+    // THE PROOF: the rebuild migration APPLIES cleanly (an orphaned partial index
+    // referencing the missing `deleted_at` would make SQLite reject the rebuild).
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+    let (doc_out, _) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor is clean after the column drop + index prune:\n{doc_out}"
+    );
+}
+
 /// CONTRACT (Codex review): a `schema pull` against a NONEXISTENT sqlite file must
 /// error clearly (`SQLite` would otherwise create-on-open an empty DB and a non-dry-run
 /// pull would overwrite the checked-in snapshot with zero tables). It must NOT create
@@ -576,5 +664,79 @@ fn schema_pull_errors_on_missing_sqlite_file() {
         std::fs::read_to_string(&snapshot_path).expect("snapshot"),
         sentinel,
         "the existing snapshot must NOT be overwritten"
+    );
+}
+
+/// CONTRACT (Codex review): the create-on-open guard must also cover `file:` URIs —
+/// a `file:` URI with a MISSING path must error (not create-on-open + clobber the
+/// snapshot), while a `file:` URI pointing at a REAL DB pulls normally.
+#[test]
+fn schema_pull_file_uri_missing_path_errors_but_real_path_pulls() {
+    let (_tmp, project) = fresh_project("pull_sqlite_file_uri");
+    let db_path = project.join("app.db");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // First build a real DB via a bare-path migration.
+    let bare_url = format!("sqlite://{}", db_path.display());
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_one",
+        "CREATE TABLE widgets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);\n",
+        "DROP TABLE widgets;\n",
+    );
+    run_autumn_ok(
+        &project,
+        &["schema", "migrate"],
+        &[("AUTUMN_DATABASE__URL", &bare_url)],
+    );
+    assert!(db_path.is_file(), "real DB created");
+
+    // (a) A `file:` URI with a MISSING path must ERROR and not create the file.
+    let missing = project.join("nope.db");
+    let missing_uri = format!("file:{}", missing.display());
+    std::fs::create_dir_all(project.join(".autumn")).expect("mkdir .autumn");
+    let sentinel = "{\"backend\":\"Sqlite\",\"tables\":[{\"name\":\"sentinel\",\"managed\":true,\"columns\":[],\"indexes\":[],\"checks\":[],\"primary_key\":[]}]}";
+    std::fs::write(&snapshot_path, sentinel).expect("seed snapshot");
+    let (out, err, code) = run_autumn(
+        &project,
+        &["schema", "pull"],
+        &[("AUTUMN_DATABASE__URL", &missing_uri)],
+    );
+    let combined = format!("{out}{err}");
+    assert_ne!(
+        code,
+        Some(0),
+        "a file: URI with a missing path must fail:\n{combined}"
+    );
+    assert!(
+        combined.contains("could not open the SQLite database") && combined.contains("nope.db"),
+        "the error names the missing file: {combined}"
+    );
+    assert!(
+        !missing.exists(),
+        "the missing file: URI DB must NOT be created"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&snapshot_path).expect("snapshot"),
+        sentinel,
+        "the snapshot must NOT be overwritten by the failed file: pull"
+    );
+
+    // (b) A `file:` URI pointing at the REAL DB pulls normally.
+    let real_uri = format!("file:{}", db_path.display());
+    let (pull_out, _) = run_autumn_ok(
+        &project,
+        &["schema", "pull"],
+        &[("AUTUMN_DATABASE__URL", &real_uri)],
+    );
+    assert!(
+        pull_out.contains("pulled schema snapshot") && pull_out.contains("1 table(s)"),
+        "a file: URI at a real DB pulls: {pull_out}"
+    );
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        snap.contains("\"name\": \"widgets\""),
+        "widgets pulled: {snap}"
     );
 }

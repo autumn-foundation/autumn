@@ -1125,7 +1125,7 @@ fn diff_table(
         }
     }
 
-    diff_indexes(&want.name, base, want, &skipped, opts, changes);
+    diff_indexes(&want.name, base, want, &skipped, opts, backend, changes);
     diff_checks(&want.name, base, want, changes);
 }
 
@@ -1286,21 +1286,66 @@ fn indexes_equivalent(a: &Index, b: &Index) -> bool {
     }
 }
 
-/// Whether `index` depends on column `col` — i.e. Postgres would automatically
-/// drop the index (and any constraint it backs) when `col` is dropped via
-/// `ALTER TABLE … DROP COLUMN`. True iff `col` is in the index's `columns`.
+/// Whether `index` depends on column `col` — i.e. dropping `col` via
+/// `ALTER TABLE … DROP COLUMN` would leave the index referencing a missing column
+/// (so the index must be dropped/pruned first).
 ///
-/// For a retained (`definition`-carrying) expression/partial/constraint-owned index
-/// `columns` is the **exact `pg_depend` dependent-column set** captured by
-/// introspection (key, expression-referenced, AND predicate columns — the same set
-/// Postgres cascades on a `DROP COLUMN`), so membership is an exact match rather
-/// than a `definition`-text scan (which could false-positive on a column name that
-/// merely appears in a string literal, e.g. a partial index `WHERE kind = 'email'`
-/// while dropping an unrelated `email` column). Both `project_plan_target` (snapshot
-/// projection) and [`emit_down_sql_pg`] (rollback restore) use this single test so
-/// they cannot drift.
-pub fn index_depends_on_column(index: &Index, col: &str) -> bool {
-    index.columns.iter().any(|c| c == col)
+/// **Postgres**: dependency is EXACT `columns` membership. For a retained
+/// (`definition`-carrying) expression/partial/constraint-owned index `columns` is
+/// the **exact `pg_depend` dependent-column set** captured by introspection (key,
+/// expression-referenced, AND predicate columns — the same set Postgres cascades on
+/// a `DROP COLUMN`), so a text scan is unnecessary and deliberately avoided (it would
+/// false-positive on a column name that merely appears in a string literal, e.g. a
+/// partial index `WHERE kind = 'email'` while dropping an unrelated `email` column).
+///
+/// **`SQLite`**: a retained partial/expression index records only its KEY columns in
+/// `columns` (its WHERE-predicate / key-expression columns are NOT captured there —
+/// `SQLite`'s catalog exposes no `pg_depend` equivalent), so exact `columns`
+/// membership misses a predicate/expression column. To avoid emitting an
+/// invalid `DROP COLUMN` that orphans such an index, the verbatim `definition` is
+/// **word-bounded token-scanned** for `col`: any occurrence counts as a dependency,
+/// so the index is pruned before the column drop. This is the conservative
+/// over-include-is-safe direction (a false positive from a string literal at worst
+/// prunes an index that a rebuild would recreate anyway — never invalid SQL).
+///
+/// Both `project_plan_target` (snapshot projection) and [`emit_down_sql_pg`] use this
+/// single test so they cannot drift.
+pub fn index_depends_on_column(index: &Index, col: &str, backend: Backend) -> bool {
+    if index.columns.iter().any(|c| c == col) {
+        return true;
+    }
+    if backend == Backend::Sqlite
+        && let Some(def) = &index.definition
+    {
+        return definition_references_column(def, col);
+    }
+    false
+}
+
+/// Whether the verbatim index `definition` references the identifier `col` as a
+/// **word-bounded** token (case-insensitive; word chars are `[A-Za-z0-9_]`), so a
+/// quoted `"col"`, a bare `col`, or `col` inside an expression/predicate matches, but
+/// a longer identifier that merely contains it (`col_backup`, `old_col`) does not.
+fn definition_references_column(definition: &str, col: &str) -> bool {
+    if col.is_empty() {
+        return false;
+    }
+    let hay = definition.to_ascii_lowercase();
+    let needle = col.to_ascii_lowercase();
+    let hb = hay.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(&needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !is_word(hb[start - 1]);
+        let after_ok = end == hb.len() || !is_word(hb[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 ///
@@ -1427,12 +1472,25 @@ fn diff_indexes(
     want: &Table,
     skipped: &BTreeSet<String>,
     opts: DiffOptions,
+    backend: Backend,
     changes: &mut Vec<SchemaChange>,
 ) {
     let base_by_name: BTreeMap<&str, &Index> =
         base.indexes.iter().map(|i| (i.name.as_str(), i)).collect();
     let want_by_name: BTreeMap<&str, &Index> =
         want.indexes.iter().map(|i| (i.name.as_str(), i)).collect();
+    // Columns that this diff DROPS (present in the baseline, absent from the desired
+    // side, and not a parser-skipped column). An index — even a retained one — that
+    // depends on such a column CANNOT survive the drop (SQLite rejects DROP COLUMN on
+    // a referenced column), so it must be dropped BEFORE the column (`DropIndex` is
+    // ordered ahead of `DropColumn`).
+    let want_col_names: BTreeSet<&str> = want.columns.iter().map(|c| c.name.as_str()).collect();
+    let dropped_columns: Vec<&str> = base
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .filter(|n| !want_col_names.contains(n) && !skipped.contains(*n))
+        .collect();
 
     for want_idx in &want.indexes {
         match base_by_name.get(want_idx.name.as_str()) {
@@ -1508,12 +1566,28 @@ fn diff_indexes(
         {
             continue;
         }
+        // SQLite ONLY: an index that depends on a column being DROPPED must be
+        // dropped first — even a retained (`definition`) one the model cannot express
+        // — else it would reference a missing column (SQLite rejects the
+        // `DROP COLUMN`). This OVERRIDES the retention rule below; its down leg
+        // recreates the index verbatim (after the column is re-added), so the
+        // rollback is faithful. Postgres is EXCLUDED: it cascade-drops the dependent
+        // index automatically on `DROP COLUMN` and restores it on rollback via
+        // `retained_indexes_depending_on_any`, so an explicit `DropIndex` there would
+        // double-drop and break that mechanism.
+        let orphaned_by_column_drop = backend == Backend::Sqlite
+            && dropped_columns
+                .iter()
+                .any(|c| index_depends_on_column(base_idx, c, backend));
         // A baseline-only `definition` index has no same-named desired index, and
         // in a model diff the desired side could not have expressed it anyway —
         // retain it (never DropIndex), independent of `allow_destructive`. In an
         // introspection diff it is authoritative, so a genuinely-dropped
         // expression/partial index still drops.
-        if base_idx.definition.is_some() && !opts.definitions_authoritative {
+        if base_idx.definition.is_some()
+            && !opts.definitions_authoritative
+            && !orphaned_by_column_drop
+        {
             continue;
         }
         changes.push(SchemaChange::DropIndex {
@@ -2251,7 +2325,9 @@ fn retained_indexes_depending_on_any<'a>(
                 i.definition.is_some()
                     && dropped_columns
                         .iter()
-                        .any(|c| index_depends_on_column(i, c))
+                        // pg-only rollback path (`emit_down_sql_pg`) — exact `columns`
+                        // membership; the SQLite definition-scan branch never runs here.
+                        .any(|c| index_depends_on_column(i, c, Backend::Postgres))
             })
             .collect()
     })
@@ -2501,6 +2577,14 @@ fn baseline_with_changes_applied(
             SchemaChange::DropColumn { column, .. } => {
                 shape.columns.retain(|c| c.name != column.name);
                 shape.primary_key.retain(|n| n != &column.name);
+                // Prune any index depending on the dropped column — including a
+                // retained partial/expression index that references the column only
+                // in its `definition` predicate/expression (SQLite rejects DROP
+                // COLUMN on a referenced column, and this rebuild must NOT recreate an
+                // orphaned index on the new table). This is the SQLite rebuild path.
+                shape
+                    .indexes
+                    .retain(|i| !index_depends_on_column(i, &column.name, Backend::Sqlite));
             }
             SchemaChange::AlterColumnType { column, to, .. } => {
                 if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
@@ -8005,11 +8089,11 @@ PRAGMA foreign_keys=ON;
             key_columns: Vec::new(),
         };
         assert!(
-            !index_depends_on_column(&partial, "email"),
+            !index_depends_on_column(&partial, "email", Backend::Postgres),
             "a column name in a definition string literal is NOT a dependency (no false positive)"
         );
         assert!(
-            index_depends_on_column(&partial, "id"),
+            index_depends_on_column(&partial, "id", Backend::Postgres),
             "the true dependent column (in `columns`) IS a dependency"
         );
 
@@ -8023,11 +8107,11 @@ PRAGMA foreign_keys=ON;
             key_columns: Vec::new(),
         };
         assert!(
-            index_depends_on_column(&expr, "email"),
+            index_depends_on_column(&expr, "email", Backend::Postgres),
             "the expression-referenced `email` is captured in `columns`"
         );
         assert!(
-            !index_depends_on_column(&expr, "mail"),
+            !index_depends_on_column(&expr, "mail", Backend::Postgres),
             "a column absent from `columns` is not a dependency"
         );
 
@@ -8040,9 +8124,72 @@ PRAGMA foreign_keys=ON;
             key_columns: Vec::new(),
         };
         assert!(
-            index_depends_on_column(&plain, "email"),
+            index_depends_on_column(&plain, "email", Backend::Postgres),
             "columns membership counts as a dependency"
         );
+    }
+
+    /// On `SQLite` a retained partial/expression index records only its KEY columns in
+    /// `columns`, so a WHERE-predicate / key-expression column is detected via a
+    /// word-bounded `definition` scan — otherwise dropping it would orphan the index
+    /// and `SQLite` rejects the `DROP COLUMN`.
+    #[test]
+    fn sqlite_index_dependency_includes_predicate_and_expression_columns() {
+        // A partial index whose KEY is `email` but whose predicate references
+        // `deleted_at` (only in the definition text, NOT in `columns`).
+        let partial = Index {
+            name: "t_email_active".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: false,
+            definition: Some(
+                "CREATE INDEX t_email_active ON t (email) WHERE deleted_at IS NULL".to_owned(),
+            ),
+            is_partial: true,
+            key_columns: Vec::new(),
+        };
+        assert!(
+            index_depends_on_column(&partial, "deleted_at", Backend::Sqlite),
+            "the WHERE-predicate column is a dependency on SQLite (definition scan)"
+        );
+        assert!(
+            index_depends_on_column(&partial, "email", Backend::Sqlite),
+            "the key column is still a dependency"
+        );
+        // Word-bounded: a longer identifier that merely contains the name is NOT a hit.
+        assert!(!index_depends_on_column(
+            &partial,
+            "deleted",
+            Backend::Sqlite
+        ));
+        assert!(!index_depends_on_column(&partial, "at", Backend::Sqlite));
+        // The SAME index on Postgres keeps exact `columns` semantics (its real deps
+        // would be in `columns`), so the definition text is never scanned.
+        assert!(!index_depends_on_column(
+            &partial,
+            "deleted_at",
+            Backend::Postgres
+        ));
+    }
+
+    #[test]
+    fn definition_references_column_is_word_bounded_and_case_insensitive() {
+        let def = "CREATE INDEX i ON t (email) WHERE Deleted_At IS NULL AND kind = 'deleted_at_x'";
+        assert!(definition_references_column(def, "email"));
+        assert!(
+            definition_references_column(def, "deleted_at"),
+            "case-insensitive match against `Deleted_At`"
+        );
+        // A quoted identifier still matches (quotes are non-word boundaries).
+        assert!(definition_references_column(
+            "CREATE INDEX i ON t (\"email\")",
+            "email"
+        ));
+        // Substring of a longer token does NOT match.
+        assert!(!definition_references_column(
+            "CREATE INDEX i ON t (email_verified)",
+            "email"
+        ));
+        assert!(!definition_references_column(def, ""));
     }
 
     #[test]

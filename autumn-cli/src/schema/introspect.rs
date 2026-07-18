@@ -1291,6 +1291,100 @@ fn sqlite_target(url: &str) -> String {
     rest.to_owned()
 }
 
+/// Classify a resolved `SQLite` target for the create-on-open existence guard:
+/// `Some(path)` is a concrete filesystem path that must be checked for existence
+/// (bare path or a `file:` URI with a real path); `None` is an in-memory database
+/// (nothing to check).
+///
+/// `SQLite`'s `sqlite3_open` CREATES a missing file, so a typo'd path (bare OR inside
+/// a `file:` URI) would otherwise pull zero tables and overwrite the snapshot. Only
+/// genuine in-memory targets are exempt: `:memory:`, `file::memory:` (and its
+/// shared-cache `?cache=shared` form), and any `file:` URI carrying `mode=memory`.
+/// For a `file:` URI with a real path the path is parsed out — the `file:` scheme
+/// stripped (handling `file:p`, `file:/p`, `file://host/p`, `file:///p`), the `?query`
+/// separator honored, and the path percent-decoded — then existence-checked like a
+/// bare path.
+#[cfg(feature = "sqlite")]
+fn sqlite_existence_check_path(target: &str) -> Option<String> {
+    if target.is_empty() || target == ":memory:" {
+        return None;
+    }
+    let Some(rest) = target.strip_prefix("file:") else {
+        // A bare filesystem path.
+        return Some(target.to_owned());
+    };
+    // Split off the `?query` (URI parameters like `mode=`, `cache=`).
+    let (path_part, query) = rest.split_once('?').unwrap_or((rest, ""));
+    // Strip an optional authority: `file://host/path` / `file:///path`.
+    let path_part = path_part.strip_prefix("//").map_or(path_part, |after| {
+        after.find('/').map_or(after, |idx| &after[idx..])
+    });
+    // In-memory forms are exempt (no file to check).
+    let is_memory = path_part == ":memory:"
+        || query
+            .split('&')
+            .any(|kv| kv.trim().eq_ignore_ascii_case("mode=memory"));
+    if is_memory {
+        return None;
+    }
+    let decoded = percent_encoding::percent_decode_str(path_part)
+        .decode_utf8_lossy()
+        .into_owned();
+    Some(decoded)
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod target_tests {
+    use super::sqlite_existence_check_path;
+
+    #[test]
+    fn existence_check_path_parses_files_and_exempts_memory() {
+        // In-memory targets: no file to check.
+        for mem in [
+            ":memory:",
+            "",
+            "file::memory:",
+            "file::memory:?cache=shared",
+            "file:app.db?mode=memory",
+            "file:app.db?cache=shared&mode=memory",
+        ] {
+            assert_eq!(
+                sqlite_existence_check_path(mem),
+                None,
+                "{mem} is in-memory (exempt)"
+            );
+        }
+        // Bare filesystem path.
+        assert_eq!(
+            sqlite_existence_check_path("/srv/app.db"),
+            Some("/srv/app.db".to_owned())
+        );
+        // `file:` URI forms → the real path is parsed out (scheme/authority/query
+        // stripped, percent-decoded).
+        assert_eq!(
+            sqlite_existence_check_path("file:/srv/app.db"),
+            Some("/srv/app.db".to_owned())
+        );
+        assert_eq!(
+            sqlite_existence_check_path("file:///srv/app.db"),
+            Some("/srv/app.db".to_owned())
+        );
+        assert_eq!(
+            sqlite_existence_check_path("file://localhost/srv/app.db"),
+            Some("/srv/app.db".to_owned())
+        );
+        assert_eq!(
+            sqlite_existence_check_path("file:app.db?mode=ro"),
+            Some("app.db".to_owned())
+        );
+        assert_eq!(
+            sqlite_existence_check_path("file:/srv/my%20app.db"),
+            Some("/srv/my app.db".to_owned()),
+            "percent-decoded"
+        );
+    }
+}
+
 /// Introspect a live `SQLite` database at `url` into a set of [`Table`]s tagged
 /// [`Backend::Sqlite`] and marked `managed` — the `SQLite` counterpart of
 /// [`introspect_postgres`], producing the identical snapshot IR so a pulled snapshot
@@ -1310,19 +1404,16 @@ pub fn introspect_sqlite(url: &str) -> Result<Vec<Table>, IntrospectError> {
     use diesel::{Connection as _, SqliteConnection};
 
     let target = sqlite_target(url);
-    // Guard against SQLite's create-if-missing behavior: `establish` on a
-    // nonexistent file SUCCEEDS against a brand-new EMPTY database, so a typo'd or
-    // missing DB path would otherwise pull ZERO tables and (on a non-dry-run pull)
-    // silently overwrite the checked-in snapshot with an empty one. For a plain
-    // file-backed target, require the file to already exist. `:memory:` and `file:`
-    // URI forms (which may legitimately encode `mode=`/shared-cache/`:memory:`
-    // semantics) are exempt — they are not plain filesystem paths and are left to
-    // diesel to open.
-    if target != ":memory:"
-        && !target.starts_with("file:")
-        && !std::path::Path::new(&target).exists()
+    // Guard against SQLite's create-if-missing behavior: `establish` on a nonexistent
+    // file SUCCEEDS against a brand-new EMPTY database, so a typo'd or missing DB path
+    // would otherwise pull ZERO tables and (on a non-dry-run pull) silently overwrite
+    // the checked-in snapshot with an empty one. Require a concrete file-backed target
+    // (bare path OR a `file:` URI with a real path) to already exist; genuine
+    // in-memory targets have no file to check and are exempt.
+    if let Some(path) = sqlite_existence_check_path(&target)
+        && !std::path::Path::new(&path).exists()
     {
-        return Err(IntrospectError::ConnectionSqlite { path: target });
+        return Err(IntrospectError::ConnectionSqlite { path });
     }
     let mut conn = SqliteConnection::establish(&target)
         .map_err(|_| IntrospectError::ConnectionSqlite { path: target })?;

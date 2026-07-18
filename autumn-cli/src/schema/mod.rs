@@ -848,7 +848,7 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
                     // the same dependency test the down emitter uses to restore
                     // these indexes on rollback, so projection and rollback agree.
                     t.indexes
-                        .retain(|i| !diff::index_depends_on_column(i, &column.name));
+                        .retain(|i| !diff::index_depends_on_column(i, &column.name, plan.backend));
                 }
             }
             SchemaChange::AlterColumnType {
