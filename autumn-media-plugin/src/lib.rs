@@ -66,9 +66,9 @@ pub use retention::{
 };
 pub use rooms::{
     InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse, LeaveRequest, ParticipantView,
-    PublishTarget, RoomError, RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore,
+    PublishTarget, ReapStats, RoomError, RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore,
     SessionToken, SubscribeTarget, room_participant_path, room_route_infos, room_router,
-    validate_room_segment,
+    spawn_room_reaper_loop, validate_room_segment,
 };
 pub use sink::{
     MediaArtifact, MediaArtifactFile, MediaArtifactKind, MediaArtifactSink, MediaArtifactSinkExt,
@@ -104,9 +104,9 @@ pub mod prelude {
         newest_recording_files_since, recording_segments_covering_window, slugify,
     };
     pub use crate::{
-        InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, RoomError, RoomService,
-        RoomSnapshot, RoomStore, SessionToken, room_participant_path, room_route_infos,
-        room_router, validate_room_segment,
+        InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, ReapStats, RoomError,
+        RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
+        room_route_infos, room_router, spawn_room_reaper_loop, validate_room_segment,
     };
     pub use crate::{
         IngestStatus, MediaMtxClient, MediaUrls, StreamQualityStats, StreamStatus, ViewerCount,
@@ -363,6 +363,10 @@ impl Plugin for MediaPlugin {
         Cow::Borrowed("autumn-media-plugin")
     }
 
+    // `build` is a long, linear plugin-assembly routine (config validation,
+    // room wiring + reaper, storage/workflow install, retention loop); it reads
+    // best as one top-to-bottom sequence rather than fragmented across helpers.
+    #[allow(clippy::too_many_lines)]
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
             config,
@@ -437,8 +441,12 @@ impl Plugin for MediaPlugin {
         // served and audit-visible under `api_prefix`.
         let mut app = app;
         if enable_rooms {
+            // Hold a handle to the store so the idle-room / stale-participant
+            // reaper can sweep the same registry the `RoomService` serves.
+            let room_store: Arc<dyn rooms::RoomStore> =
+                Arc::new(rooms::InMemoryRoomStore::new(room_max_participants));
             let room_service = rooms::RoomService::new(
-                Arc::new(rooms::InMemoryRoomStore::new(room_max_participants)),
+                room_store.clone(),
                 transport::MediaUrls::from_config(&config.mediamtx),
                 config.room_namespace.clone().unwrap_or_default(),
                 chrono::Duration::seconds(i64::from(config.room_token_ttl_seconds)),
@@ -449,6 +457,15 @@ impl Plugin for MediaPlugin {
                 .declare_plugin_routes(rooms::room_route_infos(&api_prefix))
                 .state_initializer(move |state| {
                     state.insert_extension(room_service);
+                })
+                // Spawn from `on_startup` so the reaper shares the running app's
+                // tokio runtime (matching the retention sweep below).
+                .on_startup(move |_state| {
+                    let store = room_store.clone();
+                    async move {
+                        rooms::spawn_room_reaper_loop(store);
+                        Ok(())
+                    }
                 });
         }
 
