@@ -1929,41 +1929,72 @@ fn emit_up_sql_pg(plan: &MigrationPlan) -> Result<String, EmitError> {
 /// verbatim `definition`, else rollback silently loses the uniqueness/index. This
 /// needs the baseline shapes carried in `ctx`; ordinary model-managed indexes are
 /// restored via their own `DropIndex → AddIndex` inversion and are skipped here.
+///
+/// Recreation is **delayed and deduped**: a retained index can depend on more than
+/// one dropped column (e.g. a partial index
+/// `... ON t (lower(email)) WHERE tenant_id IS NOT NULL` when the model drops BOTH
+/// `email` and `tenant_id`). Recreating it inline after re-adding only the *first*
+/// dependent column would (a) fail — the other dependent column is still absent, so
+/// Postgres rejects the `CREATE INDEX` — and (b) re-emit the same `CREATE INDEX`
+/// again for the second column. So the down path first emits ALL the column
+/// re-adds (and every other reversed change), then recreates each cascade-dropped
+/// retained index EXACTLY ONCE, keyed by `(table, index name)`, after all of its
+/// dropped columns have been restored.
 fn emit_down_sql_pg(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String, EmitError> {
     let mut ordered = up_ordered(&plan.changes)?;
     ordered.reverse();
     let mut groups = Vec::new();
+    // Per-table set of columns this migration drops (and the down path re-adds),
+    // gathered so a multi-column retained index is recreated only after ALL its
+    // dependent dropped columns are back.
+    let mut dropped_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for change in ordered {
         let sql = emit_change_down(change, plan.backend)?;
         let sql = sql.trim_end();
         if !sql.is_empty() {
             groups.push(sql.to_owned());
         }
-        // The column is re-added above; recreate its cascade-dropped retained
-        // indexes immediately after (column-before-index ordering).
         if let SchemaChange::DropColumn { table, column } = change {
-            for idx in retained_indexes_depending_on(ctx, table, &column.name) {
-                groups.push(index_sql(table, idx).trim_end().to_owned());
-            }
+            dropped_by_table
+                .entry(table.clone())
+                .or_default()
+                .insert(column.name.clone());
+        }
+    }
+    // Every column re-add is now emitted. Recreate each retained index whose
+    // dependent-column set intersects this table's dropped columns — once per
+    // (table, index name) — so a multi-column index is created exactly once, after
+    // all of its dropped columns are restored.
+    for (table, dropped) in &dropped_by_table {
+        for idx in retained_indexes_depending_on_any(ctx, table, dropped) {
+            groups.push(index_sql(table, idx).trim_end().to_owned());
         }
     }
     Ok(join_groups(&groups))
 }
 
-/// The RETAINED (`definition`-carrying) baseline indexes of `table` that depend on
-/// `column` — the expression/partial/constraint-owned indexes Postgres
-/// cascade-drops with the column and that carry no `DropIndex` in the plan, so the
-/// down migration must recreate them verbatim. Returns empty when the table is
-/// absent from `ctx.baseline` (e.g. context-free emit).
-fn retained_indexes_depending_on<'a>(
+/// The RETAINED (`definition`-carrying) baseline indexes of `table` whose
+/// dependent-column set intersects `dropped_columns` — the
+/// expression/partial/constraint-owned indexes Postgres cascade-drops when ANY of
+/// those columns is dropped and that carry no `DropIndex` in the plan, so the down
+/// migration must recreate them verbatim. Each qualifying index appears once (the
+/// baseline lists each index once), so a retained index depending on two dropped
+/// columns is returned — and thus recreated — exactly once. Returns empty when the
+/// table is absent from `ctx.baseline` (e.g. context-free emit).
+fn retained_indexes_depending_on_any<'a>(
     ctx: &'a SchemaContext,
     table: &str,
-    column: &str,
+    dropped_columns: &BTreeSet<String>,
 ) -> Vec<&'a Index> {
     ctx.baseline.get(table).map_or_else(Vec::new, |t| {
         t.indexes
             .iter()
-            .filter(|i| i.definition.is_some() && index_depends_on_column(i, column))
+            .filter(|i| {
+                i.definition.is_some()
+                    && dropped_columns
+                        .iter()
+                        .any(|c| index_depends_on_column(i, c))
+            })
             .collect()
     })
 }
@@ -6831,6 +6862,102 @@ PRAGMA foreign_keys=ON;
         assert!(
             readd_at < index_at,
             "column must be re-added before its dependent index is recreated: {down}"
+        );
+        // No regression: a single-column retained index is restored EXACTLY ONCE.
+        assert_eq!(
+            down.matches("CREATE UNIQUE INDEX users_email_key").count(),
+            1,
+            "the single-column retained index must be recreated exactly once: {down}"
+        );
+    }
+
+    /// A retained index depending on TWO columns, both dropped, must have its
+    /// recreation DELAYED until BOTH columns are restored and emitted EXACTLY ONCE
+    /// (never once per dependent dropped column). Recreating it inline after the
+    /// first re-add would fail (the second dependent column is still absent) and
+    /// duplicate the `CREATE INDEX`.
+    #[test]
+    fn drop_two_columns_down_restores_multicol_retained_index_once_after_both() {
+        // Baseline `users(id, keep, email, tenant_id)` with a RETAINED partial +
+        // expression index depending on BOTH `email` and `tenant_id`
+        // (definition-carrying, no paired DropIndex).
+        let mut baseline = Table::new("users", Backend::Postgres);
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        baseline.primary_key.push("id".to_owned());
+        baseline.columns.push(id);
+        baseline.columns.push(col("keep", ColumnType::Text));
+        let mut email = col("email", ColumnType::Text);
+        email.nullable = false;
+        baseline.columns.push(email);
+        baseline.columns.push(col("tenant_id", ColumnType::Int64));
+        baseline.indexes.push(Index {
+            name: "users_active".to_owned(),
+            // The exact `pg_depend` dependent set: expression column + predicate
+            // column (sorted by name, as introspection records it).
+            columns: vec!["email".to_owned(), "tenant_id".to_owned()],
+            unique: false,
+            definition: Some(
+                "CREATE INDEX users_active ON users (lower(email)) WHERE tenant_id IS NOT NULL"
+                    .to_owned(),
+            ),
+        });
+
+        // Desired side: BOTH `email` and `tenant_id` removed. The model diff
+        // retains the definition index (no DropIndex), so the plan is two
+        // DropColumns.
+        let mut desired = Table::new("users", Backend::Postgres);
+        let mut did = col("id", ColumnType::Int64);
+        did.primary_key = true;
+        desired.primary_key.push("id".to_owned());
+        desired.columns.push(did);
+        desired.columns.push(col("keep", ColumnType::Text));
+
+        let plan = diff_schema(
+            std::slice::from_ref(&baseline),
+            &parsed(vec![desired.clone()], vec![]),
+            ALLOW,
+        );
+        assert_eq!(
+            plan.changes
+                .iter()
+                .filter(|c| matches!(c, SchemaChange::DropColumn { .. }))
+                .count(),
+            2,
+            "plan must drop both columns: {:?}",
+            plan.changes
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { index, .. } if index.name == "users_active")),
+            "the retained definition index must NOT get a DropIndex: {:?}",
+            plan.changes
+        );
+
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+
+        // DOWN re-adds BOTH columns and recreates the index EXACTLY ONCE.
+        let email_at = down.find("ADD COLUMN email").expect("email re-add present");
+        let tenant_at = down
+            .find("ADD COLUMN tenant_id")
+            .expect("tenant_id re-add present");
+        assert_eq!(
+            down.matches("CREATE INDEX users_active").count(),
+            1,
+            "the multi-column retained index must be recreated exactly once (deduped): {down}"
+        );
+        let index_at = down
+            .find("CREATE INDEX users_active")
+            .expect("index restore present");
+        assert!(
+            email_at < index_at && tenant_at < index_at,
+            "both dependent columns must be re-added BEFORE the index is recreated: {down}"
         );
     }
 }

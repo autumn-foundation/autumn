@@ -627,6 +627,86 @@ pub struct Account {
     assert_no_secret_leak(&mdiff_out, &mdiff_err);
 }
 
+/// A covering `INCLUDE` index (`CREATE UNIQUE INDEX … ON t (a) INCLUDE (b)`) must
+/// be RETAINED verbatim via its `definition`, not recorded as a plain `(a, b)`
+/// unique index. Recording it as an ordinary index would widen the uniqueness
+/// scope from `(a)` to `(a, b)` and drop the covering behavior on recreation — and
+/// the model DSL cannot express the key/INCLUDE split. So the snapshot keeps the
+/// verbatim `CREATE UNIQUE INDEX … INCLUDE …` definition and a later model-side
+/// `schema diff` is clean (the definition index is retained, never recreated).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_retains_covering_include_index() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_include_index_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // A table with a covering unique index, authored via a raw migration so
+    // Postgres records the `INCLUDE` clause. `created_at TIMESTAMP NOT NULL DEFAULT
+    // NOW()` matches the column the managed-model parser synthesizes for `Cover`
+    // below, so the later model-side `schema diff` is genuinely empty and validates
+    // only the INCLUDE-index retention.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_covers",
+        "CREATE TABLE covers (id BIGSERIAL PRIMARY KEY, a TEXT NOT NULL, b TEXT, created_at TIMESTAMP NOT NULL DEFAULT NOW());\n\
+         CREATE UNIQUE INDEX covers_a_inc_b ON covers (a) INCLUDE (b);",
+        "DROP TABLE covers;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: the covering index must be preserved via its verbatim definition.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+
+    assert!(
+        snap.contains("covers_a_inc_b"),
+        "the covering index is preserved by name: {snap}"
+    );
+    assert!(
+        snap.contains("\"definition\"") && snap.contains("INCLUDE"),
+        "the covering index is retained via its verbatim CREATE UNIQUE INDEX … INCLUDE … definition: {snap}"
+    );
+
+    // doctor agrees the DB matches the pulled baseline (retained index is stable).
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports the DB matches the snapshot with the covering index:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+
+    // A MODEL-side `schema diff` whose model does NOT redeclare the index must
+    // RETAIN it — no recreation, clean diff.
+    write_models(
+        &project,
+        "
+#[autumn_web::model(managed)]
+pub struct Cover {
+    #[id]
+    pub id: i64,
+    pub a: String,
+    pub b: Option<String>,
+}
+",
+    );
+    let (mdiff_out, mdiff_err) = run_autumn_ok(&project, &["schema", "diff"], &envs);
+    assert!(
+        !mdiff_out.contains("covers_a_inc_b"),
+        "a model-side `schema diff` must NOT recreate or drop the covering index:\n{mdiff_out}"
+    );
+    assert!(
+        mdiff_out.contains("No schema changes"),
+        "model diff against the pulled snapshot is clean (covering index retained):\n{mdiff_out}"
+    );
+    assert_no_secret_leak(&mdiff_out, &mdiff_err);
+}
+
 /// Dropping a model column covered by a RETAINED constraint-owned unique index
 /// must not leave the snapshot stale. Postgres cascade-drops the index with the
 /// column (`ALTER TABLE … DROP COLUMN`), so the generated up-migration is a bare
@@ -816,6 +896,121 @@ pub struct Event {
     assert!(
         doc_out.contains("database schema matches the snapshot baseline"),
         "doctor reports no drift — the partial index was not falsely pruned:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
+/// Dropping TWO columns that a single RETAINED index depends on (an expression +
+/// partial index `… ON t (lower(email)) WHERE tenant_id IS NOT NULL`, cascade-
+/// dropped once BOTH `email` and `tenant_id` are removed) must produce a down
+/// migration that re-adds BOTH columns and recreates the index EXACTLY ONCE, after
+/// both re-adds. Recreating it inline after only the first re-add would (a) fail —
+/// the other dependent column is still absent — and (b) duplicate the
+/// `CREATE INDEX`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_diff_dropping_two_indexed_columns_recreates_index_once() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_drop_two_indexed_cols_app");
+
+    // Brownfield `members(id, email, tenant_id, created_at)` with an expression +
+    // partial index depending on BOTH `email` (via `lower(email)`) and `tenant_id`
+    // (via the `WHERE` predicate). `created_at` matches the synthesized model column
+    // so the only real changes are the two DROP COLUMNs.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_members",
+        "CREATE TABLE members (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL, tenant_id BIGINT, created_at TIMESTAMP NOT NULL DEFAULT NOW());\n\
+         CREATE INDEX members_active_idx ON members (lower(email)) WHERE tenant_id IS NOT NULL;",
+        "DROP TABLE members;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+
+    // Model DROPS both `email` and `tenant_id` (keeps only id + synthesized
+    // created_at). The index depends on both, so it is cascade-dropped by the
+    // DROP COLUMNs; the down migration must restore both columns then the index.
+    write_models(
+        &project,
+        "
+#[autumn_web::model(managed)]
+pub struct Member {
+    #[id]
+    pub id: i64,
+}
+",
+    );
+    let (diff_out, diff_err) = run_autumn_ok(
+        &project,
+        &[
+            "schema",
+            "diff",
+            "--write-migration",
+            "--name",
+            "drop_both",
+            "--allow-destructive",
+        ],
+        &envs,
+    );
+    assert_no_secret_leak(&diff_out, &diff_err);
+
+    let mig_root = project.join("migrations");
+    let mut up_sql = String::new();
+    let mut down_sql = String::new();
+    for entry in std::fs::read_dir(&mig_root).expect("migrations dir") {
+        let dir = entry.expect("entry").path();
+        if dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("drop_both"))
+        {
+            up_sql = std::fs::read_to_string(dir.join("up.sql")).unwrap_or_default();
+            down_sql = std::fs::read_to_string(dir.join("down.sql")).unwrap_or_default();
+        }
+    }
+    assert!(
+        up_sql.contains("DROP COLUMN email") && up_sql.contains("DROP COLUMN tenant_id"),
+        "up migration drops both columns: {up_sql}"
+    );
+    assert!(
+        !up_sql.contains("DROP INDEX"),
+        "up migration must NOT emit a DROP INDEX for the cascade-dropped index: {up_sql}"
+    );
+
+    // DOWN: re-adds BOTH columns and recreates the index EXACTLY ONCE, after both.
+    assert!(
+        down_sql.contains("ADD COLUMN email") && down_sql.contains("ADD COLUMN tenant_id"),
+        "down migration re-adds both dependent columns: {down_sql}"
+    );
+    assert_eq!(
+        down_sql.matches("members_active_idx").count(),
+        1,
+        "the multi-column retained index must be recreated exactly once (deduped): {down_sql}"
+    );
+    let email_at = down_sql.find("ADD COLUMN email").expect("email re-add");
+    let tenant_at = down_sql
+        .find("ADD COLUMN tenant_id")
+        .expect("tenant_id re-add");
+    let index_at = down_sql
+        .find("members_active_idx")
+        .expect("index recreation");
+    assert!(
+        email_at < index_at && tenant_at < index_at,
+        "both dependent columns must be re-added BEFORE the index recreation: {down_sql}"
+    );
+
+    // Apply the up migration (Postgres cascades the index away with the columns).
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // doctor must report NO drift: the advanced snapshot pruned the index to match.
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports no drift after dropping both indexed columns:\n{doc_out}"
     );
     assert_no_secret_leak(&doc_out, &doc_err);
 }

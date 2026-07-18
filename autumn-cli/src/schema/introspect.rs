@@ -54,6 +54,15 @@
 //!   [`pg_get_indexdef`](https://www.postgresql.org/docs/current/functions-info.html)
 //!   (see [`Index::definition`]), so their operator classes/collations/ordering
 //!   are preserved exactly.
+//! - **Covering (`INCLUDE`) indexes are retained by definition**: a covering
+//!   index (`CREATE UNIQUE INDEX idx ON t (a) INCLUDE (b)`, detected via
+//!   `pg_index.indnkeyatts < indnatts`) is *not* a simple droppable index — its
+//!   uniqueness scope is only the KEY column(s) `(a)`, but the `indkey`-derived
+//!   column list mixes key and `INCLUDE` columns indistinguishably, and the model
+//!   DSL cannot express the split. It is retained verbatim via
+//!   [`Index::definition`] (like an expression/partial/constraint index) rather
+//!   than rebuilt as a scope-widening `(a, b)` unique index, and never sets a
+//!   single-column `unique` flag. See [`collapse_indexes`].
 //! - **Composite / multi-column foreign keys**: only the first
 //!   referencing/referenced column pair is recorded (the IR [`ForeignKey`] is
 //!   single-column). The model parser never emits a composite FK.
@@ -242,6 +251,14 @@ struct IndexRow {
     /// Whether any key column is an expression (an `indkey` entry equal to `0`).
     #[diesel(sql_type = diesel::sql_types::Bool)]
     has_expression: bool,
+    /// Whether the index is a *covering* index — i.e. it carries non-key
+    /// `INCLUDE` columns (`pg_index.indnkeyatts < indnatts`). Such an index's
+    /// uniqueness scope is only its KEY columns, but its `indkey`-derived
+    /// `columns` list mixes key and INCLUDE columns indistinguishably, so it is
+    /// not expressible by the model DSL and must be retained verbatim via its
+    /// `definition` (never rebuilt as a plain `(key, include)` unique index).
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    has_include: bool,
     /// Whether the index backs a constraint (`pg_constraint.conindid` points at
     /// it) — true for UNIQUE/EXCLUDE (and PK, but PKs are already filtered out).
     /// Such an index cannot be dropped independently of its constraint, and the
@@ -424,6 +441,7 @@ fn fetch_indexes(
          i.indisunique AS is_unique, pg_get_indexdef(i.indexrelid) AS definition, \
          (i.indpred IS NOT NULL) AS is_partial, \
          (0 = ANY(string_to_array(i.indkey::text, ' ')::int[])) AS has_expression, \
+         (i.indnkeyatts < i.indnatts) AS has_include, \
          EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid) AS is_constraint, \
          COALESCE(( \
            SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
@@ -567,8 +585,15 @@ fn build_table(
 ///   prior snapshots and a single-column plain unique index (the model-DSL
 ///   `#[unique]` shape, a bare `CREATE UNIQUE INDEX` with no backing constraint)
 ///   still sets the owning column's `unique` flag for round-trip parity.
-/// - **expression, partial, or constraint-owned** — preserved verbatim via
-///   `definition: Some(pg_get_indexdef(...))`, never dropped. A constraint-owned
+/// - **expression, partial, covering (`INCLUDE`), or constraint-owned** —
+///   preserved verbatim via
+///   `definition: Some(pg_get_indexdef(...))`, never dropped. A covering
+///   `INCLUDE` index (`indnkeyatts < indnatts`) is retained because its
+///   uniqueness scope is only its KEY columns while the model DSL cannot
+///   distinguish key from `INCLUDE` columns — rebuilding it as a plain
+///   `(key, include)` unique index would silently widen the uniqueness scope and
+///   drop the covering behavior, so it never sets a single-column `unique` flag.
+///   A constraint-owned
 ///   index (a brownfield column/table-level `UNIQUE`/`EXCLUDE`, which auto-creates
 ///   a `pg_constraint`-backed index Postgres refuses to drop independently, and
 ///   which the declarative model DSL cannot express) is retained just like an
@@ -587,18 +612,23 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
             .map(str::to_owned)
             .collect();
         // "Simple" == a single representable column set (not partial, not an
-        // expression). A single-column simple unique index sets the owning
-        // column's `unique` flag whether or not it backs a constraint (the flag
-        // is accurate either way and is never diffed).
-        let simple = !row.is_partial && !row.has_expression;
+        // expression, and NOT a covering `INCLUDE` index — whose key/INCLUDE
+        // columns are indistinguishable in the `indkey`-derived list). A
+        // single-column simple unique index sets the owning column's `unique`
+        // flag whether or not it backs a constraint (the flag is accurate either
+        // way and is never diffed). A covering `INCLUDE` unique index is NOT
+        // simple, so it never sets that flag (its uniqueness scope is only its
+        // key columns) and is retained verbatim via its `definition`.
+        let simple = !row.is_partial && !row.has_expression && !row.has_include;
         if simple && row.is_unique && key_columns.len() == 1 {
             unique_columns.insert(key_columns[0].clone());
         }
         // Retain (preserve verbatim, never drop) any index the model DSL cannot
-        // express: an expression or partial index, OR a constraint-owned index
-        // (UNIQUE/EXCLUDE) whose backing constraint Postgres won't let us drop.
-        // A plain, non-constraint index keeps `definition: None` so its JSON is
-        // unchanged and the model round-trip stays clean.
+        // express: an expression, partial, or covering `INCLUDE` index, OR a
+        // constraint-owned index (UNIQUE/EXCLUDE) whose backing constraint
+        // Postgres won't let us drop. A plain, non-constraint index keeps
+        // `definition: None` so its JSON is unchanged and the model round-trip
+        // stays clean.
         //
         // For a SIMPLE index `Index.columns` stays the ordered key columns (exact
         // round-trip parity; the `pg_depend` set equals the key columns anyway).
@@ -798,6 +828,7 @@ mod tests {
             definition: definition.to_owned(),
             is_partial,
             has_expression,
+            has_include: false,
             is_constraint: false,
             columns: columns.to_owned(),
             dep_columns: dep_columns.to_owned(),
@@ -995,6 +1026,40 @@ mod tests {
             "a non-constraint (model-style) unique index stays ordinary/droppable"
         );
         assert!(unique_cols.contains("email"));
+    }
+
+    #[test]
+    fn collapse_indexes_covering_include_index_retained_via_definition() {
+        // A covering index `CREATE UNIQUE INDEX ... ON t (a) INCLUDE (b)`
+        // (`has_include == true`) must be RETAINED verbatim via `definition`,
+        // never rebuilt as a plain `(a, b)` unique index (which would widen the
+        // uniqueness scope from (a) to (a, b) and drop the covering behavior). It
+        // must NOT set a single-column `unique` column flag, and `columns` carries
+        // the exact `pg_depend` dependent set (key + INCLUDE columns).
+        let def = "CREATE UNIQUE INDEX idx_cover ON public.t USING btree (a) INCLUDE (b)";
+        let rows = vec![IndexRow {
+            has_include: true,
+            ..index_row("idx_cover", true, "a,b", "a,b", false, false, def)
+        }];
+        let (indexes, unique_cols) = collapse_indexes(&rows);
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "idx_cover");
+        assert!(indexes[0].unique);
+        assert_eq!(
+            indexes[0].definition.as_deref(),
+            Some(def),
+            "an INCLUDE covering index must be retained via its definition, not left droppable"
+        );
+        assert_eq!(
+            indexes[0].columns,
+            vec!["a".to_owned(), "b".to_owned()],
+            "columns carries the exact pg_depend dependent set (key + INCLUDE)"
+        );
+        assert!(
+            unique_cols.is_empty(),
+            "an INCLUDE unique index must not set a single-column unique flag \
+             (its uniqueness scope is only the key column)"
+        );
     }
 
     #[test]
