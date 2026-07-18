@@ -101,9 +101,22 @@ mod schema {
             user_id -> Int8,
         }
     }
+
+    // Tenant-scoped model whose `tenant_id` is ALSO `#[searchable]`, so the
+    // generated FTS5 table carries a `tenant_id` column too — the exact column
+    // collision that makes an *unqualified* `AND tenant_id = ?` ambiguous once
+    // the base table is JOINed to `<table>__fts` (Codex P2 / #1910).
+    autumn_web::reexports::diesel::table! {
+        tenant_collision_notes (id) {
+            id -> Int8,
+            title -> Text,
+            body -> Text,
+            tenant_id -> Text,
+        }
+    }
 }
 
-use schema::{owner_search_notes, search_notes, tenant_search_notes};
+use schema::{owner_search_notes, search_notes, tenant_collision_notes, tenant_search_notes};
 
 // Plain searchable repository (no tenant, no owner).
 #[autumn_web::model(table = "search_notes")]
@@ -157,6 +170,34 @@ pub struct OwnerSearchNote {
 
 #[autumn_web::repository(OwnerSearchNote, table = "owner_search_notes", owner = user_id, searchable)]
 pub trait OwnerSearchNoteRepository {}
+
+// Tenant-scoped searchable repository whose `tenant_id` is itself `#[searchable]`.
+// Marking the tenant column searchable puts a `tenant_id` column on the generated
+// `tenant_collision_notes__fts` table, so the base↔FTS JOIN exposes two
+// `tenant_id` columns. The macro must qualify the tenant predicate as
+// `"tenant_collision_notes"."tenant_id"` or SQLite raises
+// `ambiguous column name: tenant_id` (Codex P2 / #1910).
+#[autumn_web::model(table = "tenant_collision_notes")]
+#[searchable(language = "english")]
+pub struct TenantCollisionNote {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+    #[searchable(weight = "B")]
+    pub body: String,
+    #[default]
+    #[searchable(weight = "C")]
+    pub tenant_id: String,
+}
+
+#[autumn_web::repository(
+    TenantCollisionNote,
+    table = "tenant_collision_notes",
+    tenant_scoped,
+    searchable
+)]
+pub trait TenantCollisionNoteRepository {}
 
 async fn boot_pool(db_name: &str) -> SqlitePool {
     // A shared-cache in-memory database so every pooled checkout observes the
@@ -216,6 +257,44 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
         conn.batch_execute(&fts5_ddl("owner_search_notes"))
             .await
             .expect("create owner_search_notes FTS5 objects");
+        diesel::sql_query(
+            "CREATE TABLE tenant_collision_notes (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 title TEXT NOT NULL, \
+                 body TEXT NOT NULL, \
+                 tenant_id TEXT NOT NULL\
+             )",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("create tenant_collision_notes table");
+        // FTS5 objects for the collision model: the indexed columns are
+        // (title, body, tenant_id) in SEARCH_FIELDS order — `tenant_id` is
+        // indexed here precisely to reproduce the base↔FTS `tenant_id` collision.
+        conn.batch_execute(
+            "CREATE VIRTUAL TABLE \"tenant_collision_notes__fts\" USING fts5(\
+                 \"title\", \"body\", \"tenant_id\", \
+                 content='tenant_collision_notes', content_rowid='id', tokenize='unicode61'); \
+             CREATE TRIGGER \"tenant_collision_notes__fts_ai\" \
+                 AFTER INSERT ON \"tenant_collision_notes\" BEGIN \
+                 INSERT INTO \"tenant_collision_notes__fts\"(rowid, \"title\", \"body\", \"tenant_id\") \
+                     VALUES (new.id, new.\"title\", new.\"body\", new.\"tenant_id\"); \
+             END; \
+             CREATE TRIGGER \"tenant_collision_notes__fts_ad\" \
+                 AFTER DELETE ON \"tenant_collision_notes\" BEGIN \
+                 INSERT INTO \"tenant_collision_notes__fts\"(\"tenant_collision_notes__fts\", rowid, \"title\", \"body\", \"tenant_id\") \
+                     VALUES('delete', old.id, old.\"title\", old.\"body\", old.\"tenant_id\"); \
+             END; \
+             CREATE TRIGGER \"tenant_collision_notes__fts_au\" \
+                 AFTER UPDATE ON \"tenant_collision_notes\" BEGIN \
+                 INSERT INTO \"tenant_collision_notes__fts\"(\"tenant_collision_notes__fts\", rowid, \"title\", \"body\", \"tenant_id\") \
+                     VALUES('delete', old.id, old.\"title\", old.\"body\", old.\"tenant_id\"); \
+                 INSERT INTO \"tenant_collision_notes__fts\"(rowid, \"title\", \"body\", \"tenant_id\") \
+                     VALUES (new.id, new.\"title\", new.\"body\", new.\"tenant_id\"); \
+             END;",
+        )
+        .await
+        .expect("create tenant_collision_notes FTS5 objects");
     }
 
     pool
@@ -589,6 +668,98 @@ async fn search_never_crosses_tenants_on_sqlite() {
             "`{probe}` matches only tenant-a data, so tenant-b sees nothing: {leaked:?}"
         );
     }
+}
+
+/// Codex P2 (#1910): when the tenant column is itself `#[searchable]`, the
+/// generated FTS5 table also carries a `tenant_id` column, so the base↔FTS JOIN
+/// exposes two `tenant_id` columns. Before the fix the unqualified
+/// `AND tenant_id = ?` made SQLite raise `ambiguous column name: tenant_id`
+/// (`.expect` below would panic). The macro now qualifies every base-table
+/// predicate as `"tenant_collision_notes"."tenant_id"` (and `.deleted_at`,
+/// the owner col, the selected/ordered `.id`), so search resolves cleanly AND
+/// tenant isolation still holds under the FTS join.
+#[tokio::test]
+async fn search_tenant_predicate_is_base_table_qualified_on_sqlite() {
+    let pool = boot_pool("search_tenant_collision").await;
+    let repo = PgTenantCollisionNoteRepository::with_pool_untracked(pool);
+
+    // Tenant A and tenant B both own a row whose title matches "report".
+    with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewTenantCollisionNote {
+            title: "Alpha Report".to_string(),
+            body: "tenant a private note".to_string(),
+        })
+        .await
+        .expect("save under tenant-a");
+    })
+    .await;
+    with_tenant("tenant-b".to_string(), async {
+        repo.save(&NewTenantCollisionNote {
+            title: "Bravo Report".to_string(),
+            body: "tenant b private note".to_string(),
+        })
+        .await
+        .expect("save under tenant-b");
+    })
+    .await;
+
+    // The `.expect` here is the load-bearing assertion: with an unqualified
+    // tenant predicate SQLite would raise `ambiguous column name: tenant_id`
+    // and this would panic. It resolves — the predicate is base-table-qualified.
+    let b_hits = with_tenant("tenant-b".to_string(), async {
+        repo.search("report")
+            .await
+            .expect("search must not raise `ambiguous column name: tenant_id`")
+    })
+    .await;
+    assert_eq!(
+        b_hits.len(),
+        1,
+        "tenant-b sees exactly its own matching row (no ambiguity, no leak): {b_hits:?}"
+    );
+    assert_eq!(b_hits[0].tenant_id, "tenant-b", "no cross-tenant leak");
+    assert_eq!(b_hits[0].title, "Bravo Report");
+
+    // The paginated path (count + select, both JOIN the FTS table) is qualified too.
+    let req = PageRequest::new(1, 10);
+    let b_page = with_tenant("tenant-b".to_string(), async {
+        repo.search_page("report", &req)
+            .await
+            .expect("search_page must not raise `ambiguous column name: tenant_id`")
+    })
+    .await;
+    assert_eq!(
+        b_page.total_elements, 1,
+        "tenant-b's paged total counts only its own rows: {:?}",
+        b_page.content
+    );
+    assert!(
+        b_page.content.iter().all(|n| n.tenant_id == "tenant-b"),
+        "no cross-tenant row in the page: {:?}",
+        b_page.content
+    );
+
+    // Tenant A still finds its own row (search genuinely works per tenant).
+    let a_hits = with_tenant("tenant-a".to_string(), async {
+        repo.search("report").await.expect("search under tenant-a")
+    })
+    .await;
+    assert_eq!(a_hits.len(), 1, "tenant-a sees its own row: {a_hits:?}");
+    assert_eq!(a_hits[0].tenant_id, "tenant-a");
+
+    // ADVERSARIAL: a token present only in tenant A's row must never surface for
+    // tenant B — the FTS MATCH hits A's row, the qualified tenant predicate on
+    // the JOINed base table filters it out.
+    let leaked = with_tenant("tenant-b".to_string(), async {
+        repo.search("private note")
+            .await
+            .expect("adversarial search under tenant-b")
+    })
+    .await;
+    assert!(
+        leaked.iter().all(|n| n.tenant_id == "tenant-b"),
+        "tenant-b must never see tenant-a rows: {leaked:?}"
+    );
 }
 
 /// Owner-scoped `search_page_scoped` (#1841) never returns another owner's rows.

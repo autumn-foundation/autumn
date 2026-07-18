@@ -13878,17 +13878,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::core::option::Option::None => ::std::vec::Vec::<SearchId>::new(),
                             ::core::option::Option::Some(__autumn_match) => {
                                 let mut sql = ::std::format!(
-                                    "SELECT id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    "SELECT \"{tbl}\".id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
                                     tbl = #table_name
                                 );
                                 if #config_soft_delete {
-                                    sql.push_str(" AND deleted_at IS NULL");
+                                    sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
                                 }
                                 if let ::core::option::Option::Some(ref _t) = tenant_id {
-                                    sql.push_str(" AND tenant_id = $2");
+                                    sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
                                 }
                                 sql.push_str(&::std::format!(
-                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), id DESC",
+                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), \"{tbl}\".id DESC",
                                     tbl = #table_name, weights = __autumn_bm25_weights
                                 ));
 
@@ -14049,10 +14049,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     tbl = #table_name
                                 );
                                 if #config_soft_delete {
-                                    count_sql.push_str(" AND deleted_at IS NULL");
+                                    count_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
                                 }
                                 if let ::core::option::Option::Some(ref _t) = tenant_id {
-                                    count_sql.push_str(" AND tenant_id = $2");
+                                    count_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
                                 }
 
                                 if #config_tenant_scoped {
@@ -14137,18 +14137,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::core::option::Option::None => ::std::vec::Vec::<SearchId>::new(),
                             ::core::option::Option::Some(__autumn_match) => {
                                 let mut select_sql = ::std::format!(
-                                    "SELECT id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    "SELECT \"{tbl}\".id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
                                     tbl = #table_name
                                 );
                                 if #config_soft_delete {
-                                    select_sql.push_str(" AND deleted_at IS NULL");
+                                    select_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
                                 }
                                 let __autumn_order = ::std::format!(
-                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), id DESC",
+                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), \"{tbl}\".id DESC",
                                     tbl = #table_name, weights = __autumn_bm25_weights
                                 );
                                 if let ::core::option::Option::Some(ref _t) = tenant_id {
-                                    select_sql.push_str(" AND tenant_id = $2");
+                                    select_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
                                     select_sql.push_str(&__autumn_order);
                                     select_sql.push_str(" LIMIT $3 OFFSET $4");
                                 } else {
@@ -14250,8 +14250,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // language+query pair), so the owner filter lands on `$2` (no tenant) or
         // `$3` (tenant occupies `$2`). Same trusted developer-declared identifier
         // as the pg literals — never request input.
-        let owner_sqlite_p2 = format!(" AND \"{owner_col_name}\" = $2");
-        let owner_sqlite_p3 = format!(" AND \"{owner_col_name}\" = $3");
+        let owner_sqlite_p2 = format!(" AND \"{table_name}\".\"{owner_col_name}\" = $2");
+        let owner_sqlite_p3 = format!(" AND \"{table_name}\".\"{owner_col_name}\" = $3");
 
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
@@ -14416,11 +14416,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     tbl = #table_name
                                 );
                                 if #config_soft_delete {
-                                    count_sql.push_str(" AND deleted_at IS NULL");
+                                    count_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
                                 }
                                 if #config_tenant_scoped {
                                     if let ::core::option::Option::Some(ref _t) = tenant_id {
-                                        count_sql.push_str(" AND tenant_id = $2");
+                                        count_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
                                         count_sql.push_str(#owner_sqlite_p3);
                                     } else {
                                         count_sql.push_str(#owner_sqlite_p2);
@@ -14526,19 +14526,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::core::option::Option::None => ::std::vec::Vec::<SearchId>::new(),
                             ::core::option::Option::Some(__autumn_match) => {
                                 let mut select_sql = ::std::format!(
-                                    "SELECT id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
+                                    "SELECT \"{tbl}\".id FROM \"{tbl}\" JOIN \"{tbl}__fts\" ON \"{tbl}__fts\".rowid = \"{tbl}\".id WHERE \"{tbl}__fts\" MATCH $1",
                                     tbl = #table_name
                                 );
                                 if #config_soft_delete {
-                                    select_sql.push_str(" AND deleted_at IS NULL");
+                                    select_sql.push_str(&::std::format!(" AND \"{tbl}\".deleted_at IS NULL", tbl = #table_name));
                                 }
                                 let __autumn_order = ::std::format!(
-                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), id DESC",
+                                    " ORDER BY bm25(\"{tbl}__fts\", {weights}), \"{tbl}\".id DESC",
                                     tbl = #table_name, weights = __autumn_bm25_weights
                                 );
                                 if #config_tenant_scoped {
                                     if let ::core::option::Option::Some(ref _t) = tenant_id {
-                                        select_sql.push_str(" AND tenant_id = $2");
+                                        select_sql.push_str(&::std::format!(" AND \"{tbl}\".tenant_id = $2", tbl = #table_name));
                                         select_sql.push_str(#owner_sqlite_p3);
                                         select_sql.push_str(&__autumn_order);
                                         select_sql.push_str(" LIMIT $4 OFFSET $5");
@@ -19493,6 +19493,19 @@ mod tests {
             generated.contains("bm25(\\\"{tbl}__fts\\\""),
             "the SQLite search arm must rank with bm25 over the FTS5 table: {generated}"
         );
+        // Codex P2 (#1910): every base-table column referenced across the FTS
+        // JOIN must be qualified with the base table (`"{tbl}".<col>`), or a
+        // model that marks a base column (e.g. `tenant_id`) `#[searchable]`
+        // would make SQLite raise `ambiguous column name`. The selected id and
+        // the bm25 tiebreak id are both base-table-qualified.
+        assert!(
+            generated.contains("SELECT \\\"{tbl}\\\".id FROM \\\"{tbl}\\\""),
+            "the SQLite search select must qualify id against the base table: {generated}"
+        );
+        assert!(
+            generated.contains("\\\"{tbl}\\\".id DESC"),
+            "the SQLite bm25 tiebreak must qualify id against the base table: {generated}"
+        );
         assert!(
             generated.contains("SEARCH_FIELDS"),
             "the SQLite search arm must derive its bm25 weights from SEARCH_FIELDS: {generated}"
@@ -19533,9 +19546,13 @@ mod tests {
             generated.contains("AND tenant_id = $3"),
             "the Postgres search arm must filter tenant_id = $3: {generated}"
         );
+        // Codex P2 (#1910): the SQLite tenant predicate must be base-table-
+        // qualified (`"{tbl}".tenant_id`) so a searchable `tenant_id` column
+        // (which also lands on `<table>__fts`) doesn't make it ambiguous under
+        // the FTS JOIN. The predicate survives — only the qualification changes.
         assert!(
-            generated.contains("AND tenant_id = $2"),
-            "the SQLite search arm must filter tenant_id = $2: {generated}"
+            generated.contains("AND \\\"{tbl}\\\".tenant_id = $2"),
+            "the SQLite search arm must filter \"{{tbl}}\".tenant_id = $2: {generated}"
         );
         // The pg arm still ranks with tsvector; the sqlite arm still MATCHes FTS5.
         assert!(
@@ -19565,9 +19582,13 @@ mod tests {
             generated.contains("AND user_id = $3"),
             "the Postgres owner-scoped arm must filter user_id = $3: {generated}"
         );
+        // Codex P2 (#1910): the SQLite owner predicate must be base-table-
+        // qualified (`"posts"."user_id"`) so a searchable owner column doesn't
+        // collide with the `<table>__fts` side of the JOIN. The owner filter
+        // survives — only the qualification changes.
         assert!(
-            generated.contains("AND \\\"user_id\\\" = $2"),
-            "the SQLite owner-scoped arm must filter \"user_id\" = $2: {generated}"
+            generated.contains("AND \\\"posts\\\".\\\"user_id\\\" = $2"),
+            "the SQLite owner-scoped arm must filter \"posts\".\"user_id\" = $2: {generated}"
         );
         assert!(
             generated.contains("websearch_to_tsquery") && generated.contains("MATCH $1"),
