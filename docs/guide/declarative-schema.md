@@ -161,7 +161,11 @@ autumn schema migrate --profile prod
   with `--features sqlite`" error and never touches the database. Only *applying*
   migrations is gated this way — `autumn schema diff` still generates SQLite
   migration SQL offline in the default build.
-- It is **provider-locked** against the snapshot's dialect before applying.
+- It is **provider-locked** against the snapshot's dialect before applying —
+  *when a snapshot is present*. If `.autumn/schema-snapshot.json` is missing (a
+  pre-snapshot or adopting project), `schema migrate` prints a note and applies
+  the pending migrations **without** a provider-lock check rather than failing;
+  run `autumn schema snapshot` to establish the baseline and arm the guard.
 - It **does not touch the snapshot** — the baseline already advanced at
   generation time (`schema diff --write-migration`), so this command only applies
   the pending files. The destructive-change guards already ran at diff time, so

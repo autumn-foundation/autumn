@@ -108,7 +108,7 @@ not a rewrite.
 | One host, write volume comfortably below a single serialized writer | **SQLite** |
 | Multiple replicas / multiple hosts sharing data | **Postgres** |
 | Read replicas, sharding, or heavy write concurrency | **Postgres** |
-| You need Postgres FTS, `LISTEN/NOTIFY`, or advisory-lock leader election | **Postgres** |
+| You need Postgres-specific FTS features (language-stemming dictionaries), `LISTEN/NOTIFY`, or advisory-lock leader election | **Postgres** |
 
 ---
 
