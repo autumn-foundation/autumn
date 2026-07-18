@@ -75,6 +75,21 @@
 //!   index, never a failure. Full constraint↔index reconciliation is deferred;
 //!   the load-bearing property this slice guarantees is only that the generated
 //!   migration no longer *fails* with a rejected `DROP INDEX`.
+//! - **Cascade-dropped retained indexes on a dropped column**: when a model
+//!   removes a column that a retained (`definition`-carrying) expression / partial
+//!   / constraint-owned index depends on, Postgres cascade-drops that index with
+//!   the `ALTER TABLE … DROP COLUMN` (the up path emits no `DROP INDEX`). The
+//!   snapshot projection prunes it to match (so `doctor` / `pull --dry-run` do not
+//!   false-drift) and the down migration recreates it from its verbatim
+//!   `definition`. Two nuances are deferred: **(i)** a cascade-removed brownfield
+//!   `UNIQUE`/`EXCLUDE` *constraint* is restored on rollback as a unique *index*
+//!   (via its `pg_get_indexdef` definition), not as the original named
+//!   `CONSTRAINT` — functional uniqueness is preserved, exact constraint-object
+//!   reconstruction is deferred; **(ii)** whether a column is *depended on* by an
+//!   expression index is detected best-effort — `columns` membership plus a
+//!   word-bounded token match of the column name in the `definition` text (so
+//!   `email` matches `lower(email)` but not `emailer`), not a full parse of the
+//!   index expression.
 //!
 //! Errors are **credential-safe** by construction: no variant ever embeds the
 //! resolved database URL (only a parsed host/port on the connection-error path,

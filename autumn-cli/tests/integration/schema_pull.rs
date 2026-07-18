@@ -613,6 +613,103 @@ pub struct Account {
     assert_no_secret_leak(&mdiff_out, &mdiff_err);
 }
 
+/// Dropping a model column covered by a RETAINED constraint-owned unique index
+/// must not leave the snapshot stale. Postgres cascade-drops the index with the
+/// column (`ALTER TABLE … DROP COLUMN`), so the generated up-migration is a bare
+/// `DROP COLUMN` (never a rejected `DROP INDEX`), the advanced snapshot prunes the
+/// index (so `doctor` reports NO drift after apply), and the down-migration
+/// restores the index verbatim.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_diff_dropping_uniquely_indexed_column_stays_clean() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_drop_unique_col_app");
+
+    // Brownfield `accounts(id, email UNIQUE, note)` — Postgres auto-creates the
+    // constraint-backed `accounts_email_key` index.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_accounts",
+        "CREATE TABLE accounts (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, note TEXT);",
+        "DROP TABLE accounts;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull the brownfield shape (retains the constraint-owned index).
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+
+    // Model DROPS `email` (keeps id + note). Generate the migration; the snapshot
+    // advances at generation time.
+    write_models(
+        &project,
+        "
+#[autumn_web::model(managed)]
+pub struct Account {
+    #[id]
+    pub id: i64,
+    pub note: Option<String>,
+}
+",
+    );
+    let (diff_out, diff_err) = run_autumn_ok(
+        &project,
+        &[
+            "schema",
+            "diff",
+            "--write-migration",
+            "--name",
+            "drop_email",
+            "--allow-destructive",
+        ],
+        &envs,
+    );
+    assert_no_secret_leak(&diff_out, &diff_err);
+
+    // Read the generated up/down SQL.
+    let mig_root = project.join("migrations");
+    let mut up_sql = String::new();
+    let mut down_sql = String::new();
+    for entry in std::fs::read_dir(&mig_root).expect("migrations dir") {
+        let dir = entry.expect("entry").path();
+        if dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("drop_email"))
+        {
+            up_sql = std::fs::read_to_string(dir.join("up.sql")).unwrap_or_default();
+            down_sql = std::fs::read_to_string(dir.join("down.sql")).unwrap_or_default();
+        }
+    }
+    assert!(
+        up_sql.contains("DROP COLUMN email"),
+        "up migration drops the column: {up_sql}"
+    );
+    assert!(
+        !up_sql.contains("DROP INDEX"),
+        "up migration must NOT emit a DROP INDEX for the cascade-dropped constraint index: {up_sql}"
+    );
+    assert!(
+        down_sql.contains("CREATE UNIQUE INDEX") && down_sql.contains("accounts_email_key"),
+        "down migration restores the cascade-dropped retained index: {down_sql}"
+    );
+
+    // Apply the migration (Postgres cascades the index away with the column).
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // doctor must report NO database-schema drift: the advanced snapshot pruned
+    // the retained index to match the cascade-dropped DB (no false perpetual drift).
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports no drift after dropping the uniquely-indexed column:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
 /// `SQLite` introspection is a future slice: `schema pull` against a `SQLite` URL
 /// is refused loudly (no Docker needed — the refusal happens before any
 /// connection), names `SQLite`, and writes no snapshot.

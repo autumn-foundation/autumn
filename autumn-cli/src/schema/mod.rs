@@ -749,6 +749,19 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
             SchemaChange::DropColumn { table, column } => {
                 if let Some(t) = tables.get_mut(table) {
                     t.columns.retain(|c| c.name != column.name);
+                    // Postgres `ALTER TABLE … DROP COLUMN` automatically drops any
+                    // index (and the constraint it backs) that depends on the
+                    // column. Ordinary model-managed indexes on the column already
+                    // carry an explicit `DropIndex` in this plan; this ALSO prunes
+                    // the RETAINED (`definition`-carrying) expression / partial /
+                    // constraint-owned indexes that have NO `DropIndex` — otherwise
+                    // the projected snapshot would claim an index the database just
+                    // cascade-dropped and every subsequent `schema doctor` /
+                    // `pull --dry-run` would report false, perpetual drift. Uses
+                    // the same dependency test the down emitter uses to restore
+                    // these indexes on rollback, so projection and rollback agree.
+                    t.indexes
+                        .retain(|i| !diff::index_depends_on_column(i, &column.name));
                 }
             }
             SchemaChange::AlterColumnType {
@@ -1682,6 +1695,127 @@ mod tests {
         assert!(
             err.contains("--from"),
             "error tells the user to pass --from"
+        );
+    }
+
+    // -- Part A: `project_plan_target` prunes column-dependent retained indexes --
+
+    /// A `posts(id, email)` table carrying a RETAINED expression/constraint index
+    /// on `email` (a `definition`-carrying index with NO paired `DropIndex`, the
+    /// shape `schema pull` preserves for a brownfield `UNIQUE`/expression index).
+    fn users_table_with_email_unique_index() -> Table {
+        use autumn_schema_core::{ColumnType, Index};
+        let mut id = Column::new("id".to_string(), ColumnType::Int64);
+        id.primary_key = true;
+        let email = Column::new("email".to_string(), ColumnType::Text);
+        let mut table = Table::new("users", Backend::Postgres);
+        table.managed = true;
+        table.primary_key = vec!["id".to_string()];
+        table.columns = vec![id, email];
+        table.indexes = vec![Index {
+            name: "users_email_key".to_string(),
+            columns: vec!["email".to_string()],
+            unique: true,
+            // A constraint-owned unique index, retained verbatim by `schema pull`.
+            definition: Some("CREATE UNIQUE INDEX users_email_key ON users (email)".to_string()),
+        }];
+        table
+    }
+
+    fn drop_email_plan() -> MigrationPlan {
+        use autumn_schema_core::{Column, ColumnType};
+        MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::DropColumn {
+                table: "users".to_string(),
+                column: Column::new("email".to_string(), ColumnType::Text),
+            }],
+        }
+    }
+
+    #[test]
+    fn project_plan_target_prunes_retained_index_depending_on_dropped_column() {
+        // Dropping `email` cascade-drops the retained unique index in Postgres, so
+        // the projected snapshot must contain NEITHER the column NOR the index —
+        // otherwise `doctor` / `pull --dry-run` would report false perpetual drift.
+        let baseline = vec![users_table_with_email_unique_index()];
+        let projected = project_plan_target(&baseline, &drop_email_plan());
+        let users = projected
+            .iter()
+            .find(|t| t.name == "users")
+            .expect("users table retained");
+        assert!(
+            users.columns.iter().all(|c| c.name != "email"),
+            "dropped column must be gone: {:?}",
+            users.columns
+        );
+        assert!(
+            users.indexes.is_empty(),
+            "retained index depending on the dropped column must be pruned: {:?}",
+            users.indexes
+        );
+    }
+
+    #[test]
+    fn project_plan_target_keeps_retained_index_on_unrelated_column() {
+        use autumn_schema_core::{Column, ColumnType, Index};
+        // A retained expression index on `handle`; a DropColumn of the UNRELATED
+        // `email` must leave it intact (no over-pruning).
+        let mut table = Table::new("users", Backend::Postgres);
+        table.managed = true;
+        let mut id = Column::new("id".to_string(), ColumnType::Int64);
+        id.primary_key = true;
+        table.primary_key = vec!["id".to_string()];
+        table.columns = vec![
+            id,
+            Column::new("email".to_string(), ColumnType::Text),
+            Column::new("handle".to_string(), ColumnType::Text),
+        ];
+        table.indexes = vec![Index {
+            name: "users_lower_handle_idx".to_string(),
+            columns: vec!["handle".to_string()],
+            unique: false,
+            definition: Some(
+                "CREATE INDEX users_lower_handle_idx ON users (lower(handle))".to_string(),
+            ),
+        }];
+        let projected = project_plan_target(&[table], &drop_email_plan());
+        let users = projected
+            .iter()
+            .find(|t| t.name == "users")
+            .expect("users table");
+        assert_eq!(
+            users.indexes.len(),
+            1,
+            "an index on an unrelated column must survive: {:?}",
+            users.indexes
+        );
+        assert_eq!(users.indexes[0].name, "users_lower_handle_idx");
+    }
+
+    #[test]
+    fn project_plan_target_false_drift_regression_is_clean() {
+        // Snapshot = the projected target (post-Part-A). The live DB (like
+        // Postgres) also lacks the cascade-dropped column AND index. The
+        // authoritative drift check must then report Clean — proving the false
+        // perpetual drift is gone.
+        let baseline = vec![users_table_with_email_unique_index()];
+        let snapshot = project_plan_target(&baseline, &drop_email_plan());
+
+        // The database after `ALTER TABLE users DROP COLUMN email` cascades:
+        // no `email` column, no dependent index.
+        let mut db_users = users_table_with_email_unique_index();
+        db_users.columns.retain(|c| c.name != "email");
+        db_users.indexes.clear();
+        let db = vec![db_users];
+
+        let drift = doctor::compute_db_schema_drift(&snapshot, &db);
+        assert!(
+            drift.is_clean(),
+            "projected snapshot must match the cascade-dropped DB (no false drift); \
+             forward={:?} reverse={:?}",
+            drift.forward.changes,
+            drift.reverse.changes
         );
     }
 }

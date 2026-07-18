@@ -1183,6 +1183,49 @@ fn indexes_equivalent(a: &Index, b: &Index) -> bool {
     }
 }
 
+/// Whether `index` depends on column `col` — i.e. Postgres would automatically
+/// drop the index (and any constraint it backs) when `col` is dropped via
+/// `ALTER TABLE … DROP COLUMN`. True when the index lists `col` among its indexed
+/// `columns`, or when its raw `definition` references `col` as a word-bounded SQL
+/// identifier (so `email` matches `lower(email)` / `(email)` but not `emailer`).
+///
+/// The token match on the `definition` text is a best-effort mirror of Postgres's
+/// cascade (see the introspect.rs "Deferred blind spots"): it detects the common
+/// expression/partial-index shapes without fully parsing the index expression.
+/// Both `project_plan_target` (snapshot projection) and [`emit_down_sql_pg`]
+/// (rollback restore) use this single test so they cannot drift.
+pub fn index_depends_on_column(index: &Index, col: &str) -> bool {
+    index.columns.iter().any(|c| c == col)
+        || index
+            .definition
+            .as_deref()
+            .is_some_and(|def| sql_token_references(def, col))
+}
+
+/// Whether `haystack` contains `needle` as a word-bounded token, where a "word"
+/// character is `[A-Za-z0-9_]`. Hand-rolled (no `regex` dependency) so a column
+/// name matches `lower(email)` / `(email)` / `email DESC` but never a longer
+/// identifier such as `emailer` or `user_email`.
+fn sql_token_references(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !is_word(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_word(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 ///
 /// ## Unmodellable (expression/partial) indexes
 ///
@@ -1880,7 +1923,7 @@ pub fn emit_down_sql_with_context(
     ctx: &SchemaContext,
 ) -> Result<String, EmitError> {
     match plan.backend {
-        Backend::Postgres => emit_down_sql_pg(plan),
+        Backend::Postgres => emit_down_sql_pg(plan, ctx),
         Backend::Sqlite => emit_down_sql_sqlite(plan, ctx),
     }
 }
@@ -1902,7 +1945,17 @@ fn emit_up_sql_pg(plan: &MigrationPlan) -> Result<String, EmitError> {
 
 /// The Postgres reverse path: changes reversed and individually inverted, with
 /// `-- irreversible:` markers where data cannot round-trip.
-fn emit_down_sql_pg(plan: &MigrationPlan) -> Result<String, EmitError> {
+///
+/// A `DropColumn` on a column covered by a RETAINED (`definition`-carrying)
+/// baseline index — the expression/partial/constraint-owned indexes `schema pull`
+/// preserves and the model diff never `DropIndex`'s — cascade-drops that index in
+/// Postgres along with the column (the up path is a bare `ALTER TABLE … DROP
+/// COLUMN`, never a failing `DROP INDEX` on a constraint-backed index). So after
+/// re-adding the column the down path must recreate each such index from its
+/// verbatim `definition`, else rollback silently loses the uniqueness/index. This
+/// needs the baseline shapes carried in `ctx`; ordinary model-managed indexes are
+/// restored via their own `DropIndex → AddIndex` inversion and are skipped here.
+fn emit_down_sql_pg(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String, EmitError> {
     let mut ordered = up_ordered(&plan.changes)?;
     ordered.reverse();
     let mut groups = Vec::new();
@@ -1912,8 +1965,33 @@ fn emit_down_sql_pg(plan: &MigrationPlan) -> Result<String, EmitError> {
         if !sql.is_empty() {
             groups.push(sql.to_owned());
         }
+        // The column is re-added above; recreate its cascade-dropped retained
+        // indexes immediately after (column-before-index ordering).
+        if let SchemaChange::DropColumn { table, column } = change {
+            for idx in retained_indexes_depending_on(ctx, table, &column.name) {
+                groups.push(index_sql(table, idx).trim_end().to_owned());
+            }
+        }
     }
     Ok(join_groups(&groups))
+}
+
+/// The RETAINED (`definition`-carrying) baseline indexes of `table` that depend on
+/// `column` — the expression/partial/constraint-owned indexes Postgres
+/// cascade-drops with the column and that carry no `DropIndex` in the plan, so the
+/// down migration must recreate them verbatim. Returns empty when the table is
+/// absent from `ctx.baseline` (e.g. context-free emit).
+fn retained_indexes_depending_on<'a>(
+    ctx: &'a SchemaContext,
+    table: &str,
+    column: &str,
+) -> Vec<&'a Index> {
+    ctx.baseline.get(table).map_or_else(Vec::new, |t| {
+        t.indexes
+            .iter()
+            .filter(|i| i.definition.is_some() && index_depends_on_column(i, column))
+            .collect()
+    })
 }
 
 /// The change kinds whose `SQLite` realisation is a full table recreate: the
@@ -6647,6 +6725,126 @@ PRAGMA foreign_keys=ON;
             *tables,
             vec!["a".to_owned(), "b".to_owned()],
             "names the cycle"
+        );
+    }
+
+    // -- Part B: rollback restores a cascade-dropped retained index ----------
+
+    /// The `index_depends_on_column` word-boundary contract: a column name matches
+    /// `columns` membership and its word-bounded appearance in an expression
+    /// `definition`, but never a longer identifier that merely contains it.
+    #[test]
+    fn index_dependency_detection_is_word_bounded() {
+        let expr = Index {
+            name: "u_lower_email".to_owned(),
+            columns: vec![],
+            unique: false,
+            definition: Some("CREATE INDEX u_lower_email ON users (lower(email))".to_owned()),
+        };
+        assert!(
+            index_depends_on_column(&expr, "email"),
+            "matches lower(email)"
+        );
+        assert!(
+            !index_depends_on_column(&expr, "mail"),
+            "must not match a substring inside the token"
+        );
+
+        let emailer = Index {
+            name: "u_emailer".to_owned(),
+            columns: vec![],
+            unique: false,
+            definition: Some("CREATE INDEX u_emailer ON users (emailer)".to_owned()),
+        };
+        assert!(
+            !index_depends_on_column(&emailer, "email"),
+            "`email` must not match the longer identifier `emailer`"
+        );
+
+        let plain = Index {
+            name: "u_email".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: None,
+        };
+        assert!(
+            index_depends_on_column(&plain, "email"),
+            "columns membership counts as a dependency"
+        );
+    }
+
+    #[test]
+    fn drop_column_up_drops_column_and_down_restores_retained_index() {
+        // Baseline `users(id, email)` with a RETAINED constraint-owned unique
+        // index on `email` (definition-carrying, no paired DropIndex). The model
+        // removes `email`, so the plan carries only a DropColumn.
+        let mut email_col = col("email", ColumnType::Text);
+        email_col.nullable = false;
+        let mut baseline = posts_ref_table("users", email_col);
+        baseline.indexes.push(Index {
+            name: "users_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some("CREATE UNIQUE INDEX users_email_key ON users (email)".to_owned()),
+        });
+        // Desired side: `email` removed. `diff_indexes` retains the definition
+        // index (no DropIndex), so the plan is a lone DropColumn.
+        let desired = posts_ref_table("users", col("keep", ColumnType::Text));
+        let plan = diff_schema(
+            std::slice::from_ref(&baseline),
+            &parsed(vec![desired.clone()], vec![]),
+            ALLOW,
+        );
+        assert!(
+            plan.changes.iter().any(
+                |c| matches!(c, SchemaChange::DropColumn { column, .. } if column.name == "email")
+            ),
+            "plan must drop `email`: {:?}",
+            plan.changes
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { index, .. } if index.name == "users_email_key")),
+            "the retained definition index must NOT get a DropIndex: {:?}",
+            plan.changes
+        );
+
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+
+        // UP: a bare DROP COLUMN (Postgres cascade-drops the index), never a
+        // failing DROP INDEX on the constraint-backed index.
+        assert!(
+            up.contains("ALTER TABLE users DROP COLUMN email"),
+            "up must drop the column: {up}"
+        );
+        assert!(
+            !up.contains("DROP INDEX users_email_key"),
+            "up must NOT emit DROP INDEX for the cascade-dropped retained index: {up}"
+        );
+
+        // DOWN: re-add the column, THEN recreate the retained index verbatim.
+        assert!(
+            down.contains("ADD COLUMN email"),
+            "down must re-add the column: {down}"
+        );
+        assert!(
+            down.contains("CREATE UNIQUE INDEX users_email_key ON users (email)"),
+            "down must restore the cascade-dropped retained index: {down}"
+        );
+        let readd_at = down.find("ADD COLUMN email").expect("re-add present");
+        let index_at = down
+            .find("CREATE UNIQUE INDEX users_email_key")
+            .expect("index restore present");
+        assert!(
+            readd_at < index_at,
+            "column must be re-added before its dependent index is recreated: {down}"
         );
     }
 }
