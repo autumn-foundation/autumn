@@ -528,6 +528,11 @@ impl ProxyController for KamalProxyController {
         // The re-register reuses `deploy_shell` (with `force = true`), so it keeps the
         // `env -u XDG_RUNTIME_DIR` control-socket pin (#2019) and any `--host/--tls`
         // segment. The `|| exit 1` fail-fast on `systemctl restart` is unchanged.
+        //
+        // Operator advisory: do not combine the one-time proxy reboot-durability
+        // upgrade with a `deploy.tls.host` change in the same deploy — the pre-flip
+        // route refresh re-registers the live release with the current TLS host, so
+        // a failed rollback could strand the previous host. Tracked in #2074.
         ops.push(DeployOp::Run(RemoteCommand::new(
             "proxy-restart-if-changed",
             format!(
