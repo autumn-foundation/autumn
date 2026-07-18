@@ -511,9 +511,8 @@ fn load_existing_snapshot(path: &Path) -> Option<SchemaSnapshot> {
 /// the dry-run never under-reports: the forward plan is what pulling would change
 /// in the snapshot, but a manually-dropped default / FK / CHECK in the live DB is
 /// invisible to the forward pass (a desired `None` is "retained") and only surfaces
-/// in the reverse plan. When the forward plan has changes it is printed via
-/// [`diff::describe_plan`]; when only the reverse plan does, a short note names the
-/// dropped-facet differences so they are not silently omitted.
+/// in the reverse plan. The report is built by the pure [`format_pull_dry_run_report`]
+/// so it can be unit-tested without any I/O.
 fn report_pull_dry_run(
     pulled: &SchemaSnapshot,
     existing: Option<&SchemaSnapshot>,
@@ -530,33 +529,112 @@ fn report_pull_dry_run(
         }
         Some(existing) => {
             let drift = doctor::compute_db_schema_drift(&existing.tables, &pulled.tables);
-            if !drift.forward.is_empty() {
-                println!(
-                    "--dry-run: the database differs from the snapshot at {} — {} change(s) would \
-                     be captured (nothing written):",
-                    out_path.display(),
-                    drift.forward.changes.len()
-                );
-                print!("{}", diff::describe_plan(&drift.forward));
-            } else if !drift.reverse.is_empty() {
-                // The forward pass found nothing to pull, but the reverse pass did:
-                // the live DB dropped a default / foreign key / CHECK the snapshot
-                // still carries. Name it rather than falsely report "up to date".
-                println!(
-                    "--dry-run: the database at {} has {} dropped-default/foreign-key/CHECK \
-                     difference(s) the snapshot still carries — run `autumn schema diff \
-                     --write-migration` to generate a migration (nothing written).",
-                    out_path.display(),
-                    drift.reverse.changes.len()
-                );
-            } else {
-                println!(
-                    "--dry-run: the snapshot at {} is up to date — the database matches it.",
-                    out_path.display()
-                );
-            }
+            print!(
+                "{}",
+                format_pull_dry_run_report(&drift.forward, &drift.reverse, out_path)
+            );
         }
     }
+}
+
+/// Format the `--dry-run` report body for a snapshot that already exists, from the
+/// pre-computed bidirectional plans. Pure (no I/O) so it is unit-testable.
+///
+/// The report ALWAYS surfaces both directions independently:
+///
+/// * The **forward** plan — the structural changes a real pull would apply to the
+///   snapshot (added/dropped columns, type changes, index adds/drops, …) — is
+///   printed via [`diff::describe_plan`] whenever it is non-empty.
+/// * The **reverse-only** removals — a default / foreign key / CHECK the snapshot
+///   still carries but the live DB has dropped, which the forward pass structurally
+///   cannot express (a desired `None` is "retained", never a drop) — are ALWAYS
+///   named, phrased as removals, INDEPENDENT of whether the forward plan had
+///   changes. Without this a pull that both adds a column AND drops a default would
+///   report only the added column and silently omit that pulling also removes the
+///   default from the snapshot.
+///
+/// Structural adds/drops already in the forward plan are never re-listed here — only
+/// the asymmetric [`reverse_only_removals`] facets are surfaced from the reverse
+/// plan, so nothing is double-counted. When BOTH directions are empty the snapshot
+/// is up to date.
+fn format_pull_dry_run_report(
+    forward: &MigrationPlan,
+    reverse: &MigrationPlan,
+    out_path: &Path,
+) -> String {
+    use std::fmt::Write as _;
+
+    let removals = reverse_only_removals(reverse);
+    if forward.is_empty() && removals.is_empty() {
+        return format!(
+            "--dry-run: the snapshot at {} is up to date — the database matches it.\n",
+            out_path.display()
+        );
+    }
+
+    let mut out = String::new();
+    if !forward.is_empty() {
+        let _ = writeln!(
+            out,
+            "--dry-run: the database differs from the snapshot at {} — {} change(s) would be \
+             captured (nothing written):",
+            out_path.display(),
+            forward.changes.len()
+        );
+        out.push_str(&diff::describe_plan(forward));
+    }
+    if !removals.is_empty() {
+        let _ = writeln!(
+            out,
+            "--dry-run: pulling would also remove from the snapshot at {}: {} (nothing written).",
+            out_path.display(),
+            removals.join(", ")
+        );
+    }
+    out
+}
+
+/// The reverse-plan changes that represent a facet present in the snapshot but
+/// **dropped from the live DB** — the asymmetric removals the forward pass cannot
+/// emit (`diff_column` treats a desired `None` as "unknown, retained", never a
+/// drop). Rendered as human-readable removal phrases for the dry-run report.
+///
+/// Only genuine removals are surfaced, so a facet that merely *changed* value (and
+/// is therefore already captured by the forward plan) is never double-counted:
+///
+/// * [`SchemaChange::SetDefault`] with `from: None` — the reverse baseline (the DB)
+///   had no default at all, so the snapshot's default was dropped. A reverse
+///   `SetDefault` whose `from` is `Some` is a value *change* the forward plan
+///   already reports and is skipped here.
+/// * [`SchemaChange::AddForeignKey`] / [`SchemaChange::AddForeignKeyToExistingColumn`]
+///   — a foreign key the snapshot carries that the DB dropped (the reverse pass
+///   only ever emits these when the DB-side column had no FK; a *retarget* surfaces
+///   as `ForeignKeyChange` in BOTH directions and is not listed here).
+/// * [`SchemaChange::AddCheck`] — a CHECK constraint the snapshot carries that the
+///   DB dropped (checks are name-keyed add-only, so a reverse `AddCheck` is always a
+///   removal).
+fn reverse_only_removals(reverse: &MigrationPlan) -> Vec<String> {
+    reverse
+        .changes
+        .iter()
+        .filter_map(|change| match change {
+            SchemaChange::SetDefault {
+                table,
+                column,
+                from: None,
+                ..
+            } => Some(format!("default on `{table}.{column}`")),
+            SchemaChange::AddForeignKey { table, column, .. }
+            | SchemaChange::AddForeignKeyToExistingColumn { table, column } => {
+                Some(format!("foreign key on `{table}.{column}`"))
+            }
+            SchemaChange::AddCheck { table, check } => Some(format!(
+                "CHECK `{}` on `{table}`",
+                check.name.as_deref().unwrap_or("(unnamed)")
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Diff the declared models against the checked-in snapshot baseline and either
@@ -1820,6 +1898,116 @@ mod tests {
              forward={:?} reverse={:?}",
             drift.forward.changes,
             drift.reverse.changes
+        );
+    }
+
+    // -- `pull --dry-run` report formatting (pure) ---------------------------
+
+    /// A `posts(id BIGINT PK, created_at TIMESTAMP [default])` table. `default`
+    /// controls the `created_at` default; `extra` adds a trailing `TEXT` column.
+    fn dry_run_posts(default: Option<autumn_schema_core::ColumnDefault>, extra: bool) -> Table {
+        use autumn_schema_core::{Column, ColumnType};
+        let mut id = Column::new("id".to_string(), ColumnType::Int64);
+        id.primary_key = true;
+        let mut created_at = Column::new("created_at".to_string(), ColumnType::Timestamp);
+        created_at.default = default;
+        let mut table = Table::new("posts", Backend::Postgres);
+        table.managed = true;
+        table.primary_key = vec!["id".to_string()];
+        table.columns = vec![id, created_at];
+        if extra {
+            table
+                .columns
+                .push(Column::new("extra".to_string(), ColumnType::Text));
+        }
+        table
+    }
+
+    #[test]
+    fn dry_run_report_surfaces_reverse_only_removal_alongside_forward_change() {
+        // Snapshot: posts(id, created_at DEFAULT now()). Live DB: added an `extra`
+        // column AND dropped the `created_at` default. The forward plan catches the
+        // added column; the reverse-only pass must still surface the dropped
+        // default — the two must both appear, not just the forward change.
+        let snapshot = vec![dry_run_posts(
+            Some(autumn_schema_core::ColumnDefault::Now),
+            false,
+        )];
+        let db = vec![dry_run_posts(None, true)];
+        let drift = doctor::compute_db_schema_drift(&snapshot, &db);
+
+        // Precondition: the forward plan is non-empty (the added column) so we are
+        // exercising the "both directions non-empty" path, not the old fallback.
+        assert!(
+            !drift.forward.is_empty(),
+            "forward plan should carry the added column: {:?}",
+            drift.forward.changes
+        );
+
+        let report = format_pull_dry_run_report(
+            &drift.forward,
+            &drift.reverse,
+            Path::new(".autumn/schema-snapshot.json"),
+        );
+
+        assert!(
+            report.contains("ADD COLUMN posts.extra"),
+            "dry-run report must include the forward added-column change:\n{report}"
+        );
+        assert!(
+            report.contains("pulling would also remove from the snapshot")
+                && report.contains("default on `posts.created_at`"),
+            "dry-run report must ALSO surface the reverse-only dropped default even though a \
+             forward change exists:\n{report}"
+        );
+    }
+
+    #[test]
+    fn dry_run_report_reverse_only_removal_with_empty_forward() {
+        // Only a dropped default (no forward change) — the reverse-only removal must
+        // still be surfaced (never a false "up to date").
+        let snapshot = vec![dry_run_posts(
+            Some(autumn_schema_core::ColumnDefault::Now),
+            false,
+        )];
+        let db = vec![dry_run_posts(None, false)];
+        let drift = doctor::compute_db_schema_drift(&snapshot, &db);
+        assert!(
+            drift.forward.is_empty(),
+            "forward pass must miss the dropped default"
+        );
+
+        let report = format_pull_dry_run_report(
+            &drift.forward,
+            &drift.reverse,
+            Path::new(".autumn/schema-snapshot.json"),
+        );
+        assert!(
+            report.contains("default on `posts.created_at`"),
+            "dry-run report must surface the reverse-only dropped default:\n{report}"
+        );
+        assert!(
+            !report.contains("is up to date"),
+            "a dropped default is drift, never 'up to date':\n{report}"
+        );
+    }
+
+    #[test]
+    fn dry_run_report_clean_when_both_directions_empty() {
+        let snapshot = vec![dry_run_posts(
+            Some(autumn_schema_core::ColumnDefault::Now),
+            false,
+        )];
+        let db = snapshot.clone();
+        let drift = doctor::compute_db_schema_drift(&snapshot, &db);
+        let report = format_pull_dry_run_report(
+            &drift.forward,
+            &drift.reverse,
+            Path::new(".autumn/schema-snapshot.json"),
+        );
+        assert!(
+            report.contains("is up to date"),
+            "identical snapshot/DB must report up to date:\n{report}"
         );
     }
 }
