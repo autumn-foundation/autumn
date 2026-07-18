@@ -120,7 +120,7 @@ retry regenerates a single migration rather than a duplicate.
 
 On SQLite, `schema diff` emits real migrations for the ALTER-family changes
 SQLite's `ALTER TABLE` cannot express directly (`ALTER COLUMN TYPE`,
-`DROP NOT NULL`, `SET DEFAULT`, `ADD CHECK`, `ADD CONSTRAINT`) using the
+`DROP NOT NULL`, `SET DEFAULT`, `ADD CHECK`, `ADD FOREIGN KEY`) using the
 standard **table-recreate** procedure — create a new table, `INSERT..SELECT` the
 common columns, drop the old table, rename, and recreate indexes, all wrapped in
 `PRAGMA foreign_keys=OFF` … `foreign_key_check` … `ON` and coalesced to one

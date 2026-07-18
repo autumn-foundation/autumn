@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   valid token keeps authorizing room lifecycle/roster ops until the participant
   is removed or the process restarts — a WHIP publish URL
   plus per-peer WHEP subscribe URLs, a `RoomService` `AppState` extension, and a
-  durable `compose_room_recording` grid workflow (`FfmpegRoomCompositeCommand`,
-  xstack/hstack video + amix audio, a `#[job]` on the `media` queue). Isolation
+  durable `compose_room_recording` grid-composite `#[job]`
+  (`FfmpegRoomCompositeCommand`, `xstack` grid video + `amix` audio, on the
+  `media` queue). Isolation
   is fail-closed and keyed by `(namespace, room_id)`; the full-mesh cap is **6**
   participants (fail-fast on `0` or `> 6` from config or the builder — no silent
   clamp). Flat `[media]` config keys `room_max_participants` /
