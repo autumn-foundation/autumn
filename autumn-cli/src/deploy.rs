@@ -1697,6 +1697,56 @@ fn validate_public_port(public_port: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse a **redeploy** whose new port band collides with the still-live slot's
+/// actual loopback port, BEFORE any op runs — so traffic stays up (#2071).
+///
+/// On a redeploy the operator may have changed `server.port` since the live
+/// release was deployed. The proxy binds `0.0.0.0:{public_port}` (covering
+/// `127.0.0.1:{public_port}`) and the candidate app slot binds
+/// `127.0.0.1:{candidate_port}`, while the still-live release is holding its own
+/// `127.0.0.1:{live_upstream_port}` (the persisted ACTUAL live-slot port). If the
+/// new public port or the new candidate port equals that live loopback port, the
+/// #2070 proxy restart-refresh or the `start-candidate` step fails to bind
+/// (`EADDRINUSE`) mid-cutover — taking public traffic down with no auto-recovery.
+///
+/// This guard runs after `live_upstream_port` is resolved and before any cutover
+/// op executes: on a genuine collision it returns an error so **nothing is run**
+/// and the live release keeps serving. It is intentionally narrow — it refuses
+/// ONLY the two band members that can actually collide (`public_port` and
+/// `candidate_port` vs `live_upstream_port`). A live-slot *port* is never equal
+/// to its own candidate/public on an unchanged-port redeploy (the candidate takes
+/// the OTHER slot, and the public port is never a slot port), so unchanged-port
+/// durability upgrades pass, and a non-colliding `server.port` change (e.g.
+/// 3000→5000) also passes. A fully live-safe colliding-port change is future work
+/// (Option C).
+fn validate_no_live_port_collision(
+    public_port: u16,
+    candidate_port: u16,
+    live_upstream_port: u16,
+) -> Result<(), String> {
+    let offender = if public_port == live_upstream_port {
+        Some(("the proxy's public listener", public_port))
+    } else if candidate_port == live_upstream_port {
+        Some(("the candidate app slot", candidate_port))
+    } else {
+        None
+    };
+    if let Some((which, offending_port)) = offender {
+        return Err(format!(
+            "redeploy public port {public_port} is invalid — {which} (port {offending_port}) \
+             would collide with the currently-live release's loopback port \
+             {live_upstream_port}, so the proxy/candidate restart would fail to bind \
+             (EADDRINUSE) mid-cutover and take public traffic down with no auto-recovery. \
+             Choose a public port whose band {{{public_port}, {p1}, {p2}}} does not include \
+             the currently-live port {live_upstream_port}, or take a maintenance window (a \
+             fully live-safe colliding-port change is future work).",
+            p1 = exec::slot_app_port(public_port, exec::SLOT_BLUE),
+            p2 = exec::slot_app_port(public_port, exec::SLOT_GREEN),
+        ));
+    }
+    Ok(())
+}
+
 // Linear deploy orchestrator; the added MediaMTX host-prep step (#1974 Slice 7)
 // tips it one line over the threshold, and it reads clearest as one sequence.
 #[allow(clippy::too_many_lines)]
@@ -1825,6 +1875,19 @@ fn run_up(
             } else {
                 live_port.unwrap_or(plan.live_port)
             };
+            // Pre-flight guard (#2071): if the operator changed `server.port` such
+            // that the new public port OR the new candidate slot port collides with
+            // the port the still-live release is ACTUALLY holding on loopback, the
+            // #2070 proxy restart-refresh / start-candidate would fail to bind and
+            // take public traffic down with no auto-recovery. Refuse here — BEFORE
+            // any op runs — so the live release keeps serving. Unchanged-port
+            // redeploys and non-colliding port changes are unaffected.
+            validate_no_live_port_collision(
+                plan.public_port,
+                plan.candidate_port,
+                live_upstream_port,
+            )
+            .map_err(DeployError::Config)?;
             let unit = render_app_unit(
                 resolved,
                 &release_dir,
@@ -2000,6 +2063,71 @@ mod tests {
         assert!(validate_public_port(80).is_ok());
         assert!(validate_public_port(3000).is_ok());
         assert!(validate_public_port(8080).is_ok());
+    }
+
+    #[test]
+    fn redeploy_refuses_new_port_band_colliding_with_live_slot() {
+        // #2071 pre-flight guard. Baseline: the live release was deployed at public
+        // 3000 on the blue slot, so it holds `127.0.0.1:3001` (public+1). The
+        // operator now redeploys with a changed `server.port`; the candidate takes
+        // the GREEN slot (public+2).
+
+        // --- Collision variant 1: new public port == the live loopback port. ---
+        // Operator sets server.port = 3001, so the proxy would rebind 0.0.0.0:3001
+        // (covering 127.0.0.1:3001) — the exact port the live app holds.
+        let plan = exec::SlotPlan::redeploy(3001, exec::SLOT_BLUE);
+        let live_upstream_port = 3001; // persisted actual live-slot port (old public+1)
+        let err = validate_no_live_port_collision(
+            plan.public_port,
+            plan.candidate_port,
+            live_upstream_port,
+        )
+        .expect_err("new public port == live loopback port must be refused");
+        assert!(
+            err.contains("3001")
+                && err.contains("public listener")
+                && err.contains("currently-live"),
+            "public-collision message must name the offending/live port + the proxy \
+             listener, got: {err}",
+        );
+
+        // --- Collision variant 2: new candidate slot port == the live loopback. ---
+        // Operator sets server.port = 2999; the green candidate binds public+2 =
+        // 3001, colliding with the still-live blue app's 127.0.0.1:3001.
+        let plan = exec::SlotPlan::redeploy(2999, exec::SLOT_BLUE);
+        assert_eq!(plan.candidate_port, 3001, "green candidate binds public+2");
+        let err = validate_no_live_port_collision(
+            plan.public_port,
+            plan.candidate_port,
+            live_upstream_port,
+        )
+        .expect_err("new candidate port == live loopback port must be refused");
+        assert!(
+            err.contains("3001")
+                && err.contains("candidate app slot")
+                && err.contains("currently-live"),
+            "candidate-collision message must name the offending/live port + the \
+             candidate slot, got: {err}",
+        );
+
+        // --- ALLOWED (a): unchanged-port redeploy (3000, still blue live). ---
+        // The candidate takes the green slot (3002) and the public port (3000) is
+        // never a slot port, so nothing collides with the live 3001.
+        let plan = exec::SlotPlan::redeploy(3000, exec::SLOT_BLUE);
+        assert!(
+            validate_no_live_port_collision(plan.public_port, plan.candidate_port, 3001).is_ok(),
+            "unchanged-port durability redeploy must pass (candidate 3002, public \
+             3000, live 3001)",
+        );
+
+        // --- ALLOWED (b): non-colliding port change 3000 -> 5000. ---
+        // The live app still holds 3001; the new band is {5000, 5001, 5002}, which
+        // does not include 3001.
+        let plan = exec::SlotPlan::redeploy(5000, exec::SLOT_BLUE);
+        assert!(
+            validate_no_live_port_collision(plan.public_port, plan.candidate_port, 3001).is_ok(),
+            "non-colliding server.port change (3000->5000, live 3001) must pass",
+        );
     }
 
     #[test]
