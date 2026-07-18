@@ -375,11 +375,25 @@ pub fn render_mediamtx_yml(cfg: &MediaMtxHostConfig) -> String {
         let joined = cfg
             .webrtc_additional_hosts
             .iter()
-            .map(|h| format!("'{}'", h.replace('\'', "''")))
+            .map(|h| yaml_single_quote(h))
             .collect::<Vec<_>>()
             .join(", ");
         format!("[{joined}]")
     };
+
+    // The two config-derived string values in this template (the `recordPath`
+    // prefix built from `recordings_dir`, and the `recordDeleteAfter` retention
+    // window) are rendered as single-quoted YAML scalars (issue #2051, Finding T
+    // sweep). A plain scalar carrying a leading/trailing space or a YAML
+    // structural char (`:`/`#`/`{`/`[`/…) would otherwise break parsing — and a
+    // `mediamtx.yml` that fails to parse strands the daemon on the deferred
+    // post-cutover `systemctl restart`, the worst time. Quoting a path/duration
+    // is loss-free for MediaMTX (both parse the same string either way).
+    let record_path = yaml_single_quote(&format!(
+        "{}/%path/%Y-%m-%d_%H-%M-%S-%f",
+        cfg.recordings_dir
+    ));
+    let record_delete = yaml_single_quote(&cfg.record_delete_after);
 
     format!(
         "logLevel: info\n\
@@ -435,7 +449,7 @@ pub fn render_mediamtx_yml(cfg: &MediaMtxHostConfig) -> String {
          pathDefaults:\n\
          \x20\x20source: publisher\n\
          \x20\x20record: true\n\
-         \x20\x20recordPath: {rec_dir}/%path/%Y-%m-%d_%H-%M-%S-%f\n\
+         \x20\x20recordPath: {rec_path}\n\
          \x20\x20recordFormat: fmp4\n\
          \x20\x20recordPartDuration: 1s\n\
          \x20\x20recordSegmentDuration: 5m\n\
@@ -460,17 +474,42 @@ pub fn render_mediamtx_yml(cfg: &MediaMtxHostConfig) -> String {
         seg_count = HLS_SEGMENT_COUNT,
         seg_dur = HLS_SEGMENT_DURATION,
         webrtc_hosts = webrtc_hosts,
-        rec_dir = cfg.recordings_dir,
-        rec_delete = cfg.record_delete_after,
+        rec_path = record_path,
+        rec_delete = record_delete,
     )
+}
+
+/// Render `value` as a single-quoted YAML scalar (the only escape inside a YAML
+/// single-quoted scalar is a doubled `''` for a literal quote). Used for the
+/// config-derived string values in [`render_mediamtx_yml`] (record path, retention
+/// window, WebRTC additional hosts) so a value carrying whitespace or a YAML
+/// structural char stays a single scalar and never breaks `mediamtx.yml` parsing.
+#[must_use]
+fn yaml_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Render `value` as a systemd double-quoted `ExecStart` argument (issue #2051,
+/// Finding T). systemd is **not** a shell: it splits `ExecStart` on whitespace but
+/// honors its own C-style quoting, where a double-quoted token is one argument and
+/// `\\` / `\"` are the escapes for a literal backslash / quote. So a
+/// `binary_path`/`config_path` containing a space (e.g. `/opt/media mtx/mediamtx`)
+/// must be wrapped in double quotes or the deferred post-cutover
+/// `systemctl restart` parses the command as the truncated path `/opt/media`.
+/// Backslash is escaped first, then the quote, so the result round-trips exactly.
+#[must_use]
+fn systemd_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Render the systemd unit that supervises `MediaMTX`, styled like
 /// [`super::render_app_unit`] / [`super::proxy::KamalProxyController::render_proxy_unit`].
 ///
-/// `ExecStart` is `<binary_path> <config_path>`; `Restart=always` (a media
-/// daemon that dies must come straight back so ingest/playback recover without
-/// operator intervention). Pure — exposed for unit assertions.
+/// `ExecStart` is `"<binary_path>" "<config_path>"` — both paths are
+/// [`systemd_quote`]d (issue #2051, Finding T) so a path containing whitespace
+/// stays a single argument instead of splitting the command; `Restart=always` (a
+/// media daemon that dies must come straight back so ingest/playback recover
+/// without operator intervention). Pure — exposed for unit assertions.
 #[must_use]
 pub fn render_mediamtx_unit(cfg: &MediaMtxHostConfig) -> String {
     format!(
@@ -487,8 +526,8 @@ pub fn render_mediamtx_unit(cfg: &MediaMtxHostConfig) -> String {
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
-        bin = cfg.binary_path,
-        config = cfg.config_path,
+        bin = systemd_quote(&cfg.binary_path),
+        config = systemd_quote(&cfg.config_path),
     )
 }
 
@@ -608,6 +647,11 @@ impl MediaMtxController {
         let cfg_new = super::exec::shell_quote(&config_tmp);
         let unit_live = super::exec::shell_quote(&unit_path);
         let unit_new = super::exec::shell_quote(&unit_tmp);
+        // The systemd unit id passed to `systemctl` is a config-derived string
+        // (`unit_name`), so shell-quote `<unit_name>.service` (issue #2051, Finding
+        // T sweep) — an unquoted unit name containing whitespace/special chars
+        // would otherwise split the `systemctl enable/is-active/restart` arguments.
+        let unit_service = super::exec::shell_quote(&format!("{unit}.service"));
         // POSIX-sh, fail-fast (`set -e`): compare each staged file to its live
         // counterpart; a missing live file (`cmp` non-zero) or a real diff copies
         // it over and flags `changed`. daemon-reload + enable are idempotent. The
@@ -621,9 +665,9 @@ impl MediaMtxController {
              if ! cmp -s {unit_new} {unit_live}; then cp {unit_new} {unit_live}; chmod 0644 {unit_live}; changed=1; fi; \
              rm -f {cfg_new} {unit_new}; \
              systemctl daemon-reload; \
-             systemctl enable {unit}.service; \
-             if [ \"$changed\" -ne 0 ] || ! systemctl is-active --quiet {unit}.service; then \
-             systemctl restart {unit}.service; \
+             systemctl enable {unit_service}; \
+             if [ \"$changed\" -ne 0 ] || ! systemctl is-active --quiet {unit_service}; then \
+             systemctl restart {unit_service}; \
              fi",
         );
         ops.push(DeployOp::Run(RemoteCommand::new("media-install", install)));
@@ -873,9 +917,12 @@ fn managed_process_name(cfg: &MediaMtxHostConfig) -> &str {
 /// at most once per check and the result reused.
 #[must_use]
 fn unit_is_active(exec: &impl DeployExecutor, unit_name: &str) -> bool {
+    // `unit_name` is a config-derived string, so shell-quote `<unit>.service`
+    // (issue #2051, Finding T sweep) rather than interpolating it bare.
+    let unit_service = super::exec::shell_quote(&format!("{unit_name}.service"));
     let cmd = RemoteCommand::new(
         "media-unit-active",
-        format!("systemctl is-active --quiet {unit_name}.service"),
+        format!("systemctl is-active --quiet {unit_service}"),
     );
     exec.run(&cmd).is_ok()
 }
@@ -1420,9 +1467,12 @@ unit_name = \"mediamtx-prod\"
         assert!(yml.contains("hlsSegmentCount: 60"));
         // Recording config under the configured recordings dir.
         assert!(yml.contains("record: true"));
-        assert!(yml.contains("recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f"));
+        // Config-derived path/duration values are single-quoted YAML scalars
+        // (Finding T sweep) so a value with whitespace/special chars can't break
+        // parsing.
+        assert!(yml.contains("recordPath: '/recordings/%path/%Y-%m-%d_%H-%M-%S-%f'"));
         assert!(yml.contains("recordFormat: fmp4"));
-        assert!(yml.contains("recordDeleteAfter: 72h"));
+        assert!(yml.contains("recordDeleteAfter: '72h'"));
         // WebRTC config.
         assert!(yml.contains("webrtc: true"));
         assert!(yml.contains("webrtcAdditionalHosts: []"));
@@ -1494,8 +1544,8 @@ unit_name = \"mediamtx-prod\"
         let yml = render_mediamtx_yml(&cfg);
         assert!(yml.contains("apiAddress: 127.0.0.1:19997"));
         assert!(yml.contains("hlsAddress: :18888"));
-        assert!(yml.contains("recordPath: /data/rec/%path/"));
-        assert!(yml.contains("recordDeleteAfter: 24h"));
+        assert!(yml.contains("recordPath: '/data/rec/%path/%Y-%m-%d_%H-%M-%S-%f'"));
+        assert!(yml.contains("recordDeleteAfter: '24h'"));
         assert!(yml.contains("webrtcAdditionalHosts: ['a.example.com', 'b.example.com']"));
     }
 
@@ -1504,13 +1554,110 @@ unit_name = \"mediamtx-prod\"
     #[test]
     fn rendered_unit_uses_binary_and_config_paths_and_restarts_always() {
         let unit = render_mediamtx_unit(&MediaMtxHostConfig::default());
+        // Finding T: the binary/config paths are systemd double-quoted so a path
+        // with whitespace stays one argument.
         assert!(
-            unit.contains("ExecStart=/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml\n"),
+            unit.contains("ExecStart=\"/usr/local/bin/mediamtx\" \"/etc/mediamtx/mediamtx.yml\"\n"),
             "ExecStart: {unit}"
         );
         assert!(unit.contains("Restart=always\n"), "restart: {unit}");
         assert!(unit.contains("After=network-online.target\n"));
         assert!(unit.contains("WantedBy=multi-user.target\n"));
+    }
+
+    #[test]
+    fn rendered_unit_quotes_whitespace_paths_in_execstart() {
+        // Finding T (issue #2051): a `binary_path`/`config_path` containing
+        // whitespace must be systemd double-quoted in `ExecStart`, or systemd
+        // parses `ExecStart=/opt/media mtx/mediamtx ...` as the truncated command
+        // `/opt/media` and the deferred post-cutover `systemctl restart` fails.
+        let cfg = MediaMtxHostConfig {
+            binary_path: "/opt/media mtx/mediamtx".to_owned(),
+            config_path: "/etc/media mtx/mediamtx.yml".to_owned(),
+            ..MediaMtxHostConfig::default()
+        };
+        let unit = render_mediamtx_unit(&cfg);
+        // Each path is wrapped in systemd double quotes → one argument each.
+        assert!(
+            unit.contains(
+                "ExecStart=\"/opt/media mtx/mediamtx\" \"/etc/media mtx/mediamtx.yml\"\n"
+            ),
+            "ExecStart must double-quote whitespace paths: {unit}"
+        );
+        // And NOT the bare, space-splitting form.
+        assert!(
+            !unit.contains("ExecStart=/opt/media mtx/mediamtx"),
+            "ExecStart must not interpolate the path unquoted: {unit}"
+        );
+    }
+
+    #[test]
+    fn systemd_quote_escapes_backslash_and_double_quote() {
+        // systemd C-style quoting: `\\` and `\"` are the escapes inside a
+        // double-quoted token, escaped in that order so the value round-trips.
+        assert_eq!(systemd_quote("/usr/bin/mediamtx"), "\"/usr/bin/mediamtx\"");
+        assert_eq!(systemd_quote("/opt/a b/mtx"), "\"/opt/a b/mtx\"");
+        assert_eq!(systemd_quote(r#"/a"b"#), "\"/a\\\"b\"");
+        assert_eq!(systemd_quote(r"/a\b"), "\"/a\\\\b\"");
+    }
+
+    #[test]
+    fn rendered_yml_quotes_whitespace_and_special_config_values() {
+        // Finding T sweep: config-derived path/duration values are single-quoted
+        // YAML scalars, so a recordings dir with a space or a YAML structural char
+        // stays a single scalar instead of breaking `mediamtx.yml` parsing.
+        let cfg = MediaMtxHostConfig {
+            recordings_dir: "/mnt/rec ords".to_owned(),
+            record_delete_after: "72h".to_owned(),
+            ..MediaMtxHostConfig::default()
+        };
+        let yml = render_mediamtx_yml(&cfg);
+        assert!(
+            yml.contains("recordPath: '/mnt/rec ords/%path/%Y-%m-%d_%H-%M-%S-%f'"),
+            "recordPath must be single-quoted: {yml}"
+        );
+        // A `#` in the recordings dir would otherwise start a YAML comment.
+        let hashy = MediaMtxHostConfig {
+            recordings_dir: "/mnt/rec#1".to_owned(),
+            ..MediaMtxHostConfig::default()
+        };
+        let yml = render_mediamtx_yml(&hashy);
+        assert!(
+            yml.contains("recordPath: '/mnt/rec#1/%path/%Y-%m-%d_%H-%M-%S-%f'"),
+            "a `#` path must be quoted, not truncated by a YAML comment: {yml}"
+        );
+    }
+
+    #[test]
+    fn install_op_quotes_whitespace_unit_name() {
+        // Finding T sweep: the config-derived unit name is shell-quoted in every
+        // systemctl invocation, so a unit name with whitespace does not split the
+        // arguments.
+        let cfg = MediaMtxHostConfig {
+            enabled: true,
+            unit_name: "media mtx".to_owned(),
+            ..MediaMtxHostConfig::default()
+        };
+        let ops = MediaMtxController::new(cfg).ensure_installed_ops();
+        let DeployOp::Run(cmd) = &ops[3] else {
+            panic!("op 3 must be the install Run op");
+        };
+        assert!(
+            cmd.shell.contains("systemctl enable 'media mtx.service'"),
+            "unit name must be shell-quoted: {}",
+            cmd.shell
+        );
+        assert!(
+            cmd.shell
+                .contains("systemctl is-active --quiet 'media mtx.service'"),
+            "{}",
+            cmd.shell
+        );
+        assert!(
+            cmd.shell.contains("systemctl restart 'media mtx.service'"),
+            "{}",
+            cmd.shell
+        );
     }
 
     // ── Controller op sequence ───────────────────────────────────────────────
@@ -1578,7 +1725,7 @@ unit_name = \"mediamtx-prod\"
                 let FileContents::Plain(unit) = contents else {
                     panic!("unit must be plain text");
                 };
-                assert!(unit.contains("ExecStart=/usr/local/bin/mediamtx"));
+                assert!(unit.contains("ExecStart=\"/usr/local/bin/mediamtx\""));
             }
             other => panic!("op 2 must write the unit, got {other:?}"),
         }
@@ -1640,8 +1787,10 @@ unit_name = \"mediamtx-prod\"
         // Idempotent daemon-reload + enable (NOT `enable --now` — start is handled
         // by the conditional restart).
         assert!(shell.contains("systemctl daemon-reload"), "{shell}");
+        // The unit id is shell-quoted (`'mediamtx.service'`, Finding T sweep) in
+        // every systemctl invocation.
         assert!(
-            shell.contains("systemctl enable mediamtx.service"),
+            shell.contains("systemctl enable 'mediamtx.service'"),
             "{shell}"
         );
         assert!(
@@ -1651,12 +1800,12 @@ unit_name = \"mediamtx-prod\"
         // Restart gated on change-OR-inactive, never unconditional.
         assert!(
             shell.contains(
-                "if [ \"$changed\" -ne 0 ] || ! systemctl is-active --quiet mediamtx.service; then"
+                "if [ \"$changed\" -ne 0 ] || ! systemctl is-active --quiet 'mediamtx.service'; then"
             ),
             "restart must be gated on change or an inactive unit: {shell}"
         );
         assert!(
-            shell.contains("systemctl restart mediamtx.service"),
+            shell.contains("systemctl restart 'mediamtx.service'"),
             "{shell}"
         );
     }
@@ -1677,12 +1826,15 @@ unit_name = \"mediamtx-prod\"
         let DeployOp::Run(cmd) = &ops[3] else {
             panic!("op 3 must be the install Run op");
         };
-        assert!(cmd.shell.contains("systemctl enable mediamtx-prod.service"));
         assert!(
             cmd.shell
-                .contains("is-active --quiet mediamtx-prod.service")
+                .contains("systemctl enable 'mediamtx-prod.service'")
         );
-        assert!(cmd.shell.contains("restart mediamtx-prod.service"));
+        assert!(
+            cmd.shell
+                .contains("is-active --quiet 'mediamtx-prod.service'")
+        );
+        assert!(cmd.shell.contains("restart 'mediamtx-prod.service'"));
         // The staged temp unit tracks the custom unit name too.
         assert!(
             cmd.shell
