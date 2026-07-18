@@ -295,6 +295,13 @@ pub struct PreflightCheck {
     pub name: &'static str,
     /// Whether the check passed.
     pub passed: bool,
+    /// Whether the check could not be verified here and is deliberately
+    /// **deferred to the service's own runtime** (e.g. an env/interpolation
+    /// indirected `[media.ffmpeg] bin` the deploy side must not guess). A
+    /// deferred check is non-passing but **non-blocking** — it is surfaced as a
+    /// warning and never aborts a deploy, distinct from an honest failure. See
+    /// [`PreflightCheck::blocking`].
+    pub deferred: bool,
     /// Human-readable detail (what was found).
     pub detail: String,
     /// One-line remediation hint shown on failure.
@@ -306,6 +313,7 @@ impl PreflightCheck {
         Self {
             name,
             passed: true,
+            deferred: false,
             detail: detail.into(),
             hint: None,
         }
@@ -315,9 +323,20 @@ impl PreflightCheck {
         Self {
             name,
             passed: false,
+            deferred: false,
             detail: detail.into(),
             hint: Some(hint),
         }
+    }
+
+    /// Whether this check must abort the deploy. A check blocks only when it
+    /// genuinely failed — a **deferred** check (non-passing, but resolved in the
+    /// service's own runtime environment) is surfaced as a warning and never
+    /// blocks. This is the single predicate every preflight gate keys on so a
+    /// deferred outcome can never silently pass *or* hard-fail a deploy.
+    #[must_use]
+    pub const fn blocking(&self) -> bool {
+        !self.passed && !self.deferred
     }
 }
 
@@ -1304,6 +1323,13 @@ fn report_preflight(checks: &[PreflightCheck]) -> usize {
     for check in checks {
         if check.passed {
             eprintln!("\u{2705} {}: {}", check.name, check.detail);
+        } else if check.deferred {
+            // Non-blocking: verified in the service's own runtime, not here.
+            // Surfaced as a warning so it is visible but never aborts the deploy.
+            eprintln!("\u{26A0}\u{FE0F}  {}: {}", check.name, check.detail);
+            if let Some(hint) = check.hint {
+                eprintln!("   \u{2192} {hint}");
+            }
         } else {
             failed += 1;
             eprintln!("\u{274C} {}: {}", check.name, check.detail);
@@ -1381,13 +1407,19 @@ fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
     );
 }
 
-/// Grade the media host with the three fail-closed, **non-mutating** doctor
-/// checks (`FFmpeg` preflight, recordings dir writable, ports available) and abort
-/// the deploy on any failure — so a host that cannot serve media fails fast BEFORE
-/// the app deploy touches anything. A no-op when `[media.mediamtx]` is not
-/// enabled. This writes and restarts nothing; the mutating provisioning is
-/// deferred to [`provision_media_host`], which runs only after the app cutover
-/// succeeds.
+/// Grade the media host with the fail-closed, **non-mutating** doctor checks
+/// (`FFmpeg` preflight, `MediaMTX` binary, recordings dir writable, ports
+/// distinct/available) and abort the deploy on any **blocking** failure — so a
+/// host that cannot serve media fails fast BEFORE the app deploy touches
+/// anything. A **deferred** check (an env/interpolation-indirected
+/// `[media.ffmpeg] bin` the deployed service resolves from its own runtime
+/// environment) is surfaced as a warning and does **not** abort — the service
+/// resolves `FFmpeg` at runtime, so blocking the deploy here would be wrong,
+/// while a concrete literal `FFmpeg` path that is missing/not-executable still
+/// fails closed (see [`media::ffmpeg_preflight`] and
+/// [`PreflightCheck::blocking`]). A no-op when `[media.mediamtx]` is not enabled.
+/// This writes and restarts nothing; the mutating provisioning is deferred to
+/// [`provision_media_host`], which runs only after the app cutover succeeds.
 fn check_media_host_preflight(
     media_cfg: &media::MediaMtxHostConfig,
     ffmpeg_bin: &str,

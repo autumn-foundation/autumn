@@ -54,15 +54,19 @@
 //! environment, so [`ffmpeg_preflight`] verifies **only a concrete literal** `bin`
 //! — an environment-independent value it can probe correctly.
 //!
-//! **Fail-closed-honest.** An env/interpolation-indirected path — an empty value,
-//! or one carrying a `${...}` placeholder (including
+//! **Deferred, not failed.** An env/interpolation-indirected path — an empty
+//! value, or one carrying a `${...}` placeholder (including
 //! `${AUTUMN_MEDIA__FFMPEG__BIN}`) — is **deferred to runtime** with a clear
-//! non-passing outcome ("`FFmpeg` path uses env/interpolation indirection resolved
-//! in the service environment; deferring verification to runtime") rather than
-//! resolved against the CLI's local env and probed. Deferring is honest: the
-//! deployed service resolves and runs whatever *its* environment names, and the
-//! deploy side would otherwise report a false pass/fail against a binary the
-//! service will never run.
+//! non-passing, **non-blocking** outcome ("`FFmpeg` path uses env/interpolation
+//! indirection resolved in the service environment; deferring verification to
+//! runtime") rather than resolved against the CLI's local env and probed. It sets
+//! [`PreflightCheck::deferred`], so [`PreflightCheck::blocking`] is `false` and
+//! the deferred result is surfaced as a **warning that does not abort `deploy
+//! up`** — the deployed service resolves and runs whatever *its* environment
+//! names, so blocking the deploy on a path the deploy side cannot (and must not)
+//! verify would be wrong, while reporting it as a plain pass would falsely claim
+//! success. A **concrete literal** `FFmpeg` path that is missing / not executable
+//! / not actually `FFmpeg` still fails closed (blocking) as before.
 //!
 //! ## `MediaMTX` = a SEPARATE host daemon
 //!
@@ -195,6 +199,23 @@ fn default_ffmpeg_bin() -> String {
 /// (mirroring how the plugin reads `[media]`), so it never touches
 /// `autumn-web`'s strict `AutumnConfig` schema — no `autumn-media-plugin`
 /// dependency and no change to the app config type.
+///
+/// ## Deploy-side ports ↔ app runtime base URLs must stay consistent
+///
+/// The `*_port` fields here (`api_port` / `rtmp_port` / `hls_port` /
+/// `webrtc_port` / `playback_port`) only **provision the daemon's listeners** in
+/// the rendered `mediamtx.yml` (see [`render_mediamtx_yml`]). They are a separate
+/// config surface from the *app's* runtime `MediaMtxConfig` `*_base` URLs
+/// (`api_base` / `hls_base` / `webrtc_base` / playback base), which the deployed
+/// app/clients build request URLs from and which default to the standard ports
+/// (`9997`/`8888`/`8889`/`9996`). This module deliberately does **not** read or
+/// unify with the plugin's `MediaMtxConfig` — that autumn-cli→autumn-media-plugin
+/// coupling is out of slice-7 scope (a plugin-owned config-model change; issue
+/// #1974, codex PR #2051 finding). Consequence: **if you customize a
+/// `[media.mediamtx] *_port` here you MUST update the matching app-side `*_base`
+/// URL to the same port**, or the app/clients will keep calling the standard-port
+/// origin the daemon no longer binds. The two surfaces are default-aligned, so
+/// the common case needs no action.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MediaMtxHostConfig {
@@ -729,11 +750,14 @@ const FFMPEG_UNRESOLVED_HINT: &str = "Set `[media.ffmpeg] bin` to a concrete pat
 /// side neither has nor may guess (`build_env_file` does not propagate the
 /// operator's local shell). Probing a value resolved against the CLI's local env
 /// would be a false pass/fail against a binary the service will not use, so such a
-/// path is **deferred to runtime** with a clear non-passing outcome instead of
-/// probed. Otherwise it runs `<bin> -version` over the executor and requires the
-/// standard `ffmpeg version` banner in stdout — a binary that is missing, not
-/// executable, or is not actually `FFmpeg` (no banner) is a clear failure.
-/// Fail-closed: a transport error is a failure, not a pass.
+/// path is **deferred to runtime**: a non-passing but **non-blocking** result
+/// (`deferred: true`, so [`PreflightCheck::blocking`] is `false`) that surfaces as
+/// a warning and does **not** abort `deploy up` — the deployed service resolves
+/// `FFmpeg` from its own environment at runtime. Otherwise it runs `<bin>
+/// -version` over the executor and requires the standard `ffmpeg version` banner
+/// in stdout — a **concrete literal** binary that is missing, not executable, or
+/// is not actually `FFmpeg` (no banner) is a clear, **blocking** failure.
+/// Fail-closed: a transport error is a blocking failure, not a pass.
 #[must_use]
 pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> PreflightCheck {
     // Env/interpolation indirection the deployed service resolves from its OWN
@@ -744,6 +768,7 @@ pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> Preflig
         return PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
             passed: false,
+            deferred: true,
             detail: format!(
                 "FFmpeg path uses env/interpolation indirection (`{ffmpeg_bin}`) resolved in \
                  the service environment; deferring verification to runtime"
@@ -759,12 +784,14 @@ pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> Preflig
         Ok(out) if out.stdout.contains("ffmpeg version") => PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
             passed: true,
+            deferred: false,
             detail: format!("FFmpeg resolves at `{ffmpeg_bin}` and reports a version banner"),
             hint: None,
         },
         Ok(_) => PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
             passed: false,
+            deferred: false,
             detail: format!(
                 "`{ffmpeg_bin} -version` ran but did not report an `ffmpeg version` banner — \
                  the binary is not FFmpeg"
@@ -774,6 +801,7 @@ pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> Preflig
         Err(err) => PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
             passed: false,
+            deferred: false,
             detail: format!("could not run `{ffmpeg_bin} -version` on the host: {err}"),
             hint: Some(FFMPEG_HINT),
         },
@@ -801,12 +829,14 @@ pub fn recordings_dir_writable(
         Ok(_) => PreflightCheck {
             name: CHECK_RECORDINGS_DIR_WRITABLE,
             passed: true,
+            deferred: false,
             detail: format!("recordings directory `{dir}` exists and is writable"),
             hint: None,
         },
         Err(err) => PreflightCheck {
             name: CHECK_RECORDINGS_DIR_WRITABLE,
             passed: false,
+            deferred: false,
             detail: format!("recordings directory `{dir}` is missing or not writable: {err}"),
             hint: Some(RECORDINGS_HINT),
         },
@@ -975,6 +1005,7 @@ pub fn mediamtx_ports_available(
             return PreflightCheck {
                 name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
                 passed: false,
+                deferred: false,
                 detail: format!("could not verify MediaMTX port availability (`ss` failed): {err}"),
                 hint: Some(PORTS_HINT),
             };
@@ -989,6 +1020,7 @@ pub fn mediamtx_ports_available(
         return PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
             passed: false,
+            deferred: false,
             detail: "could not verify MediaMTX port availability: `ss` output did not parse into \
                      any listening ports"
                 .to_owned(),
@@ -1061,6 +1093,7 @@ pub fn mediamtx_ports_available(
         return PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
             passed: false,
+            deferred: false,
             detail: conflict_msgs.join("; "),
             hint: Some(PORTS_HINT),
         };
@@ -1078,6 +1111,7 @@ pub fn mediamtx_ports_available(
     PreflightCheck {
         name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
         passed: true,
+        deferred: false,
         detail,
         hint: None,
     }
@@ -1127,12 +1161,14 @@ pub fn mediamtx_binary_preflight(
         Ok(_) => PreflightCheck {
             name: CHECK_MEDIAMTX_BINARY,
             passed: true,
+            deferred: false,
             detail: format!("MediaMTX binary `{bin}` exists and is executable"),
             hint: None,
         },
         Err(err) => PreflightCheck {
             name: CHECK_MEDIAMTX_BINARY,
             passed: false,
+            deferred: false,
             detail: format!(
                 "MediaMTX binary `{bin}` is missing or not executable: {err} — MediaMTX cannot \
                  start, so the post-cutover `systemctl restart` would fail; the binary is a \
@@ -1187,6 +1223,7 @@ pub fn mediamtx_ports_distinct(cfg: &MediaMtxHostConfig) -> PreflightCheck {
         PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_DISTINCT,
             passed: true,
+            deferred: false,
             detail: "all MediaMTX TCP listener ports are distinct".to_owned(),
             hint: None,
         }
@@ -1194,6 +1231,7 @@ pub fn mediamtx_ports_distinct(cfg: &MediaMtxHostConfig) -> PreflightCheck {
         PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_DISTINCT,
             passed: false,
+            deferred: false,
             detail: format!(
                 "MediaMTX listener ports must be unique per protocol, but {} — two servers \
                  cannot bind the same TCP port, so `systemctl restart mediamtx` would fail after \
@@ -1906,6 +1944,10 @@ unit_name = \"mediamtx-prod\"
             RecordingExecutor::new().with_stdout("media-ffmpeg-preflight", "not-ffmpeg output");
         let check = ffmpeg_preflight(&exec, "/usr/bin/ffmpeg");
         assert!(!check.passed);
+        // A concrete literal that is not FFmpeg is a BLOCKING failure (not
+        // deferred) — it must still abort the deploy (Finding U, #2051).
+        assert!(!check.deferred);
+        assert!(check.blocking());
         assert!(check.hint.is_some());
     }
 
@@ -1916,6 +1958,9 @@ unit_name = \"mediamtx-prod\"
         let exec = RecordingExecutor::failing_on("media-ffmpeg-preflight");
         let check = ffmpeg_preflight(&exec, "/usr/bin/ffmpeg");
         assert!(!check.passed);
+        // A missing concrete literal is a BLOCKING failure, not deferred.
+        assert!(!check.deferred);
+        assert!(check.blocking());
         assert!(check.detail.contains("could not run"));
     }
 
@@ -1944,6 +1989,13 @@ unit_name = \"mediamtx-prod\"
             let exec = RecordingExecutor::new();
             let check = ffmpeg_preflight(&exec, configured);
             assert!(!check.passed, "must be non-passing for `{configured}`");
+            // Deferred, not failed: the service resolves FFmpeg from its own
+            // runtime env, so this must NOT abort the deploy (Finding U, #2051).
+            assert!(check.deferred, "must be deferred for `{configured}`");
+            assert!(
+                !check.blocking(),
+                "deferred check must be non-blocking for `{configured}`"
+            );
             assert!(
                 check.detail.contains("indirection") && check.detail.contains("deferring"),
                 "detail must name the deferral for `{configured}`: {}",
@@ -2331,6 +2383,39 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
                 // old `systemctl is-active` gate was removed (Finding D).
                 "media-ports"
             ]
+        );
+    }
+
+    #[test]
+    fn collect_with_env_indirected_ffmpeg_has_no_blocking_failures() {
+        // Finding U (#2051): an env/interpolation-indirected `[media.ffmpeg] bin`
+        // is DEFERRED to the service runtime — non-passing but non-blocking — so
+        // the aggregate has zero blocking checks and `deploy up` proceeds (the
+        // deploy gate counts `blocking()`, not `!passed`). A concrete missing
+        // FFmpeg would instead block.
+        let exec = RecordingExecutor::new().with_stdout(
+            "media-ports",
+            "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n",
+        );
+        let checks = collect_media_doctor_checks(
+            &exec,
+            &MediaMtxHostConfig::default(),
+            "${AUTUMN_MEDIA__FFMPEG__BIN}",
+        );
+        // The ffmpeg check is present, deferred, and non-passing …
+        let ffmpeg = checks
+            .iter()
+            .find(|c| c.name == CHECK_FFMPEG_PREFLIGHT)
+            .expect("ffmpeg check present");
+        assert!(ffmpeg.deferred && !ffmpeg.passed);
+        // … and no probe ran for it (no ffmpeg-preflight label recorded).
+        assert!(!exec.labels().contains(&"media-ffmpeg-preflight"));
+        // The deploy gate keys on `blocking()`: the deferred ffmpeg does NOT
+        // count, so the aggregate is non-blocking and the deploy is not aborted.
+        assert_eq!(
+            checks.iter().filter(|c| c.blocking()).count(),
+            0,
+            "deferred ffmpeg must not block the deploy"
         );
     }
 

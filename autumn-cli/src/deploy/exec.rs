@@ -1721,7 +1721,9 @@ fn execute_with_teardown(
     kind: TeardownKind,
     exec: &impl DeployExecutor,
 ) -> Result<(), DeployExecError> {
-    let failed = checks.iter().filter(|c| !c.passed).count();
+    // Only genuinely blocking failures abort — a deferred check (resolved in the
+    // service's own runtime) is non-blocking and never aborts the deploy.
+    let failed = checks.iter().filter(|c| c.blocking()).count();
     if failed > 0 {
         return Err(DeployExecError::PreflightAborted { failed });
     }
