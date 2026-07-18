@@ -2666,6 +2666,33 @@ fn unknown_key_was_previously_strict(schema_parent: &str) -> bool {
     schema_parent == "profile" || PRE_1890_STRICT_PARENTS.contains(&schema_parent)
 }
 
+/// Policy for how the strict unknown-key check treats a genuinely-unknown
+/// TOP-LEVEL config root — an unknown key whose schema parent is the document
+/// root `""` (e.g. a plugin-owned `[media]` section that no core-schema key
+/// covers).
+///
+/// App boot uses [`Strict`](UnknownRootPolicy::Strict): an unknown top-level
+/// root is a hard error, exactly as before. Tooling that structurally cannot
+/// know the application's plugin set — the deploy CLI, which has no
+/// `AppBuilder`, no plugin list, and no plugin-crate dependency — uses
+/// [`LenientWarn`](UnknownRootPolicy::LenientWarn): unknown top-level roots are
+/// accepted as opaque with a single doctor-style warning, because app boot
+/// (which DOES know the plugin set via the `config_section` seam / #2061 /
+/// #1974) remains the authoritative strict gate for plugin-owned roots (#2063).
+///
+/// The leniency is scoped to top-level roots ONLY: unknown keys INSIDE a known
+/// section (schema parent != `""`, e.g. a `[database] primry_url` typo) keep
+/// their normal (hard) classification under both policies, and malformed TOML
+/// still fails everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnknownRootPolicy {
+    /// Unknown top-level roots hard-fail (the app-boot path).
+    Strict,
+    /// Unknown top-level roots are accepted as opaque with one warning (the
+    /// deploy-CLI config-load path).
+    LenientWarn,
+}
+
 /// Child schema keys for config sections whose `Deserialize` is OPAQUE to the
 /// schema walker and must be declared by hand.
 ///
@@ -3043,6 +3070,36 @@ impl AutumnConfig {
     /// Panics if the internally-built TOML table fails to re-serialize
     /// (should never happen with well-formed profile defaults).
     pub fn load() -> Result<Self, ConfigError> {
+        Self::load_policy(UnknownRootPolicy::Strict)
+    }
+
+    /// Like [`load`](Self::load), but accepts unknown TOP-LEVEL config roots as
+    /// opaque-with-a-warning instead of hard-failing.
+    ///
+    /// For tooling that cannot know the application's plugin set (e.g. the
+    /// deploy CLI). Keeps STRICT validation of every known/core section
+    /// `AutumnConfig` owns (`[server]`, `[database]`, `[deploy]`, …) — including
+    /// child-key typos inside them — and still fails on malformed TOML; only a
+    /// genuinely-unknown top-level root (very likely a plugin-owned table such
+    /// as `[media]`) is spared, with a single doctor-style warning. App boot
+    /// remains the authoritative strict gate for plugin-owned roots (see the
+    /// `config_section` seam / #2061 / #1974 / #2063).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Io`] if a config file cannot be read,
+    /// [`ConfigError::Parse`] if a file contains invalid TOML, or
+    /// [`ConfigError::Validation`] if a value is invalid (including an unknown
+    /// key inside a known section under `strict_config`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internally-built TOML table fails to re-serialize.
+    pub fn load_lenient_unknown_roots() -> Result<Self, ConfigError> {
+        Self::load_policy(UnknownRootPolicy::LenientWarn)
+    }
+
+    fn load_policy(root_policy: UnknownRootPolicy) -> Result<Self, ConfigError> {
         // Feed a project-root `.env` into the `AUTUMN_*` env layer before
         // resolving config from the real environment. Rather than mutating the
         // process environment, `.env` values are layered *under* the real
@@ -3059,7 +3116,11 @@ impl AutumnConfig {
         let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
             .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
         let env = crate::dotenv::DotenvEnv::new(&base, vars);
-        Self::load_with_env(&env)
+        // The zero-arg loaders (`load` / `load_lenient_unknown_roots`) have no
+        // AppBuilder and therefore no plugin-declared config roots; plugin roots
+        // arrive only via `TomlEnvConfigLoader::with_plugin_config_roots` →
+        // `load_with_env_and_plugin_roots`. Pass an empty set here.
+        Self::load_with_env_and_plugin_roots_policy(&env, &BTreeSet::new(), root_policy)
     }
 
     /// Load configuration with profile-aware layering, using a provided
@@ -3073,7 +3134,11 @@ impl AutumnConfig {
     /// # Panics
     /// Panics if the internally-built TOML table fails to re-serialize.
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
-        Self::load_with_env_and_plugin_roots(env, &BTreeSet::new())
+        Self::load_with_env_and_plugin_roots_policy(
+            env,
+            &BTreeSet::new(),
+            UnknownRootPolicy::Strict,
+        )
     }
 
     /// Like [`load_with_env`](Self::load_with_env), but treats each top-level
@@ -3105,6 +3170,54 @@ impl AutumnConfig {
     pub fn load_with_env_and_plugin_roots(
         env: &dyn Env,
         plugin_config_roots: &BTreeSet<String>,
+    ) -> Result<Self, ConfigError> {
+        Self::load_with_env_and_plugin_roots_policy(
+            env,
+            plugin_config_roots,
+            UnknownRootPolicy::Strict,
+        )
+    }
+
+    /// Like [`load_with_env`](Self::load_with_env), but accepts unknown
+    /// TOP-LEVEL config roots as opaque-with-a-warning instead of hard-failing.
+    ///
+    /// For tooling that cannot know the application's plugin set (e.g. the
+    /// deploy CLI). Keeps STRICT validation of every known/core section — and
+    /// of child-key typos inside them — and still fails on malformed TOML; only
+    /// a genuinely-unknown top-level root (very likely a plugin-owned table such
+    /// as `[media]`) is spared, with a single doctor-style warning. App boot
+    /// remains the authoritative strict gate for plugin-owned roots (see the
+    /// `config_section` seam / #2061 / #1974 / #2063).
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Io`] if a config file cannot be read,
+    /// [`ConfigError::Parse`] if a file contains invalid TOML, or
+    /// [`ConfigError::Validation`] if a value is invalid (including an unknown
+    /// key inside a known section under `strict_config`).
+    ///
+    /// # Panics
+    /// Panics if the internally-built TOML table fails to re-serialize.
+    pub fn load_with_env_lenient_unknown_roots(env: &dyn Env) -> Result<Self, ConfigError> {
+        Self::load_with_env_and_plugin_roots_policy(
+            env,
+            &BTreeSet::new(),
+            UnknownRootPolicy::LenientWarn,
+        )
+    }
+
+    /// Shared config-loading worker threading BOTH the plugin-declared config
+    /// roots (#2061) AND the unknown-top-level-root policy (#2063).
+    ///
+    /// The two knobs are orthogonal: `plugin_config_roots` exempts SPECIFIC
+    /// declared table roots (they produce no error to classify), while
+    /// `root_policy` decides whether the REMAINING unknown top-level roots
+    /// hard-fail ([`Strict`](UnknownRootPolicy::Strict), app boot) or are
+    /// accepted opaque-with-a-warning
+    /// ([`LenientWarn`](UnknownRootPolicy::LenientWarn), the deploy CLI).
+    fn load_with_env_and_plugin_roots_policy(
+        env: &dyn Env,
+        plugin_config_roots: &BTreeSet<String>,
+        root_policy: UnknownRootPolicy,
     ) -> Result<Self, ConfigError> {
         let selected_profile_input = resolve_profile_input(env);
         let profile =
@@ -3161,7 +3274,12 @@ impl AutumnConfig {
                 || env
                     .var("AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL")
                     .is_ok_and(|v| v == "true" || v == "1");
-            Self::run_strict_unknown_key_check(&toml_str, enforce_all, plugin_config_roots)?;
+            Self::run_strict_unknown_key_check(
+                &toml_str,
+                enforce_all,
+                plugin_config_roots,
+                root_policy,
+            )?;
         }
 
         // ── Deprecation channel (purely additive; never mutates `config`). ──────
@@ -3232,18 +3350,55 @@ impl AutumnConfig {
         toml_str: &str,
         enforce_all: bool,
         plugin_config_roots: &BTreeSet<String>,
+        root_policy: UnknownRootPolicy,
     ) -> Result<(), ConfigError> {
         let schema = Self::get_schema_keys();
         let errors = Self::validate_toml_detailed(toml_str, &schema, plugin_config_roots);
 
         let mut hard_errors = Vec::new();
         let mut warn_only = Vec::new();
+        let mut opaque_roots = Vec::new();
         for (path, sug, schema_parent) in errors {
+            // Deploy-CLI leniency (#2063): a genuinely-unknown TOP-LEVEL root
+            // (its schema parent is the document root `""`) is accepted as
+            // opaque rather than failing — it is almost certainly a
+            // plugin-owned config table (e.g. `[media]`) the CLI structurally
+            // cannot know about, and app boot stays the strict gate for it.
+            // ONLY the root is spared: an unknown key inside a KNOWN section
+            // (schema_parent != "") falls through to its normal classification
+            // below, so a `[database] primry_url` typo still hard-fails. The
+            // app-boot path passes `Strict`, so its behavior is unchanged.
+            if root_policy == UnknownRootPolicy::LenientWarn && schema_parent.is_empty() {
+                opaque_roots.push(path);
+                continue;
+            }
             if enforce_all || unknown_key_was_previously_strict(&schema_parent) {
                 hard_errors.push((path, sug));
             } else {
                 warn_only.push((path, sug));
             }
+        }
+
+        // Deploy-CLI opaque top-level roots (#2063): surface exactly one
+        // doctor-style line (never fatal) so an accepted plugin root is
+        // observable and a typo'd root is not silently swallowed — it will be
+        // rejected authoritatively when the app itself boots. `eprintln!`
+        // guarantees visibility before a tracing subscriber is installed; the
+        // `tracing::warn!` keeps structured output for apps that pre-install one.
+        if !opaque_roots.is_empty() {
+            let roots = opaque_roots.join(", ");
+            let count = opaque_roots.len();
+            eprintln!(
+                "deploy config: accepting {count} unknown top-level config section(s) as \
+                 opaque (validated at app boot): {roots} — if one of these is a typo it \
+                 will be rejected when the app starts."
+            );
+            tracing::warn!(
+                unknown_top_level_roots = roots.as_str(),
+                count,
+                "deploy config: accepting unknown top-level config section(s) as opaque; \
+                 app boot remains the strict gate for plugin-owned roots (#2063)"
+            );
         }
 
         // Warn-first rollout (#1890): unknown keys in sections that only became
@@ -7998,6 +8153,122 @@ mod tests {
         assert!(res.is_err());
         let err_str = format!("{:?}", res.err().unwrap());
         assert!(err_str.contains("primry_url"));
+    }
+
+    // #2063 helper: a `prod`, manifest-scoped env with `strict_config` sourced
+    // from the on-disk `autumn.toml`. `prod` is pinned (not `dev`) so the
+    // dev-only injected `[storage]` smart-default can't masquerade as an unknown
+    // top-level root and skew these assertions — same reason the #1890 tests do.
+    fn strict_prod_env_2063(temp: &std::path::Path) -> FakeEnv {
+        FakeEnv(
+            [
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        )
+    }
+
+    // #2063: the deploy CLI's lenient-unknown-roots load accepts a plugin-owned
+    // top-level config table (`[media]`) under `strict_config` — the CLI cannot
+    // know the app's plugin set — while the STRICT (app-boot) load still rejects
+    // it, so app boot remains the authoritative strict gate for plugin roots.
+    #[test]
+    fn deploy_cli_lenient_accepts_plugin_owned_top_level_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[server]\nstrict_config = true\n\n[media]\nmediamtx_host = \"cdn.example\"\n",
+        )
+        .unwrap();
+        let env = strict_prod_env_2063(temp.path());
+
+        // App boot stays strict: an unknown `[media]` root is a hard error.
+        let strict = AutumnConfig::load_with_env(&env);
+        assert!(
+            strict.is_err(),
+            "app boot must stay strict for unknown plugin roots: {strict:?}"
+        );
+        let strict_err = format!("{:?}", strict.err().unwrap());
+        assert!(
+            strict_err.contains("media"),
+            "strict error should name the unknown root: {strict_err}"
+        );
+
+        // Deploy CLI accepts it as opaque (warn, not fail) so the project deploys.
+        let lenient = AutumnConfig::load_with_env_lenient_unknown_roots(&env);
+        assert!(
+            lenient.is_ok(),
+            "deploy CLI must accept plugin-owned [media] under strict_config: {lenient:?}"
+        );
+    }
+
+    // #2063: any genuinely-unknown top-level root (not just `[media]`) is
+    // warn-not-fail under the lenient CLI load, and still fatal under app boot.
+    #[test]
+    fn deploy_cli_lenient_accepts_arbitrary_unknown_top_level_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[server]\nstrict_config = true\n\n[definitely_not_a_root]\nx = 1\n",
+        )
+        .unwrap();
+        let env = strict_prod_env_2063(temp.path());
+
+        assert!(
+            AutumnConfig::load_with_env(&env).is_err(),
+            "app boot must reject an unknown top-level root"
+        );
+        assert!(
+            AutumnConfig::load_with_env_lenient_unknown_roots(&env).is_ok(),
+            "deploy CLI must accept an unknown top-level root as opaque"
+        );
+    }
+
+    // #2063: leniency is scoped to top-level ROOTS only. A typo INSIDE a known
+    // section (`[database] primry_url`) stays a hard error even under the lenient
+    // CLI load — the CLI does not soften validation of sections it knows.
+    #[test]
+    fn deploy_cli_lenient_still_rejects_known_section_typo() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[server]\nstrict_config = true\n\n[database]\nprimry_url = \"postgres://localhost/db\"\n",
+        )
+        .unwrap();
+        let env = strict_prod_env_2063(temp.path());
+
+        let res = AutumnConfig::load_with_env_lenient_unknown_roots(&env);
+        assert!(
+            res.is_err(),
+            "known-section typo must still hard-fail under the lenient CLI load: {res:?}"
+        );
+        let err = format!("{:?}", res.err().unwrap());
+        assert!(
+            err.contains("primry_url"),
+            "error should name the known-section typo: {err}"
+        );
+    }
+
+    // #2063: malformed TOML is fatal everywhere — the lenient policy never
+    // softens a parse failure.
+    #[test]
+    fn deploy_cli_lenient_still_rejects_malformed_toml() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[server]\nstrict_config = true\n\nthis is not = = valid toml\n",
+        )
+        .unwrap();
+        let env = strict_prod_env_2063(temp.path());
+
+        assert!(
+            AutumnConfig::load_with_env_lenient_unknown_roots(&env).is_err(),
+            "malformed TOML must still fail under the lenient CLI load"
+        );
     }
 
     // 7a (#1890): a typo in a section that ONLY became strictly validated by the
