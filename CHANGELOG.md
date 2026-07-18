@@ -48,9 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn deploy plan` surfaces the media unit, its provisioning steps, and the
   required `connect-src`/`media-src`/`frame-src` CSP origins. The
   `[media.mediamtx]` / `[media.ffmpeg]` deploy config is read straight from the
-  merged `autumn.toml` (base ← profile ← `autumn-<profile>.toml`) so it never
-  touches autumn-web's `AutumnConfig` schema, and the whole controller is a no-op
-  when disabled — a non-media project is byte-for-byte unaffected. See the new
+  merged `autumn.toml` (base ← profile ← `autumn-<profile>.toml`), so that
+  media-subtree read itself never routes through autumn-web's `AutumnConfig`
+  schema. This does **not** make `strict_config` deploy-safe, though: `deploy::run`
+  still calls the strict `AutumnConfig::load()` (for `[deploy]`) ahead of
+  `load_media_host_config`, so with `[server] strict_config = true` **and** a
+  top-level `[media]` table in the strict-loaded config, that load hard-fails on
+  the unknown `[media]` key — both the app runtime and `deploy plan`/`up` exit
+  during config load (treat the two as mutually exclusive today). The whole
+  controller is a no-op when disabled — a non-media project is byte-for-byte
+  unaffected. See the new
   [media deployment guide](docs/guide/deployment.md#mediamtx-host-provisioning-media)
   (#2051).
 - **cli:** the declarative-schema command group (`autumn schema`, tracking
