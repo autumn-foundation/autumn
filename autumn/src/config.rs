@@ -2824,15 +2824,20 @@ impl AutumnConfig {
     ) -> Vec<(String, Option<String>)> {
         Self::validate_toml_detailed(content, schema, &BTreeSet::new())
             .into_iter()
-            .map(|(path, sug, _parent)| (path, sug))
+            .map(|(path, sug, _parent, _is_table)| (path, sug))
             .collect()
     }
 
     /// Like [`validate_toml`](Self::validate_toml), but also returns each error's
     /// profile-stripped schema parent path (computed from path SEGMENTS, so it is
     /// correct even for quoted dotted profile names like
-    /// `[profile."prod.eu".server]`). Used by strict-config classification;
+    /// `[profile."prod.eu".server]`) AND whether the offending TOML value was
+    /// itself a table (`is_table`). Used by strict-config classification;
     /// `validate_toml` maps this down to `(path, suggestion)`.
+    ///
+    /// The `is_table` flag lets the deploy-CLI leniency (#2067) demote ONLY a
+    /// true top-level TABLE root, mirroring the app-boot `config_section` seam
+    /// (#2061) which exempts a registered plugin root only when `val.is_table()`.
     ///
     /// `plugin_config_roots` lists top-level roots a plugin has declared via
     /// [`config_section`](crate::app::AppBuilder::config_section): each is
@@ -2843,7 +2848,7 @@ impl AutumnConfig {
         content: &str,
         schema: &HashMap<String, HashSet<String>>,
         plugin_config_roots: &BTreeSet<String>,
-    ) -> Vec<(String, Option<String>, String)> {
+    ) -> Vec<(String, Option<String>, String, bool)> {
         let Ok(table) = toml::from_str::<toml::Table>(content) else {
             return Vec::new();
         };
@@ -2860,7 +2865,7 @@ impl AutumnConfig {
         path: &mut Vec<String>,
         schema: &HashMap<String, HashSet<String>>,
         plugin_config_roots: &BTreeSet<String>,
-        errors: &mut Vec<(String, Option<String>, String)>,
+        errors: &mut Vec<(String, Option<String>, String, bool)>,
     ) {
         let mut schema_path_parts = Vec::new();
         if path.len() >= 2 && path[0] == "profile" {
@@ -2971,7 +2976,7 @@ impl AutumnConfig {
                         sug_parts.join(".")
                     });
 
-                    errors.push((full_path, suggestion, schema_path.clone()));
+                    errors.push((full_path, suggestion, schema_path.clone(), val.is_table()));
                 }
             }
         } else if path.len() == 1 && path[0] == "profile" {
@@ -2983,7 +2988,12 @@ impl AutumnConfig {
                 } else {
                     let mut full_path_parts = path.clone();
                     full_path_parts.push(k.clone());
-                    errors.push((full_path_parts.join("."), None, schema_path.clone()));
+                    errors.push((
+                        full_path_parts.join("."),
+                        None,
+                        schema_path.clone(),
+                        val.is_table(),
+                    ));
                 }
             }
         } else if path.is_empty() {
@@ -3034,7 +3044,12 @@ impl AutumnConfig {
                             closest = Some(valid_key);
                         }
                     }
-                    errors.push((k.clone(), closest.map(String::from), schema_path.clone()));
+                    errors.push((
+                        k.clone(),
+                        closest.map(String::from),
+                        schema_path.clone(),
+                        val.is_table(),
+                    ));
                 }
             }
         }
@@ -3358,7 +3373,7 @@ impl AutumnConfig {
         let mut hard_errors = Vec::new();
         let mut warn_only = Vec::new();
         let mut opaque_roots = Vec::new();
-        for (path, sug, schema_parent) in errors {
+        for (path, sug, schema_parent, is_table) in errors {
             // Deploy-CLI leniency (#2063/#2067): a genuinely-unknown TRUE
             // top-level root — one sitting directly at the document root, i.e.
             // whose ACTUAL path is a bare root key (no `profile.<name>` prefix)
@@ -3389,9 +3404,22 @@ impl AutumnConfig {
             // key inside a KNOWN section (schema_parent != "") also falls
             // through, so a `[database] primry_url` typo still hard-fails. The
             // app-boot path passes `Strict`, so its behavior is unchanged.
+            //
+            // Leniency additionally requires the root's TOML value to be a TABLE
+            // (`is_table`), mirroring the #2061 `config_section` app-boot
+            // exemption, which accepts a registered plugin root only when
+            // `val.is_table()`. A non-table true-top-level root — a scalar or
+            // array like `media = "enabled"` / `media = ["a", "b"]` — is a
+            // malformed section nothing would deserialize, so it does NOT match
+            // here and falls through to the normal (hard) classification →
+            // strict rejection at deploy, EXACTLY as the deployed app rejects it
+            // at boot. Without this check deploy would accept a non-table root
+            // that app boot rejects, reopening the "deploy accepts what boot
+            // rejects" gap this branch exists to close.
             if root_policy == UnknownRootPolicy::LenientWarn
                 && schema_parent.is_empty()
                 && !path.contains('.')
+                && is_table
             {
                 opaque_roots.push(path);
                 continue;
@@ -8354,6 +8382,61 @@ mod tests {
         assert!(
             err.contains("definitely_unknown"),
             "error should name the profile-prefixed unknown root: {err}"
+        );
+    }
+
+    // #2067: the lenient deploy-CLI demotion applies ONLY to a true top-level
+    // root whose TOML value is a TABLE. A registered/unknown root written as a
+    // SCALAR (`media = "enabled"`) or an ARRAY (`media = ["a", "b"]`) is a
+    // malformed section nothing would deserialize, so it must HARD-FAIL under
+    // the lenient CLI load too — exactly as the deployed app rejects it at boot
+    // (the #2061 `config_section` seam exempts a plugin root only when
+    // `val.is_table()`). Without the `is_table` gate deploy would accept a
+    // non-table root that app boot rejects.
+    #[test]
+    fn deploy_cli_lenient_still_rejects_non_table_root() {
+        // Scalar root: `media = "enabled"`.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("autumn.toml"),
+            "[server]\nstrict_config = true\n\nmedia = \"enabled\"\n",
+        )
+        .unwrap();
+        let env = strict_prod_env_2063(temp.path());
+
+        let res = AutumnConfig::load_with_env_lenient_unknown_roots(&env);
+        assert!(
+            res.is_err(),
+            "a SCALAR top-level root (media = \"enabled\") must hard-fail under the \
+             lenient CLI load — it is not a table and the deployed app rejects it at \
+             boot: {res:?}"
+        );
+        let err = format!("{:?}", res.err().unwrap());
+        assert!(
+            err.contains("media"),
+            "error should name the non-table root: {err}"
+        );
+
+        // Array root: `media = ["a", "b"]`.
+        let temp2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp2.path().join("autumn.toml"),
+            "[server]\nstrict_config = true\n\nmedia = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+        let env2 = strict_prod_env_2063(temp2.path());
+
+        let res2 = AutumnConfig::load_with_env_lenient_unknown_roots(&env2);
+        assert!(
+            res2.is_err(),
+            "an ARRAY top-level root (media = [\"a\", \"b\"]) must hard-fail under the \
+             lenient CLI load — it is not a table and the deployed app rejects it at \
+             boot: {res2:?}"
+        );
+        let err2 = format!("{:?}", res2.err().unwrap());
+        assert!(
+            err2.contains("media"),
+            "error should name the non-table root: {err2}"
         );
     }
 
