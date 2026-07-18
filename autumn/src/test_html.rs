@@ -80,6 +80,9 @@ fn collect_text(nodes: &[Node], out: &mut String) {
 /// Collapse runs of ASCII whitespace into single spaces and trim the ends, so
 /// text/`assert_text` comparisons survive indentation and line-wrapping
 /// changes in templates.
+///
+/// Optimized to iterate over words and push them into a pre-allocated `String`,
+/// which eliminates an intermediate `Vec` heap allocation that `.collect::<Vec<_>>().join(" ")` would require.
 pub fn normalize_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut first = true;

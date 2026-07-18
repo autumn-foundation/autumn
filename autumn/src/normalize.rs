@@ -47,6 +47,9 @@ pub fn upcase(s: &str) -> String {
 }
 
 /// Trim and collapse every internal run of whitespace to a single ASCII space.
+///
+/// Optimized to iterate over words and push them into a pre-allocated `String`,
+/// which eliminates an intermediate `Vec` heap allocation that `.collect::<Vec<_>>().join(" ")` would require.
 #[must_use]
 pub fn squish(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

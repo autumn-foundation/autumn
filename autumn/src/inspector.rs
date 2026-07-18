@@ -232,6 +232,11 @@ pub fn detect_n_plus_one(queries: &[QueryRecord], threshold: usize) -> Option<NP
 }
 
 /// Collapse whitespace and lower-case a SQL string for comparison.
+///
+/// Optimized to iterate over words and push them into a pre-allocated `String`,
+/// which eliminates an intermediate `Vec` heap allocation that `.collect::<Vec<_>>().join(" ")` would require.
+/// Uses `make_ascii_lowercase` to modify the buffer in-place (since SQL keywords are ASCII),
+/// avoiding another heap allocation that `to_lowercase` would perform.
 fn normalize_sql(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut first = true;
