@@ -22,14 +22,15 @@ on:
         description: "Stock Ubuntu image to provision (no pre-baked deploy tooling)"
         type: string
         default: "ubuntu-24.04"
+        # Optional HINT only. The provisioning step queries Hetzner live and
+        # picks the first orderable type from a cheapest-first preference list;
+        # this value, when set, is merely tried first (empty on scheduled runs).
+        # No need to update it when Hetzner retires a plan — that is exactly the
+        # failure class the live selection removes.
       server_type:
-        # Single source of truth for the provisioned server type. The
-        # provisioning step below falls back to this same value for scheduled
-        # runs (which supply no inputs). Update BOTH when Hetzner retires the
-        # type: cx22 was retired, hence cpx11 (current AMD shared-vCPU, nbg1).
-        description: "Hetzner server type"
+        description: "Hetzner server type (optional hint; live selection is authoritative)"
         type: string
-        default: "cpx11"
+        default: ""
       location:
         description: "Hetzner location"
         type: string
@@ -107,20 +108,73 @@ jobs:
 
       # ── Provider-specific provisioning (Hetzner Cloud). Swap this block for a
       # different provider without touching the lifecycle script below. ────────
+      #
+      # RESILIENT server-type selection (issue #2019). Hardcoding one
+      # --type/--location wedged the run every time Hetzner retired or sold out a
+      # plan (cx22, then cpx11 — "Server Type X is unavailable in Y and can no
+      # longer be ordered"). Instead we query Hetzner LIVE and pick the first
+      # ACTUALLY-ORDERABLE type from a cheapest-first preference list, trying the
+      # configured location first and then EU fallbacks; the choice is logged.
+      # Orderability comes from each server type's own `locations[].available`
+      # flag — the non-deprecated signal (the datacenter `server_types.available`
+      # list stops being returned after 2026-10-01). If nothing matches we fail
+      # with the full per-location availability table. This converts the whole
+      # "guessed-wrong-static-type" failure class into a logged runtime decision.
       - name: Provision throwaway VM (Hetzner Cloud)
         id: provision
         run: |
           set -euo pipefail
           hcloud ssh-key create --name "${HCLOUD_SSH_KEY_NAME}" --public-key-from-file "${SSH_KEY}.pub"
+
+          # Cheapest-first preference list. The workflow_dispatch `server_type`
+          # input is kept for backward-compat but is now only a HINT: it is tried
+          # first when set (empty on scheduled runs), then the live selection is
+          # authoritative — a retired/sold-out hint simply falls through.
+          PREF_TYPES="${{ inputs.server_type }} cpx22 cx32 cpx31 cpx41 cx42 cpx51"
+          # Configured location first, then EU fallbacks (deduped, order kept).
+          LOCATIONS="${{ inputs.location || 'nbg1' }} fsn1 hel1 nbg1"
+
+          types_json="$(hcloud server-type list -o json)"
+          chosen_type=""; chosen_loc=""
+          for loc in $(printf '%s\n' $LOCATIONS | awk '!seen[$0]++'); do
+            # Names of server types orderable (available == true) in this location.
+            avail_names="$(printf '%s' "$types_json" \
+              | jq -r --arg loc "$loc" '.[] | select(any(.locations[]?; .name == $loc and .available)) | .name')"
+            [ -z "$avail_names" ] && continue
+            for pref in $PREF_TYPES; do
+              if printf '%s\n' "$avail_names" | grep -qx "$pref"; then
+                chosen_type="$pref"; chosen_loc="$loc"; break
+              fi
+            done
+            [ -n "$chosen_type" ] && break
+          done
+
+          if [ -z "$chosen_type" ]; then
+            echo "::error::No preferred server type ($PREF_TYPES) is orderable in any of: $LOCATIONS"
+            echo "=== orderable server types per location (live Hetzner availability) ==="
+            for loc in $(printf '%s\n' $LOCATIONS | awk '!seen[$0]++'); do
+              printf -- '-- %s --\n' "$loc"
+              printf '%s' "$types_json" \
+                | jq -r --arg loc "$loc" '.[] | select(any(.locations[]?; .name == $loc and .available)) | .name' \
+                | paste -sd' ' -
+            done
+            echo "=== hcloud server-type list ==="; hcloud server-type list
+            echo "=== hcloud datacenter list ==="; hcloud datacenter list
+            exit 1
+          fi
+
+          echo "Selected server type '$chosen_type' in location '$chosen_loc' (live Hetzner availability)."
           hcloud server create \
             --name "${HCLOUD_SERVER_NAME}" \
-            --type "${{ inputs.server_type || 'cpx11' }}" \
+            --type "$chosen_type" \
             --image "${{ inputs.ubuntu_image || 'ubuntu-24.04' }}" \
-            --location "${{ inputs.location || 'nbg1' }}" \
+            --location "$chosen_loc" \
             --ssh-key "${HCLOUD_SSH_KEY_NAME}"
           ip="$(hcloud server ip "${HCLOUD_SERVER_NAME}")"
-          echo "Provisioned ${HCLOUD_SERVER_NAME} at ${ip}"
+          echo "Provisioned ${HCLOUD_SERVER_NAME} (${chosen_type}/${chosen_loc}) at ${ip}"
           echo "TARGET_HOST=${ip}" >> "${GITHUB_ENV}"
+          echo "HCLOUD_LOCATION=${chosen_loc}" >> "${GITHUB_ENV}"
+          echo "HCLOUD_SERVER_TYPE=${chosen_type}" >> "${GITHUB_ENV}"
 
       # The app signing secret is env-provided WHEN PRESENT, per-run GENERATED
       # when absent (a throwaway VM never needs a persistent secret). Either way
