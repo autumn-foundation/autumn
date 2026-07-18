@@ -2892,20 +2892,26 @@ impl AutumnConfig {
                         _ => {}
                     }
                     path.pop();
-                } else if schema_path.is_empty() && plugin_config_roots.contains(k) {
-                    // A plugin has declared this root as its own config section
-                    // (via `AppBuilder::config_section`). It is known AND opaque:
-                    // accept it and do NOT descend — the plugin, not core, owns
-                    // validation of its subtree. The `schema_path.is_empty()` guard
-                    // fires whenever `valid_keys` is the ROOT schema set
-                    // (`schema.get("")`) — that is, both at the true top-level root
-                    // (`[media]`, path `[]`) AND under a profile prefix
-                    // (`[profile.prod.media]`, path `["profile","prod"]`), since
-                    // Autumn validates `[profile.<name>.<key>]` overrides against
-                    // the root schema. It stays strictly root-level: a key that
-                    // merely shares a plugin-root name while nested inside a known
-                    // section (e.g. `[database.media]`, `schema_path == "database"`)
-                    // is still validated normally (fail-closed). Deliberately NOT
+                } else if path.is_empty() && plugin_config_roots.contains(k) {
+                    // A plugin has declared this TOP-LEVEL root as its own config
+                    // section (via `AppBuilder::config_section`). It is known AND
+                    // opaque: accept it and do NOT descend — the plugin, not core,
+                    // owns validation of its subtree. The `path.is_empty()` guard
+                    // keeps this strictly the TRUE top-level root (`[media]`,
+                    // path `[]`), so a key that merely shares a plugin-root name
+                    // while nested inside a known section is still validated
+                    // normally (fail-closed).
+                    //
+                    // A profile-prefixed plugin root (`[profile.<env>.media]`,
+                    // path `["profile","<env>"]`) is deliberately NOT exempted and
+                    // falls through to the normal unknown-root strict rejection:
+                    // the plugin consumes ONLY the top-level `[media]` table (its
+                    // reader deserializes `root.media` directly and does not apply
+                    // Autumn's profile merge), so exempting a profile layer the
+                    // plugin cannot read would let a strict app with media settings
+                    // only under `[profile.<env>.media]` boot SILENTLY on default
+                    // plugin config instead of failing loudly. Profile-aware plugin
+                    // config is a separate, larger enhancement. Deliberately NOT
                     // added to `valid_keys`, which would make the walk recurse and
                     // flag every one of the plugin's children as unknown.
                 } else {
@@ -8199,15 +8205,17 @@ mod tests {
         );
     }
 
-    // A registered plugin root set through the inline PROFILE layer
-    // (`[profile.prod.media]`) is opaque too. Autumn validates
-    // `[profile.<name>.<key>]` overrides against the ROOT schema (that's why
-    // `[profile.prod.database]` is accepted), so a registered root must be opaque
-    // under a profile prefix exactly as it is at the true root — otherwise a
-    // strict-profiled media app still can't boot. Even with `enforce_all` the
-    // arbitrary nested children are never descended into.
+    // A registered plugin root under a PROFILE prefix (`[profile.prod.media]`)
+    // stays STRICT and must be rejected — the exemption only ever covers the
+    // TRUE top-level `[media]` table. Soundness rationale: the media plugin's
+    // reader deserializes only the top-level `root.media` and does NOT apply
+    // Autumn's profile merge, so a profile layer the plugin cannot consume must
+    // not be exempted — otherwise a strict app with media settings only under
+    // `[profile.prod.media]` would boot silently on default plugin config
+    // instead of failing loudly. (Profile-aware plugin config is a separate,
+    // larger enhancement.)
     #[test]
-    fn profile_prefixed_registered_plugin_root_is_opaque_under_enforce_all() {
+    fn strict_config_still_rejects_profile_prefixed_plugin_root() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("autumn.toml"),
@@ -8219,9 +8227,15 @@ mod tests {
         let env = strict_prod_env(temp.path(), true);
         let res = AutumnConfig::load_with_env_and_plugin_roots(&env, &plugin_roots(&["media"]));
         assert!(
-            res.is_ok(),
-            "a registered [media] root must be opaque under a profile prefix \
-             ([profile.prod.media]) even with enforce_all: {res:?}"
+            res.is_err(),
+            "a profile-prefixed plugin root ([profile.prod.media]) must stay strict \
+             and be rejected — the plugin reads only the top-level [media] table, so \
+             exempting the profile layer would boot silently on default config: {res:?}"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("media"),
+            "error should name the media/profile root: {err_str}"
         );
     }
 
