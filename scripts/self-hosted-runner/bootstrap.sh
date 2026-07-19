@@ -38,6 +38,45 @@ apt-get update
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 systemctl enable --now docker
 
+# --- system-wide Rust toolchain -------------------------------------------
+# ci.yml's Test job sets Rust up with dtolnay/rust-toolchain, which installs
+# cargo/rustc into the RUNNER user's ~/.cargo/bin and only exports that dir via
+# $GITHUB_PATH for workflow *steps*. Subprocesses SPAWNED BY THE TESTS — e.g.
+# autumn-cli's `Command::new("cargo").args(["metadata", ...])` (src/dev.rs) and
+# `Command::new(rustc)` (src/new.rs) — resolve the binary via a plain PATH
+# lookup and do not reliably inherit that step-only PATH, and a test that
+# env_clear()s or overrides $HOME loses the $HOME/.cargo resolution entirely, so
+# those spawns fail with `Os { code: 2, kind: NotFound }`. Install the toolchain
+# system-wide in an absolute, HOME-independent location so every process (and
+# every child it spawns) can resolve cargo/rustc/rustup regardless of $HOME or a
+# reset environment.
+export RUSTUP_HOME=/opt/rust/rustup
+export CARGO_HOME=/opt/rust/cargo
+curl -fsSL https://sh.rustup.rs \
+  | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
+      --component rustfmt --component clippy
+# Record a system default toolchain under the absolute RUSTUP_HOME so a rustup
+# proxy invoked with a cleared/reset environment still resolves a toolchain.
+RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo /opt/rust/cargo/bin/rustup default stable
+# Belt-and-suspenders: symlink the proxies into /usr/local/bin, which is on the
+# default execvp search path even when PATH is unset (env_clear) — so a test
+# that spawns `cargo`/`rustc`/`rustup` with a minimal or cleared environment
+# still finds them (`env -i /usr/local/bin/cargo --version` succeeds).
+for b in cargo rustc rustup; do
+  ln -sf /opt/rust/cargo/bin/"${b}" /usr/local/bin/"${b}"
+done
+# Login shells (and anything sourcing /etc/profile) also get the toolchain.
+cat > /etc/profile.d/rust.sh <<'PROFILE'
+export RUSTUP_HOME=/opt/rust/rustup
+export CARGO_HOME=/opt/rust/cargo
+export PATH="/opt/rust/cargo/bin:${PATH}"
+PROFILE
+chmod 0644 /etc/profile.d/rust.sh
+# Make the whole toolchain world-readable/traversable (done LAST so every file
+# rustup wrote is covered) so the unprivileged `runner` user — and the CI test
+# subprocesses running as it — can execute it.
+chmod -R a+rX /opt/rust
+
 # --- unprivileged runner user (needs sudo: ci.yml runs sudo apt-get / sudo rm) ---
 if ! id -u "${RUNNER_USER}" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "${RUNNER_USER}"
@@ -127,6 +166,15 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# Put the system-wide Rust toolchain (installed by bootstrap.sh at /opt/rust) on
+# the service PATH and pin the absolute RUSTUP_HOME/CARGO_HOME, so the runner
+# service, the Runner.Worker it forks, `cargo test`, AND every subprocess the
+# tests spawn (autumn-cli's `cargo metadata` / `rustc`) inherit them and can
+# resolve cargo/rustc without depending on $GITHUB_PATH or the runner user's
+# $HOME (fixes the `Os NotFound` spawn failures on the self-hosted runner).
+Environment=PATH=/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=RUSTUP_HOME=/opt/rust/rustup
+Environment=CARGO_HOME=/opt/rust/cargo
 ExecStart=/opt/autumn-runner/run-ephemeral.sh %i
 Restart=always
 RestartSec=5
