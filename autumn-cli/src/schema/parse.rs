@@ -174,7 +174,7 @@ impl ParsedSchema {
     /// diffed against a snapshot baseline without inventing a fake model source.
     /// There are no parser diagnostics for an introspected schema (every column
     /// is resolved — an unmappable type becomes
-    /// [`ColumnType::Opaque`](autumn_schema_core::ColumnType::Opaque) rather than
+    /// [`ColumnType::Opaque`] rather than
     /// being skipped), so the `diagnostics` vec is empty.
     #[must_use]
     pub const fn from_tables(tables: Vec<Table>) -> Self {
