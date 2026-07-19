@@ -213,23 +213,28 @@ jobs:
         # `systemctl enable --now` (Type=simple) returns instantly and says nothing
         # about whether the on-VM registration actually succeeded, so a crash-looping
         # fleet was previously invisible until the heavy job sat unassigned for hours.
-        # Poll the GitHub runners API and require at least one Online runner whose
-        # NAME is EXACTLY one of THIS provision's slot names (the workflow-controlled
-        # "hetzner-<server_name>-<slot>" for slot in 1..RUNNER_COUNT, see the render
-        # step and run-ephemeral.sh). Exact per-slot names — NOT an unbounded
-        # startswith(prefix) — because a prefix match would also accept a DIFFERENT
-        # server whose name merely EXTENDS this one past a dash (e.g. while
-        # provisioning "autumn-ci-runner", an online "hetzner-autumn-ci-runner-canary-1"
-        # from a separate "-canary" VM startswith("hetzner-autumn-ci-runner-") and
-        # would FALSE-PASS this run's verification). Name-based matching is correct on
-        # BOTH paths: a fresh provision brings new online names, and a --replace
-        # REPROVISION of the same-named server reconnects the SAME stable runner
-        # names/ids — still online, still exactly these slot names — which an id-diff
-        # against a pre-enable baseline would have WRONGLY excluded (config.sh
-        # --replace reuses the existing record), false-failing the recovery path. A
-        # stale runner from a DIFFERENT prior server has a different name and won't
-        # match; a stale SAME-name runner from a dead VM is offline and is filtered
-        # out. Fail the run loudly if none appear. Runs BEFORE the SSH-key teardown so
+        # Poll the GitHub runners API and require ALL runner_count Online runners
+        # whose NAME is EXACTLY one of THIS provision's slot names (the
+        # workflow-controlled "hetzner-<server_name>-<slot>" for slot in
+        # 1..RUNNER_COUNT, see the render step and run-ephemeral.sh). Requiring the
+        # FULL expected slot set — NOT just >= 1 — because a PARTIAL provision (slot 1
+        # registers but another autumn-runner@N unit crash-loops / can't configure)
+        # would otherwise false-pass green while the fleet sits at reduced capacity and
+        # the SSH diagnostics get torn down, leaving heavy CI short of slots with no
+        # way to see why. Exact per-slot names — NOT an unbounded startswith(prefix) —
+        # because a prefix match would also accept a DIFFERENT server whose name merely
+        # EXTENDS this one past a dash (e.g. while provisioning "autumn-ci-runner", an
+        # online "hetzner-autumn-ci-runner-canary-1" from a separate "-canary" VM
+        # startswith("hetzner-autumn-ci-runner-") and would FALSE-PASS this run's
+        # verification). Name-based matching is correct on BOTH paths: a fresh provision
+        # brings new online names, and a --replace REPROVISION of the same-named server
+        # reconnects the SAME stable runner names/ids — still online, still exactly
+        # these slot names — which an id-diff against a pre-enable baseline would have
+        # WRONGLY excluded (config.sh --replace reuses the existing record),
+        # false-failing the recovery path. A stale runner from a DIFFERENT prior server
+        # has a different name and won't match; a stale SAME-name runner from a dead VM
+        # is offline and is filtered out. Fail the run loudly, NAMING the missing
+        # slot(s), if fewer than all N come Online. Runs BEFORE the SSH-key teardown so
         # the on-box diagnostic below can still reach the VM.
         run: |
           set -uo pipefail
@@ -248,21 +253,36 @@ jobs:
           ip="${{ steps.create.outputs.ip }}"
           attempts=0; max=12   # ~4 min at 20s
           online=0
+          online_names='[]'
           until [ "$attempts" -ge "$max" ]; do
-            online=$(curl -sS -H "Authorization: Bearer ${RUNNER_REG_PAT}" -H "Accept: application/vnd.github+json" \
+            # The set of ONLINE runner names that are in this run's expected slot set,
+            # as a JSON array; `online` is its length.
+            online_names=$(curl -sS -H "Authorization: Bearer ${RUNNER_REG_PAT}" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${gh_owner}/${gh_repo}/actions/runners?per_page=100" \
-              | jq --argjson expected "$expected" '[.runners[] | select(.status=="online") | select(.name as $nm | ($expected | index($nm)) != null)] | length') || online=0
-            echo "online runners in ${expected} : ${online:-0} (attempt $((attempts+1))/$max)"
-            [ "${online:-0}" -ge 1 ] && break
+              | jq -c --argjson expected "$expected" '[.runners[] | select(.status=="online") | .name | select(. as $nm | ($expected | index($nm)) != null)]') || online_names='[]'
+            online=$(printf '%s' "${online_names:-[]}" | jq 'length') || online=0
+            echo "online runners in ${expected} : ${online:-0}/${count} (attempt $((attempts+1))/$max)"
+            [ "${online:-0}" -ge "$count" ] && break
             attempts=$((attempts+1)); sleep 20
           done
-          if [ "${online:-0}" -lt 1 ]; then
-            echo "::error::No Online runner named one of ${expected} from this provision appeared within the timeout; units started but on-VM registration failed."
+          if [ "${online:-0}" -lt "$count" ]; then
+            # Expected slot names that are NOT in the online set (space-joined for the
+            # operator-facing error). "online" (connected) includes a busy runner.
+            missing=$(jq -r -n --argjson expected "$expected" --argjson online "${online_names:-[]}" \
+              '($expected - $online) | join(" ")')
+            echo "::error::Only ${online:-0}/${count} expected runners came Online. Missing: ${missing}. On-VM registration for those slots failed."
+            # Best-effort on-box diagnostic. Map the FIRST missing slot name back to its
+            # slot index (trailing -<N>) so journalctl targets a unit that actually
+            # failed; fall back to slot 1 if the mapping can't be derived.
+            miss1=$(jq -r -n --argjson expected "$expected" --argjson online "${online_names:-[]}" \
+              '(($expected - $online)[0] // "")')
+            slot="${miss1##*-}"
+            case "$slot" in ''|*[!0-9]*) slot=1 ;; esac
             ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${ip}" \
-              'systemctl --no-pager status autumn-runner@1 || true; journalctl -u autumn-runner@1 --no-pager -n 60 || true' || true
+              "systemctl --no-pager status autumn-runner@${slot} || true; journalctl -u autumn-runner@${slot} --no-pager -n 60 || true" || true
             exit 1
           fi
-          echo "Registration verified: at least one runner named one of ${expected} is Online."
+          echo "Registration verified: all ${count} expected runners are Online."
 
       - name: Teardown provisioning SSH key
         if: always()
