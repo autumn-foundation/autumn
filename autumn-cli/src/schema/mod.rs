@@ -390,7 +390,7 @@ fn run_snapshot(
 /// three commands can never derive the backend inconsistently for one profile.
 ///
 /// Both backends are supported: a resolved `SQLite` backend introspects via
-/// [`introspect::introspect_sqlite`] on the `sqlite` build (and is refused loudly on
+/// `introspect::introspect_sqlite` on the `sqlite` build (and is refused loudly on
 /// a default Postgres-only build). Before writing, a **provider-lock** guard refuses
 /// to clobber an existing snapshot tagged for another backend.
 fn run_pull(

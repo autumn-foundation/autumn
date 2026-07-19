@@ -23,7 +23,7 @@
 //! - [`MediaMtxController::ensure_installed_ops`] emits the ordered
 //!   [`DeployOp`]s (mkdir the config dir, write the yml, write the unit,
 //!   `daemon-reload && enable --now && restart`) driven over the injectable
-//!   [`DeployExecutor`](super::exec::DeployExecutor), so the remote command
+//!   [`DeployExecutor`], so the remote command
 //!   sequence is assertable against a recording fake with no live host. It
 //!   no-ops (empty op vector) when the section is not `enabled`.
 //! - Five fail-closed doctor checks — [`mediamtx_ports_distinct`],
@@ -1135,7 +1135,7 @@ fn join_ports(ports: &[u16]) -> String {
 /// provisioned by this module, exactly as autumn treats kamal-proxy. This check
 /// verifies it is present before cutover.
 ///
-/// **Why this must run in the pre-cutover preflight:** [`provision_media_host`]
+/// **Why this must run in the pre-cutover preflight:** `provision_media_host`
 /// (which writes the unit and runs `systemctl … restart`) is deliberately
 /// deferred until AFTER the app deploy commits. Without this check a host missing
 /// the binary passes the other three checks, the app cuts over, and only THEN

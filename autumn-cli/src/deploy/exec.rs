@@ -54,7 +54,7 @@
 //! - The **CI end-to-end container harness** that exercises the real `ssh` path
 //!   against a live container — actually driving a rollback over ssh end-to-end —
 //!   is Slice 4; live ssh is not exercised by these unit tests.
-//! - A **Caddy** [`ProxyController`](super::proxy::ProxyController) — kamal-proxy
+//! - A **Caddy** [`ProxyController`] — kamal-proxy
 //!   is the confirmed proxy; Caddy is only the documented swappable alternative.
 //!
 //! The migrate step is fully real: the one-shot runs the uploaded release with
@@ -1182,7 +1182,7 @@ fn loopback_upstream(port: u16) -> String {
 }
 
 /// Per-deploy scratch path holding the pre-refresh kamal-proxy unit's content hash,
-/// so [`ProxyController::refresh_installed_ops`](super::proxy::ProxyController::refresh_installed_ops)
+/// so [`ProxyController::refresh_installed_ops`]
 /// can decide whether the unit ACTUALLY changed on this host (issue #2070). Keyed on
 /// the unique `release_id` so two shared-host deploys never race on a fixed scratch
 /// path; the restart step removes it.
@@ -1193,7 +1193,7 @@ fn proxy_unit_snapshot_path(release_id: &str) -> String {
 /// Command that records which slot now serves live traffic AND the loopback
 /// `port` its unit was rendered with, as `{slot}\t{port}` (read by the next
 /// redeploy's [`probe_deploy_state`], and copied into the previous-release marker
-/// by [`record_previous_release`] so a later rollback targets the real listener).
+/// by `record_previous_release` so a later rollback targets the real listener).
 ///
 /// The port is persisted because it is `slot_app_port(current server.port, slot)`
 /// computed AT THIS deploy — correct at deploy time even if a later deploy changes

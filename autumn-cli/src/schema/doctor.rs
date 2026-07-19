@@ -23,7 +23,7 @@
 //! skipped WARN rather than failing. The database-schema-drift check introspects
 //! the live database: on a default (Postgres-only) build a `SQLite` backend is
 //! skipped, while a `--features sqlite` build additionally references
-//! [`introspect_sqlite`](super::introspect::introspect_sqlite) so it can diff a live
+//! `introspect_sqlite` so it can diff a live
 //! `SQLite` database too.
 
 use std::path::Path;

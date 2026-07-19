@@ -4302,9 +4302,9 @@ fn resolve_optional_signing_secret() -> Option<String> {
 
 /// Resolve the signing secret the deploy preflight should grade, from the SAME
 /// merged active-profile runtime table used for the deploy config and DB URL
-/// (base autumn.toml + `[profile.<env>]` + autumn-<env>.toml), env first. A
+/// (base autumn.toml + `[profile.<env>]` + `autumn-<env>.toml`), env first. A
 /// secret supplied only in an active profile
-/// (`[profile.<env>].security.signing_secret` / autumn-<env>.toml) is invisible
+/// (`[profile.<env>].security.signing_secret` / `autumn-<env>.toml`) is invisible
 /// to the raw top-level `autumn.toml` that [`resolve_optional_signing_secret`]
 /// reads, so a raw-table lookup would report it MISSING even though
 /// `AutumnConfig::load()` and `autumn deploy check` see it. Never returns/prints
