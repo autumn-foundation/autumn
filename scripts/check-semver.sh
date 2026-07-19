@@ -144,9 +144,18 @@ for crate in "${CRATES[@]}"; do
     #      published 0.5.x crates.io baseline, so the symmetric enable on both
     #      baseline and current builds cleanly.
     #
-    # Source of truth: autumn/Cargo.toml `[package.metadata.docs.rs].features`.
-    # This list is hardcoded to MIRROR `AUTUMN_WEB_DOCS_FEATURES` in
-    # scripts/check-docs.sh — keep the two in sync when either changes.
+    # The list = the crate's documented public-API (docs.rs) feature set
+    # INTERSECTED with the published 0.5.0 baseline's features. It cannot equal
+    # either set alone: cargo-semver-checks enables `--features` symmetrically on
+    # the 0.5.0 baseline build too, so any feature the baseline lacks would error
+    # there, while the docs.rs set also carries the incompatible DB pair below.
+    #   - EXCLUDES `sqlite`/`managed-pg`/`managed-pg-bundled` (the DB-backend
+    #     type-incompatible pair the all-features heuristic would otherwise
+    #     co-enable → E0271 rustdoc failure — the bug this special-case fixes).
+    #   - EXCLUDES `embed-assets`/`offline-sync`: both are NEW in 0.6.0 and
+    #     absent from the 0.5.0 baseline, so the symmetric enable would fail the
+    #     baseline build ("v0.5.0 does not have feature ...") and re-break the
+    #     gate. Add them once a future baseline (0.6.x) carries them.
     #
     # Deferred: a genuine apples-to-apples sqlite-vs-sqlite pass
     # (`--only-explicit-features --no-default-features --features sqlite`) is
@@ -155,7 +164,7 @@ for crate in "${CRATES[@]}"; do
     # sqlite-vs-Postgres comparison yields false-positive breaks because
     # `sqlite` flips `RuntimeConnection`'s type. Add that pass in a release
     # after 0.6.0 is published (when a sqlite baseline exists).
-    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv"
+    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting"
     crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features --no-default-features \
       --features "$autumn_web_semver_features" 2>&1)"
