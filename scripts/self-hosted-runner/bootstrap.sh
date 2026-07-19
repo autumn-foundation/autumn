@@ -58,12 +58,19 @@ curl -fsSL https://sh.rustup.rs \
 # Record a system default toolchain under the absolute RUSTUP_HOME so a rustup
 # proxy invoked with a cleared/reset environment still resolves a toolchain.
 RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo /opt/rust/cargo/bin/rustup default stable
-# Belt-and-suspenders: symlink the proxies into /usr/local/bin, which is on the
-# default execvp search path even when PATH is unset (env_clear) — so a test
-# that spawns `cargo`/`rustc`/`rustup` with a minimal or cleared environment
-# still finds them (`env -i /usr/local/bin/cargo --version` succeeds).
+# Belt-and-suspenders: symlink the proxies onto the exec search path. The
+# load-bearing target is /usr/bin: when a process spawns a command by name with
+# PATH unset/cleared (Command::env_clear()), glibc's execvp falls back to the
+# confstr _CS_PATH default of `/bin:/usr/bin` (verify: `getconf PATH`), which
+# does NOT include /usr/local/bin — so a link there alone would still NotFound
+# an env_clear'd `cargo`/`rustc` spawn. Linking into /usr/bin puts the proxies
+# on that default path (`env -i /usr/bin/cargo --version` succeeds). We also
+# link into /usr/local/bin, which is earlier in a normal PATH. /usr/bin/{cargo,
+# rustc,rustup} are free on this image (Rust is installed via rustup at /opt/rust,
+# not apt), so `ln -sf` clobbers no distro package.
 for b in cargo rustc rustup; do
   ln -sf /opt/rust/cargo/bin/"${b}" /usr/local/bin/"${b}"
+  ln -sf /opt/rust/cargo/bin/"${b}" /usr/bin/"${b}"
 done
 # Login shells (and anything sourcing /etc/profile) also get the toolchain BIN
 # dir on PATH. Deliberately do NOT export RUSTUP_HOME/CARGO_HOME here: pointing
