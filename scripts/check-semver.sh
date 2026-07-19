@@ -134,9 +134,13 @@ for crate in "${CRATES[@]}"; do
     # branch and hard-blocking a tag-push release, even though the semver API
     # check itself is clean.
     #
-    # `--only-explicit-features --no-default-features --features <list>` pins
-    # the feature set to a fully deterministic, compilable posture so the
-    # heuristic can never co-enable `sqlite`+`managed-pg-bundled`:
+    # `--only-explicit-features --features <list>` pins the feature set to a
+    # fully deterministic, compilable posture so the heuristic can never
+    # co-enable `sqlite`+`managed-pg-bundled`. `--only-explicit-features`
+    # disables the "enable (almost) all features" heuristic, so ONLY the
+    # `--features` list is enabled (the crate's default feature set is a subset
+    # of that list and contains neither `sqlite` nor `managed-pg`, so the
+    # incompatible pair can never be co-enabled):
     #   1. The list is the crate's own documented API posture (Postgres `db`),
     #      and EXCLUDES `sqlite`/`managed-pg`/`managed-pg-bundled`, so rustdoc
     #      compiles.
@@ -158,7 +162,7 @@ for crate in "${CRATES[@]}"; do
     #     gate. Add them once a future baseline (0.6.x) carries them.
     #
     # Deferred: a genuine apples-to-apples sqlite-vs-sqlite pass
-    # (`--only-explicit-features --no-default-features --features sqlite`) is
+    # (`--only-explicit-features --features sqlite`) is
     # intentionally NOT added this release — the 0.5.x baseline has no `sqlite`
     # feature (a symmetric enable would hard-error on the baseline), and a
     # sqlite-vs-Postgres comparison yields false-positive breaks because
@@ -166,7 +170,7 @@ for crate in "${CRATES[@]}"; do
     # after 0.6.0 is published (when a sqlite baseline exists).
     autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting"
     crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
-      --only-explicit-features --no-default-features \
+      --only-explicit-features \
       --features "$autumn_web_semver_features" 2>&1)"
   else
     crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" 2>&1)"
