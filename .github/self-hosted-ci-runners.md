@@ -163,7 +163,10 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
 The provisioner now runs this exact preflight before creating the VM (failing
 fast if it is not `201`) and, after enabling the units, **verifies at least one
 `hetzner` runner comes Online** before the run succeeds — so a bad PAT surfaces
-in the run itself instead of hours later.
+in the run itself instead of hours later. The verify step snapshots the existing
+runner IDs *before* enabling and requires a **newly-registered** runner (an id
+absent from that baseline), so a stale/pre-existing `hetzner` runner from a
+prior provision can never mask a failed new registration.
 
 ### Set `AUTUMN_SELF_HOSTED_HEAVY` (do this AFTER provisioning verifies)
 
