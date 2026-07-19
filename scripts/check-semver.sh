@@ -148,18 +148,45 @@ for crate in "${CRATES[@]}"; do
     #      published 0.5.x crates.io baseline, so the symmetric enable on both
     #      baseline and current builds cleanly.
     #
-    # The list = the crate's documented public-API (docs.rs) feature set
-    # INTERSECTED with the published 0.5.0 baseline's features. It cannot equal
-    # either set alone: cargo-semver-checks enables `--features` symmetrically on
-    # the 0.5.0 baseline build too, so any feature the baseline lacks would error
-    # there, while the docs.rs set also carries the incompatible DB pair below.
-    #   - EXCLUDES `sqlite`/`managed-pg`/`managed-pg-bundled` (the DB-backend
-    #     type-incompatible pair the all-features heuristic would otherwise
-    #     co-enable → E0271 rustdoc failure — the bug this special-case fixes).
-    #   - EXCLUDES `embed-assets`/`offline-sync`: both are NEW in 0.6.0 and
-    #     absent from the 0.5.0 baseline, so the symmetric enable would fail the
-    #     baseline build ("v0.5.0 does not have feature ...") and re-break the
-    #     gate. Add them once a future baseline (0.6.x) carries them.
+    # The list = the STABILITY.md stable public-API feature surface INTERSECTED
+    # with the published 0.5.0 baseline's `[features]` keys — i.e. the MAXIMAL
+    # baseline-safe coverage. This deliberately supersedes the earlier
+    # docs.rs-only list, which silently DROPPED feature-gated public modules that
+    # already exist in the 0.5.0 baseline (e.g. `presence`, `webauthn`,
+    # `inbound-mail`/`inbound-mailgun`/`inbound-ses`, `telemetry-otlp`) — so a
+    # breaking change behind any of those would have passed the tag gate
+    # unnoticed. STABILITY.md ("Feature flags") makes every non-`unstable-*`
+    # feature part of the public API, so all of them are restored here.
+    #
+    # It cannot equal either set alone: cargo-semver-checks enables `--features`
+    # symmetrically on the 0.5.0 baseline build too, so any feature the baseline
+    # lacks would error there.
+    #   - EXCLUDES the 0.6.0-only features `sqlite`, `managed-pg`,
+    #     `managed-pg-bundled`, `embed-assets`, `offline-sync`, `tls`, `acme`:
+    #     all are NEW in 0.6.0 and absent from the 0.5.0 baseline, so the
+    #     symmetric enable would fail the baseline build ("v0.5.0 does not have
+    #     feature ...") and re-break the gate. This intersection also
+    #     AUTOMATICALLY drops the DB-backend type-incompatible pair
+    #     `sqlite` × `managed-pg`/`managed-pg-bundled` (co-enabling them is the
+    #     E0271 rustdoc failure this special-case originally fixed), since none
+    #     of them are baseline-present. Add each once a future baseline carries
+    #     it.
+    #   - EXCLUDES `system-tests` and `test-support` even though both ARE in the
+    #     0.5.0 baseline: STABILITY.md's "Unsupported feature combinations (CI
+    #     excluded)" table names both (alongside `managed-pg`/`managed-pg-bundled`)
+    #     as "not checked in CI because their build requirements make them
+    #     cost-prohibitive or unsuitable for standard runners" (`system-tests`
+    #     pulls a headless-Chromium `chromiumoxide`; `test-support` is dev-only
+    #     and pulls Docker-dependent `testcontainers`). The semver gate is itself
+    #     a CI feature-combination check on a standard runner, so aligning its
+    #     excluded set with that table is a defensible, STABILITY.md-grounded
+    #     carve-out — and it keeps the release gate from building chromiumoxide
+    #     twice (current + baseline). `telemetry-otlp`, by contrast, is in
+    #     STABILITY.md's CHECKED representative-combinations table, so it stays IN.
+    #
+    # Maintenance: expand this list as the published baseline advances — a
+    # feature that is 0.6.0-only today becomes intersection-eligible the moment a
+    # baseline release (0.6.x) carries it.
     #
     # Deferred: a genuine apples-to-apples sqlite-vs-sqlite pass
     # (`--only-explicit-features --features sqlite`) is
@@ -168,7 +195,7 @@ for crate in "${CRATES[@]}"; do
     # sqlite-vs-Postgres comparison yields false-positive breaks because
     # `sqlite` flips `RuntimeConnection`'s type. Add that pass in a release
     # after 0.6.0 is published (when a sqlite baseline exists).
-    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting"
+    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp"
     crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features \
       --features "$autumn_web_semver_features" 2>&1)"
