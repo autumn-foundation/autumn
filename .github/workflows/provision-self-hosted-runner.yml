@@ -105,11 +105,20 @@ jobs:
           set -euo pipefail
           gh_owner="${GITHUB_REPOSITORY%/*}"
           gh_repo="${GITHUB_REPOSITORY#*/}"
+          # Runner names are WORKFLOW-CONTROLLED via RUNNER_NAME_PREFIX so "Verify
+          # runner registration" can match THIS provision's runners by name exactly,
+          # without assuming the VM hostname equals the Hetzner server name (a
+          # free-form input; cloud-init may sanitize dots/case/length). The prefix
+          # is exported into the on-VM env and reused by the verify step below;
+          # run-ephemeral.sh falls back to hetzner-$(hostname) if it is ever unset.
+          prefix="hetzner-${{ inputs.server_name }}"
+          echo "RUNNER_NAME_PREFIX=${prefix}" >> "$GITHUB_ENV"
           {
             echo '#!/usr/bin/env bash'
             echo "export GH_OWNER=${gh_owner}"
             echo "export GH_REPO=${gh_repo}"
             echo "export RUNNER_COUNT=${RUNNER_COUNT}"
+            echo "export RUNNER_NAME_PREFIX=${prefix}"
             tail -n +2 scripts/self-hosted-runner/bootstrap.sh
           } > "${RUNNER_TEMP}/user-data.sh"
 
@@ -148,46 +157,6 @@ jobs:
           done
           [ "$ok" = 1 ] || { echo "::error::cloud-init did not finish in time"; exit 1; }
 
-      - name: Snapshot existing runner IDs (pre-registration baseline)
-        id: runners_before
-        # Capture the set of runner IDs that exist BEFORE this run's units
-        # register, so "Verify runner registration" below can diff against it and
-        # require a NEWLY-registered runner. Without this baseline a stale/
-        # pre-existing `hetzner` runner (from a prior provision) that is already
-        # Online would false-pass the verify poll even if THIS run's VM never
-        # registered — masking a broken box before its diagnostics are captured.
-        # RUNNER_REG_PAT is job-level env (see the job `env:` block).
-        run: |
-          set -uo pipefail
-          gh_owner="${GITHUB_REPOSITORY%/*}"
-          gh_repo="${GITHUB_REPOSITORY#*/}"
-          # Distinguish a SUCCESSFUL read that legitimately returns zero runners
-          # (a first-ever provision → baseline '[]', valid, proceed) from a FAILED
-          # read (curl error / non-200 / jq parse failure). A failed read must NOT
-          # fall back to an empty baseline: an unreadable baseline would make the
-          # id-diff in "Verify runner registration" treat a pre-existing Online
-          # hetzner runner as newly-registered and false-pass. So on a genuine read
-          # failure we retry, then FAIL CLOSED rather than proceed with '[]'.
-          before=""
-          attempts=0; max=5
-          until [ "$attempts" -ge "$max" ]; do
-            http=$(curl -sS -o /tmp/runners_before.json -w '%{http_code}' \
-              -H "Authorization: Bearer ${RUNNER_REG_PAT}" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${gh_owner}/${gh_repo}/actions/runners?per_page=100") || http="000"
-            if [ "$http" = "200" ] && before=$(jq -c '[.runners[].id]' /tmp/runners_before.json 2>/dev/null); then
-              break
-            fi
-            before=""
-            echo "runner baseline read failed (http=$http), retrying... ($((attempts+1))/$max)"
-            attempts=$((attempts+1)); sleep 5
-          done
-          if [ -z "$before" ]; then
-            echo "::error::Could not read the runner baseline from the GitHub API after ${max} attempts. Refusing to proceed: an unreadable baseline would let a pre-existing runner false-pass the registration verification."
-            exit 1
-          fi
-          echo "before_ids=$before" >> "$GITHUB_OUTPUT"
-          echo "baseline runner IDs: $before"
-
       - name: Deliver registration PAT and start ephemeral runners
         run: |
           set -euo pipefail
@@ -203,38 +172,44 @@ jobs:
         # `systemctl enable --now` (Type=simple) returns instantly and says nothing
         # about whether the on-VM registration actually succeeded, so a crash-looping
         # fleet was previously invisible until the heavy job sat unassigned for hours.
-        # Poll the GitHub runners API and require at least one hetzner runner that is
-        # Online AND was registered by THIS run — i.e. whose id is NOT in the
-        # pre-registration baseline (steps.runners_before). This id-diff is
-        # naming-agnostic (it does not assume the VM hostname matches the Hetzner
-        # server name), so a stale/pre-existing hetzner runner from a prior
-        # provision can never false-pass while this run's VM silently failed to
-        # register. Fail the run loudly if none appear. Runs BEFORE the SSH-key
-        # teardown so the on-box diagnostic below can still reach the VM.
+        # Poll the GitHub runners API and require at least one Online runner whose
+        # NAME belongs to THIS provision's VM (the workflow-controlled prefix
+        # "hetzner-<server_name>-", see the render step). Name-based matching is
+        # correct on BOTH paths: a fresh provision brings new online names, and a
+        # --replace REPROVISION of the same-named server reconnects the SAME stable
+        # runner names/ids — still online — which an id-diff against a pre-enable
+        # baseline would have WRONGLY excluded (config.sh --replace reuses the
+        # existing record), false-failing the recovery path. A stale runner from a
+        # DIFFERENT prior server has a different name and won't match; a stale
+        # SAME-name runner from a dead VM is offline and is filtered out. Fail the
+        # run loudly if none appear. Runs BEFORE the SSH-key teardown so the on-box
+        # diagnostic below can still reach the VM.
         run: |
           set -uo pipefail
           gh_owner="${GITHUB_REPOSITORY%/*}"
           gh_repo="${GITHUB_REPOSITORY#*/}"
-          before='${{ steps.runners_before.outputs.before_ids }}'
-          [ -n "$before" ] || before='[]'
+          # RUNNER_NAME_PREFIX is exported into $GITHUB_ENV by the render step;
+          # fall back to the same expression defensively so a propagation hiccup
+          # can never leave this unbound under `set -u`.
+          prefix="${RUNNER_NAME_PREFIX:-hetzner-${{ inputs.server_name }}}-"
           ip="${{ steps.create.outputs.ip }}"
           attempts=0; max=12   # ~4 min at 20s
-          new_online=0
+          online=0
           until [ "$attempts" -ge "$max" ]; do
-            new_online=$(curl -sS -H "Authorization: Bearer ${RUNNER_REG_PAT}" -H "Accept: application/vnd.github+json" \
+            online=$(curl -sS -H "Authorization: Bearer ${RUNNER_REG_PAT}" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${gh_owner}/${gh_repo}/actions/runners?per_page=100" \
-              | jq --argjson before "$before" '[.runners[] | select(.status=="online") | select(any(.labels[]; .name=="hetzner")) | select(.id as $id | ($before | index($id)) | not)] | length') || new_online=0
-            echo "new online hetzner runners (not in baseline): ${new_online:-0} (attempt $((attempts+1))/$max)"
-            [ "${new_online:-0}" -ge 1 ] && break
+              | jq --arg prefix "$prefix" '[.runners[] | select(.status=="online") | select(.name | startswith($prefix))] | length') || online=0
+            echo "online runners named ${prefix}* : ${online:-0} (attempt $((attempts+1))/$max)"
+            [ "${online:-0}" -ge 1 ] && break
             attempts=$((attempts+1)); sleep 20
           done
-          if [ "${new_online:-0}" -lt 1 ]; then
-            echo "::error::No NEWLY-registered hetzner runner from this provision came Online within the timeout; units started but on-VM registration failed."
+          if [ "${online:-0}" -lt 1 ]; then
+            echo "::error::No Online runner named ${prefix}* from this provision appeared within the timeout; units started but on-VM registration failed."
             ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${ip}" \
               'systemctl --no-pager status autumn-runner@1 || true; journalctl -u autumn-runner@1 --no-pager -n 60 || true' || true
             exit 1
           fi
-          echo "Registration verified: at least one NEWLY-provisioned hetzner runner is Online."
+          echo "Registration verified: at least one runner named ${prefix}* is Online."
 
       - name: Teardown provisioning SSH key
         if: always()

@@ -16,6 +16,10 @@ RUNNER_COUNT="${RUNNER_COUNT:-6}"
 GH_OWNER="${GH_OWNER:-madmax983}"
 GH_REPO="${GH_REPO:-autumn}"
 RUNNER_VERSION="${RUNNER_VERSION:-}"   # empty => resolve the latest release at boot
+# Workflow-controlled runner-name prefix so the provisioner can verify THIS run's
+# runners by name (see provision-self-hosted-runner.yml). Empty => run-ephemeral.sh
+# falls back to hetzner-$(hostname).
+RUNNER_NAME_PREFIX="${RUNNER_NAME_PREFIX:-}"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -76,6 +80,7 @@ cat > /etc/autumn-runner/env <<EOF
 GH_OWNER=${GH_OWNER}
 GH_REPO=${GH_REPO}
 RUNNER_HOME=${RUNNER_HOME}
+RUNNER_NAME_PREFIX=${RUNNER_NAME_PREFIX}
 EOF
 chmod 0644 /etc/autumn-runner/env
 
@@ -104,7 +109,7 @@ sudo -u runner rm -f .runner .credentials .credentials_rsaparams 2>/dev/null || 
 sudo -u runner ./config.sh --unattended --replace \
   --url "https://github.com/${GH_OWNER}/${GH_REPO}" \
   --token "${reg_token}" \
-  --name "hetzner-$(hostname)-${slot}" \
+  --name "${RUNNER_NAME_PREFIX:-hetzner-$(hostname)}-${slot}" \
   --labels "self-hosted,hetzner,linux,x64" \
   --ephemeral
 exec sudo -u runner ./run.sh

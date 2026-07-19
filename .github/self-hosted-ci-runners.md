@@ -162,11 +162,20 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
 
 The provisioner now runs this exact preflight before creating the VM (failing
 fast if it is not `201`) and, after enabling the units, **verifies at least one
-`hetzner` runner comes Online** before the run succeeds — so a bad PAT surfaces
-in the run itself instead of hours later. The verify step snapshots the existing
-runner IDs *before* enabling and requires a **newly-registered** runner (an id
-absent from that baseline), so a stale/pre-existing `hetzner` runner from a
-prior provision can never mask a failed new registration.
+Online runner belonging to THIS provision** before the run succeeds — so a bad
+PAT surfaces in the run itself instead of hours later. Verification is
+**by runner name**: runners are named with the workflow-controlled prefix
+`hetzner-<server_name>-<slot>` (`RUNNER_NAME_PREFIX`, threaded through cloud-init
+into `run-ephemeral.sh`), and the verify step polls for an Online runner whose
+name starts with `hetzner-<server_name>-`. This is correct on both the fresh
+provision path (new Online names) and the **`--replace` reprovision** of the
+same-named server (the normal recovery path — `config.sh --replace` reconnects
+the same stable runner names/ids, still Online). An earlier id-diff against a
+pre-enable baseline false-*failed* that reprovision (the reconnected runner's id
+was already in the baseline, so it was wrongly excluded); name-based matching
+counts it. A stale runner from a *different* prior server has a different
+name-prefix and won't match; a stale same-name runner from a dead VM is Offline
+and is filtered out — so nothing can mask a failed new registration.
 
 ### Set `AUTUMN_SELF_HOSTED_HEAVY` (do this AFTER provisioning verifies)
 
