@@ -184,9 +184,17 @@ for crate in "${CRATES[@]}"; do
     #     twice (current + baseline). `telemetry-otlp`, by contrast, is in
     #     STABILITY.md's CHECKED representative-combinations table, so it stays IN.
     #
-    # Maintenance: expand this list as the published baseline advances — a
-    # feature that is 0.6.0-only today becomes intersection-eligible the moment a
-    # baseline release (0.6.x) carries it.
+    # Maintenance: this list is PINNED to `SEMVER_ALLOWLIST_TARGET_VERSION`
+    # (below) — the autumn-web version it was hand-computed for. Expand it as the
+    # published baseline advances: a feature that is 0.6.0-only today becomes
+    # intersection-eligible the moment a baseline release (0.6.x) carries it. The
+    # version tripwire immediately below the maintenance note `die`s for any
+    # autumn-web version other than the pinned target, so a version bump can never
+    # silently ship this static list against a newer baseline that already carries
+    # tls/acme/sqlite/managed-pg/embed-assets/offline-sync (a breaking change
+    # behind those would otherwise pass the tag gate unnoticed) — the maintainer
+    # is forced to recompute the intersection (and add the deferred
+    # sqlite-vs-sqlite pass, see below) before the target is bumped.
     #
     # Deferred: a genuine apples-to-apples sqlite-vs-sqlite pass
     # (`--only-explicit-features --features sqlite`) is
@@ -199,6 +207,25 @@ for crate in "${CRATES[@]}"; do
     # NOTE: `telemetry-otlp` pulls prost/tonic, which need `protoc` at build
     # time. The SemVer job in .github/workflows/publish-gate.yml installs
     # protobuf-compiler for this reason — keep them in sync.
+    #
+    # TRIPWIRE (baseline-drift guard): the allowlist above is a static, hand-
+    # computed intersection valid ONLY while cargo-semver-checks compares the
+    # current build against the 0.5.x crates.io baseline. It is pinned to the
+    # autumn-web version it was computed for. Fail LOUDLY for any other version
+    # so a future release cannot silently under-cover features that are present
+    # in a newer (0.6.x+) baseline but still omitted here. autumn-web inherits
+    # the `[workspace.package]` version, so its "current" version for
+    # cargo-semver-checks is exactly `workspace_package_value "version"` — parsed
+    # with the SAME method used for `workspace_version` above; if it cannot be
+    # parsed at all, FAIL CLOSED (a release gate must be conservative).
+    SEMVER_ALLOWLIST_TARGET_VERSION="0.6.0"
+    autumn_web_current_version="$(workspace_package_value "version")"
+    [[ -n "$autumn_web_current_version" ]] || \
+      die "could not determine autumn-web version for the SemVer allowlist guard"
+    if [[ "$autumn_web_current_version" != "$SEMVER_ALLOWLIST_TARGET_VERSION" ]]; then
+      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.5.0-baseline ∩ 0.6.0 feature set). cargo-semver-checks now compares against a newer baseline that has tls/acme/sqlite/managed-pg/embed-assets/offline-sync — recompute the allowlist as (new-baseline ∩ current) features (and add the deferred sqlite-vs-sqlite pass) before releasing. See the comment above this block."
+    fi
+
     autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp"
     crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features \
