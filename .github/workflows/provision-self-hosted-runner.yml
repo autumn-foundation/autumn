@@ -161,10 +161,30 @@ jobs:
           set -uo pipefail
           gh_owner="${GITHUB_REPOSITORY%/*}"
           gh_repo="${GITHUB_REPOSITORY#*/}"
-          before=$(curl -sS -H "Authorization: Bearer ${RUNNER_REG_PAT}" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${gh_owner}/${gh_repo}/actions/runners?per_page=100" \
-            | jq -c '[.runners[].id]') || before='[]'
-          [ -n "$before" ] || before='[]'
+          # Distinguish a SUCCESSFUL read that legitimately returns zero runners
+          # (a first-ever provision → baseline '[]', valid, proceed) from a FAILED
+          # read (curl error / non-200 / jq parse failure). A failed read must NOT
+          # fall back to an empty baseline: an unreadable baseline would make the
+          # id-diff in "Verify runner registration" treat a pre-existing Online
+          # hetzner runner as newly-registered and false-pass. So on a genuine read
+          # failure we retry, then FAIL CLOSED rather than proceed with '[]'.
+          before=""
+          attempts=0; max=5
+          until [ "$attempts" -ge "$max" ]; do
+            http=$(curl -sS -o /tmp/runners_before.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${RUNNER_REG_PAT}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${gh_owner}/${gh_repo}/actions/runners?per_page=100") || http="000"
+            if [ "$http" = "200" ] && before=$(jq -c '[.runners[].id]' /tmp/runners_before.json 2>/dev/null); then
+              break
+            fi
+            before=""
+            echo "runner baseline read failed (http=$http), retrying... ($((attempts+1))/$max)"
+            attempts=$((attempts+1)); sleep 5
+          done
+          if [ -z "$before" ]; then
+            echo "::error::Could not read the runner baseline from the GitHub API after ${max} attempts. Refusing to proceed: an unreadable baseline would let a pre-existing runner false-pass the registration verification."
+            exit 1
+          fi
           echo "before_ids=$before" >> "$GITHUB_OUTPUT"
           echo "baseline runner IDs: $before"
 
