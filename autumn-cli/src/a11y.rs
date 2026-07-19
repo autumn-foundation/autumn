@@ -1,7 +1,7 @@
 //! `autumn a11y verify` — a build-time accessibility audit of raw `html!`
 //! markup.
 //!
-//! The typed primitives in [`autumn_web::a11y`](autumn_web::a11y) (`Img`,
+//! The typed primitives in [`autumn_web::a11y`] (`Img`,
 //! `Button`, `Link`, `MenuItem`, `TextField`) discharge every accessible-name
 //! obligation **at compile time**: an alt-less image or an unlabeled field
 //! written through them does not compile. Code that uses those primitives is
@@ -26,7 +26,7 @@
 //! therefore *miss* a defect in exotic markup (a miss is acceptable by design),
 //! so its raw-`html!` findings are advisory-grade signal, not a proof of
 //! accessibility. The complete, by-construction guarantee lives in the typed
-//! primitives in [`autumn_web::a11y`](autumn_web::a11y), where an accessible
+//! primitives in [`autumn_web::a11y`], where an accessible
 //! name is a compile-time type obligation proven by `trybuild`; this scanner is
 //! only the escape-hatch net over raw hand-written `html!`.
 //!

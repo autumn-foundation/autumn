@@ -4302,9 +4302,9 @@ fn resolve_optional_signing_secret() -> Option<String> {
 
 /// Resolve the signing secret the deploy preflight should grade, from the SAME
 /// merged active-profile runtime table used for the deploy config and DB URL
-/// (base autumn.toml + `[profile.<env>]` + autumn-<env>.toml), env first. A
+/// (base autumn.toml + `[profile.\<env\>]` + autumn-\<env\>.toml), env first. A
 /// secret supplied only in an active profile
-/// (`[profile.<env>].security.signing_secret` / autumn-<env>.toml) is invisible
+/// (`[profile.\<env\>].security.signing_secret` / autumn-\<env\>.toml) is invisible
 /// to the raw top-level `autumn.toml` that [`resolve_optional_signing_secret`]
 /// reads, so a raw-table lookup would report it MISSING even though
 /// `AutumnConfig::load()` and `autumn deploy check` see it. Never returns/prints
@@ -5909,7 +5909,7 @@ fn resolve_deploy_doctor_config(
     env: &dyn autumn_web::config::Env,
 ) -> (Option<DeployConfig>, Option<CheckResult>) {
     // First resolve the merged-profile `[deploy]` table (base autumn.toml +
-    // [profile.<env>] + autumn-<env>.toml). A present-but-malformed table is a
+    // `[profile.\<env\>]` + autumn-\<env\>.toml). A present-but-malformed table is a
     // hard fail regardless of env, because `AutumnConfig::load()` also fails to
     // deserialize it, so `autumn deploy` cannot run — surface it loudly instead
     // of silently skipping.
@@ -6023,12 +6023,12 @@ pub fn run(opts: DoctorOptions) {
     let web_ver = read_autumn_web_version();
     let toml_result = std::fs::read_to_string("autumn.toml");
     // Resolve doctor's database topology + process role/jobs backend from the
-    // MERGED active-profile config (base autumn.toml + [profile.<env>] +
-    // autumn-<env>.toml) plus the `.env` overlay — the SAME layering the
+    // MERGED active-profile config (base autumn.toml + `[profile.\<env\>]` +
+    // autumn-\<env\>.toml) plus the `.env` overlay — the SAME layering the
     // runtime, generator (`detect_backend`), and `autumn migrate` use — NOT the
     // raw top-level `autumn.toml` table. A database URL (or `role`/`jobs.backend`)
-    // supplied only by an active profile (`[profile.<env>].database` /
-    // `autumn-<env>.toml`) or by `.env` is invisible to the raw table, so a
+    // supplied only by an active profile (``[profile.\<env\>]`.database` /
+    // `autumn-\<env\>.toml`) or by `.env` is invisible to the raw table, so a
     // raw-table lookup under `AUTUMN_ENV=prod` would MISS a SQLite target and run
     // the Postgres-only pg_dump/pg_restore + pending-migration checks (finding
     // F21). Env precedence is preserved: the resolver reads the `.env`-backed
@@ -6099,8 +6099,8 @@ pub fn run(opts: DoctorOptions) {
 
     // 4c. Queue pinning zero-coverage guard (#1623): warn if jobs.pin leaves a
     // configured queue with no worker coverage anywhere in the topology. Build
-    // from the merged active-profile table (base autumn.toml + [profile.<env>]
-    // + autumn-<env>.toml) exactly like the runtime config loader — and like the
+    // from the merged active-profile table (base autumn.toml + `[profile.\<env\>]`
+    // + autumn-\<env\>.toml) exactly like the runtime config loader — and like the
     // sibling profile-aware doctor checks (proxy conflict, mail unsubscribe) —
     // so profile-specific `jobs.queues` / `jobs.pin` layers are honored instead
     // of only the top-level `[jobs]` section.
@@ -6109,8 +6109,8 @@ pub fn run(opts: DoctorOptions) {
     let (configured_queues, jobs_pin) = resolve_queues_and_pin(Some(&merged_jobs_toml));
     // Resolve the process role for THIS check from the SAME merged active-profile
     // table the queues/pin come from — not the raw top-level `toml_table` that
-    // feeds `process_role` above. A `role` set only under `[profile.<env>]` /
-    // `autumn-<env>.toml` (e.g. a web replica in prod) is invisible to the raw
+    // feeds `process_role` above. A `role` set only under `[profile.\<env\>]` /
+    // `autumn-\<env\>.toml` (e.g. a web replica in prod) is invisible to the raw
     // table, so the raw-table role would resolve to `Combined`, the web-role
     // skip-gate would never fire, and `doctor --strict` could wrongly warn/fail
     // on queue coverage for a process that runs no job workers. Precedence
@@ -6310,10 +6310,10 @@ pub fn run(opts: DoctorOptions) {
     // stays offline and non-flaky by default, matching the ACME probes.
     //
     // Resolve `[deploy]` from the MERGED active-profile runtime table (base
-    // autumn.toml + [profile.<env>] + autumn-<env>.toml), exactly like the
+    // autumn.toml + `[profile.\<env\>]` + autumn-\<env\>.toml), exactly like the
     // sibling profile-aware checks (queue pinning, ACME) and the runtime config
     // loader — NOT the raw top-level `toml_table`. A `[deploy]` block supplied
-    // only by an active profile (`autumn-<env>.toml` / `[profile.<env>].deploy`)
+    // only by an active profile (`autumn-\<env\>.toml` / ``[profile.\<env\>]`.deploy`)
     // is invisible to the raw table, so a raw-table lookup would skip the deploy
     // preflight entirely (or `--online` would probe the base host instead of the
     // effective target) — grading a deploy config the runtime never loads.
@@ -6424,10 +6424,10 @@ pub fn run(opts: DoctorOptions) {
             resolve_deploy_previous_signing_secrets(&merged_deploy_toml);
         // Derive the deploy DB-URL preflight input from the SAME merged
         // active-profile table used for `deploy_cfg` (base autumn.toml +
-        // [profile.<env>] + autumn-<env>.toml), exactly like the sibling
+        // `[profile.\<env\>]` + autumn-\<env\>.toml), exactly like the sibling
         // profile-aware checks above — NOT the pre-merge `db_topology` built from
         // the raw top-level `toml_table`. A database URL supplied only by the
-        // active profile (`[profile.<env>].database` / `autumn-<env>.toml`) is
+        // active profile (``[profile.\<env\>]`.database` / `autumn-\<env\>.toml`) is
         // invisible to the raw table, so a raw-table lookup would fail
         // `deploy_database_url` under `--strict` even though `AutumnConfig::load()`
         // and `autumn deploy check` see it. Env-var precedence is preserved
@@ -6614,7 +6614,7 @@ pub fn run(opts: DoctorOptions) {
     // "must set both cert_path and key_path" Fail for EVERY ACME deployment.
     // ACME mode is graded by the acme checks below instead.
     // Resolve the ACME config from the MERGED active-profile runtime table (base
-    // autumn.toml + [profile.<env>] + autumn-<env>.toml), exactly like the
+    // autumn.toml + `[profile.\<env\>]` + autumn-\<env\>.toml), exactly like the
     // sibling `resolve_tls_paths()` does — NOT the raw top-level `toml_table`. A
     // `[server.tls.acme]` supplied only by an active profile or override file is
     // invisible to the raw table, so a raw-table lookup would leave
@@ -10224,7 +10224,7 @@ contact_email = \"ops@example.com\"
     // spuriously Fail a valid ACME deployment. The MERGED runtime table (base +
     // profile) sees the acme config, so doctor SKIPS the static check. This
     // mirrors get_merged_toml_table_runtime's profile merge (deep_merge of
-    // [profile.<env>] onto the base top-level) feeding the testable
+    // `[profile.\<env\>]` onto the base top-level) feeding the testable
     // resolve_acme_doctor_config helper.
     #[test]
     fn profile_only_acme_skips_static_tls_check() {
@@ -12857,7 +12857,7 @@ foo = "bar"
     fn queue_coverage_honors_profile_layer_jobs_config() {
         // Regression for the #1623 review finding: when queue config is
         // profile-specific, the coverage check must read the merged
-        // active-profile table (base + `[profile.<env>]` + `autumn-<env>.toml`)
+        // active-profile table (base + `[profile.\<env\>]` + `autumn-\<env\>.toml`)
         // exactly like the runtime — not just the raw top-level `[jobs]`.
         //
         // Scenario: base `autumn.toml` has no top-level `[jobs]`; the prod
