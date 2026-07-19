@@ -1,0 +1,5 @@
+impl Future<Output = Result<Option<Pool<AsyncDieselConnectionManager<AsyncPgConnection>>>, PoolError>>
+Result<Option<Pool<AsyncDieselConnectionManager<SyncConnectionWrapper<SqliteConnection, Tokio>>>>, PoolError>
+Result<Option<Pool<AsyncDieselConnectionManager<AsyncPgConnection>>>, PoolError>
+std::result::Result<std::option::Option<deadpool::managed::Pool<diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::sync_connection_wrapper::implementation::SyncConnectionWrapper<diesel::SqliteConnection, diesel_async::sync_connection_wrapper::implementation::Tokio>>>>, db::PoolError>
+std::result::Result<std::option::Option<deadpool::managed::Pool<diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>>>, db::PoolError>
