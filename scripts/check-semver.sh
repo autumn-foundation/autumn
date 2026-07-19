@@ -117,7 +117,51 @@ for crate in "${CRATES[@]}"; do
   # We distinguish these cases by parsing the output rather than relying on
   # exit codes alone.
   set +e
-  crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" 2>&1)"
+  if [[ "$crate" == "autumn-web" ]]; then
+    # autumn-web special case: run ONE explicit-feature pass over the crate's
+    # documented Postgres public-API surface, with cargo-semver-checks'
+    # "enable (almost) all features" heuristic disabled.
+    #
+    # Why: as of 0.6.0 autumn-web gained the mutually-incompatible feature pair
+    # `sqlite` × `managed-pg`/`managed-pg-bundled`. `sqlite` flips the
+    # `db::RuntimeConnection` type alias to a SQLite connection, while
+    # `managed_pg.rs` hard-codes `AsyncPgConnection` against the Postgres
+    # `RuntimeConnection` — so co-enabling them is a TYPE-LEVEL incompatibility
+    # that fails rustdoc with E0308/E0271. Left unconstrained, the tool's
+    # all-features heuristic co-enables exactly that pair, the rustdoc build
+    # cargo-semver-checks needs fails to compile, and the tool exits 1 with
+    # compile-error output — tripping this script's catch-all tool-failure
+    # branch and hard-blocking a tag-push release, even though the semver API
+    # check itself is clean.
+    #
+    # `--only-explicit-features --no-default-features --features <list>` pins
+    # the feature set to a fully deterministic, compilable posture so the
+    # heuristic can never co-enable `sqlite`+`managed-pg-bundled`:
+    #   1. The list is the crate's own documented API posture (Postgres `db`),
+    #      and EXCLUDES `sqlite`/`managed-pg`/`managed-pg-bundled`, so rustdoc
+    #      compiles.
+    #   2. It is baseline-safe: every feature in the list already exists in the
+    #      published 0.5.x crates.io baseline, so the symmetric enable on both
+    #      baseline and current builds cleanly.
+    #
+    # Source of truth: autumn/Cargo.toml `[package.metadata.docs.rs].features`.
+    # This list is hardcoded to MIRROR `AUTUMN_WEB_DOCS_FEATURES` in
+    # scripts/check-docs.sh — keep the two in sync when either changes.
+    #
+    # Deferred: a genuine apples-to-apples sqlite-vs-sqlite pass
+    # (`--only-explicit-features --no-default-features --features sqlite`) is
+    # intentionally NOT added this release — the 0.5.x baseline has no `sqlite`
+    # feature (a symmetric enable would hard-error on the baseline), and a
+    # sqlite-vs-Postgres comparison yields false-positive breaks because
+    # `sqlite` flips `RuntimeConnection`'s type. Add that pass in a release
+    # after 0.6.0 is published (when a sqlite baseline exists).
+    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv"
+    crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
+      --only-explicit-features --no-default-features \
+      --features "$autumn_web_semver_features" 2>&1)"
+  else
+    crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" 2>&1)"
+  fi
   exit_code=$?
   set -e
 
