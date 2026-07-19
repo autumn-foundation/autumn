@@ -136,6 +136,35 @@ and the slot would die after a single job.
 6. In the repo: **Settings → Secrets and variables → Actions → Secrets → New
    repository secret**, name `RUNNER_REG_PAT`, paste the token.
 
+#### `RUNNER_REG_PAT` requirements (the common silent-failure cause)
+
+Registration happens **inside the systemd unit on the VM** (`run-ephemeral.sh`
+POSTs `…/actions/runners/registration-token`, then `config.sh`), so a
+mis-scoped or expired PAT makes registration 403/404 and the slots crash-loop —
+without any error in the provision run. The PAT **must** be:
+
+- a **fine-grained** PAT whose **resource owner** is the account/org that owns
+  `madmax983/autumn`;
+- granted **repository access** to `madmax983/autumn`;
+- granted **Repository permissions → Administration: Read and write**;
+- **not expired**.
+
+Decisive manual check (prints `201` for a good PAT, `403`/`404` for a
+bad-scope/expired one):
+
+```sh
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  -H "Authorization: Bearer <PAT>" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  https://api.github.com/repos/madmax983/autumn/actions/runners/registration-token
+```
+
+The provisioner now runs this exact preflight before creating the VM (failing
+fast if it is not `201`) and, after enabling the units, **verifies at least one
+`hetzner` runner comes Online** before the run succeeds — so a bad PAT surfaces
+in the run itself instead of hours later.
+
 ### Set `AUTUMN_SELF_HOSTED_HEAVY` (do this AFTER provisioning verifies)
 
 - **Settings → Secrets and variables → Actions → Variables → New repository
