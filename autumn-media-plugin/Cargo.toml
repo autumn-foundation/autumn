@@ -56,7 +56,7 @@ aws-smithy-types = ">=1.4, <1.5"
 # blanket From impl; time is already in this crate's graph via the aws
 # crates, so this only bounds resolution. Lift once upstream releases
 # are compatible.
-time = { version = ">=0.3.36, <0.3.48", default-features = false }
+time = { version = ">=0.3.36, <0.3.54", default-features = false }
 # aws-smithy-async 1.3.0 bumped its rust-version to 1.94.1, above this
 # workspace's pinned toolchains (MSRV 1.88.0; CI's semver-check runner is
 # 1.92.0). This is a transitive dep pulled in via aws-config/aws-sdk-s3, not
