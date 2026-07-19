@@ -251,15 +251,38 @@ jobs:
           expected=$(for i in $(seq 1 "$count"); do printf '%s\n' "${prefix}-${i}"; done \
             | jq -R . | jq -s -c .)
           ip="${{ steps.create.outputs.ip }}"
+          # Fetch ALL runner pages and emit the ONLINE runner names as a compact JSON
+          # array. A single `?per_page=100` fetch (page 1) misses the newly-Online slot
+          # names when the repo has >100 runner records — stale offline entries from
+          # hard-killed / crash-looped boxes accumulate — pushing the fresh names onto
+          # page 2+ and false-failing this guard even though the VM registered fine. So
+          # loop until a short page (the last), accumulating names across pages. Any
+          # transient fetch/parse error returns non-zero so the caller treats the cycle
+          # as not-yet-complete and retries — never a false pass.
+          list_online_runner_names() {
+            local page=1 acc='[]' body names cnt
+            while :; do
+              body=$(curl -sS -H "Authorization: Bearer ${RUNNER_REG_PAT}" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${gh_owner}/${gh_repo}/actions/runners?per_page=100&page=${page}") || return 1
+              names=$(printf '%s' "$body" | jq -c '[(.runners // [])[] | select(.status=="online") | .name]') || return 1
+              acc=$(jq -c -n --argjson a "$acc" --argjson b "$names" '$a + $b') || return 1
+              cnt=$(printf '%s' "$body" | jq '(.runners // []) | length') || return 1
+              [ "${cnt:-0}" -lt 100 ] && break   # short page => last page
+              page=$((page+1))
+              [ "$page" -gt 50 ] && break          # safety cap (>=5000 runners)
+            done
+            printf '%s' "$acc"
+          }
           attempts=0; max=12   # ~4 min at 20s
           online=0
           online_names='[]'
           until [ "$attempts" -ge "$max" ]; do
-            # The set of ONLINE runner names that are in this run's expected slot set,
-            # as a JSON array; `online` is its length.
-            online_names=$(curl -sS -H "Authorization: Bearer ${RUNNER_REG_PAT}" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${gh_owner}/${gh_repo}/actions/runners?per_page=100" \
-              | jq -c --argjson expected "$expected" '[.runners[] | select(.status=="online") | .name | select(. as $nm | ($expected | index($nm)) != null)]') || online_names='[]'
+            # ALL online runner names across every page (empty on a transient error,
+            # so the cycle just counts as not-yet-complete and retries), then filtered
+            # to this run's expected slot set as a JSON array; `online` is its length.
+            all_online=$(list_online_runner_names) || all_online='[]'
+            online_names=$(printf '%s' "${all_online:-[]}" \
+              | jq -c --argjson expected "$expected" '[.[] | select(. as $nm | ($expected | index($nm)) != null)]') || online_names='[]'
             online=$(printf '%s' "${online_names:-[]}" | jq 'length') || online=0
             echo "online runners in ${expected} : ${online:-0}/${count} (attempt $((attempts+1))/$max)"
             [ "${online:-0}" -ge "$count" ] && break
