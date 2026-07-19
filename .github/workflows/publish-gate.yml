@@ -176,6 +176,14 @@ jobs:
       # (1.94.1: aws-smithy MSRV floor; 1.96.0 ICEs — see script comment).
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
+      # protoc is required by telemetry-otlp (prost/tonic) in the broadened
+      # feature set check-semver.sh enables; it is not in the standard
+      # ubuntu-latest image. Mirrors feature-combinations.yml's install so the
+      # semver gate does not fail the rustdoc/dependency build for that feature.
+      - name: Install protoc (required for telemetry-otlp)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
       - name: Install cargo-semver-checks
         # Pin @v2 and pass the tool explicitly. The bare @cargo-semver-checks tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz

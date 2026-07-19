@@ -195,6 +195,10 @@ for crate in "${CRATES[@]}"; do
     # sqlite-vs-Postgres comparison yields false-positive breaks because
     # `sqlite` flips `RuntimeConnection`'s type. Add that pass in a release
     # after 0.6.0 is published (when a sqlite baseline exists).
+    #
+    # NOTE: `telemetry-otlp` pulls prost/tonic, which need `protoc` at build
+    # time. The SemVer job in .github/workflows/publish-gate.yml installs
+    # protobuf-compiler for this reason — keep them in sync.
     autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp"
     crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features \
