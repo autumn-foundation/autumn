@@ -240,7 +240,7 @@ impl ResolvedDeployConfig {
     }
 
     /// Persistent per-app dir shared across releases (holds the secret env file
-    /// and, since #1952, the uploaded config manifest[s]). The deployed systemd
+    /// and, since #1952, the uploaded config manifest\[s\]). The deployed systemd
     /// unit sets `AUTUMN_MANIFEST_DIR` to this path so the app's config loader
     /// reads the uploaded `autumn.toml` here at boot.
     #[must_use]
