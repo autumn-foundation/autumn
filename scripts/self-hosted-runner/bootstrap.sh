@@ -151,7 +151,17 @@ sudo -u runner ./config.sh --unattended --replace \
   --name "${RUNNER_NAME_PREFIX:-hetzner-$(hostname)}-${slot}" \
   --labels "self-hosted,hetzner,linux,x64" \
   --ephemeral
-exec sudo -u runner ./run.sh
+# The runner worker (Runner.Worker) is started via `sudo -u runner ./run.sh`,
+# and sudo's default env_reset STRIPS the systemd unit's RUSTUP_HOME/CARGO_HOME
+# and resets PATH to secure_path — so the Environment= vars above never reach the
+# worker or the cargo/rustc it spawns. Set them explicitly with `env` at the sudo
+# boundary (hardcoding the absolute /opt/rust paths) so run.sh, Runner.Worker, and
+# every `cargo test` / `rustc` subprocess inherit the system toolchain by design.
+exec sudo -u runner env \
+  RUSTUP_HOME=/opt/rust/rustup \
+  CARGO_HOME=/opt/rust/cargo \
+  PATH="/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  ./run.sh
 WRAP
 chmod 0755 "${RUNNER_HOME}/run-ephemeral.sh"
 
