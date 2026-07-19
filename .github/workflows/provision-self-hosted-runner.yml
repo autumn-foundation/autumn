@@ -33,6 +33,11 @@ on:
       admin_ssh_key_name:
         description: "Optional existing hcloud ssh-key name to also attach for your own admin access"
         default: ""
+      force_replace:
+        description: "Migration only: permit deleting a same-named server that LACKS the managed-by=autumn-ci-provisioner label (needed once to replace a pre-label VM)."
+        required: false
+        default: "false"
+        type: boolean
 
 concurrency:
   group: provision-self-hosted-runner
@@ -122,6 +127,41 @@ jobs:
             tail -n +2 scripts/self-hosted-runner/bootstrap.sh
           } > "${RUNNER_TEMP}/user-data.sh"
 
+      - name: Delete labeled predecessor server (own same-named VM)
+        # Each provision creates a fresh server named `${{ inputs.server_name }}`,
+        # which collides on Hetzner's server-name uniqueness with a prior one and
+        # would otherwise leave the old VM running (and billing). Delete our OWN
+        # same-named predecessor before creating the new one — but SAFELY: only a
+        # server carrying the managed-by=autumn-ci-provisioner label this workflow
+        # stamps on every server it creates (see "Create server" below) is deleted
+        # automatically. An unlabeled same-named server (e.g. an unrelated VM, or the
+        # one pre-label `autumn-ci-runner` box) is refused with a HARD FAIL unless the
+        # one-time `force_replace=true` migration input is set — so this step can never
+        # delete a server this provisioner did not create. Runs after the PAT preflight
+        # (Guard A) and after the hcloud CLI is installed, before "Create server".
+        # HCLOUD_TOKEN is in scope from the job-level env, like the other hcloud steps.
+        run: |
+          set -uo pipefail
+          name="${{ inputs.server_name }}"
+          force_replace="${{ inputs.force_replace }}"
+          # Exact-name existence + label lookup in one describe (describe by name;
+          # non-zero exit if absent). jq is available on the hosted runner.
+          if server_json=$(hcloud server describe "$name" -o json 2>/dev/null); then
+            label=$(printf '%s' "$server_json" | jq -r '.labels["managed-by"] // ""')
+            if [ "$label" = "autumn-ci-provisioner" ]; then
+              echo "Deleting managed predecessor server '$name' (labeled managed-by=autumn-ci-provisioner)."
+              hcloud server delete "$name"
+            elif [ "$force_replace" = "true" ]; then
+              echo "::warning::force_replace=true: deleting UNLABELED same-named server '$name' (one-time migration)."
+              hcloud server delete "$name"
+            else
+              echo "::error::A server named '$name' exists but is NOT labeled managed-by=autumn-ci-provisioner. Refusing to delete it (could be unrelated). Manual review required, or re-dispatch with force_replace=true for a one-time migration."
+              exit 1
+            fi
+          else
+            echo "No existing server named '$name'; nothing to clean up."
+          fi
+
       - name: Create server
         id: create
         run: |
@@ -135,6 +175,7 @@ jobs:
             --image "${{ inputs.ubuntu_image }}"
             --location "${{ inputs.location }}"
             --ssh-key "${key_name}"
+            --label managed-by=autumn-ci-provisioner
             --user-data-from-file "${RUNNER_TEMP}/user-data.sh")
           if [ -n "${{ inputs.admin_ssh_key_name }}" ]; then
             create_args+=(--ssh-key "${{ inputs.admin_ssh_key_name }}")

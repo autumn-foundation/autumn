@@ -196,6 +196,10 @@ and is filtered out — so nothing can mask a failed new registration.
      to also attach so you can SSH in for debugging. Leave blank if you don't
      need admin access (the provisioner always attaches its own throwaway key
      for setup, then deletes it).
+   - `force_replace` — **migration only**, default `false`. Permits the
+     cleanup-before-create step (§5.1) to delete a same-named server that
+     **lacks** the `managed-by=autumn-ci-provisioner` label. Needed exactly once
+     to replace the pre-label `autumn-ci-runner` VM; leave `false` afterward.
 3. Watch the run: it installs the `hcloud` CLI, creates the VM with
    `bootstrap.sh` as cloud-init user-data, waits for cloud-init to finish,
    delivers the PAT over SSH, and enables the `autumn-runner@1..N` units. The
@@ -205,6 +209,39 @@ and is filtered out — so nothing can mask a failed new registration.
    `self-hosted, hetzner, linux, x64`.
 5. **Flip the switch:** set the repo variable `AUTUMN_SELF_HOSTED_HEAVY = 1`
    (§4). The next CI run routes heavy trusted lanes to the box.
+
+### 5.1 Cleanup-before-create (labeled predecessor deletion)
+
+Hetzner enforces server-name uniqueness, so a **re-provision** of the same
+`server_name` would collide with the prior VM (and, if it somehow succeeded,
+leave the old box running and billing). To make re-provision idempotent, every
+server this workflow creates is stamped with the label
+`managed-by=autumn-ci-provisioner` (via `hcloud server create --label …`), and a
+cleanup step runs **before** "Create server" (after the PAT preflight and the
+hcloud CLI install):
+
+- **No same-named server exists** → nothing to do; proceed to create.
+- **A same-named server carries `managed-by=autumn-ci-provisioner`** → it is our
+  own predecessor, so it is **deleted automatically** before the new one is
+  created. This is the normal recovery/re-provision path.
+- **A same-named server exists but is NOT labeled** → the step **hard-fails**
+  (`exit 1`) and creates nothing, because it cannot prove the workflow created
+  that server — it could be an unrelated VM. Resolve by either deleting it
+  manually after review, or re-dispatching with **`force_replace=true`** (below).
+
+So the provisioner deletes only servers it can prove it created; it never touches
+an unlabeled/unrelated server on its own.
+
+#### One-time `force_replace=true` migration
+
+The **existing** `autumn-ci-runner` VM was created before the label existed, so
+it carries no `managed-by` label and the cleanup step would refuse to delete it.
+To adopt the new behavior, re-dispatch the provision workflow **once** with the
+`force_replace` input set to `true` (§5, step 2). That single run logs a
+`::warning::` and deletes the unlabeled same-named server, then creates a fresh,
+correctly-labeled replacement. Leave `force_replace` at its `false` default for
+every subsequent provision — once the box is labeled, ordinary re-provisions
+delete it automatically without the override.
 
 ## 6. Which lanes route
 
@@ -264,7 +301,12 @@ than failing; flip the variable to drain them onto hosted runners immediately.
 
 - **Delete the VM:** `hcloud server delete autumn-ci-runner` (use whatever
   `server_name` you provisioned with). This destroys all slots at once.
-- **Recreate:** re-run the **"Provision self-hosted runner"** workflow (§5).
+- **Recreate:** re-run the **"Provision self-hosted runner"** workflow (§5). You
+  no longer need to delete the old box by hand first: because provisioned servers
+  carry the `managed-by=autumn-ci-provisioner` label, the cleanup-before-create
+  step (§5.1) deletes the same-named labeled predecessor automatically. (The
+  one-time exception is the pre-label `autumn-ci-runner` VM — use
+  `force_replace=true` for that first migration; see §5.1.)
 - Ephemeral runners **auto-deregister** after each job, so a deleted box leaves
   no live registrations. Any **stale offline** entries left behind (e.g. from a
   hard-killed box) can be removed manually at **Settings → Actions → Runners**.
