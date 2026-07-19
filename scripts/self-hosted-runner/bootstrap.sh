@@ -65,10 +65,12 @@ RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo /opt/rust/cargo/bin/rust
 for b in cargo rustc rustup; do
   ln -sf /opt/rust/cargo/bin/"${b}" /usr/local/bin/"${b}"
 done
-# Login shells (and anything sourcing /etc/profile) also get the toolchain.
+# Login shells (and anything sourcing /etc/profile) also get the toolchain BIN
+# dir on PATH. Deliberately do NOT export RUSTUP_HOME/CARGO_HOME here: pointing
+# them at the read-only /opt/rust would break job-time toolchain/tool installs
+# (dtolnay/rust-toolchain, `cargo install cargo-fuzz`) for login-shell jobs too.
+# Left unset, they default to the runner user's writable ~/.rustup / ~/.cargo.
 cat > /etc/profile.d/rust.sh <<'PROFILE'
-export RUSTUP_HOME=/opt/rust/rustup
-export CARGO_HOME=/opt/rust/cargo
 export PATH="/opt/rust/cargo/bin:${PATH}"
 PROFILE
 chmod 0644 /etc/profile.d/rust.sh
@@ -152,14 +154,20 @@ sudo -u runner ./config.sh --unattended --replace \
   --labels "self-hosted,hetzner,linux,x64" \
   --ephemeral
 # The runner worker (Runner.Worker) is started via `sudo -u runner ./run.sh`,
-# and sudo's default env_reset STRIPS the systemd unit's RUSTUP_HOME/CARGO_HOME
-# and resets PATH to secure_path — so the Environment= vars above never reach the
-# worker or the cargo/rustc it spawns. Set them explicitly with `env` at the sudo
-# boundary (hardcoding the absolute /opt/rust paths) so run.sh, Runner.Worker, and
-# every `cargo test` / `rustc` subprocess inherit the system toolchain by design.
+# and sudo's default env_reset resets PATH to secure_path — so the unit's
+# Environment=PATH never reaches the worker or the cargo/rustc it spawns. Set
+# PATH explicitly with `env` at the sudo boundary so run.sh, Runner.Worker, and
+# every spawned `cargo`/`rustc` subprocess resolve the system toolchain binaries
+# via /opt/rust/cargo/bin + the /usr/local/bin symlinks.
+#
+# Deliberately do NOT set RUSTUP_HOME/CARGO_HOME here: /opt/rust is root-owned
+# and read-only (a+rX), so pointing them there would make job-time installs
+# (dtolnay/rust-toolchain@nightly, `cargo install cargo-fuzz`) fail with
+# permission errors. Left unset, they default to the runner user's WRITABLE
+# ~/.rustup / ~/.cargo, where the job's own toolchain step installs; the rustup
+# proxy (found on PATH) then resolves that per-user toolchain. This mirrors
+# GitHub-hosted runners: system-discoverable binaries + a per-user writable home.
 exec sudo -u runner env \
-  RUSTUP_HOME=/opt/rust/rustup \
-  CARGO_HOME=/opt/rust/cargo \
   PATH="/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   ./run.sh
 WRAP
@@ -176,15 +184,16 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# Put the system-wide Rust toolchain (installed by bootstrap.sh at /opt/rust) on
-# the service PATH and pin the absolute RUSTUP_HOME/CARGO_HOME, so the runner
-# service, the Runner.Worker it forks, `cargo test`, AND every subprocess the
-# tests spawn (autumn-cli's `cargo metadata` / `rustc`) inherit them and can
-# resolve cargo/rustc without depending on $GITHUB_PATH or the runner user's
-# $HOME (fixes the `Os NotFound` spawn failures on the self-hosted runner).
+# Put the system-wide Rust toolchain BIN dir (installed by bootstrap.sh at
+# /opt/rust) on the service PATH so the runner service, the Runner.Worker it
+# forks, `cargo`, AND every subprocess the tests spawn (autumn-cli's
+# `cargo metadata` / `rustc`) resolve cargo/rustc/rustup without depending on
+# $GITHUB_PATH or the runner user's $HOME (fixes the `Os NotFound` spawn
+# failures on the self-hosted runner). Deliberately do NOT set
+# RUSTUP_HOME/CARGO_HOME: /opt/rust is read-only, so pointing them there would
+# break job-time installs (dtolnay/rust-toolchain, cargo-fuzz). Left unset they
+# default to the runner user's writable ~/.rustup / ~/.cargo.
 Environment=PATH=/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=RUSTUP_HOME=/opt/rust/rustup
-Environment=CARGO_HOME=/opt/rust/cargo
 ExecStart=/opt/autumn-runner/run-ephemeral.sh %i
 Restart=always
 RestartSec=5
