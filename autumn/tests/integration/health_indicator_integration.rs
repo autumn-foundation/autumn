@@ -123,7 +123,17 @@ fn registry_duplicate_name_is_rejected() {
 // ── run_all ──────────────────────────────────────────────────────
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn registry_run_all_returns_all_results() {
+    // `run_all()` folds in the process-global circuit-breaker registry, which a
+    // concurrently-running circuit_breaker_integration test may have populated.
+    // Take the same guard that module uses so a leaked breaker can't inflate our
+    // count.
+    let _lock = autumn_web::circuit_breaker::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::circuit_breaker::global_registry().clear();
+
     let registry = HealthIndicatorRegistry::new();
     registry
         .register("a", IndicatorGroup::Readiness, Arc::new(AlwaysUp))
@@ -134,6 +144,8 @@ async fn registry_run_all_returns_all_results() {
 
     let results = registry.run_all().await;
     assert_eq!(results.len(), 2);
+
+    autumn_web::circuit_breaker::global_registry().clear();
 }
 
 #[tokio::test]
@@ -161,7 +173,17 @@ async fn registry_run_readiness_skips_health_only_indicators() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn hung_indicator_times_out_and_reports_unknown_with_timed_out_detail() {
+    // `run_all()` folds in the process-global circuit-breaker registry, which a
+    // concurrently-running circuit_breaker_integration test may have populated.
+    // Take the same guard that module uses so a leaked breaker can't inflate our
+    // count.
+    let _lock = autumn_web::circuit_breaker::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::circuit_breaker::global_registry().clear();
+
     let registry = HealthIndicatorRegistry::new();
     registry
         .register("hung", IndicatorGroup::Readiness, Arc::new(HungIndicator))
@@ -174,6 +196,8 @@ async fn hung_indicator_times_out_and_reports_unknown_with_timed_out_detail() {
         results[0].output.details.get("timed_out"),
         Some(&serde_json::Value::Bool(true))
     );
+
+    autumn_web::circuit_breaker::global_registry().clear();
 }
 
 // ── aggregate_status ─────────────────────────────────────────────
