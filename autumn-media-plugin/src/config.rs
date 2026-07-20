@@ -216,6 +216,36 @@ impl MediaStorageBackend {
     }
 }
 
+/// Which backend holds mesh-room state (rosters, seats, liveness clocks).
+///
+/// [`Memory`](Self::Memory) is the single-process default — rooms live in one
+/// process's [`InMemoryRoomStore`](crate::rooms::InMemoryRoomStore) and do not
+/// survive a restart or span multiple app processes. [`Db`](Self::Db) selects
+/// the shared, Postgres/SQLite-backed
+/// [`DbRoomStore`](crate::rooms_db::DbRoomStore), so rooms are durable and every
+/// app process/instance sees the same rooms — the correct choice for any
+/// multi-process or horizontally-scaled deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RoomStoreBackend {
+    /// Single-process, in-memory room state (the default).
+    #[default]
+    Memory,
+    /// Shared, database-backed room state (multi-process safe).
+    Db,
+}
+
+impl RoomStoreBackend {
+    /// Stable lowercase label for logs/summaries.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Db => "db",
+        }
+    }
+}
+
 /// Media object storage settings (local filesystem or S3-compatible).
 ///
 /// `secret_access_key` and `session_token` are redacted by the hand-written
@@ -351,6 +381,11 @@ pub struct MediaConfig {
     /// (empty / `None` inserts no namespace segment).
     #[serde(default)]
     pub room_namespace: Option<String>,
+    /// Which backend holds mesh-room state. Defaults to
+    /// [`RoomStoreBackend::Memory`] (single-process); set to `db` for a shared,
+    /// multi-process-safe [`DbRoomStore`](crate::rooms_db::DbRoomStore).
+    #[serde(default)]
+    pub room_store_backend: RoomStoreBackend,
 }
 
 impl Default for MediaConfig {
@@ -363,6 +398,7 @@ impl Default for MediaConfig {
             room_max_participants: default_room_max_participants(),
             room_token_ttl_seconds: default_room_token_ttl_seconds(),
             room_namespace: None,
+            room_store_backend: RoomStoreBackend::default(),
         }
     }
 }
@@ -597,6 +633,12 @@ impl MediaConfig {
             env,
             "AUTUMN_MEDIA__ROOM_NAMESPACE",
         );
+        if let Some(value) = env.get("AUTUMN_MEDIA__ROOM_STORE_BACKEND") {
+            self.room_store_backend = match value.trim().to_ascii_lowercase().as_str() {
+                "db" => RoomStoreBackend::Db,
+                _ => RoomStoreBackend::Memory,
+            };
+        }
     }
 
     /// Apply `AUTUMN_MEDIA__<TABLE>__<FIELD>` scalar leaf overrides
@@ -1064,6 +1106,43 @@ mod tests {
         assert_eq!(config.room_max_participants, DEFAULT_ROOM_MAX_PARTICIPANTS);
         assert_eq!(config.room_token_ttl_seconds, 300);
         assert_eq!(config.room_namespace, None);
+        // The room store defaults to the single-process in-memory backend.
+        assert_eq!(config.room_store_backend, RoomStoreBackend::Memory);
+    }
+
+    #[test]
+    fn room_store_backend_parses_from_toml_and_env_override() {
+        // Selected via `[media]`.
+        let config = MediaConfig::from_toml_str_with_env(
+            "[media]\nroom_store_backend = \"db\"\n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(config.room_store_backend, RoomStoreBackend::Db);
+
+        // An unknown / blank value falls back to the memory default (never errors).
+        let config = MediaConfig::from_toml_str_with_env(
+            "[media]\nroom_store_backend = \"memory\"\n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(config.room_store_backend, RoomStoreBackend::Memory);
+
+        // `AUTUMN_MEDIA__ROOM_STORE_BACKEND` overrides the file value.
+        let config = MediaConfig::from_toml_str_with_env(
+            "[media]\nroom_store_backend = \"memory\"\n",
+            &env(&[("AUTUMN_MEDIA__ROOM_STORE_BACKEND", "db")]),
+        )
+        .unwrap();
+        assert_eq!(config.room_store_backend, RoomStoreBackend::Db);
+
+        // A garbage env value degrades to memory (no panic, no error).
+        let config = MediaConfig::from_toml_str_with_env(
+            "[media]\nroom_store_backend = \"db\"\n",
+            &env(&[("AUTUMN_MEDIA__ROOM_STORE_BACKEND", "nonsense")]),
+        )
+        .unwrap();
+        assert_eq!(config.room_store_backend, RoomStoreBackend::Memory);
     }
 
     #[test]

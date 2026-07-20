@@ -14,6 +14,14 @@ categories = ["web-programming", "multimedia"]
 [dependencies]
 autumn-web = { version = "0.6.0", path = "../autumn" }
 chrono = { workspace = true }
+# Diesel is used ONLY by the optional DB-backed `RoomStore` (rooms_db).
+# Backend selection (postgres / sqlite) is inherited from autumn-web's `db`
+# feature via cargo feature unification — this crate never enables a backend
+# (or the `sqlite` runtime lane) itself, so the FEATURE-UNIFICATION HAZARD in
+# `autumn/src/db.rs` does not apply. Queries are written against autumn-web's
+# `RuntimeConnection` / `RuntimeBackend` aliases so both lanes compile.
+diesel = { workspace = true }
+diesel-async = { workspace = true }
 percent-encoding = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -94,6 +102,14 @@ aws-sdk-s3 = { version = ">=1.122, <1.123", default-features = false, features =
 tempfile = "3"
 # Job-arg / artifact (de)serialization round-trip tests.
 serde_json = { workspace = true }
+# DB-backed `RoomStore` (rooms_db) testcontainer integration tests — spin a real
+# Postgres via testcontainers, exactly mirroring autumn-admin-plugin's
+# `tests/token_admin_db.rs`. `#[ignore]`d so a default `cargo test` never needs
+# Docker.
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 
 [lints]
 workspace = true
