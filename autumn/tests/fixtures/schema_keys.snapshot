@@ -135,6 +135,7 @@ dev.inspector_n_plus_one_threshold
 dev.inspector_path
 health
 health.detailed
+health.enabled
 health.live_path
 health.path
 health.ready_path

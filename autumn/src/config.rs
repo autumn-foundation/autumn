@@ -87,6 +87,7 @@
 //! | `AUTUMN_HEALTH__READY_PATH` | `health.ready_path` | `String` |
 //! | `AUTUMN_HEALTH__STARTUP_PATH` | `health.startup_path` | `String` |
 //! | `AUTUMN_HEALTH__DETAILED` | `health.detailed` | `bool` |
+//! | `AUTUMN_HEALTH__ENABLED` | `health.enabled` | `bool` |
 //! | `AUTUMN_CORS__ALLOWED_ORIGINS` | `cors.allowed_origins` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_METHODS` | `cors.allowed_methods` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_HEADERS` | `cors.allowed_headers` | comma-separated `String` |
@@ -3708,6 +3709,7 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__READY_PATH` → `health.ready_path` (String)
     /// - `AUTUMN_HEALTH__STARTUP_PATH` → `health.startup_path` (String)
     /// - `AUTUMN_HEALTH__DETAILED` → `health.detailed` (bool)
+    /// - `AUTUMN_HEALTH__ENABLED` → `health.enabled` (bool)
     ///
     /// # Jobs
     /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis`)
@@ -4298,6 +4300,7 @@ impl AutumnConfig {
             &mut self.health.startup_path,
         );
         parse_env_bool(env, "AUTUMN_HEALTH__DETAILED", &mut self.health.detailed);
+        parse_env_bool(env, "AUTUMN_HEALTH__ENABLED", &mut self.health.enabled);
     }
 
     fn apply_cors_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -6701,6 +6704,7 @@ impl TelemetryProtocol {
 /// use autumn_web::config::HealthConfig;
 ///
 /// let health = HealthConfig::default();
+/// assert!(health.enabled);
 /// assert_eq!(health.path, "/health");
 /// assert_eq!(health.live_path, "/live");
 /// assert_eq!(health.ready_path, "/ready");
@@ -6709,6 +6713,13 @@ impl TelemetryProtocol {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
+    /// When `true` (the default), the framework auto-mounts the built-in
+    /// probe endpoints (health/live/ready/startup). Set to `false` to
+    /// suppress all built-in probes so an app can own those paths entirely
+    /// (or expose none at all). Default: `true` (issue #1971).
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+
     /// Compatibility alias path for readiness. Default: `"/health"`.
     ///
     /// Common alternatives: `"/healthz"`, `"/_health"`.
@@ -7211,6 +7222,10 @@ const fn default_acme_renew_before_days() -> u32 {
     30
 }
 
+const fn default_health_enabled() -> bool {
+    true
+}
+
 fn default_health_path() -> String {
     "/health".to_owned()
 }
@@ -7303,6 +7318,7 @@ impl Default for TelemetryConfig {
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
+            enabled: default_health_enabled(),
             path: default_health_path(),
             live_path: default_live_path(),
             ready_path: default_ready_path(),
@@ -13187,6 +13203,24 @@ path = "/healthz"
         config.health.detailed = true;
         config.apply_env_overrides_with_env(&env);
         assert!(!config.health.detailed);
+    }
+
+    #[test]
+    fn health_enabled_defaults_true() {
+        // Issue #1971: the probe off-switch is opt-in — enabled by default so
+        // behavior is byte-identical to before the field existed.
+        assert!(HealthConfig::default().enabled);
+    }
+
+    #[test]
+    fn env_override_health_enabled_false() {
+        // Issue #1971: AUTUMN_HEALTH__ENABLED=false flips the built-in probe
+        // off-switch via env, mirroring the AUTUMN_HEALTH__DETAILED wiring.
+        let env = MockEnv::new().with("AUTUMN_HEALTH__ENABLED", "false");
+        let mut config = AutumnConfig::default();
+        assert!(config.health.enabled); // starts true (default)
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.health.enabled);
     }
 
     #[test]

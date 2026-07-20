@@ -394,6 +394,24 @@ fn is_verbatim(manifest: &Manifest, rel_path: &str) -> bool {
     manifest.starter.verbatim.iter().any(|p| p == rel_path)
 }
 
+/// Suffix stripped from a starter file's in-tree name when it is emitted into
+/// the scaffolded project.
+///
+/// A starter ships its project manifest as `Cargo.toml.tmpl` rather than a
+/// literal `Cargo.toml`: `cargo package` treats any subdirectory that contains
+/// a `Cargo.toml` as a nested crate and drops that whole subtree from the
+/// published tarball, which would leave `include_dir!` with no starter files to
+/// embed at `cargo publish` verify time. The `.tmpl` suffix keeps the file in
+/// the tarball; it is removed here so the generated project gets a real
+/// `Cargo.toml` (and any other `*.tmpl`-named starter file its intended name).
+const TEMPLATE_SUFFIX: &str = ".tmpl";
+
+/// Map a starter file's in-tree path to the path emitted into the project,
+/// stripping a single trailing [`TEMPLATE_SUFFIX`].
+fn emit_rel_path(rel_path: &str) -> &str {
+    rel_path.strip_suffix(TEMPLATE_SUFFIX).unwrap_or(rel_path)
+}
+
 /// Render and emit a loaded starter into `project_dir`.
 fn scaffold(
     contents: &StarterContents,
@@ -416,7 +434,7 @@ fn scaffold(
                 file.rel_path
             )));
         }
-        let target = project_dir.join(rel_path);
+        let target = project_dir.join(emit_rel_path(&file.rel_path));
         // Verbatim or non-UTF-8 files are copied byte-for-byte; substituting
         // them would corrupt binary assets.
         if is_verbatim(&contents.manifest, &file.rel_path) {
@@ -448,6 +466,39 @@ mod tests {
         let r = resolve("saas", None).unwrap();
         assert!(matches!(r, Resolved::Builtin(_)));
         assert!(!r.requires_confirmation());
+    }
+
+    #[test]
+    fn emit_rel_path_strips_single_tmpl_suffix() {
+        // The packaging-safe manifest name is emitted as a real Cargo.toml.
+        assert_eq!(emit_rel_path("Cargo.toml.tmpl"), "Cargo.toml");
+        assert_eq!(emit_rel_path("src/main.rs"), "src/main.rs");
+        // Only a single trailing suffix is stripped.
+        assert_eq!(emit_rel_path("weird.tmpl.tmpl"), "weird.tmpl");
+        assert_eq!(emit_rel_path("no-suffix"), "no-suffix");
+    }
+
+    #[test]
+    fn embedded_saas_emits_a_real_cargo_toml() {
+        // The starter ships Cargo.toml.tmpl (so cargo package keeps the subtree),
+        // but scaffolding must produce a real Cargo.toml — and the .tmpl name
+        // must never leak into the generated project.
+        let contents = load_from_embedded(&builtin::SAAS).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("app");
+        let crate_name = "app".to_owned();
+        let vars = TemplateVars {
+            project_name: "app",
+            crate_name: &crate_name,
+            autumn_version: env!("CARGO_PKG_VERSION"),
+            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+        };
+        scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
+        assert!(dest.join("Cargo.toml").is_file());
+        assert!(!dest.join("Cargo.toml.tmpl").exists());
+        let cargo = fs::read_to_string(dest.join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("name = \"app\""), "got: {cargo}");
+        assert!(!cargo.contains("{{"), "no tokens should remain: {cargo}");
     }
 
     #[test]
@@ -589,30 +640,32 @@ mod tests {
         let example_root =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/saas");
 
-        // Every rendered file matches the committed example.
+        // Every rendered file matches the committed example. Compare against the
+        // emitted name (the starter ships `Cargo.toml.tmpl`, emitted as
+        // `Cargo.toml`).
         for file in &contents.files {
-            if file.rel_path == "Cargo.toml" {
+            let emitted = emit_rel_path(&file.rel_path);
+            if emitted == "Cargo.toml" {
                 continue;
             }
-            let example_path = example_root.join(&file.rel_path);
-            let rendered = fs::read(dest.join(&file.rel_path)).unwrap();
+            let example_path = example_root.join(emitted);
+            let rendered = fs::read(dest.join(emitted)).unwrap();
             let committed = fs::read(&example_path).unwrap_or_else(|_| {
-                panic!(
-                    "examples/saas is missing {} — regenerate it from the starter",
-                    file.rel_path
-                )
+                panic!("examples/saas is missing {emitted} — regenerate it from the starter")
             });
             assert_eq!(
                 rendered, committed,
-                "drift between embedded saas starter and examples/saas at {}",
-                file.rel_path
+                "drift between embedded saas starter and examples/saas at {emitted}"
             );
         }
 
         // …and the example has no stray files the starter does not produce
         // (ignoring build artefacts and the generated CSS).
-        let mut starter_paths: std::collections::BTreeSet<String> =
-            contents.files.iter().map(|f| f.rel_path.clone()).collect();
+        let mut starter_paths: std::collections::BTreeSet<String> = contents
+            .files
+            .iter()
+            .map(|f| emit_rel_path(&f.rel_path).to_owned())
+            .collect();
         starter_paths.insert("Cargo.toml".to_owned());
         let mut stack = vec![example_root.clone()];
         while let Some(dir) = stack.pop() {

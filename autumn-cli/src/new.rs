@@ -312,10 +312,14 @@ fn generate_inner(
         // The `--api` Dockerfile carries i18n `COPY` anchors resolved by flag:
         // ship the `i18n/` sidecar into the image for `--with-i18n`, or strip
         // the anchors so a non-i18n build context (which has no `i18n/` dir)
-        // still builds. The fullstack `Dockerfile.tmpl` is used verbatim.
+        // still builds.
         inject_i18n_dockerfile_api(&render(templates::DOCKERFILE_API), opts.with_i18n)
     } else {
-        render(templates::DOCKERFILE)
+        // The fullstack `Dockerfile.tmpl` carries the same i18n `COPY` anchors:
+        // ship the `i18n/` sidecar into the image for `--with-i18n`, or strip
+        // the anchors so a non-i18n build context (which has no `i18n/` dir)
+        // still builds.
+        inject_i18n_dockerfile(&render(templates::DOCKERFILE), opts.with_i18n)
     };
     fs::write(project_dir.join("Dockerfile"), dockerfile)?;
     fs::write(
@@ -614,6 +618,46 @@ fn inject_i18n_dockerfile_api(dockerfile: &str, with_i18n: bool) -> String {
     } else {
         let no_builder = replace_anchor(dockerfile, DOCKERFILE_API_I18N_BUILDER_ANCHOR, "");
         replace_anchor(&no_builder, DOCKERFILE_API_I18N_RUNTIME_ANCHOR, "")
+    }
+}
+
+/// Anchor: the builder-stage i18n `COPY` insertion point in the fullstack
+/// `Dockerfile.tmpl` (an otherwise-inert comment line). Replaced with a
+/// `COPY i18n ./i18n` line for `--with-i18n`, or stripped entirely otherwise so
+/// a non-i18n project's build context has no missing `i18n/` dir.
+const DOCKERFILE_I18N_BUILDER_ANCHOR: &str = "# __AUTUMN_I18N_BUILDER_COPY__\n";
+/// Anchor: the runtime-stage i18n `COPY` insertion point in the fullstack
+/// `Dockerfile.tmpl`. Replaced with a `COPY --from=builder /app/i18n /app/i18n`
+/// line for `--with-i18n`, or stripped otherwise.
+const DOCKERFILE_I18N_RUNTIME_ANCHOR: &str = "# __AUTUMN_I18N_RUNTIME_COPY__\n";
+
+/// Resolve the two i18n `COPY` anchors in the rendered fullstack Dockerfile.
+///
+/// The default (fullstack) scaffold's `main.rs` calls `.i18n_auto()` when
+/// `--with-i18n`, which loads `i18n/en.ftl` from disk at startup and panics if
+/// it is missing. The image must therefore ship the `i18n/` sidecar into both
+/// the builder (so `cargo build` sees it for any embed) and the runtime stage
+/// (so the running binary can read it). The `COPY` lines are gated on
+/// `with_i18n`: an unconditional `COPY i18n ./i18n` would break `docker build`
+/// for non-i18n projects, whose build context has no `i18n/` directory. When
+/// `with_i18n` is false the anchors are stripped, leaving the Dockerfile
+/// byte-for-byte as it was before this wiring (no leftover anchor markers).
+/// Mirrors [`inject_i18n_dockerfile_api`] for the `--api` scaffold.
+fn inject_i18n_dockerfile(dockerfile: &str, with_i18n: bool) -> String {
+    if with_i18n {
+        let with_builder = replace_anchor(
+            dockerfile,
+            DOCKERFILE_I18N_BUILDER_ANCHOR,
+            "COPY i18n ./i18n\n",
+        );
+        replace_anchor(
+            &with_builder,
+            DOCKERFILE_I18N_RUNTIME_ANCHOR,
+            "COPY --from=builder /app/i18n /app/i18n\n",
+        )
+    } else {
+        let no_builder = replace_anchor(dockerfile, DOCKERFILE_I18N_BUILDER_ANCHOR, "");
+        replace_anchor(&no_builder, DOCKERFILE_I18N_RUNTIME_ANCHOR, "")
     }
 }
 
@@ -1926,6 +1970,61 @@ mod tests {
         assert!(
             main.contains(".i18n_auto()"),
             "main.rs should call .i18n_auto(): {main}"
+        );
+    }
+
+    #[test]
+    fn with_i18n_copies_i18n_into_fullstack_docker_image() {
+        // The fullstack (non-`--api`) scaffold's `main.rs` calls `.i18n_auto()`
+        // for `--with-i18n`, which loads `i18n/en.ftl` from disk at startup and
+        // panics if missing. The image must therefore ship the `i18n/` sidecar
+        // into both the builder and runtime stages (issue #1865, mirroring the
+        // `--api` fix in #1847).
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "i18n-docker-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let dockerfile = fs::read_to_string(tmp.path().join("i18n-docker-app/Dockerfile")).unwrap();
+        assert!(
+            dockerfile.contains("COPY i18n ./i18n"),
+            "--with-i18n fullstack Dockerfile must copy i18n/ into the builder stage:\n{dockerfile}"
+        );
+        assert!(
+            dockerfile.contains("COPY --from=builder /app/i18n /app/i18n"),
+            "--with-i18n fullstack Dockerfile must copy i18n/ into the runtime stage:\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("__AUTUMN_I18N"),
+            "--with-i18n fullstack Dockerfile must not leave anchor markers:\n{dockerfile}"
+        );
+    }
+
+    #[test]
+    fn without_i18n_fullstack_docker_image_has_no_i18n_copy() {
+        // A non-i18n fullstack Dockerfile must carry NO i18n `COPY` lines (an
+        // unconditional `COPY i18n ./i18n` would break `docker build`, whose
+        // context has no `i18n/` dir) and no leftover anchor markers.
+        let tmp = TempDir::new().unwrap();
+        generate("no-i18n-docker-app", tmp.path()).unwrap();
+        let dockerfile =
+            fs::read_to_string(tmp.path().join("no-i18n-docker-app/Dockerfile")).unwrap();
+        assert!(
+            !dockerfile.contains("COPY i18n ./i18n"),
+            "non-i18n fullstack Dockerfile must not copy i18n/ (build context has no i18n/ dir):\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("/app/i18n"),
+            "non-i18n fullstack Dockerfile must not reference /app/i18n:\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("__AUTUMN_I18N"),
+            "non-i18n fullstack Dockerfile must not leave anchor markers:\n{dockerfile}"
         );
     }
 

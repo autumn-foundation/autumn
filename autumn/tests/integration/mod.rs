@@ -202,6 +202,7 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+mod sim_test_smoke;
 #[cfg(feature = "ws")]
 mod sse_replay;
 mod static_serving;
