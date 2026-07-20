@@ -1507,7 +1507,7 @@ pub fn probe_deploy_state(
          env -u XDG_RUNTIME_DIR kamal-proxy list 2>/dev/null || true; \
          printf '\\n{unit_delim}\\n'; \
          if [ -f {unit} ]; then grep -hoE -e '--http-port[[:space:]]+[0-9]+' {unit} 2>/dev/null || true; \
-         else printf '{no_unit}'; fi",
+         else printf '%s' '{no_unit}'; fi",
         current = shell_quote(&cfg.current_symlink()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
@@ -2331,6 +2331,32 @@ mod tests {
             RELEASE_ID,
             &plan,
         )
+    }
+
+    #[test]
+    fn detect_current_prints_no_proxy_sentinel_literally() {
+        // The `detect-current` probe emits the "no proxy unit" sentinel, whose
+        // value begins with `--`. It MUST be printed as a literal string argument
+        // (`printf '%s' '<sentinel>'`), never as printf's format string
+        // (`printf '<sentinel>'`) — otherwise POSIX printf parses the leading `--`
+        // as an invalid option and exits non-zero, breaking deploy on any fresh
+        // target that has no kamal-proxy unit (the `else` branch always runs).
+        let cfg = resolved();
+        let exec = RecordingExecutor::new();
+        // Scripted-empty stdout; we only care about the emitted shell command.
+        let _ = probe_deploy_state(&cfg, &exec);
+        let shell = exec.shell_for("detect-current").expect("detect-current ran");
+        let safe = format!("printf '%s' '{NO_PROXY_UNIT_SENTINEL}'");
+        let unsafe_form = format!("printf '{NO_PROXY_UNIT_SENTINEL}'");
+        assert!(
+            shell.contains(&safe),
+            "the no-proxy sentinel must be printed via `printf '%s'`: {shell}"
+        );
+        assert!(
+            !shell.contains(&unsafe_form),
+            "the no-proxy sentinel must not be printed as a bare printf format \
+             string (its `--` prefix would be parsed as an invalid option): {shell}"
+        );
     }
 
     #[test]
