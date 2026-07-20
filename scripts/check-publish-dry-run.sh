@@ -33,11 +33,29 @@ die() {
 # Publishable crates in dependency order.
 CRATES=(
   autumn-macros
+  autumn-schema-core
   autumn-web
   autumn-cli
   autumn-admin-plugin
+  autumn-media-plugin
   autumn-storage-s3
   autumn-cache-redis
+)
+
+# Assets that MUST appear in a crate's packaged file list. `--list` does not
+# compile, so it cannot run the `include_dir!` / `include_str!` macros — a file
+# that cargo silently drops from the tarball (e.g. a starter subtree excluded
+# because it contains a nested `Cargo.toml`) would only surface as a proc-macro
+# panic at real `cargo publish` verify time. Asserting the embedded-asset paths
+# are present in the listing closes that gap without needing registry
+# dependency resolution. Format: "crate:substring".
+REQUIRED_ASSETS=(
+  # include_dir!("$CARGO_MANIFEST_DIR/src/starters/saas") in starters/builtin.rs
+  "autumn-cli:src/starters/saas/Cargo.toml.tmpl"
+  "autumn-cli:src/starters/saas/src/main.rs"
+  # include_dir!("$CARGO_MANIFEST_DIR/static") / i18n in lib.rs macros
+  "autumn-web:static/"
+  "autumn-web:i18n/"
 )
 
 failures=0
@@ -47,9 +65,25 @@ for crate in "${CRATES[@]}"; do
   echo "==> cargo package --list -p $crate"
   # --list enumerates the files that would be in the archive.
   # --allow-dirty lets this run on a working tree with uncommitted changes.
-  if cargo package -p "$crate" --list --allow-dirty 2>&1; then
+  if listing="$(cargo package -p "$crate" --list --allow-dirty 2>&1)"; then
+    echo "$listing"
     echo "  PASS: $crate manifest and files are valid"
+    # Assert this crate's embedded assets survived packaging.
+    for spec in "${REQUIRED_ASSETS[@]}"; do
+      asset_crate="${spec%%:*}"
+      asset_path="${spec#*:}"
+      [[ "$asset_crate" == "$crate" ]] || continue
+      if ! grep -qF "$asset_path" <<<"$listing"; then
+        echo "  FAIL: $crate is missing embedded asset '$asset_path' from its package" >&2
+        echo "        (an include_dir!/include_str! target was dropped from the tarball —" >&2
+        echo "         a nested Cargo.toml or include/exclude rule likely excluded it)" >&2
+        failures=$((failures + 1))
+      else
+        echo "  OK: embedded asset present — $asset_path"
+      fi
+    done
   else
+    echo "$listing"
     echo "  FAIL: $crate could not be listed for packaging" >&2
     failures=$((failures + 1))
   fi
