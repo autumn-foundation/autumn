@@ -19,6 +19,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COPY --from=builder /app/i18n /app/i18n` lines are injected for
   `--with-i18n` and the anchors stripped otherwise (a non-i18n build context
   has no `i18n/` dir), leaving no stray anchor markers.
+### Added
+
+- **router:** new `health.enabled` config knob (default `true`,
+  `AUTUMN_HEALTH__ENABLED`) — an opt-out that suppresses all built-in probe
+  endpoints (`/health`, `/live`, `/ready`, `/startup`) so an app can own those
+  paths entirely (or expose none). Enabled by default, so behavior is
+  byte-identical to before when unset. Completes the probe-conflict work begun
+  in #1977 (which already lets a hand-written user route at a probe path win),
+  with explicit regression tests for both the user-route-wins and
+  probes-disabled cases (#1971).
+### Fixed
+
+- **deploy:** the one-time kamal-proxy reboot-durability upgrade (#2070/#2071) no
+  longer stamps a new/removed `deploy.tls.host` onto the still-live OLD release
+  during its pre-flip forced re-register (#2074). Because kamal-proxy exposes no
+  `ServiceOptions` read-back, autumn now records the TLS/host options each forward
+  deploy registered in a host-side `shared/proxy-options` marker (`{tls}\t{host}`,
+  written atomically alongside the live-slot marker on both first deploy and
+  cutover) and reads it back at deploy-start. On a redeploy the durability
+  re-register of the still-live old release preserves ITS recorded options (the
+  candidate flip still adopts the new config), so a later-op failure + rollback
+  leaves the old release on its own host/TLS instead of behind the changed one.
+  An absent marker (a legacy host's first redeploy) proceeds as before and
+  self-heals by writing the marker; an unreadable marker fails closed at
+  pre-flight (mirroring the #2073 port-change refuse) with two-deploy repair
+  guidance. Part of #1607.
+### Added
+
+- **sim-testing:** `#[sim_test]` macro and public `Sim` skeleton for
+  deterministic simulation tests (seed-driven, replay-on-panic) (#1797). [no-plugin]
 
 ## [0.6.0] - 2026-07-18
 

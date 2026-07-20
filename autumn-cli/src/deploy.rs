@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use autumn_web::config::{AutumnConfig, DeployConfig, Env};
+use proxy::ProxyController;
 
 /// Bounded timeout for the SSH-reachability preflight probe. Kept short so the
 /// check fails fast on an unreachable host instead of hanging on a dropped SYN.
@@ -1767,6 +1768,41 @@ fn refuse_concurrent_public_port_change(
     }
 }
 
+/// Pre-flight refuse for an UNPROVABLE `shared/proxy-options` marker on the redeploy
+/// path (issue #2074), mirroring [`refuse_concurrent_public_port_change`]'s
+/// `Unreadable` fail-closed arm.
+///
+/// The durability-refresh re-register (#2070/#2071) re-registers the still-live OLD
+/// release; #2074 preserves that release's own TLS/host by reading them back from the
+/// `shared/proxy-options` marker. When the marker is:
+///
+///   - [`exec::ProxyOptionsMarker::Options`] → the old options are known → preserve
+///     them (no refuse);
+///   - [`exec::ProxyOptionsMarker::Absent`] → a legacy host (or first deploy) that
+///     never wrote the marker → **allowed**: proceed as legacy (re-register with the
+///     new config and write the marker this deploy — see the redeploy arm). Refusing
+///     here would block the FIRST redeploy of every pre-existing host, the deadlock
+///     #2074 explicitly rejects;
+///   - [`exec::ProxyOptionsMarker::Unreadable`] → the marker is present but its
+///     `{tls}\t{host}` value couldn't be parsed, so the old options can't be proved →
+///     **fail closed** (refuse): a concurrent `deploy.tls.host` change can't be safely
+///     preserved across the one-time restart, and stamping the wrong host onto the
+///     live release on a rollback is worse than refusing.
+fn refuse_unprovable_proxy_options(marker: &exec::ProxyOptionsMarker) -> Result<(), String> {
+    match marker {
+        exec::ProxyOptionsMarker::Absent | exec::ProxyOptionsMarker::Options(_) => Ok(()),
+        exec::ProxyOptionsMarker::Unreadable => Err(
+            "Cannot verify the last-deployed proxy TLS/host options before a redeploy \
+             (the shared/proxy-options marker is present but unreadable), so a concurrent \
+             deploy.tls.host change cannot be preserved across the one-time reboot-durability \
+             restart and is refused to avoid stranding the live release behind the wrong \
+             TLS/host on a rollback. Redeploy with deploy.tls unchanged to repair the marker, \
+             then change the host in a separate deploy. Tracked in #2074."
+                .to_owned(),
+        ),
+    }
+}
+
 // Linear deploy orchestrator; the added MediaMTX host-prep step (#1974 Slice 7)
 // tips it one line over the threshold, and it reads clearest as one sequence.
 #[allow(clippy::too_many_lines)]
@@ -1870,6 +1906,24 @@ fn run_up(
             // unit → first-deploy shape (allowed); an unreadable unit → fail closed.
             refuse_concurrent_public_port_change(&probe.installed_proxy_port, public_port)
                 .map_err(DeployError::Config)?;
+            // Pre-flight refuse (#2074): if the `shared/proxy-options` marker is present
+            // but unreadable, we cannot prove the OLD release's TLS/host, so a concurrent
+            // `deploy.tls.host` change can't be safely preserved across the durability
+            // restart — fail closed BEFORE any op runs, so the live release keeps serving.
+            refuse_unprovable_proxy_options(&probe.last_proxy_options)
+                .map_err(DeployError::Config)?;
+            // Choose the options the durability-refresh re-register carries for the
+            // still-live OLD release (#2074). PRESERVE the marker's recorded options
+            // when known; on an ABSENT marker fall back to the NEW config (proceed as
+            // legacy — the durability-upgrade deploy's kamal-proxy table is empty, so
+            // there is nothing to preserve, and refusing would deadlock every
+            // pre-#2074 host's first redeploy). The marker is (re)written by
+            // `cutover_ops` this deploy, so the next redeploy is fully protected. The
+            // Unreadable case is already refused above, so it never reaches here.
+            let reregister_options = match &probe.last_proxy_options {
+                exec::ProxyOptionsMarker::Options(old) => old.clone(),
+                _ => proxy.proxy_service_options(),
+            };
             // Reconcile the (possibly stale) live-slot marker against the live
             // proxy before choosing the candidate slot. On an UNAMBIGUOUS
             // proxy-vs-marker disagreement the proxy is authoritative (so the
@@ -1904,6 +1958,7 @@ fn run_up(
                 &manifests,
                 &release_id,
                 &plan,
+                &reregister_options,
             );
             // Repair the drifted marker as an early op — before the cutover's
             // record-previous-release reads it — so the on-disk marker matches the
@@ -2123,6 +2178,62 @@ mod tests {
         assert!(
             refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Absent, 8080).is_ok(),
             "an absent installed proxy unit must not trigger the refuse",
+        );
+    }
+
+    // --- proxy-options marker refuse / preserve decision (issue #2074) --------
+
+    #[test]
+    fn redeploy_fails_closed_on_an_unreadable_proxy_options_marker() {
+        // The `shared/proxy-options` marker is present but unparseable, so the OLD
+        // release's TLS/host can't be proved — a concurrent `deploy.tls.host` change
+        // can't be safely preserved across the durability restart. Refuse (fail closed)
+        // BEFORE any op runs, with the two-deploy repair guidance and the #2074 ref.
+        let err = refuse_unprovable_proxy_options(&exec::ProxyOptionsMarker::Unreadable)
+            .expect_err("an unreadable proxy-options marker must fail closed");
+        assert!(
+            err.contains("proxy-options") && err.contains("unreadable"),
+            "the fail-closed message must name the unreadable proxy-options marker: {err}",
+        );
+        assert!(
+            err.contains("deploy.tls unchanged") && err.contains("#2074"),
+            "the message must spell out the two-deploy repair and reference #2074: {err}",
+        );
+    }
+
+    #[test]
+    fn redeploy_allows_an_absent_proxy_options_marker() {
+        // A legacy host (or first deploy) never wrote the marker. Refusing would block
+        // the FIRST redeploy of every pre-existing host — the deadlock #2074 rejects —
+        // so an absent marker is ALLOWED (proceed as legacy: the deploy re-registers
+        // with the new config and writes the marker, self-healing the next redeploy).
+        assert!(
+            refuse_unprovable_proxy_options(&exec::ProxyOptionsMarker::Absent).is_ok(),
+            "an absent proxy-options marker must not trigger the refuse",
+        );
+    }
+
+    #[test]
+    fn redeploy_allows_a_readable_proxy_options_marker() {
+        // A present, parseable marker is exactly the preserve path — it never refuses,
+        // whether the recorded options match the new config or not (the re-register
+        // simply carries the recorded options).
+        let unchanged = exec::ProxyOptionsMarker::Options(exec::ProxyServiceOptions {
+            tls: true,
+            host: Some("app.example.com".to_owned()),
+        });
+        assert!(
+            refuse_unprovable_proxy_options(&unchanged).is_ok(),
+            "an unchanged readable marker must be allowed (preserve is a no-op)",
+        );
+        let changed = exec::ProxyOptionsMarker::Options(exec::ProxyServiceOptions {
+            tls: false,
+            host: None,
+        });
+        assert!(
+            refuse_unprovable_proxy_options(&changed).is_ok(),
+            "a readable marker whose options differ from the new config is still allowed \
+             (the old options are preserved, not refused)",
         );
     }
 
