@@ -601,6 +601,20 @@ path = "tests/sqlite_read_only_tx.rs"
 name = "sqlite_transactional_url_pool"
 path = "tests/sqlite_transactional_url_pool.rs"
 
+# Sim-testing W4 SQLite DB lane (issue #1797): proves the job/scheduler drain
+# runs end-to-end against a fresh, migrated, in-process in-memory SQLite substrate
+# (`sim::substrate::SqliteSubstrate`) over the representative local scheduler
+# (`InProcessSchedulerCoordinator`) + local job runtime paths. Standalone because
+# the consolidated `integration_tests` binary is Postgres-typed and does not
+# compile under `--features sqlite`; needs `test-support` for the public
+# `TestApp` harness, so the file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]` and a default
+# `cargo test` compiles it to an empty (passing) binary. Runs without Docker. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_sqlite_substrate`.
+[[test]]
+name = "sim_sqlite_substrate"
+path = "tests/sim_sqlite_substrate.rs"
+
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
 # consolidated binary — those vars would race the inline network tests.

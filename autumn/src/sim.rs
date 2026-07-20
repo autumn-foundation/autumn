@@ -55,6 +55,20 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::time::TickingClock;
 
+// The per-sim SQLite DB lane (W4, issue #1797): a fresh, migrated, in-process
+// SQLite substrate the sim builds its app on. Self-contained and additive — W2
+// consumes its pool when it mounts the app on `SimApp`. Only meaningful under the
+// `sqlite` feature (the sim's DB substrate is SQLite by design).
+//
+// Exposed as `#[doc(hidden)] pub` — unstable test/sim plumbing, not the stable
+// surface — mirroring this module's `__seed_from_env` / `__replay_line` hidden
+// hooks. It is `pub` (not `pub(crate)`) purely so the W4 DoD consolidated
+// integration test, which is an external crate, can drive the end-to-end drain;
+// the stable mount API remains W2's `Sim::build`.
+#[cfg(feature = "sqlite")]
+#[doc(hidden)]
+pub mod substrate;
+
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.
 ///
