@@ -240,7 +240,7 @@ typed values on the request hot path — must ship with either:
 Reviewers should treat a new request-path parser with neither as incomplete.
 
 [cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
-[issue-1611]: https://github.com/madmax983/autumn/issues/1611
+[issue-1611]: https://github.com/autumn-foundation/autumn/issues/1611
 
 ## Supply chain (cargo-deny)
 

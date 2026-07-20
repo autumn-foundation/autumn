@@ -236,7 +236,7 @@ async fn add_todo_flow() {
 }
 ```
 
-Transaction-based rollback (from [#807](https://github.com/madmax983/autumn/issues/807))
+Transaction-based rollback (from [#807](https://github.com/autumn-foundation/autumn/issues/807))
 is not yet available for system tests because the browser drives a real HTTP
 server on a separate TCP connection; per-test transaction wrapping would
 require a proxy layer not yet shipped.

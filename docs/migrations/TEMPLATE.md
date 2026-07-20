@@ -148,7 +148,7 @@ Known rough edges, workarounds, and known-good version combinations
 ## Reporting problems
 
 If you hit something not covered here, please open an issue at
-<https://github.com/madmax983/autumn/issues> with:
+<https://github.com/autumn-foundation/autumn/issues> with:
 
 - The error message or unexpected behavior.
 - The old version you upgraded from.

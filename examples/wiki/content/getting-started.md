@@ -20,7 +20,7 @@ documentation pages.
 Clone the repository and navigate to the wiki example:
 
 ```bash
-git clone https://github.com/madmax983/autumn
+git clone https://github.com/autumn-foundation/autumn
 cd autumn
 ```
 
