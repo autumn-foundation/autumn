@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **test-support:** `autumn_web::test::drain_ready_repository_commit_hooks(pool, max_rows)`
+  deterministically claims and runs ready durable repository commit hooks in
+  integration tests — driving the real worker→drain wiring without starting the
+  timing-based background commit-hook worker — and returns the number processed.
 - **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
   shared, **multi-process-safe** database-backed implementation. The `RoomStore`
   trait, `RoomService`, and the four room HTTP handlers are now `async` (via

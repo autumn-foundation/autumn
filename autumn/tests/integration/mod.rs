@@ -38,6 +38,7 @@ mod chaos_session_loom;
 mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
+mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
 mod config_deprecation;
