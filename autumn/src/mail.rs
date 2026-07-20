@@ -4179,7 +4179,6 @@ pub mod db_suppression {
     use std::pin::Pin;
 
     use diesel::prelude::*;
-    use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -4207,13 +4206,13 @@ pub mod db_suppression {
     /// `autumn generate mailer --list-unsubscribe` writes into the app.
     #[derive(Clone)]
     pub struct DbSuppressionStore {
-        pool: Pool<AsyncPgConnection>,
+        pool: Pool<crate::db::RuntimeConnection>,
     }
 
     impl DbSuppressionStore {
         /// Create a store backed by `pool`.
         #[must_use]
-        pub const fn new(pool: Pool<AsyncPgConnection>) -> Self {
+        pub const fn new(pool: Pool<crate::db::RuntimeConnection>) -> Self {
             Self { pool }
         }
     }

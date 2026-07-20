@@ -73,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COPY --from=builder /app/i18n /app/i18n` lines are injected for
   `--with-i18n` and the anchors stripped otherwise (a non-i18n build context
   has no `i18n/` dir), leaving no stray anchor markers.
+- **mail:** make `DbSuppressionStore` backend-agnostic
+  (`Pool<RuntimeConnection>`) so the `sqlite` + `mail` feature union compiles,
+  unblocking the Coverage CI job (#1614).
 ### Added
 
 - **router:** new `health.enabled` config knob (default `true`,
