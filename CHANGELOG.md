@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **cli:** `autumn new <name> --with-i18n` (default fullstack flavor, without
+  `--api`) now ships the `i18n/` sidecar into its generated Dockerfile, so the
+  runtime image no longer panics at boot when `.i18n_auto()` loads
+  `i18n/en.ftl` from disk (#1865). The fullstack `Dockerfile.tmpl` gained the
+  same builder- and runtime-stage i18n `COPY` anchors the `--api` template
+  already carried, resolved by a new `inject_i18n_dockerfile` helper that
+  mirrors the `--api` fix (#1847): the `COPY i18n ./i18n` /
+  `COPY --from=builder /app/i18n /app/i18n` lines are injected for
+  `--with-i18n` and the anchors stripped otherwise (a non-i18n build context
+  has no `i18n/` dir), leaving no stray anchor markers.
+
 ## [0.6.0] - 2026-07-18
 
 ### Added
