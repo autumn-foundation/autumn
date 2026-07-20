@@ -115,6 +115,7 @@ mod tests {
         NullablePost,
         table = "nullable_posts",
         broadcasts = true,
+        commit_hooks = true,
         topic = "category_posts:{category}",
         container = "category-posts-list"
     )]
