@@ -45,6 +45,7 @@ mod routes_macro;
 mod scheduled;
 mod secured;
 mod service;
+mod sim_test;
 mod static_route;
 mod static_routes_macro;
 mod step_up;
@@ -242,6 +243,33 @@ pub fn paths(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     main_macro::main_macro(item.into()).into()
+}
+
+/// Annotate an async function as a deterministic simulation test (S-1797, W1).
+///
+/// Expands into a synchronous `#[test]` function that reads a seed from the
+/// `AUTUMN_SIM_SEED` environment variable (hex `0x..` or decimal, default `0`),
+/// builds a paused current-thread tokio runtime, constructs a
+/// `autumn_web::sim::Sim` from the seed, runs the async body, and prints a
+/// copy-pasteable replay line on panic before re-propagating the failure.
+///
+/// The annotated function must be `async` and take exactly one argument — the
+/// [`Sim`](../autumn_web/sim/struct.Sim.html) handle.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::sim::Sim;
+/// use autumn_web::sim_test;
+///
+/// #[sim_test]
+/// async fn deterministic(mut sim: Sim) {
+///     assert_eq!(sim.seed, 0);
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn sim_test(attr: TokenStream, item: TokenStream) -> TokenStream {
+    sim_test::sim_test_macro(attr.into(), item.into()).into()
 }
 
 /// Annotate an async inbound mail handler function.

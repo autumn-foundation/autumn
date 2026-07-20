@@ -776,6 +776,16 @@ pub use autumn_macros::mailer_preview;
 /// }
 /// ```
 pub use autumn_macros::main;
+/// Annotate an async function as a deterministic simulation test (S-1797).
+///
+/// Expands into a synchronous `#[test]` that reads a seed from
+/// `AUTUMN_SIM_SEED` (hex `0x..` or decimal, default `0`), builds a paused
+/// current-thread runtime, constructs a [`sim::Sim`] from the seed, runs the
+/// body, and prints a copy-pasteable replay line on panic. The function must be
+/// `async` and take exactly one argument — the [`sim::Sim`] handle.
+///
+/// See the [`sim`] module for the full quick-start.
+pub use autumn_macros::sim_test;
 /// Author a widget story for the `/_stories` gallery:
 /// `story!{ "Group", "Name", { ... } }`.
 ///
@@ -1570,6 +1580,7 @@ pub mod reexports {
     pub use validator;
 }
 
+pub mod sim;
 /// Shared application state passed to route handlers.
 pub(crate) mod state;
 #[cfg(feature = "system-tests")]
