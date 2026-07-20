@@ -1377,7 +1377,7 @@ fn spawn_repository_commit_hook_kick_worker(
 }
 
 #[cfg(not(feature = "sqlite"))]
-async fn drain_ready_repository_commit_hooks(pool: &PgPool, worker_id: &str, max_rows: usize) {
+pub async fn drain_ready_repository_commit_hooks(pool: &PgPool, worker_id: &str, max_rows: usize) {
     for _ in 0..max_rows {
         let Some(row) = pg_claim_next_repository_commit_hook(pool, worker_id).await else {
             break;
@@ -1909,7 +1909,7 @@ async fn sqlite_claim_next_repository_commit_hook(
 /// scope) → ack/nack, one row at a time. Mirrors the Postgres
 /// `drain_ready_repository_commit_hooks` shape.
 #[cfg(feature = "sqlite")]
-async fn sqlite_drain_ready_repository_commit_hooks(
+pub async fn sqlite_drain_ready_repository_commit_hooks(
     pool: &RtPool,
     worker_id: &str,
     max_rows: usize,
@@ -2131,7 +2131,7 @@ fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     )
 }
 
-fn repository_commit_hook_worker_id() -> String {
+pub fn repository_commit_hook_worker_id() -> String {
     format!("repository-hook-{}", uuid::Uuid::new_v4())
 }
 

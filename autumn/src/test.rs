@@ -3997,6 +3997,98 @@ impl TestDb {
     }
 }
 
+/// Deterministically claims and runs up to `max_rows` ready durable repository
+/// commit hooks, returning the number of ready hooks selected for this drain
+/// pass.
+///
+/// Intended for integration tests that need to drive the real worker→drain
+/// wiring (claim → run the registered runner → ack/nack) **without** the
+/// timing-based background commit-hook worker that a served app starts. It
+/// generates its own worker id and delegates to the same backend-appropriate
+/// drain the production worker uses, so a test can enqueue a durable hook,
+/// assert its side effect has not happened, drain once, and assert the side
+/// effect deterministically — no `sleep`, no polling.
+///
+/// Pass a `max_rows` >= the number of enqueued hooks to fully drain in one
+/// call. Hooks whose `run_at` is still in the future, or whose handler runner
+/// is not registered in this process, are left untouched.
+///
+/// The returned count is the size of the ready set measured *before* the pass
+/// (`status = 'enqueued'` and due), capped at `max_rows`
+/// (`min(ready_hooks, max_rows)`). Because it is measured up front — the
+/// underlying private drains return `()` and expose no per-hook success tally —
+/// it reflects the rows *selected* for draining, not a success count. In the
+/// intended single-threaded / private-pool test (no competing worker) every
+/// selected hook runs, so this equals the number processed; a hook that fails
+/// and is re-queued with a future backoff during the pass is still counted here.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::test::TestDb;
+///
+/// let db = TestDb::shared().await;
+/// // ... enqueue a durable repository commit hook and register its runner ...
+///
+/// let processed = autumn_web::test::drain_ready_repository_commit_hooks(&db.pool(), 16).await;
+/// assert_eq!(processed, 1);
+/// // ... assert the hook's side effect now exists ...
+/// ```
+///
+/// # Panics
+///
+/// Panics if a pooled database connection cannot be acquired or the ready-hook
+/// count query fails — this helper is for tests, where surfacing such a
+/// database failure loudly is the desired behavior.
+#[cfg(feature = "db")]
+pub async fn drain_ready_repository_commit_hooks(
+    pool: &Pool<crate::db::RuntimeConnection>,
+    max_rows: usize,
+) -> usize {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct ReadyCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        ready: i64,
+    }
+
+    // The private drains return `()`, so measure the ready set up-front and
+    // report how many this pass will claim-and-run. In a single-threaded test
+    // (no competing worker) this equals the number processed, capped at
+    // `max_rows`. Predicate mirrors the claim query's readiness gate
+    // (`status = 'enqueued' AND run_at <= now`); `CURRENT_TIMESTAMP` is standard
+    // SQL on both the Postgres and SQLite backends.
+    let ready_before: usize = {
+        let mut conn = pool
+            .get()
+            .await
+            .expect("drain_ready_repository_commit_hooks: acquire pooled connection");
+        let row = diesel::sql_query(
+            "SELECT COUNT(*) AS ready \
+             FROM autumn_repository_commit_hooks \
+             WHERE status = 'enqueued' AND run_at <= CURRENT_TIMESTAMP",
+        )
+        .get_result::<ReadyCount>(&mut *conn)
+        .await
+        .expect("drain_ready_repository_commit_hooks: count ready hooks");
+        usize::try_from(row.ready).unwrap_or(0)
+    };
+
+    let worker_id = crate::repository_commit_hooks::repository_commit_hook_worker_id();
+
+    #[cfg(not(feature = "sqlite"))]
+    crate::repository_commit_hooks::drain_ready_repository_commit_hooks(pool, &worker_id, max_rows)
+        .await;
+    #[cfg(feature = "sqlite")]
+    crate::repository_commit_hooks::sqlite_drain_ready_repository_commit_hooks(
+        pool, &worker_id, max_rows,
+    )
+    .await;
+
+    ready_before.min(max_rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
