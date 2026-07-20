@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **sim-testing:** `#[sim_test]` macro and public `Sim` skeleton for
-  deterministic simulation tests (seed-driven, replay-on-panic) (#1797).
+  deterministic simulation tests (seed-driven, replay-on-panic) (#1797). [no-plugin]
 
 ## [0.6.0] - 2026-07-18
 
