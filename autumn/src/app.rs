@@ -7960,18 +7960,19 @@ async fn run_startup_migrations(
                 );
             }
             // The shard-map guard table also lives on the control plane only.
-            // Always allow auto-applying this framework-internal table: the guard
-            // depends on it existing and returns a hard error when it's missing,
-            // so skipping the migration in production would block startup.
+            // It follows the same resolved profile-agnostic auto-migrate decision
+            // as the app migrations above (issue #1903): dev-profile default-on,
+            // prod/custom opt-in via `auto_migrate` / `auto_migrate_in_production`,
+            // with the advisory-locked apply path preserved. Under a report-only
+            // decision the missing table is reported rather than force-applied, so
+            // a DB-free/offline startup path never fails fatally on an unreachable
+            // control target.
             if shard_map_migration_required {
-                // Force-apply this framework-internal table regardless of profile
-                // or config: an explicit `Some(true)` override (issue #1903)
-                // preserves the pre-existing "always allow" behavior.
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
-                    Some(true),
-                    true,
+                    auto_migrate,
+                    auto_in_prod,
                     &crate::sharding::SHARD_MAP_MIGRATIONS,
                     "control",
                 );

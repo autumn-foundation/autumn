@@ -21,7 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   honored on any non-`dev` profile (so an existing custom-profile config finally
   takes effect). All applies still route through the advisory-locked runner, and
   an opt-in profile that is left in report-only mode now logs the profile and the
-  key to set.
+  key to set. The framework shard-map (`control` queue) migration now follows the
+  same `database.auto_migrate` decision as app migrations rather than
+  force-applying, so it stays consistent with the profile-agnostic convention (and
+  no longer fails fatally on an unreachable control target under a report-only
+  decision).
 
 ## [0.6.0] - 2026-07-18
 
