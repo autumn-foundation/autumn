@@ -2345,7 +2345,9 @@ mod tests {
         let exec = RecordingExecutor::new();
         // Scripted-empty stdout; we only care about the emitted shell command.
         let _ = probe_deploy_state(&cfg, &exec);
-        let shell = exec.shell_for("detect-current").expect("detect-current ran");
+        let shell = exec
+            .shell_for("detect-current")
+            .expect("detect-current ran");
         let safe = format!("printf '%s' '{NO_PROXY_UNIT_SENTINEL}'");
         let unsafe_form = format!("printf '{NO_PROXY_UNIT_SENTINEL}'");
         assert!(
