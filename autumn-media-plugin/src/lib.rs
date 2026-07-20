@@ -42,6 +42,7 @@ pub mod encode;
 pub mod error;
 pub mod retention;
 pub mod rooms;
+pub mod rooms_db;
 pub mod sink;
 pub mod storage;
 pub mod transport;
@@ -49,7 +50,7 @@ pub mod workflows;
 
 pub use config::{
     MediaConfig, MediaConfigError, MediaMtxConfig, MediaStorageBackend, MediaStorageConfig,
-    RecordingConfig,
+    RecordingConfig, RoomStoreBackend,
 };
 pub use encode::{
     FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand, FfmpegPosterCommand,
@@ -66,10 +67,11 @@ pub use retention::{
 };
 pub use rooms::{
     InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse, LeaveRequest, ParticipantView,
-    PublishTarget, ReapStats, RoomError, RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore,
-    SessionToken, SubscribeTarget, room_participant_path, room_route_infos, room_router,
-    spawn_room_reaper_loop, validate_room_segment,
+    PublishTarget, ReapFuture, ReapStats, RoomError, RoomLeaveResponse, RoomService, RoomSnapshot,
+    RoomStore, RoomStoreFuture, SessionToken, SubscribeTarget, room_participant_path,
+    room_route_infos, room_router, spawn_room_reaper_loop, validate_room_segment,
 };
+pub use rooms_db::DbRoomStore;
 pub use sink::{
     MediaArtifact, MediaArtifactFile, MediaArtifactKind, MediaArtifactSink, MediaArtifactSinkExt,
     MediaSinkFuture,
@@ -449,6 +451,7 @@ impl Plugin for MediaPlugin {
             broadcast = %enable_broadcast,
             rooms = %enable_rooms,
             room_max_participants,
+            room_store_backend = config.room_store_backend.as_str(),
             storage_backend = config.storage.backend.as_str(),
             queue = %queue,
             api_prefix = %api_prefix,
@@ -465,27 +468,57 @@ impl Plugin for MediaPlugin {
         // served and audit-visible under `api_prefix`.
         let mut app = app;
         if enable_rooms {
-            // Hold a handle to the store so the idle-room / stale-participant
-            // reaper can sweep the same registry the `RoomService` serves.
-            let room_store: Arc<dyn rooms::RoomStore> =
-                Arc::new(rooms::InMemoryRoomStore::new(room_max_participants));
-            let room_service = rooms::RoomService::new(
-                room_store.clone(),
-                transport::MediaUrls::from_config(&config.mediamtx),
-                config.room_namespace.clone().unwrap_or_default(),
-                chrono::Duration::seconds(i64::from(config.room_token_ttl_seconds)),
-                room_max_participants,
-            );
+            // Select the room-state backend (config, default `memory`).
+            //
+            // The `memory` store is per-process, so the `RoomService` and the
+            // reaper MUST share ONE instance — built once here and cloned into
+            // both hooks. The `db` store is stateless w.r.t. process memory (all
+            // room state lives in the shared database), so per-hook instances
+            // over the same pool are equivalent; it is built lazily from
+            // `state.pool()` inside each hook via `build_room_store`, which
+            // degrades to a warned in-memory store if `db` was selected without
+            // a configured database.
+            let backend = config.room_store_backend;
+            let shared_memory_store: Option<Arc<dyn rooms::RoomStore>> = match backend {
+                config::RoomStoreBackend::Memory => Some(Arc::new(rooms::InMemoryRoomStore::new(
+                    room_max_participants,
+                ))),
+                config::RoomStoreBackend::Db => None,
+            };
+
+            // URL/namespace/TTL for the `RoomService`, cloned into the
+            // initializer so the service can be built there (the `db` store
+            // needs `&AppState`).
+            let room_urls = transport::MediaUrls::from_config(&config.mediamtx);
+            let room_namespace = config.room_namespace.clone().unwrap_or_default();
+            let room_token_ttl =
+                chrono::Duration::seconds(i64::from(config.room_token_ttl_seconds));
+
+            let init_store = shared_memory_store.clone();
             app = app
                 .nest(&api_prefix, rooms::room_router())
                 .declare_plugin_routes(rooms::room_route_infos(&api_prefix))
                 .state_initializer(move |state| {
+                    let store = init_store
+                        .clone()
+                        .unwrap_or_else(|| build_room_store(state, room_max_participants));
+                    let room_service = rooms::RoomService::new(
+                        store,
+                        room_urls.clone(),
+                        room_namespace.clone(),
+                        room_token_ttl,
+                        room_max_participants,
+                    );
                     state.insert_extension(room_service);
                 })
                 // Spawn from `on_startup` so the reaper shares the running app's
-                // tokio runtime (matching the retention sweep below).
-                .on_startup(move |_state| {
-                    let store = room_store.clone();
+                // tokio runtime (matching the retention sweep below). For the
+                // `db` backend it builds its own store instance over the same
+                // pool the service uses — sweeping the same shared rows.
+                .on_startup(move |state| {
+                    let store = shared_memory_store
+                        .clone()
+                        .unwrap_or_else(|| build_room_store(&state, room_max_participants));
                     async move {
                         rooms::spawn_room_reaper_loop(store);
                         Ok(())
@@ -620,6 +653,28 @@ fn room_config_boot_error(
     }
     room_max_participants_error(room_max_participants)
         .or_else(|| room_namespace_error(room_namespace))
+}
+
+/// Build a shared, database-backed [`rooms_db::DbRoomStore`] from the running
+/// app's connection pool for the `db` room-store backend.
+///
+/// Only called on the `db` code path (the `memory` backend shares one pre-built
+/// [`rooms::InMemoryRoomStore`] across the service and reaper). If `db` was
+/// selected but no database pool is configured, it logs an actionable error and
+/// **degrades to a per-process in-memory store** so the app still boots and
+/// rooms still work — they just will not survive across processes until a
+/// database is configured.
+fn build_room_store(state: &autumn_web::AppState, cap: usize) -> Arc<dyn rooms::RoomStore> {
+    if let Some(pool) = state.pool().cloned() {
+        Arc::new(rooms_db::DbRoomStore::new(pool, cap))
+    } else {
+        tracing::error!(
+            "🍂 Autumn Media: room_store_backend=\"db\" but no database pool is configured; \
+             falling back to the in-memory room store — rooms will NOT survive across \
+             processes. Configure a `[database]` primary_url to enable the shared store."
+        );
+        Arc::new(rooms::InMemoryRoomStore::new(cap))
+    }
 }
 
 /// Recordings root an Arroyo deployment uses when `ARROYO_RECORDINGS_ROOT` is

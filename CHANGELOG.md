@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
+  shared, **multi-process-safe** database-backed implementation. The `RoomStore`
+  trait, `RoomService`, and the four room HTTP handlers are now `async` (via
+  hand-rolled boxed futures — `RoomStoreFuture` / `ReapFuture` — mirroring the
+  crate's existing `MediaSinkFuture` seam, no `async_trait` dependency), so a
+  networked/durable backing store can `.await` real I/O. A new
+  `rooms_db::DbRoomStore` persists rooms and participants in two tables
+  (`media_rooms`, `media_room_participants`), so rooms survive restarts and every
+  process/instance sharing the database sees the same rooms. It is selected via
+  the new `[media] room_store_backend = "memory" | "db"` config key (env
+  `AUTUMN_MEDIA__ROOM_STORE_BACKEND`); **`memory` remains the default**
+  single-process store. All queries are written against autumn-web's
+  `RuntimeConnection` / `RuntimeBackend` aliases (Postgres by default, `SQLite`
+  under `autumn-web/sqlite`) so **both lanes compile**; the crate never enables
+  the `sqlite` runtime feature itself. The idle-room / stale-participant reaper
+  works against the shared store via a **last-write-wins** design: `reap_stale`
+  deletes stale participants and now-empty stale rooms with unconditional deletes
+  keyed only on the injected clock, so **concurrent reapers across processes
+  converge with no corruption** (no lease row, no leader election) while still
+  never crossing namespaces. Ships a `20260720000000_media_rooms` migration for
+  apps that opt into the `db` backend. (0.7.0 work — do not merge until v0.6.0 is
+  cut.)
+
 ## [0.6.0] - 2026-07-18
 
 ### Added
