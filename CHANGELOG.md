@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **router:** new `health.enabled` config knob (default `true`,
+  `AUTUMN_HEALTH__ENABLED`) — an opt-out that suppresses all built-in probe
+  endpoints (`/health`, `/live`, `/ready`, `/startup`) so an app can own those
+  paths entirely (or expose none). Enabled by default, so behavior is
+  byte-identical to before when unset. Completes the probe-conflict work begun
+  in #1977 (which already lets a hand-written user route at a probe path win),
+  with explicit regression tests for both the user-route-wins and
+  probes-disabled cases (#1971).
+
 ## [0.6.0] - 2026-07-18
 
 ### Added

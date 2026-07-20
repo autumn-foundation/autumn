@@ -1998,6 +1998,16 @@ where
     // wants their handler, so the built-in steps aside and logs the override.
     let mut mounted_probe_paths = std::collections::HashSet::new();
 
+    // Global off-switch (issue #1971): when `health.enabled = false`, the
+    // framework mounts none of the built-in probes (health/live/ready/startup),
+    // leaving those paths free for an app to own — or to expose nothing. The
+    // returned `mounted_probe_paths` set stays empty, so the actuator overlap
+    // guard treats every probe path as unclaimed by the framework.
+    if !config.health.enabled {
+        tracing::info!("health.enabled = false; built-in probe endpoints are not auto-mounted");
+        return (mounted_probe_paths, router);
+    }
+
     let mut mount_probe = |mut router: axum::Router<S>,
                            path: &str,
                            label: &'static str,
@@ -4606,6 +4616,37 @@ mod tests {
                 resp.status(),
                 StatusCode::NOT_FOUND,
                 "built-in probe {path} should still be mounted"
+            );
+        }
+    }
+
+    /// Issue #1971: `health.enabled = false` is a global off-switch — the
+    /// framework auto-mounts NONE of the built-in probes (health/live/ready/
+    /// startup). The router still builds cleanly (`build_router` panics on any
+    /// `RouterBuildError`, so a successful return proves no structured error is
+    /// raised), and every probe path resolves to `404` because nothing owns it.
+    #[tokio::test]
+    async fn health_enabled_false_mounts_no_builtin_probes() {
+        let mut config = AutumnConfig::default();
+        config.health.enabled = false;
+
+        let app = build_router(vec![], &config, test_state());
+
+        for path in [
+            config.health.path.as_str(),
+            config.health.live_path.as_str(),
+            config.health.ready_path.as_str(),
+            config.health.startup_path.as_str(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "probe path {path} must not be auto-mounted when health.enabled = false"
             );
         }
     }
