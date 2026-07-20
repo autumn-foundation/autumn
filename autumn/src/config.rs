@@ -63,6 +63,7 @@
 //! | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` | `fail_readiness` / `primary` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
 //! | `AUTUMN_DATABASE__STARTUP_WAIT_SECS` | `database.startup_wait_secs` | `u64` |
+//! | `AUTUMN_DATABASE__AUTO_MIGRATE` | `database.auto_migrate` | `Option<bool>` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
@@ -3684,6 +3685,7 @@ impl AutumnConfig {
     /// - `AUTUMN_DATABASE__POOL_SIZE` → `database.pool_size` (usize)
     /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` → `database.connect_timeout_secs` (u64)
     /// - `AUTUMN_DATABASE__STARTUP_WAIT_SECS` → `database.startup_wait_secs` (u64)
+    /// - `AUTUMN_DATABASE__AUTO_MIGRATE` -> `database.auto_migrate` (`Option<bool>`)
     /// - `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` -> `database.auto_migrate_in_production` (bool)
     ///
     /// # Log
@@ -4151,6 +4153,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_DATABASE__STARTUP_WAIT_SECS",
             &mut self.database.startup_wait_secs,
+        );
+        parse_env_option_bool(
+            env,
+            "AUTUMN_DATABASE__AUTO_MIGRATE",
+            &mut self.database.auto_migrate,
         );
         parse_env_bool(
             env,
@@ -5892,6 +5899,7 @@ fn is_sqlite_target(s: &str) -> bool {
 /// | `replica_pool_size` | `None` |
 /// | `replica_fallback` | `fail_readiness` |
 /// | `connect_timeout_secs` | `5` |
+/// | `auto_migrate` | `None` |
 /// | `auto_migrate_in_production` | `false` |
 /// | `shards` | `[]` |
 ///
@@ -5988,8 +5996,28 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub startup_wait_secs: u64,
 
-    /// When true, permits automatic migration application while running with
-    /// `prod`/`production` profile. Default: `false`.
+    /// Profile-agnostic explicit override for startup migration auto-apply
+    /// (issue #1903). `None` (the default, when the key is absent) leaves the
+    /// decision to convention: `dev`/`development` auto-apply, every other
+    /// profile (`prod`/`production` **and** custom names like `fly`/`staging`)
+    /// is opt-in. `Some(true)` / `Some(false)` overrides that convention on
+    /// **any** profile.
+    ///
+    /// This supersedes [`Self::auto_migrate_in_production`], which is retained
+    /// as a back-compat alias: when `auto_migrate` is unset but
+    /// `auto_migrate_in_production = true`, auto-apply is enabled on any
+    /// non-`dev` profile (so a custom-profile operator's existing config finally
+    /// takes effect). `auto_migrate` wins when both are set.
+    ///
+    /// Override via `AUTUMN_DATABASE__AUTO_MIGRATE`.
+    #[serde(default)]
+    pub auto_migrate: Option<bool>,
+
+    /// Back-compat alias for [`Self::auto_migrate`] (issue #1903). When `true`,
+    /// permits automatic migration application on any non-`dev` profile (not
+    /// just `prod`/`production` — the old name-gated behavior silently skipped
+    /// custom profiles). Default: `false`. Prefer setting `auto_migrate`
+    /// directly; this key is honored only when `auto_migrate` is unset.
     ///
     /// Keep this disabled for multi-replica production fleets and use an
     /// explicit migration job (`autumn migrate`) instead.
@@ -7232,6 +7260,7 @@ impl Default for DatabaseConfig {
             pin_after_write_secs: default_pin_after_write_secs(),
             connect_timeout_secs: default_connect_timeout(),
             startup_wait_secs: 0,
+            auto_migrate: None,
             auto_migrate_in_production: false,
             statement_timeout: None,
             slow_query_threshold: default_slow_query_threshold(),
@@ -10625,6 +10654,29 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.database.auto_migrate_in_production);
+    }
+
+    #[test]
+    fn database_auto_migrate_defaults_to_none() {
+        // Issue #1903: the profile-agnostic override is unset by default, so the
+        // decision falls to convention (dev on, everything else opt-in).
+        assert_eq!(DatabaseConfig::default().auto_migrate, None);
+    }
+
+    #[test]
+    fn env_override_database_auto_migrate() {
+        // Issue #1903: AUTUMN_DATABASE__AUTO_MIGRATE flips the profile-agnostic
+        // override to an explicit Some(_) on any profile.
+        let env = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE", "true");
+        let mut config = AutumnConfig::default();
+        assert_eq!(config.database.auto_migrate, None);
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.auto_migrate, Some(true));
+
+        let env_false = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE", "false");
+        let mut config_false = AutumnConfig::default();
+        config_false.apply_env_overrides_with_env(&env_false);
+        assert_eq!(config_false.database.auto_migrate, Some(false));
     }
 
     #[test]

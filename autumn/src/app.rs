@@ -7907,6 +7907,7 @@ async fn run_startup_migrations(
         Vec::new()
     };
     let profile = config.profile.clone();
+    let auto_migrate = config.database.auto_migrate;
     let auto_in_prod = config.database.auto_migrate_in_production;
     let migration_result = tokio::task::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (issue #1614, PR3): apply
@@ -7926,6 +7927,7 @@ async fn run_startup_migrations(
                 crate::migrate::auto_migrate_sqlite(
                     url,
                     profile.as_deref(),
+                    auto_migrate,
                     auto_in_prod,
                     mig,
                     "control",
@@ -7939,6 +7941,7 @@ async fn run_startup_migrations(
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
+                    auto_migrate,
                     auto_in_prod,
                     mig,
                     "control",
@@ -7950,6 +7953,7 @@ async fn run_startup_migrations(
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
+                    auto_migrate,
                     auto_in_prod,
                     &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
                     "control",
@@ -7960,9 +7964,13 @@ async fn run_startup_migrations(
             // depends on it existing and returns a hard error when it's missing,
             // so skipping the migration in production would block startup.
             if shard_map_migration_required {
+                // Force-apply this framework-internal table regardless of profile
+                // or config: an explicit `Some(true)` override (issue #1903)
+                // preserves the pre-existing "always allow" behavior.
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
+                    Some(true),
                     true,
                     &crate::sharding::SHARD_MAP_MIGRATIONS,
                     "control",
@@ -7980,7 +7988,14 @@ async fn run_startup_migrations(
                 .iter()
                 .filter(|mig| !migration_set_is_control_framework(mig))
             {
-                crate::migrate::auto_migrate(url, profile.as_deref(), auto_in_prod, mig, target);
+                crate::migrate::auto_migrate(
+                    url,
+                    profile.as_deref(),
+                    auto_migrate,
+                    auto_in_prod,
+                    mig,
+                    target,
+                );
             }
         }
     })

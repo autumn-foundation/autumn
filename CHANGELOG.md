@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
+  Previously the opt-in was name-gated to `prod`/`production`, so a custom
+  profile (`fly`, `staging`, …) with `auto_migrate_in_production = true` silently
+  fell through to log-only and skipped its migrations (crashing later on missing
+  tables). The decision is now convention-over-configuration: `dev`/`development`
+  auto-apply by default; every other profile — prod **and** custom — is opt-in.
+  A new profile-agnostic `database.auto_migrate` (`Option<bool>`,
+  `AUTUMN_DATABASE__AUTO_MIGRATE`) explicitly overrides on any profile, and the
+  existing `auto_migrate_in_production` is retained as a back-compat alias now
+  honored on any non-`dev` profile (so an existing custom-profile config finally
+  takes effect). All applies still route through the advisory-locked runner, and
+  an opt-in profile that is left in report-only mode now logs the profile and the
+  key to set.
+
 ## [0.6.0] - 2026-07-18
 
 ### Added
