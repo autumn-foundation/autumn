@@ -216,7 +216,7 @@ impl Sim {
     /// clock paused, so background tasks (the job worker consuming its queue, a
     /// retry timer that just fired, a delayed enqueue delivering) make progress
     /// only when the running task yields. This cooperatively yields until no
-    /// further ready progress is observed (bounded by [`MAX_DRAIN_STEPS`] so a
+    /// further ready progress is observed (bounded by `MAX_DRAIN_STEPS` so a
     /// pathological busy task can never hang the drain).
     ///
     /// It does **not** fast-forward to a *future* timer — advancing the clock to
