@@ -273,7 +273,12 @@ mod tests {
             .expect("timeout waiting for custom update broadcast")
             .expect("recv error");
         let html_content = msg.into_string();
-        assert!(html_content.contains("hx-swap-oob=\"beforeend:#custom-posts-list\""));
+        // A topic-change re-insert publishes with the model's `insert_swap()`
+        // (not the create-path container), so the OOB selector comes from
+        // `BroadcastPost::insert_swap()` = Target(BeforeEnd, "#broadcast_posts-list").
+        // `OobSwap::Target::format_value` uses that selector verbatim and ignores
+        // the target id, so the SSE envelope is `beforeend:#broadcast_posts-list`.
+        assert!(html_content.contains("hx-swap-oob=\"beforeend:#broadcast_posts-list\""));
         assert!(html_content.contains(&format!("id=\"custom-post-{}", custom_post.id)));
         assert!(html_content.contains("world"));
 
