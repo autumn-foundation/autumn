@@ -37,7 +37,10 @@
 //!
 //! - **W2** wires virtual-clock advancing / draining onto [`SimClock`] against
 //!   [`crate::time::ClockSource`], and mounts an app on [`SimApp`].
-//! - **W3** exposes deterministic id / `Uuid` generation through [`SimRng`].
+//! - **W3** exposes deterministic id / `Uuid` generation through [`SimRng`] and
+//!   the [`crate::entropy::Rng`] extractor / [`crate::entropy::Entropy`] seam,
+//!   and routes the framework's high-value id sites through it. Bridge a seeded
+//!   source into a mounted app with [`Sim::seeded_entropy`].
 //! - **W5** turns [`Chaos`] into a public fault-injection builder.
 //!
 //! Everything here is designed to grow additively (builder-style) without
@@ -49,10 +52,14 @@
 // issues in the behavioral code that lands later.
 #![allow(clippy::missing_const_for_fn)]
 
-use chrono::{TimeZone, Utc};
-use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
+use std::sync::Arc;
 
+use chrono::{TimeZone, Utc};
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use uuid::Uuid;
+
+use crate::entropy::{Entropy, SeededEntropy, uuid_v4_from_bytes, uuid_v7_from_parts};
 use crate::time::TickingClock;
 
 /// The fixed, deterministic epoch the simulation clock starts at:
@@ -132,21 +139,41 @@ impl Sim {
 
     /// Borrow the seeded deterministic RNG handle.
     ///
-    /// W1 exposes only the handle; the deterministic id / `Uuid` generation
-    /// helpers built on top of it land in W3.
+    /// Draw deterministic values and UUIDs through it — e.g.
+    /// [`SimRng::uuid_v4`] / [`SimRng::next_u64`]. The same seed always yields
+    /// the same draw sequence.
     #[must_use]
     pub fn rng(&mut self) -> &mut SimRng {
         &mut self.rng
+    }
+
+    /// Build a shared, seeded [`Entropy`] source for this simulation's seed,
+    /// ready to inject into a mounted app via
+    /// [`crate::state::AppState::with_entropy`].
+    ///
+    /// This is the bridge W3 provides for W2's app mounting: the app the
+    /// simulation drives resolves the [`crate::entropy::Rng`] extractor and
+    /// every framework-minted identifier (job ids, request ids, idempotency
+    /// lock owners, session ids) from this source, so a fixed seed replays the
+    /// whole identifier stream byte-for-byte.
+    ///
+    /// The returned source is seeded independently from the [`rng`](Self::rng)
+    /// handle (both from [`seed`](Self::seed)), so drawing from one does not
+    /// perturb the other's sequence.
+    #[must_use]
+    pub fn seeded_entropy(&self) -> Arc<dyn Entropy> {
+        SeededEntropy::shared(self.seed)
     }
 }
 
 /// A seeded, deterministic random number generator handle.
 ///
 /// Wraps a `ChaCha8Rng` seeded from the simulation seed, so the same seed
-/// always yields the same draw sequence. W3 will expose deterministic id and
-/// `Uuid` generation through this handle; W1 only constructs and threads it.
+/// always yields the same draw sequence. Draw deterministic bytes and UUIDs
+/// through the generation helpers below; they share their `Uuid` bit-stamping
+/// with the [`crate::entropy::Entropy`] source an app is seeded with, so a
+/// `SimRng` draw and an equivalently-seeded app draw agree.
 pub struct SimRng {
-    #[allow(dead_code)] // read by the deterministic generation helpers in W3
     inner: ChaCha8Rng,
 }
 
@@ -158,10 +185,39 @@ impl SimRng {
         }
     }
 
+    /// Draw the next deterministic `u64`.
+    pub fn next_u64(&mut self) -> u64 {
+        self.inner.next_u64()
+    }
+
+    /// Fill `dest` with deterministic bytes.
+    pub fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.inner.fill_bytes(dest);
+    }
+
+    /// Draw a deterministic version-4 (fully random) [`Uuid`].
+    ///
+    /// The same seed and the same number of prior draws always yield the same
+    /// UUID.
+    #[must_use]
+    pub fn uuid_v4(&mut self) -> Uuid {
+        let mut bytes = [0u8; 16];
+        self.inner.fill_bytes(&mut bytes);
+        uuid_v4_from_bytes(bytes)
+    }
+
+    /// Draw a version-7 (time-ordered) [`Uuid`] whose 48-bit timestamp is
+    /// `unix_millis` and whose remaining bits are drawn deterministically.
+    #[must_use]
+    pub fn uuid_v7(&mut self, unix_millis: u64) -> Uuid {
+        let mut rand_bytes = [0u8; 10];
+        self.inner.fill_bytes(&mut rand_bytes);
+        uuid_v7_from_parts(unix_millis, rand_bytes)
+    }
+
     /// Borrow the underlying `ChaCha8Rng`.
     ///
-    /// Internal for W1 (used by the determinism smoke test); the public
-    /// generation surface lands in W3.
+    /// Internal escape hatch for the determinism smoke test.
     #[cfg(test)]
     pub(crate) fn inner_mut(&mut self) -> &mut ChaCha8Rng {
         &mut self.inner

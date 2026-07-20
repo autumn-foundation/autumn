@@ -1793,6 +1793,7 @@ impl TestApp {
             clock: self
                 .clock
                 .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock)),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: crate::state::AppState::next_app_id(),
         };
 

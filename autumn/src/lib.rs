@@ -105,6 +105,7 @@ pub mod db;
 pub mod dotenv;
 pub mod download;
 pub mod encryption;
+pub mod entropy;
 pub mod error;
 #[cfg(feature = "maud")]
 pub mod error_pages;
