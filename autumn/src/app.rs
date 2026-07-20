@@ -7907,6 +7907,7 @@ async fn run_startup_migrations(
         Vec::new()
     };
     let profile = config.profile.clone();
+    let auto_migrate = config.database.auto_migrate;
     let auto_in_prod = config.database.auto_migrate_in_production;
     let migration_result = tokio::task::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (issue #1614, PR3): apply
@@ -7926,6 +7927,7 @@ async fn run_startup_migrations(
                 crate::migrate::auto_migrate_sqlite(
                     url,
                     profile.as_deref(),
+                    auto_migrate,
                     auto_in_prod,
                     mig,
                     "control",
@@ -7939,6 +7941,7 @@ async fn run_startup_migrations(
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
+                    auto_migrate,
                     auto_in_prod,
                     mig,
                     "control",
@@ -7950,20 +7953,26 @@ async fn run_startup_migrations(
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
+                    auto_migrate,
                     auto_in_prod,
                     &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
                     "control",
                 );
             }
             // The shard-map guard table also lives on the control plane only.
-            // Always allow auto-applying this framework-internal table: the guard
-            // depends on it existing and returns a hard error when it's missing,
-            // so skipping the migration in production would block startup.
+            // It follows the same resolved profile-agnostic auto-migrate decision
+            // as the app migrations above (issue #1903): dev-profile default-on,
+            // prod/custom opt-in via `auto_migrate` / `auto_migrate_in_production`,
+            // with the advisory-locked apply path preserved. Under a report-only
+            // decision the missing table is reported rather than force-applied, so
+            // a DB-free/offline startup path never fails fatally on an unreachable
+            // control target.
             if shard_map_migration_required {
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
-                    true,
+                    auto_migrate,
+                    auto_in_prod,
                     &crate::sharding::SHARD_MAP_MIGRATIONS,
                     "control",
                 );
@@ -7980,7 +7989,14 @@ async fn run_startup_migrations(
                 .iter()
                 .filter(|mig| !migration_set_is_control_framework(mig))
             {
-                crate::migrate::auto_migrate(url, profile.as_deref(), auto_in_prod, mig, target);
+                crate::migrate::auto_migrate(
+                    url,
+                    profile.as_deref(),
+                    auto_migrate,
+                    auto_in_prod,
+                    mig,
+                    target,
+                );
             }
         }
     })
