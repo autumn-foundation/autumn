@@ -92,7 +92,7 @@ pub trait Entropy: std::fmt::Debug + Send + Sync + 'static {
 /// version (4) and variant bits. Shared by [`Entropy::uuid_v4`] and
 /// [`crate::sim::SimRng::uuid_v4`] so both paths produce identical UUIDs.
 #[must_use]
-pub(crate) fn uuid_v4_from_bytes(mut bytes: [u8; 16]) -> Uuid {
+pub(crate) const fn uuid_v4_from_bytes(mut bytes: [u8; 16]) -> Uuid {
     bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
     bytes[8] = (bytes[8] & 0x3F) | 0x80; // RFC 4122 variant
     Uuid::from_bytes(bytes)

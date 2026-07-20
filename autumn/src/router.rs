@@ -3174,7 +3174,7 @@ fn apply_middleware(
         config.profile.as_deref(),
         session_store,
         signing_keys_opt,
-        state.entropy_arc(),
+        &state.entropy_arc(),
     )?;
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 

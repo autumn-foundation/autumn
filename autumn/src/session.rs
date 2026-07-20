@@ -965,7 +965,7 @@ pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
     profile: Option<&str>,
     custom_store: Option<Arc<dyn BoxedSessionStore>>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
-    entropy: Arc<dyn crate::entropy::Entropy>,
+    entropy: &Arc<dyn crate::entropy::Entropy>,
 ) -> Result<axum::Router<S>, SessionBackendConfigError> {
     if let Some(store) = custom_store {
         tracing::debug!(
