@@ -201,7 +201,7 @@ impl SeededEntropy {
     /// The same seed and `purpose_tag` always yield the same UUID no matter how
     /// many bytes have been drawn, so it is safe for byte-reproducible
     /// multi-tenant fixtures without disturbing the deterministic id stream. See
-    /// [`derive_uuid_from`] for the mechanism and the version bits it sets.
+    /// `derive_uuid_from` for the mechanism and the version bits it sets.
     #[must_use]
     pub fn derive_uuid(&self, purpose_tag: impl AsRef<[u8]>) -> Uuid {
         derive_uuid_from(self.seed, purpose_tag.as_ref())
