@@ -4,6 +4,14 @@
 //! core set is vetted and shipped with `autumn-cli` (issue #993). Each starter's
 //! template tree is embedded via [`include_dir!`]; the tree's root contains an
 //! `autumn-starter.toml` manifest plus the template files.
+//!
+//! The project manifest is committed as `Cargo.toml.tmpl` (not a literal
+//! `Cargo.toml`): `cargo package` treats any subdirectory holding a `Cargo.toml`
+//! as a nested crate and drops that whole subtree from the published tarball,
+//! which would leave this `include_dir!` with nothing to embed at `cargo publish`
+//! verify time. The scaffolder strips the `.tmpl` suffix on emit (see
+//! `starters::emit_rel_path`), so generated projects still get a real
+//! `Cargo.toml`.
 
 use include_dir::{Dir, include_dir};
 
