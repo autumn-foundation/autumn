@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   self-heals by writing the marker; an unreadable marker fails closed at
   pre-flight (mirroring the #2073 port-change refuse) with two-deploy repair
   guidance. Part of #1607.
+### Added
+
+- **sim-testing:** `#[sim_test]` macro and public `Sim` skeleton for
+  deterministic simulation tests (seed-driven, replay-on-panic) (#1797). [no-plugin]
 
 ## [0.6.0] - 2026-07-18
 
