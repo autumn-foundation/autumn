@@ -22,6 +22,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deploy but silently ignored at runtime under `AUTUMN_ENV=prod`. The existing
   single-file `from_autumn_toml` / `from_toml_str_with_env` entry points are
   unchanged.
+### Fixed
+
+- **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
+  Previously the opt-in was name-gated to `prod`/`production`, so a custom
+  profile (`fly`, `staging`, …) with `auto_migrate_in_production = true` silently
+  fell through to log-only and skipped its migrations (crashing later on missing
+  tables). The decision is now convention-over-configuration: `dev`/`development`
+  auto-apply by default; every other profile — prod **and** custom — is opt-in.
+  A new profile-agnostic `database.auto_migrate` (`Option<bool>`,
+  `AUTUMN_DATABASE__AUTO_MIGRATE`) explicitly overrides on any profile, and the
+  existing `auto_migrate_in_production` is retained as a back-compat alias now
+  honored on any non-`dev` profile (so an existing custom-profile config finally
+  takes effect). All applies still route through the advisory-locked runner, and
+  an opt-in profile that is left in report-only mode now logs the profile and the
+  key to set. The framework shard-map (`control` queue) migration now follows the
+  same `database.auto_migrate` decision as app migrations rather than
+  force-applying, so it stays consistent with the profile-agnostic convention (and
+  no longer fails fatally on an unreachable control target under a report-only
+  decision).
+- **cli:** `autumn new <name> --with-i18n` (default fullstack flavor, without
+  `--api`) now ships the `i18n/` sidecar into its generated Dockerfile, so the
+  runtime image no longer panics at boot when `.i18n_auto()` loads
+  `i18n/en.ftl` from disk (#1865). The fullstack `Dockerfile.tmpl` gained the
+  same builder- and runtime-stage i18n `COPY` anchors the `--api` template
+  already carried, resolved by a new `inject_i18n_dockerfile` helper that
+  mirrors the `--api` fix (#1847): the `COPY i18n ./i18n` /
+  `COPY --from=builder /app/i18n /app/i18n` lines are injected for
+  `--with-i18n` and the anchors stripped otherwise (a non-i18n build context
+  has no `i18n/` dir), leaving no stray anchor markers.
+### Added
+
+- **router:** new `health.enabled` config knob (default `true`,
+  `AUTUMN_HEALTH__ENABLED`) — an opt-out that suppresses all built-in probe
+  endpoints (`/health`, `/live`, `/ready`, `/startup`) so an app can own those
+  paths entirely (or expose none). Enabled by default, so behavior is
+  byte-identical to before when unset. Completes the probe-conflict work begun
+  in #1977 (which already lets a hand-written user route at a probe path win),
+  with explicit regression tests for both the user-route-wins and
+  probes-disabled cases (#1971).
+### Fixed
+
+- **deploy:** the one-time kamal-proxy reboot-durability upgrade (#2070/#2071) no
+  longer stamps a new/removed `deploy.tls.host` onto the still-live OLD release
+  during its pre-flip forced re-register (#2074). Because kamal-proxy exposes no
+  `ServiceOptions` read-back, autumn now records the TLS/host options each forward
+  deploy registered in a host-side `shared/proxy-options` marker (`{tls}\t{host}`,
+  written atomically alongside the live-slot marker on both first deploy and
+  cutover) and reads it back at deploy-start. On a redeploy the durability
+  re-register of the still-live old release preserves ITS recorded options (the
+  candidate flip still adopts the new config), so a later-op failure + rollback
+  leaves the old release on its own host/TLS instead of behind the changed one.
+  An absent marker (a legacy host's first redeploy) proceeds as before and
+  self-heals by writing the marker; an unreadable marker fails closed at
+  pre-flight (mirroring the #2073 port-change refuse) with two-deploy repair
+  guidance. Part of #1607.
+### Added
+
+- **sim-testing:** `#[sim_test]` macro and public `Sim` skeleton for
+  deterministic simulation tests (seed-driven, replay-on-panic) (#1797). [no-plugin]
 
 ## [0.6.0] - 2026-07-18
 

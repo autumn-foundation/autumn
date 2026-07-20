@@ -91,6 +91,7 @@ cors.allowed_methods
 cors.allowed_origins
 cors.max_age_secs
 database
+database.auto_migrate
 database.auto_migrate_in_production
 database.connect_timeout_secs
 database.directory_shard_router
@@ -134,6 +135,7 @@ dev.inspector_n_plus_one_threshold
 dev.inspector_path
 health
 health.detailed
+health.enabled
 health.live_path
 health.path
 health.ready_path

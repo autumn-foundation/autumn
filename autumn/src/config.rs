@@ -63,6 +63,7 @@
 //! | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` | `fail_readiness` / `primary` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
 //! | `AUTUMN_DATABASE__STARTUP_WAIT_SECS` | `database.startup_wait_secs` | `u64` |
+//! | `AUTUMN_DATABASE__AUTO_MIGRATE` | `database.auto_migrate` | `Option<bool>` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
@@ -86,6 +87,7 @@
 //! | `AUTUMN_HEALTH__READY_PATH` | `health.ready_path` | `String` |
 //! | `AUTUMN_HEALTH__STARTUP_PATH` | `health.startup_path` | `String` |
 //! | `AUTUMN_HEALTH__DETAILED` | `health.detailed` | `bool` |
+//! | `AUTUMN_HEALTH__ENABLED` | `health.enabled` | `bool` |
 //! | `AUTUMN_CORS__ALLOWED_ORIGINS` | `cors.allowed_origins` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_METHODS` | `cors.allowed_methods` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_HEADERS` | `cors.allowed_headers` | comma-separated `String` |
@@ -3684,6 +3686,7 @@ impl AutumnConfig {
     /// - `AUTUMN_DATABASE__POOL_SIZE` → `database.pool_size` (usize)
     /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` → `database.connect_timeout_secs` (u64)
     /// - `AUTUMN_DATABASE__STARTUP_WAIT_SECS` → `database.startup_wait_secs` (u64)
+    /// - `AUTUMN_DATABASE__AUTO_MIGRATE` -> `database.auto_migrate` (`Option<bool>`)
     /// - `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` -> `database.auto_migrate_in_production` (bool)
     ///
     /// # Log
@@ -3706,6 +3709,7 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__READY_PATH` → `health.ready_path` (String)
     /// - `AUTUMN_HEALTH__STARTUP_PATH` → `health.startup_path` (String)
     /// - `AUTUMN_HEALTH__DETAILED` → `health.detailed` (bool)
+    /// - `AUTUMN_HEALTH__ENABLED` → `health.enabled` (bool)
     ///
     /// # Jobs
     /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis`)
@@ -4152,6 +4156,11 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__STARTUP_WAIT_SECS",
             &mut self.database.startup_wait_secs,
         );
+        parse_env_option_bool(
+            env,
+            "AUTUMN_DATABASE__AUTO_MIGRATE",
+            &mut self.database.auto_migrate,
+        );
         parse_env_bool(
             env,
             "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION",
@@ -4291,6 +4300,7 @@ impl AutumnConfig {
             &mut self.health.startup_path,
         );
         parse_env_bool(env, "AUTUMN_HEALTH__DETAILED", &mut self.health.detailed);
+        parse_env_bool(env, "AUTUMN_HEALTH__ENABLED", &mut self.health.enabled);
     }
 
     fn apply_cors_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -5892,6 +5902,7 @@ fn is_sqlite_target(s: &str) -> bool {
 /// | `replica_pool_size` | `None` |
 /// | `replica_fallback` | `fail_readiness` |
 /// | `connect_timeout_secs` | `5` |
+/// | `auto_migrate` | `None` |
 /// | `auto_migrate_in_production` | `false` |
 /// | `shards` | `[]` |
 ///
@@ -5988,8 +5999,28 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub startup_wait_secs: u64,
 
-    /// When true, permits automatic migration application while running with
-    /// `prod`/`production` profile. Default: `false`.
+    /// Profile-agnostic explicit override for startup migration auto-apply
+    /// (issue #1903). `None` (the default, when the key is absent) leaves the
+    /// decision to convention: `dev`/`development` auto-apply, every other
+    /// profile (`prod`/`production` **and** custom names like `fly`/`staging`)
+    /// is opt-in. `Some(true)` / `Some(false)` overrides that convention on
+    /// **any** profile.
+    ///
+    /// This supersedes [`Self::auto_migrate_in_production`], which is retained
+    /// as a back-compat alias: when `auto_migrate` is unset but
+    /// `auto_migrate_in_production = true`, auto-apply is enabled on any
+    /// non-`dev` profile (so a custom-profile operator's existing config finally
+    /// takes effect). `auto_migrate` wins when both are set.
+    ///
+    /// Override via `AUTUMN_DATABASE__AUTO_MIGRATE`.
+    #[serde(default)]
+    pub auto_migrate: Option<bool>,
+
+    /// Back-compat alias for [`Self::auto_migrate`] (issue #1903). When `true`,
+    /// permits automatic migration application on any non-`dev` profile (not
+    /// just `prod`/`production` — the old name-gated behavior silently skipped
+    /// custom profiles). Default: `false`. Prefer setting `auto_migrate`
+    /// directly; this key is honored only when `auto_migrate` is unset.
     ///
     /// Keep this disabled for multi-replica production fleets and use an
     /// explicit migration job (`autumn migrate`) instead.
@@ -6673,6 +6704,7 @@ impl TelemetryProtocol {
 /// use autumn_web::config::HealthConfig;
 ///
 /// let health = HealthConfig::default();
+/// assert!(health.enabled);
 /// assert_eq!(health.path, "/health");
 /// assert_eq!(health.live_path, "/live");
 /// assert_eq!(health.ready_path, "/ready");
@@ -6681,6 +6713,13 @@ impl TelemetryProtocol {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
+    /// When `true` (the default), the framework auto-mounts the built-in
+    /// probe endpoints (health/live/ready/startup). Set to `false` to
+    /// suppress all built-in probes so an app can own those paths entirely
+    /// (or expose none at all). Default: `true` (issue #1971).
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+
     /// Compatibility alias path for readiness. Default: `"/health"`.
     ///
     /// Common alternatives: `"/healthz"`, `"/_health"`.
@@ -7183,6 +7222,10 @@ const fn default_acme_renew_before_days() -> u32 {
     30
 }
 
+const fn default_health_enabled() -> bool {
+    true
+}
+
 fn default_health_path() -> String {
     "/health".to_owned()
 }
@@ -7232,6 +7275,7 @@ impl Default for DatabaseConfig {
             pin_after_write_secs: default_pin_after_write_secs(),
             connect_timeout_secs: default_connect_timeout(),
             startup_wait_secs: 0,
+            auto_migrate: None,
             auto_migrate_in_production: false,
             statement_timeout: None,
             slow_query_threshold: default_slow_query_threshold(),
@@ -7274,6 +7318,7 @@ impl Default for TelemetryConfig {
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
+            enabled: default_health_enabled(),
             path: default_health_path(),
             live_path: default_live_path(),
             ready_path: default_ready_path(),
@@ -10628,6 +10673,29 @@ path = "/healthz"
     }
 
     #[test]
+    fn database_auto_migrate_defaults_to_none() {
+        // Issue #1903: the profile-agnostic override is unset by default, so the
+        // decision falls to convention (dev on, everything else opt-in).
+        assert_eq!(DatabaseConfig::default().auto_migrate, None);
+    }
+
+    #[test]
+    fn env_override_database_auto_migrate() {
+        // Issue #1903: AUTUMN_DATABASE__AUTO_MIGRATE flips the profile-agnostic
+        // override to an explicit Some(_) on any profile.
+        let env = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE", "true");
+        let mut config = AutumnConfig::default();
+        assert_eq!(config.database.auto_migrate, None);
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.auto_migrate, Some(true));
+
+        let env_false = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE", "false");
+        let mut config_false = AutumnConfig::default();
+        config_false.apply_env_overrides_with_env(&env_false);
+        assert_eq!(config_false.database.auto_migrate, Some(false));
+    }
+
+    #[test]
     fn env_override_jobs_fields() {
         let env = MockEnv::new()
             .with("AUTUMN_JOBS__BACKEND", "redis")
@@ -13135,6 +13203,24 @@ path = "/healthz"
         config.health.detailed = true;
         config.apply_env_overrides_with_env(&env);
         assert!(!config.health.detailed);
+    }
+
+    #[test]
+    fn health_enabled_defaults_true() {
+        // Issue #1971: the probe off-switch is opt-in — enabled by default so
+        // behavior is byte-identical to before the field existed.
+        assert!(HealthConfig::default().enabled);
+    }
+
+    #[test]
+    fn env_override_health_enabled_false() {
+        // Issue #1971: AUTUMN_HEALTH__ENABLED=false flips the built-in probe
+        // off-switch via env, mirroring the AUTUMN_HEALTH__DETAILED wiring.
+        let env = MockEnv::new().with("AUTUMN_HEALTH__ENABLED", "false");
+        let mut config = AutumnConfig::default();
+        assert!(config.health.enabled); // starts true (default)
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.health.enabled);
     }
 
     #[test]
