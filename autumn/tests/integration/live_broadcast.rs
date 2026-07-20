@@ -190,7 +190,7 @@ async fn update_broadcasts_true_swap() {
     );
     // Update uses OobSwap::True (outerHTML) — fragment carries the attribute directly
     assert!(
-        html.contains("live_item"),
+        html.contains("live-item"),
         "update fragment must reference item element, got: {html}"
     );
 }
@@ -228,10 +228,10 @@ async fn delete_broadcasts_oob_delete() {
 
     let html = msg.as_str();
     assert!(html.contains("delete"), "must contain delete swap: {html}");
-    // Trunk-dev delete tombstone: <div id="live_item-{id}" hx-swap-oob="delete">
+    // Trunk-dev delete tombstone: <div id="live-item-{id}" hx-swap-oob="delete">
     assert!(
-        html.contains(&format!("live_item-{}", saved.id)),
-        "must contain element id live_item-{}, got: {html}",
+        html.contains(&format!("live-item-{}", saved.id)),
+        "must contain element id live-item-{}, got: {html}",
         saved.id
     );
 }
@@ -247,9 +247,11 @@ async fn no_broadcasts_attr_emits_nothing() {
     let new_item = NewSilentItem {
         name: "quiet".to_owned(),
     };
-    // Even inside a CURRENT_CHANNELS scope, SilentItemRepository has no broadcasts attr
+    // Even inside a CURRENT_CHANNELS scope, SilentItemRepository has no broadcasts attr.
+    // Clone the handle so the sender stays alive across the recv below — otherwise the
+    // only Channels handle is moved into the scope and dropped, closing rx immediately.
     CURRENT_CHANNELS
-        .scope(channels, async {
+        .scope(channels.clone(), async {
             repo.save(&new_item).await.expect("save");
         })
         .await;

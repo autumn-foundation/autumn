@@ -376,7 +376,7 @@ enum Commands {
     /// It always runs under the test profile and exports these for the suite:
     ///
     ///   AUTUMN_ENV=test
-    ///   DATABASE_URL / AUTUMN_DATABASE__PRIMARY_URL = <resolved test URL>
+    ///   DATABASE_URL / AUTUMN_DATABASE__PRIMARY_URL = `<resolved test URL>`
     ///
     /// Lifecycle (create → migrate → run):
     ///
@@ -1917,7 +1917,7 @@ enum GenerateCommands {
     /// Generate a `#[model]` struct, Diesel migration, and schema entry.
     ///
     /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, `NaiveDateTime`,
-    /// `DateTime`, Vec<u8>/Bytea, Attachment, references, `enum{a,b,...}`, Option<...>.
+    /// `DateTime`, `Vec<u8>`/Bytea, Attachment, references, `enum{a,b,...}`, `Option<...>`.
     ///
     /// `field:references` scaffolds a foreign key: a `field_id BIGINT` column
     /// with a `REFERENCES <table>(id)` constraint and an index, where `<table>`
@@ -2354,7 +2354,7 @@ enum GenerateCommands {
     ///
     ///   autumn generate tauri
     ///   autumn generate tauri --dry-run
-    ///   autumn generate tauri --remote-url https://app.example.com
+    ///   autumn generate tauri --remote-url <https://app.example.com>
     #[allow(clippy::doc_markdown)]
     #[command(verbatim_doc_comment)]
     Tauri {
@@ -2476,7 +2476,7 @@ enum GenerateCommands {
     /// register the new routes in `src/main.rs`.
     ///
     /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, `NaiveDateTime`,
-    /// `DateTime`, Vec<u8>/Bytea, Attachment, references, `enum{a,b,...}`, Option<...>.
+    /// `DateTime`, `Vec<u8>`/Bytea, Attachment, references, `enum{a,b,...}`, `Option<...>`.
     ///
     /// `field:references` scaffolds a foreign key (`field_id BIGINT
     /// REFERENCES <table>(id)` plus an index), e.g.

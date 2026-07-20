@@ -9,6 +9,7 @@ do not need a dedicated guide — their changes are called out in the
 ## Index
 
 - [`0.4.0.md`](0.4.0.md) - `autumn-web 0.3.x -> 0.4.0`
+- [`0.6.0.md`](0.6.0.md) - `autumn-web 0.5.x -> 0.6.0`
 
 - [`TEMPLATE.md`](TEMPLATE.md) — template for new migration guides. Copy
   this when drafting the guide for the next major release.
