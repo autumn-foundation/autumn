@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deterministically claims and runs ready durable repository commit hooks in
   integration tests — driving the real worker→drain wiring without starting the
   timing-based background commit-hook worker — and returns the number processed.
+- **sim-testing:** the `Sim` handle gained its W2 virtual-clock + drain wiring
+  (#1797): `Sim::build(TestApp)` mounts an app on the paused runtime with the
+  simulation's `TickingClock` installed (via `TestApp::with_clock`), exposing the
+  resulting `TestClient` through `Sim::client()` / `try_client()`;
+  `Sim::advance(dur)` steps the injected wall clock and tokio's paused timer wheel
+  together so `Utc::now()`-via-extractor and `tokio::time::sleep` stay in
+  lockstep; and `Sim::run_to_idle()` cooperatively drains ready jobs and
+  timer-woken work to quiescence. A job whose retry backs off 24h now fires in
+  virtual time with zero wall-clock sleep. [no-plugin]
 - **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
   shared, **multi-process-safe** database-backed implementation. The `RoomStore`
   trait, `RoomService`, and the four room HTTP handlers are now `async` (via
