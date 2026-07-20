@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-flight (mirroring the #2073 port-change refuse) with two-deploy repair
   guidance. Part of #1607.
 
+## [0.6.0] - 2026-07-18
+
 ### Added
 
 - **media:** autumn-media gained a full **Rooms** primitive (#1974) — a
