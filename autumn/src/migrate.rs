@@ -2379,18 +2379,43 @@ pub fn pending_shard_framework_migrations(
     }
 }
 
-fn should_auto_apply(profile: Option<&str>, allow_auto_migrate_in_production: bool) -> bool {
+/// Decide whether pending migrations are auto-applied at startup (issue #1903).
+///
+/// Profile-agnostic, convention-over-configuration:
+///
+/// 1. An explicit `database.auto_migrate` (`auto_migrate = Some(_)`) overrides
+///    everything on **any** profile — `Some(true)` forces apply, `Some(false)`
+///    forces report-only.
+/// 2. Otherwise `dev`/`development` auto-applies by convention.
+/// 3. Otherwise the back-compat `auto_migrate_in_production` alias enables
+///    auto-apply on **any** non-`dev` profile — `prod`/`production` **and**
+///    custom names like `fly`/`staging` (the previous name-gated check silently
+///    skipped custom profiles, so their opt-in was ignored: the bug).
+/// 4. Otherwise report-only.
+fn should_auto_apply(
+    profile: Option<&str>,
+    auto_migrate: Option<bool>,
+    auto_migrate_in_production: bool,
+) -> bool {
+    if let Some(explicit) = auto_migrate {
+        return explicit;
+    }
     let profile_name = profile.unwrap_or("none");
-    matches!(profile_name, "dev" | "development")
-        || (matches!(profile_name, "prod" | "production") && allow_auto_migrate_in_production)
+    if matches!(profile_name, "dev" | "development") {
+        return true;
+    }
+    auto_migrate_in_production
 }
 
-/// Run migrations according to the active profile and migration policy.
+/// Run migrations according to the active profile and migration policy
+/// (decision by [`should_auto_apply`], issue #1903).
 ///
 /// - **dev/development**: runs all pending migrations automatically and logs each one.
-/// - **prod/production**: logs pending migrations unless
-///   `allow_auto_migrate_in_production` is enabled.
-/// - **other profiles**: logs pending migrations without auto-applying.
+/// - **any other profile** (`prod`/`production` **and** custom names like
+///   `fly`/`staging`): logs pending migrations unless auto-apply is explicitly
+///   opted into via `auto_migrate = true` or the `auto_migrate_in_production`
+///   alias.
+/// - An explicit `auto_migrate = Some(false)` forces report-only on any profile.
 ///
 /// `target` labels the database being migrated (`"control"` or
 /// `"shard:<name>"`) so a failing target is unambiguous in sharded
@@ -2404,23 +2429,34 @@ fn should_auto_apply(profile: Option<&str>, allow_auto_migrate_in_production: bo
 pub(crate) fn auto_migrate(
     database_url: &str,
     profile: Option<&str>,
-    allow_auto_migrate_in_production: bool,
+    auto_migrate: Option<bool>,
+    auto_migrate_in_production: bool,
     migrations: &EmbeddedMigrations,
     target: &str,
 ) {
     let profile_name = profile.unwrap_or("none");
     let is_dev = matches!(profile_name, "dev" | "development");
-    let is_prod = matches!(profile_name, "prod" | "production");
-    let should_auto_apply = should_auto_apply(profile, allow_auto_migrate_in_production);
+    let should_auto_apply = should_auto_apply(profile, auto_migrate, auto_migrate_in_production);
 
     if should_auto_apply {
         if is_dev {
             tracing::info!(target = %target, "Development profile: running pending database migrations...");
         } else {
+            // Non-dev auto-apply is always an explicit opt-in (issue #1903):
+            // either `database.auto_migrate = true` or the
+            // `auto_migrate_in_production` alias. Name the profile and the key
+            // that enabled it so a custom-profile operator (`fly`, `staging`, …)
+            // sees clearly that their opt-in was honored.
+            let key = if auto_migrate.is_some() {
+                "database.auto_migrate"
+            } else {
+                "database.auto_migrate_in_production"
+            };
             tracing::warn!(
                 profile = profile_name,
+                key,
                 target = %target,
-                "Production auto-migration is enabled; running pending database migrations"
+                "Auto-migration is explicitly enabled for this profile; running pending database migrations"
             );
         }
 
@@ -2510,14 +2546,21 @@ pub(crate) fn auto_migrate(
                 tracing::info!(target = %target, "Database migrations are up to date");
             }
             Ok(pending) => {
-                if is_prod {
+                if !is_dev {
+                    // Any non-dev profile (prod/production AND custom names like
+                    // `fly`/`staging`) is opt-in (issue #1903). Name the profile
+                    // and the key an operator would set so a custom-profile
+                    // deploy is not left with only the generic "Run `autumn
+                    // migrate`" line as its signal.
                     tracing::warn!(
-                        "Production profile detected: automatic migrations are disabled by default. \
-                         Run `autumn migrate check` to review safety before applying, then \
-                         `autumn migrate` in your deployment job. \
-                         Set database.auto_migrate_in_production=true only for single-process \
-                         deployments after confirming all pending migrations are safe for a \
-                         rolling deploy (expand/contract pattern)."
+                        profile = profile_name,
+                        target = %target,
+                        "Profile is opt-in for startup migrations: automatic migrations are \
+                         disabled by default. Run `autumn migrate check` to review safety before \
+                         applying, then `autumn migrate` in your deployment job. Set \
+                         database.auto_migrate=true (or the auto_migrate_in_production alias) only \
+                         for single-process deployments after confirming all pending migrations \
+                         are safe for a rolling deploy (expand/contract pattern)."
                     );
                 }
                 tracing::warn!(
@@ -2539,10 +2582,11 @@ pub(crate) fn auto_migrate(
 /// Run migrations against a `SQLite` control target at startup (issue #1614, PR3).
 ///
 /// The `SQLite` counterpart to [`auto_migrate`]: it honors the same profile
-/// policy via [`should_auto_apply`] (dev / development auto-applies; prod /
-/// production applies only when `allow_auto_migrate_in_production` is set;
-/// otherwise it reports pending work), and fails fast (`process::exit(1)`) on an
-/// apply error exactly like the Postgres path.
+/// policy via [`should_auto_apply`] (dev / development auto-applies; every other
+/// profile — prod/production and custom — applies only when `auto_migrate` or
+/// the `auto_migrate_in_production` alias opts in; otherwise it reports pending
+/// work), and fails fast (`process::exit(1)`) on an apply error exactly like the
+/// Postgres path.
 ///
 /// It deliberately omits the two Postgres-specific mechanisms
 /// [`auto_migrate`] relies on:
@@ -2562,7 +2606,8 @@ pub(crate) fn auto_migrate(
 pub(crate) fn auto_migrate_sqlite(
     database_url: &str,
     profile: Option<&str>,
-    allow_auto_migrate_in_production: bool,
+    auto_migrate: Option<bool>,
+    auto_migrate_in_production: bool,
     migrations: &EmbeddedMigrations,
     target: &str,
 ) {
@@ -2582,7 +2627,7 @@ pub(crate) fn auto_migrate_sqlite(
         );
         std::process::exit(1);
     }
-    if should_auto_apply(profile, allow_auto_migrate_in_production) {
+    if should_auto_apply(profile, auto_migrate, auto_migrate_in_production) {
         tracing::info!(target = %target, "Running pending SQLite database migrations...");
         match run_pending_sqlite(database_url, EmbeddedMigrationsRef(migrations)) {
             Ok(result) if result.applied.is_empty() => {
@@ -3401,13 +3446,46 @@ mod tests {
 
     #[test]
     fn profile_aliases_are_recognized() {
-        assert!(should_auto_apply(Some("dev"), false));
-        assert!(should_auto_apply(Some("development"), false));
-        assert!(!should_auto_apply(Some("prod"), false));
-        assert!(!should_auto_apply(Some("production"), false));
-        assert!(should_auto_apply(Some("prod"), true));
-        assert!(should_auto_apply(Some("production"), true));
-        assert!(!should_auto_apply(Some("staging"), true));
+        // `auto_migrate` unset (None) — decision falls to convention + alias.
+        assert!(should_auto_apply(Some("dev"), None, false));
+        assert!(should_auto_apply(Some("development"), None, false));
+        assert!(!should_auto_apply(Some("prod"), None, false));
+        assert!(!should_auto_apply(Some("production"), None, false));
+        assert!(should_auto_apply(Some("prod"), None, true));
+        assert!(should_auto_apply(Some("production"), None, true));
+    }
+
+    /// Issue #1903: a CUSTOM profile (`fly`, `staging`, …) that opts in via the
+    /// `auto_migrate_in_production` alias must auto-apply — the old name-gated
+    /// check only honored `prod`/`production`, silently skipping custom profiles
+    /// (the reported bug). And a custom profile with nothing set stays off.
+    #[test]
+    fn should_auto_apply_is_profile_agnostic_for_the_alias() {
+        // THE bug: custom profile + alias opt-in => auto-apply.
+        assert!(should_auto_apply(Some("fly"), None, true));
+        assert!(should_auto_apply(Some("staging"), None, true));
+        // Custom profile, nothing set => opt-in only, stays off.
+        assert!(!should_auto_apply(Some("fly"), None, false));
+        assert!(!should_auto_apply(Some("staging"), None, false));
+    }
+
+    /// Issue #1903: the profile-agnostic `auto_migrate` override wins on ANY
+    /// profile — `Some(true)` forces apply, `Some(false)` forces report-only,
+    /// even on dev.
+    #[test]
+    fn explicit_auto_migrate_overrides_convention_on_any_profile() {
+        // dev/development => auto-apply by default (alias irrelevant).
+        assert!(should_auto_apply(Some("dev"), None, false));
+        assert!(should_auto_apply(Some("development"), None, false));
+        // Explicit false on dev => report-only (override beats convention).
+        assert!(!should_auto_apply(Some("dev"), Some(false), false));
+        assert!(!should_auto_apply(Some("development"), Some(false), true));
+        // Explicit true forces apply on a custom/prod profile with no alias.
+        assert!(should_auto_apply(Some("fly"), Some(true), false));
+        assert!(should_auto_apply(Some("prod"), Some(true), false));
+        // Explicit `auto_migrate` wins even when the alias disagrees.
+        assert!(should_auto_apply(Some("prod"), Some(true), false));
+        assert!(!should_auto_apply(Some("prod"), Some(false), true));
     }
 
     #[test]
@@ -3483,8 +3561,12 @@ mod tests {
 
     #[test]
     fn should_auto_apply_returns_false_for_none_profile() {
-        assert!(!should_auto_apply(None, false));
-        assert!(!should_auto_apply(None, true));
+        // No profile is treated as a non-dev, opt-in profile: off unless an
+        // explicit override or the alias enables it.
+        assert!(!should_auto_apply(None, None, false));
+        assert!(should_auto_apply(None, None, true));
+        assert!(should_auto_apply(None, Some(true), false));
+        assert!(!should_auto_apply(None, Some(false), true));
     }
 
     // ── startup wait-for-DB (red phase) ───────────────────────────────────────

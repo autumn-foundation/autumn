@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
+  Previously the opt-in was name-gated to `prod`/`production`, so a custom
+  profile (`fly`, `staging`, …) with `auto_migrate_in_production = true` silently
+  fell through to log-only and skipped its migrations (crashing later on missing
+  tables). The decision is now convention-over-configuration: `dev`/`development`
+  auto-apply by default; every other profile — prod **and** custom — is opt-in.
+  A new profile-agnostic `database.auto_migrate` (`Option<bool>`,
+  `AUTUMN_DATABASE__AUTO_MIGRATE`) explicitly overrides on any profile, and the
+  existing `auto_migrate_in_production` is retained as a back-compat alias now
+  honored on any non-`dev` profile (so an existing custom-profile config finally
+  takes effect). All applies still route through the advisory-locked runner, and
+  an opt-in profile that is left in report-only mode now logs the profile and the
+  key to set. The framework shard-map (`control` queue) migration now follows the
+  same `database.auto_migrate` decision as app migrations rather than
+  force-applying, so it stays consistent with the profile-agnostic convention (and
+  no longer fails fatally on an unreachable control target under a report-only
+  decision).
 - **cli:** `autumn new <name> --with-i18n` (default fullstack flavor, without
   `--api`) now ships the `i18n/` sidecar into its generated Dockerfile, so the
   runtime image no longer panics at boot when `.i18n_auto()` loads

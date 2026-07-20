@@ -91,6 +91,7 @@ cors.allowed_methods
 cors.allowed_origins
 cors.max_age_secs
 database
+database.auto_migrate
 database.auto_migrate_in_production
 database.connect_timeout_secs
 database.directory_shard_router
