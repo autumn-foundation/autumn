@@ -260,7 +260,11 @@ pin-project-lite = "0.2"
 serde.workspace = true
 serde_json = "1"
 thiserror.workspace = true
-tokio.workspace = true
+# `test-util` is required at runtime by the `#[sim_test]` macro (S-1797): its
+# generated code builds a `start_paused(true)` current-thread runtime so
+# simulation tests run against a paused virtual clock. Enabled here (not just as
+# a dev-dependency) so a downstream crate's `#[sim_test]` compiles out of the box.
+tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, optional = true }
 tokio-util = { workspace = true, features = ["io"] }
 toml.workspace = true
