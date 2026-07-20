@@ -75,7 +75,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has no `i18n/` dir), leaving no stray anchor markers.
 - **mail:** make `DbSuppressionStore` backend-agnostic
   (`Pool<RuntimeConnection>`) so the `sqlite` + `mail` feature union compiles,
-  unblocking the Coverage CI job (#1614).
+  unblocking the Coverage CI job (#1614). The Coverage lane's
+  `--workspace --all-features` catch-all now also `--exclude`s the Pg-only
+  example crates (`blog`, `bookmarks`, `bookmarks-distributed`,
+  `bookmarks-sharded`, `reddit-clone`, `saas`, `todo-app`, `wiki`) and
+  `autumn-admin-plugin`, which cannot compile under the global `sqlite`
+  backend-flip; the examples are not coverage-critical and `autumn-admin-plugin`
+  keeps its coverage via its dedicated `-p` invocation. [no-plugin]
 ### Added
 
 - **router:** new `health.enabled` config knob (default `true`,

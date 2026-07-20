@@ -238,7 +238,18 @@ jobs:
           # separately with an explicit Postgres feature list (every autumn-web
           # feature EXCEPT `sqlite`). Both accumulate into the same profile set.
           PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,system-tests,managed-pg,managed-pg-bundled,tls,acme"
-          cargo llvm-cov --workspace --exclude autumn-web --all-features --no-report
+          # `--all-features` also flips these Pg-only crates to the sqlite
+          # backend they cannot compile against (they pin diesel `postgres` and
+          # use `#[model]`/`Jsonb`/`AsyncPgConnection`). The 8 example apps are
+          # not coverage-critical; autumn-admin-plugin is covered separately via
+          # its own `-p` invocation below (default Pg features). Exclude them so
+          # this workspace catch-all lane compiles under the sqlite flip.
+          cargo llvm-cov --workspace --exclude autumn-web \
+            --exclude autumn-admin-plugin \
+            --exclude blog --exclude bookmarks --exclude bookmarks-distributed \
+            --exclude bookmarks-sharded --exclude reddit-clone --exclude saas \
+            --exclude todo-app --exclude wiki \
+            --all-features --no-report
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES"
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test db_hooks_lifecycle -- --ignored
