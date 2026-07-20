@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **media:** the runtime `MediaConfig` loader is now **profile-aware** (#2066).
+  New `MediaConfig::from_autumn_dir` / `from_autumn_dir_with_env` resolve the
+  active profile (`AUTUMN_ENV` → `AUTUMN_PROFILE` → `--profile` →
+  `AUTUMN_IS_DEBUG=0` ⇒ `prod` → `dev`) and merge the `[media]` subtree across
+  the same layers Autumn's core config loader and the deploy CLI use — base
+  `autumn.toml` `[media]` ← inline `[profile.<name>].media` ←
+  `autumn-<profile>.toml` `[media]` — before applying the runtime's `${VAR}`
+  interpolation and `AUTUMN_MEDIA__*` overrides last. Previously the runtime
+  read only the top-level `[media]` table, so a `[profile.prod.media]` block
+  (or a `[media]` table living only in `autumn-prod.toml`) was honored by a
+  deploy but silently ignored at runtime under `AUTUMN_ENV=prod`. The existing
+  single-file `from_autumn_toml` / `from_toml_str_with_env` entry points are
+  unchanged.
 ### Fixed
 
 - **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
