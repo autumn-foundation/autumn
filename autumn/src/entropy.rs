@@ -55,7 +55,7 @@ use uuid::Uuid;
 /// provided methods built on [`fill_bytes`](Entropy::fill_bytes), so every
 /// source generates RFC 4122 UUIDs identically — a custom source only implements
 /// the two byte-drawing methods.
-pub trait Entropy: Send + Sync + 'static {
+pub trait Entropy: std::fmt::Debug + Send + Sync + 'static {
     /// Draw the next random `u64`.
     fn next_u64(&self) -> u64;
 
@@ -113,6 +113,40 @@ pub(crate) fn uuid_v7_from_parts(unix_millis: u64, rand_bytes: [u8; 10]) -> Uuid
     Uuid::from_bytes(bytes)
 }
 
+/// Derive a stable [`Uuid`] from a `seed` and a `purpose_tag` namespace,
+/// **independently of any draw stream** (issue #1797, seed-derived ids).
+///
+/// The same `(seed, purpose_tag)` pair always yields the same UUID, regardless
+/// of how many other values have been drawn from any RNG — it is a pure
+/// function of its inputs, so it never perturbs (and is never perturbed by) the
+/// main deterministic draw sequence. This makes it ideal for byte-reproducible
+/// multi-tenant fixtures: `derive(seed, "tenant:acme")` is a stable id for
+/// "acme" under that seed.
+///
+/// Mechanism: a stable, platform-independent FNV-1a 64-bit hash of the seed
+/// bytes followed by the tag bytes yields a sub-seed; a `ChaCha8Rng` seeded from
+/// that sub-seed fills 16 bytes, which are stamped as a version-4 (RFC 4122)
+/// UUID. Version 4 is used so a derived id is indistinguishable in shape from a
+/// normally-drawn one; its reproducibility comes purely from the derivation, not
+/// from any embedded structure.
+#[must_use]
+pub(crate) fn derive_uuid_from(seed: u64, purpose_tag: &[u8]) -> Uuid {
+    // FNV-1a 64-bit over seed bytes then tag bytes. Chosen for a fully stable,
+    // dependency-free, cross-platform hash (unlike std's DefaultHasher, whose
+    // output is not guaranteed stable across Rust versions).
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in seed.to_le_bytes().iter().chain(purpose_tag) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    let mut rng = ChaCha8Rng::seed_from_u64(hash);
+    let mut bytes = [0u8; 16];
+    rng.fill_bytes(&mut bytes);
+    uuid_v4_from_bytes(bytes)
+}
+
 // ── OS (real) entropy ─────────────────────────────────────────────────────────
 
 /// Real operating-system entropy implementation of [`Entropy`].
@@ -147,6 +181,7 @@ impl Entropy for OsEntropy {
 /// [`crate::sim::SimRng`] so a `Sim` handle and the `AppState` it mounts agree.
 #[derive(Debug)]
 pub struct SeededEntropy {
+    seed: u64,
     inner: Mutex<ChaCha8Rng>,
 }
 
@@ -155,8 +190,21 @@ impl SeededEntropy {
     #[must_use]
     pub fn new(seed: u64) -> Self {
         Self {
+            seed,
             inner: Mutex::new(ChaCha8Rng::seed_from_u64(seed)),
         }
+    }
+
+    /// Derive a stable [`Uuid`] from this source's seed and a `purpose_tag`
+    /// namespace, **independently of the draw stream** (seed-derived ids).
+    ///
+    /// The same seed and `purpose_tag` always yield the same UUID no matter how
+    /// many bytes have been drawn, so it is safe for byte-reproducible
+    /// multi-tenant fixtures without disturbing the deterministic id stream. See
+    /// [`derive_uuid_from`] for the mechanism and the version bits it sets.
+    #[must_use]
+    pub fn derive_uuid(&self, purpose_tag: impl AsRef<[u8]>) -> Uuid {
+        derive_uuid_from(self.seed, purpose_tag.as_ref())
     }
 
     /// Seed a fresh deterministic entropy source from `seed`, boxed as a shared
@@ -300,6 +348,26 @@ mod tests {
         let a = SeededEntropy::new(1);
         let b = SeededEntropy::new(2);
         assert_ne!(a.uuid_v4(), b.uuid_v4());
+    }
+
+    #[test]
+    fn derive_uuid_is_stable_tag_sensitive_and_stream_independent() {
+        let e = SeededEntropy::new(7);
+        // Same tag ⇒ same id.
+        assert_eq!(e.derive_uuid("tenant:acme"), e.derive_uuid("tenant:acme"));
+        // Different tags ⇒ different ids.
+        assert_ne!(e.derive_uuid("tenant:acme"), e.derive_uuid("tenant:beta"));
+        // Stable regardless of interleaved main-stream draws (order-independent).
+        let before = e.derive_uuid("tenant:acme");
+        let _ = e.uuid_v4();
+        let _ = e.next_u64();
+        assert_eq!(before, e.derive_uuid("tenant:acme"));
+        // Reproducible from a fresh source with the same seed.
+        assert_eq!(before, SeededEntropy::new(7).derive_uuid("tenant:acme"));
+        // Diverges by seed.
+        assert_ne!(before, SeededEntropy::new(8).derive_uuid("tenant:acme"));
+        // Shaped as a v4 UUID.
+        assert_eq!(before.get_version_num(), 4);
     }
 
     #[test]

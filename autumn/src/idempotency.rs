@@ -989,6 +989,7 @@ pub struct IdempotencyLayer {
     replay_through_inner: bool,
     fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 impl IdempotencyLayer {
@@ -1002,7 +1003,19 @@ impl IdempotencyLayer {
             replay_through_inner: false,
             fail_closed_on_replay: false,
             metrics: None,
+            entropy: Arc::new(crate::entropy::OsEntropy),
         }
+    }
+
+    /// Inject the entropy source used to mint in-flight lock owner ids.
+    ///
+    /// Defaults to [`crate::entropy::OsEntropy`]; the framework threads the
+    /// app's seeded source here so lock ids replay deterministically under a
+    /// fixed simulation seed.
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: Arc<dyn crate::entropy::Entropy>) -> Self {
+        self.entropy = entropy;
+        self
     }
 
     #[must_use]
@@ -1050,6 +1063,7 @@ impl<S> Layer<S> for IdempotencyLayer {
             replay_through_inner: self.replay_through_inner,
             fail_closed_on_replay: self.fail_closed_on_replay,
             metrics: self.metrics.clone(),
+            entropy: self.entropy.clone(),
         }
     }
 }
@@ -1066,6 +1080,7 @@ pub struct IdempotencyService<S> {
     replay_through_inner: bool,
     fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 struct IdempotencyRequestConfig {
@@ -1075,6 +1090,7 @@ struct IdempotencyRequestConfig {
     replay_through_inner: bool,
     fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 impl<S> Service<Request<Body>> for IdempotencyService<S>
@@ -1106,6 +1122,7 @@ where
             replay_through_inner: self.replay_through_inner,
             fail_closed_on_replay: self.fail_closed_on_replay,
             metrics: self.metrics.clone(),
+            entropy: self.entropy.clone(),
         };
         Box::pin(handle_idempotent_request(inner, config, req))
     }
@@ -1377,8 +1394,8 @@ fn request_idempotency_key(req: &Request<Body>) -> Option<String> {
     (!key.is_empty()).then(|| key.to_owned())
 }
 
-fn in_flight_lock_owner() -> String {
-    uuid::Uuid::new_v4().to_string()
+fn in_flight_lock_owner(entropy: &dyn crate::entropy::Entropy) -> String {
+    entropy.uuid_v4().to_string()
 }
 
 async fn prepare_idempotency_request(
@@ -1440,12 +1457,13 @@ fn stale_cookie_fallback_in_flight(
     store: &dyn IdempotencyStore,
     prepared: &PreparedIdempotencyRequest,
     in_flight_ttl: Duration,
+    entropy: &dyn crate::entropy::Entropy,
 ) -> bool {
     let Some(key) = prepared.stale_cookie_storage_key.as_deref() else {
         return false;
     };
 
-    let owner = in_flight_lock_owner();
+    let owner = in_flight_lock_owner(entropy);
     if store.try_lock_owned(key, &owner, in_flight_ttl) {
         store.unlock_owned(key, &owner);
         false
@@ -1486,6 +1504,7 @@ where
         replay_through_inner,
         fail_closed_on_replay,
         metrics,
+        entropy,
     } = config;
 
     if !is_mutating_method(req.method()) {
@@ -1525,7 +1544,7 @@ where
         }
     }
 
-    if stale_cookie_fallback_in_flight(store.as_ref(), &prepared, in_flight_ttl) {
+    if stale_cookie_fallback_in_flight(store.as_ref(), &prepared, in_flight_ttl, entropy.as_ref()) {
         tracing::debug!(
             idempotency.key = %prepared.idempotency_key,
             "Stale session cookie idempotency key already in flight — returning 409"
@@ -1537,7 +1556,7 @@ where
     }
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
-    let lock_owner = in_flight_lock_owner();
+    let lock_owner = in_flight_lock_owner(entropy.as_ref());
     if !store.try_lock_owned(&prepared.storage_key, &lock_owner, in_flight_ttl) {
         tracing::debug!(
             idempotency.key = %prepared.idempotency_key,
@@ -1880,6 +1899,31 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Mutex;
     use tower::ServiceExt;
+
+    /// W3 (issue #1797): the in-flight lock owner id is minted from the injected
+    /// entropy source, so a fixed seed reproduces the exact lock-owner stream.
+    #[test]
+    fn in_flight_lock_owner_is_deterministic_under_seeded_entropy() {
+        use crate::entropy::SeededEntropy;
+
+        let a = SeededEntropy::new(0x5eed);
+        let b = SeededEntropy::new(0x5eed);
+        for _ in 0..5 {
+            assert_eq!(
+                in_flight_lock_owner(&a),
+                in_flight_lock_owner(&b),
+                "same seed ⇒ identical lock-owner stream"
+            );
+        }
+        // The owner is a well-formed v4 UUID string.
+        let owner = in_flight_lock_owner(&SeededEntropy::new(1));
+        assert!(uuid::Uuid::parse_str(&owner).is_ok());
+        // A different seed diverges.
+        assert_ne!(
+            in_flight_lock_owner(&SeededEntropy::new(1)),
+            in_flight_lock_owner(&SeededEntropy::new(2)),
+        );
+    }
 
     #[derive(Clone, Default)]
     struct RecordingStore {

@@ -174,6 +174,7 @@ impl Sim {
 /// with the [`crate::entropy::Entropy`] source an app is seeded with, so a
 /// `SimRng` draw and an equivalently-seeded app draw agree.
 pub struct SimRng {
+    seed: u64,
     inner: ChaCha8Rng,
 }
 
@@ -181,8 +182,24 @@ impl SimRng {
     /// Seed a fresh deterministic RNG from `seed`.
     pub(crate) fn new(seed: u64) -> Self {
         Self {
+            seed,
             inner: ChaCha8Rng::seed_from_u64(seed),
         }
+    }
+
+    /// Derive a stable [`Uuid`] from this simulation's seed and a `purpose_tag`
+    /// namespace, **independently of the draw stream** (seed-derived ids).
+    ///
+    /// Unlike [`uuid_v4`](Self::uuid_v4), this does **not** advance the RNG: the
+    /// same seed and `purpose_tag` always produce the same UUID no matter how
+    /// many other values have been drawn, so `derive_uuid("tenant:acme")` is a
+    /// stable, byte-reproducible id for "acme" across runs and machines. Ideal
+    /// for seeding multi-tenant fixtures without perturbing the deterministic id
+    /// stream. See [`crate::entropy::SeededEntropy::derive_uuid`] for the shared
+    /// mechanism and the version bits it sets (v4).
+    #[must_use]
+    pub fn derive_uuid(&self, purpose_tag: impl AsRef<[u8]>) -> Uuid {
+        crate::entropy::derive_uuid_from(self.seed, purpose_tag.as_ref())
     }
 
     /// Draw the next deterministic `u64`.

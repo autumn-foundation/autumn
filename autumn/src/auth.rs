@@ -4991,7 +4991,7 @@ mod api_token_tests {
         let app = axum::Router::new()
             .route("/api/private", axum::routing::get(|| async { "ok" }))
             .layer(RequireApiToken::new(store))
-            .layer(RequestIdLayer);
+            .layer(RequestIdLayer::default());
 
         let response = app
             .oneshot(
