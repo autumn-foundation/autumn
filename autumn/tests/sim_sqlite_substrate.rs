@@ -1,10 +1,10 @@
 //! W4 Definition-of-Done proof (sim-testing, issue #1797): the job/scheduler
-//! drain runs end-to-end against an **in-process, in-memory SQLite** substrate
+//! drain runs end-to-end against an **in-process, in-memory `SQLite`** substrate
 //! over the *representative* local scheduler + job paths.
 //!
-//! This is the W4 "SQLite sim DB lane" acceptance test. It:
+//! This is the W4 "`SQLite` sim DB lane" acceptance test. It:
 //!
-//! 1. Builds a fresh, migrated in-memory SQLite substrate
+//! 1. Builds a fresh, migrated in-memory `SQLite` substrate
 //!    ([`autumn_web::sim::substrate::SqliteSubstrate`]) — a shared-cache in-memory
 //!    database anchored by a kept-alive guard connection, with a registered
 //!    migration applied so the schema is live for every pooled checkout.
@@ -15,7 +15,7 @@
 //!    under the `sqlite` feature (the feature-unification hazard resolution).
 //! 4. Enqueues a `#[job]` and drains it through the **local job runtime**
 //!    (`perform_enqueued_jobs`), whose handler writes a row into the migrated
-//!    SQLite schema — proving the drain ran end-to-end against in-process SQLite.
+//!    `SQLite` schema — proving the drain ran end-to-end against in-process `SQLite`.
 //!
 //! # Divergence (documented, consistent with RFC §12)
 //!
@@ -26,7 +26,7 @@
 //! sqlite` and remain the province of the Postgres integration tests. See
 //! `autumn/src/sim/substrate.rs` for the full rationale.
 //!
-//! Needs no Docker: the substrate is in-memory SQLite, so this is a fast,
+//! Needs no Docker: the substrate is in-memory `SQLite`, so this is a fast,
 //! non-`#[ignore]`d test.
 //!
 //! A **standalone** `[[test]]` binary (not part of the consolidated
@@ -64,8 +64,8 @@ struct MarkArgs {
 }
 
 /// A background job whose handler writes one row into the migration-created
-/// `sim_job_marks` table on the substrate's SQLite pool. Its side effect is the
-/// row itself, so the drain is observable by querying SQLite afterwards.
+/// `sim_job_marks` table on the substrate's `SQLite` pool. Its side effect is the
+/// row itself, so the drain is observable by querying `SQLite` afterwards.
 #[job(name = "sim_write_mark", max_attempts = 1, backoff_ms = 1)]
 async fn sim_write_mark(state: AppState, args: MarkArgs) -> AutumnResult<()> {
     let pool = state
@@ -100,9 +100,9 @@ struct MarkRow {
     tag: String,
 }
 
-/// The full W4 DoD: migrated in-memory SQLite substrate → mounted app → local
+/// The full W4 `DoD`: migrated in-memory `SQLite` substrate → mounted app → local
 /// scheduler resolves in-process (and rejects Postgres) → local job drain writes
-/// to the migrated SQLite schema end-to-end.
+/// to the migrated `SQLite` schema end-to-end.
 #[tokio::test]
 async fn job_and_scheduler_drain_end_to_end_on_sqlite_substrate() {
     // Serialize on the global-job-runtime lock (the `#[job]::enqueue` path uses
