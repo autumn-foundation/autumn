@@ -1,5 +1,32 @@
 # Contributing to Autumn
 
+## Before you push
+
+Run the pre-push gate, which compiles the **same targets CI compiles** so a
+cross-package break is caught locally instead of on the PR:
+
+```sh
+./scripts/pre-push-check.sh
+```
+
+It mirrors CI's always-on `lint` + `test` jobs (`.github/workflows/ci.yml`) —
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, and a **compile-only** `cargo test --workspace --no-run`. The
+compile-only step is the important one: CI's blocking gate is `cargo test
+--workspace`, which links **every** workspace test target including the
+autumn-web consolidated `integration_tests` binary. A narrower loop like `cargo
+test -p autumn-cli` never compiles that binary, so a cross-package compile break
+(e.g. the #1614 sqlite+mail `E0308`) passes locally and only shows up in CI,
+where it looks like a flake.
+
+`--no-run` compiles those targets without executing them, deliberately skipping
+the trybuild suite (`autumn/tests/integration/compile_fail.rs`) whose cases each
+spawn a nested `cargo build` at test-**run** time — expanding scratch by ~17GB
+and risking `ENOSPC`. So the gate stays disk-cheap. It does **not** cover the
+Docker/testcontainer, `sqlite`-backend, or Chromium `system-tests` lanes (those
+run in dedicated CI jobs); `cargo test -p <pkg>` remains fine for iterating on a
+single crate — just run `./scripts/pre-push-check.sh` before you push.
+
 ## Generator conformance gate
 
 Autumn's headline DX promise is that `autumn new` and `autumn generate` emit

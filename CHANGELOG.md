@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deterministically claims and runs ready durable repository commit hooks in
   integration tests — driving the real worker→drain wiring without starting the
   timing-based background commit-hook worker — and returns the number processed.
+
+- **dev:** add `scripts/pre-push-check.sh`, a compile-only (`--no-run`) pre-push
+  gate that mirrors CI's `lint` + `test` jobs (`cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets`, and `cargo test --workspace
+  --no-run`). It compiles every workspace test target — including the autumn-web
+  consolidated `integration_tests` binary that a narrow `cargo test -p
+  autumn-cli` loop never links — so cross-package compile breaks (e.g. the #1614
+  sqlite+mail `E0308`) are caught locally instead of surfacing as CI "flakes".
+  `--no-run` keeps it disk-cheap by skipping the trybuild run that expands
+  scratch by ~17GB. Documented in CONTRIBUTING.md "Before you push". [no-plugin]
+
 - **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
   shared, **multi-process-safe** database-backed implementation. The `RoomStore`
   trait, `RoomService`, and the four room HTTP handlers are now `async` (via

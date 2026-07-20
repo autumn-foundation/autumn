@@ -19,6 +19,11 @@ separate, deliberate step the user asks for by name.
 - **Test all**: `cargo test --workspace`
 - **Test specific package**: `cargo test -p <pkg>`
 - **Test specific target**: `cargo test -p <pkg> --test <target>`
+- **Pre-push gate**: `./scripts/pre-push-check.sh` — compile-only (`--no-run`)
+  mirror of CI's `lint` + `test` jobs. Run it before pushing: a narrow `cargo
+  test -p <pkg>` never links the autumn-web consolidated `integration_tests`
+  binary, so it misses cross-package compile breaks the CI `cargo test
+  --workspace` gate catches. See CONTRIBUTING.md "Before you push".
 
 ---
 
