@@ -39,7 +39,7 @@
 //!   it via systemd and assumes the binary is on `PATH`/`/usr/local/bin`.
 //! - Live ssh is not exercised here (Slice 4's CI container harness).
 
-use super::exec::{DeployOp, FileContents, RemoteCommand, shell_quote};
+use super::exec::{DeployOp, FileContents, ProxyServiceOptions, RemoteCommand, shell_quote};
 
 /// Absolute path the proxy binary is expected at on the target.
 const KAMAL_PROXY_BIN: &str = "/usr/local/bin/kamal-proxy";
@@ -169,6 +169,12 @@ pub trait ProxyController {
     /// (an unchanged unit must NOT restart — that preserves today's steady-state
     /// no-restart behavior).
     ///
+    /// `reregister_options` is the proxy TLS/host the still-live OLD release was
+    /// registered with (recovered from the `shared/proxy-options` marker, issue
+    /// #2074). The change-gated re-register carries THESE options — NOT the
+    /// controller's new config — so a later-op failure + rollback leaves the old
+    /// release on its own host/TLS rather than the new/removed one.
+    ///
     /// The default is exactly [`Self::ensure_installed_ops`] (write + enable, NO
     /// restart): a controller that provisions its own pinned binary/config and has
     /// nothing to "restart to adopt" — e.g. a future `CaddyController` — inherits
@@ -179,9 +185,23 @@ pub trait ProxyController {
         service: &str,
         live_upstream: &str,
         snapshot_path: &str,
+        reregister_options: &ProxyServiceOptions,
     ) -> Vec<DeployOp> {
-        let _ = (service, live_upstream, snapshot_path);
+        let _ = (service, live_upstream, snapshot_path, reregister_options);
         self.ensure_installed_ops(public_port)
+    }
+
+    /// The proxy `ServiceOptions` (TLS on/off + host) THIS controller registers on a
+    /// deploy (issue #2074), persisted to the `shared/proxy-options` marker so the
+    /// NEXT redeploy can preserve the old release's own options across the durability
+    /// re-register. The default is TLS-off (a controller that terminates no TLS —
+    /// e.g. a future `CaddyController`); [`KamalProxyController`] returns its
+    /// configured `tls_host`.
+    fn proxy_service_options(&self) -> ProxyServiceOptions {
+        ProxyServiceOptions {
+            tls: false,
+            host: None,
+        }
     }
 
     /// Op that points `service`'s public port at `upstream` (`host:port`) for the
@@ -273,6 +293,27 @@ impl KamalProxyController {
     /// flip ([`Self::flip_op`]) pass `false` and STAY health-gated (unchanged): they
     /// route to a candidate whose readiness must genuinely be proven first.
     fn deploy_shell(&self, service: &str, target: &str, force: bool) -> String {
+        // The common route/flip/re-register uses THIS controller's configured
+        // `tls_host`; only the #2074 durability re-register overrides it (below).
+        self.deploy_shell_with_tls(service, target, force, self.tls_host.as_deref())
+    }
+
+    /// [`Self::deploy_shell`] with a per-call TLS host override (issue #2074).
+    ///
+    /// The durability-refresh re-register of the still-live OLD release must carry
+    /// that release's OWN `--host/--tls` (recovered from the `shared/proxy-options`
+    /// marker), NOT the controller's new config, so a rollback never strands the old
+    /// release behind the new/removed host. `tls_host = None` emits the HTTP-only
+    /// form (no `--host/--tls` — a TLS-removed re-register). The route/flip delegate
+    /// here via [`Self::deploy_shell`] with `self.tls_host`, so their output is
+    /// unchanged.
+    fn deploy_shell_with_tls(
+        &self,
+        service: &str,
+        target: &str,
+        force: bool,
+        tls_host: Option<&str>,
+    ) -> String {
         // Every string parameter is shell-quoted so a service name, upstream, or
         // health-check path carrying query params / special chars can't break out
         // of the command. The numeric timeouts need no quoting.
@@ -292,7 +333,7 @@ impl KamalProxyController {
         // TLS (opt-in): `--host <host> --tls` sits in a STABLE position between
         // the health-check path and the timeouts. When `tls_host` is `None` the
         // segment is empty and the command is byte-for-byte the HTTP-only form.
-        let tls = self.tls_host.as_deref().map_or_else(String::new, |host| {
+        let tls = tls_host.map_or_else(String::new, |host| {
             format!("--host {host} --tls ", host = shell_quote(host))
         });
         // `--force` (re-register only, issue #2071) trails the stable flag block, so
@@ -465,6 +506,7 @@ impl ProxyController for KamalProxyController {
         service: &str,
         live_upstream: &str,
         snapshot_path: &str,
+        reregister_options: &ProxyServiceOptions,
     ) -> Vec<DeployOp> {
         let unit = shell_quote(KAMAL_PROXY_UNIT_PATH);
         let snap = shell_quote(snapshot_path);
@@ -525,14 +567,19 @@ impl ProxyController for KamalProxyController {
         //   * An UNCHANGED unit (steady-state redeploy) takes NEITHER branch — today's
         //     no-restart behavior is preserved exactly, so a routine redeploy never
         //     churns the shared proxy.
-        // The re-register reuses `deploy_shell` (with `force = true`), so it keeps the
-        // `env -u XDG_RUNTIME_DIR` control-socket pin (#2019) and any `--host/--tls`
-        // segment. The `|| exit 1` fail-fast on `systemctl restart` is unchanged.
-        //
-        // Operator advisory: do not combine the one-time proxy reboot-durability
-        // upgrade with a `deploy.tls.host` change in the same deploy — the pre-flip
-        // route refresh re-registers the live release with the current TLS host, so
-        // a failed rollback could strand the previous host. Tracked in #2074.
+        // The re-register uses `deploy_shell_with_tls` (with `force = true`), so it
+        // keeps the `env -u XDG_RUNTIME_DIR` control-socket pin (#2019). It carries
+        // `reregister_options`' `--host/--tls` — the still-live OLD release's OWN
+        // options recovered from the `shared/proxy-options` marker (issue #2074), NOT
+        // this controller's new config — so a failed rollback leaves the old release
+        // on its own host/TLS instead of stranding it behind the new/removed host.
+        // The candidate flip (`flip_op`) still uses `self.tls_host` (the new config),
+        // so the new release gets the new host. The `|| exit 1` fail-fast on
+        // `systemctl restart` is unchanged. On an ABSENT marker the redeploy arm
+        // passes the new config as `reregister_options` (proceed-as-legacy: the
+        // durability-upgrade deploy's kamal-proxy table is empty, so there is nothing
+        // to preserve — refusing there would deadlock every pre-#2074 host's first
+        // redeploy); an UNREADABLE marker is refused at pre-flight before this runs.
         ops.push(DeployOp::Run(RemoteCommand::new(
             "proxy-restart-if-changed",
             format!(
@@ -549,10 +596,25 @@ impl ProxyController for KamalProxyController {
                  echo 'kamal-proxy did not accept the live route after restart' >&2; exit 1; fi; \
                  sleep 0.5; \
                  done",
-                reregister = self.deploy_shell(service, live_upstream, true),
+                reregister = self.deploy_shell_with_tls(
+                    service,
+                    live_upstream,
+                    true,
+                    reregister_options.host.as_deref()
+                ),
             ),
         )));
         ops
+    }
+
+    fn proxy_service_options(&self) -> ProxyServiceOptions {
+        // Authoritative "what did we actually register": `deploy_shell` emits
+        // `--host/--tls` iff `tls_host` is `Some`, so the marker mirrors that exactly
+        // (a configured-but-blank host resolves to `tls_host = None` upstream → TLS-off).
+        ProxyServiceOptions {
+            tls: self.tls_host.is_some(),
+            host: self.tls_host.clone(),
+        }
     }
 
     fn compat_probe(&self) -> Option<ProxyCompatProbe> {
@@ -741,7 +803,16 @@ mod tests {
 
         // The re-register (last op of the refresh) is forced, socket-pinned, and
         // targets the LIVE upstream.
-        let ops = proxy.refresh_installed_ops(8080, "myapp", "127.0.0.1:3001", "/tmp/snap.sha256");
+        let ops = proxy.refresh_installed_ops(
+            8080,
+            "myapp",
+            "127.0.0.1:3001",
+            "/tmp/snap.sha256",
+            &ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
+        );
         let DeployOp::Run(restart) = ops.last().expect("has ops") else {
             panic!("last op must be the restart/re-register");
         };
@@ -995,6 +1066,10 @@ mod tests {
             "myapp",
             "127.0.0.1:3001",
             "/tmp/autumn-kamal-proxy-unit-REL.sha256",
+            &ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
         );
         assert_eq!(ops.len(), 4, "snapshot + write-unit + install + restart");
 
@@ -1088,11 +1163,21 @@ mod tests {
 
     #[test]
     fn refresh_installed_ops_tls_reregister_carries_host_and_tls() {
-        // With TLS enabled, the change-gated re-register carries the same
-        // `--host <h> --tls` segment as the flip, so a restarted TLS proxy re-adopts
-        // the live route with its cert config intact.
+        // With TLS, the change-gated re-register carries the PRESERVED old release's
+        // `--host <h> --tls` segment (issue #2074), so a restarted TLS proxy re-adopts
+        // the live route with its own cert config intact. Here the preserved options
+        // match the controller's config (a steady-state redeploy).
         let proxy = KamalProxyController::new(60).with_tls_host(Some("app.example.com".to_owned()));
-        let ops = proxy.refresh_installed_ops(8080, "myapp", "127.0.0.1:3001", "/tmp/snap.sha256");
+        let ops = proxy.refresh_installed_ops(
+            8080,
+            "myapp",
+            "127.0.0.1:3001",
+            "/tmp/snap.sha256",
+            &ProxyServiceOptions {
+                tls: true,
+                host: Some("app.example.com".to_owned()),
+            },
+        );
         let DeployOp::Run(restart) = ops.last().expect("has ops") else {
             panic!("last op must be the restart");
         };
@@ -1104,6 +1189,94 @@ mod tests {
             ),
             "TLS re-register carries --host/--tls and --force: {}",
             restart.shell,
+        );
+    }
+
+    #[test]
+    fn refresh_reregister_preserves_old_options_while_flip_uses_new_host() {
+        // #2074 PRESERVE: the operator changed `deploy.tls.host` to `new.example.com`,
+        // but the still-live OLD release was registered under `old.example.com`. The
+        // durability re-register must carry the OLD host (recovered from the marker),
+        // while the candidate flip carries the NEW host — so a rollback leaves the old
+        // release on its own host, not the new one.
+        let proxy = KamalProxyController::new(60).with_tls_host(Some("new.example.com".to_owned()));
+        let ops = proxy.refresh_installed_ops(
+            8080,
+            "myapp",
+            "127.0.0.1:3001",
+            "/tmp/snap.sha256",
+            &ProxyServiceOptions {
+                tls: true,
+                host: Some("old.example.com".to_owned()),
+            },
+        );
+        let DeployOp::Run(restart) = ops.last().expect("has ops") else {
+            panic!("last op must be the restart/re-register");
+        };
+        assert!(
+            restart.shell.contains("--host 'old.example.com' --tls")
+                && !restart.shell.contains("new.example.com"),
+            "re-register of the live OLD release preserves the OLD host, not the new: {}",
+            restart.shell,
+        );
+        // The candidate flip still carries the NEW config host.
+        let DeployOp::Run(flip) = proxy.flip_op("myapp", "127.0.0.1:3002") else {
+            panic!("flip_op must be a Run op");
+        };
+        assert!(
+            flip.shell.contains("--host 'new.example.com' --tls")
+                && !flip.shell.contains("old.example.com"),
+            "the candidate flip carries the NEW host: {}",
+            flip.shell,
+        );
+    }
+
+    #[test]
+    fn refresh_reregister_can_preserve_tls_off_removing_a_host() {
+        // #2074: a removed host is representable — preserving TLS-off options emits the
+        // plain HTTP-only re-register (no `--host/--tls`), even when the controller's
+        // NEW config turned TLS on. So a redeploy that ADDS a host never strands the
+        // old (host-less) release behind the new host on a rollback.
+        let proxy = KamalProxyController::new(60).with_tls_host(Some("new.example.com".to_owned()));
+        let ops = proxy.refresh_installed_ops(
+            8080,
+            "myapp",
+            "127.0.0.1:3001",
+            "/tmp/snap.sha256",
+            &ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
+        );
+        let DeployOp::Run(restart) = ops.last().expect("has ops") else {
+            panic!("last op must be the restart/re-register");
+        };
+        assert!(
+            !restart.shell.contains("--host") && !restart.shell.contains("--tls "),
+            "preserving TLS-off options emits an HTTP-only re-register: {}",
+            restart.shell,
+        );
+    }
+
+    #[test]
+    fn proxy_service_options_mirror_the_configured_tls_host() {
+        // The controller reports the options it actually registers, so the marker
+        // written at deploy time matches what kamal-proxy was told (issue #2074).
+        assert_eq!(
+            KamalProxyController::new(60).proxy_service_options(),
+            ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
+        );
+        assert_eq!(
+            KamalProxyController::new(60)
+                .with_tls_host(Some("app.example.com".to_owned()))
+                .proxy_service_options(),
+            ProxyServiceOptions {
+                tls: true,
+                host: Some("app.example.com".to_owned()),
+            },
         );
     }
 
@@ -1124,8 +1297,16 @@ mod tests {
                 DeployOp::Run(RemoteCommand::new("flip", "true"))
             }
         }
-        let refreshed =
-            PinnedController.refresh_installed_ops(80, "svc", "127.0.0.1:9001", "/tmp/x");
+        let refreshed = PinnedController.refresh_installed_ops(
+            80,
+            "svc",
+            "127.0.0.1:9001",
+            "/tmp/x",
+            &ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
+        );
         let installed = PinnedController.ensure_installed_ops(80);
         assert_eq!(refreshed.len(), installed.len());
         assert!(

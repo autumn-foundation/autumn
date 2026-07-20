@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **deploy:** the one-time kamal-proxy reboot-durability upgrade (#2070/#2071) no
+  longer stamps a new/removed `deploy.tls.host` onto the still-live OLD release
+  during its pre-flip forced re-register (#2074). Because kamal-proxy exposes no
+  `ServiceOptions` read-back, autumn now records the TLS/host options each forward
+  deploy registered in a host-side `shared/proxy-options` marker (`{tls}\t{host}`,
+  written atomically alongside the live-slot marker on both first deploy and
+  cutover) and reads it back at deploy-start. On a redeploy the durability
+  re-register of the still-live old release preserves ITS recorded options (the
+  candidate flip still adopts the new config), so a later-op failure + rollback
+  leaves the old release on its own host/TLS instead of behind the changed one.
+  An absent marker (a legacy host's first redeploy) proceeds as before and
+  self-heals by writing the marker; an unreadable marker fails closed at
+  pre-flight (mirroring the #2073 port-change refuse) with two-deploy repair
+  guidance. Part of #1607.
 ### Added
 
 - **sim-testing:** `#[sim_test]` macro and public `Sim` skeleton for

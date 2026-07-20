@@ -510,6 +510,18 @@ fn previous_release_marker(cfg: &ResolvedDeployConfig) -> String {
     format!("{}/shared/previous-release", cfg.app_dir)
 }
 
+/// Remote marker file recording the proxy `ServiceOptions` (TLS on/off + host) the
+/// LAST forward deploy registered with kamal-proxy, stored as `{tls}\t{host}`
+/// (`1\tapp.example.com` for TLS-on, `0\t` for TLS-off/removed) — so the next
+/// redeploy's durability-refresh re-register can PRESERVE the old release's own
+/// TLS/host instead of stamping the new config's onto the still-live old release
+/// (issue #2074). kamal-proxy exposes no `ServiceOptions` read-back, so this
+/// host-side marker is the only way to recover what was actually registered.
+/// Mirrors [`live_slot_marker`]'s path convention (both live under `shared/`).
+fn proxy_options_marker(cfg: &ResolvedDeployConfig) -> String {
+    format!("{}/shared/proxy-options", cfg.app_dir)
+}
+
 /// The resolved blue/green slot layout for a deploy.
 ///
 /// The candidate always takes the slot the live release is NOT using, so both
@@ -667,6 +679,10 @@ pub fn first_deploy_ops(
             plan.candidate_slot,
             plan.candidate_port,
         )),
+        // Record the proxy TLS/host options this deploy registers (issue #2074), so
+        // the NEXT redeploy's durability-refresh re-register can preserve THIS
+        // release's own options across the one-time reboot-durability restart.
+        DeployOp::Run(record_proxy_options(cfg, &proxy.proxy_service_options())),
         // A first deploy has no previous release: clear any stale previous-release
         // marker so an on-demand rollback correctly reports NoPreviousRelease
         // rather than pointing at a since-removed release from a prior lifecycle.
@@ -731,6 +747,7 @@ pub fn cutover_ops(
     manifests: &[ManifestUpload],
     release_id: &str,
     plan: &SlotPlan,
+    reregister_options: &ProxyServiceOptions,
 ) -> Vec<DeployOp> {
     let release_dir = format!("{}/{release_id}", cfg.releases_dir());
     let remote_binary = format!("{release_dir}/{}", cfg.app_name);
@@ -759,11 +776,18 @@ pub fn cutover_ops(
     // derived live port necessarily equals the port the live release actually binds —
     // a live-safe port change is future work (Option C). The candidate/flip below use
     // the new derived candidate port, which the new release genuinely binds.
+    //
+    // The re-register carries `reregister_options` — the OLD release's own TLS/host
+    // recovered from the `shared/proxy-options` marker (issue #2074) — NOT the new
+    // config's, so a later-op failure + rollback leaves the still-live old release on
+    // its OWN host/TLS instead of the new/removed one. The candidate flip below still
+    // uses the controller's NEW `tls_host`.
     let mut ops = proxy.refresh_installed_ops(
         plan.public_port,
         &cfg.service_name,
         &loopback_upstream(plan.live_port),
         &proxy_unit_snapshot_path(release_id),
+        reregister_options,
     );
     ops.push(DeployOp::Run(RemoteCommand::new(
         "prepare-dirs",
@@ -845,6 +869,12 @@ pub fn cutover_ops(
                 port: plan.live_port,
             },
         )),
+        // Record the proxy TLS/host options this cutover registered on the new
+        // release (issue #2074) — the controller's NEW `tls_host`, NOT the preserved
+        // `reregister_options` — so the NEXT redeploy preserves the options THIS
+        // release actually serves behind. Written after the marker commit (the flip
+        // has landed), atomically via mktemp + `mv`.
+        DeployOp::Run(record_proxy_options(cfg, &proxy.proxy_service_options())),
         DeployOp::Run(RemoteCommand::new(
             "drain-old",
             format!("systemctl disable --now {live_unit}.service"),
@@ -1212,6 +1242,33 @@ fn record_live_slot(cfg: &ResolvedDeployConfig, slot: &str, port: u16) -> Remote
     )
 }
 
+/// Command that records the proxy `ServiceOptions` (TLS on/off + host) THIS deploy
+/// registered with kamal-proxy into the `shared/proxy-options` marker (issue
+/// #2074), so the NEXT redeploy's durability-refresh re-register can preserve the
+/// old release's own TLS/host instead of stamping the new config's onto it.
+///
+/// Written atomically (mktemp + `mv -f` into the marker's own `shared/` dir, an
+/// atomic same-filesystem rename), matching [`commit_markers_command`], so a
+/// concurrent next-deploy probe never observes a half-written marker. The value is
+/// [`ProxyServiceOptions::marker_value`] (`{tls}\t{host}`), shell-quoted whole so a
+/// host with special chars can't break out of the command.
+fn record_proxy_options(
+    cfg: &ResolvedDeployConfig,
+    options: &ProxyServiceOptions,
+) -> RemoteCommand {
+    let shared = cfg.shared_dir();
+    let tmpl = format!("{shared}/proxy-options.tmp.XXXXXX");
+    RemoteCommand::new(
+        "record-proxy-options",
+        format!(
+            "otmp=$(mktemp {tmpl}) && printf '%s' {value} > \"$otmp\" && mv -f \"$otmp\" {marker}",
+            tmpl = shell_quote(&tmpl),
+            value = shell_quote(&options.marker_value()),
+            marker = shell_quote(&proxy_options_marker(cfg)),
+        ),
+    )
+}
+
 /// Fallback slot + loopback port for the previous-release marker, used only when
 /// the CURRENT live-slot marker is absent or predates the port field (older
 /// slot-only format), so parsing never fails. In the normal path the real slot +
@@ -1388,6 +1445,96 @@ pub enum DeployMode {
     },
 }
 
+/// The proxy `ServiceOptions` (TLS on/off + host) a forward deploy registered
+/// with kamal-proxy (issue #2074), recorded in the `shared/proxy-options` marker
+/// so the next redeploy's durability-refresh re-register can PRESERVE the old
+/// release's own TLS/host rather than stamp the new config's onto the still-live
+/// old release. `host` is `Some` iff `tls` (kamal-proxy only carries a `--host`
+/// when `--tls` is on); a removed host is representable as `{tls:false,host:None}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyServiceOptions {
+    /// Whether the deploy registered TLS (`--host <host> --tls`).
+    pub tls: bool,
+    /// The TLS host, `Some` iff `tls` (empty/absent when TLS is off).
+    pub host: Option<String>,
+}
+
+impl ProxyServiceOptions {
+    /// Serialize to the `shared/proxy-options` marker value: `{tls}\t{host}`, with
+    /// `tls` as `1`/`0` and `host` empty when TLS is off. Round-trips through
+    /// [`parse_proxy_options`]. The single-string form (rather than two printf args)
+    /// keeps the write DRY with the parser and the tests.
+    #[must_use]
+    fn marker_value(&self) -> String {
+        format!(
+            "{}\t{}",
+            if self.tls { "1" } else { "0" },
+            self.host.as_deref().unwrap_or("")
+        )
+    }
+}
+
+/// The `shared/proxy-options` marker state captured in the deploy-start probe
+/// round-trip (issue #2074), mirroring [`InstalledProxyPort`]. The redeploy path
+/// uses it to decide the durability-refresh re-register's TLS/host:
+///
+/// - [`Self::Absent`] (no marker / a legacy host) → proceed as legacy: re-register
+///   with the NEW config options and WRITE the marker this deploy (self-heals);
+/// - [`Self::Options`] → PRESERVE these OLD options on the re-register of the
+///   still-live old release (the candidate flip still uses the new config);
+/// - [`Self::Unreadable`] (present but unparseable) → FAIL CLOSED (refuse) — the old
+///   options can't be proved, so a concurrent host change can't be safely preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyOptionsMarker {
+    /// No `shared/proxy-options` marker on disk (a first-deploy shape, or a
+    /// pre-#2074 host that never wrote one). Treated as legacy — see the enum docs.
+    Absent,
+    /// The marker file is present but its `{tls}\t{host}` value could not be parsed
+    /// (missing field, bad TLS token, or TLS-on with an empty host). The refuse
+    /// guard FAILS CLOSED here — the old options can't be proved.
+    Unreadable,
+    /// The parsed options the last forward deploy registered.
+    Options(ProxyServiceOptions),
+}
+
+/// Parse the probe's proxy-options section into a [`ProxyOptionsMarker`] (#2074).
+///
+/// The section is `cat shared/proxy-options` (empty when the file is absent). The
+/// marker value is `{tls}\t{host}` (see [`ProxyServiceOptions::marker_value`]):
+///
+/// - empty (absent file, or an empty marker) → [`ProxyOptionsMarker::Absent`];
+/// - `1\t<non-empty host>` → `Options{tls:true, host:Some(host)}`;
+/// - `0\t` (host ignored) → `Options{tls:false, host:None}`;
+/// - anything else — no tab (missing field), a non-`{0,1}` TLS token, or `1\t` with
+///   an empty host → [`ProxyOptionsMarker::Unreadable`] (fail closed).
+///
+/// Only surrounding newlines are trimmed (NOT the tab), so a well-formed TLS-off
+/// `0\t` is not mistaken for a fieldless `0`.
+fn parse_proxy_options(section: &str) -> ProxyOptionsMarker {
+    let s = section.trim_matches(|c| c == '\n' || c == '\r');
+    if s.is_empty() {
+        return ProxyOptionsMarker::Absent;
+    }
+    // Exactly two tab fields; a missing tab (fieldless) can't be trusted → fail closed.
+    let mut parts = s.splitn(2, '\t');
+    let tls_field = parts.next().unwrap_or_default();
+    let Some(host_field) = parts.next() else {
+        return ProxyOptionsMarker::Unreadable;
+    };
+    match tls_field {
+        "1" if !host_field.is_empty() => ProxyOptionsMarker::Options(ProxyServiceOptions {
+            tls: true,
+            host: Some(host_field.to_owned()),
+        }),
+        "0" => ProxyOptionsMarker::Options(ProxyServiceOptions {
+            tls: false,
+            host: None,
+        }),
+        // `1\t` with an empty host, a bad TLS token, or any other shape: unprovable.
+        _ => ProxyOptionsMarker::Unreadable,
+    }
+}
+
 /// The `--http-port` state of the currently-installed kamal-proxy systemd unit,
 /// captured in the same deploy-start probe round-trip (#2073). The redeploy path
 /// uses it to REFUSE a concurrent `server.port` change before touching the proxy:
@@ -1427,6 +1574,13 @@ const PROXY_UNIT_DELIM: &str = "---autumn-kamal-proxy-unit---";
 /// [`InstalledProxyPort::Unreadable`] (unit present but no parseable `--http-port`).
 const NO_PROXY_UNIT_SENTINEL: &str = "---autumn-no-proxy-unit---";
 
+/// Delimiter appended after the installed-unit `--http-port` grep, before the
+/// `shared/proxy-options` marker `cat` (#2074), so all four sections ride in ONE
+/// round-trip. Its ABSENCE (older recorded output / a scripted test) leaves an
+/// empty options section → [`ProxyOptionsMarker::Absent`] (proceed as legacy — the
+/// refuse guard never fires on synthetic input).
+const PROXY_OPTIONS_DELIM: &str = "---autumn-kamal-proxy-options---";
+
 /// The outcome of the deploy-start probe: the first-vs-redeploy [`DeployMode`],
 /// the raw `kamal-proxy list` output, AND the installed proxy unit's `--http-port`
 /// state — all captured in the SAME remote round-trip, so a drifted live-slot
@@ -1442,6 +1596,10 @@ pub struct DeployProbe {
     /// The installed kamal-proxy unit's `--http-port` (#2073), used by the redeploy
     /// path to refuse a concurrent `server.port` change before touching the proxy.
     pub installed_proxy_port: InstalledProxyPort,
+    /// The proxy TLS/host options the last forward deploy recorded (#2074), used by
+    /// the redeploy path to PRESERVE the old release's options on the durability
+    /// re-register — or FAIL CLOSED when the marker is present but unreadable.
+    pub last_proxy_options: ProxyOptionsMarker,
 }
 
 /// Parse the probe's unit section into an [`InstalledProxyPort`] (#2073).
@@ -1487,11 +1645,13 @@ fn parse_installed_proxy_port(section: &str) -> InstalledProxyPort {
 /// so on a real pam host the list would silently come back empty — disabling both
 /// the #1938 drift reconcile and the observed-port path.
 /// The mode section is split off on [`PROXY_LIST_DELIM`]; the remainder is split on
-/// [`PROXY_UNIT_DELIM`] into the proxy list and the installed-unit `--http-port`
-/// grep. When a delimiter is absent (older recorded output / a scripted test) that
-/// trailing section is empty and the probe degrades safely — an empty proxy list
-/// (reconcile falls back to the marker) and [`InstalledProxyPort::Absent`] (the
-/// refuse guard treats it as "nothing to conflict with").
+/// [`PROXY_UNIT_DELIM`] into the proxy list and the installed-unit section, which is
+/// itself split on [`PROXY_OPTIONS_DELIM`] into the `--http-port` grep and the
+/// `shared/proxy-options` marker `cat` (#2074). When a delimiter is absent (older
+/// recorded output / a scripted test) that trailing section is empty and the probe
+/// degrades safely — an empty proxy list (reconcile falls back to the marker),
+/// [`InstalledProxyPort::Absent`], and [`ProxyOptionsMarker::Absent`] (each treated
+/// as "nothing to conflict with" / "proceed as legacy").
 ///
 /// # Errors
 ///
@@ -1507,7 +1667,9 @@ pub fn probe_deploy_state(
          env -u XDG_RUNTIME_DIR kamal-proxy list 2>/dev/null || true; \
          printf '\\n{unit_delim}\\n'; \
          if [ -f {unit} ]; then grep -hoE -e '--http-port[[:space:]]+[0-9]+' {unit} 2>/dev/null || true; \
-         else printf '%s' '{no_unit}'; fi",
+         else printf '%s' '{no_unit}'; fi; \
+         printf '\\n{opts_delim}\\n'; \
+         cat {opts_marker} 2>/dev/null || true",
         current = shell_quote(&cfg.current_symlink()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
@@ -1515,6 +1677,8 @@ pub fn probe_deploy_state(
         unit_delim = PROXY_UNIT_DELIM,
         unit = shell_quote(super::proxy::KAMAL_PROXY_UNIT_PATH),
         no_unit = NO_PROXY_UNIT_SENTINEL,
+        opts_delim = PROXY_OPTIONS_DELIM,
+        opts_marker = shell_quote(&proxy_options_marker(cfg)),
     );
     let out = exec.run(&RemoteCommand::new("detect-current", shell))?;
     let (mode_part, rest) = out
@@ -1522,11 +1686,24 @@ pub fn probe_deploy_state(
         .split_once(PROXY_LIST_DELIM)
         .unwrap_or((out.stdout.as_str(), ""));
     // Split the proxy list from the installed-unit section. A missing unit delimiter
-    // (older/scripted output) → empty unit section → `Absent` (never a spurious refuse).
-    let (proxy_list, installed_proxy_port) = match rest.split_once(PROXY_UNIT_DELIM) {
-        Some((list, unit_section)) => (list, parse_installed_proxy_port(unit_section)),
-        None => (rest, InstalledProxyPort::Absent),
-    };
+    // (older/scripted output) → empty unit + options sections → `Absent`/`Absent`
+    // (never a spurious refuse, always proceed-as-legacy).
+    let (proxy_list, installed_proxy_port, last_proxy_options) =
+        match rest.split_once(PROXY_UNIT_DELIM) {
+            Some((list, after_unit)) => {
+                // The installed-unit section further splits into the `--http-port` grep and
+                // the proxy-options marker; a missing options delimiter → empty → `Absent`.
+                let (unit_section, opts_section) = after_unit
+                    .split_once(PROXY_OPTIONS_DELIM)
+                    .unwrap_or((after_unit, ""));
+                (
+                    list,
+                    parse_installed_proxy_port(unit_section),
+                    parse_proxy_options(opts_section),
+                )
+            }
+            None => (rest, InstalledProxyPort::Absent, ProxyOptionsMarker::Absent),
+        };
     let mode = mode_part
         .trim()
         .strip_prefix("redeploy:")
@@ -1544,6 +1721,7 @@ pub fn probe_deploy_state(
         mode,
         proxy_list: proxy_list.to_owned(),
         installed_proxy_port,
+        last_proxy_options,
     })
 }
 
@@ -2330,6 +2508,12 @@ mod tests {
             &sample_manifests(),
             RELEASE_ID,
             &plan,
+            // The default `proxy()` terminates no TLS, so the still-live old release's
+            // preserved options are TLS-off (matching what it registered).
+            &ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
         )
     }
 
@@ -2469,6 +2653,7 @@ mod tests {
                 "readiness-gate",
                 "proxy-flip",
                 "commit-markers",
+                "record-proxy-options",
                 "drain-old",
                 "prune",
             ],
@@ -4060,6 +4245,235 @@ mod tests {
         );
     }
 
+    // --- proxy-options marker (issue #2074) ----------------------------------
+
+    #[test]
+    fn proxy_options_marker_round_trips_through_serialize_and_parse() {
+        // TLS on: `1\t<host>` serializes and parses back to the same options.
+        let tls_on = ProxyServiceOptions {
+            tls: true,
+            host: Some("app.example.com".to_owned()),
+        };
+        let on_marker = tls_on.marker_value();
+        assert_eq!(on_marker, "1\tapp.example.com");
+        assert_eq!(
+            parse_proxy_options(&on_marker),
+            ProxyOptionsMarker::Options(tls_on),
+        );
+
+        // TLS off (host removed): `0\t` serializes and parses back to TLS-off.
+        let tls_off = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        assert_eq!(tls_off.marker_value(), "0\t");
+        assert_eq!(
+            parse_proxy_options(&tls_off.marker_value()),
+            ProxyOptionsMarker::Options(tls_off.clone()),
+        );
+
+        // A surrounding newline (as `cat` would yield through the probe wrapping) is
+        // tolerated without dropping the trailing tab of a TLS-off marker.
+        assert_eq!(
+            parse_proxy_options(&format!("\n{}\n", tls_off.marker_value())),
+            ProxyOptionsMarker::Options(tls_off),
+        );
+    }
+
+    #[test]
+    fn record_proxy_options_writes_the_marker_atomically() {
+        let cfg = resolved();
+        // TLS-on: the op mktemp's in shared/, printfs the `1\t<host>` value, and mv's
+        // it onto shared/proxy-options (atomic same-fs rename, never a truncating `>`).
+        let cmd = record_proxy_options(
+            &cfg,
+            &ProxyServiceOptions {
+                tls: true,
+                host: Some("app.example.com".to_owned()),
+            },
+        );
+        assert_eq!(cmd.label, "record-proxy-options");
+        assert!(
+            cmd.shell
+                .contains("mktemp '/srv/autumn/myapp/shared/proxy-options.tmp.XXXXXX'"),
+            "mktemp's a temp file in the marker's own shared dir: {}",
+            cmd.shell,
+        );
+        assert!(
+            cmd.shell.contains("printf '%s' '1\tapp.example.com'"),
+            "writes the {{tls}}\\t{{host}} marker value: {}",
+            cmd.shell,
+        );
+        assert!(
+            cmd.shell
+                .contains("mv -f \"$otmp\" '/srv/autumn/myapp/shared/proxy-options'"),
+            "mv's the temp file onto the final marker path (atomic): {}",
+            cmd.shell,
+        );
+        // TLS-off writes the host-less `0\t` form.
+        let off = record_proxy_options(
+            &cfg,
+            &ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
+        );
+        assert!(
+            off.shell.contains("printf '%s' '0\t'"),
+            "TLS-off writes `0\\t` (empty host — a removed host is representable): {}",
+            off.shell,
+        );
+    }
+
+    #[test]
+    fn parse_proxy_options_classifies_the_marker_section() {
+        // Empty (absent file, or an empty marker) → Absent (proceed as legacy).
+        assert_eq!(parse_proxy_options(""), ProxyOptionsMarker::Absent);
+        assert_eq!(parse_proxy_options("\n\n"), ProxyOptionsMarker::Absent);
+
+        // TLS-on with a host → Options{tls:true}.
+        assert_eq!(
+            parse_proxy_options("1\ta.com"),
+            ProxyOptionsMarker::Options(ProxyServiceOptions {
+                tls: true,
+                host: Some("a.com".to_owned()),
+            }),
+        );
+        // TLS-off → Options{tls:false, host:None}.
+        assert_eq!(
+            parse_proxy_options("0\t"),
+            ProxyOptionsMarker::Options(ProxyServiceOptions {
+                tls: false,
+                host: None,
+            }),
+        );
+
+        // Fail-closed shapes → Unreadable:
+        //  - no tab at all (a fieldless / truncated marker),
+        assert_eq!(
+            parse_proxy_options("garbage"),
+            ProxyOptionsMarker::Unreadable
+        );
+        //  - a non-{0,1} TLS token,
+        assert_eq!(parse_proxy_options("2\tx"), ProxyOptionsMarker::Unreadable);
+        //  - TLS-on with an EMPTY host (can't preserve a host we don't have).
+        assert_eq!(parse_proxy_options("1\t"), ProxyOptionsMarker::Unreadable);
+    }
+
+    #[test]
+    fn cutover_records_proxy_options_after_the_marker_commit() {
+        // The cutover appends a `record-proxy-options` op AFTER `commit-markers`
+        // (post-flip), persisting the options THIS deploy registered so the next
+        // redeploy can preserve them (issue #2074).
+        let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let exec = RecordingExecutor::new();
+        run_ops(&ops, &exec).expect("recording executor never fails");
+        let labels = exec.run_labels();
+        let commit = labels
+            .iter()
+            .position(|&l| l == "commit-markers")
+            .expect("commit-markers ran");
+        let record = labels
+            .iter()
+            .position(|&l| l == "record-proxy-options")
+            .expect("record-proxy-options ran");
+        assert!(
+            commit < record,
+            "record-proxy-options is written after the marker commit: {labels:?}",
+        );
+        // The default `proxy()` is TLS-off, so the recorded value is `0\t`.
+        let shell = exec
+            .shell_for("record-proxy-options")
+            .expect("record-proxy-options ran");
+        assert!(
+            shell.contains("printf '%s' '0\t'"),
+            "records the TLS-off options the default controller registered: {shell}",
+        );
+    }
+
+    #[test]
+    fn first_deploy_records_proxy_options() {
+        // The first-deploy path also writes the marker (after record-live-slot), so a
+        // brand-new host is protected from its second redeploy onward (issue #2074).
+        let ops = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let exec = RecordingExecutor::new();
+        run_ops(&ops, &exec).expect("recording executor never fails");
+        let labels = exec.run_labels();
+        let live = labels
+            .iter()
+            .position(|&l| l == "record-live-slot")
+            .expect("record-live-slot ran");
+        let record = labels
+            .iter()
+            .position(|&l| l == "record-proxy-options")
+            .expect("record-proxy-options ran on first deploy");
+        assert!(
+            live < record,
+            "record-proxy-options follows record-live-slot on first deploy: {labels:?}",
+        );
+    }
+
+    #[test]
+    fn probe_deploy_state_captures_the_proxy_options_marker() {
+        let cfg = resolved();
+        // Full probe stdout: mode, list, unit `--http-port`, then the proxy-options
+        // section carrying a TLS-on marker.
+        let stdout = format!(
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n{}\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n\
+             ---autumn-kamal-proxy-options---\n1\tapp.example.com",
+            proxy_list_serving("myapp", 3001)
+        );
+        let exec = RecordingExecutor::new().with_stdout("detect-current", stdout);
+        let probe = probe_deploy_state(&cfg, &exec).unwrap();
+        assert_eq!(
+            probe.last_proxy_options,
+            ProxyOptionsMarker::Options(ProxyServiceOptions {
+                tls: true,
+                host: Some("app.example.com".to_owned()),
+            }),
+            "the proxy-options marker is captured",
+        );
+        // The unit `--http-port` section is still cleanly split off from the options.
+        assert_eq!(probe.installed_proxy_port, InstalledProxyPort::Port(80));
+        // The probe shell cats the proxy-options marker behind its delimiter.
+        let shell = exec.shell_for("detect-current").expect("probe ran");
+        assert!(
+            shell.contains("---autumn-kamal-proxy-options---")
+                && shell.contains("cat '/srv/autumn/myapp/shared/proxy-options'"),
+            "probe cats the proxy-options marker behind its delimiter: {shell}",
+        );
+
+        // A missing options delimiter (older recorded output) → Absent (legacy).
+        let legacy = RecordingExecutor::new().with_stdout(
+            "detect-current",
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80",
+        );
+        assert_eq!(
+            probe_deploy_state(&cfg, &legacy)
+                .unwrap()
+                .last_proxy_options,
+            ProxyOptionsMarker::Absent,
+            "a missing options delimiter degrades to Absent (proceed as legacy)",
+        );
+
+        // Present-but-unparseable marker → Unreadable (fail closed).
+        let unreadable = RecordingExecutor::new().with_stdout(
+            "detect-current",
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n\
+             ---autumn-kamal-proxy-options---\ngarbage",
+        );
+        assert_eq!(
+            probe_deploy_state(&cfg, &unreadable)
+                .unwrap()
+                .last_proxy_options,
+            ProxyOptionsMarker::Unreadable,
+            "an unparseable proxy-options marker fails closed as Unreadable",
+        );
+    }
+
     /// A compatible `kamal-proxy deploy --help` capture for the compat probe tests.
     fn compatible_deploy_help() -> &'static str {
         "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
@@ -4529,10 +4943,10 @@ mod tests {
         let exec = RecordingExecutor::new();
         let checks = vec![PreflightCheck::pass("ssh_reachability", "reachable")];
         execute_first_deploy(&checks, &ops, &[], &exec).expect("all checks pass → deploy runs");
-        // 2 proxy ops + 10 first-deploy ops (incl. clear-previous) + 2 config-manifest
-        // uploads (sample_manifests: autumn.toml + autumn-prod.toml, #1952) + 1 proxy
-        // route = 15.
-        assert_eq!(exec.calls().len(), 15, "the full op sequence should run");
+        // 2 proxy ops + 11 first-deploy ops (incl. clear-previous and the #2074
+        // record-proxy-options) + 2 config-manifest uploads (sample_manifests:
+        // autumn.toml + autumn-prod.toml, #1952) + 1 proxy route = 16.
+        assert_eq!(exec.calls().len(), 16, "the full op sequence should run");
     }
 
     #[test]
