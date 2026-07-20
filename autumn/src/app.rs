@@ -999,7 +999,7 @@ impl AppBuilder {
     /// # async fn main() {
     /// autumn_web::app()
     ///     .routes(routes![index])
-    ///     .scoped("/api", RequestIdLayer, routes![list_users])
+    ///     .scoped("/api", RequestIdLayer::default(), routes![list_users])
     ///     .run()
     ///     .await;
     /// # }
