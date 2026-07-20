@@ -86,16 +86,16 @@ pub struct Sim {
     rng: SimRng,
 
     /// Virtual clock, started at the fixed sim epoch
-    /// (`2020-01-01T00:00:00Z`). Advancing / draining lands in W2.
-    #[allow(dead_code)] // wired up (advance/run_to_idle) in W2
+    /// (`2020-01-01T00:00:00Z`). Stepped by [`Sim::advance`] in lockstep with
+    /// tokio's paused timer.
     clock: SimClock,
 
     /// Fault-injection configuration. Becomes a public builder in W5.
     #[allow(dead_code)] // fault-injection behavior lands in W5
     chaos: Chaos,
 
-    /// Built router + `AppState` handle. Mounted on the paused runtime in W2.
-    #[allow(dead_code)] // app mounting lands in W2
+    /// Built [`crate::test::TestClient`] handle, mounted by [`Sim::build`] on
+    /// the paused runtime with the virtual clock installed.
     app: SimApp,
 }
 
@@ -138,7 +138,123 @@ impl Sim {
     pub fn rng(&mut self) -> &mut SimRng {
         &mut self.rng
     }
+
+    /// Mount `app` on the paused runtime with the simulation's virtual clock
+    /// installed, and return the resulting [`crate::test::TestClient`].
+    ///
+    /// The simulation's [`SimClock`] is threaded in via
+    /// [`crate::test::TestApp::with_clock`], so every handler that reads a
+    /// [`crate::time::Clock`] extractor sees the virtual instant — starting at
+    /// the fixed sim epoch (`2020-01-01T00:00:00Z`) and moving only when
+    /// [`Sim::advance`] steps it. The built app also starts the in-process job
+    /// runtime (the in-memory backend), so [`run_to_idle`](Sim::run_to_idle)
+    /// can drain enqueued jobs deterministically.
+    ///
+    /// Configure `app` fully before handing it over — routes, jobs, and (in a
+    /// later wave) a sim database are attached to the [`crate::test::TestApp`]
+    /// prior to this call. Do **not** call [`crate::test::TestApp::with_clock`]
+    /// yourself; `build` owns the clock so time stays in lockstep.
+    ///
+    /// The returned borrow is convenient for an immediate request; to interleave
+    /// requests with [`advance`](Sim::advance) / [`run_to_idle`](Sim::run_to_idle)
+    /// calls, reach the client through [`client`](Sim::client) instead.
+    ///
+    /// ```rust,ignore
+    /// let client = sim.build(TestApp::new().routes(routes![hello]).jobs(jobs![work]));
+    /// client.get("/hello").send().await.assert_ok();
+    /// ```
+    pub fn build(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        let client = app.with_clock(self.clock.ticking()).build();
+        self.app.client = Some(client);
+        self.app.client()
+    }
+
+    /// Borrow the [`crate::test::TestClient`] mounted by [`build`](Sim::build).
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`build`](Sim::build) has not been called yet.
+    #[must_use]
+    pub fn client(&self) -> &crate::test::TestClient {
+        self.app.client()
+    }
+
+    /// Borrow the mounted [`crate::test::TestClient`], or `None` before
+    /// [`build`](Sim::build).
+    #[must_use]
+    pub const fn try_client(&self) -> Option<&crate::test::TestClient> {
+        self.app.try_client()
+    }
+
+    /// Advance virtual time by `duration`, stepping the injected wall clock and
+    /// tokio's paused timer wheel **together**.
+    ///
+    /// The framework [`crate::time::Clock`] extractor (backed by the
+    /// simulation's [`SimClock`]) and tokio's virtual timer (`tokio::time::sleep`,
+    /// job backoff delays, delayed enqueues) move by exactly the same amount, so
+    /// `Utc::now()`-via-extractor and a sleeping task stay in lockstep — a job
+    /// whose retry backs off 24 hours fires the instant this advances 24 hours,
+    /// with zero wall-clock delay. Timers that come due within the window fire
+    /// and their tasks are polled before this returns.
+    ///
+    /// Pair with [`run_to_idle`](Sim::run_to_idle) to then drain the work the
+    /// fired timers enqueued.
+    pub async fn advance(&self, duration: std::time::Duration) {
+        // Step the framework clock first so any task woken by the tokio timer
+        // that reads the clock observes the already-advanced instant.
+        self.clock.advance(duration);
+        // Advance tokio's paused timer wheel; this fires due timers and yields
+        // so their tasks are polled before returning.
+        tokio::time::advance(duration).await;
+    }
+
+    /// Drain all ready work — enqueued jobs the in-process runtime can run now,
+    /// plus tasks woken by timers that have already come due — until the runtime
+    /// is quiescent.
+    ///
+    /// The sim runtime is a single-threaded, current-thread runtime with the
+    /// clock paused, so background tasks (the job worker consuming its queue, a
+    /// retry timer that just fired, a delayed enqueue delivering) make progress
+    /// only when the running task yields. This cooperatively yields until no
+    /// further ready progress is observed (bounded by [`MAX_DRAIN_STEPS`] so a
+    /// pathological busy task can never hang the drain).
+    ///
+    /// It does **not** fast-forward to a *future* timer — advancing the clock to
+    /// reach a not-yet-due backoff/sleep is [`advance`](Sim::advance)'s job
+    /// (tokio exposes no next-deadline hook, and a blind auto-advance would
+    /// break the clock lockstep). The idiom is therefore
+    /// [`advance`](Sim::advance) to the next interesting instant, then
+    /// `run_to_idle` to settle the work it released.
+    pub async fn run_to_idle(&self) {
+        for _ in 0..MAX_DRAIN_STEPS {
+            // One yield lets each currently-ready spawned task take a step; a
+            // zero-duration timer advance flushes any timers registered for the
+            // current instant and yields again, so a chain of ready timer/task
+            // wakeups settles without advancing the clock. This quiesces the
+            // in-process job runtime (TestJobRuntime / JobAdminMemoryBackend)
+            // and any tasks woken by already-due scheduler ticks.
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::ZERO).await;
+
+            // W2: repository commit-hook drain — the third ready-work source
+            // this loop must quiesce on. Wires to the public test-harness
+            // wrapper `crate::repository_commit_hooks::drain_ready_repository_commit_hooks(pool, max_rows)`
+            // once the parallel commit-hooks lane widens that seam (its drain
+            // fns are private + `worker_id`-taking today). It is intentionally
+            // NOT called yet: re-widening or duplicating that private drain here
+            // is out of W2's boundary, and the DoD job path is in-memory (no
+            // pool). Slot: resolve the mounted app's pool from
+            // `self.app.client().state()` and drain here inside the settle loop
+            // so hook-enqueued jobs are picked up on a subsequent iteration.
+        }
+    }
 }
+
+/// Upper bound on cooperative yield rounds [`Sim::run_to_idle`] performs before
+/// returning, so a misbehaving always-ready task can never hang the drain.
+/// Generous relative to the handful of hops a job takes from the queue through
+/// its handler to completion under the single-threaded paused runtime.
+const MAX_DRAIN_STEPS: usize = 1024;
 
 /// A seeded, deterministic random number generator handle.
 ///
@@ -170,12 +286,11 @@ impl SimRng {
 
 /// A virtual clock handle for the simulation.
 ///
-/// Wraps a [`TickingClock`] started at the fixed sim
-/// epoch. W2 wires `advance` / `run_to_idle` here against
-/// [`crate::time::ClockSource`], driving the paused tokio runtime's virtual
-/// clock in lockstep. W1 only constructs it.
+/// Wraps a [`TickingClock`] started at the fixed sim epoch. [`Sim::advance`]
+/// steps this clock (the wall-clock time a [`crate::time::Clock`] extractor
+/// reports) in lockstep with tokio's paused virtual timer, so
+/// `Utc::now()`-via-extractor and `tokio::time::sleep` never drift apart.
 pub struct SimClock {
-    #[allow(dead_code)] // advance/run_to_idle wiring lands in W2
     inner: TickingClock,
 }
 
@@ -183,6 +298,23 @@ impl SimClock {
     /// Wrap a ticking clock as the simulation's virtual clock.
     pub(crate) fn new(inner: TickingClock) -> Self {
         Self { inner }
+    }
+
+    /// Step the injected wall clock forward by `duration`.
+    ///
+    /// This moves only the framework clock (the [`crate::time::Clock`]
+    /// extractor / `ClockSource`); [`Sim::advance`] pairs it with
+    /// `tokio::time::advance` so the tokio timer wheel moves the same amount.
+    pub(crate) fn advance(&self, duration: std::time::Duration) {
+        self.inner.advance(duration);
+    }
+
+    /// A [`TickingClock`] handle sharing this clock's instant.
+    ///
+    /// Handed to [`crate::test::TestApp::with_clock`] at [`Sim::build`] time so
+    /// mounted handlers read the same virtual instant [`Sim::advance`] steps.
+    pub(crate) fn ticking(&self) -> TickingClock {
+        self.inner.clone()
     }
 }
 
@@ -197,12 +329,39 @@ pub struct Chaos {}
 
 /// The built application handle for a simulation.
 ///
-/// A placeholder for the mounted router + `AppState` in W1. W2 mounts an
-/// `AppBuilder` app on the paused runtime here so sim tests can drive real
-/// requests deterministically.
+/// Holds the [`crate::test::TestClient`] mounted by [`Sim::build`] on the paused
+/// runtime with the simulation's virtual clock installed. Empty until
+/// [`Sim::build`] is called (an empty [`#[sim_test]`](crate::sim_test) that only
+/// drives time / RNG never mounts an app).
+///
+/// Marked `#[non_exhaustive]` so later waves (e.g. W4's sim-DB substrate) can
+/// hang additional handles here without a breaking change.
 #[non_exhaustive]
 #[derive(Default)]
-pub struct SimApp {}
+pub struct SimApp {
+    /// The mounted test client, or `None` before [`Sim::build`].
+    client: Option<crate::test::TestClient>,
+}
+
+impl SimApp {
+    /// Borrow the mounted [`crate::test::TestClient`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if no app has been mounted yet — call [`Sim::build`] first.
+    #[must_use]
+    pub fn client(&self) -> &crate::test::TestClient {
+        self.try_client()
+            .expect("no app mounted: call `sim.build(TestApp::new()...)` before `client()`")
+    }
+
+    /// Borrow the mounted [`crate::test::TestClient`], or `None` before
+    /// [`Sim::build`].
+    #[must_use]
+    pub const fn try_client(&self) -> Option<&crate::test::TestClient> {
+        self.client.as_ref()
+    }
+}
 
 /// Read and parse the simulation seed from the `AUTUMN_SIM_SEED` environment
 /// variable.
