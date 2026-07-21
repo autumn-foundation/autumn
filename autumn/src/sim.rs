@@ -85,6 +85,15 @@ pub mod chaos;
 
 pub use chaos::{Chaos, ChaosEvent, ChaosHook};
 
+// The seeded LLM stub (W5.b, item 6, issue #1797): a deterministic fake
+// completion client — canned responses + a seeded fault/latency schedule — for
+// exercising agent retry/fallback paths under the virtual clock. Standalone and
+// additive; it does not route through the `Chaos` builder. See the module docs
+// for the determinism contract.
+pub mod llm;
+
+pub use llm::{LlmCall, LlmClient, LlmError, LlmRequest, LlmResponse, SeededLlm, SeededLlmBuilder};
+
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.
 ///
