@@ -1074,7 +1074,7 @@ impl AppBuilder {
     /// should be wrapped in `Arc` so the layer can satisfy the
     /// `Clone + Send + Sync + 'static` bounds without moving the state.
     ///
-    /// See [the middleware guide](https://github.com/madmax983/autumn/blob/trunk/docs/guide/middleware.md)
+    /// See [the middleware guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/middleware.md)
     /// for ready-made recipes.
     ///
     /// # Examples

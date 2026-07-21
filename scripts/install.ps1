@@ -9,7 +9,7 @@
     tagged crate releases; "latest" is the most recent release.
 
     Run it directly:
-        irm https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.ps1 | iex
+        irm https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.ps1 | iex
 
     Or with options after downloading:
         .\install.ps1 -Version v0.6.0 -Dir C:\tools\autumn
@@ -21,14 +21,14 @@
     Install directory (default: %LOCALAPPDATA%\autumn\bin). Env override: AUTUMN_INSTALL_DIR.
 
 .PARAMETER BaseUrl
-    Release base URL (default: https://github.com/madmax983/autumn/releases).
+    Release base URL (default: https://github.com/autumn-foundation/autumn/releases).
     Env override: AUTUMN_BASE_URL.
 #>
 [CmdletBinding()]
 param(
     [string]$Version = $(if ($env:AUTUMN_VERSION) { $env:AUTUMN_VERSION } else { 'latest' }),
     [string]$Dir     = $(if ($env:AUTUMN_INSTALL_DIR) { $env:AUTUMN_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'autumn\bin' }),
-    [string]$BaseUrl = $(if ($env:AUTUMN_BASE_URL) { $env:AUTUMN_BASE_URL } else { 'https://github.com/madmax983/autumn/releases' })
+    [string]$BaseUrl = $(if ($env:AUTUMN_BASE_URL) { $env:AUTUMN_BASE_URL } else { 'https://github.com/autumn-foundation/autumn/releases' })
 )
 
 $ErrorActionPreference = 'Stop'

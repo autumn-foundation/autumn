@@ -115,7 +115,7 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
          gen_random_uuid() default, and the generated `New*` insert type omits `#[id]` \
          fields — so inserted rows would get NULL/omitted ids. App-side UUID generation is \
          part of the deferred SQLite runtime slice, tracked in \
-         https://github.com/madmax983/autumn/issues/1905 — re-run without `--id uuid` to use \
+         https://github.com/autumn-foundation/autumn/issues/1905 — re-run without `--id uuid` to use \
          the default INTEGER PRIMARY KEY AUTOINCREMENT, or target a Postgres database."
             .to_owned(),
     )
@@ -196,7 +196,7 @@ pub fn sqlite_generator_unsupported_error(name: &str) -> GenerateError {
          emit Postgres-only DDL (`BIGSERIAL PRIMARY KEY`, `DEFAULT NOW()`), which SQLite \
          rejects, so the generated migrations would fail to apply. Backend-aware auth/mailer \
          generators for SQLite are tracked in \
-         https://github.com/madmax983/autumn/issues/1927 — target a Postgres database to use \
+         https://github.com/autumn-foundation/autumn/issues/1927 — target a Postgres database to use \
          `generate {name}` for now."
     ))
 }
@@ -414,7 +414,7 @@ pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> Gene
          backend in a generated app's feature set, so a generated SQLite app using this \
          field would fail to compile. Supported SQLite field kinds are: {kinds}. \
          First-class SQLite support for Uuid / attachments / Decimal / DateTime<Utc> / \
-         enum fields is tracked in https://github.com/madmax983/autumn/issues/1924 — use a \
+         enum fields is tracked in https://github.com/autumn-foundation/autumn/issues/1924 — use a \
          supported field kind, or target a Postgres database.",
         kinds = dsl::SQLITE_SUPPORTED_KINDS,
     ))

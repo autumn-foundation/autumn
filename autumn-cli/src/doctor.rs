@@ -2430,7 +2430,7 @@ fn check_pg_client_tools_sqlite() -> CheckResult {
             "SQLite app: PostgreSQL client tools (pg_dump/pg_restore) are not required".into(),
         ),
         hint: Some(
-            "SQLite backup/restore is tracked in https://github.com/madmax983/autumn/issues/1909",
+            "SQLite backup/restore is tracked in https://github.com/autumn-foundation/autumn/issues/1909",
         ),
     }
 }
@@ -3144,7 +3144,7 @@ fn check_pending_migrations_sqlite() -> CheckResult {
                 .into(),
         ),
         hint: Some(
-            "SQLite migration support is tracked in https://github.com/madmax983/autumn/issues/1906",
+            "SQLite migration support is tracked in https://github.com/autumn-foundation/autumn/issues/1906",
         ),
     }
 }
