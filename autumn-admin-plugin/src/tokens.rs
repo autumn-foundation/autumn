@@ -89,7 +89,7 @@ impl AdminModel for TokenAdminModel {
 
     fn list(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         params: ListParams,
     ) -> AdminFuture<'_, ListResult> {
         use diesel_async::RunQueryDsl;
@@ -150,7 +150,7 @@ impl AdminModel for TokenAdminModel {
 
     fn get(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
     ) -> AdminFuture<'_, Option<Value>> {
         use diesel::OptionalExtension as _;
@@ -178,7 +178,7 @@ impl AdminModel for TokenAdminModel {
 
     fn create(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         data: Value,
     ) -> AdminFuture<'_, Value> {
         use diesel_async::RunQueryDsl;
@@ -238,7 +238,7 @@ impl AdminModel for TokenAdminModel {
 
     fn update(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
         data: Value,
     ) -> AdminFuture<'_, Value> {
@@ -274,7 +274,7 @@ impl AdminModel for TokenAdminModel {
 
     fn delete(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
     ) -> AdminFuture<'_, ()> {
         use diesel_async::RunQueryDsl;
