@@ -119,6 +119,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follow-up. (0.7.0 work — do not merge until v0.6.0 is cut.)
 ### Fixed
 
+- **migrate:** the two `SQLite` migration entry points — `run_pending_sqlite`
+  (up) and `revert_user_migrations_sqlite` (down) — now serialize their whole
+  list→plan→apply/revert sequence under a single shared `BEGIN IMMEDIATE` write
+  lock (#2065, the deferred follow-up from #2062). Previously the read→plan→apply
+  window was unlocked, so two concurrent `autumn migrate` / `autumn schema
+  migrate` processes against the same file could each read the same pending (or
+  applied) set before either wrote, and the loser then re-ran an already-applied
+  `up.sql` (or already-reverted `down.sql`) and reported a **false** migration
+  failure. The lock is taken through diesel's `AnsiTransactionManager` so diesel's
+  own per-migration transactions nest as savepoints (no "cannot start a
+  transaction within a transaction"), and a concurrent migrator now queues on the
+  connection's `busy_timeout`, re-reads an already-drained set, and cleanly
+  no-ops. There is still **no Postgres advisory lock** on the `SQLite` path —
+  `SQLite` has no such primitive; the on-disk write lock is the entire
+  serialization mechanism. Single-process migrate/revert behaviour is unchanged.
+  [no-plugin]
 - Docs and crate metadata: updated repository/homepage URLs, README badges, install scripts, and the CI workflow template from the old `madmax983/autumn` owner to `autumn-foundation/autumn` after the GitHub org transfer. Old links still redirect; this makes the canonical URLs correct.
 - **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
   Previously the opt-in was name-gated to `prod`/`production`, so a custom
