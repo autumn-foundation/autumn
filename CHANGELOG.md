@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.last_modified` builders, and `into_response_ranged` for RFC 7233 `Range`
   requests / `206 Partial Content` — plus a range-capable CSV export route
   (`GET /bookmarks/export.csv`) added to the `bookmarks` example. `[no-plugin]`
+- **docs:** a `docs/guide/submit-tokens.md` guide for one-time submit tokens
+  (at-most-once form submissions) — the double-submit / duplicate-POST problem,
+  how the default-on `SubmitTokenLayer` + hidden `_submit_token` field +
+  `SubmitToken` extractor close it with no client JS, how it differs from CSRF
+  and `Idempotency-Key`, and the `[security.submit_token]` config knobs. The
+  `saas` example now guards its signup POST with a one-time submit token so a
+  double-clicked signup cannot create a duplicate account. [no-plugin]
 - **test-support:** `autumn_web::test::drain_ready_repository_commit_hooks(pool, max_rows)`
   deterministically claims and runs ready durable repository commit hooks in
   integration tests — driving the real worker→drain wiring without starting the
@@ -97,6 +104,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **admin-plugin:** made the core connection surface backend-agnostic so
+  SQLite-backend apps can compile it — flipped every hardcoded
+  `diesel_async::AsyncPgConnection` to `autumn_web::RuntimeConnection` across
+  `routes.rs`, `tokens.rs`, `traits.rs`, `registry.rs`, and the
+  `token_admin_db` test, mirroring `autumn-media-plugin`'s `rooms_db.rs`
+  (#2090) and `DbSuppressionStore` (#2100). This is an incremental step toward
+  #2108: the token admin surface now compiles clean under both Postgres and
+  SQLite, but the `experiments`/`feature_flags` models remain Postgres-only
+  pending a separate typed-DSL / `Timestamptz` rewrite (tracked in #2108).
+  [no-plugin]
+
 - **cli:** aligned the remaining stale `autumn-web = "0.5.0"` test fixtures in
   the `generate` modules (tauri sidecar, scaffold, pwa) to the current `0.6.0`
   release, matching the sibling generators. The end-user pin is unaffected —
@@ -125,6 +143,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follow-up. (0.7.0 work — do not merge until v0.6.0 is cut.)
 ### Fixed
 
+- **migrate:** the two `SQLite` migration entry points — `run_pending_sqlite`
+  (up) and `revert_user_migrations_sqlite` (down) — now serialize their whole
+  list→plan→apply/revert sequence under a single shared `BEGIN IMMEDIATE` write
+  lock (#2065, the deferred follow-up from #2062). Previously the read→plan→apply
+  window was unlocked, so two concurrent `autumn migrate` / `autumn schema
+  migrate` processes against the same file could each read the same pending (or
+  applied) set before either wrote, and the loser then re-ran an already-applied
+  `up.sql` (or already-reverted `down.sql`) and reported a **false** migration
+  failure. The lock is taken through diesel's `AnsiTransactionManager` so diesel's
+  own per-migration transactions nest as savepoints (no "cannot start a
+  transaction within a transaction"), and a concurrent migrator now queues on the
+  connection's `busy_timeout`, re-reads an already-drained set, and cleanly
+  no-ops. There is still **no Postgres advisory lock** on the `SQLite` path —
+  `SQLite` has no such primitive; the on-disk write lock is the entire
+  serialization mechanism. Single-process migrate/revert behaviour is unchanged.
+  [no-plugin]
 - Docs and crate metadata: updated repository/homepage URLs, README badges, install scripts, and the CI workflow template from the old `madmax983/autumn` owner to `autumn-foundation/autumn` after the GitHub org transfer. Old links still redirect; this makes the canonical URLs correct.
 - **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
   Previously the opt-in was name-gated to `prod`/`production`, so a custom

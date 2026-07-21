@@ -325,12 +325,16 @@ where
 
 /// Run all pending migrations against a `SQLite` database URL (issue #1614, PR3).
 ///
-/// The `SQLite` counterpart to [`run_pending`]. `SQLite` is a single-writer local
-/// database, so — unlike the Postgres path — there is **no advisory lock**: no
-/// cross-process serialization is needed and `SQLite` has no `pg_advisory_lock`
-/// primitive. Establishes a synchronous `SqliteConnection` (via
-/// [`crate::db::establish_sqlite_migration_connection`]) and applies pending
-/// migrations through diesel's `MigrationHarness`.
+/// The `SQLite` counterpart to [`run_pending`]. Establishes a synchronous
+/// `SqliteConnection` (via [`crate::db::establish_sqlite_migration_connection`])
+/// and applies pending migrations through diesel's `MigrationHarness`, wrapping
+/// the whole list→apply sequence in the shared [`with_sqlite_migration_lock`]
+/// write lock (issue #2065, deferred from PR #2062) so two concurrent `autumn
+/// migrate` / `autumn schema migrate` processes against the same file cannot
+/// interleave their read-then-write windows and re-run an already-applied
+/// migration. There is still **no Postgres advisory lock** on this path —
+/// `SQLite` has no `pg_advisory_lock` primitive; the on-disk write lock held
+/// across the sequence is the entire cross-process serialization mechanism.
 ///
 /// The migration set is taken as a [`MigrationSource<Sqlite>`](diesel::migration::MigrationSource);
 /// the framework's [`EmbeddedMigrations`] (and [`EmbeddedMigrationsRef`]) satisfy
@@ -358,13 +362,87 @@ pub fn run_pending_sqlite(
     }
     let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
         .map_err(|e| MigrationError::Connection(e.to_string()))?;
-    let mut harness = HarnessWithOutput::write_to_stdout(&mut conn);
-    let applied = harness
-        .run_pending_migrations(migrations)
+    let applied = with_sqlite_migration_lock(&mut conn, |conn| {
+        let mut harness = HarnessWithOutput::write_to_stdout(conn);
+        harness
+            .run_pending_migrations(migrations)
+            .map(|applied| applied.iter().map(|m| format!("{m}")).collect::<Vec<_>>())
+            .map_err(|e| MigrationError::Migration(e.to_string()))
+    })?;
+    Ok(MigrationResult { applied })
+}
+
+/// Serialize a `SQLite` migration sequence under the database's write lock.
+///
+/// The single intra-run serialization primitive shared by BOTH `SQLite`
+/// migration directions — [`run_pending_sqlite`] (up) and
+/// [`revert_user_migrations_sqlite`] (down) — and therefore by both the `autumn
+/// migrate` and `autumn schema migrate` verbs, which each route through those two
+/// functions. It takes the `SQLite` write lock up front with `BEGIN IMMEDIATE`
+/// and holds it across the whole list→plan→apply/revert sequence in `f`, then
+/// commits. Two concurrent migrators against the same file therefore cannot
+/// interleave their read-then-write windows: the second `BEGIN IMMEDIATE` queues
+/// on the connection's `busy_timeout` (set by
+/// [`crate::db::establish_sqlite_migration_connection`]) until the first commits,
+/// then re-reads an already-drained pending/applied set and cleanly no-ops
+/// instead of re-running an already-applied `up.sql` (or already-reverted
+/// `down.sql`) and reporting a false failure (issue #2065, deferred from
+/// PR #2062).
+///
+/// There is deliberately **no Postgres advisory lock** on the `SQLite` path
+/// (issue #1999 / #2036 precedent) — `SQLite` has no `pg_advisory_lock`
+/// primitive; this on-disk write lock is the whole serialization mechanism.
+///
+/// # Cooperation with diesel's per-migration transactions
+///
+/// The `BEGIN IMMEDIATE` is issued **through** diesel's `AnsiTransactionManager`
+/// (`begin_transaction_sql`), so the manager's depth counter advances 0 → 1 (the
+/// same technique as [`crate::db::scoped_immediate_transaction`]). Each migration
+/// diesel then applies/reverts inside its own `self.transaction(...)` becomes a
+/// nested `SAVEPOINT` (depth 1 → 2) rather than a raw nested `BEGIN`, which would
+/// fail with "cannot start a transaction within a transaction".
+///
+/// On any error the outer transaction is rolled back, so a mid-sequence failure
+/// leaves the applied set unchanged (the sequence is atomic) rather than
+/// partially advanced. On the success path — the only path the concurrency fix
+/// exercises, since a loser drains an already-empty set — the end state is
+/// identical to the pre-lock harness.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] if the write lock cannot be taken or the
+/// transaction cannot be committed, or the error returned by `f`.
+#[cfg(feature = "sqlite")]
+fn with_sqlite_migration_lock<T>(
+    conn: &mut diesel::SqliteConnection,
+    f: impl FnOnce(&mut diesel::SqliteConnection) -> Result<T, MigrationError>,
+) -> Result<T, MigrationError> {
+    use diesel::connection::{AnsiTransactionManager, TransactionManager};
+
+    // Take the write lock up front THROUGH the transaction manager so its depth
+    // counter is synced (0 → 1); diesel's per-migration `self.transaction(...)`
+    // then nests as a SAVEPOINT instead of colliding with a raw nested BEGIN.
+    AnsiTransactionManager::begin_transaction_sql(conn, "BEGIN IMMEDIATE")
         .map_err(|e| MigrationError::Migration(e.to_string()))?;
-    Ok(MigrationResult {
-        applied: applied.iter().map(|m| format!("{m}")).collect(),
-    })
+
+    match f(conn) {
+        Ok(value) => {
+            <AnsiTransactionManager as TransactionManager<diesel::SqliteConnection>>::commit_transaction(conn)
+                .map_err(|e| MigrationError::Migration(e.to_string()))?;
+            Ok(value)
+        }
+        Err(err) => {
+            if let Err(rollback_err) = <AnsiTransactionManager as TransactionManager<
+                diesel::SqliteConnection,
+            >>::rollback_transaction(conn)
+            {
+                tracing::warn!(
+                    "failed to roll back SQLite migration write-lock transaction after error: {rollback_err}"
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Return names of pending (not yet applied) migrations on a `SQLite` target.
@@ -1776,10 +1854,15 @@ pub fn applied_user_migrations_sqlite(
 /// `SQLite` counterpart to [`revert_user_migrations_locked`]: plan and execute a
 /// user-migration rollback against a `SQLite` database.
 ///
-/// `SQLite` is a single-writer local database, so there is **no advisory lock**
-/// (issue #1999 / #2036 precedent): the applied set is listed, `plan` chooses the
-/// newest-first versions to revert, and each is reverted through diesel's
-/// `MigrationHarness`. There is likewise **no content-checksum bookkeeping** — the
+/// The applied set is listed, `plan` chooses the newest-first versions to revert,
+/// and each is reverted through diesel's `MigrationHarness` — the whole
+/// list→plan→revert sequence held under the shared [`with_sqlite_migration_lock`]
+/// write lock (issue #2065, deferred from PR #2062) so a concurrent migrator
+/// cannot interleave and re-revert an already-reverted `down.sql`. There is
+/// deliberately **no Postgres advisory lock** on this path (issue #1999 / #2036
+/// precedent) — `SQLite` has no `pg_advisory_lock` primitive; the on-disk write
+/// lock is the whole cross-process serialization mechanism. There is likewise
+/// **no content-checksum bookkeeping** — the
 /// `SQLite` `autumn migrate up` path applies through the unlocked harness and
 /// records no `autumn_migration_checksums` rows (that table's DDL is
 /// Postgres-specific), so there is nothing to delete on revert.
@@ -1812,37 +1895,39 @@ where
         .migrations()
         .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    let applied_user =
-        resolve_applied_user_migrations_sqlite(&mut conn, &all_migrations, migrations_dir)?;
-    let versions = plan(&applied_user)?;
+    with_sqlite_migration_lock(&mut conn, |conn| {
+        let applied_user =
+            resolve_applied_user_migrations_sqlite(conn, &all_migrations, migrations_dir)?;
+        let versions = plan(&applied_user)?;
 
-    let mut count = 0;
-    for version in &versions {
-        let target = diesel::migration::MigrationVersion::from(version.as_str());
-        let migration = all_migrations
-            .iter()
-            .find(|m| m.name().version() == target)
-            .ok_or_else(|| {
-                MigrationError::Migration(format!(
-                    "migration version {version} is applied but not present in {} — \
-                     cannot revert (its down.sql is unavailable)",
-                    migrations_dir.display()
-                ))
-            })?;
+        let mut count = 0;
+        for version in &versions {
+            let target = diesel::migration::MigrationVersion::from(version.as_str());
+            let migration = all_migrations
+                .iter()
+                .find(|m| m.name().version() == target)
+                .ok_or_else(|| {
+                    MigrationError::Migration(format!(
+                        "migration version {version} is applied but not present in {} — \
+                         cannot revert (its down.sql is unavailable)",
+                        migrations_dir.display()
+                    ))
+                })?;
 
-        let started = std::time::Instant::now();
-        conn.revert_migration(migration.as_ref())
-            .map_err(|e| MigrationError::Migration(e.to_string()))?;
-        let duration = started.elapsed();
+            let started = std::time::Instant::now();
+            conn.revert_migration(migration.as_ref())
+                .map_err(|e| MigrationError::Migration(e.to_string()))?;
+            let duration = started.elapsed();
 
-        on_reverted(&RevertedMigration {
-            version: version.clone(),
-            name: migration.name().to_string(),
-            duration,
-        });
-        count += 1;
-    }
-    Ok(count)
+            on_reverted(&RevertedMigration {
+                version: version.clone(),
+                name: migration.name().to_string(),
+                duration,
+            });
+            count += 1;
+        }
+        Ok(count)
+    })
 }
 
 // ── Startup wait-for-database ─────────────────────────────────────────────────

@@ -10,6 +10,7 @@ dashboard that only ever shows your own organisation's data.
 | Piece | Primitive |
 |-------|-----------|
 | Signup / login / logout | `Session` + `hash_password`/`verify_password` (bcrypt) |
+| At-most-once signup | one-time `SubmitToken` in a hidden `_submit_token` field |
 | Tenant per organisation | `tenant_id` stored in the session at signup/login |
 | Row-level isolation | `#[repository(Project, tenant_scoped)]` + `with_tenant` |
 | Server-rendered UI | Maud templates + htmx + Tailwind |
