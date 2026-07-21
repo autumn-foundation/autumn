@@ -23,6 +23,7 @@ async fn main() {
         .routes(routes![
             home,
             routes::bookmarks::index,
+            routes::bookmarks::export_csv,
             routes::bookmarks::search,
             routes::bookmarks::tags_autocomplete,
             routes::bookmarks::show,

@@ -615,6 +615,22 @@ path = "tests/sqlite_transactional_url_pool.rs"
 name = "sim_sqlite_substrate"
 path = "tests/sim_sqlite_substrate.rs"
 
+# Sim-testing W4 ↔ W2 integration (issue #1797): wires the merged W4
+# `sim::substrate::SqliteSubstrate` (#2106) through the merged W2 public `Sim` API
+# (#2104). Drives a 24h-backoff `#[job]` to completion via `sim.build` +
+# `sim.advance` + `sim.run_to_idle` against the in-memory SQLite substrate and
+# reads back the row the job wrote, proving the W2 drain runs end-to-end on the W4
+# substrate. Standalone for the same reason as `sim_sqlite_substrate` (the
+# consolidated `integration_tests` binary is Postgres-typed and does not compile
+# under `--features sqlite`); needs `test-support` for the `TestApp`/`sim_test`
+# harness, so the file is `#![cfg(all(feature = "sqlite", feature =
+# "test-support"))]` and a default `cargo test` compiles it to an empty (passing)
+# binary. Runs without Docker. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_sqlite_integration`.
+[[test]]
+name = "sim_sqlite_integration"
+path = "tests/sim_sqlite_integration.rs"
+
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
 # consolidated binary — those vars would race the inline network tests.
