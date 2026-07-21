@@ -4410,6 +4410,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-room"
+version = "0.1.0"
+dependencies = [
+ "autumn-media-plugin",
+ "autumn-web",
+ "chrono",
+ "example-e2e",
+ "maud",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
