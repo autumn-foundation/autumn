@@ -2935,7 +2935,8 @@ fn build_idempotency_layers(
     let base = IdempotencyLayer::new(store)
         .with_ttl(ttl)
         .with_in_flight_ttl(in_flight_ttl)
-        .with_metrics(state.metrics.clone());
+        .with_metrics(state.metrics.clone())
+        .with_entropy(state.entropy_arc());
 
     Ok(Some(BuiltIdempotencyLayers {
         route: base.clone().replay_through_inner(),
@@ -3160,7 +3161,7 @@ fn apply_middleware(
     // carries HSTS/CSP/nosniff — see the application point after the gate loop.
     // RequestId stays here (inner to session) so the request id seeds the
     // session, logs, and trace context.
-    let router = router.layer(RequestIdLayer);
+    let router = router.layer(RequestIdLayer::with_entropy(state.entropy_arc()));
 
     // Pre-clone signing keys for the RYWW middleware (session mode needs to
     // sign/verify the `autumn.ryw` cookie; `signing_keys_opt` is consumed below).
@@ -3173,6 +3174,7 @@ fn apply_middleware(
         config.profile.as_deref(),
         session_store,
         signing_keys_opt,
+        &state.entropy_arc(),
     )?;
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 
@@ -4431,6 +4433,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: crate::state::AppState::next_app_id(),
         }
     }
@@ -8603,7 +8606,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             false,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state);
 
         let response = router
@@ -8647,7 +8650,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             false,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state.clone());
 
         router
@@ -8685,7 +8688,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             false,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state);
 
         // A live inbound request (no marker) is bounded by the deadline -> 503.
@@ -8745,7 +8748,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             true,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state);
 
         let response = router
@@ -8808,7 +8811,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             true,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state);
 
         let response = router
@@ -8853,7 +8856,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             false,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state);
 
         let response = router

@@ -633,6 +633,10 @@ pub struct JobClient {
     per_job_settings: HashMap<String, JobRuntimeSettings>,
     pub interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
+    /// Injected entropy source for minting job ids. Defaults to
+    /// [`crate::entropy::OsEntropy`]; a simulation seeds it via the app's
+    /// [`crate::state::AppState::with_entropy`] so job ids replay deterministically.
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 /// Per-job configuration captured from [`JobInfo`] at runtime start.
@@ -2618,7 +2622,7 @@ impl JobClient {
         };
         let job_queue = normalize_queue_name(&settings.queue);
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = self.entropy.uuid_v4().to_string();
         if let Some(due) = due_at {
             // A future due time only becomes claimable later (local timer /
             // durable `run_at`), so record it as scheduled: it must not count
@@ -3219,7 +3223,7 @@ impl JobClient {
             payload
         };
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = self.entropy.uuid_v4().to_string();
 
         // Postgres transactional path: the caller controls when the surrounding
         // transaction commits, so we cannot safely update process-local counters
@@ -3636,6 +3640,7 @@ pub(crate) fn start_local_runtime_inner(
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
+        entropy: state.entropy_arc(),
         resilience_config: state
             .extension::<crate::config::AutumnConfig>()
             .map(|c| Arc::new(c.resilience.clone())),
@@ -6834,6 +6839,7 @@ fn start_redis_runtime(
             interceptor: state
                 .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
+            entropy: state.entropy_arc(),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
@@ -8840,6 +8846,7 @@ fn start_postgres_runtime(
             interceptor: state
                 .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
+            entropy: state.entropy_arc(),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
@@ -9174,6 +9181,70 @@ mod tests {
         assert!(snapshot.enqueued.records.is_empty());
     }
 
+    /// W3 (issue #1797): a job id is minted from the injected entropy source, so
+    /// two clients seeded identically produce a byte-identical job-id stream and
+    /// a differently-seeded client diverges.
+    #[tokio::test]
+    async fn job_ids_are_deterministic_under_seeded_entropy() {
+        fn client_with(
+            entropy: std::sync::Arc<dyn crate::entropy::Entropy>,
+            sender: tokio::sync::mpsc::Sender<QueuedJob>,
+        ) -> JobClient {
+            let mut per_job_settings = HashMap::new();
+            per_job_settings.insert("welcome".to_owned(), JobRuntimeSettings::default());
+            JobClient {
+                local_sender: Some(sender),
+                local_coordination: None,
+                #[cfg(feature = "redis")]
+                redis: None,
+                #[cfg(feature = "db")]
+                pg_pool: None,
+                registry: crate::actuator::JobRegistry::new(),
+                job_admin: JobAdminMemoryBackend::new_for_test(64),
+                default_max_attempts: 3,
+                default_initial_backoff_ms: 250,
+                per_job_settings,
+                interceptor: None,
+                entropy,
+                resilience_config: None,
+            }
+        }
+
+        async fn minted_ids(seed: u64) -> Vec<String> {
+            // A live receiver kept in scope so the bounded channel accepts every
+            // send (a failed send would undo the admin record we read back).
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            let client = client_with(crate::entropy::SeededEntropy::shared(seed), tx);
+            for _ in 0..3 {
+                client
+                    .enqueue_with_outcome("welcome", serde_json::json!({}))
+                    .await
+                    .expect("enqueue should succeed with a live local sender");
+            }
+            let snapshot = client
+                .job_admin
+                .snapshot(JobAdminQuery::default())
+                .await
+                .expect("snapshot");
+            let mut ids: Vec<String> = snapshot
+                .enqueued
+                .records
+                .iter()
+                .map(|record| record.id.clone())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        let a = minted_ids(0x5eed).await;
+        let b = minted_ids(0x5eed).await;
+        assert_eq!(a.len(), 3, "all three enqueues were recorded");
+        assert_eq!(a, b, "same seed ⇒ byte-identical job-id stream");
+
+        let c = minted_ids(0x1234).await;
+        assert_ne!(a, c, "a different seed ⇒ different job ids");
+    }
+
     #[tokio::test]
     async fn global_job_client_survives_concurrent_init_and_clear() {
         fn make_client() -> JobClient {
@@ -9190,6 +9261,7 @@ mod tests {
                 default_initial_backoff_ms: 250,
                 per_job_settings: HashMap::new(),
                 interceptor: None,
+                entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 resilience_config: None,
             }
         }
@@ -9250,6 +9322,7 @@ mod tests {
                 JobRuntimeSettings::basic(5, 250),
             )]),
             interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         });
 
@@ -9332,6 +9405,7 @@ mod tests {
                 JobRuntimeSettings::basic(5, 250),
             )]),
             interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         });
 
@@ -9386,6 +9460,7 @@ mod tests {
                 JobRuntimeSettings::basic(5, 250),
             )]),
             interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         });
 
@@ -9443,6 +9518,7 @@ mod tests {
                 JobRuntimeSettings::basic(5, 250),
             )]),
             interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         });
 
@@ -9683,6 +9759,7 @@ mod tests {
                 JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: Some(Arc::new(PanickingEnqueueInterceptor)),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         };
 
@@ -9743,6 +9820,7 @@ mod tests {
                 JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: Some(Arc::new(AsyncPanickingEnqueueInterceptor)),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         };
 
@@ -12636,6 +12714,7 @@ mod tests {
             default_initial_backoff_ms: 250,
             per_job_settings: HashMap::new(),
             interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         });
         assert!(global_job_client().is_some());
@@ -14532,6 +14611,7 @@ mod tests {
                 default_initial_backoff_ms: 1000,
                 per_job_settings: settings,
                 interceptor: None,
+                entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 resilience_config: None,
             };
 
@@ -15671,6 +15751,7 @@ mod tests {
                 JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         };
         (client, rx)
@@ -16059,6 +16140,7 @@ mod tests {
                     JobRuntimeSettings::basic(3, 100),
                 )]),
                 interceptor: None,
+                entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 resilience_config: None,
             };
             rt.block_on(async {
@@ -16110,6 +16192,7 @@ mod tests {
             default_initial_backoff_ms: 1000,
             per_job_settings: std::collections::HashMap::new(),
             interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         };
 
@@ -16832,6 +16915,7 @@ mod tests {
                 JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         });
 
@@ -16872,6 +16956,7 @@ mod tests {
                 JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         });
 
@@ -17022,6 +17107,7 @@ mod tests {
                 JobRuntimeSettings::basic(3, 100),
             )]),
             interceptor: None,
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             resilience_config: None,
         });
 

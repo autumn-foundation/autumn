@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deterministically claims and runs ready durable repository commit hooks in
   integration tests — driving the real worker→drain wiring without starting the
   timing-based background commit-hook worker — and returns the number processed.
+- **sim:** a seeded **`Entropy`** seam for deterministic identifiers (#1797),
+  mirroring the `Clock`/`ClockSource` seam. `AppState` now carries an injectable
+  entropy source (`OsEntropy` by default; `SeededEntropy` over `ChaCha8Rng` for
+  simulation), reachable in handlers through the new **`Rng`** request extractor
+  (`autumn_web::entropy::Rng`) and overridable via `AppState::with_entropy` /
+  `TestApp::with_entropy`. Deterministic `uuid_v4` / `uuid_v7` helpers, plus a
+  seed-derived, order-independent `derive_uuid(purpose_tag)` namespace helper
+  (on `SeededEntropy` and `SimRng`) for byte-reproducible multi-tenant fixtures,
+  round out the surface. The framework's four high-value id sites — job ids,
+  request-id middleware, idempotency in-flight lock owners, and session ids —
+  now mint through this source, so under a fixed seed the whole identifier
+  stream replays byte-for-byte. Other `Uuid::new_v4()` sites are intentionally
+  left as-is (a crate-wide deny-lint is deferred to a later phase).
 - **sim-testing:** the `Sim` handle gained its W2 virtual-clock + drain wiring
   (#1797): `Sim::build(TestApp)` mounts an app on the paused runtime with the
   simulation's `TickingClock` installed (via `TestApp::with_clock`), exposing the

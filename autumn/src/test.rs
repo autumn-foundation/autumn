@@ -772,6 +772,8 @@ pub struct TestApp {
     extensions: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send>>,
     /// Injected clock; `None` means use [`crate::time::SystemClock`].
     clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
+    /// Injected entropy source; `None` means use [`crate::entropy::OsEntropy`].
+    entropy: Option<std::sync::Arc<dyn crate::entropy::Entropy>>,
     /// Retained as `Arc<dyn Any>` so `TestClient::advance_clock` can downcast
     /// to [`crate::time::TickingClock`] at runtime.
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
@@ -849,6 +851,7 @@ impl TestApp {
             registered_plugins: std::collections::HashSet::new(),
             extensions: std::collections::HashMap::new(),
             clock: None,
+            entropy: None,
             clock_as_any: None,
             api_versions: Vec::new(),
             metrics_sources: Vec::new(),
@@ -1465,6 +1468,32 @@ impl TestApp {
         self
     }
 
+    /// Inject a custom entropy source into the test app.
+    ///
+    /// All handlers that take a [`crate::entropy::Rng`] extractor — and every
+    /// framework-minted identifier (request ids, session ids, idempotency lock
+    /// owners, job ids) — draw from `entropy`. Pass a
+    /// [`crate::entropy::SeededEntropy`] to make the whole app's identifier
+    /// stream byte-for-byte reproducible under a fixed seed. Mirrors
+    /// [`Self::with_clock`].
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::entropy::SeededEntropy;
+    /// use autumn_web::test::TestApp;
+    ///
+    /// let _client = TestApp::new()
+    ///     .with_entropy(SeededEntropy::new(0x5eed))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn with_entropy<E>(mut self, entropy: E) -> Self
+    where
+        E: crate::entropy::Entropy + 'static,
+    {
+        self.entropy = Some(std::sync::Arc::new(entropy));
+        self
+    }
+
     /// Register a single API version for testing.
     #[must_use]
     pub fn api_version(mut self, version: crate::app::ApiVersion) -> Self {
@@ -1793,6 +1822,9 @@ impl TestApp {
             clock: self
                 .clock
                 .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock)),
+            entropy: self
+                .entropy
+                .unwrap_or_else(|| std::sync::Arc::new(crate::entropy::OsEntropy)),
             app_id: crate::state::AppState::next_app_id(),
         };
 

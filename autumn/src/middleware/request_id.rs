@@ -44,10 +44,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use std::sync::Arc;
+
 use axum::http::{HeaderValue, Request, Response};
 use http::header::HeaderName;
 use pin_project_lite::pin_project;
 use tower::{Layer, Service};
+
+use crate::entropy::{Entropy, OsEntropy};
 use uuid::Uuid;
 
 /// Header name for the request ID, added to every response.
@@ -99,16 +103,40 @@ impl fmt::Display for RequestId {
 ///
 /// let app = axum::Router::<()>::new()
 ///     .route("/", axum::routing::get(|| async { "ok" }))
-///     .layer(RequestIdLayer);
+///     .layer(RequestIdLayer::default());
 /// ```
 #[derive(Clone, Debug)]
-pub struct RequestIdLayer;
+pub struct RequestIdLayer {
+    /// Injected entropy source for minting request ids. Defaults to
+    /// [`OsEntropy`]; the framework threads the app's seeded source here so
+    /// request ids replay deterministically under a fixed simulation seed.
+    entropy: Arc<dyn Entropy>,
+}
+
+impl Default for RequestIdLayer {
+    fn default() -> Self {
+        Self {
+            entropy: Arc::new(OsEntropy),
+        }
+    }
+}
+
+impl RequestIdLayer {
+    /// Build a layer that mints request ids from the given entropy source.
+    #[must_use]
+    pub fn with_entropy(entropy: Arc<dyn Entropy>) -> Self {
+        Self { entropy }
+    }
+}
 
 impl<S> Layer<S> for RequestIdLayer {
     type Service = RequestIdService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        RequestIdService { inner }
+        RequestIdService {
+            inner,
+            entropy: self.entropy.clone(),
+        }
     }
 }
 
@@ -121,6 +149,7 @@ impl<S> Layer<S> for RequestIdLayer {
 #[derive(Clone, Debug)]
 pub struct RequestIdService<S> {
     inner: S,
+    entropy: Arc<dyn Entropy>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for RequestIdService<S>
@@ -136,7 +165,7 @@ where
     }
 
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
-        let id = RequestId(Uuid::new_v4());
+        let id = RequestId(self.entropy.uuid_v4());
         req.extensions_mut().insert(id.clone());
 
         RequestIdFuture {
@@ -194,7 +223,7 @@ mod tests {
     async fn response_has_request_id_header() {
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
-            .layer(RequestIdLayer);
+            .layer(RequestIdLayer::default());
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -211,7 +240,7 @@ mod tests {
     async fn each_request_gets_unique_id() {
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
-            .layer(RequestIdLayer);
+            .layer(RequestIdLayer::default());
 
         let r1 = app
             .clone()
@@ -234,7 +263,9 @@ mod tests {
             id.to_string()
         }
 
-        let app = Router::new().route("/", get(handler)).layer(RequestIdLayer);
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(RequestIdLayer::default());
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())

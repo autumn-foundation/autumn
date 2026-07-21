@@ -92,6 +92,7 @@ use http::request::Parts;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tower::{Layer, Service};
+#[cfg(test)]
 use uuid::Uuid;
 
 // ── Session data ────────────────────────────────────────────────
@@ -106,6 +107,10 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct Session {
     inner: Arc<RwLock<SessionInner>>,
+    /// Entropy source used to mint rotated session ids. Defaults to
+    /// [`crate::entropy::OsEntropy`]; the session layer threads the app's seeded
+    /// source in so id rotation replays deterministically under a fixed seed.
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 #[derive(Debug)]
@@ -153,7 +158,18 @@ impl Session {
                 dirty: false,
                 destroyed: false,
             })),
+            entropy: Arc::new(crate::entropy::OsEntropy),
         }
+    }
+
+    /// Attach the entropy source used to mint rotated session ids.
+    ///
+    /// The session layer calls this with the app's injected source so a
+    /// simulation replays session-id rotation deterministically.
+    #[must_use]
+    fn with_entropy(mut self, entropy: Arc<dyn crate::entropy::Entropy>) -> Self {
+        self.entropy = entropy;
+        self
     }
 
     /// Returns the session ID.
@@ -220,8 +236,8 @@ impl Session {
     /// This is critical to call during privilege elevation (e.g., login)
     /// to prevent Session Fixation attacks.
     pub async fn rotate_id(&self) {
+        let new_id = self.entropy.uuid_v4().to_string();
         let mut inner = self.inner.write().await;
-        let new_id = Uuid::new_v4().to_string();
         if inner.old_id.is_none() {
             inner.old_id = Some(inner.id.clone());
         }
@@ -717,6 +733,7 @@ pub struct SessionLayer<S: SessionStore> {
     store: Arc<S>,
     config: Arc<SessionConfig>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 impl<S: SessionStore> SessionLayer<S> {
@@ -726,7 +743,19 @@ impl<S: SessionStore> SessionLayer<S> {
             store: Arc::new(store),
             config: Arc::new(config),
             signing_keys: None,
+            entropy: Arc::new(crate::entropy::OsEntropy),
         }
+    }
+
+    /// Inject the entropy source used to mint new and rotated session ids.
+    ///
+    /// Defaults to [`crate::entropy::OsEntropy`]; the framework threads the
+    /// app's seeded source here so session ids replay deterministically under a
+    /// fixed simulation seed.
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: Arc<dyn crate::entropy::Entropy>) -> Self {
+        self.entropy = entropy;
+        self
     }
 
     /// Attach signing keys so session cookies are HMAC-signed.
@@ -754,6 +783,7 @@ impl<S: SessionStore + Clone, Inner> Layer<Inner> for SessionLayer<S> {
             store: Arc::clone(&self.store),
             config: Arc::clone(&self.config),
             signing_keys: self.signing_keys.clone(),
+            entropy: self.entropy.clone(),
         }
     }
 }
@@ -765,6 +795,7 @@ pub struct SessionService<S: SessionStore, Inner> {
     store: Arc<S>,
     config: Arc<SessionConfig>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 /// `true` when the response was produced by the request-timeout layer
@@ -804,6 +835,7 @@ where
         let store = Arc::clone(&self.store);
         let config = Arc::clone(&self.config);
         let signing_keys = self.signing_keys.clone();
+        let entropy = self.entropy.clone();
         let mut inner = self.inner.clone();
         // Swap to ensure correct poll_ready semantics
         std::mem::swap(&mut self.inner, &mut inner);
@@ -834,12 +866,12 @@ where
                     Ok(Some(data)) => (id.clone(), data),
                     Ok(None) => {
                         stale_cookie_session_id = Some(id.clone());
-                        (Uuid::new_v4().to_string(), HashMap::new())
+                        (entropy.uuid_v4().to_string(), HashMap::new())
                     }
                     Err(error) => return Ok(session_store_unavailable_response(&error)),
                 }
             } else {
-                (Uuid::new_v4().to_string(), HashMap::new())
+                (entropy.uuid_v4().to_string(), HashMap::new())
             };
 
             // 2. Create session handle and insert into extensions
@@ -848,7 +880,8 @@ where
                 Session::new_cookie_backed(session_id.clone(), data)
             } else {
                 Session::new(session_id.clone(), data)
-            };
+            }
+            .with_entropy(entropy.clone());
             let current_session_scope = cookie_backed.then(|| session_id.clone());
             req.extensions_mut()
                 .insert(crate::idempotency::IdempotencySessionScope::new(
@@ -932,12 +965,14 @@ pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
     profile: Option<&str>,
     custom_store: Option<Arc<dyn BoxedSessionStore>>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+    entropy: &Arc<dyn crate::entropy::Entropy>,
 ) -> Result<axum::Router<S>, SessionBackendConfigError> {
     if let Some(store) = custom_store {
         tracing::debug!(
             "Custom session store installed via with_session_store(); skipping config-driven backend selection"
         );
-        let mut layer = SessionLayer::new(ArcSessionStore(store), config.clone());
+        let mut layer =
+            SessionLayer::new(ArcSessionStore(store), config.clone()).with_entropy(entropy.clone());
         if let Some(keys) = signing_keys {
             layer = layer.with_signing_keys(keys);
         }
@@ -952,7 +987,8 @@ pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
                      session.allow_memory_in_production=true to acknowledge the risk"
                 );
             }
-            let mut layer = SessionLayer::new(MemoryStore::new(), config.clone());
+            let mut layer =
+                SessionLayer::new(MemoryStore::new(), config.clone()).with_entropy(entropy.clone());
             if let Some(keys) = signing_keys {
                 layer = layer.with_signing_keys(keys);
             }
@@ -962,7 +998,8 @@ pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
             #[cfg(feature = "redis")]
             {
                 let store = crate::session_redis::RedisStore::from_config(config)?;
-                let mut layer = SessionLayer::new(store, config.clone());
+                let mut layer =
+                    SessionLayer::new(store, config.clone()).with_entropy(entropy.clone());
                 if let Some(keys) = signing_keys {
                     layer = layer.with_signing_keys(keys);
                 }
@@ -1005,6 +1042,33 @@ mod tests {
             session.id().await,
             "fresh-id",
             "touch() must not change the id"
+        );
+    }
+
+    /// W3 (issue #1797): a rotated session id is minted from the injected
+    /// entropy source, so a fixed seed reproduces the exact rotated id and a
+    /// different seed diverges.
+    #[tokio::test]
+    async fn rotate_id_is_deterministic_under_seeded_entropy() {
+        async fn rotated(seed: u64) -> String {
+            let session = Session::new_for_test_without_cookie("orig".to_owned(), HashMap::new())
+                .with_entropy(crate::entropy::SeededEntropy::shared(seed));
+            session.rotate_id().await;
+            session.id().await
+        }
+
+        let first = rotated(0x5eed).await;
+        assert_ne!(first, "orig", "rotation changes the id");
+        assert!(Uuid::parse_str(&first).is_ok(), "rotated id is a v4 UUID");
+        assert_eq!(
+            first,
+            rotated(0x5eed).await,
+            "same seed ⇒ identical rotated session id"
+        );
+        assert_ne!(
+            rotated(1).await,
+            rotated(2).await,
+            "a different seed ⇒ different rotated id"
         );
     }
 
@@ -1328,6 +1392,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: crate::state::AppState::next_app_id(),
         };
 
@@ -1385,6 +1450,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: crate::state::AppState::next_app_id(),
         }
     }

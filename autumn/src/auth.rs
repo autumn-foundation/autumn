@@ -3009,6 +3009,7 @@ mod tests {
             auth_session_key: auth_session_key.to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: crate::state::AppState::next_app_id(),
         }
     }
@@ -4990,7 +4991,7 @@ mod api_token_tests {
         let app = axum::Router::new()
             .route("/api/private", axum::routing::get(|| async { "ok" }))
             .layer(RequireApiToken::new(store))
-            .layer(RequestIdLayer);
+            .layer(RequestIdLayer::default());
 
         let response = app
             .oneshot(
