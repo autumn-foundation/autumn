@@ -273,10 +273,11 @@ use crate::state::AppState;
 // qualified path — so without `test-support` this import would be unused.
 #[cfg(all(feature = "db", feature = "test-support"))]
 use diesel_async::AsyncPgConnection;
-// Used by the Postgres transactional establish path and by the `test-support`
-// `TestDb`; neither is compiled in a `--features sqlite` build without
-// `test-support`, so this import would otherwise be unused there.
-#[cfg(all(feature = "db", any(not(feature = "sqlite"), feature = "test-support")))]
+// Used by the Postgres transactional establish path (the `.get_result()` on
+// `TransactionalDbInterceptor`), which is itself gated `not(feature = "sqlite")`;
+// every other `RunQueryDsl` method call in this module brings the trait in via a
+// local `use`, so this import is unused under any `sqlite` build.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 use diesel_async::RunQueryDsl;
 #[cfg(feature = "db")]
 use diesel_async::pooled_connection::deadpool::Pool;
