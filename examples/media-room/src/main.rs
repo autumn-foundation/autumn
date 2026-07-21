@@ -101,7 +101,23 @@ fn page(rooms: &[RoomEntry]) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Autumn Media Rooms" }
-                link rel="stylesheet" href="/static/css/autumn.css";
+                // Inline styling keeps this example self-contained: it needs no
+                // asset pipeline, and an inline <style> makes no network request
+                // (so there is never a missing-stylesheet console error). The
+                // app's default CSP allows `style-src 'unsafe-inline'`.
+                style {
+                    (PreEscaped(
+                        "body{font-family:system-ui,sans-serif;line-height:1.5;margin:0;\
+                         color:#1a1a1a;background:#fafafa}\
+                         main{max-width:44rem;margin:0 auto;padding:2rem 1.25rem}\
+                         h1{margin-top:0}\
+                         code{background:#eee;padding:.1em .35em;border-radius:4px}\
+                         table{border-collapse:collapse;width:100%}\
+                         th,td{border:1px solid #ddd;padding:.4rem .6rem;text-align:left}\
+                         button{padding:.5rem 1rem;font-size:1rem;cursor:pointer}\
+                         section{margin:1.5rem 0}"
+                    ))
+                }
             }
             body {
                 main class="container" {
