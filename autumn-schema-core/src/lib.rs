@@ -235,9 +235,11 @@ impl ColumnType {
                 Self::Float32 => "Float4",
                 Self::Float64 => "Float8",
                 // `NaiveDateTime` -> core, ungated `Timestamp` (compiles).
-                // `DateTime<Utc>` -> nominal `Timestamp` for documentation only;
-                // it is rejected at generate time (see `sqlite_has_diesel_conversion`).
-                Self::Timestamp | Self::TimestampTz => "Timestamp",
+                Self::Timestamp => "Timestamp",
+                // `DateTime<Utc>` -> diesel's SQLite `TimestamptzSqlite` (issue
+                // #1924); its `sqlite`+`chrono` conversion resolves through the
+                // app's `autumn-web` sqlite feature.
+                Self::TimestampTz => "TimestamptzSqlite",
                 Self::Bytes => "Binary",
             },
         }
@@ -312,19 +314,18 @@ impl ColumnType {
     /// set (diesel `sqlite` + `chrono`, without `uuid`/`numeric`).
     ///
     /// Mirrors `dsl::FieldKind::sqlite_has_diesel_conversion`: `false` for
-    /// [`Uuid`](Self::Uuid), [`Attachment`](Self::Attachment),
-    /// [`Decimal`](Self::Decimal), [`TimestampTz`](Self::TimestampTz), and
-    /// [`Enum`](Self::Enum) (all rejected at generate time on `SQLite`, issue
-    /// #1924); `true` for every other type — including [`Timestamp`](Self::Timestamp)
-    /// via the core, ungated diesel `Timestamp` sql-type.
+    /// [`Uuid`](Self::Uuid), [`Decimal`](Self::Decimal), and [`Enum`](Self::Enum)
+    /// (still rejected at generate time on `SQLite`, issue #1924); `true` for
+    /// every other type — including [`Timestamp`](Self::Timestamp) via the core,
+    /// ungated diesel `Timestamp` sql-type, [`TimestampTz`](Self::TimestampTz)
+    /// via diesel's `SQLite` `TimestamptzSqlite`, and [`Attachment`](Self::Attachment)
+    /// via `autumn-web`'s local `Blob` `Text`/`Sqlite` conversion (all #1924).
     #[must_use]
     pub const fn sqlite_has_diesel_conversion(&self) -> bool {
         !matches!(
             self,
             Self::Uuid
-                | Self::Attachment
                 | Self::Decimal { .. }
-                | Self::TimestampTz
                 | Self::Enum { .. }
                 // Introspection-only: an opaque type has no known diesel conversion.
                 | Self::Opaque { .. }
@@ -940,7 +941,7 @@ mod tests {
             (ColumnType::Float64, "Float8"),
             (ColumnType::Uuid, "Text"),
             (ColumnType::Timestamp, "Timestamp"),
-            (ColumnType::TimestampTz, "Timestamp"),
+            (ColumnType::TimestampTz, "TimestamptzSqlite"),
             (ColumnType::Bytes, "Binary"),
             (ColumnType::Attachment, "Text"),
             (
@@ -1088,11 +1089,7 @@ mod tests {
         for ct in all_column_types() {
             let expected = !matches!(
                 ct,
-                ColumnType::Uuid
-                    | ColumnType::Attachment
-                    | ColumnType::Decimal { .. }
-                    | ColumnType::TimestampTz
-                    | ColumnType::Enum { .. }
+                ColumnType::Uuid | ColumnType::Decimal { .. } | ColumnType::Enum { .. }
             );
             assert_eq!(
                 ct.sqlite_has_diesel_conversion(),

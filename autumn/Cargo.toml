@@ -468,6 +468,20 @@ path = "tests/sqlite_scoped_repository.rs"
 name = "sqlite_crud_basic"
 path = "tests/sqlite_crud_basic.rs"
 
+# SQLite model-field type conversions (issue #1924): proves a `#[model]` carrying
+# a `DateTime<Utc>` (-> TimestamptzSqlite), a `NaiveDateTime` (-> Timestamp), and
+# an `Option<Blob>` attachment (-> Text/JSON) compiles AND round-trips on an
+# in-memory SQLite pool with no Docker — insert, read-back equality (incl.
+# fractional seconds and NULL attachment), and chronological ordering of the
+# TEXT-backed DateTime column. Un-rejects those kinds at generate time. Only
+# meaningful under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]`
+# so a default `cargo test` compiles it to an empty (passing) binary. Needs the
+# `storage` feature for the `Blob` attachment field. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support,storage" --test sqlite_field_conversions`.
+[[test]]
+name = "sqlite_field_conversions"
+path = "tests/sqlite_field_conversions.rs"
+
 # SQLite upsert isolation + optimistic-lock proof (issue #1996, PR #2021): the two
 # P1 fixes on the cfg-dual `__autumn_execute_upsert` SQLite arm. Proves (Bug 2,
 # SECURITY) a tenant-scoped `upsert_many` under tenant B with tenant A's id leaves
