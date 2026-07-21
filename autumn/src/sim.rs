@@ -226,6 +226,16 @@ impl Sim {
     /// [`advance`](Sim::advance) to the next interesting instant, then
     /// `run_to_idle` to settle the work it released.
     pub async fn run_to_idle(&self) {
+        // Resolve the mounted app's DB pool once (a cheap, cloned Arc-backed
+        // handle). Durable repository commit hooks are rows, so there is
+        // nothing to drain when the app was built without a database (e.g. the
+        // in-memory job DoD path) — the lane is skipped entirely then.
+        #[cfg(feature = "db")]
+        let commit_hook_pool = self
+            .app
+            .try_client()
+            .and_then(|client| crate::db::DbState::pool(client.state()).cloned());
+
         for _ in 0..MAX_DRAIN_STEPS {
             // One yield lets each currently-ready spawned task take a step; a
             // zero-duration timer advance flushes any timers registered for the
@@ -236,16 +246,23 @@ impl Sim {
             tokio::task::yield_now().await;
             tokio::time::advance(std::time::Duration::ZERO).await;
 
-            // W2: repository commit-hook drain — the third ready-work source
-            // this loop must quiesce on. Wires to the public test-harness
-            // wrapper `crate::repository_commit_hooks::drain_ready_repository_commit_hooks(pool, max_rows)`
-            // once the parallel commit-hooks lane widens that seam (its drain
-            // fns are private + `worker_id`-taking today). It is intentionally
-            // NOT called yet: re-widening or duplicating that private drain here
-            // is out of W2's boundary, and the DoD job path is in-memory (no
-            // pool). Slot: resolve the mounted app's pool from
-            // `self.app.client().state()` and drain here inside the settle loop
-            // so hook-enqueued jobs are picked up on a subsequent iteration.
+            // Third ready-work source: durable repository commit hooks. Drain
+            // the ready set through the public test-harness wrapper
+            // (`crate::test::drain_ready_repository_commit_hooks`), which runs
+            // the same claim → run → ack wiring the background commit-hook
+            // worker uses, but deterministically and worker-free. A hook may
+            // itself enqueue a job, so draining inside the settle loop lets a
+            // subsequent iteration pick that job up, and the returned
+            // hooks-drained count folds into the loop's quiescence: a nonzero
+            // drain is progress that keeps this bounded settle running. Under
+            // the paused runtime the job/timer sources expose no idle signal,
+            // so the cooperative spin remains their settle mechanism and the
+            // loop still exits when the step bound is hit.
+            #[cfg(feature = "db")]
+            if let Some(pool) = commit_hook_pool.as_ref() {
+                let _hooks_drained =
+                    crate::test::drain_ready_repository_commit_hooks(pool, MAX_DRAIN_STEPS).await;
+            }
         }
     }
 }
