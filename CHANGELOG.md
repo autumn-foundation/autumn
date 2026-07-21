@@ -35,7 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockstep; and `Sim::run_to_idle()` cooperatively drains ready jobs and
   timer-woken work to quiescence. A job whose retry backs off 24h now fires in
   virtual time with zero wall-clock sleep. [no-plugin]
-
+- **sim-testing:** `Sim::advance_to(target)` advances the virtual clock **to** a
+  zoned instant (#1797), the DST/timezone-aware companion to `Sim::advance(dur)`.
+  It is generic over any `chrono::TimeZone` (pass a `chrono::DateTime<Utc>`, a
+  `FixedOffset` datetime, or a `chrono_tz::Tz` datetime — no new hard dependency)
+  and resolves the target to the correct UTC instant before reusing `advance`
+  internally, so the injected clock and tokio's paused timer wheel stay in
+  lockstep across a DST spring-forward boundary and any timer due inside the
+  crossed window still fires. Time is forward-only: advancing to the current
+  instant is a no-op and advancing to a strictly-past instant panics. A companion
+  `Sim::advance_to_local(naive, &tz)` resolves a naive wall time with explicit,
+  deterministic DST-edge handling (ambiguous fall-back → earlier instant; spring
+  -forward gap → carried across the gap), never `.unwrap()`ing a `LocalResult`.
+  [no-plugin]
 - **dev:** add `scripts/pre-push-check.sh`, a pre-push gate that mirrors CI's
   `lint` + `test` jobs (`cargo fmt --all -- --check`, `cargo clippy --workspace
   --all-targets`, a compile-only `cargo test --workspace --no-run`, and a
@@ -52,7 +64,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   infra-free and disk-cheap because doctests are overwhelmingly `no_run`/`ignore`
   (still compiled, so the break is caught) and `--doc` never triggers trybuild.
   Documented in CONTRIBUTING.md "Before you push". [no-plugin]
-
 - **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
   shared, **multi-process-safe** database-backed implementation. The `RoomStore`
   trait, `RoomService`, and the four room HTTP handlers are now `async` (via
