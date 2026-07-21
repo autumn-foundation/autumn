@@ -75,6 +75,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deploy but silently ignored at runtime under `AUTUMN_ENV=prod`. The existing
   single-file `from_autumn_toml` / `from_toml_str_with_env` entry points are
   unchanged.
+- **sim-testing:** the deterministic simulation harness (#1797) gained its
+  **SQLite DB lane** — the per-sim database substrate a sim builds its app on.
+  `sim::substrate::SqliteSubstrate` (gated on the `sqlite` feature) builds a
+  fresh, migrated, **in-process in-memory** SQLite pool, unique per simulation,
+  ready to hand to the mounted app. It uses a **named shared-cache** in-memory
+  database anchored by a **kept-alive guard connection** so the migrated schema
+  survives for every pooled checkout — sidestepping the framework's conservative
+  in-memory-migration reject precisely because the guard keeps the database
+  alive — and a distinct database name per substrate guarantees two sims never
+  share state. It also resolves the **feature-unification hazard**: under
+  `--features sqlite` the Postgres advisory-lock scheduler and the durable
+  Postgres job queue are compiled out, so the sim exercises the *representative*
+  local paths — the `InProcessSchedulerCoordinator` (scheduler) and the local
+  `JobAdminMemoryBackend` (jobs). The documented divergence: a green sim proves
+  the orchestration/timing/ordering of those local paths, **not** the Postgres
+  advisory-lock leasing or durable `LISTEN`/`NOTIFY` + `SKIP LOCKED` queue
+  claim/lock semantics (consistent with the RFC §12 scope). The substrate is
+  self-contained and additive: it hands its `RuntimeConnection` pool to a
+  `TestApp` via `TestApp::with_db(...)`, which is exactly the seam W2's
+  `Sim::build(TestApp)` consumes — so W2 wires it into the `Sim` app mount in a
+  follow-up. (0.7.0 work — do not merge until v0.6.0 is cut.)
 ### Fixed
 
 - Docs and crate metadata: updated repository/homepage URLs, README badges, install scripts, and the CI workflow template from the old `madmax983/autumn` owner to `autumn-foundation/autumn` after the GitHub org transfer. Old links still redirect; this makes the canonical URLs correct.
