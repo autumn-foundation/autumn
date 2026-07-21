@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs:** an **audit logging** guide (`docs/guide/audit-logging.md`) documenting audit events with actor auto-attribution, with a minimal audit sink wired into the `reddit-clone` example (#2099). [no-plugin]
 - **docs/examples:** documented the `autumn-media-plugin` media subsystem
   (broadcast + mesh rooms + MediaMTX). Adds the `docs/guide/media.md` guide
   (install/mount, `MediaConfig` profile loading, the `RoomService`/`RoomStore`
