@@ -78,6 +78,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COPY --from=builder /app/i18n /app/i18n` lines are injected for
   `--with-i18n` and the anchors stripped otherwise (a non-i18n build context
   has no `i18n/` dir), leaving no stray anchor markers.
+- **ci:** the Quickstart Gate now falls back to a local source install
+  ("PRE-RELEASE MODE") when the README-pinned `autumn-cli` version is not yet on
+  crates.io, so the release window between bumping the README and the crate
+  publishing no longer turns the gate structurally red. `check-quickstart.sh`
+  probes the crates.io sparse index; when the version is unpublished the install
+  phase runs `cargo install --path autumn-cli --locked` and the build phase
+  patches the generated app's `[patch.crates-io]` to the in-tree `autumn-web`
+  (which transitively resolves `autumn-macros` via its own path dep), relaxing
+  the registry-provenance assertion to a path-source check. An indeterminate
+  publication probe (network/transport error) fails loudly rather than guessing.
+  The normal published-version path stays the default and is behavior-unchanged
+  (0.6.0 is live, so this is dormant today). [no-plugin]
 - **mail:** make `DbSuppressionStore` backend-agnostic
   (`Pool<RuntimeConnection>`) so the `sqlite` + `mail` feature union compiles,
   unblocking the Coverage CI job (#1614). The Coverage lane's
