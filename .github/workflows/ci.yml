@@ -229,17 +229,52 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo llvm-cov clean --workspace
-          # `--all-features` is unsafe here: it would enable autumn-web's
-          # backend-flip `sqlite` feature alongside the Postgres-assuming
-          # features, flipping `db::RuntimeConnection` to SQLite and failing
-          # autumn-web's lib to compile (#1614). Cargo has no "all-features
-          # except one crate feature" flag, so cover the rest of the workspace
-          # with `--all-features --exclude autumn-web`, then cover autumn-web
-          # separately with an explicit Postgres feature list (every autumn-web
-          # feature EXCEPT `sqlite`). Both accumulate into the same profile set.
+          # `--all-features` on a `--workspace` run is structurally unsafe here.
+          # Only two workspace members own a `sqlite` feature — autumn-web and
+          # autumn-cli (`sqlite = ["autumn-web/sqlite", ...]`). Under
+          # `--all-features`, autumn-cli's `sqlite` forwards to `autumn-web/sqlite`
+          # and — through GLOBAL cargo feature unification — flips the SHARED
+          # autumn-web dependency's `db::RuntimeConnection` alias to the SQLite
+          # backend for the ENTIRE graph. Every Pg-assuming crate then fails to
+          # compile with E0308 (they pin diesel `postgres` and use
+          # `#[model]`/`Jsonb`/`AsyncPgConnection`): autumn-web's lib itself
+          # (#1614), autumn-admin-plugin, autumn-media-plugin, and the example
+          # apps. Cargo has no "all-features except one crate feature" flag, and
+          # excluding victim crates one-by-one is whack-a-mole. Instead exclude
+          # the two crates that OWN a `sqlite` feature so NO selected package can
+          # turn the flip on, then cover each explicitly:
+          #   - autumn-web: covered below with an explicit Postgres feature list
+          #     (`$PG_FEATURES`, every feature EXCEPT `sqlite`) plus a dedicated
+          #     sqlite+mail lane (see #1614 note below).
+          #   - autumn-cli: its `postgres`/`sqlite` backends are MUTUALLY
+          #     EXCLUSIVE ("NEVER `--all-features`", per autumn-cli/Cargo.toml),
+          #     so it can never be part of an `--all-features` build at all; it is
+          #     covered by its own `-p autumn-cli` test lanes below.
+          # With both feature-owners excluded the catch-all resolves autumn-web
+          # to Postgres, so autumn-admin-plugin / autumn-media-plugin / the
+          # example apps compile again and need NO exclusion.
+          #
+          # `$PG_FEATURES` = every autumn-web feature except `sqlite`. It is the
+          # coverage sibling of `autumn_web_semver_features` in
+          # scripts/check-semver.sh (both deliberately EXCLUDE `sqlite` to avoid
+          # the backend flip); keep the `sqlite`-exclusion invariant in sync.
+          # Coverage is not bound by the crates.io baseline, so this list is a
+          # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
+          # `acme`, `managed-pg*`, `system-tests`, `test-support`, …).
           PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,system-tests,managed-pg,managed-pg-bundled,tls,acme"
-          cargo llvm-cov --workspace --exclude autumn-web --all-features --no-report
+          cargo llvm-cov --workspace --exclude autumn-web --exclude autumn-cli \
+            --all-features --no-report
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES"
+          # Explicit sqlite+mail lane (#1614). Excluding autumn-cli above removed
+          # the only place the `--all-features` catch-all compiled autumn-web
+          # under the `sqlite` + `mail` union — which is exactly the
+          # `DbSuppressionStore` backend-flip this PR fixes, so coverage must
+          # keep compiling it. Restore it here, isolated to `-p autumn-web` so the
+          # sqlite flip can never leak onto the Pg-assuming workspace crates. A
+          # named sqlite `[[test]]` target keeps it off the pg-URL lib unit tests
+          # (which assume Postgres) — same rule the `sqlite-runtime` job follows.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
+            --test sqlite_boot_serve
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test db_hooks_lifecycle -- --ignored
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \

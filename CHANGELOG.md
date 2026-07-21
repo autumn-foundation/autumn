@@ -22,6 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockstep; and `Sim::run_to_idle()` cooperatively drains ready jobs and
   timer-woken work to quiescence. A job whose retry backs off 24h now fires in
   virtual time with zero wall-clock sleep. [no-plugin]
+
+- **dev:** add `scripts/pre-push-check.sh`, a pre-push gate that mirrors CI's
+  `lint` + `test` jobs (`cargo fmt --all -- --check`, `cargo clippy --workspace
+  --all-targets`, a compile-only `cargo test --workspace --no-run`, and a
+  `cargo test --workspace --doc` doctest leg). The compile-only step builds every
+  workspace test target — including the autumn-web consolidated
+  `integration_tests` binary that a narrow `cargo test -p autumn-cli` loop never
+  links — so cross-package compile breaks (e.g. the #1614 sqlite+mail `E0308`)
+  are caught locally instead of surfacing as CI "flakes". `--no-run` keeps it
+  disk-cheap by skipping the trybuild run that expands scratch by ~17GB. Because
+  `--no-run` does **not** build doctests (they compile only in the `--doc`
+  phase) and cargo has no stable compile-only doctest mode, the separate
+  `--workspace --doc` leg runs them to catch doctest breaks like #2107 (an
+  `app.rs` `no_run` example that broke after a struct gained a field); it stays
+  infra-free and disk-cheap because doctests are overwhelmingly `no_run`/`ignore`
+  (still compiled, so the break is caught) and `--doc` never triggers trybuild.
+  Documented in CONTRIBUTING.md "Before you push". [no-plugin]
+
 - **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
   shared, **multi-process-safe** database-backed implementation. The `RoomStore`
   trait, `RoomService`, and the four room HTTP handlers are now `async` (via
@@ -59,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 ### Fixed
 
+- Docs and crate metadata: updated repository/homepage URLs, README badges, install scripts, and the CI workflow template from the old `madmax983/autumn` owner to `autumn-foundation/autumn` after the GitHub org transfer. Old links still redirect; this makes the canonical URLs correct.
 - **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
   Previously the opt-in was name-gated to `prod`/`production`, so a custom
   profile (`fly`, `staging`, …) with `auto_migrate_in_production = true` silently
@@ -86,6 +105,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COPY --from=builder /app/i18n /app/i18n` lines are injected for
   `--with-i18n` and the anchors stripped otherwise (a non-i18n build context
   has no `i18n/` dir), leaving no stray anchor markers.
+- **ci:** the Quickstart Gate now falls back to a local source install
+  ("PRE-RELEASE MODE") when the README-pinned `autumn-cli` version is not yet on
+  crates.io, so the release window between bumping the README and the crate
+  publishing no longer turns the gate structurally red. `check-quickstart.sh`
+  probes the crates.io sparse index; when the version is unpublished the install
+  phase runs `cargo install --path autumn-cli --locked` and the build phase
+  patches the generated app's `[patch.crates-io]` to the in-tree `autumn-web`
+  (which transitively resolves `autumn-macros` via its own path dep), relaxing
+  the registry-provenance assertion to a path-source check. An indeterminate
+  publication probe (network/transport error) fails loudly rather than guessing.
+  The normal published-version path stays the default and is behavior-unchanged
+  (0.6.0 is live, so this is dormant today). [no-plugin]
+- **mail:** make `DbSuppressionStore` backend-agnostic
+  (`Pool<RuntimeConnection>`) so the `sqlite` + `mail` feature union compiles,
+  unblocking the Coverage CI job (#1614). The Coverage lane's
+  `--workspace --all-features` catch-all now excludes the two workspace members
+  that OWN a `sqlite` feature — `autumn-web` and `autumn-cli` — instead of the
+  earlier per-crate exclusion of victim crates. Under `--all-features`,
+  autumn-cli's `sqlite` forwarded to `autumn-web/sqlite` and (via global cargo
+  feature unification) flipped the shared autumn-web dependency to the SQLite
+  backend for the whole graph, breaking every Pg-assuming crate
+  (`autumn-admin-plugin`, `autumn-media-plugin`, the example apps) with E0308.
+  Excluding the two feature-owners resolves autumn-web to Postgres in the
+  catch-all, so those crates compile again and their earlier `--exclude`s are
+  dropped; autumn-cli's `postgres`/`sqlite` backends are mutually exclusive and
+  it can never be `--all-features`'d anyway (it keeps its dedicated `-p` test
+  lanes). A dedicated `-p autumn-web --features "sqlite,mail"` lane preserves the
+  `sqlite` + `mail` union compile in the coverage job. [no-plugin]
 ### Added
 
 - **router:** new `health.enabled` config knob (default `true`,

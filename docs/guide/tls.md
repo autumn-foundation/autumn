@@ -292,13 +292,13 @@ Fields:
 > distributed scheduler backend is configured. For multi-replica or clustered
 > deployments, terminate TLS at a shared reverse proxy / load balancer (or a
 > single dedicated TLS-terminating instance) instead of in-process ACME
-> ([#1620](https://github.com/madmax983/autumn/issues/1620)).
+> ([#1620](https://github.com/autumn-foundation/autumn/issues/1620)).
 
 ### Scope
 
 This is a **single-host** slice. Wildcard certificates and the DNS-01 challenge
 are out of scope (tracked in
-[#1620](https://github.com/madmax983/autumn/issues/1620)). For multiple replicas
+[#1620](https://github.com/autumn-foundation/autumn/issues/1620)). For multiple replicas
 behind a shared entry point, terminate TLS at the proxy instead — see below.
 
 ---

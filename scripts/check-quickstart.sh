@@ -131,6 +131,76 @@ readme_cli_version() {
   sed -n 's/^cargo install autumn-cli --version \([0-9][0-9A-Za-z.+-]*\).*$/\1/p' "$repo_root/README.md" | head -n 1
 }
 
+# ── Pre-release detection (crates.io sparse index) ───────────────────────────
+#
+# During a release window the README is bumped to a new version BEFORE that
+# version appears on crates.io. In that gap both `cargo install autumn-cli
+# --version <new>` (install phase) and the crates.io registry-provenance
+# assertion (build phase) fail through no real fault. `crate_version_published`
+# lets those phases detect the window and fall back to a local source install
+# ("PRE-RELEASE MODE") instead of going structurally red. When the version IS
+# published (the normal case — 0.6.0 is live today) this is dormant and the
+# published crates.io path runs unchanged.
+
+sparse_index_path() {
+  # crates.io sparse-index path layout (see the Cargo book, "Index files"):
+  #   1 char  -> 1/{name}
+  #   2 chars -> 2/{name}
+  #   3 chars -> 3/{first}/{name}
+  #   4+      -> {first-two}/{second-two}/{name}
+  # Crate names are case-insensitive on the index; the path is lowercased.
+  local name="${1,,}" n=${#1}
+  case "$n" in
+    1) printf '1/%s' "$name" ;;
+    2) printf '2/%s' "$name" ;;
+    3) printf '3/%s/%s' "${name:0:1}" "$name" ;;
+    *) printf '%s/%s/%s' "${name:0:2}" "${name:2:2}" "$name" ;;
+  esac
+}
+
+crate_version_published() {
+  # Exit 0 iff <crate> <version> is published on crates.io, 1 if it is
+  # definitely not (the crate exists but lacks that version, or the crate has
+  # never been published at all → sparse-index 404). On a TRANSPORT/network
+  # error we cannot tell, and both silent outcomes are dangerous: silently
+  # source-installing could mask a genuinely broken published crate, while
+  # silently treating it as published would reintroduce the red we are fixing.
+  # So an indeterminate result is a LOUD fail() — the caller only ever branches
+  # on a definitive yes/no.
+  local crate="$1" version="$2" path url resp curl_rc http_code body
+  path="$(sparse_index_path "$crate")"
+  url="https://index.crates.io/${path}"
+  # No `curl -f`: a 404 must be READABLE (published-crate-without-version vs
+  # never-published), so we read the HTTP status from --write-out instead of
+  # letting -f collapse every non-2xx into the same nonzero exit. --retry rides
+  # out transient blips (not 404s). curl's own nonzero exit therefore means a
+  # genuine transport failure, which we distinguish from a 404 below.
+  if resp="$(curl -sS --max-time 20 --retry 3 --retry-delay 2 --retry-connrefused \
+      --write-out $'\n%{http_code}' "$url" 2>/dev/null)"; then
+    curl_rc=0
+  else
+    curl_rc=$?
+  fi
+  http_code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  if [[ "$http_code" == "404" ]]; then
+    # Definitively not published (the crate name has no index entry at all).
+    return 1
+  fi
+  if [[ $curl_rc -ne 0 || "$http_code" != "200" ]]; then
+    # Couldn't tell (network error, proxy, 5xx, rate-limit, empty status) →
+    # fail loudly rather than guessing either way.
+    fail "could not determine whether ${crate} ${version} is published: crates.io sparse index ${url} returned curl exit ${curl_rc}, HTTP '${http_code:-none}'"
+  fi
+  # The sparse-index body is newline-delimited JSON, one object per version.
+  # `jq -e 'select(.vers==$v)'` streams every line and exits 0 iff some line's
+  # .vers equals the requested version.
+  if printf '%s\n' "$body" | jq -e --arg v "$version" 'select(.vers==$v)' >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
 # Every database env override the published runtime/CLI honors must be
 # stripped from the documented commands, or a var the CI job happens to
 # carry could satisfy DB resolution and mask a broken documented
@@ -337,6 +407,30 @@ phase_install() {
   date +%s >"$state/t_install_start"
   echo "$version" >"$state/cli_version"
 
+  # PRE-RELEASE MODE: if the README-pinned version is not yet on crates.io (a
+  # release window between bumping the README and the crate publishing), install
+  # from the local source tree instead of going red. A dispatch override
+  # (QUICKSTART_CLI_VERSION) that IS published takes the normal path; if it names
+  # an unpublished candidate it too falls back to the honest local build. This
+  # publication check is the ONLY gate — when the version is published (0.6.0
+  # today) the published crates.io path below is byte-for-byte unchanged.
+  if ! crate_version_published autumn-cli "$version"; then
+    # Persist a marker BESIDE the shared state so the later (separate-process)
+    # build phase resolves the generated app against the in-tree crates too —
+    # in a real pre-release window autumn-web at this version is also unpublished,
+    # so the registry-provenance assertion would otherwise just move the red from
+    # install → build.
+    echo "$version" >"$state/.quickstart-prerelease"
+    echo "::warning::PRE-RELEASE MODE: autumn-cli ${version} is not yet published on crates.io — installing autumn-cli from the local source tree (${repo_root}/autumn-cli) instead of crates.io"
+    echo "installing autumn-cli ${version} from local source tree (PRE-RELEASE MODE — not yet on crates.io)"
+    if ! cargo install --path "$repo_root/autumn-cli" --locked; then
+      fail "'cargo install --path ${repo_root}/autumn-cli --locked' (PRE-RELEASE MODE source install) failed"
+    fi
+    command -v autumn >/dev/null || fail "cargo install succeeded but 'autumn' is not on PATH"
+    ok "PRE-RELEASE MODE — autumn-cli ${version} not on crates.io; installed autumn-cli from local source tree"
+    return
+  fi
+
   echo "installing autumn-cli ${version} from crates.io (README quickstart step 1)"
   if ! cargo install autumn-cli --version "$version"; then
     fail "'cargo install autumn-cli --version ${version}' failed — the README-pinned CLI version does not install from crates.io"
@@ -378,8 +472,73 @@ phase_setup() {
   ok
 }
 
+inject_prerelease_patch() {
+  # PRE-RELEASE MODE: point the generated app's autumn-web dependency at the
+  # in-tree source so it builds without needing crates.io for any autumn crate.
+  # We patch ONLY autumn-web — mirroring the root Cargo.toml's
+  # `[patch.crates-io] autumn-web = { path = "autumn" }`. autumn-web's sole
+  # in-tree dependency, autumn-macros, is referenced in autumn-web's OWN manifest
+  # by `path = "../autumn-macros"`, so patching autumn-web transitively resolves
+  # autumn-macros from source too (a `path` dep is always resolved by path,
+  # regardless of the patch). Adding a redundant `[patch] autumn-macros` here
+  # would be an UNUSED patch (cargo would warn), because nothing in the graph
+  # requests autumn-macros from crates.io. This matches how the whole workspace
+  # builds today with only the autumn-web patch. The generated app depends on no
+  # other autumn crate (autumn-schema-core / the plugins / storage / cache crates
+  # are not in its graph).
+  local toml="$app_dir/Cargo.toml"
+  local marker="# >>> autumn quickstart PRE-RELEASE MODE patch (auto-injected) >>>"
+  local endmarker="# <<< autumn quickstart PRE-RELEASE MODE patch <<<"
+  # Idempotent: a phase rerun must not append a second [patch] table (which would
+  # be a TOML duplicate-key error). phase_new already asserts the generated
+  # manifest ships no [patch] section, so appending our own table is safe.
+  if grep -qF "$marker" "$toml"; then
+    echo "PRE-RELEASE MODE: [patch.crates-io] already present in ${toml} (idempotent rerun)"
+    return 0
+  fi
+  {
+    printf '\n%s\n' "$marker"
+    printf '# PRE-RELEASE MODE: the README-pinned autumn-web is not yet on crates.io,\n'
+    printf '# so redirect it (and, via autumn-web'"'"'s own path dep, autumn-macros) to\n'
+    printf '# the in-tree workspace source, mirroring the root Cargo.toml.\n'
+    printf '[patch.crates-io]\n'
+    printf 'autumn-web = { path = "%s/autumn" }\n' "$repo_root"
+    printf '%s\n' "$endmarker"
+  } >>"$toml"
+  echo "PRE-RELEASE MODE: injected [patch.crates-io] autumn-web -> ${repo_root}/autumn into ${toml}"
+}
+
 phase_build() {
   require_app
+
+  # PRE-RELEASE MODE (marker written by phase_install when the README-pinned
+  # version is not yet on crates.io): the same version's autumn-web is also
+  # unpublished, so build the generated app against the in-tree source and relax
+  # the crates.io registry-provenance assertion to a path-source check. Without a
+  # marker this is the unchanged published-crates path.
+  if [[ -f "$state/.quickstart-prerelease" ]]; then
+    local prerelease_version
+    prerelease_version="$(cat "$state/.quickstart-prerelease")"
+    inject_prerelease_patch
+    (cd "$app_dir" && cargo build) || fail "PRE-RELEASE MODE: 'cargo build' of the generated app failed against the in-tree autumn-web (${repo_root}/autumn)"
+
+    local lock="$app_dir/Cargo.lock"
+    [[ -f "$lock" ]] || fail "no Cargo.lock produced by the build"
+    grep -q '^name = "autumn-web"$' "$lock" || fail "autumn-web missing from the generated Cargo.lock"
+    local source_line
+    source_line="$(awk '/^\[\[package\]\]/{found=0} /^name = "autumn-web"$/{found=1} found && /^source = /{print; exit}' "$lock")"
+    # A cargo PATH dependency has NO `source =` line in Cargo.lock (empty) — or an
+    # explicit `path+file://` source; a crates.io leak would carry the registry
+    # source. In PRE-RELEASE MODE we REQUIRE the path source and reject the
+    # registry (the inverse of the published-path assertion).
+    if [[ "$source_line" == *"registry+https://github.com/rust-lang/crates.io-index"* ]]; then
+      fail "PRE-RELEASE MODE: autumn-web resolved from the crates.io registry ('${source_line}') despite the [patch.crates-io] path redirect — the generated app did not build against the in-tree source"
+    fi
+    echo "::warning::PRE-RELEASE MODE: autumn-web ${prerelease_version} is not on crates.io — the generated app was patched to the in-tree source (${repo_root}/autumn) and the crates.io registry-provenance check was relaxed to a path-source check"
+    ok "PRE-RELEASE MODE — autumn-web ${prerelease_version} built from in-tree source (${repo_root}/autumn); registry-provenance check relaxed to path-source (lockfile source: '${source_line:-none — path dependency}')"
+    return
+  fi
+
   (cd "$app_dir" && cargo build) || fail "'cargo build' of the freshly generated app failed against the published autumn-web"
 
   # The whole point of this gate: prove the app compiled against the crates.io

@@ -4,7 +4,7 @@
 //! assert the produced filesystem matches the documented contract — covering
 //! the user-facing flow described in [Issue #493].
 //!
-//! [Issue #493]: https://github.com/madmax983/autumn/issues/493
+//! [Issue #493]: https://github.com/autumn-foundation/autumn/issues/493
 
 use std::fmt::Write as _;
 use std::fs;

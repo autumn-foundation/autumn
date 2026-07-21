@@ -2819,12 +2819,12 @@ mod tests {
     #[test]
     fn offline_shell_dep_mirrors_git_source_with_rev() {
         let (dep, warnings) = shell_dep_for(
-            "autumn-web = { git = \"https://github.com/madmax983/autumn\", rev = \"abc123\" }",
+            "autumn-web = { git = \"https://github.com/autumn-foundation/autumn\", rev = \"abc123\" }",
             "",
         );
         assert_eq!(
             dep.dep_entry,
-            r#"autumn-web = { git = "https://github.com/madmax983/autumn", rev = "abc123", features = ["offline-sync"] }"#,
+            r#"autumn-web = { git = "https://github.com/autumn-foundation/autumn", rev = "abc123", features = ["offline-sync"] }"#,
         );
         assert!(warnings.is_empty(), "got {warnings:?}");
     }
