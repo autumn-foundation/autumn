@@ -1,0 +1,4 @@
+CREATE TABLE t2 (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);

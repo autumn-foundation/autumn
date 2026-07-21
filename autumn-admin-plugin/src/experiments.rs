@@ -148,7 +148,7 @@ impl AdminModel for ExperimentAdminModel {
 
     fn list(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         params: ListParams,
     ) -> AdminFuture<'_, ListResult> {
         use diesel_async::RunQueryDsl;
@@ -209,7 +209,7 @@ impl AdminModel for ExperimentAdminModel {
 
     fn get(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
     ) -> AdminFuture<'_, Option<Value>> {
         use diesel::prelude::*;
@@ -238,7 +238,7 @@ impl AdminModel for ExperimentAdminModel {
 
     fn create(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         data: Value,
     ) -> AdminFuture<'_, Value> {
         use diesel_async::RunQueryDsl;
@@ -332,7 +332,7 @@ impl AdminModel for ExperimentAdminModel {
     #[allow(clippy::too_many_lines)]
     fn update(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
         data: Value,
     ) -> AdminFuture<'_, Value> {
@@ -463,7 +463,7 @@ impl AdminModel for ExperimentAdminModel {
 
     fn delete(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
     ) -> AdminFuture<'_, ()> {
         use diesel_async::RunQueryDsl;
@@ -504,7 +504,7 @@ impl AdminModel for ExperimentAdminModel {
 
     fn get_history<'a>(
         &'a self,
-        pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         record_id: i64,
         page: u64,
         per_page: u64,
