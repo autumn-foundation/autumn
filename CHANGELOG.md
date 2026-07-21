@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs:** a `docs/guide/downloads.md` guide covering the typed `Download`
+  response — the `from_bytes` / `from_stream` / `from_async_read` / `from_blob`
+  constructors, the `.filename` / `.content_type` / `.inline` / `.etag` /
+  `.last_modified` builders, and `into_response_ranged` for RFC 7233 `Range`
+  requests / `206 Partial Content` — plus a range-capable CSV export route
+  (`GET /bookmarks/export.csv`) added to the `bookmarks` example. `[no-plugin]`
 - **docs:** a `docs/guide/submit-tokens.md` guide for one-time submit tokens
   (at-most-once form submissions) — the double-submit / duplicate-POST problem,
   how the default-on `SubmitTokenLayer` + hidden `_submit_token` field +
