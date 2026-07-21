@@ -117,6 +117,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TestApp` via `TestApp::with_db(...)`, which is exactly the seam W2's
   `Sim::build(TestApp)` consumes — so W2 wires it into the `Sim` app mount in a
   follow-up. (0.7.0 work — do not merge until v0.6.0 is cut.)
+- **sim-testing:** the deterministic simulation harness (#1797) gained its
+  **chaos lane** — a seed-driven fault-injection builder. `sim::Chaos`
+  (`#[non_exhaustive]`, opt-in via the new `Sim::chaos(...)` setter) turns on
+  three reproducible faults: `db_transient_errors(p)` (a probability that a `Db`
+  checkout returns a retryable `service_unavailable` error), `job_duplicate_delivery(p)`
+  (a probability that a job is delivered — and executed — twice, via an
+  enqueue-seam re-enqueue of the same `(name, payload)`, to test idempotency),
+  and `clock_skew(dur)` (a deterministic wall-clock offset in `[0, dur]` applied
+  through a wrapping `ClockSource`). Every fault decision is drawn from a
+  **dedicated seeded entropy stream** (`seed ^ salt`, independent of the
+  app-facing `Entropy` source), so the **same seed and configuration replay the
+  same fault schedule byte-for-byte**; the schedule is recorded and readable via
+  the hidden `Sim::__chaos_events()`. `Sim::build` installs the hooks (DB / job
+  interceptors + skew clock) only when the config is active, so a default
+  (empty) `Chaos` leaves the build byte-for-byte unchanged. Probabilities are
+  clamped to `[0.0, 1.0]`. This is W5.0 (chaos scaffolding + chaos-v1 base); the
+  richer per-fault surfaces build additively on it. [no-plugin]
 ### Fixed
 
 - Docs and crate metadata: updated repository/homepage URLs, README badges, install scripts, and the CI workflow template from the old `madmax983/autumn` owner to `autumn-foundation/autumn` after the GitHub org transfer. Old links still redirect; this makes the canonical URLs correct.

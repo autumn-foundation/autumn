@@ -41,7 +41,9 @@
 //!   the [`crate::entropy::Rng`] extractor / [`crate::entropy::Entropy`] seam,
 //!   and routes the framework's high-value id sites through it. Bridge a seeded
 //!   source into a mounted app with [`Sim::seeded_entropy`].
-//! - **W5** turns [`Chaos`] into a public fault-injection builder.
+//! - **W5** turns [`Chaos`] into a public, seed-driven fault-injection builder
+//!   ([`Sim::chaos`]), installed at [`Sim::build`] and recorded into the
+//!   schedule read by [`Sim::__chaos_events`].
 //!
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
@@ -75,6 +77,13 @@ use crate::time::TickingClock;
 #[cfg(feature = "sqlite")]
 #[doc(hidden)]
 pub mod substrate;
+
+// The chaos lane (W5, issue #1797): deterministic fault injection wired into
+// `Sim::build`. Additive and opt-in — a default (empty) `Chaos` installs
+// nothing. See the module docs for the determinism contract.
+pub mod chaos;
+
+pub use chaos::{Chaos, ChaosEvent, ChaosHook};
 
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.
@@ -111,9 +120,14 @@ pub struct Sim {
     /// tokio's paused timer.
     clock: SimClock,
 
-    /// Fault-injection configuration. Becomes a public builder in W5.
-    #[allow(dead_code)] // fault-injection behavior lands in W5
+    /// Fault-injection configuration installed at [`Sim::build`]. A default
+    /// (empty) [`Chaos`] is inactive and installs nothing.
     chaos: Chaos,
+
+    /// Shared chaos runtime state (decision stream + event log), populated by
+    /// [`Sim::build`] when [`chaos`](Self::chaos) is active. Read through
+    /// [`Sim::__chaos_events`].
+    chaos_state: Option<Arc<chaos::ChaosState>>,
 
     /// Built [`crate::test::TestClient`] handle, mounted by [`Sim::build`] on
     /// the paused runtime with the virtual clock installed.
@@ -138,8 +152,27 @@ impl Sim {
             rng: SimRng::new(seed),
             clock: SimClock::new(TickingClock::starting_at(epoch)),
             chaos: Chaos::default(),
+            chaos_state: None,
             app: SimApp::default(),
         }
+    }
+
+    /// Configure deterministic fault injection for this simulation.
+    ///
+    /// The `chaos` builder's hooks (transient DB checkout errors, job duplicate
+    /// delivery, clock skew) are installed at [`build`](Sim::build) time, each
+    /// fault decision drawn from a dedicated seed-derived stream so the same
+    /// seed and configuration replay the same fault schedule. A default
+    /// [`Chaos`] is inactive and changes nothing.
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::sim::Chaos;
+    /// sim.chaos(Chaos::default().db_transient_errors(0.1).job_duplicate_delivery(0.2));
+    /// let client = sim.build(TestApp::new().routes(routes![touch]).jobs(jobs![work]));
+    /// ```
+    pub fn chaos(&mut self, chaos: Chaos) -> &mut Self {
+        self.chaos = chaos;
+        self
     }
 
     /// The seed this simulation was constructed from.
@@ -178,7 +211,7 @@ impl Sim {
     pub fn seeded_entropy(&self) -> Arc<dyn Entropy> {
         SeededEntropy::shared(self.seed)
     }
-  
+
     /// Mount `app` on the paused runtime with the simulation's virtual clock
     /// installed, and return the resulting [`crate::test::TestClient`].
     ///
@@ -204,9 +237,37 @@ impl Sim {
     /// client.get("/hello").send().await.assert_ok();
     /// ```
     pub fn build(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
-        let client = app.with_clock(self.clock.ticking()).build();
+        // When chaos is active, install its deterministic hooks (which also own
+        // the clock so a skew wrapper can be applied); otherwise the build is
+        // byte-for-byte the pre-W5 path — just the virtual clock.
+        let app = if self.chaos.is_active() {
+            let state = chaos::ChaosState::new(self.seed, &self.chaos);
+            self.chaos_state = Some(Arc::clone(&state));
+            chaos::install(app, &self.chaos, self.seed, self.clock.ticking(), state)
+        } else {
+            app.with_clock(self.clock.ticking())
+        };
+        let client = app.build();
         self.app.client = Some(client);
         self.app.client()
+    }
+
+    /// The recorded chaos fault schedule for this simulation.
+    ///
+    /// Returns one [`ChaosEvent`] per chaos-hook invocation, in the order the
+    /// hooks fired — the reproducible *fault schedule* the run produced. Empty
+    /// when chaos was inactive or [`build`](Sim::build) has not run.
+    ///
+    /// Unstable sim plumbing (hidden from the stable surface, like the module's
+    /// other `__`-prefixed hooks); the W5 Definition-of-Done test asserts two
+    /// same-seed runs return equal schedules.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __chaos_events(&self) -> Vec<ChaosEvent> {
+        self.chaos_state
+            .as_ref()
+            .map(|state| state.events())
+            .unwrap_or_default()
     }
 
     /// Borrow the [`crate::test::TestClient`] mounted by [`build`](Sim::build).
@@ -421,15 +482,6 @@ impl SimClock {
         self.inner.clone()
     }
 }
-
-/// Fault-injection configuration for a simulation.
-///
-/// An empty placeholder in W1. W5 makes this a public, `#[non_exhaustive]`
-/// builder (e.g. `db_transient_errors`, `clock_skew`, …) that the executor
-/// consults to deterministically inject faults.
-#[non_exhaustive]
-#[derive(Default, Debug, Clone)]
-pub struct Chaos {}
 
 /// The built application handle for a simulation.
 ///
