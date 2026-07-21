@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs:** a **content negotiation** guide (`docs/guide/content-negotiation.md`)
+  documenting the `Negotiate` extractor and its `.respond(html, json)` responder —
+  one handler serving HTML to browsers and JSON to API clients from a single
+  source of truth, including `Accept` q-value precedence, `q=0` exclusions, the
+  `406 Not Acceptable` arm, and `default_format`. Paired with a runnable
+  `GET /todos/summary` dual-render route in the `todo-app` example (#2099).
+  [no-plugin]
 - **docs/examples:** a `docs/guide/nested-forms.md` guide for nested (`has_many`)
   form binding (`NestedChangesetForm<P, C>`, `NestedChild`, `inputs_for`,
   `_destroy`, atomic saves) plus a runnable master–detail form in
