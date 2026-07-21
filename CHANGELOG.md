@@ -197,6 +197,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **sim-testing:** `#[sim_test]` macro and public `Sim` skeleton for
   deterministic simulation tests (seed-driven, replay-on-panic) (#1797). [no-plugin]
+### Changed
+
+- **cli:** the accessibility (a11y) verify step in the generated-app CI template
+  (`autumn new`) is now an **enforcing gate** — its `continue-on-error: true`
+  escape hatch has been removed, so an a11y violation now fails the job. The step
+  was shipped non-blocking in #2018 only until a pinned autumn release published
+  prebuilt CLI binaries; with v0.6.0 now published with prebuilt binaries, the
+  step runs against the release binary and blocks. Checklist item #7 of #2040.
 
 ## [0.6.0] - 2026-07-18
 
