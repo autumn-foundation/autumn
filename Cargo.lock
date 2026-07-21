@@ -8896,10 +8896,12 @@ dependencies = [
  "example-e2e",
  "maud",
  "pq-sys",
+ "scoped-futures",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "validator",
 ]
 
 [[package]]

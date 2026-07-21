@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs/examples:** a `docs/guide/nested-forms.md` guide for nested (`has_many`)
+  form binding (`NestedChangesetForm<P, C>`, `NestedChild`, `inputs_for`,
+  `_destroy`, atomic saves) plus a runnable master–detail form in
+  `examples/wiki` — the new **Collections** feature, where a collection (parent)
+  owns many links (children), created/edited/removed in one transaction-backed
+  form. `[no-plugin]`
 - **docs:** a `docs/guide/downloads.md` guide covering the typed `Download`
   response — the `from_bytes` / `from_stream` / `from_async_read` / `from_blob`
   constructors, the `.filename` / `.content_type` / `.inline` / `.etag` /
