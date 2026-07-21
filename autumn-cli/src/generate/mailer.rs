@@ -250,7 +250,7 @@ fn sqlite_unsubscribe_migration_unsupported_error() -> GenerateError {
          (`BIGSERIAL PRIMARY KEY`, `DEFAULT NOW()`), which SQLite rejects, so the generated \
          migration would fail to apply. A plain `generate mailer` (without `--list-unsubscribe`) \
          works on a SQLite app today. A SQLite-compatible unsubscribe migration is tracked in \
-         https://github.com/madmax983/autumn/issues/1927 — omit `--list-unsubscribe`, or target a \
+         https://github.com/autumn-foundation/autumn/issues/1927 — omit `--list-unsubscribe`, or target a \
          Postgres database, to use unsubscribe tracking for now."
             .to_owned(),
     )

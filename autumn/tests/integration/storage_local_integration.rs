@@ -1,7 +1,7 @@
 //! Framework-level integration tests for the `Local` blob store.
 //!
 //! `survives_process_restart` is the headline test the storage spec
-//! ([issue #494](https://github.com/madmax983/autumn/issues/494)) cares
+//! ([issue #494](https://github.com/autumn-foundation/autumn/issues/494)) cares
 //! about: write a blob through one [`LocalBlobStore`], drop it, point a
 //! fresh store at the same root + same signing key, and confirm the
 //! bytes are still there. This proves the on-disk format outlives a

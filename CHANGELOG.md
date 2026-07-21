@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **test-support:** `autumn_web::test::drain_ready_repository_commit_hooks(pool, max_rows)`
+  deterministically claims and runs ready durable repository commit hooks in
+  integration tests — driving the real worker→drain wiring without starting the
+  timing-based background commit-hook worker — and returns the number processed.
 - **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
   shared, **multi-process-safe** database-backed implementation. The `RoomStore`
   trait, `RoomService`, and the four room HTTP handlers are now `async` (via
@@ -46,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 ### Fixed
 
+- Docs and crate metadata: updated repository/homepage URLs, README badges, install scripts, and the CI workflow template from the old `madmax983/autumn` owner to `autumn-foundation/autumn` after the GitHub org transfer. Old links still redirect; this makes the canonical URLs correct.
 - **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
   Previously the opt-in was name-gated to `prod`/`production`, so a custom
   profile (`fly`, `staging`, …) with `auto_migrate_in_production = true` silently
@@ -85,6 +90,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publication probe (network/transport error) fails loudly rather than guessing.
   The normal published-version path stays the default and is behavior-unchanged
   (0.6.0 is live, so this is dormant today). [no-plugin]
+- **mail:** make `DbSuppressionStore` backend-agnostic
+  (`Pool<RuntimeConnection>`) so the `sqlite` + `mail` feature union compiles,
+  unblocking the Coverage CI job (#1614). The Coverage lane's
+  `--workspace --all-features` catch-all now excludes the two workspace members
+  that OWN a `sqlite` feature — `autumn-web` and `autumn-cli` — instead of the
+  earlier per-crate exclusion of victim crates. Under `--all-features`,
+  autumn-cli's `sqlite` forwarded to `autumn-web/sqlite` and (via global cargo
+  feature unification) flipped the shared autumn-web dependency to the SQLite
+  backend for the whole graph, breaking every Pg-assuming crate
+  (`autumn-admin-plugin`, `autumn-media-plugin`, the example apps) with E0308.
+  Excluding the two feature-owners resolves autumn-web to Postgres in the
+  catch-all, so those crates compile again and their earlier `--exclude`s are
+  dropped; autumn-cli's `postgres`/`sqlite` backends are mutually exclusive and
+  it can never be `--all-features`'d anyway (it keeps its dedicated `-p` test
+  lanes). A dedicated `-p autumn-web --features "sqlite,mail"` lane preserves the
+  `sqlite` + `mail` union compile in the coverage job. [no-plugin]
 ### Added
 
 - **router:** new `health.enabled` config knob (default `true`,

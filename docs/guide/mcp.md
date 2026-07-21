@@ -639,7 +639,7 @@ This slice is **tools-only**. Tool results are buffered by default, with
 scope** and are tracked as follow-ups:
 
 - **Daemon lifetime** for long-running, session-surviving work —
-  [#1119](https://github.com/madmax983/autumn/issues/1119).
+  [#1119](https://github.com/autumn-foundation/autumn/issues/1119).
 - **Durable workflow tools** — exposing Harvest `#[workflow]`s as
   start/status/signal MCP tools on top of this layer
   ([autumn-harvest#597](https://github.com/madmax983/autumn-harvest)); the

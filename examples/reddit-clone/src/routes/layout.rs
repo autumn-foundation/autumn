@@ -157,7 +157,7 @@ pub fn layout(
                 footer role="contentinfo" class="border-t border-gray-200 mt-12" {
                     div class="max-w-5xl mx-auto text-center text-xs text-gray-400 py-6" {
                         "Built with "
-                        a href="https://github.com/madmax983/autumn"
+                        a href="https://github.com/autumn-foundation/autumn"
                           class="text-orange-600 hover:underline" { "Autumn" }
                         " — Rust + Diesel + Maud + htmx + Tailwind"
                     }
