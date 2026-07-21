@@ -71,6 +71,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockstep; and `Sim::run_to_idle()` cooperatively drains ready jobs and
   timer-woken work to quiescence. A job whose retry backs off 24h now fires in
   virtual time with zero wall-clock sleep. [no-plugin]
+- **sim-testing / rate-limit:** the built-in token-bucket rate limiter now reads
+  its refill clock from the framework's injected `ClockSource` instead of
+  `Instant::now()` / `SystemTime::now()` (#1797). `RateLimitLayer::with_clock`
+  threads `AppState`'s clock through the limiter, both bucket stores, and both
+  construction sites (the global rate-limit middleware and the `#[throttle]`
+  path); a per-key bucket's `last_refill` is stored as a `DateTime<Utc>` with a
+  fail-safe clamp of negative wall-clock deltas to zero refill (mirroring the
+  Redis Lua's `math.max(0, …)`). A `#[sim_test]` can now deterministically
+  **exhaust** a bucket and then **refill** it under virtual time via
+  `Sim::advance`, with zero real sleep. Production behavior under the default
+  `SystemClock` is unchanged, and `rate_limit.lua` is untouched (the timestamp is
+  still supplied as a Rust-computed `ARGV`). [no-plugin]
 - **sim-testing:** `Sim::advance_to(target)` advances the virtual clock **to** a
   zoned instant (#1797), the DST/timezone-aware companion to `Sim::advance(dur)`.
   It is generic over any `chrono::TimeZone` (pass a `chrono::DateTime<Utc>`, a
