@@ -178,7 +178,7 @@ impl Sim {
     pub fn seeded_entropy(&self) -> Arc<dyn Entropy> {
         SeededEntropy::shared(self.seed)
     }
-  
+
     /// Mount `app` on the paused runtime with the simulation's virtual clock
     /// installed, and return the resulting [`crate::test::TestClient`].
     ///
