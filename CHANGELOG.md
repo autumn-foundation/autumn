@@ -91,6 +91,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **admin-plugin:** made the core connection surface backend-agnostic so
+  SQLite-backend apps can compile it — flipped every hardcoded
+  `diesel_async::AsyncPgConnection` to `autumn_web::RuntimeConnection` across
+  `routes.rs`, `tokens.rs`, `traits.rs`, `registry.rs`, and the
+  `token_admin_db` test, mirroring `autumn-media-plugin`'s `rooms_db.rs`
+  (#2090) and `DbSuppressionStore` (#2100). This is an incremental step toward
+  #2108: the token admin surface now compiles clean under both Postgres and
+  SQLite, but the `experiments`/`feature_flags` models remain Postgres-only
+  pending a separate typed-DSL / `Timestamptz` rewrite (tracked in #2108).
+  [no-plugin]
+
 - **cli:** aligned the remaining stale `autumn-web = "0.5.0"` test fixtures in
   the `generate` modules (tauri sidecar, scaffold, pwa) to the current `0.6.0`
   release, matching the sibling generators. The end-user pin is unaffected —
