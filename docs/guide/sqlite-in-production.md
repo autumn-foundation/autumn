@@ -188,9 +188,11 @@ published support contract**. Available **today**:
     paths).
   - `DROP INDEX` emitted before `DROP COLUMN` on the forward **and** rollback
     paths (a plain `--index` is dropped before its column is removed).
-  - `generate auth` / `generate mailer` on a SQLite app — #1927 (a **generate-time**
-    refusal only; `generate destroy`/revert of an existing scaffold is
-    unaffected).
+- **Backend-aware `generate auth` / `generate mailer` (#1927 / #1908)** — both now
+  scaffold SQLite-dialect migrations on a SQLite app (`INTEGER PRIMARY KEY
+  AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`, `INTEGER` foreign keys) instead of
+  being refused, and the generated auth session store is typed against
+  `::autumn_web::RuntimeConnection` so it compiles on either backend.
 - **`autumn doctor` SQLite awareness** — a SQLite app is no longer nagged about a
   missing `pg_dump` or a non-`postgres://` URL.
 
@@ -311,12 +313,15 @@ Additional generator shapes are refused on SQLite:
 - **`--id uuid` primary keys** are rejected at generate time — the SQLite primary
   key is `INTEGER PRIMARY KEY AUTOINCREMENT`, and a UUID primary key has no
   working conversion yet. Tracked in #1905.
-- **`generate auth` / `generate mailer`** are rejected on a SQLite app at
-  generate time — their scaffolds emit Postgres-shaped models and store code with
-  no working SQLite mapping yet, so they are refused before any files are written
-  rather than emitted as output that breaks on SQLite. This is a **generate-time**
-  refusal only — `generate destroy`/revert of an existing scaffold still works.
-  Tracked in #1927.
+> **`generate auth` / `generate mailer` now generate on SQLite (#1927 / #1908).**
+> Historically refused at generate time, both now scaffold SQLite-dialect
+> migrations on a SQLite app (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT
+> CURRENT_TIMESTAMP`, `INTEGER` foreign keys — including the `--totp`,
+> `--magic-link`, `--oauth`, and `--passkeys` tables and the `generate mailer
+> --list-unsubscribe` suppression table). The generated auth **DB-backed session
+> store** is typed against `::autumn_web::RuntimeConnection` (which resolves to the
+> Postgres connection by default and the SQLite connection under the `sqlite`
+> feature), so it compiles on whichever backend the app selected.
 
 > **Full-text search now generates on SQLite (#2047).** The `--searchable` /
 > `#[searchable]` scaffold — historically rejected at generate time on SQLite —
