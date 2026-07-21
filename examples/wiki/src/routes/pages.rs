@@ -25,6 +25,7 @@ pub fn layout(title: &str, content: Markup) -> Markup {
                         a href=(paths::list()) class="text-xl font-bold" { "Wiki" }
                         div class="space-x-4 text-sm" {
                             a href=(paths::new_form()) class="opacity-75 hover:opacity-100" { "+ New Page" }
+                            a href="/collections" class="opacity-75 hover:opacity-100" { "Collections" }
                             a href="/actuator/health" class="opacity-75 hover:opacity-100" { "Health" }
                         }
                     }
