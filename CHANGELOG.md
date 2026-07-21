@@ -14,15 +14,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integration tests — driving the real worker→drain wiring without starting the
   timing-based background commit-hook worker — and returns the number processed.
 
-- **dev:** add `scripts/pre-push-check.sh`, a compile-only (`--no-run`) pre-push
-  gate that mirrors CI's `lint` + `test` jobs (`cargo fmt --all -- --check`,
-  `cargo clippy --workspace --all-targets`, and `cargo test --workspace
-  --no-run`). It compiles every workspace test target — including the autumn-web
-  consolidated `integration_tests` binary that a narrow `cargo test -p
-  autumn-cli` loop never links — so cross-package compile breaks (e.g. the #1614
-  sqlite+mail `E0308`) are caught locally instead of surfacing as CI "flakes".
-  `--no-run` keeps it disk-cheap by skipping the trybuild run that expands
-  scratch by ~17GB. Documented in CONTRIBUTING.md "Before you push". [no-plugin]
+- **dev:** add `scripts/pre-push-check.sh`, a pre-push gate that mirrors CI's
+  `lint` + `test` jobs (`cargo fmt --all -- --check`, `cargo clippy --workspace
+  --all-targets`, a compile-only `cargo test --workspace --no-run`, and a
+  `cargo test --workspace --doc` doctest leg). The compile-only step builds every
+  workspace test target — including the autumn-web consolidated
+  `integration_tests` binary that a narrow `cargo test -p autumn-cli` loop never
+  links — so cross-package compile breaks (e.g. the #1614 sqlite+mail `E0308`)
+  are caught locally instead of surfacing as CI "flakes". `--no-run` keeps it
+  disk-cheap by skipping the trybuild run that expands scratch by ~17GB. Because
+  `--no-run` does **not** build doctests (they compile only in the `--doc`
+  phase) and cargo has no stable compile-only doctest mode, the separate
+  `--workspace --doc` leg runs them to catch doctest breaks like #2107 (an
+  `app.rs` `no_run` example that broke after a struct gained a field); it stays
+  infra-free and disk-cheap because doctests are overwhelmingly `no_run`/`ignore`
+  (still compiled, so the break is caught) and `--doc` never triggers trybuild.
+  Documented in CONTRIBUTING.md "Before you push". [no-plugin]
 
 - **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
   shared, **multi-process-safe** database-backed implementation. The `RoomStore`

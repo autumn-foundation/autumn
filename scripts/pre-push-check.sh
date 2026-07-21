@@ -18,6 +18,20 @@
 # by ~17GB and risking ENOSPC. trybuild compiles at run time, not build time, so
 # `--no-run` never triggers it. This gate stays disk-cheap by construction.
 #
+# Why a SEPARATE doctest leg: `--no-run` compiles every *binary* test target but
+# does NOT build doctests — doctests are only built during the `--doc` phase. So
+# a doctest that stops compiling (e.g. #2107: an app.rs `no_run` example doctest
+# broke after a struct gained a field) sails past `--no-run` locally yet fails
+# CI's `cargo test --workspace`, which DOES run the doc target. Cargo has no
+# stable compile-only doctest mode (`cargo test --doc --no-run` errors "can't
+# skip running doc tests with --no-run" on the current toolchain), so the only
+# way to catch a doctest break is to actually run them. Fortunately that is
+# cheap and infra-free here: almost every doctest is `no_run` or `ignore` (which
+# still COMPILE — exactly the #2107 signal), so `cargo test --workspace --doc`
+# needs no Postgres/MediaMTX, never hangs, and — because `--doc` selects only the
+# doc target — never touches the trybuild integration binaries, so it adds no
+# meaningful disk. It reuses the libs the steps above already built.
+#
 # NOT run here (need Docker / a backend-flip feature / a browser — out of scope
 # for a fast, disk-cheap compile-only gate; CI runs them in dedicated jobs):
 #   - the Docker/testcontainer `#[ignore]`d sweep (ci.yml "Run Docker-dependent tests")
@@ -60,7 +74,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "cargo test --workspace --no-run   (compile-only; skips ~17GB trybuild run)"
 cargo test --workspace --no-run
 
+# --- 4. Doctests (workspace, doc target only) --------------------------------
+# `--no-run` above skips doctests (they build only in the `--doc` phase), so a
+# doctest compile break — like #2107's app.rs example — would pass locally but
+# fail CI's `cargo test --workspace`. There's no stable compile-only doctest
+# mode, so run them: it mirrors CI's workspace doctest scope, stays infra-free
+# (doctests are overwhelmingly no_run/ignore, so nothing hits a DB or hangs),
+# and — because `--doc` selects only the doc target — never triggers trybuild,
+# so it adds no meaningful disk.
+step "cargo test --workspace --doc   (doctests; --no-run above does not build them)"
+cargo test --workspace --doc
+
 echo
-echo "pre-push-check: OK — workspace test targets compile clean (compile-only)."
-echo "note: this gate is COMPILE-ONLY. A full \`cargo test --workspace\` (without"
-echo "      --no-run) additionally RUNS trybuild, expanding scratch by ~17GB."
+echo "pre-push-check: OK — workspace test targets compile clean, doctests pass."
+echo "note: steps 1-3 are COMPILE-ONLY; step 4 RUNS doctests (cheap: mostly"
+echo "      no_run/ignore, no DB, and --doc never triggers the ~17GB trybuild run)."
+echo "      A bare \`cargo test --workspace\` (without --no-run / --doc) additionally"
+echo "      RUNS trybuild, expanding scratch by ~17GB — avoid it on a small disk."
