@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs:** an **aggregate queries** guide (`docs/guide/aggregates.md`) documenting GROUP BY roll-ups, paired with a runnable `GET /stats` roll-up route in the `bookmarks` example (#2099). [no-plugin]
 - **docs/examples:** documented the `autumn-media-plugin` media subsystem
   (broadcast + mesh rooms + MediaMTX). Adds the `docs/guide/media.md` guide
   (install/mount, `MediaConfig` profile loading, the `RoomService`/`RoomStore`
