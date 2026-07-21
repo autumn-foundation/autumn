@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs/examples:** documented the `autumn-media-plugin` media subsystem
+  (broadcast + mesh rooms + MediaMTX). Adds the `docs/guide/media.md` guide
+  (install/mount, `MediaConfig` profile loading, the `RoomService`/`RoomStore`
+  rooms surface incl. the `memory` vs multi-process `db` backend,
+  `MediaMtxClient`/`MediaUrls`, and the durable encode jobs / `MediaArtifactSink`)
+  and a new runnable `examples/media-room` crate that installs the plugin with
+  rooms and serves create/join/list routes, wired into the example drift gate
+  (workspace member, EXAMPLES.md catalog entry, README table, quickstart
+  README). [no-plugin]
+
 - **docs:** a **content negotiation** guide (`docs/guide/content-negotiation.md`)
   documenting the `Negotiate` extractor and its `.respond(html, json)` responder —
   one handler serving HTML to browsers and JSON to API clients from a single
