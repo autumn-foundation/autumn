@@ -167,6 +167,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jobs:** routed the job runtime's recorded timestamps (enqueued_at/started_at/finished_at, due-at filtering, and the backoff-delay computation) through the injected `ClockSource` seam instead of reading `Utc::now()` directly, so recorded job timestamps are deterministic under the sim harness (production defaults to `SystemClock`, behavior unchanged). The in-memory/sim job path is now fully deterministic; the Postgres durable path still uses server-side SQL `NOW()` (#2111). [no-plugin]
+
 - **admin-plugin:** made the core connection surface backend-agnostic so
   SQLite-backend apps can compile it — flipped every hardcoded
   `diesel_async::AsyncPgConnection` to `autumn_web::RuntimeConnection` across
