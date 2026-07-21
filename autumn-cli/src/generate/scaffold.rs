@@ -10965,7 +10965,7 @@ async fn main() {
         let tmp = project_with_main(default_main());
         fs::write(
             tmp.path().join("Cargo.toml"),
-            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         let plan = plan_scaffold_with_options(
@@ -10991,7 +10991,7 @@ async fn main() {
         let tmp = project_with_main(default_main());
         fs::write(
             tmp.path().join("Cargo.toml"),
-            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         let plan = plan_scaffold_with_options(

@@ -88,6 +88,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deploy but silently ignored at runtime under `AUTUMN_ENV=prod`. The existing
   single-file `from_autumn_toml` / `from_toml_str_with_env` entry points are
   unchanged.
+
+### Changed
+
+- **cli:** aligned the remaining stale `autumn-web = "0.5.0"` test fixtures in
+  the `generate` modules (tauri sidecar, scaffold, pwa) to the current `0.6.0`
+  release, matching the sibling generators. The end-user pin is unaffected —
+  `autumn new` already emits the current version via `CARGO_PKG_VERSION` (#2040).
+
 - **sim-testing:** the deterministic simulation harness (#1797) gained its
   **SQLite DB lane** — the per-sim database substrate a sim builds its app on.
   `sim::substrate::SqliteSubstrate` (gated on the `sqlite` feature) builds a
