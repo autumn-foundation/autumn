@@ -1,6 +1,6 @@
 # Reddit Clone
 
-A Reddit clone built with [Autumn](https://github.com/madmax983/autumn),
+A Reddit clone built with [Autumn](https://github.com/autumn-foundation/autumn),
 showcasing the framework's major features in a single cohesive application.
 
 ## Features Demonstrated

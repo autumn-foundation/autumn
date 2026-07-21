@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 ### Fixed
 
+- Docs and crate metadata: updated repository/homepage URLs, README badges, install scripts, and the CI workflow template from the old `madmax983/autumn` owner to `autumn-foundation/autumn` after the GitHub org transfer. Old links still redirect; this makes the canonical URLs correct.
 - **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
   Previously the opt-in was name-gated to `prod`/`production`, so a custom
   profile (`fly`, `staging`, …) with `auto_migrate_in_production = true` silently

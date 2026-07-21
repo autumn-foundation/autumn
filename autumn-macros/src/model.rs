@@ -510,7 +510,7 @@ fn check_m2m_mutation_name_collisions(assocs: &[Association]) -> syn::Result<()>
                      ..., helper = \"...\")]`, so each gets a distinct \
                      `add_`/`remove_` name (the followers/following-through-a-\
                      join pattern) — see \
-                     https://github.com/madmax983/autumn/issues/1785",
+                     https://github.com/autumn-foundation/autumn/issues/1785",
                     assoc.name, assoc.target, assoc.target,
                 ),
             ));
