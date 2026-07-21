@@ -17,9 +17,15 @@
 //! All four compose without special wiring, demonstrating the widget lane
 //! (data_table, active_search, autocomplete_input, property_list).
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use autumn_web::download::Download;
 use autumn_web::extract::{Form, Path};
 use autumn_web::form::Changeset;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::response::Response;
+use autumn_web::reexports::http::HeaderMap;
 use autumn_web::widgets::{Column, DataTableConfig, data_table, property_list};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -153,6 +159,10 @@ pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
                       class="border border-indigo-600 text-indigo-600 px-4 py-2 rounded hover:bg-indigo-50" {
                         "+ Add (wizard)"
                     }
+                    a href="/bookmarks/export.csv"
+                      class="border border-gray-300 text-gray-600 px-4 py-2 rounded hover:bg-gray-100" {
+                        "Export CSV"
+                    }
                 }
             }
             // ── Active search widget ──────────────────────────────────────
@@ -169,6 +179,64 @@ pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
             }
         },
     ))
+}
+
+// ── CSV export (typed Download + Range) ───────────────────────────────────────
+
+/// Escape one CSV field per RFC 4180: wrap it in double quotes when it contains
+/// a comma, quote, CR, or LF, doubling any embedded quote.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Render every bookmark as one RFC 4180 CSV document (header row + one row per
+/// bookmark).
+fn bookmarks_csv(rows: &[Bookmark]) -> String {
+    let mut out = String::from("id,url,title,tag,alive,created_at\n");
+    for row in rows {
+        out.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            row.id,
+            csv_field(&row.url),
+            csv_field(&row.title),
+            csv_field(&row.tag),
+            row.alive,
+            row.created_at,
+        ));
+    }
+    out
+}
+
+/// Export all bookmarks as a downloadable CSV file.
+///
+/// Builds a typed [`Download`] from in-memory bytes, names the file (which also
+/// sets `Content-Type: text/csv` from the `.csv` extension and
+/// `Content-Disposition: attachment`), and attaches a strong `ETag` derived
+/// from the content. Serving it through [`Download::into_response_ranged`] lets
+/// the response honour a request `Range` header: a byte range yields `206
+/// Partial Content` with `Content-Range` (a stale `If-Range` validator falls
+/// back to the full body), while a plain request gets the full `200` with
+/// `Accept-Ranges: bytes`.
+#[get("/bookmarks/export.csv")]
+pub async fn export_csv(repo: PgBookmarkRepository, headers: HeaderMap) -> AutumnResult<Response> {
+    let rows = repo.find_all().await?;
+    let csv = bookmarks_csv(&rows);
+
+    // A strong validator so a client's `If-Range` can be honoured across a
+    // resumed/ranged transfer; it changes whenever the exported rows change.
+    let mut hasher = DefaultHasher::new();
+    csv.hash(&mut hasher);
+    let etag = ETag::strong(format!("{:016x}", hasher.finish()));
+
+    Ok(Download::from_bytes(csv)
+        .filename("bookmarks.csv")
+        .etag(etag)
+        .into_response_ranged(&headers)
+        .await)
 }
 
 #[get("/bookmarks/{id}")]

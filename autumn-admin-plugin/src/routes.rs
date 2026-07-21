@@ -23,7 +23,6 @@ use axum::http::{StatusCode, header};
 use axum::middleware::from_fn;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing;
-use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 use futures::future::join_all;
 use serde::Deserialize;
@@ -306,7 +305,7 @@ fn resolve<'r>(
     state: &AppState,
     registry: &'r AdminRegistry,
     slug: &str,
-) -> AutumnResult<(Pool<AsyncPgConnection>, &'r dyn AdminModel)> {
+) -> AutumnResult<(Pool<::autumn_web::RuntimeConnection>, &'r dyn AdminModel)> {
     // `Pool` is Arc-backed inside deadpool; cloning is cheap.
     let pool = state
         .pool()
