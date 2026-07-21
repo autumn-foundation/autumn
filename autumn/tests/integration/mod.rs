@@ -205,6 +205,7 @@ mod sharding_integration;
 mod signed_webhooks;
 mod sim_clock_drain;
 mod sim_deterministic_ids;
+mod sim_rate_limit_clock;
 mod sim_test_smoke;
 #[cfg(feature = "ws")]
 mod sse_replay;
