@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs/examples:** a runnable state-machine / lifecycle demonstration (`#[state_machine]` transition effects) in the `wiki` example — the `Page::status` machine now declares per-edge `on = "..."` effects that append the audit `Revision` inside the transition's transaction, driven from the transitions handler via `transition_status_to_on_conn` under one `Db::tx_with` — cross-linked from the state-machines guide (#2099). [no-plugin]
 - **docs/examples:** documented the `autumn-media-plugin` media subsystem
   (broadcast + mesh rooms + MediaMTX). Adds the `docs/guide/media.md` guide
   (install/mount, `MediaConfig` profile loading, the `RoomService`/`RoomStore`

@@ -206,9 +206,14 @@ let next_states: Vec<&str> = Order::__AUTUMN_SM_STATUS_TRANSITIONS
 
 ## Wiki example
 
-The wiki example ships a `Page` model with `draft`, `published`, and `archived`
-states. `#[state_machine]` is added to its `status` field and the
-`PageHooks::before_update` implementation enforces valid transitions, so a
-direct API call or form submission cannot skip `draft → published → archived`
-or jump backward. See `examples/wiki/src/models.rs` and
-`examples/wiki/src/hooks.rs`.
+[`examples/wiki`](../../examples/wiki) ships a `Page` model with `draft`,
+`published`, and `archived` states. `#[state_machine]` is added to its `status`
+field and the `PageHooks::before_update` implementation enforces valid
+transitions, so a direct API call or form submission cannot skip
+`draft → published → archived` or jump backward. Each edge also declares a
+[transition effect](transition-effects.md) (`on = "record_publish_revision"` /
+`on = "record_archive_revision"`) that appends the audit `Revision` inside the
+transition's transaction, and the `transition_status` handler drives the
+effectful `transition_status_to_on_conn` under `Db::tx_with` so the status change
+and its audit row commit atomically. See `examples/wiki/src/models.rs` and
+`examples/wiki/src/routes/pages.rs`.
