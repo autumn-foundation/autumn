@@ -267,12 +267,20 @@ async fn w2_drain_runs_against_w4_sqlite_substrate(mut sim: Sim) {
     after.assert_ok();
     assert_eq!(after.text(), "2020-01-02T00:00:00+00:00");
 
-    // ...while essentially no wall-clock time elapsed: the 24h backoff was slept
-    // in virtual time, never on the real clock.
+    // ...while the 24h backoff cost essentially no wall-clock time: it was slept
+    // in virtual time, never on the real clock. The bound only has to separate
+    // "virtual" (microseconds) from "real" (a real 24h backoff would take 86_400
+    // seconds), so it is deliberately generous rather than near-zero: this is a
+    // standalone `[[test]]` binary that CI runs *concurrently* with the whole
+    // `sqlite_*` suite in one `cargo test --test ... --test ...` invocation, and
+    // the measured window spans all the real setup/drain work (substrate build,
+    // migrations, mount, enqueue, SQL read-backs) — under that CPU contention a
+    // tight sub-second bound flakes even though no real sleeping ever happened.
     let wall_elapsed = wall_start.elapsed();
     assert!(
-        wall_elapsed < Duration::from_secs(1),
-        "expected near-zero wall time for a 24h virtual backoff, but {wall_elapsed:?} elapsed"
+        wall_elapsed < Duration::from_secs(60),
+        "the 24h virtual backoff must not sleep on the real clock (a real backoff \
+         would take 24h); {wall_elapsed:?} elapsed"
     );
 
     job::clear_global_job_client();
