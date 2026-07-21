@@ -76,6 +76,18 @@ use crate::time::TickingClock;
 #[doc(hidden)]
 pub mod substrate;
 
+// The W6 semantic core (issue #1797): the `always!` / `sometimes!` assertion
+// macros and the thread-local non-vacuity registry. Public (documented) module —
+// the macros are `#[macro_export]`ed at the crate root (`autumn_web::always` /
+// `autumn_web::sometimes`), and their hidden plumbing plus the sweep-facing
+// registry API live here.
+pub mod assert;
+
+pub use assert::{
+    SometimesRegistry, assert_all_sometimes_satisfied, reset_sometimes_registry,
+    sometimes_snapshot, sometimes_unsatisfied,
+};
+
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.
 ///
@@ -129,6 +141,10 @@ impl Sim {
     /// arrives in W2 via [`SimApp`].
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
+        // Each seed run starts with a clean reachability registry, so the sweep
+        // can attribute observed/satisfied `sometimes!` labels to exactly one
+        // seed before folding them into its cross-seed aggregate (W6, #1797).
+        assert::reset_sometimes_registry();
         let epoch = Utc
             .timestamp_opt(SIM_EPOCH_UNIX_SECS, 0)
             .single()

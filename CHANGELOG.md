@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sim-testing:** add the `always!` / `sometimes!` simulation assertion macros
+  (W6 op-driver assertion core, #1797) — hard-invariant + reachability assertions
+  for `#[sim_test]`, with a non-vacuity registry the forthcoming sim-sweep
+  aggregates. `always!(cond[, "fmt", …])` panics on a false invariant with a
+  greppable message (the `#[sim_test]` harness prints the `AUTUMN_SIM_SEED=…`
+  replay line); `sometimes!(cond, "label")` records a reachability target in a
+  thread-local registry (observed vs satisfied) that `Sim::from_seed` resets per
+  seed, exposed via `sometimes_snapshot` / `assert_all_sometimes_satisfied` for
+  the sweep to fail a green-but-vacuous run. [no-plugin]
+
 - **docs/examples:** documented the `autumn-media-plugin` media subsystem
   (broadcast + mesh rooms + MediaMTX). Adds the `docs/guide/media.md` guide
   (install/mount, `MediaConfig` profile loading, the `RoomService`/`RoomStore`
