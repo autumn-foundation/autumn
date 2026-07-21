@@ -76,12 +76,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **mail:** make `DbSuppressionStore` backend-agnostic
   (`Pool<RuntimeConnection>`) so the `sqlite` + `mail` feature union compiles,
   unblocking the Coverage CI job (#1614). The Coverage lane's
-  `--workspace --all-features` catch-all now also `--exclude`s the Pg-only
-  example crates (`blog`, `bookmarks`, `bookmarks-distributed`,
-  `bookmarks-sharded`, `reddit-clone`, `saas`, `todo-app`, `wiki`) and
-  `autumn-admin-plugin`, which cannot compile under the global `sqlite`
-  backend-flip; the examples are not coverage-critical and `autumn-admin-plugin`
-  keeps its coverage via its dedicated `-p` invocation. [no-plugin]
+  `--workspace --all-features` catch-all now excludes the two workspace members
+  that OWN a `sqlite` feature — `autumn-web` and `autumn-cli` — instead of the
+  earlier per-crate exclusion of victim crates. Under `--all-features`,
+  autumn-cli's `sqlite` forwarded to `autumn-web/sqlite` and (via global cargo
+  feature unification) flipped the shared autumn-web dependency to the SQLite
+  backend for the whole graph, breaking every Pg-assuming crate
+  (`autumn-admin-plugin`, `autumn-media-plugin`, the example apps) with E0308.
+  Excluding the two feature-owners resolves autumn-web to Postgres in the
+  catch-all, so those crates compile again and their earlier `--exclude`s are
+  dropped; autumn-cli's `postgres`/`sqlite` backends are mutually exclusive and
+  it can never be `--all-features`'d anyway (it keeps its dedicated `-p` test
+  lanes). A dedicated `-p autumn-web --features "sqlite,mail"` lane preserves the
+  `sqlite` + `mail` union compile in the coverage job. [no-plugin]
 ### Added
 
 - **router:** new `health.enabled` config knob (default `true`,
