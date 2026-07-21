@@ -11,7 +11,7 @@
 //!
 //! Every fault decision is drawn from a **dedicated seeded entropy stream**,
 //! independent of the app-facing [`SimRng`](crate::sim::SimRng) /
-//! [`Entropy`](crate::entropy::Entropy) source an app is seeded with. The stream
+//! [`Entropy`] source an app is seeded with. The stream
 //! is seeded from `seed ^ CHAOS_STREAM_SALT`, so:
 //!
 //! * chaos draws never perturb (and are never perturbed by) the application's
@@ -102,8 +102,8 @@ pub struct ChaosEvent {
 /// then installs the corresponding deterministic hooks. All fields are private
 /// and the struct is `#[non_exhaustive]`, so future fault kinds are additive.
 ///
-/// A default `Chaos` is **inactive** ([`is_active`](Chaos::is_active) is
-/// `false`) and installs nothing.
+/// A default `Chaos` is **inactive** (`is_active` is `false`) and installs
+/// nothing.
 ///
 /// ```rust,ignore
 /// use autumn_web::sim::Chaos;

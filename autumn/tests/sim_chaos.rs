@@ -5,9 +5,9 @@
 //! This is the W5.0 "chaos scaffolding + chaos-v1 base" acceptance test. It:
 //!
 //! 1. Builds a [`Sim`] with an active [`Chaos`] config
-//!    ([`db_transient_errors`](autumn_web::sim::Chaos::db_transient_errors) +
-//!    [`job_duplicate_delivery`](autumn_web::sim::Chaos::job_duplicate_delivery)
-//!    + [`clock_skew`](autumn_web::sim::Chaos::clock_skew)) mounted on a fresh,
+//!    ([`db_transient_errors`](autumn_web::sim::Chaos::db_transient_errors),
+//!    [`job_duplicate_delivery`](autumn_web::sim::Chaos::job_duplicate_delivery),
+//!    and [`clock_skew`](autumn_web::sim::Chaos::clock_skew)) mounted on a fresh,
 //!    migrated in-memory `SQLite` substrate
 //!    ([`SqliteSubstrate`](autumn_web::sim::substrate::SqliteSubstrate)).
 //! 2. Drives **real DB checkouts** (requests to a `Db`-extractor route, which
@@ -132,10 +132,11 @@ async fn run_chaos_scenario(seed: u64) -> (Vec<ChaosEvent>, usize) {
     // Deterministic local drain: `perform_enqueued_jobs` dispatches every
     // recorded enqueue (originals + injected duplicate copies) exactly once and
     // returns the count. We use it rather than `Sim::run_to_idle` because
-    // `run_to_idle`'s repository-commit-hook drain queries the Postgres framework
-    // control table `autumn_repository_commit_hooks`, which the SQLite sim
-    // substrate deliberately does not create (only the app's registered
-    // migrations are applied — see `sim/substrate.rs`).
+    // `run_to_idle`'s commit-hook drain queries `autumn_repository_commit_hooks`,
+    // which the SQLite sim substrate does not create (only the app's registered
+    // migrations are applied — see `sim/substrate.rs`), so `run_to_idle` panics
+    // on this substrate unless the caller manually provisions the commit-hook
+    // table (as the W4↔W2 integration test #2124 does).
     let drained = sim.client().perform_enqueued_jobs().await.len();
 
     let events = sim.__chaos_events();

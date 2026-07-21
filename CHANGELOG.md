@@ -136,6 +136,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   richer per-fault surfaces build additively on it. [no-plugin]
 ### Fixed
 
+- **ci:** wire the `sim_sqlite_substrate` (W4) integration test into the
+  `sqlite-runtime` job's `cargo test --features "sqlite,test-support"`
+  invocation (alongside `sim_chaos`) so it actually runs in CI, and fix a
+  private/redundant intra-doc link in the `sim::Chaos` rustdoc that broke the
+  documentation-build gate (#1797). [no-plugin]
 - Docs and crate metadata: updated repository/homepage URLs, README badges, install scripts, and the CI workflow template from the old `madmax983/autumn` owner to `autumn-foundation/autumn` after the GitHub org transfer. Old links still redirect; this makes the canonical URLs correct.
 - **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
   Previously the opt-in was name-gated to `prod`/`production`, so a custom
