@@ -251,4 +251,4 @@ Before pushing the release tag:
    The dispatched run must be green before the release is announced.
 
 > Publishing to crates.io is a manual step; no crates.io credentials are stored
-> in CI. See the Out of Scope section in [issue #594](https://github.com/madmax983/autumn/issues/594).
+> in CI. See the Out of Scope section in [issue #594](https://github.com/autumn-foundation/autumn/issues/594).

@@ -38,6 +38,7 @@ mod chaos_session_loom;
 mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
+mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
 mod config_deprecation;
@@ -202,6 +203,8 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+mod sim_deterministic_ids;
+mod sim_clock_drain;
 mod sim_test_smoke;
 #[cfg(feature = "ws")]
 mod sse_replay;

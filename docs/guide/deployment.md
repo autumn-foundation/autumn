@@ -161,7 +161,7 @@ AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
 > paths, CORS, signing-secret rotation
 > (`security.signing_secret.previous_secrets`), and so on — instead of falling
 > back to built-in defaults (fixes
-> [#1952](https://github.com/madmax983/autumn/issues/1952)). Coupling the config
+> [#1952](https://github.com/autumn-foundation/autumn/issues/1952)). Coupling the config
 > to the release (rather than a single shared dir) means a **rollback loads the
 > rolled-back release's own config** — never the latest deploy's — and **removing
 > a local override and redeploying no longer leaves a stale one loaded**, because
@@ -344,7 +344,7 @@ or error messages.
   provisioned on the target separately. The file is rebuilt on every `deploy
   up`, so hand-added entries do not persist.
 - **Your project's `autumn.toml` is deployed**
-  ([#1952](https://github.com/madmax983/autumn/issues/1952)). `autumn deploy up`
+  ([#1952](https://github.com/autumn-foundation/autumn/issues/1952)). `autumn deploy up`
   uploads your `autumn.toml` (and the profile sibling `autumn-<profile>.toml`
   when present) into the **per-release directory** at mode `0600` (owner-only, so
   secrets are never exposed to other local accounts) and sets

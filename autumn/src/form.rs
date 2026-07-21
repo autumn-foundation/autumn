@@ -1996,8 +1996,8 @@ pub fn required_datetime_input<T: Serialize>(
 /// Wraps in `<div id="{field}-field">` for stable htmx targeting. ARIA
 /// annotations behave identically to [`text_input`].
 ///
-/// [#1030]: https://github.com/madmax983/autumn/issues/1030
-/// [#1026]: https://github.com/madmax983/autumn/issues/1026
+/// [#1030]: https://github.com/autumn-foundation/autumn/issues/1030
+/// [#1026]: https://github.com/autumn-foundation/autumn/issues/1026
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn select_input<T: Serialize>(

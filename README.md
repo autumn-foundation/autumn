@@ -1,10 +1,10 @@
 # Autumn 🍂
 
-[![CI](https://github.com/madmax983/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/madmax983/autumn/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/madmax983/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/madmax983/autumn)
+[![CI](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/autumn-foundation/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/autumn-foundation/autumn)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust: 1.88.0+](https://img.shields.io/badge/rust-1.88.0%2B-orange.svg)](https://www.rust-lang.org)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/madmax983/autumn)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/autumn-foundation/autumn)
 
 > Spring Boot-style web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum).
 
@@ -63,15 +63,15 @@ Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 Get the `autumn` CLI without compiling from source — no Rust toolchain required:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.sh | sh
 ```
 
 The installer detects your OS and architecture (macOS or Linux, x86_64 or aarch64), downloads the matching prebuilt binary, verifies its sha256 checksum, and installs it to `~/.local/bin/autumn` — printing the line to add if that directory isn't on your `PATH`. Override the target dir with `AUTUMN_INSTALL_DIR`, or pin a version with `AUTUMN_VERSION=vX.Y.Z` (or `--version vX.Y.Z`).
 
 Prefer a manual download? Grab the tarball plus its `.sha256`:
 
-- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-<target>.tar.gz`
-- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
+- Latest: `https://github.com/autumn-foundation/autumn/releases/latest/download/autumn-<target>.tar.gz`
+- Pinned: `https://github.com/autumn-foundation/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
 
 where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
 
@@ -80,15 +80,15 @@ where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-m
 Windows ships a native `x86_64-pc-windows-msvc` build as a `.zip` (not a tarball). The POSIX `install.sh` above does not run on Windows; use the PowerShell installer instead:
 
 ```powershell
-irm https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.ps1 | iex
 ```
 
 It downloads `autumn-x86_64-pc-windows-msvc.zip`, verifies its sha256 (`Get-FileHash`), extracts `autumn.exe` to `%LOCALAPPDATA%\autumn\bin`, and prints the line to add if that directory isn't on your `PATH`. Override the install dir with `-Dir`, or pin a version with `-Version vX.Y.Z`.
 
 Prefer a manual download? Grab the zip plus its `.sha256`:
 
-- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-x86_64-pc-windows-msvc.zip`
-- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-x86_64-pc-windows-msvc.zip`
+- Latest: `https://github.com/autumn-foundation/autumn/releases/latest/download/autumn-x86_64-pc-windows-msvc.zip`
+- Pinned: `https://github.com/autumn-foundation/autumn/releases/download/<tag>/autumn-x86_64-pc-windows-msvc.zip`
 
 Verify with `Get-FileHash autumn-x86_64-pc-windows-msvc.zip -Algorithm SHA256` and compare against the `.sha256` file, then extract `autumn.exe` and put it on your `PATH`.
 

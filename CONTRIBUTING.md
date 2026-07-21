@@ -1,5 +1,46 @@
 # Contributing to Autumn
 
+## Before you push
+
+Run the pre-push gate, which compiles the **same targets CI compiles** so a
+cross-package break is caught locally instead of on the PR:
+
+```sh
+./scripts/pre-push-check.sh
+```
+
+It mirrors CI's always-on `lint` + `test` jobs (`.github/workflows/ci.yml`) —
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, a **compile-only** `cargo test --workspace --no-run`, and a
+`cargo test --workspace --doc` doctest leg. The compile-only step is the
+important one: CI's blocking gate is `cargo test --workspace`, which links
+**every** workspace test target including the autumn-web consolidated
+`integration_tests` binary. A narrower loop like `cargo test -p autumn-cli`
+never compiles that binary, so a cross-package compile break (e.g. the #1614
+sqlite+mail `E0308`) passes locally and only shows up in CI, where it looks like
+a flake.
+
+`--no-run` compiles those targets without executing them, deliberately skipping
+the trybuild suite (`autumn/tests/integration/compile_fail.rs`) whose cases each
+spawn a nested `cargo build` at test-**run** time — expanding scratch by ~17GB
+and risking `ENOSPC`. So the gate stays disk-cheap.
+
+The catch: `--no-run` does **not** build doctests — they only compile during the
+`--doc` phase — so a doctest that stops compiling (e.g. #2107, where an `app.rs`
+`no_run` example doctest broke after a struct gained a field) passes `--no-run`
+locally yet fails CI's `cargo test --workspace`, which runs the doc target.
+Cargo has no stable compile-only doctest mode (`cargo test --doc --no-run`
+errors on the current toolchain), so the gate simply **runs** the doctests with
+`cargo test --workspace --doc`. That stays cheap: doctests are overwhelmingly
+`no_run`/`ignore` (which still compile — exactly the #2107 signal), so it needs
+no Postgres/MediaMTX and never hangs, and because `--doc` selects only the doc
+target it never triggers trybuild.
+
+The gate does **not** cover the Docker/testcontainer, `sqlite`-backend, or
+Chromium `system-tests` lanes (those run in dedicated CI jobs); `cargo test -p
+<pkg>` remains fine for iterating on a single crate — just run
+`./scripts/pre-push-check.sh` before you push.
+
 ## Generator conformance gate
 
 Autumn's headline DX promise is that `autumn new` and `autumn generate` emit
@@ -240,7 +281,7 @@ typed values on the request hot path — must ship with either:
 Reviewers should treat a new request-path parser with neither as incomplete.
 
 [cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
-[issue-1611]: https://github.com/madmax983/autumn/issues/1611
+[issue-1611]: https://github.com/autumn-foundation/autumn/issues/1611
 
 ## Supply chain (cargo-deny)
 

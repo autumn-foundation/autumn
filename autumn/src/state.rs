@@ -163,6 +163,13 @@ pub struct AppState {
     /// Tests override via [`crate::test::TestApp::with_clock`].
     pub(crate) clock: Arc<dyn ClockSource>,
 
+    /// Injected entropy source. Defaults to [`crate::entropy::OsEntropy`] (real
+    /// OS randomness). Simulation tests override via [`Self::with_entropy`] with
+    /// a [`crate::entropy::SeededEntropy`] so framework-minted identifiers
+    /// replay byte-for-byte under a fixed seed. Read through the
+    /// [`crate::entropy::Rng`] extractor in handlers.
+    pub(crate) entropy: Arc<dyn crate::entropy::Entropy>,
+
     /// Process-unique identity assigned once per real `AppState` construction
     /// and preserved verbatim across `.clone()` (it is `Copy`).
     ///
@@ -500,6 +507,34 @@ impl AppState {
         self
     }
 
+    /// Returns the active entropy source wired into this state.
+    ///
+    /// Handlers should prefer the [`crate::entropy::Rng`] extractor; this
+    /// accessor exists for framework internals (id-minting subsystems) that need
+    /// randomness without going through Axum's extractor machinery.
+    #[must_use]
+    pub fn entropy(&self) -> &dyn crate::entropy::Entropy {
+        self.entropy.as_ref()
+    }
+
+    /// Clone the shared entropy handle, e.g. to thread into a subsystem or the
+    /// [`crate::entropy::Rng`] extractor.
+    #[must_use]
+    pub(crate) fn entropy_arc(&self) -> Arc<dyn crate::entropy::Entropy> {
+        self.entropy.clone()
+    }
+
+    /// Replace the entropy source (builder / simulation helper).
+    ///
+    /// Pass a [`crate::entropy::SeededEntropy`] to make every
+    /// framework-minted identifier reproducible under a fixed seed. Mirrors
+    /// [`Self::with_clock`].
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: Arc<dyn crate::entropy::Entropy>) -> Self {
+        self.entropy = entropy;
+        self
+    }
+
     /// Install or replace the global cache backend at runtime (e.g. from a startup hook).
     ///
     /// Updates both the process-level global (used by `#[cached]` functions) and
@@ -733,6 +768,7 @@ impl AppState {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: Arc::new(SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: Self::next_app_id(),
         }
     }

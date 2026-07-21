@@ -999,7 +999,7 @@ impl AppBuilder {
     /// # async fn main() {
     /// autumn_web::app()
     ///     .routes(routes![index])
-    ///     .scoped("/api", RequestIdLayer, routes![list_users])
+    ///     .scoped("/api", RequestIdLayer::default(), routes![list_users])
     ///     .run()
     ///     .await;
     /// # }
@@ -1074,7 +1074,7 @@ impl AppBuilder {
     /// should be wrapped in `Arc` so the layer can satisfy the
     /// `Clone + Send + Sync + 'static` bounds without moving the state.
     ///
-    /// See [the middleware guide](https://github.com/madmax983/autumn/blob/trunk/docs/guide/middleware.md)
+    /// See [the middleware guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/middleware.md)
     /// for ready-made recipes.
     ///
     /// # Examples
@@ -9079,6 +9079,7 @@ fn build_state(
         auth_session_key: config.auth.session_key.clone(),
         shared_cache: None,
         clock: std::sync::Arc::new(crate::time::SystemClock),
+        entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
         app_id: AppState::next_app_id(),
     };
     #[cfg(feature = "db")]
@@ -9644,6 +9645,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: AppState::next_app_id(),
         };
         crate::router::build_router(routes, &config, state)
@@ -11168,6 +11170,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: AppState::next_app_id(),
         };
         let router =
@@ -11282,6 +11285,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router(post_routes, &config, state);
@@ -11636,6 +11640,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
@@ -11955,6 +11960,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: AppState::next_app_id(),
         };
         crate::router::build_router(routes, config, state)
@@ -12110,6 +12116,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
@@ -12163,6 +12170,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
@@ -12422,6 +12430,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: AppState::next_app_id(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
@@ -12499,6 +12508,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: AppState::next_app_id(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),

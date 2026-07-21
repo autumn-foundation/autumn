@@ -84,7 +84,7 @@ pub fn layout_with_seo(locale: &Locale, seo: SeoMeta, content: Markup) -> Markup
                     div class="max-w-3xl mx-auto text-center text-xs text-stone-500 py-8" {
                         (t!(locale, "footer.tagline"))
                         " \u{2022} "
-                        a href="https://github.com/madmax983/autumn"
+                        a href="https://github.com/autumn-foundation/autumn"
                           class="text-amber-700 underline hover:text-amber-800" {
                             "Autumn"
                         }

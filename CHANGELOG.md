@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **test-support:** `autumn_web::test::drain_ready_repository_commit_hooks(pool, max_rows)`
+  deterministically claims and runs ready durable repository commit hooks in
+  integration tests — driving the real worker→drain wiring without starting the
+  timing-based background commit-hook worker — and returns the number processed.
+- **sim:** a seeded **`Entropy`** seam for deterministic identifiers (#1797),
+  mirroring the `Clock`/`ClockSource` seam. `AppState` now carries an injectable
+  entropy source (`OsEntropy` by default; `SeededEntropy` over `ChaCha8Rng` for
+  simulation), reachable in handlers through the new **`Rng`** request extractor
+  (`autumn_web::entropy::Rng`) and overridable via `AppState::with_entropy` /
+  `TestApp::with_entropy`. Deterministic `uuid_v4` / `uuid_v7` helpers, plus a
+  seed-derived, order-independent `derive_uuid(purpose_tag)` namespace helper
+  (on `SeededEntropy` and `SimRng`) for byte-reproducible multi-tenant fixtures,
+  round out the surface. The framework's four high-value id sites — job ids,
+  request-id middleware, idempotency in-flight lock owners, and session ids —
+  now mint through this source, so under a fixed seed the whole identifier
+  stream replays byte-for-byte. Other `Uuid::new_v4()` sites are intentionally
+  left as-is (a crate-wide deny-lint is deferred to a later phase).
+- **sim-testing:** the `Sim` handle gained its W2 virtual-clock + drain wiring
+  (#1797): `Sim::build(TestApp)` mounts an app on the paused runtime with the
+  simulation's `TickingClock` installed (via `TestApp::with_clock`), exposing the
+  resulting `TestClient` through `Sim::client()` / `try_client()`;
+  `Sim::advance(dur)` steps the injected wall clock and tokio's paused timer wheel
+  together so `Utc::now()`-via-extractor and `tokio::time::sleep` stay in
+  lockstep; and `Sim::run_to_idle()` cooperatively drains ready jobs and
+  timer-woken work to quiescence. A job whose retry backs off 24h now fires in
+  virtual time with zero wall-clock sleep. [no-plugin]
+
+- **dev:** add `scripts/pre-push-check.sh`, a pre-push gate that mirrors CI's
+  `lint` + `test` jobs (`cargo fmt --all -- --check`, `cargo clippy --workspace
+  --all-targets`, a compile-only `cargo test --workspace --no-run`, and a
+  `cargo test --workspace --doc` doctest leg). The compile-only step builds every
+  workspace test target — including the autumn-web consolidated
+  `integration_tests` binary that a narrow `cargo test -p autumn-cli` loop never
+  links — so cross-package compile breaks (e.g. the #1614 sqlite+mail `E0308`)
+  are caught locally instead of surfacing as CI "flakes". `--no-run` keeps it
+  disk-cheap by skipping the trybuild run that expands scratch by ~17GB. Because
+  `--no-run` does **not** build doctests (they compile only in the `--doc`
+  phase) and cargo has no stable compile-only doctest mode, the separate
+  `--workspace --doc` leg runs them to catch doctest breaks like #2107 (an
+  `app.rs` `no_run` example that broke after a struct gained a field); it stays
+  infra-free and disk-cheap because doctests are overwhelmingly `no_run`/`ignore`
+  (still compiled, so the break is caught) and `--doc` never triggers trybuild.
+  Documented in CONTRIBUTING.md "Before you push". [no-plugin]
+
 - **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
   shared, **multi-process-safe** database-backed implementation. The `RoomStore`
   trait, `RoomService`, and the four room HTTP handlers are now `async` (via
@@ -52,8 +96,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release, matching the sibling generators. The end-user pin is unaffected —
   `autumn new` already emits the current version via `CARGO_PKG_VERSION` (#2040).
 
+- **sim-testing:** the deterministic simulation harness (#1797) gained its
+  **SQLite DB lane** — the per-sim database substrate a sim builds its app on.
+  `sim::substrate::SqliteSubstrate` (gated on the `sqlite` feature) builds a
+  fresh, migrated, **in-process in-memory** SQLite pool, unique per simulation,
+  ready to hand to the mounted app. It uses a **named shared-cache** in-memory
+  database anchored by a **kept-alive guard connection** so the migrated schema
+  survives for every pooled checkout — sidestepping the framework's conservative
+  in-memory-migration reject precisely because the guard keeps the database
+  alive — and a distinct database name per substrate guarantees two sims never
+  share state. It also resolves the **feature-unification hazard**: under
+  `--features sqlite` the Postgres advisory-lock scheduler and the durable
+  Postgres job queue are compiled out, so the sim exercises the *representative*
+  local paths — the `InProcessSchedulerCoordinator` (scheduler) and the local
+  `JobAdminMemoryBackend` (jobs). The documented divergence: a green sim proves
+  the orchestration/timing/ordering of those local paths, **not** the Postgres
+  advisory-lock leasing or durable `LISTEN`/`NOTIFY` + `SKIP LOCKED` queue
+  claim/lock semantics (consistent with the RFC §12 scope). The substrate is
+  self-contained and additive: it hands its `RuntimeConnection` pool to a
+  `TestApp` via `TestApp::with_db(...)`, which is exactly the seam W2's
+  `Sim::build(TestApp)` consumes — so W2 wires it into the `Sim` app mount in a
+  follow-up. (0.7.0 work — do not merge until v0.6.0 is cut.)
 ### Fixed
 
+- Docs and crate metadata: updated repository/homepage URLs, README badges, install scripts, and the CI workflow template from the old `madmax983/autumn` owner to `autumn-foundation/autumn` after the GitHub org transfer. Old links still redirect; this makes the canonical URLs correct.
 - **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
   Previously the opt-in was name-gated to `prod`/`production`, so a custom
   profile (`fly`, `staging`, …) with `auto_migrate_in_production = true` silently
@@ -81,6 +147,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COPY --from=builder /app/i18n /app/i18n` lines are injected for
   `--with-i18n` and the anchors stripped otherwise (a non-i18n build context
   has no `i18n/` dir), leaving no stray anchor markers.
+- **ci:** the Quickstart Gate now falls back to a local source install
+  ("PRE-RELEASE MODE") when the README-pinned `autumn-cli` version is not yet on
+  crates.io, so the release window between bumping the README and the crate
+  publishing no longer turns the gate structurally red. `check-quickstart.sh`
+  probes the crates.io sparse index; when the version is unpublished the install
+  phase runs `cargo install --path autumn-cli --locked` and the build phase
+  patches the generated app's `[patch.crates-io]` to the in-tree `autumn-web`
+  (which transitively resolves `autumn-macros` via its own path dep), relaxing
+  the registry-provenance assertion to a path-source check. An indeterminate
+  publication probe (network/transport error) fails loudly rather than guessing.
+  The normal published-version path stays the default and is behavior-unchanged
+  (0.6.0 is live, so this is dormant today). [no-plugin]
+- **mail:** make `DbSuppressionStore` backend-agnostic
+  (`Pool<RuntimeConnection>`) so the `sqlite` + `mail` feature union compiles,
+  unblocking the Coverage CI job (#1614). The Coverage lane's
+  `--workspace --all-features` catch-all now excludes the two workspace members
+  that OWN a `sqlite` feature — `autumn-web` and `autumn-cli` — instead of the
+  earlier per-crate exclusion of victim crates. Under `--all-features`,
+  autumn-cli's `sqlite` forwarded to `autumn-web/sqlite` and (via global cargo
+  feature unification) flipped the shared autumn-web dependency to the SQLite
+  backend for the whole graph, breaking every Pg-assuming crate
+  (`autumn-admin-plugin`, `autumn-media-plugin`, the example apps) with E0308.
+  Excluding the two feature-owners resolves autumn-web to Postgres in the
+  catch-all, so those crates compile again and their earlier `--exclude`s are
+  dropped; autumn-cli's `postgres`/`sqlite` backends are mutually exclusive and
+  it can never be `--all-features`'d anyway (it keeps its dedicated `-p` test
+  lanes). A dedicated `-p autumn-web --features "sqlite,mail"` lane preserves the
+  `sqlite` + `mail` union compile in the coverage job. [no-plugin]
 ### Added
 
 - **router:** new `health.enabled` config knob (default `true`,
@@ -111,6 +205,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **sim-testing:** `#[sim_test]` macro and public `Sim` skeleton for
   deterministic simulation tests (seed-driven, replay-on-panic) (#1797). [no-plugin]
+### Changed
+
+- **cli:** the accessibility (a11y) verify step in the generated-app CI template
+  (`autumn new`) is now an **enforcing gate** — its `continue-on-error: true`
+  escape hatch has been removed, so an a11y violation now fails the job. The step
+  was shipped non-blocking in #2018 only until a pinned autumn release published
+  prebuilt CLI binaries; with v0.6.0 now published with prebuilt binaries, the
+  step runs against the release binary and blocks. Checklist item #7 of #2040.
 
 ## [0.6.0] - 2026-07-18
 
