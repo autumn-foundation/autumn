@@ -273,10 +273,11 @@ use crate::state::AppState;
 // qualified path — so without `test-support` this import would be unused.
 #[cfg(all(feature = "db", feature = "test-support"))]
 use diesel_async::AsyncPgConnection;
-// Used by the Postgres transactional establish path and by the `test-support`
-// `TestDb`; neither is compiled in a `--features sqlite` build without
-// `test-support`, so this import would otherwise be unused there.
-#[cfg(all(feature = "db", any(not(feature = "sqlite"), feature = "test-support")))]
+// Used by the Postgres transactional establish path (the `.get_result()` on
+// `TransactionalDbInterceptor`), which is itself gated `not(feature = "sqlite")`;
+// every other `RunQueryDsl` method call in this module brings the trait in via a
+// local `use`, so this import is unused under any `sqlite` build.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 use diesel_async::RunQueryDsl;
 #[cfg(feature = "db")]
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -4103,7 +4104,14 @@ pub async fn drain_ready_repository_commit_hooks(
         )
         .get_result::<ReadyCount>(&mut *conn)
         .await
-        .expect("drain_ready_repository_commit_hooks: count ready hooks");
+        .expect(
+            "drain_ready_repository_commit_hooks: count ready hooks \
+             (querying autumn_repository_commit_hooks). An app mounted on a sim \
+             substrate must have the framework repository-commit-hook migrations \
+             applied — SqliteSubstrate applies them automatically, so a bare \
+             SqliteSubstrate satisfies this; a custom DB substrate must apply them \
+             too, or run_to_idle cannot drain durable commit hooks",
+        );
         usize::try_from(row.ready).unwrap_or(0)
     };
 

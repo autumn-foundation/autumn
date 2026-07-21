@@ -752,7 +752,7 @@ impl From<autumn_web::version_history::VersionPage> for AdminHistoryPage {
     ///
     /// ```rust,ignore
     /// fn get_history<'a>(
-    ///     &'a self, pool: &'a Pool<AsyncPgConnection>,
+    ///     &'a self, pool: &'a Pool<RuntimeConnection>,
     ///     record_id: i64, page: u64, per_page: u64,
     /// ) -> AdminFuture<'a, AdminHistoryPage> {
     ///     let pool = pool.clone();
@@ -926,7 +926,7 @@ mod tests {
         fn list(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _params: ListParams,
         ) -> AdminFuture<'_, ListResult> {
@@ -942,7 +942,7 @@ mod tests {
         fn get(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
         ) -> AdminFuture<'_, Option<Value>> {
@@ -951,7 +951,7 @@ mod tests {
         fn create(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             data: Value,
         ) -> AdminFuture<'_, Value> {
@@ -960,7 +960,7 @@ mod tests {
         fn update(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
             data: Value,
@@ -970,7 +970,7 @@ mod tests {
         fn delete(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             id: i64,
         ) -> AdminFuture<'_, ()> {
@@ -1011,7 +1011,7 @@ mod tests {
         fn list(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _params: ListParams,
         ) -> AdminFuture<'_, ListResult> {
@@ -1027,7 +1027,7 @@ mod tests {
         fn get(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
         ) -> AdminFuture<'_, Option<Value>> {
@@ -1036,7 +1036,7 @@ mod tests {
         fn create(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             data: Value,
         ) -> AdminFuture<'_, Value> {
@@ -1045,7 +1045,7 @@ mod tests {
         fn update(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
             data: Value,
@@ -1055,7 +1055,7 @@ mod tests {
         fn delete(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
         ) -> AdminFuture<'_, ()> {
@@ -1067,7 +1067,7 @@ mod tests {
         fn restore<'a>(
             &'a self,
             _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             id: i64,
         ) -> AdminFuture<'a, ()> {
@@ -1079,7 +1079,7 @@ mod tests {
         fn purge<'a>(
             &'a self,
             _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             id: i64,
         ) -> AdminFuture<'a, ()> {
@@ -1091,7 +1091,7 @@ mod tests {
         fn list_deleted<'a>(
             &'a self,
             _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _params: ListParams,
         ) -> AdminFuture<'a, ListResult> {
@@ -1109,10 +1109,10 @@ mod tests {
     /// Build a `Pool` whose manager would fail to connect — the test models
     /// never call `pool.get()`, so the pool itself just sits unused.
     fn dummy_pool()
-    -> diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection> {
+    -> diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection> {
         use diesel_async::pooled_connection::AsyncDieselConnectionManager;
         use diesel_async::pooled_connection::deadpool::Pool;
-        let mgr = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(
+        let mgr = AsyncDieselConnectionManager::<::autumn_web::RuntimeConnection>::new(
             "postgresql://test",
         );
         Pool::builder(mgr).build().expect("build pool")

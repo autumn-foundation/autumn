@@ -49,6 +49,15 @@ use tower::ServiceExt as _; // for `oneshot`
 /// `.migrations(MIGRATIONS)` stores. It creates the `widgets` table.
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("tests/fixtures/sqlite_migrations");
 
+/// A multi-migration set (six `CREATE TABLE` steps, each without `IF NOT
+/// EXISTS`) used by the concurrency test. Several migrations widen the
+/// read→plan→apply window so racing migrators genuinely overlap, and a
+/// double-applied step errors hard ("table already exists") — so an unserialized
+/// path reliably surfaces a false failure, while the write-locked path drains the
+/// set exactly once.
+const CONCURRENT_MIGRATIONS: EmbeddedMigrations =
+    embed_migrations!("tests/fixtures/sqlite_migrations_concurrent");
+
 /// The runtime pool type. Under `--features sqlite` `RuntimeConnection` resolves
 /// to `SyncConnectionWrapper<SqliteConnection>`.
 type SqlitePool = Pool<RuntimeConnection>;
@@ -220,5 +229,91 @@ fn shared_cache_in_memory_target_with_registered_migrations_is_rejected() {
         !msg.contains("`file::memory:?cache=shared`"),
         "the corrected message no longer recommends a shared-cache in-memory URL as a remedy \
          (got {msg:?})"
+    );
+}
+
+/// Many concurrent `run_pending_sqlite` calls against the SAME file-backed
+/// database must ALL succeed — the winner applies the pending set once, every
+/// loser queues on the write lock, re-reads an already-drained pending set, and
+/// cleanly no-ops — instead of a loser re-running an already-applied migration
+/// and reporting a false failure (issue #2065, deferred from PR #2062).
+///
+/// Before the shared `BEGIN IMMEDIATE` serialization primitive, the
+/// list→plan→apply window was unlocked, so racing migrators read the same empty
+/// applied set and double-applied the same `up.sql`, and the loser surfaced a
+/// failed migration. The single-file write lock now serializes the whole
+/// sequence, so a racer that waits and then finds nothing pending is a clean
+/// no-op, never an error.
+#[test]
+fn concurrent_run_pending_sqlite_serializes_without_false_failure() {
+    use std::sync::{Arc, Barrier};
+
+    // Enough racers to reliably force the wait-on-lock path.
+    const THREADS: usize = 8;
+    // The six-step set widens the race window; a double-applied step errors.
+    const EXPECTED_APPLIED: usize = 6;
+
+    // A file target so every migration connection contends on the same on-disk
+    // write lock (a `:memory:` target is private per connection — no contention).
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("concurrent.db");
+    let url: Arc<str> = Arc::from(format!("sqlite://{}", db_path.display()));
+
+    // A `Barrier` releases every racer together so their read→apply windows
+    // genuinely overlap.
+    let barrier = Arc::new(Barrier::new(THREADS));
+
+    // Spawn ALL threads before joining ANY: collecting the handles first is
+    // load-bearing (fusing the spawn+join iterators would join each thread
+    // before spawning the next, serialising the racers and defeating the test).
+    #[allow(clippy::needless_collect)]
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let url = Arc::clone(&url);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                run_pending_sqlite(&url, CONCURRENT_MIGRATIONS)
+            })
+        })
+        .collect();
+
+    let results: Vec<Result<_, _>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("migration thread did not panic"))
+        .collect();
+
+    // (1) No racer reports a false failure.
+    for (i, result) in results.iter().enumerate() {
+        assert!(
+            result.is_ok(),
+            "concurrent migrator {i} reported a failure instead of a clean no-op: {:?}",
+            result.as_ref().err()
+        );
+    }
+
+    // (2) Every registered migration is applied EXACTLY once across all racers:
+    //     the winner (holding the write lock) drains the whole set, and every
+    //     loser then reads an already-empty pending set. A double-applied step
+    //     under an unserialized path would instead error above.
+    let per_thread_applied: Vec<usize> = results
+        .iter()
+        .map(|r| r.as_ref().expect("ok checked above").applied.len())
+        .collect();
+    let total_applied: usize = per_thread_applied.iter().sum();
+    assert_eq!(
+        total_applied, EXPECTED_APPLIED,
+        "each registered migration must apply exactly once across all racers \
+         (per-thread applied counts = {per_thread_applied:?})"
+    );
+
+    // (3) The schema converged and the migrations are recorded: a fresh
+    //     `run_pending_sqlite` now finds nothing pending (idempotent no-op).
+    let after = run_pending_sqlite(&url, CONCURRENT_MIGRATIONS)
+        .expect("a post-convergence run is a clean no-op, not a failure");
+    assert!(
+        after.applied.is_empty(),
+        "after the concurrent batch converged, re-running applies nothing (got {:?})",
+        after.applied
     );
 }
