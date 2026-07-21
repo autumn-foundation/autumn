@@ -206,6 +206,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follow-up. (0.7.0 work — do not merge until v0.6.0 is cut.)
 ### Fixed
 
+- **ci:** Real-VPS deploy lane fails fast with an actionable message (and a capacity preflight + runbook) when the shared Hetzner account server limit is reached, instead of a cryptic mid-provision `resource_limit_exceeded`. [no-plugin]
 - **migrate:** the two `SQLite` migration entry points — `run_pending_sqlite`
   (up) and `revert_user_migrations_sqlite` (down) — now serialize their whole
   list→plan→apply/revert sequence under a single shared `BEGIN IMMEDIATE` write

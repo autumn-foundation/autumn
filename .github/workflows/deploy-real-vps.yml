@@ -106,6 +106,26 @@ jobs:
           ssh-keygen -t ed25519 -N "" -q -f "${RUNNER_TEMP}/rvps_key"
           echo "SSH_KEY=${RUNNER_TEMP}/rvps_key" >> "${GITHUB_ENV}"
 
+      # Capacity preflight: the Hetzner account's server limit is SHARED with the
+      # nexus CI runner fleet (Hetzner default is 5 servers/account). List current
+      # servers so a "full account" is visible up front rather than as a cryptic
+      # mid-provision failure. Informational only — the authoritative limit check
+      # is the resource_limit_exceeded catch on `hcloud server create` below.
+      - name: Preflight - Hetzner account capacity
+        run: |
+          set -uo pipefail
+          if servers_json=$(hcloud server list -o json 2>/tmp/hcloud_ls_err); then
+            count=$(printf '%s' "$servers_json" | jq 'length')
+            echo "Hetzner account currently has ${count} server(s):"
+            printf '%s' "$servers_json" | jq -r '.[] | "  - \(.name) [\(.status)] \(.server_type.name) @ \(.datacenter.location.name) labels=\(.labels)"'
+            if [ "${count}" -ge 5 ]; then
+              echo "::warning::Account appears to be at the Hetzner default 5-server limit (${count} servers). This limit is shared with the nexus CI runner fleet; provisioning below may fail with resource_limit_exceeded. See docs/runbooks/real-vps.md."
+            fi
+          else
+            echo "::warning::Preflight could not list servers (continuing; provisioning will surface the real error):"
+            cat /tmp/hcloud_ls_err || true
+          fi
+
       # ── Provider-specific provisioning (Hetzner Cloud). Swap this block for a
       # different provider without touching the lifecycle script below. ────────
       #
@@ -173,12 +193,28 @@ jobs:
           fi
 
           echo "Selected server type '$chosen_type' in location '$chosen_loc' (live Hetzner availability)."
-          hcloud server create \
+          set +e
+          create_out=$(hcloud server create \
             --name "${HCLOUD_SERVER_NAME}" \
             --type "$chosen_type" \
             --image "${{ inputs.ubuntu_image || 'ubuntu-24.04' }}" \
             --location "$chosen_loc" \
-            --ssh-key "${HCLOUD_SSH_KEY_NAME}"
+            --ssh-key "${HCLOUD_SSH_KEY_NAME}" \
+            --label managed-by=autumn-rvps 2>&1)
+          create_rc=$?
+          set -e
+          printf '%s\n' "$create_out"
+          if [ "$create_rc" -ne 0 ]; then
+            if printf '%s' "$create_out" | grep -qiE 'resource_limit_exceeded|server limit reached'; then
+              echo "::error::Hetzner account server limit reached - cannot provision the Real-VPS test server."
+              echo "This account's server limit is SHARED with the nexus CI runner fleet (Hetzner default is 5 servers per account)."
+              echo "Operational fix: request a limit increase in the Hetzner Cloud Console (project -> Limits), or free a server slot."
+              echo "Runbook: docs/runbooks/real-vps.md (\"Account server limit\")."
+              exit 1
+            fi
+            echo "::error::hcloud server create failed (see output above)."
+            exit "$create_rc"
+          fi
           ip="$(hcloud server ip "${HCLOUD_SERVER_NAME}")"
           echo "Provisioned ${HCLOUD_SERVER_NAME} (${chosen_type}/${chosen_loc}) at ${ip}"
           echo "TARGET_HOST=${ip}" >> "${GITHUB_ENV}"
