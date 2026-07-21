@@ -44,7 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sleep — then reads back (with real SQL) the row the job's successful retry wrote,
   proving the W2 virtual-clock drain runs against the W4 substrate over the
   representative in-process scheduler + local job-runtime paths. Additive: no
-  changes to the `Sim`/`SimApp`/`SqliteSubstrate` public surface. [no-plugin]
+  changes to the `Sim`/`SimApp`/`SqliteSubstrate` public surface. `SqliteSubstrate`
+  now applies the framework's `SQLite` repository-commit-hook migration set itself
+  (before any caller migrations), so the `autumn_repository_commit_hooks`
+  control-plane table always exists and `Sim::run_to_idle` no longer panics with
+  "no such table" when draining an app mounted on a bare substrate — this test
+  therefore registers only its own app migration, with no copied framework-DDL
+  fixture to drift. [no-plugin]
 
 - **dev:** add `scripts/pre-push-check.sh`, a pre-push gate that mirrors CI's
   `lint` + `test` jobs (`cargo fmt --all -- --check`, `cargo clippy --workspace

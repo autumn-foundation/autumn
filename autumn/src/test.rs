@@ -4103,7 +4103,14 @@ pub async fn drain_ready_repository_commit_hooks(
         )
         .get_result::<ReadyCount>(&mut *conn)
         .await
-        .expect("drain_ready_repository_commit_hooks: count ready hooks");
+        .expect(
+            "drain_ready_repository_commit_hooks: count ready hooks \
+             (querying autumn_repository_commit_hooks). An app mounted on a sim \
+             substrate must have the framework repository-commit-hook migrations \
+             applied — SqliteSubstrate applies them automatically, so a bare \
+             SqliteSubstrate satisfies this; a custom DB substrate must apply them \
+             too, or run_to_idle cannot drain durable commit hooks",
+        );
         usize::try_from(row.ready).unwrap_or(0)
     };
 

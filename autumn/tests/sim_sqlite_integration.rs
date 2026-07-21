@@ -68,24 +68,18 @@ const TWENTY_FOUR_HOURS: Duration = Duration::from_secs(24 * 3600);
 
 /// The app-domain migration set: creates `sim_job_marks`. Reuses the fixture
 /// #2106 added for the W4 substrate `DoD`.
+///
+/// This is the **only** migration set this test registers. The framework's
+/// durable-repository-commit-hook queue table (`autumn_repository_commit_hooks`)
+/// is **not** provisioned here: [`SqliteSubstrate`] now applies the framework's
+/// `SQLite` repository-commit-hook migration set itself, before any caller
+/// migrations. That is load-bearing for the W4↔W2 integration — the merged W2
+/// [`Sim::run_to_idle`] drains a **third** ready-work source (durable repository
+/// commit hooks) whenever the mounted app has a DB pool, by querying that table —
+/// and this test passing with *only* `MARK_MIGRATIONS` registered is the proof the
+/// substrate auto-applies the framework table (no drift-prone copied DDL fixture).
 const MARK_MIGRATIONS: EmbeddedMigrations =
     embed_migrations!("tests/fixtures/sim_sqlite_substrate");
-
-/// The framework durable-repository-commit-hook queue table (`SQLite` variant),
-/// copied verbatim from `autumn/repository_commit_hook_migrations_sqlite`.
-///
-/// This is load-bearing for the W4↔W2 integration: the merged W2
-/// [`Sim::run_to_idle`] drains a **third** ready-work source — durable repository
-/// commit hooks — whenever the mounted app has a DB pool, by querying
-/// `autumn_repository_commit_hooks`. The W2 `DoD` test mounts **no** DB, so it never
-/// exercises that lane; a DB-backed sim app (this test) does, so the substrate
-/// must provision the table or `run_to_idle` panics on "no such table". The
-/// framework's canonical migration set is `pub(crate)`, so this test fixture
-/// copies the DDL; if the framework schema drifts, the framework's own
-/// `sqlite_drain_ready_repository_commit_hooks` query fails against the stale
-/// fixture here and this test catches it.
-const COMMIT_HOOK_MIGRATIONS: EmbeddedMigrations =
-    embed_migrations!("tests/fixtures/sim_sqlite_commit_hooks");
 
 /// Times the delayed job's handler has entered this test. The global job-runtime
 /// lock serializes access across the process; the test resets it to 0.
@@ -199,8 +193,8 @@ async fn w2_drain_runs_against_w4_sqlite_substrate(mut sim: Sim) {
     //     kept-alive guard connection anchoring the shared-cache in-memory DB, so
     //     it must outlive the mounted app — it is a local binding that lives to the
     //     end of the test, keeping the schema alive for every pooled checkout.
-    let substrate = SqliteSubstrate::with_migrations(&[&COMMIT_HOOK_MIGRATIONS, &MARK_MIGRATIONS])
-        .expect("migrated substrate builds");
+    let substrate =
+        SqliteSubstrate::with_migrations(&[&MARK_MIGRATIONS]).expect("migrated substrate builds");
 
     // The migrated schema is live on the substrate pool, and empty, before mount.
     assert!(

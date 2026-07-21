@@ -50,12 +50,23 @@
 //! never share state: `SQLite` scopes a shared-cache in-memory database by its
 //! name within the process, so distinct names are fully isolated databases.
 //!
-//! Only the caller-registered migration set is applied — mirroring
-//! [`crate::migrate::auto_migrate_sqlite`], which under the `sqlite` feature also
-//! applies only the app's registered migrations. The Postgres control-plane
-//! [`crate::migrate::FRAMEWORK_MIGRATIONS`] are **not** applied here: they are
-//! Postgres DDL, and the sim's representative scheduler + job paths (below) need
-//! no DB-side control tables.
+//! The framework's `SQLite` **repository-commit-hook** migration set
+//! ([`crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS`]) is
+//! applied *first*, before any caller-registered migrations, so the
+//! `autumn_repository_commit_hooks` control-plane table always exists on the
+//! substrate. This is load-bearing: an app mounted on a substrate that has a DB
+//! pool is drained by [`Sim::run_to_idle`](crate::sim::Sim::run_to_idle), whose
+//! drain does an unconditional `COUNT(*)` on that table
+//! ([`crate::test::drain_ready_repository_commit_hooks`]) — so without the table
+//! `run_to_idle` panics with "no such table". Because `substrate.rs` lives inside
+//! the `autumn` crate it can reference that `pub(crate)`-reachable migration set
+//! directly; a sim author outside the crate cannot, which is exactly why the
+//! substrate provisions it rather than leaving it to the caller. Other caller
+//! migrations then apply on top.
+//!
+//! The Postgres control-plane [`crate::migrate::FRAMEWORK_MIGRATIONS`] are **not**
+//! applied here: they are Postgres DDL, and the sim's representative scheduler +
+//! job paths (below) need no other DB-side control tables.
 //!
 //! # Feature-unification hazard resolution (the representative path)
 //!
@@ -174,11 +185,14 @@ impl SqliteSubstrate {
     /// against it, so the returned [`pool`](Self::pool) serves a fully-migrated
     /// schema.
     ///
-    /// Each entry is applied through diesel's `MigrationHarness`; the kept-alive
-    /// guard connection (opened first) keeps the shared in-memory database — and
-    /// thus the applied schema — alive for every later pooled checkout. See the
-    /// module docs for why this is safe against a shared-cache in-memory target
-    /// even though the framework's own startup path rejects it.
+    /// The framework's `SQLite` repository-commit-hook migration set is applied
+    /// first (so `Sim::run_to_idle`'s drain never hits a missing
+    /// `autumn_repository_commit_hooks` table — see the module docs), then each
+    /// caller entry, all through diesel's `MigrationHarness`; the kept-alive guard
+    /// connection (opened first) keeps the shared in-memory database — and thus the
+    /// applied schema — alive for every later pooled checkout. See the module docs
+    /// for why this is safe against a shared-cache in-memory target even though the
+    /// framework's own startup path rejects it.
     ///
     /// # Errors
     ///
@@ -195,8 +209,26 @@ impl SqliteSubstrate {
         let mut guard_conn = crate::db::establish_sqlite_migration_connection(&url)
             .map_err(|e| SubstrateError::Connection(e.to_string()))?;
 
-        // 2. Apply each registered migration set directly via the harness. We
-        //    bypass `run_pending_sqlite` deliberately: its in-memory reject is a
+        // 2. Apply the framework's SQLite repository-commit-hook migration set
+        //    FIRST, so the `autumn_repository_commit_hooks` control-plane table
+        //    always exists on the substrate. An app mounted here (which has a DB
+        //    pool) is drained by `Sim::run_to_idle`, whose drain does an
+        //    unconditional COUNT(*) on that table — without it, `run_to_idle`
+        //    panics with "no such table". Because this file lives in the `autumn`
+        //    crate it can reference the `pub(crate)`-reachable migration symbol
+        //    directly; the whole substrate is `#[cfg(feature = "sqlite")]`, so
+        //    `REPOSITORY_COMMIT_HOOK_MIGRATIONS` here is the SQLite variant.
+        {
+            let mut harness = HarnessWithOutput::write_to_stdout(&mut guard_conn);
+            harness
+                .run_pending_migrations(EmbeddedMigrationsRef(
+                    &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+                ))
+                .map_err(|e| SubstrateError::Migration(e.to_string()))?;
+        }
+
+        // 3. Apply each caller-registered migration set directly via the harness.
+        //    We bypass `run_pending_sqlite` deliberately: its in-memory reject is a
         //    conservative guard for the "no one is keeping the DB alive" case,
         //    which does not hold here — the guard connection above is exactly what
         //    makes migrating a shared in-memory database safe.
@@ -207,7 +239,7 @@ impl SqliteSubstrate {
                 .map_err(|e| SubstrateError::Migration(e.to_string()))?;
         }
 
-        // 3. Build the async runtime pool over the SAME shared-cache database. A
+        // 4. Build the async runtime pool over the SAME shared-cache database. A
         //    single slot keeps the sim deterministic (`SQLite` is single-writer),
         //    and every checkout attaches to the guard-anchored in-memory DB and
         //    sees the migrated schema.
