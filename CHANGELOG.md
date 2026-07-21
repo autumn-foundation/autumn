@@ -134,6 +134,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (empty) `Chaos` leaves the build byte-for-byte unchanged. Probabilities are
   clamped to `[0.0, 1.0]`. This is W5.0 (chaos scaffolding + chaos-v1 base); the
   richer per-fault surfaces build additively on it. [no-plugin]
+- **sim-testing:** the chaos lane gained a **deterministic SMTP transport fault
+  schedule** (W5.a, item 5, #1797), gated on the `mail` feature. `Chaos::smtp_faults([(7, MailFault::Fail), (8, MailFault::Timeout)])`
+  maps a **1-based send index** to a `MailFault` (`#[non_exhaustive]`; `Fail`
+  returns a permanent-ish `MailError::RuntimeUnavailable`, `Timeout` a
+  timeout-shaped `MailError::Io`/`TimedOut`) — the ratified "send #7 fails, #8
+  times out" example — so a test can adversarially exercise a throttled-resume /
+  retry path against faults that are **deterministic by construction** (a
+  scheduled send draws no entropy and never perturbs the DB/job stream).
+  Installed at `Sim::build` as a fault-injecting `MailInterceptor`, each send is
+  recorded as a new `ChaosHook::MailSend` event on the same
+  `Sim::__chaos_events()` log. Under the paused sim runtime a `Timeout` is a
+  timeout-shaped error returned immediately (never a real hang), keeping the
+  schedule byte-for-byte reproducible. An optional `Chaos::smtp_transient_errors(p)`
+  adds a probabilistic lane (drawn from a dedicated mail sub-stream) for parity
+  with `db_transient_errors`; an explicit schedule entry always wins. An empty
+  schedule / zero rate installs nothing, so a default `Chaos` is unchanged. This
+  is W5.a; it stacks on W5.0 and is a sibling of W5.b (item 6). [no-plugin]
 ### Fixed
 
 - **ci:** wire the `sim_sqlite_substrate` (W4) integration test into the

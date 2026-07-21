@@ -626,6 +626,18 @@ path = "tests/sim_sqlite_substrate.rs"
 name = "sim_chaos"
 path = "tests/sim_chaos.rs"
 
+# W5.a (item 5, issue #1797): deterministic per-send SMTP transport fault
+# schedule ("send #7 fails, #8 times out") over the in-memory SQLite sim
+# substrate. Same isolated-binary rationale as `sim_chaos` above, but it needs
+# the `mail` feature for the mail interceptor/transport surface, so the file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support", feature = "mail"))]`
+# and a default `cargo test` compiles it to an empty (passing) binary. Runs
+# without Docker (Log mail transport). Run:
+# `cargo test -p autumn-web --features "sqlite,test-support,mail" --test sim_chaos_mail`.
+[[test]]
+name = "sim_chaos_mail"
+path = "tests/sim_chaos_mail.rs"
+
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
 # consolidated binary — those vars would race the inline network tests.
