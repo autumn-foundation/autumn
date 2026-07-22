@@ -23,6 +23,10 @@ async fn main() {
         .routes(routes![
             home,
             routes::bookmarks::index,
+            routes::bookmarks::export_csv,
+            // Grouped-aggregate roll-up page (#1364): per-tag counts and a
+            // day-bucketed activity series, both via the aggregate API.
+            routes::bookmarks::stats,
             routes::bookmarks::search,
             routes::bookmarks::tags_autocomplete,
             routes::bookmarks::show,

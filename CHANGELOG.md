@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs:** a **feeds** guide (`docs/guide/feeds.md`) documenting Atom/RSS feed
+  generation, cross-linking the runnable `examples/blog` `/feed.xml` route
+  (#2099). [no-plugin]
+- **docs/examples:** a runnable state-machine / lifecycle demonstration (`#[state_machine]` transition effects) in the `wiki` example — the `Page::status` machine now declares per-edge `on = "..."` effects that append the audit `Revision` inside the transition's transaction, driven from the transitions handler via `transition_status_to_on_conn` under one `Db::tx_with` — cross-linked from the state-machines guide (#2099). [no-plugin]
+- **docs:** an **aggregate queries** guide (`docs/guide/aggregates.md`) documenting GROUP BY roll-ups, paired with a runnable `GET /stats` roll-up route in the `bookmarks` example (#2099). [no-plugin]
+- **docs:** an **audit logging** guide (`docs/guide/audit-logging.md`) documenting audit events with actor auto-attribution, with a minimal audit sink wired into the `reddit-clone` example (#2099). [no-plugin]
+- **sim-testing:** add the `always!` / `sometimes!` simulation assertion macros
+  (W6 op-driver assertion core, #1797) — hard-invariant + reachability assertions
+  for `#[sim_test]`, with a non-vacuity registry the forthcoming sim-sweep
+  aggregates. `always!(cond[, "fmt", …])` panics on a false invariant with a
+  greppable message (the `#[sim_test]` harness prints the `AUTUMN_SIM_SEED=…`
+  replay line); `sometimes!(cond, "label")` records a reachability target in a
+  thread-local registry (observed vs satisfied) that `Sim::from_seed` resets per
+  seed, exposed via `sometimes_snapshot` / `assert_all_sometimes_satisfied` for
+  the sweep to fail a green-but-vacuous run. [no-plugin]
+
+- **docs/examples:** documented the `autumn-media-plugin` media subsystem
+  (broadcast + mesh rooms + MediaMTX). Adds the `docs/guide/media.md` guide
+  (install/mount, `MediaConfig` profile loading, the `RoomService`/`RoomStore`
+  rooms surface incl. the `memory` vs multi-process `db` backend,
+  `MediaMtxClient`/`MediaUrls`, and the durable encode jobs / `MediaArtifactSink`)
+  and a new runnable `examples/media-room` crate that installs the plugin with
+  rooms and serves create/join/list routes, wired into the example drift gate
+  (workspace member, EXAMPLES.md catalog entry, README table, quickstart
+  README). [no-plugin]
+
+- **docs:** a **content negotiation** guide (`docs/guide/content-negotiation.md`)
+  documenting the `Negotiate` extractor and its `.respond(html, json)` responder —
+  one handler serving HTML to browsers and JSON to API clients from a single
+  source of truth, including `Accept` q-value precedence, `q=0` exclusions, the
+  `406 Not Acceptable` arm, and `default_format`. Paired with a runnable
+  `GET /todos/summary` dual-render route in the `todo-app` example (#2099).
+  [no-plugin]
+- **docs/examples:** a `docs/guide/nested-forms.md` guide for nested (`has_many`)
+  form binding (`NestedChangesetForm<P, C>`, `NestedChild`, `inputs_for`,
+  `_destroy`, atomic saves) plus a runnable master–detail form in
+  `examples/wiki` — the new **Collections** feature, where a collection (parent)
+  owns many links (children), created/edited/removed in one transaction-backed
+  form. `[no-plugin]`
+- **docs:** a `docs/guide/downloads.md` guide covering the typed `Download`
+  response — the `from_bytes` / `from_stream` / `from_async_read` / `from_blob`
+  constructors, the `.filename` / `.content_type` / `.inline` / `.etag` /
+  `.last_modified` builders, and `into_response_ranged` for RFC 7233 `Range`
+  requests / `206 Partial Content` — plus a range-capable CSV export route
+  (`GET /bookmarks/export.csv`) added to the `bookmarks` example. `[no-plugin]`
+- **docs:** a `docs/guide/submit-tokens.md` guide for one-time submit tokens
+  (at-most-once form submissions) — the double-submit / duplicate-POST problem,
+  how the default-on `SubmitTokenLayer` + hidden `_submit_token` field +
+  `SubmitToken` extractor close it with no client JS, how it differs from CSRF
+  and `Idempotency-Key`, and the `[security.submit_token]` config knobs. The
+  `saas` example now guards its signup POST with a one-time submit token so a
+  double-clicked signup cannot create a duplicate account. [no-plugin]
 - **test-support:** `autumn_web::test::drain_ready_repository_commit_hooks(pool, max_rows)`
   deterministically claims and runs ready durable repository commit hooks in
   integration tests — driving the real worker→drain wiring without starting the
@@ -35,7 +87,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockstep; and `Sim::run_to_idle()` cooperatively drains ready jobs and
   timer-woken work to quiescence. A job whose retry backs off 24h now fires in
   virtual time with zero wall-clock sleep. [no-plugin]
-
+- **sim-testing / rate-limit:** the built-in token-bucket rate limiter now reads
+  its refill clock from the framework's injected `ClockSource` instead of
+  `Instant::now()` / `SystemTime::now()` (#1797). `RateLimitLayer::with_clock`
+  threads `AppState`'s clock through the limiter, both bucket stores, and both
+  construction sites (the global rate-limit middleware and the `#[throttle]`
+  path); a per-key bucket's `last_refill` is stored as a `DateTime<Utc>` with a
+  fail-safe clamp of negative wall-clock deltas to zero refill (mirroring the
+  Redis Lua's `math.max(0, …)`). A `#[sim_test]` can now deterministically
+  **exhaust** a bucket and then **refill** it under virtual time via
+  `Sim::advance`, with zero real sleep. Production behavior under the default
+  `SystemClock` is unchanged, and `rate_limit.lua` is untouched (the timestamp is
+  still supplied as a Rust-computed `ARGV`). [no-plugin]
+- **sim-testing:** `Sim::advance_to(target)` advances the virtual clock **to** a
+  zoned instant (#1797), the DST/timezone-aware companion to `Sim::advance(dur)`.
+  It is generic over any `chrono::TimeZone` (pass a `chrono::DateTime<Utc>`, a
+  `FixedOffset` datetime, or a `chrono_tz::Tz` datetime — no new hard dependency)
+  and resolves the target to the correct UTC instant before reusing `advance`
+  internally, so the injected clock and tokio's paused timer wheel stay in
+  lockstep across a DST spring-forward boundary and any timer due inside the
+  crossed window still fires. Time is forward-only: advancing to the current
+  instant is a no-op and advancing to a strictly-past instant panics. A companion
+  `Sim::advance_to_local(naive, &tz)` resolves a naive wall time with explicit,
+  deterministic DST-edge handling (ambiguous fall-back → earlier instant; spring
+  -forward gap → carried across the gap), never `.unwrap()`ing a `LocalResult`.
+  [no-plugin]
+- **sim-testing:** wire the W4 `SQLite` sim DB lane through the W2 `Sim` API
+  end-to-end (#1797). A new standalone integration test (`sim_sqlite_integration`)
+  attaches a fresh, migrated, in-process in-memory `SqliteSubstrate` pool to a
+  `TestApp` via `TestApp::with_db`, mounts it through the real public
+  `Sim::build(app)`, and drives a 24h-backoff `#[job]` to completion purely via
+  `Sim::advance` + `Sim::run_to_idle` — no `perform_enqueued_jobs`, no wall-clock
+  sleep — then reads back (with real SQL) the row the job's successful retry wrote,
+  proving the W2 virtual-clock drain runs against the W4 substrate over the
+  representative in-process scheduler + local job-runtime paths. Additive: no
+  changes to the `Sim`/`SimApp`/`SqliteSubstrate` public surface. `SqliteSubstrate`
+  now applies the framework's `SQLite` repository-commit-hook migration set itself
+  (before any caller migrations), so the `autumn_repository_commit_hooks`
+  control-plane table always exists and `Sim::run_to_idle` no longer panics with
+  "no such table" when draining an app mounted on a bare substrate — this test
+  therefore registers only its own app migration, with no copied framework-DDL
+  fixture to drift. [no-plugin]
+- **sim-testing:** `Sim::strict_wall_clock()` (and `Sim::strict_wall_clock_budget(dur)`)
+  add an opt-in **real-time leak guard** (#1797): with it enabled, `Sim::advance`
+  / `Sim::run_to_idle` panic if a paused-sim step burns more than a budget of
+  *real* wall-clock time (default 100 ms; overridable per run via the
+  `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment variable), catching a real
+  `std::thread::sleep` / blocking I/O / `spawn_blocking` that escaped tokio's
+  paused virtual timer. The panic flows through the `#[sim_test]` macro's
+  `catch_unwind`, so the `AUTUMN_SIM_SEED=…` replay line still prints. This is a
+  **runtime backstop for the worst off-seam pattern (a real blocking sleep), not
+  off-seam-read detection** — a free-function `Utc::now()` / `Instant::now()` has
+  no runtime interception point in safe Rust, so finding those reads stays the
+  Phase-2 deny-lint's job; the two are complementary. Off by default; the field
+  is a plain read-only `Option<Duration>` (no interior mutability), so the
+  `&self` advance/drain futures stay `Send`. [no-plugin]
 - **dev:** add `scripts/pre-push-check.sh`, a pre-push gate that mirrors CI's
   `lint` + `test` jobs (`cargo fmt --all -- --check`, `cargo clippy --workspace
   --all-targets`, a compile-only `cargo test --workspace --no-run`, and a
@@ -52,7 +158,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   infra-free and disk-cheap because doctests are overwhelmingly `no_run`/`ignore`
   (still compiled, so the break is caught) and `--doc` never triggers trybuild.
   Documented in CONTRIBUTING.md "Before you push". [no-plugin]
-
 - **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
   shared, **multi-process-safe** database-backed implementation. The `RoomStore`
   trait, `RoomService`, and the four room HTTP handlers are now `async` (via
@@ -90,6 +195,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Changed
+
+- **jobs:** routed the job runtime's recorded timestamps (enqueued_at/started_at/finished_at, due-at filtering, and the backoff-delay computation) through the injected `ClockSource` seam instead of reading `Utc::now()` directly, so recorded job timestamps are deterministic under the sim harness (production defaults to `SystemClock`, behavior unchanged). The in-memory/sim job path is now fully deterministic; the Postgres durable path still uses server-side SQL `NOW()` (#2111). [no-plugin]
+
+- **admin-plugin:** made the core connection surface backend-agnostic so
+  SQLite-backend apps can compile it — flipped every hardcoded
+  `diesel_async::AsyncPgConnection` to `autumn_web::RuntimeConnection` across
+  `routes.rs`, `tokens.rs`, `traits.rs`, `registry.rs`, and the
+  `token_admin_db` test, mirroring `autumn-media-plugin`'s `rooms_db.rs`
+  (#2090) and `DbSuppressionStore` (#2100). This is an incremental step toward
+  #2108: the token admin surface now compiles clean under both Postgres and
+  SQLite, but the `experiments`/`feature_flags` models remain Postgres-only
+  pending a separate typed-DSL / `Timestamptz` rewrite (tracked in #2108).
+  [no-plugin]
 
 - **cli:** aligned the remaining stale `autumn-web = "0.5.0"` test fixtures in
   the `generate` modules (tauri sidecar, scaffold, pwa) to the current `0.6.0`
