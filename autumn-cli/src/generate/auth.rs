@@ -1159,6 +1159,10 @@ fn plan_auth_options_impl(
         for_revert,
     )?;
 
+    // Determine the target app's database backend so the scaffolded migrations
+    // emit backend-aware DDL (issue #1927), matching the base auth plan above.
+    let backend = super::detect_backend(project_root);
+
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let user_table = pluralize(&snake_name);
@@ -1888,13 +1892,13 @@ scope = "openid profile email"
 /// (issue #1927).
 ///
 /// The auth generator scaffolds several tables (users, sessions, remember
-/// tokens, recovery codes, magic-link tokens, OAuth identities, WebAuthn
+/// tokens, recovery codes, magic-link tokens, OAuth identities, `WebAuthn`
 /// credentials) via hand-written `CREATE TABLE` strings. This carries the small
 /// set of column-type fragments that differ between backends so the Postgres
 /// output stays byte-for-byte identical while a `SQLite` app gets valid DDL:
-/// `INTEGER PRIMARY KEY AUTOINCREMENT` for auto-increment ids (SQLite has no
+/// `INTEGER PRIMARY KEY AUTOINCREMENT` for auto-increment ids (`SQLite` has no
 /// `BIGSERIAL`), plain `INTEGER` for `BIGINT`/`INT`, and ISO-8601 `TEXT`
-/// timestamps defaulted to `CURRENT_TIMESTAMP` (SQLite has no dedicated
+/// timestamps defaulted to `CURRENT_TIMESTAMP` (`SQLite` has no dedicated
 /// timestamp type nor `NOW()`). Portable pieces (`TEXT`, `REFERENCES`, `UNIQUE`,
 /// `CREATE INDEX`) are shared and unchanged. Mirrors the dialect mapping the
 /// backend-aware model/migration generators use
@@ -11079,11 +11083,11 @@ mod tests {
     // base scaffold plus each optional feature flag.
 
     /// Backend-aware DDL (issue #1927): `generate auth` on a `SQLite` app now
-    /// scaffolds its migrations in SQLite dialect (`INTEGER PRIMARY KEY
+    /// scaffolds its migrations in `SQLite` dialect (`INTEGER PRIMARY KEY
     /// AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`) instead of being rejected —
     /// covering the users table AND the DB-backed sessions table (issue #1908) —
     /// and no Postgres-only `BIGSERIAL` / `BIGINT` / `NOW()` leaks into the
-    /// SQLite migration.
+    /// `SQLite` migration.
     #[test]
     fn plan_auth_emits_sqlite_ddl_including_sessions() {
         let tmp = project_with_main();
@@ -11183,10 +11187,10 @@ mod tests {
         );
     }
 
-    /// DB-backed sessions store on SQLite (issue #1908): the generated
+    /// DB-backed sessions store on `SQLite` (issue #1908): the generated
     /// `routes/auth.rs` types its connection pools against the backend-agnostic
     /// `::autumn_web::RuntimeConnection` alias (which resolves to `AsyncPgConnection`
-    /// on Postgres and the SQLite connection under the `sqlite` feature), never a
+    /// on Postgres and the `SQLite` connection under the `sqlite` feature), never a
     /// hard-coded `diesel_async::AsyncPgConnection`, so the generated app compiles
     /// on whichever backend it selected.
     #[test]
@@ -11195,9 +11199,7 @@ mod tests {
         for magic_link in [false, true] {
             let routes = render_routes_file("User", "user", "users", &[], false, magic_link);
             assert!(
-                routes.contains(
-                    "deadpool::Pool<::autumn_web::RuntimeConnection>"
-                ),
+                routes.contains("deadpool::Pool<::autumn_web::RuntimeConnection>"),
                 "session pool must be typed against RuntimeConnection (magic_link={magic_link}): {routes}"
             );
             assert!(
@@ -11209,7 +11211,7 @@ mod tests {
 
     /// The `--oauth` (`oauth_identities`) and `--passkeys`
     /// (`webauthn_credentials`) migrations are backend-aware too (issue #1927):
-    /// SQLite dialect on a SQLite app, historical Postgres DDL otherwise.
+    /// `SQLite` dialect on a `SQLite` app, historical Postgres DDL otherwise.
     #[test]
     fn oauth_and_passkey_migrations_are_backend_aware() {
         use autumn_web::config::DatabaseBackend;

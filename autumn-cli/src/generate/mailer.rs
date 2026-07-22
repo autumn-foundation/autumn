@@ -264,7 +264,10 @@ fn plan_unsubscribe_migration(
     let dir = existing_mail_unsubscribes_dir(&migrations_dir).unwrap_or_else(|| {
         migrations_dir.join(format!("{}_create_mail_unsubscribes", timestamp_now()))
     });
-    plan.create_if_absent(dir.join("up.sql"), unsubscribe_migration_up(backend).to_owned());
+    plan.create_if_absent(
+        dir.join("up.sql"),
+        unsubscribe_migration_up(backend).to_owned(),
+    );
     plan.create_if_absent(dir.join("down.sql"), UNSUBSCRIBE_MIGRATION_DOWN.to_owned());
 }
 
@@ -274,7 +277,7 @@ fn plan_unsubscribe_migration(
 /// `TIMESTAMPTZ NOT NULL DEFAULT NOW()`). `SQLite` — which has neither
 /// `BIGSERIAL` nor `NOW()` nor a dedicated timestamp type — gets the portable
 /// form (`INTEGER PRIMARY KEY AUTOINCREMENT`, ISO-8601 `TEXT ... DEFAULT
-/// CURRENT_TIMESTAMP`), matching the SQLite dialect the backend-aware
+/// CURRENT_TIMESTAMP`), matching the `SQLite` dialect the backend-aware
 /// model/migration generators emit.
 const fn unsubscribe_migration_up(backend: autumn_web::config::DatabaseBackend) -> &'static str {
     match backend {
@@ -310,7 +313,7 @@ CREATE TABLE mail_unsubscribes (
 
 /// SQLite-dialect companion to [`UNSUBSCRIBE_MIGRATION_UP`] (issue #1927):
 /// `INTEGER PRIMARY KEY AUTOINCREMENT` for the id and an ISO-8601 `TEXT` column
-/// defaulted to `CURRENT_TIMESTAMP` (SQLite has no `BIGSERIAL`, `TIMESTAMPTZ`,
+/// defaulted to `CURRENT_TIMESTAMP` (`SQLite` has no `BIGSERIAL`, `TIMESTAMPTZ`,
 /// or `NOW()`). The `UNIQUE` constraint and column names are portable and
 /// unchanged.
 const UNSUBSCRIBE_MIGRATION_UP_SQLITE: &str = "\
@@ -611,9 +614,9 @@ async fn main() {
 
     /// Backend-aware DDL (issue #1927): `generate mailer --list-unsubscribe` on a
     /// `SQLite` app now scaffolds the `mail_unsubscribes` suppression migration in
-    /// SQLite dialect (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT
+    /// `SQLite` dialect (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT
     /// CURRENT_TIMESTAMP`) instead of being rejected — and no Postgres-only
-    /// `BIGSERIAL` / `TIMESTAMPTZ` / `NOW()` leaks into the SQLite migration.
+    /// `BIGSERIAL` / `TIMESTAMPTZ` / `NOW()` leaks into the `SQLite` migration.
     #[test]
     fn plan_mailer_with_list_unsubscribe_emits_sqlite_ddl() {
         let tmp = project_with_main(default_main());
