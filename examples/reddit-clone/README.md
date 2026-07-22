@@ -29,6 +29,7 @@ showcasing the framework's major features in a single cohesive application.
 | htmx interactivity (voting, deletion, logout) | `routes/votes.rs`, `routes/layout.rs` |
 | Tailwind CSS styling | All templates |
 | Static asset serving (`/static/css/`, `/static/js/htmx.min.js`) | Auto-mounted |
+| Audit logging (`AuditLogger` + `TracingAuditSink`, actor auto-attribution via `Current::actor()`) | `main.rs`, `routes/posts.rs` (`delete_post`) |
 
 ## Prerequisites
 

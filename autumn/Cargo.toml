@@ -631,6 +631,17 @@ path = "tests/sim_sqlite_substrate.rs"
 name = "sim_sqlite_integration"
 path = "tests/sim_sqlite_integration.rs"
 
+# W6 semantic core (#1797): the `always!` / `sometimes!` assertion macros and the
+# thread-local non-vacuity registry. Isolated `[[test]]` binary because it drives
+# the process's thread-local reachability registry (and asserts `Sim::from_seed`
+# resets it); the thread-local gives per-test-thread isolation, and keeping it
+# standalone avoids any coupling to the consolidated binary's concurrent tests.
+# Needs no non-default feature, so the `cargo test --workspace` CI step compiles
+# and runs it automatically — no workflow edit required.
+[[test]]
+name = "sim_assert"
+path = "tests/sim_assert.rs"
+
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
 # consolidated binary — those vars would race the inline network tests.

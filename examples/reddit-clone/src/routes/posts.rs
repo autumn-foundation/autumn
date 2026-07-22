@@ -1140,6 +1140,24 @@ pub async fn delete_post(
 
     repo.delete_by_id(post.id).await?;
 
+    // Audit this moderation action. The acting principal is auto-attributed
+    // from the request scope via `Current::actor()` — the auth layer published
+    // it when `#[secured]` resolved the session — so we never re-extract the
+    // session just to answer "who deleted this post?". Best-effort: an audit
+    // sink hiccup must not fail the delete the user already performed.
+    let actor = autumn_web::current::Current::actor().unwrap_or_else(|| "unknown".to_string());
+    let _ = autumn_web::audit::write_from_state(
+        &state,
+        AuditEvent::new(
+            actor,
+            "post.delete",
+            post.id.to_string(),
+            None,
+            AuditStatus::Success,
+        ),
+    )
+    .await;
+
     let _ = state.broadcast().publish_oob(
         &format!("posts:r/{}", sub_slug),
         &post.dom_id(),
