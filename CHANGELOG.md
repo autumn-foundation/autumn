@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **docs:** an **audit logging** guide (`docs/guide/audit-logging.md`) documenting audit events with actor auto-attribution, with a minimal audit sink wired into the `reddit-clone` example (#2099). [no-plugin]
+- **sim-testing:** add the `always!` / `sometimes!` simulation assertion macros
+  (W6 op-driver assertion core, #1797) — hard-invariant + reachability assertions
+  for `#[sim_test]`, with a non-vacuity registry the forthcoming sim-sweep
+  aggregates. `always!(cond[, "fmt", …])` panics on a false invariant with a
+  greppable message (the `#[sim_test]` harness prints the `AUTUMN_SIM_SEED=…`
+  replay line); `sometimes!(cond, "label")` records a reachability target in a
+  thread-local registry (observed vs satisfied) that `Sim::from_seed` resets per
+  seed, exposed via `sometimes_snapshot` / `assert_all_sometimes_satisfied` for
+  the sweep to fail a green-but-vacuous run. [no-plugin]
+
 - **docs/examples:** documented the `autumn-media-plugin` media subsystem
   (broadcast + mesh rooms + MediaMTX). Adds the `docs/guide/media.md` guide
   (install/mount, `MediaConfig` profile loading, the `RoomService`/`RoomStore`
@@ -113,7 +123,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "no such table" when draining an app mounted on a bare substrate — this test
   therefore registers only its own app migration, with no copied framework-DDL
   fixture to drift. [no-plugin]
-
+- **sim-testing:** `Sim::strict_wall_clock()` (and `Sim::strict_wall_clock_budget(dur)`)
+  add an opt-in **real-time leak guard** (#1797): with it enabled, `Sim::advance`
+  / `Sim::run_to_idle` panic if a paused-sim step burns more than a budget of
+  *real* wall-clock time (default 100 ms; overridable per run via the
+  `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment variable), catching a real
+  `std::thread::sleep` / blocking I/O / `spawn_blocking` that escaped tokio's
+  paused virtual timer. The panic flows through the `#[sim_test]` macro's
+  `catch_unwind`, so the `AUTUMN_SIM_SEED=…` replay line still prints. This is a
+  **runtime backstop for the worst off-seam pattern (a real blocking sleep), not
+  off-seam-read detection** — a free-function `Utc::now()` / `Instant::now()` has
+  no runtime interception point in safe Rust, so finding those reads stays the
+  Phase-2 deny-lint's job; the two are complementary. Off by default; the field
+  is a plain read-only `Option<Duration>` (no interior mutability), so the
+  `&self` advance/drain futures stay `Send`. [no-plugin]
 - **dev:** add `scripts/pre-push-check.sh`, a pre-push gate that mirrors CI's
   `lint` + `test` jobs (`cargo fmt --all -- --check`, `cargo clippy --workspace
   --all-targets`, a compile-only `cargo test --workspace --no-run`, and a
@@ -167,6 +190,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Changed
+
+- **jobs:** routed the job runtime's recorded timestamps (enqueued_at/started_at/finished_at, due-at filtering, and the backoff-delay computation) through the injected `ClockSource` seam instead of reading `Utc::now()` directly, so recorded job timestamps are deterministic under the sim harness (production defaults to `SystemClock`, behavior unchanged). The in-memory/sim job path is now fully deterministic; the Postgres durable path still uses server-side SQL `NOW()` (#2111). [no-plugin]
 
 - **admin-plugin:** made the core connection surface backend-agnostic so
   SQLite-backend apps can compile it — flipped every hardcoded
