@@ -63,8 +63,7 @@ async fn strict_wall_clock_passes_on_clean_virtual_run(mut sim: Sim) {
     let max_allowed = std::env::var("AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_millis(2000));
+        .map_or(Duration::from_secs(2), Duration::from_millis);
 
     assert!(
         wall_elapsed < max_allowed,
