@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs:** an **audit logging** guide (`docs/guide/audit-logging.md`) documenting audit events with actor auto-attribution, with a minimal audit sink wired into the `reddit-clone` example (#2099). [no-plugin]
 - **sim-testing:** add the `always!` / `sometimes!` simulation assertion macros
   (W6 op-driver assertion core, #1797) — hard-invariant + reachability assertions
   for `#[sim_test]`, with a non-vacuity registry the forthcoming sim-sweep
