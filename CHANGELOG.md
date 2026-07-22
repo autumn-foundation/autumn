@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs/examples:** a runnable state-machine / lifecycle demonstration (`#[state_machine]` transition effects) in the `wiki` example — the `Page::status` machine now declares per-edge `on = "..."` effects that append the audit `Revision` inside the transition's transaction, driven from the transitions handler via `transition_status_to_on_conn` under one `Db::tx_with` — cross-linked from the state-machines guide (#2099). [no-plugin]
 - **docs:** an **aggregate queries** guide (`docs/guide/aggregates.md`) documenting GROUP BY roll-ups, paired with a runnable `GET /stats` roll-up route in the `bookmarks` example (#2099). [no-plugin]
 - **docs:** an **audit logging** guide (`docs/guide/audit-logging.md`) documenting audit events with actor auto-attribution, with a minimal audit sink wired into the `reddit-clone` example (#2099). [no-plugin]
 - **sim-testing:** add the `always!` / `sometimes!` simulation assertion macros

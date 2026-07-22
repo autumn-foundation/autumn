@@ -10,6 +10,12 @@ twice.
 - `#[model]` for `Page` and `Revision`
 - `#[repository(Page, hooks = PageHooks, api = "/api/v1/pages")]`
 - Mutation hooks for slug generation and revision auditing
+- **`#[state_machine]` with transition effects** — `Page::status`
+  (`draft → published → archived`) declares a `can_publish` guard plus per-edge
+  `on = "..."` effects that append the audit `Revision` inside the transition's
+  transaction; the `POST /pages/{slug}/transitions/status` handler drives the
+  effectful `transition_status_to_on_conn` under one `Db::tx_with` (see
+  `docs/guide/state-machines.md` and `docs/guide/transition-effects.md`)
 - Maud templates for a server-rendered editing flow
 - Embedded migrations on startup
 - Framework health and actuator endpoints
@@ -63,6 +69,7 @@ behavior automatically.
 | GET | `/pages/{slug}` | View a page |
 | GET | `/pages/{slug}/edit` | Edit form |
 | POST | `/pages/{slug}` | Update a page |
+| POST | `/pages/{slug}/transitions/status` | Apply a `#[state_machine]` status transition (fires the audit-`Revision` effect) |
 | GET | `/pages/{slug}/history` | Full revision history |
 | GET | `/collections` | List link collections |
 | GET | `/collections/new` | New collection form (nested `has_many`) |
