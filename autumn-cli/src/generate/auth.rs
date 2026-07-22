@@ -1159,6 +1159,7 @@ fn plan_auth_options_impl(
         for_revert,
     )?;
 
+    let backend = super::detect_backend(project_root);
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let user_table = pluralize(&snake_name);
