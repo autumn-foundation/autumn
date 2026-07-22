@@ -102,6 +102,16 @@ async fn main() {
         .with_error_reporter(StructuredReporter)
         .state_initializer(move |state| {
             state.insert_extension(experiment_svc);
+            // Audit sink: an append-only security-event log, kept separate from
+            // ordinary application logs. `TracingAuditSink` emits each event as
+            // structured JSON on the dedicated `autumn.audit` tracing target, so
+            // it needs no schema and no migration — the lowest-risk sink. Swap in
+            // `JsonlFileAuditSink` (append-only file archive) or a DB-backed sink
+            // for durable retention. See docs/guide/audit-logging.md.
+            state.insert_extension(
+                autumn_web::audit::AuditLogger::new()
+                    .with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
         })
         .routes(routes![
             routes::posts::front_page,
