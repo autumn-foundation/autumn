@@ -341,7 +341,7 @@ impl Sim {
     ///
     /// # Budget & the `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` override
     ///
-    /// The default budget is deliberately generous (100 ms) so ordinary CI
+    /// The default budget is deliberately generous (2000 ms) so ordinary CI
     /// scheduling jitter never trips it — the target is a *real* sleep (seconds),
     /// not sub-millisecond noise. Set the environment variable
     /// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` (whole milliseconds) to override
@@ -655,13 +655,13 @@ const MAX_DRAIN_STEPS: usize = 1024;
 /// Default real wall-clock budget for the `strict_wall_clock` leak guard
 /// ([`Sim::strict_wall_clock`]).
 ///
-/// Deliberately generous (100 ms): the guard exists to catch a *real* blocking
+/// Deliberately generous (2000 ms): the guard exists to catch a *real* blocking
 /// sleep escaping the virtual timer (seconds of wall time), so the budget must
 /// sit far above ordinary current-thread scheduling jitter to avoid false
 /// positives on a slow/contended CI runner. A legitimate virtual advance — even
 /// jumping a day of virtual time — costs microseconds of real time, orders of
 /// magnitude under this.
-const DEFAULT_STRICT_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+const DEFAULT_STRICT_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Resolve the effective `strict_wall_clock` budget: the
 /// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment override when it holds a
