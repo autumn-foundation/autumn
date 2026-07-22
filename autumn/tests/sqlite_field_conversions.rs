@@ -83,9 +83,7 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
     // test passes a DISTINCT name so the two `#[tokio::test]`s — which run in
     // parallel — never share rows through the process-wide shared cache.
     let config = DatabaseConfig {
-        url: Some(format!(
-            "sqlite://file:{db_name}?mode=memory&cache=shared"
-        )),
+        url: Some(format!("sqlite://file:{db_name}?mode=memory&cache=shared")),
         primary_pool_size: Some(1),
         ..Default::default()
     };
@@ -190,7 +188,11 @@ async fn datetime_column_orders_chronologically_on_sqlite() {
     let latest = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
     let naive = earliest.naive_utc();
 
-    for (label, ts) in [("b-middle", middle), ("c-latest", latest), ("a-earliest", earliest)] {
+    for (label, ts) in [
+        ("b-middle", middle),
+        ("c-latest", latest),
+        ("a-earliest", earliest),
+    ] {
         repo.save(&NewConversionRow {
             label: label.to_string(),
             happened_at: ts,

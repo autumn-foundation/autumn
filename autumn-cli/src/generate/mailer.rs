@@ -264,7 +264,10 @@ fn plan_unsubscribe_migration(
     let dir = existing_mail_unsubscribes_dir(&migrations_dir).unwrap_or_else(|| {
         migrations_dir.join(format!("{}_create_mail_unsubscribes", timestamp_now()))
     });
-    plan.create_if_absent(dir.join("up.sql"), unsubscribe_migration_up(backend).to_owned());
+    plan.create_if_absent(
+        dir.join("up.sql"),
+        unsubscribe_migration_up(backend).to_owned(),
+    );
     plan.create_if_absent(dir.join("down.sql"), UNSUBSCRIBE_MIGRATION_DOWN.to_owned());
 }
 

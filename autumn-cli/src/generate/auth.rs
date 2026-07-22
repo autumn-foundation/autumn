@@ -11196,9 +11196,7 @@ mod tests {
         for magic_link in [false, true] {
             let routes = render_routes_file("User", "user", "users", &[], false, magic_link);
             assert!(
-                routes.contains(
-                    "deadpool::Pool<::autumn_web::RuntimeConnection>"
-                ),
+                routes.contains("deadpool::Pool<::autumn_web::RuntimeConnection>"),
                 "session pool must be typed against RuntimeConnection (magic_link={magic_link}): {routes}"
             );
             assert!(
