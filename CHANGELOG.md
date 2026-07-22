@@ -112,7 +112,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "no such table" when draining an app mounted on a bare substrate — this test
   therefore registers only its own app migration, with no copied framework-DDL
   fixture to drift. [no-plugin]
-
+- **sim-testing:** `Sim::strict_wall_clock()` (and `Sim::strict_wall_clock_budget(dur)`)
+  add an opt-in **real-time leak guard** (#1797): with it enabled, `Sim::advance`
+  / `Sim::run_to_idle` panic if a paused-sim step burns more than a budget of
+  *real* wall-clock time (default 100 ms; overridable per run via the
+  `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment variable), catching a real
+  `std::thread::sleep` / blocking I/O / `spawn_blocking` that escaped tokio's
+  paused virtual timer. The panic flows through the `#[sim_test]` macro's
+  `catch_unwind`, so the `AUTUMN_SIM_SEED=…` replay line still prints. This is a
+  **runtime backstop for the worst off-seam pattern (a real blocking sleep), not
+  off-seam-read detection** — a free-function `Utc::now()` / `Instant::now()` has
+  no runtime interception point in safe Rust, so finding those reads stays the
+  Phase-2 deny-lint's job; the two are complementary. Off by default; the field
+  is a plain read-only `Option<Duration>` (no interior mutability), so the
+  `&self` advance/drain futures stay `Send`. [no-plugin]
 - **dev:** add `scripts/pre-push-check.sh`, a pre-push gate that mirrors CI's
   `lint` + `test` jobs (`cargo fmt --all -- --check`, `cargo clippy --workspace
   --all-targets`, a compile-only `cargo test --workspace --no-run`, and a
