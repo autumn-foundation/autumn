@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generate/sqlite:** `DateTime<Utc>` and `Attachment` model fields now compile
+  and round-trip on the SQLite backend, reaching Postgres parity (#1924). A
+  `DateTime<Utc>` column maps to diesel's `TimestamptzSqlite` sql-type, stored as
+  an RFC 3339 UTC string (SQLite `TEXT` affinity) that sorts and compares
+  chronologically; an `Attachment` (`autumn_web::storage::Blob`) column stores
+  its metadata JSON in a `TEXT` column via new local `FromSql`/`ToSql<Text,
+  Sqlite>` impls on `Blob`. Both kinds are now accepted by `generate model` /
+  `generate scaffold` / column migrations on a SQLite app instead of being
+  rejected at generate time. `Uuid` and `Decimal` remain rejected on SQLite
+  (their `uuid::Uuid` / `rust_decimal::Decimal` types are foreign to autumn-web,
+  so the orphan rule blocks a direct SQLite conversion, and diesel /
+  `rust_decimal` provide only Postgres-side impls) — a wrapper-based follow-up
+  tracked under #1924.
 - **docs:** a **feeds** guide (`docs/guide/feeds.md`) documenting Atom/RSS feed
   generation, cross-linking the runnable `examples/blog` `/feed.xml` route
   (#2099). [no-plugin]
