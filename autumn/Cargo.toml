@@ -468,6 +468,20 @@ path = "tests/sqlite_scoped_repository.rs"
 name = "sqlite_crud_basic"
 path = "tests/sqlite_crud_basic.rs"
 
+# SQLite model-field type conversions (issue #1924): proves a `#[model]` carrying
+# a `DateTime<Utc>` (-> TimestamptzSqlite), a `NaiveDateTime` (-> Timestamp), and
+# an `Option<Blob>` attachment (-> Text/JSON) compiles AND round-trips on an
+# in-memory SQLite pool with no Docker — insert, read-back equality (incl.
+# fractional seconds and NULL attachment), and chronological ordering of the
+# TEXT-backed DateTime column. Un-rejects those kinds at generate time. Only
+# meaningful under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]`
+# so a default `cargo test` compiles it to an empty (passing) binary. Needs the
+# `storage` feature for the `Blob` attachment field. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support,storage" --test sqlite_field_conversions`.
+[[test]]
+name = "sqlite_field_conversions"
+path = "tests/sqlite_field_conversions.rs"
+
 # SQLite upsert isolation + optimistic-lock proof (issue #1996, PR #2021): the two
 # P1 fixes on the cfg-dual `__autumn_execute_upsert` SQLite arm. Proves (Bug 2,
 # SECURITY) a tenant-scoped `upsert_many` under tenant B with tenant A's id leaves
@@ -512,6 +526,21 @@ path = "tests/sqlite_version_history.rs"
 [[test]]
 name = "sqlite_commit_hook_worker"
 path = "tests/sqlite_commit_hook_worker.rs"
+
+# SQLite durable-jobs + single-host scheduler e2e proof (issue #1907). On a real
+# SQLite pool/app it (1) starts the default in-process `local` job runtime and
+# drives an enqueued job to completion, (2) builds the default `in_process`
+# scheduler coordinator and fires a task tick under a granted lease, and (3)
+# asserts the Postgres-only paths (postgres scheduler/job backends + advisory
+# `Lock::from_state`) are refused under the sqlite feature with the documented
+# messages. Confirms #1907's ask is satisfied by the shipped in-process
+# substitutes. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_jobs_scheduler_e2e`.
+[[test]]
+name = "sqlite_jobs_scheduler_e2e"
+path = "tests/sqlite_jobs_scheduler_e2e.rs"
 
 # SQLite searchable-repository fallback proof (issue #1996). Drives
 # `#[repository(searchable)]` against an in-memory SQLite pool: substring matches
@@ -614,6 +643,33 @@ path = "tests/sqlite_transactional_url_pool.rs"
 [[test]]
 name = "sim_sqlite_substrate"
 path = "tests/sim_sqlite_substrate.rs"
+
+# Sim-testing W4 ↔ W2 integration (issue #1797): wires the merged W4
+# `sim::substrate::SqliteSubstrate` (#2106) through the merged W2 public `Sim` API
+# (#2104). Drives a 24h-backoff `#[job]` to completion via `sim.build` +
+# `sim.advance` + `sim.run_to_idle` against the in-memory SQLite substrate and
+# reads back the row the job wrote, proving the W2 drain runs end-to-end on the W4
+# substrate. Standalone for the same reason as `sim_sqlite_substrate` (the
+# consolidated `integration_tests` binary is Postgres-typed and does not compile
+# under `--features sqlite`); needs `test-support` for the `TestApp`/`sim_test`
+# harness, so the file is `#![cfg(all(feature = "sqlite", feature =
+# "test-support"))]` and a default `cargo test` compiles it to an empty (passing)
+# binary. Runs without Docker. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_sqlite_integration`.
+[[test]]
+name = "sim_sqlite_integration"
+path = "tests/sim_sqlite_integration.rs"
+
+# W6 semantic core (#1797): the `always!` / `sometimes!` assertion macros and the
+# thread-local non-vacuity registry. Isolated `[[test]]` binary because it drives
+# the process's thread-local reachability registry (and asserts `Sim::from_seed`
+# resets it); the thread-local gives per-test-thread isolation, and keeping it
+# standalone avoids any coupling to the consolidated binary's concurrent tests.
+# Needs no non-default feature, so the `cargo test --workspace` CI step compiles
+# and runs it automatically — no workflow edit required.
+[[test]]
+name = "sim_assert"
+path = "tests/sim_assert.rs"
 
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the

@@ -63,9 +63,10 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Instant;
 
+use crate::time::{ClockSource, SystemClock};
 use axum::http::{HeaderValue, Request, Response, StatusCode};
+use chrono::{DateTime, Utc};
 use http::header::{CONTENT_TYPE, HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
 
@@ -141,7 +142,11 @@ enum Decision {
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
     tokens: f64,
-    last_refill: Instant,
+    /// Wall-clock instant of the last refill, read from the injected
+    /// [`ClockSource`]. Stored as a `DateTime<Utc>` (rather than a monotonic
+    /// `Instant`) so deterministic test/sim clocks can drive refill under
+    /// virtual time.
+    last_refill: DateTime<Utc>,
 }
 
 /// Per-key token bucket state stored in-process.
@@ -168,11 +173,11 @@ impl MemoryStore {
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    fn decide(&self, key: &str, now: Instant, burst: f64, refill_per_sec: f64) -> Decision {
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    fn decide(&self, key: &str, now: DateTime<Utc>, burst: f64, refill_per_sec: f64) -> Decision {
+        // `now` already comes from the injected clock, so derive the Unix
+        // timestamp used in the `x-ratelimit-reset` / `retry-after` headers from
+        // it directly (rather than reaching for `SystemTime::now()` off-seam).
+        let now_unix = u64::try_from(now.timestamp()).unwrap_or(0);
 
         let tokens_after = {
             let mut buckets = match self.buckets.lock() {
@@ -185,8 +190,11 @@ impl MemoryStore {
                 last_refill: now,
             });
 
-            let elapsed = now
-                .saturating_duration_since(bucket.last_refill)
+            // Clamp a negative delta (a backwards wall-clock jump) to zero so it
+            // yields no refill — fail-safe, mirroring the Lua's `math.max(0, …)`.
+            let elapsed = (now - bucket.last_refill)
+                .to_std()
+                .unwrap_or(std::time::Duration::ZERO)
                 .as_secs_f64();
             bucket.tokens = elapsed.mul_add(refill_per_sec, bucket.tokens).min(burst);
             bucket.last_refill = now;
@@ -249,6 +257,9 @@ struct RedisStore {
     failure_mode: RateLimitBackendFailure,
     /// Set to `true` once on the first Redis error; reset when it recovers.
     outage_logged: Arc<std::sync::atomic::AtomicBool>,
+    /// Injected wall-clock; supplies the timestamp handed to the Lua script and
+    /// the reset/retry-after header values. Defaults to [`SystemClock`].
+    clock: Arc<dyn ClockSource>,
 }
 
 #[cfg(feature = "redis")]
@@ -259,6 +270,7 @@ impl Clone for RedisStore {
             key_prefix: self.key_prefix.clone(),
             failure_mode: self.failure_mode,
             outage_logged: Arc::clone(&self.outage_logged),
+            clock: Arc::clone(&self.clock),
         }
     }
 }
@@ -279,28 +291,26 @@ impl RedisStore {
         connection: redis::aio::ConnectionManager,
         key_prefix: String,
         failure_mode: RateLimitBackendFailure,
+        clock: Arc<dyn ClockSource>,
     ) -> Self {
         Self {
             connection,
             key_prefix,
             failure_mode,
             outage_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            clock,
         }
     }
 
     async fn decide(&self, key: &str, burst: f64, refill_per_sec: f64) -> Option<Decision> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // Timestamps come from the injected clock (not `SystemTime::now()`), so
+        // a deterministic test/sim clock drives the Redis token bucket too. The
+        // Lua script still receives the timestamp as a Rust-computed `ARGV`, so
+        // no change to `rate_limit.lua` is required.
+        let now_unix = crate::time::clock_unix_secs(self.clock.as_ref());
 
         let redis_key = format!("{}:{}", self.key_prefix, key);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        let now_ms = crate::time::clock_unix_duration(self.clock.as_ref()).as_millis();
 
         let script = redis::Script::new(RATE_LIMIT_LUA);
         let result: redis::RedisResult<Vec<i64>> = {
@@ -391,6 +401,27 @@ enum BucketBackend {
     Redis(RedisStore),
 }
 
+impl BucketBackend {
+    /// Point this backend at a different clock. The in-memory store reads `now`
+    /// per-call (passed into `decide`), so only the Redis store — which holds
+    /// its own clock handle — needs updating.
+    #[cfg_attr(
+        not(feature = "redis"),
+        allow(
+            clippy::needless_pass_by_ref_mut,
+            clippy::needless_pass_by_value,
+            unused_variables
+        )
+    )]
+    fn set_clock(&mut self, clock: Arc<dyn ClockSource>) {
+        match self {
+            Self::Memory(_) => {}
+            #[cfg(feature = "redis")]
+            Self::Redis(store) => store.clock = clock,
+        }
+    }
+}
+
 // ── Limiter (shared state) ────────────────────────────────────────────────────
 
 #[allow(clippy::type_complexity)]
@@ -415,7 +446,6 @@ impl std::fmt::Debug for TierHookFn {
 }
 
 /// Shared rate limiter state.
-#[derive(Debug)]
 struct Limiter {
     refill_per_sec: f64,
     burst: f64,
@@ -434,6 +464,29 @@ struct Limiter {
     /// leave it `false` so an MCP replay still consumes their route-specific
     /// bucket, exactly as the equivalent direct HTTP call would.
     honors_mcp_exempt: bool,
+    /// Injected wall-clock driving token refill. Defaults to [`SystemClock`]
+    /// (byte-identical to the pre-injection behavior); the production
+    /// construction sites in `router.rs` swap in `AppState`'s clock via
+    /// [`RateLimitLayer::with_clock`] so deterministic sim tests can exhaust and
+    /// refill buckets under virtual time.
+    clock: Arc<dyn ClockSource>,
+}
+
+impl std::fmt::Debug for Limiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Limiter")
+            .field("refill_per_sec", &self.refill_per_sec)
+            .field("burst", &self.burst)
+            .field("burst_header", &self.burst_header)
+            .field("resolver", &self.resolver)
+            .field("key_strategy", &self.key_strategy)
+            .field("tiers", &self.tiers)
+            .field("tier_hook", &self.tier_hook)
+            .field("path_overrides", &self.path_overrides)
+            .field("backend", &self.backend)
+            .field("honors_mcp_exempt", &self.honors_mcp_exempt)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Limiter {
@@ -444,6 +497,14 @@ impl Limiter {
     fn from_config_with_resolver(
         config: &RateLimitConfig,
         top_level_resolver: Option<ProxyResolver>,
+    ) -> Self {
+        Self::from_config_with_resolver_and_clock(config, top_level_resolver, Arc::new(SystemClock))
+    }
+
+    fn from_config_with_resolver_and_clock(
+        config: &RateLimitConfig,
+        top_level_resolver: Option<ProxyResolver>,
+        clock: Arc<dyn ClockSource>,
     ) -> Self {
         let burst = f64::from(config.burst.max(1));
         let refill_per_sec = config.requests_per_second.max(f64::MIN_POSITIVE);
@@ -473,7 +534,7 @@ impl Limiter {
             })
         });
 
-        let backend = Self::build_backend(config);
+        let backend = Self::build_backend(config, &clock);
 
         Self {
             refill_per_sec,
@@ -486,10 +547,14 @@ impl Limiter {
             path_overrides: Vec::new(),
             backend,
             honors_mcp_exempt: false,
+            clock,
         }
     }
 
-    fn build_backend(config: &RateLimitConfig) -> BucketBackend {
+    fn build_backend(
+        config: &RateLimitConfig,
+        #[cfg_attr(not(feature = "redis"), allow(unused_variables))] clock: &Arc<dyn ClockSource>,
+    ) -> BucketBackend {
         if config.backend == RateLimitBackend::Redis {
             #[cfg(not(feature = "redis"))]
             {
@@ -514,6 +579,7 @@ impl Limiter {
                                     conn,
                                     config.redis.key_prefix.clone(),
                                     config.on_backend_failure,
+                                    Arc::clone(clock),
                                 ));
                             }
                             Err(err) => {
@@ -636,7 +702,7 @@ impl Limiter {
     #[allow(clippy::unused_async)]
     async fn decide(&self, key: &str, burst: f64, rps: f64) -> Option<Decision> {
         match &self.backend {
-            BucketBackend::Memory(store) => Some(store.decide(key, Instant::now(), burst, rps)),
+            BucketBackend::Memory(store) => Some(store.decide(key, self.clock.now(), burst, rps)),
             #[cfg(feature = "redis")]
             BucketBackend::Redis(store) => store.decide(key, burst, rps).await,
         }
@@ -872,6 +938,24 @@ impl RateLimitLayer {
             limiter: Arc::new(limiter),
         }
     }
+
+    /// Drive token refill from the supplied [`ClockSource`] instead of the
+    /// default [`SystemClock`].
+    ///
+    /// Wired at the production construction sites in `router.rs` with
+    /// `AppState`'s injected clock, so a deterministic test/sim clock can
+    /// exhaust a bucket and then refill it under virtual time (via
+    /// `Sim::advance` / `TestClient::advance_clock`) with zero real sleep. Under
+    /// the default `SystemClock` the limiter behaves exactly as before.
+    #[must_use]
+    pub fn with_clock(self, clock: Arc<dyn ClockSource>) -> Self {
+        let mut limiter = Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).deep_clone());
+        limiter.backend.set_clock(Arc::clone(&clock));
+        limiter.clock = clock;
+        Self {
+            limiter: Arc::new(limiter),
+        }
+    }
 }
 
 impl Limiter {
@@ -888,6 +972,7 @@ impl Limiter {
             path_overrides: self.path_overrides.clone(),
             backend: self.backend.clone(),
             honors_mcp_exempt: self.honors_mcp_exempt,
+            clock: Arc::clone(&self.clock),
         }
     }
 }
@@ -1108,6 +1193,7 @@ fn build_throttle_limiter(
     limit: u32,
     per_secs: u64,
     key: KeyStrategy,
+    clock: Arc<dyn ClockSource>,
 ) -> Arc<Limiter> {
     // On the Redis backend every per-route limiter shares one connection and,
     // by default, the single `redis.key_prefix`; the bucket key handed to
@@ -1164,7 +1250,11 @@ fn build_throttle_limiter(
         None
     };
 
-    Arc::new(Limiter::from_config_with_resolver(&cfg, top_level_resolver))
+    Arc::new(Limiter::from_config_with_resolver_and_clock(
+        &cfg,
+        top_level_resolver,
+        clock,
+    ))
 }
 
 /// Stable fingerprint of every config input `build_throttle_limiter` bakes into
@@ -1505,6 +1595,7 @@ pub async fn __check_throttle(
                 limit,
                 per_secs,
                 key_strategy,
+                Arc::clone(&state.clock),
             )
         }))
     };
@@ -1544,6 +1635,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::routing::get;
+    use chrono::TimeZone;
     use std::net::{IpAddr, SocketAddr};
     use std::time::Duration;
     use tower::ServiceExt;
@@ -1758,7 +1850,11 @@ mod tests {
             backend: RateLimitBackend::Memory,
             ..Default::default()
         };
-        let backend = Limiter::build_backend(&config);
+        let backend = Limiter::build_backend(
+            &config,
+            &(std::sync::Arc::new(crate::time::SystemClock)
+                as std::sync::Arc<dyn crate::time::ClockSource>),
+        );
         assert!(matches!(backend, BucketBackend::Memory(_)));
     }
 
@@ -1773,14 +1869,18 @@ mod tests {
             },
             ..Default::default()
         };
-        let backend = Limiter::build_backend(&config);
+        let backend = Limiter::build_backend(
+            &config,
+            &(std::sync::Arc::new(crate::time::SystemClock)
+                as std::sync::Arc<dyn crate::time::ClockSource>),
+        );
         assert!(matches!(backend, BucketBackend::Memory(_)));
     }
 
     #[test]
     fn memory_store_retry_after_calculation() {
         let store = MemoryStore::new();
-        let now = Instant::now();
+        let now = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         // Burst 1.0, Refill 0.1 tokens/sec (10 sec per token)
         let _ = store.decide("ip1", now, 1.0, 0.1); // Consumes 1.0, bucket.tokens = 0.0
 
@@ -1793,7 +1893,7 @@ mod tests {
         }
 
         // 5 seconds later, bucket.tokens = 0.5. Deficit = 0.5. Secs = 0.5 / 0.1 = 5.0
-        let later = now + Duration::from_secs(5);
+        let later = now + chrono::Duration::seconds(5);
         match store.decide("ip1", later, 1.0, 0.1) {
             Decision::Denied {
                 retry_after_secs, ..
@@ -1802,7 +1902,7 @@ mod tests {
         }
 
         // 9.5 seconds later, bucket.tokens = 0.95. Deficit = 0.05. Secs = 0.05 / 0.1 = 0.5 -> ceil -> 1.0
-        let even_later = now + Duration::from_millis(9500);
+        let even_later = now + chrono::Duration::milliseconds(9500);
         match store.decide("ip1", even_later, 1.0, 0.1) {
             Decision::Denied {
                 retry_after_secs, ..
@@ -2351,6 +2451,7 @@ mod tests {
             connection,
             "test_prefix".to_string(),
             RateLimitBackendFailure::FailOpen,
+            std::sync::Arc::new(crate::time::SystemClock),
         );
         let dbg = format!("{store:?}");
         assert!(dbg.contains("RedisStore"));
@@ -2445,9 +2546,33 @@ mod tests {
         };
         let tp = TrustedProxiesConfig::default();
 
-        let route_a = build_throttle_limiter(&global, &tp, "route:a", 5, 60, KeyStrategy::Ip);
-        let route_b = build_throttle_limiter(&global, &tp, "route:b", 5, 60, KeyStrategy::Ip);
-        let named = build_throttle_limiter(&global, &tp, "named:login", 5, 60, KeyStrategy::Ip);
+        let route_a = build_throttle_limiter(
+            &global,
+            &tp,
+            "route:a",
+            5,
+            60,
+            KeyStrategy::Ip,
+            std::sync::Arc::new(crate::time::SystemClock),
+        );
+        let route_b = build_throttle_limiter(
+            &global,
+            &tp,
+            "route:b",
+            5,
+            60,
+            KeyStrategy::Ip,
+            std::sync::Arc::new(crate::time::SystemClock),
+        );
+        let named = build_throttle_limiter(
+            &global,
+            &tp,
+            "named:login",
+            5,
+            60,
+            KeyStrategy::Ip,
+            std::sync::Arc::new(crate::time::SystemClock),
+        );
         let global_limiter = Limiter::from_config(&global);
 
         // (i) two different routes for the same client → different Redis keyspace.
@@ -2483,7 +2608,15 @@ mod tests {
             trusted_hops: Some(1),
             trust_forwarded_headers: true,
         };
-        let limiter = build_throttle_limiter(&global, &tp, "route:x", 5, 60, KeyStrategy::Ip);
+        let limiter = build_throttle_limiter(
+            &global,
+            &tp,
+            "route:x",
+            5,
+            60,
+            KeyStrategy::Ip,
+            std::sync::Arc::new(crate::time::SystemClock),
+        );
 
         // XFF: real client, then one proxy hop; the TCP peer is the load balancer.
         let req = req_with_connect_info("1.1.1.1, 2.2.2.2", "9.9.9.9:4000");
@@ -2510,7 +2643,15 @@ mod tests {
             trusted_hops: Some(1),
             trust_forwarded_headers: true,
         };
-        let limiter = build_throttle_limiter(&global, &tp, "route:y", 5, 60, KeyStrategy::Ip);
+        let limiter = build_throttle_limiter(
+            &global,
+            &tp,
+            "route:y",
+            5,
+            60,
+            KeyStrategy::Ip,
+            std::sync::Arc::new(crate::time::SystemClock),
+        );
 
         let req = req_with_connect_info("1.1.1.1, 2.2.2.2", "9.9.9.9:4000");
         // Legacy resolver (trust_forwarded_headers = true, no hops/ranges) uses
@@ -2644,7 +2785,15 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Arc::clone(reg.entry(cache_key).or_insert_with(|| {
-                build_throttle_limiter(&global, &tp, route, 5, 60, key_strategy)
+                build_throttle_limiter(
+                    &global,
+                    &tp,
+                    route,
+                    5,
+                    60,
+                    key_strategy,
+                    std::sync::Arc::new(crate::time::SystemClock),
+                )
             }))
         };
 

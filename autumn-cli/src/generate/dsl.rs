@@ -444,28 +444,35 @@ impl FieldKind {
     /// The Postgres-only diesel sql-types (`Timestamptz`, `Jsonb`, `Uuid`,
     /// `Bytea`, `Numeric`) are not implemented for diesel's `SQLite` backend, so
     /// they are remapped to types `SQLite` does support: `Uuid`/`Attachment`/
-    /// `Decimal` -> `Text`, `NaiveDateTime`/`DateTime<Utc>` -> `Timestamp`,
-    /// `Bytea` -> `Binary`.
+    /// `Decimal` -> `Text`, `NaiveDateTime` -> `Timestamp`, `DateTime<Utc>` ->
+    /// `TimestamptzSqlite`, `Bytea` -> `Binary`.
     ///
     /// `NaiveDateTime` maps to the core `diesel::sql_types::Timestamp` — a
     /// backend-agnostic sql-type that is exported without diesel's `sqlite`
     /// feature and for which diesel implements `FromSql`/`ToSql<Timestamp,
     /// Sqlite>` targeting `NaiveDateTime`, so it compiles in a generated app.
     ///
-    /// `DateTime<Utc>`'s only working `SQLite` conversion is via diesel's
-    /// `TimestamptzSqlite` sql-type, which is exported *only* behind diesel's
-    /// `sqlite` feature — a feature the generated app's `MODEL_DEPS` do not
-    /// enable (they are Postgres-oriented). Emitting `TimestamptzSqlite` would
-    /// therefore fail to compile (unknown type), so `DateTime<Utc>` is rejected
-    /// at generate time (see [`FieldKind::sqlite_has_diesel_conversion`], issue
-    /// #1924) and its nominal `Timestamp` remapping here is documentation-only.
+    /// `DateTime<Utc>` maps to diesel's `TimestamptzSqlite` sql-type (issue
+    /// #1924). diesel implements `FromSql`/`ToSql<TimestamptzSqlite, Sqlite>`
+    /// for `DateTime<Utc>` under its `sqlite` + `chrono` features. A generated
+    /// `SQLite` app depends on `autumn-web` with the `sqlite` feature, which
+    /// pulls in `diesel/sqlite` (and `diesel/chrono`) by cargo feature
+    /// unification, so both `TimestamptzSqlite` and the conversion resolve — the
+    /// value round-trips as an RFC 3339 UTC string (`SQLite` `TEXT` affinity),
+    /// which sorts and compares chronologically.
     ///
-    /// Kinds whose rendered Rust type has NO working diesel `SQLite` conversion
-    /// in the generated app's feature set (`Uuid`, `Attachment`, `Decimal`,
-    /// `DateTime<Utc>`, `Enum`) still list a nominal remapping here for
-    /// documentation completeness, but they are rejected at generate time (see
-    /// [`FieldKind::sqlite_has_diesel_conversion`]) so this token never reaches
-    /// a generated `schema.rs`.
+    /// `Attachment` (`autumn_web::storage::Blob`) maps to `Text` and stores the
+    /// `Blob` metadata as its JSON body; `autumn-web` provides
+    /// `FromSql`/`ToSql<Text, Sqlite>` + `AsExpression`/`FromSqlRow<Text>` for
+    /// `Blob` under its `sqlite` feature (issue #1924).
+    ///
+    /// `Uuid`, `Decimal`, and `Enum` still list a nominal `Text` remapping here
+    /// for documentation completeness, but they are rejected at generate time
+    /// (see [`FieldKind::sqlite_has_diesel_conversion`]) — their Rust types are
+    /// foreign to `autumn-web`, so the orphan rule forbids adding the required
+    /// `Sqlite` conversions without a per-field `serialize_as`/`deserialize_as`
+    /// wrapper (tracked as follow-up work) — so this token never reaches a
+    /// generated `schema.rs`.
     #[must_use]
     #[allow(
         clippy::match_same_arms,
@@ -482,10 +489,10 @@ impl FieldKind {
             Self::F64 => "Float8",
             Self::Uuid => "Text",
             // `NaiveDateTime` -> core `Timestamp` (ungated, compiles).
-            // `DateTime<Utc>` -> nominal `Timestamp` for documentation only; it
-            // is rejected at generate time (its real SQLite conversion needs the
-            // feature-gated `TimestamptzSqlite`), so this token never emits.
-            Self::NaiveDateTime | Self::DateTime => "Timestamp",
+            Self::NaiveDateTime => "Timestamp",
+            // `DateTime<Utc>` -> `TimestamptzSqlite` (diesel's sqlite+chrono
+            // conversion, available via the app's `autumn-web` sqlite feature).
+            Self::DateTime => "TimestamptzSqlite",
             Self::Bytea => "Binary",
             Self::Attachment => "Text",
             Self::Decimal { .. } => "Text",
@@ -495,30 +502,34 @@ impl FieldKind {
     /// Whether this kind's rendered Rust model type has a working diesel
     /// `FromSql`/`ToSql` on diesel's `SQLite` backend in a generated app's
     /// feature set (diesel `sqlite` + `chrono`, without `uuid`/`numeric`) —
-    /// determined empirically (issue #1614 AC #4).
+    /// determined empirically (issue #1614 AC #4; conversions wired in #1924).
     ///
-    /// `Uuid` (`uuid::Uuid`), `Attachment` (`autumn_web::storage::Blob`, which
-    /// only implements `FromSql`/`ToSql<Jsonb, Pg>`), and `Decimal`
-    /// (`rust_decimal::Decimal`) have no such impl, so a generated `SQLite` app
-    /// using them would fail to compile. `DateTime<Utc>`'s only working `SQLite`
-    /// conversion goes through diesel's `TimestamptzSqlite` sql-type, which is
-    /// exported *only* behind diesel's `sqlite` feature — a feature the generated
-    /// app's Postgres-oriented `MODEL_DEPS` do not enable — so naming it in
-    /// `schema.rs` fails to compile too. `Enum` fields render an enum whose only
-    /// generated diesel conversion is `ToSql`/`FromSql<Text, diesel::pg::Pg>`
-    /// (see `render_enum_decl`), i.e. Postgres-only, with no `Text`/`Sqlite`
-    /// impl, so repository loads/inserts against a `SQLite` schema fail to
-    /// compile. Rather than emit uncompilable code, all of these kinds are
-    /// rejected at generate time; first-class `SQLite` support for them (backend-
-    /// aware app diesel features + `SQLite` enum impls) is tracked in issue #1924.
-    /// Every other kind — including `NaiveDateTime` via the core, ungated
-    /// `Timestamp` — compiles and is kept.
+    /// Now supported on `SQLite` (issue #1924):
+    /// - `NaiveDateTime` via the core, ungated `Timestamp` sql-type.
+    /// - `DateTime<Utc>` via diesel's `TimestamptzSqlite` sql-type — its
+    ///   `sqlite`+`chrono` conversion resolves through the app's `autumn-web`
+    ///   `sqlite` feature (RFC 3339 UTC text, chronologically sortable).
+    /// - `Attachment` (`autumn_web::storage::Blob`) — `autumn-web` provides
+    ///   `FromSql`/`ToSql<Text, Sqlite>` + `AsExpression`/`FromSqlRow<Text>` for
+    ///   `Blob` under its `sqlite` feature (`Blob` is a local type, so these
+    ///   impls are orphan-rule-legal), storing the metadata JSON as `TEXT`.
+    ///
+    /// Still rejected (their Rust types are foreign to `autumn-web`, so the
+    /// orphan rule forbids `autumn-web` from adding a `Sqlite` `FromSql`/`ToSql`
+    /// directly, and diesel/`rust_decimal`'s built-in impls are Postgres-only):
+    /// - `Uuid` (`uuid::Uuid`) and `Decimal` (`rust_decimal::Decimal`) — these
+    ///   need a per-field `serialize_as`/`deserialize_as` wrapper threaded
+    ///   through the `#[model]` macro (including nullable columns), tracked as
+    ///   follow-up work under issue #1924.
+    /// - `Enum` fields render an enum whose only generated diesel conversion is
+    ///   `ToSql`/`FromSql<Text, diesel::pg::Pg>` (see `render_enum_decl`), i.e.
+    ///   Postgres-only, with no `Text`/`Sqlite` impl.
+    ///
+    /// Rather than emit uncompilable code, the still-unsupported kinds are
+    /// rejected at generate time.
     #[must_use]
     pub const fn sqlite_has_diesel_conversion(self) -> bool {
-        !matches!(
-            self,
-            Self::Uuid | Self::Attachment | Self::Decimal { .. } | Self::DateTime | Self::Enum
-        )
+        !matches!(self, Self::Uuid | Self::Decimal { .. } | Self::Enum)
     }
 
     /// The diesel `table!` schema type token for the target `backend`
@@ -687,12 +698,12 @@ pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
     enum{a,b,…}, decimal{precision,scale}, Option<…>, :unique";
 
 /// The DSL field kinds that map to a working diesel `SQLite` conversion
-/// (issue #1614 AC #4) — the complement of the kinds
-/// [`FieldKind::sqlite_has_diesel_conversion`] rejects (`Uuid`, `Attachment`,
-/// `Decimal`, `DateTime<Utc>`, `Enum`). Used in the generate-time rejection
-/// message so the user knows which field kinds a `SQLite` app supports today.
+/// (issue #1614 AC #4; #1924) — the complement of the kinds
+/// [`FieldKind::sqlite_has_diesel_conversion`] rejects (`Uuid`, `Decimal`,
+/// `Enum`). Used in the generate-time rejection message so the user knows which
+/// field kinds a `SQLite` app supports today.
 pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, i32, i64, bool, f32, f64, \
-    NaiveDateTime, Vec<u8>, Bytea, references, Option<…>, :unique";
+    NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, Option<…>, :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -1762,17 +1773,15 @@ mod tests {
     }
 
     /// The diesel `schema.rs` types on the `SQLite` path must be types diesel's
-    /// `SQLite` backend implements — never `Timestamptz`, `Jsonb`, `Uuid`,
-    /// `Bytea`, or `Numeric`.
+    /// `SQLite` backend implements — never the Postgres-only `Timestamptz`,
+    /// `Jsonb`, `Uuid`, `Bytea`, or `Numeric`. `DateTime<Utc>` maps to the
+    /// SQLite-valid `TimestamptzSqlite` (issue #1924).
     #[test]
     fn sqlite_schema_type_avoids_postgres_only_diesel_types() {
         let cases = [
-            // `NaiveDateTime` maps to the core, ungated `Timestamp`. `DateTime`
-            // carries only a documentation-only nominal `Timestamp` remapping
-            // (its real SQLite conversion needs the feature-gated
-            // `TimestamptzSqlite`), and is rejected at generate time so this
-            // token never reaches a generated `schema.rs` (issue #1614 AC #4).
-            ("at:DateTime", "Timestamp"),
+            // `NaiveDateTime` maps to the core, ungated `Timestamp`; `DateTime`
+            // maps to diesel's SQLite `TimestamptzSqlite` (issue #1924).
+            ("at:DateTime", "TimestamptzSqlite"),
             ("naive:NaiveDateTime", "Timestamp"),
             ("token:Uuid", "Text"),
             // `Attachment` fields are auto-nullable, so `Field::schema_type_for`
@@ -1798,6 +1807,8 @@ mod tests {
             "Nullable<Text>"
         );
         // No SQLite schema type may be a Postgres-only diesel type.
+        // `TimestamptzSqlite` is deliberately NOT forbidden — it is a diesel
+        // *SQLite* sql-type (issue #1924), not a Postgres-only one.
         for token in [
             "at:DateTime",
             "token:Uuid",
@@ -1808,29 +1819,20 @@ mod tests {
                 .unwrap()
                 .schema_type_for(DatabaseBackend::Sqlite);
             assert!(
-                ![
-                    "Timestamptz",
-                    "TimestamptzSqlite",
-                    "Jsonb",
-                    "Uuid",
-                    "Bytea",
-                    "Numeric"
-                ]
-                .contains(&ty.as_str()),
-                "`{token}` -> `{ty}` must not be a Postgres-only or sqlite-feature-gated \
-                 diesel type on SQLite"
+                !["Timestamptz", "Jsonb", "Uuid", "Bytea", "Numeric"].contains(&ty.as_str()),
+                "`{token}` -> `{ty}` must not be a Postgres-only diesel type on SQLite"
             );
         }
     }
 
-    /// `Uuid`, `Attachment`, `Decimal`, `DateTime<Utc>`, and `Enum` lack a
-    /// working diesel `SQLite` conversion in a generated app's feature set
-    /// (issue #1614 AC #4): `DateTime<Utc>` would need the feature-gated
-    /// `TimestamptzSqlite`, and `Enum` renders only Postgres (`Pg`) `ToSql`/
-    /// `FromSql` impls. Every other kind — including `NaiveDateTime` via the
-    /// core, ungated `Timestamp` — compiles and is kept.
+    /// After issue #1924, `Uuid`, `Decimal`, and `Enum` are the only kinds still
+    /// lacking a working diesel `SQLite` conversion (their Rust types are
+    /// foreign to `autumn-web` with Postgres-only impls; `Enum` renders only
+    /// `Pg` `ToSql`/`FromSql`). `DateTime<Utc>` (via `TimestamptzSqlite`) and
+    /// `Attachment` (via `autumn-web`'s local `Blob` `Text`/`Sqlite` impls) now
+    /// round-trip, alongside `NaiveDateTime` (core `Timestamp`).
     #[test]
-    fn sqlite_has_diesel_conversion_rejects_uuid_attachment_decimal_datetime_enum() {
+    fn sqlite_has_diesel_conversion_rejects_only_uuid_decimal_enum() {
         for token in [
             "title:String",
             "body:Text",
@@ -1840,6 +1842,8 @@ mod tests {
             "ratio:f32",
             "amount:f64",
             "naive:NaiveDateTime",
+            "at:DateTime",
+            "cover:Attachment",
             "data:Bytea",
             "post:references",
         ] {
@@ -1853,9 +1857,7 @@ mod tests {
         }
         for token in [
             "token:Uuid",
-            "cover:Attachment",
             "price:decimal{10,2}",
-            "at:DateTime",
             "status:enum{draft,published}",
         ] {
             assert!(

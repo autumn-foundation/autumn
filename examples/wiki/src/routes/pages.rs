@@ -2,10 +2,11 @@ use autumn_web::extract::Path;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use scoped_futures::ScopedFutureExt;
 
 use crate::models::{NewPage, NewRevision, Page, Revision};
 use crate::repositories::{PageRepository, PgPageRepository};
-use crate::schema::revisions;
+use crate::schema::{pages, revisions};
 
 pub fn layout(title: &str, content: Markup) -> Markup {
     html! {
@@ -25,6 +26,7 @@ pub fn layout(title: &str, content: Markup) -> Markup {
                         a href=(paths::list()) class="text-xl font-bold" { "Wiki" }
                         div class="space-x-4 text-sm" {
                             a href=(paths::new_form()) class="opacity-75 hover:opacity-100" { "+ New Page" }
+                            a href="/collections" class="opacity-75 hover:opacity-100" { "Collections" }
                             a href="/actuator/health" class="opacity-75 hover:opacity-100" { "Health" }
                         }
                     }
@@ -406,13 +408,21 @@ pub async fn update(
     Ok(Redirect::to(&paths::show(updated.slug)))
 }
 
-/// `POST /pages/{slug}/transitions/status` — apply a state-machine transition.
+/// `POST /pages/{slug}/transitions/status` — apply a state-machine transition
+/// with its **transition effect** (docs/guide/transition-effects.md).
 ///
 /// The `transition_controls` widget on the show page posts the target state
-/// under the field name (`status`). Enforcement is the macro-generated
-/// `Page::transition_status_to`, which returns a 400 for an undefined edge or a
-/// rejected `can_publish` guard — surfaced here by `?`, matching the wiki's
-/// error-propagation convention (no Flash layer is configured).
+/// under the field name (`status`). Rather than the pure `transition_status_to`
+/// validator plus a separate revision insert, this drives the effectful
+/// `transition_status_to_on_conn` inside one transaction: it validates the edge
+/// and `can_publish` guard, fires the edge's synchronous `on` effect (which
+/// writes the audit `Revision`), and we then persist the returned status on the
+/// same connection — so the state change and its audit row commit or roll back
+/// atomically. An illegal edge / rejected guard / effect `Err` becomes a 400 (or
+/// rolls the transaction back), surfaced by `?` per the wiki's convention.
+///
+/// `Db::tx_with` hands the effect the `AsyncPgConnection` its `on` methods
+/// expect (`Db::tx` yields a different pooled connection type).
 #[post("/pages/{slug}/transitions/status")]
 pub async fn transition_status(
     Path(slug): Path<String>,
@@ -421,37 +431,34 @@ pub async fn transition_status(
     form: Form<TransitionForm>,
 ) -> AutumnResult<Redirect> {
     let page = find_page_by_slug(&repo, &slug).await?;
+    let target = form.0.status;
+    let page_id = page.id;
+    let redirect_slug = page.slug.clone();
 
-    // The state machine is the single source of truth: illegal edges and
-    // guard rejections become a 400 here.
-    let new_status = page.transition_status_to(&form.0.status)?;
+    db.tx_with(TxOptions::default(), move |conn| {
+        let page = page.clone();
+        let target = target.clone();
+        async move {
+            // Validates the edge + guard and runs the `on` effect (the audit
+            // Revision write) on `conn`.
+            let new_status = page.transition_status_to_on_conn(conn, &target).await?;
+            // Persist the new state on the same connection so it commits with
+            // the effect's audit row.
+            diesel::update(pages::table.find(page_id))
+                .set((
+                    pages::status.eq(&new_status),
+                    pages::lock_version.eq(pages::lock_version + 1),
+                    pages::updated_at.eq(diesel::dsl::now),
+                ))
+                .execute(conn)
+                .await?;
+            Ok::<(), AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
 
-    let update = crate::models::UpdatePage {
-        title: Patch::Unchanged,
-        slug: Patch::Unchanged,
-        body: Patch::Unchanged,
-        status: Patch::Set(new_status),
-        lock_version: page.lock_version,
-    };
-    let updated = repo.update(page.id, &update).await?;
-
-    let summary =
-        generate_update_summary(&page.status, &updated.status, &page.title, &updated.title);
-
-    diesel::insert_into(revisions::table)
-        .values(&NewRevision {
-            page_id: updated.id,
-            op: "update".into(),
-            title: updated.title.clone(),
-            body: updated.body.clone(),
-            status: updated.status.clone(),
-            changed_by: None,
-            summary,
-        })
-        .execute(&mut *db)
-        .await?;
-
-    Ok(Redirect::to(&paths::show(updated.slug)))
+    Ok(Redirect::to(&paths::show(redirect_slug)))
 }
 
 #[get("/pages/{slug}/history")]

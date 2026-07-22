@@ -120,7 +120,7 @@ pub mod tests {
         fn list(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _params: ListParams,
         ) -> AdminFuture<'_, ListResult> {
@@ -136,7 +136,7 @@ pub mod tests {
         fn get(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
         ) -> AdminFuture<'_, Option<Value>> {
@@ -145,7 +145,7 @@ pub mod tests {
         fn create(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             data: Value,
         ) -> AdminFuture<'_, Value> {
@@ -154,7 +154,7 @@ pub mod tests {
         fn update(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
             data: Value,
@@ -164,7 +164,7 @@ pub mod tests {
         fn delete(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
         ) -> AdminFuture<'_, ()> {

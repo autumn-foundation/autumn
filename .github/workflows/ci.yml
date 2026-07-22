@@ -341,7 +341,7 @@ jobs:
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
         # sqlite_transactional_url_pool) and is additive/harmless for the rest.
         run: |
-          cargo test -p autumn-web --features "sqlite,test-support" \
+          cargo test -p autumn-web --features "sqlite,test-support,storage" \
             --test sqlite_boot_serve \
             --test sqlite_migrations \
             --test sqlite_foreign_keys \
@@ -356,9 +356,13 @@ jobs:
             --test sqlite_immediate_transaction \
             --test sqlite_statement_timeout_fail_closed \
             --test sqlite_crud_basic \
+            --test sqlite_field_conversions \
             --test sqlite_upsert_isolation \
             --test sqlite_dependent_destroy \
-            --test sqlite_commit_hook_worker
+            --test sqlite_commit_hook_worker \
+            --test sqlite_jobs_scheduler_e2e
+            --test sim_sqlite_substrate \
+            --test sim_sqlite_integration
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings

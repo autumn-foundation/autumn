@@ -11,4 +11,16 @@ use crate::schema::bookmarks;
 pub trait BookmarkRepository {
     fn find_by_tag(tag: String) -> Vec<Bookmark>;
     fn find_by_alive(alive: bool) -> Vec<Bookmark>;
+
+    // ── Grouped aggregate roll-ups (issue #1364), powering `GET /stats` ──────
+    //
+    // Each `*_grouped_by_*` method becomes an inherent method on the generated
+    // `PgBookmarkRepository` returning a lazy `GroupedAggregate` builder; nothing
+    // runs until `.load()`. See `docs/guide/aggregates.md`.
+
+    /// `COUNT(*) GROUP BY tag` → one `(tag, count)` pair per distinct tag.
+    fn count_grouped_by_tag() -> Vec<(String, i64)>;
+    /// `COUNT(*) GROUP BY created_at` → the raw per-timestamp counts, bucketed
+    /// into a daily time series by the `/stats` route via `.bucket(DateBucket::Day)`.
+    fn count_grouped_by_created_at() -> Vec<(chrono::NaiveDateTime, i64)>;
 }
