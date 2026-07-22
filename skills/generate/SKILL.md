@@ -86,20 +86,18 @@ by hand in the generated migration's `up.sql`. On trunk-dev, use `:unique` /
 **SQLite backend (trunk-dev, #1614)**: the generator auto-detects the target
 backend from the resolved database URL (`sqlite://…` in config / env / dotenv →
 SQLite, else Postgres) and emits SQLite-appropriate DDL (e.g. `TEXT` for
-`Decimal`, `TEXT PRIMARY KEY` remaps). **(trunk-dev, #1924)** `DateTime`
-(`DateTime<Utc>`, stored as an RFC 3339 UTC string via diesel's
-`TimestamptzSqlite`, chronologically sortable) and `Attachment`
-(`autumn_web::storage::Blob`, stored as its metadata JSON in a `TEXT` column)
-now compile and round-trip on SQLite — alongside `NaiveDateTime` (core
-`Timestamp`) — so they are accepted at generate time. The field kinds still
-**rejected at generate time** (with an actionable error) on SQLite are `Uuid`,
-`Decimal`, and `enum{…}`: their Rust types (`uuid::Uuid`,
-`rust_decimal::Decimal`, the generated enum) are foreign to autumn-web (the
-orphan rule blocks adding a SQLite `FromSql`/`ToSql` directly) and diesel /
-`rust_decimal` implement only Postgres-side conversions, so a generated SQLite
-app using them would not compile. `--searchable`, UUID primary keys,
-`--sharded`, and `generate auth` are likewise Postgres-only. Wrapper-based
-SQLite support for the remaining rejected kinds is tracked in #1924.
+`Decimal`, `TEXT PRIMARY KEY`/`Timestamp` remaps). `generate auth` and `generate
+mailer --list-unsubscribe` are backend-aware too (#1927): on a SQLite app they
+scaffold SQLite-dialect migrations (`INTEGER PRIMARY KEY AUTOINCREMENT`,
+`DEFAULT CURRENT_TIMESTAMP`, `INTEGER` foreign keys) instead of being rejected,
+and the generated auth session store is typed against
+`::autumn_web::RuntimeConnection` so it compiles on either backend (#1908). Field
+kinds with no working diesel SQLite conversion in the generated app's feature
+set — `Uuid`, `Attachment`, `Decimal`, `DateTime` (`DateTime<Utc>`), and
+`enum{…}` — are still **rejected at generate time** (with an actionable error)
+rather than emitting uncompilable code; `--searchable`, UUID primary keys, and
+`--sharded` likewise remain Postgres-only. First-class SQLite support for the
+rejected kinds is tracked in #1924.
 
 **Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
 build a `Changeset` and, on a rejected submission, respond **422** and
