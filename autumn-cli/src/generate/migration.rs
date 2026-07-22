@@ -844,9 +844,10 @@ pub struct Post {
         });
     }
 
-    /// A `SQLite` `Add…To…` / `Remove…From…` migration rejects field kinds with
-    /// no working diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`) at
-    /// generate time, citing #1924 (issue #1614 AC #4).
+    /// A `SQLite` `Add…To…` / `Remove…From…` migration rejects field kinds that
+    /// still have no working diesel `SQLite` conversion (`Uuid`, `Decimal`,
+    /// `Enum`) at generate time, citing #1924 (issue #1614 AC #4). `DateTime` and
+    /// `Attachment` are accepted as of #1924 (see the `dsl`/`model` tests).
     #[test]
     fn column_migrations_on_sqlite_reject_unsupported_field_kinds_citing_1924() {
         with_no_db_env(|| {

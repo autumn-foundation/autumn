@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli/generate:** `autumn generate auth` and `autumn generate mailer
+  --list-unsubscribe` are now **backend-aware on SQLite** (#1927). On a SQLite
+  app they scaffold SQLite-dialect migrations — `INTEGER PRIMARY KEY
+  AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`, and `INTEGER` foreign keys, across
+  the users/sessions/remember-token tables and the optional `--totp`,
+  `--magic-link`, `--oauth`, `--passkeys`, and `mail_unsubscribes` tables —
+  instead of being rejected at generate time. Postgres output is byte-for-byte
+  unchanged.
+- **cli/generate:** the generated `autumn generate auth` **DB-backed session
+  store now works on SQLite** (#1908): its connection pools are typed against
+  `::autumn_web::RuntimeConnection` (resolving to `AsyncPgConnection` by default
+  and the SQLite connection under the `sqlite` feature) rather than a hard-coded
+  `diesel_async::AsyncPgConnection`, so the generated app compiles on whichever
+  backend it selected.
+- **generate/sqlite:** `DateTime<Utc>` and `Attachment` model fields now compile
+  and round-trip on the SQLite backend, reaching Postgres parity (#1924). A
+  `DateTime<Utc>` column maps to diesel's `TimestamptzSqlite` sql-type, stored as
+  an RFC 3339 UTC string (SQLite `TEXT` affinity) that sorts and compares
+  chronologically; an `Attachment` (`autumn_web::storage::Blob`) column stores
+  its metadata JSON in a `TEXT` column via new local `FromSql`/`ToSql<Text,
+  Sqlite>` impls on `Blob`. Both kinds are now accepted by `generate model` /
+  `generate scaffold` / column migrations on a SQLite app instead of being
+  rejected at generate time. `Uuid` and `Decimal` remain rejected on SQLite
+  (their `uuid::Uuid` / `rust_decimal::Decimal` types are foreign to autumn-web,
+  so the orphan rule blocks a direct SQLite conversion, and diesel /
+  `rust_decimal` provide only Postgres-side impls) — a wrapper-based follow-up
+  tracked under #1924.
 - **docs:** a **feeds** guide (`docs/guide/feeds.md`) documenting Atom/RSS feed
   generation, cross-linking the runnable `examples/blog` `/feed.xml` route
   (#2099). [no-plugin]
