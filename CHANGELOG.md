@@ -35,6 +35,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockstep; and `Sim::run_to_idle()` cooperatively drains ready jobs and
   timer-woken work to quiescence. A job whose retry backs off 24h now fires in
   virtual time with zero wall-clock sleep. [no-plugin]
+- **sim-testing:** wire the W4 `SQLite` sim DB lane through the W2 `Sim` API
+  end-to-end (#1797). A new standalone integration test (`sim_sqlite_integration`)
+  attaches a fresh, migrated, in-process in-memory `SqliteSubstrate` pool to a
+  `TestApp` via `TestApp::with_db`, mounts it through the real public
+  `Sim::build(app)`, and drives a 24h-backoff `#[job]` to completion purely via
+  `Sim::advance` + `Sim::run_to_idle` — no `perform_enqueued_jobs`, no wall-clock
+  sleep — then reads back (with real SQL) the row the job's successful retry wrote,
+  proving the W2 virtual-clock drain runs against the W4 substrate over the
+  representative in-process scheduler + local job-runtime paths. Additive: no
+  changes to the `Sim`/`SimApp`/`SqliteSubstrate` public surface. `SqliteSubstrate`
+  now applies the framework's `SQLite` repository-commit-hook migration set itself
+  (before any caller migrations), so the `autumn_repository_commit_hooks`
+  control-plane table always exists and `Sim::run_to_idle` no longer panics with
+  "no such table" when draining an app mounted on a bare substrate — this test
+  therefore registers only its own app migration, with no copied framework-DDL
+  fixture to drift. [no-plugin]
 
 - **dev:** add `scripts/pre-push-check.sh`, a pre-push gate that mirrors CI's
   `lint` + `test` jobs (`cargo fmt --all -- --check`, `cargo clippy --workspace
