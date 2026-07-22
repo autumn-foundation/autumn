@@ -206,7 +206,9 @@ mod signed_webhooks;
 mod sim_advance_to;
 mod sim_clock_drain;
 mod sim_deterministic_ids;
+mod sim_job_clock;
 mod sim_rate_limit_clock;
+mod sim_strict_wall_clock;
 mod sim_test_smoke;
 #[cfg(feature = "ws")]
 mod sse_replay;

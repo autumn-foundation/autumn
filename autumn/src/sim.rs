@@ -76,6 +76,18 @@ use crate::time::TickingClock;
 #[doc(hidden)]
 pub mod substrate;
 
+// The W6 semantic core (issue #1797): the `always!` / `sometimes!` assertion
+// macros and the thread-local non-vacuity registry. Public (documented) module —
+// the macros are `#[macro_export]`ed at the crate root (`autumn_web::always` /
+// `autumn_web::sometimes`), and their hidden plumbing plus the sweep-facing
+// registry API live here.
+pub mod assert;
+
+pub use assert::{
+    SometimesRegistry, assert_all_sometimes_satisfied, reset_sometimes_registry,
+    sometimes_snapshot, sometimes_unsatisfied,
+};
+
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.
 ///
@@ -118,6 +130,16 @@ pub struct Sim {
     /// Built [`crate::test::TestClient`] handle, mounted by [`Sim::build`] on
     /// the paused runtime with the virtual clock installed.
     app: SimApp,
+
+    /// Real wall-clock budget for the `strict_wall_clock` real-time leak guard,
+    /// or `None` (the default) when the guard is off. Set once via
+    /// [`strict_wall_clock`](Sim::strict_wall_clock) /
+    /// [`strict_wall_clock_budget`](Sim::strict_wall_clock_budget) *before* the
+    /// run and only **read** by [`advance`](Sim::advance) /
+    /// [`run_to_idle`](Sim::run_to_idle), so it is a plain `Option` with no
+    /// interior mutability — that keeps `Sim: Sync` and the `&self`
+    /// advance/drain futures `Send` (a `Cell`/`RefCell` field would break both).
+    strict_budget: Option<std::time::Duration>,
 }
 
 impl Sim {
@@ -129,6 +151,10 @@ impl Sim {
     /// arrives in W2 via [`SimApp`].
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
+        // Each seed run starts with a clean reachability registry, so the sweep
+        // can attribute observed/satisfied `sometimes!` labels to exactly one
+        // seed before folding them into its cross-seed aggregate (W6, #1797).
+        assert::reset_sometimes_registry();
         let epoch = Utc
             .timestamp_opt(SIM_EPOCH_UNIX_SECS, 0)
             .single()
@@ -139,6 +165,7 @@ impl Sim {
             clock: SimClock::new(TickingClock::starting_at(epoch)),
             chaos: Chaos::default(),
             app: SimApp::default(),
+            strict_budget: None,
         }
     }
 
@@ -226,6 +253,110 @@ impl Sim {
         self.app.try_client()
     }
 
+    /// Enable the **real-time leak guard** (`strict_wall_clock`) with the
+    /// default budget, panicking if a paused-sim step burns more than that much
+    /// *real* wall-clock time.
+    ///
+    /// # What this guards (and what it deliberately does not)
+    ///
+    /// A paused sim runs on tokio's virtual timer: a
+    /// [`tokio::time::sleep`](https://docs.rs/tokio) / job backoff / delayed
+    /// enqueue consumes **zero** real time and only advances when
+    /// [`advance`](Sim::advance) steps the clock. The one thing that breaks that
+    /// invariant is code that escapes the virtual timer and blocks the real
+    /// thread — a `std::thread::sleep`, a `spawn_blocking`, or a blocking
+    /// syscall. This guard catches the **observable consequence** of that: real
+    /// wall-clock time leaking into a step that should have taken virtually none.
+    ///
+    /// It is **not** off-seam-read detection. It cannot tell you that some code
+    /// read `Utc::now()` / `Instant::now()` directly instead of through the
+    /// injected clock — a free-function `now()` call has no runtime interception
+    /// point in safe Rust, so its *absence* is not observable at runtime. Finding
+    /// those reads is a static-analysis (deny-lint) job; this guard is the
+    /// complementary runtime backstop for the worst pattern (a real blocking
+    /// sleep). Enabling it does not slow a legitimate virtual advance: jumping a
+    /// day of virtual time still costs microseconds of real time, well under
+    /// budget.
+    ///
+    /// # Budget & the `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` override
+    ///
+    /// The default budget is deliberately generous (100 ms) so ordinary CI
+    /// scheduling jitter never trips it — the target is a *real* sleep (seconds),
+    /// not sub-millisecond noise. Set the environment variable
+    /// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` (whole milliseconds) to override
+    /// the budget globally for a run; a blank or unparseable value is ignored and
+    /// the default (or the value passed to
+    /// [`strict_wall_clock_budget`](Sim::strict_wall_clock_budget)) applies. This
+    /// mirrors the `AUTUMN_SIM_SEED` idiom, so a too-tight budget on a slow
+    /// runner can be loosened without editing test code.
+    ///
+    /// The guard is read-only during the run: enable it (chainably) *before* the
+    /// first [`advance`](Sim::advance) / [`run_to_idle`](Sim::run_to_idle).
+    ///
+    /// ```rust,ignore
+    /// let mut sim = Sim::from_seed(0);
+    /// sim.strict_wall_clock();
+    /// sim.build(TestApp::new());
+    /// sim.advance(std::time::Duration::from_secs(24 * 3600)).await; // virtual, cheap
+    /// sim.run_to_idle().await;
+    /// ```
+    pub fn strict_wall_clock(&mut self) -> &mut Self {
+        self.strict_budget = Some(strict_budget_from_env_or(DEFAULT_STRICT_WALL_CLOCK_BUDGET));
+        self
+    }
+
+    /// Enable the real-time leak guard with an explicit `budget`.
+    ///
+    /// Identical to [`strict_wall_clock`](Sim::strict_wall_clock) but starts from
+    /// `budget` instead of the 100 ms default. The
+    /// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment variable still
+    /// overrides `budget` when it holds a valid whole-millisecond value (so CI
+    /// can loosen the guard globally); a blank/unparseable value leaves `budget`
+    /// in effect. See [`strict_wall_clock`](Sim::strict_wall_clock) for what the
+    /// guard does and does not catch.
+    ///
+    /// ```rust,ignore
+    /// let mut sim = Sim::from_seed(0);
+    /// sim.strict_wall_clock_budget(std::time::Duration::from_millis(5));
+    /// ```
+    pub fn strict_wall_clock_budget(&mut self, budget: std::time::Duration) -> &mut Self {
+        self.strict_budget = Some(strict_budget_from_env_or(budget));
+        self
+    }
+
+    /// Sample a real [`std::time::Instant`] at the start of a guarded step, or
+    /// `None` when the leak guard is off. Held across the step's `.await`s (an
+    /// `Instant` is `Send + Sync`, so the guarded `&self` futures stay `Send`).
+    fn wall_clock_guard_start(&self) -> Option<std::time::Instant> {
+        self.strict_budget.map(|_| std::time::Instant::now())
+    }
+
+    /// Enforce the real-time leak guard at the end of a step: panic if more than
+    /// the configured budget of *real* wall-clock time elapsed since `start`.
+    ///
+    /// A no-op when the guard is off (`start` / `strict_budget` are `None`). The
+    /// panic flows up through the [`#[sim_test]`](crate::sim_test) macro's
+    /// `catch_unwind`, so the `AUTUMN_SIM_SEED=…` replay line still prints.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the leak guard is enabled and real elapsed time exceeds the
+    /// budget (see [`strict_wall_clock`](Sim::strict_wall_clock)).
+    fn enforce_wall_clock_budget(&self, start: Option<std::time::Instant>) {
+        if let (Some(budget), Some(start)) = (self.strict_budget, start) {
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed <= budget,
+                "Sim::strict_wall_clock real-time leak guard tripped: {elapsed:?} of real \
+                 wall-clock time elapsed inside a paused-sim step, exceeding the {budget:?} \
+                 budget. This means real time leaked into the virtual timeline — usually a real \
+                 `std::thread::sleep`, blocking I/O, or `spawn_blocking` that escaped tokio's \
+                 paused timer. If this is CI scheduling jitter rather than a genuine leak, raise \
+                 the budget via the AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS environment variable."
+            );
+        }
+    }
+
     /// Advance virtual time by `duration`, stepping the injected wall clock and
     /// tokio's paused timer wheel **together**.
     ///
@@ -240,12 +371,18 @@ impl Sim {
     /// Pair with [`run_to_idle`](Sim::run_to_idle) to then drain the work the
     /// fired timers enqueued.
     pub async fn advance(&self, duration: std::time::Duration) {
+        // Real-time leak guard (no-op unless `strict_wall_clock` is enabled):
+        // sample a REAL instant (not tokio's paused time) at entry and check the
+        // real elapsed against the budget before returning. `advance_to` routes
+        // through here, so it inherits the guard for free.
+        let guard_start = self.wall_clock_guard_start();
         // Step the framework clock first so any task woken by the tokio timer
         // that reads the clock observes the already-advanced instant.
         self.clock.advance(duration);
         // Advance tokio's paused timer wheel; this fires due timers and yields
         // so their tasks are polled before returning.
         tokio::time::advance(duration).await;
+        self.enforce_wall_clock_budget(guard_start);
     }
 
     /// Advance virtual time **to** a specific zoned instant, resolving the
@@ -400,6 +537,11 @@ impl Sim {
     /// [`advance`](Sim::advance) to the next interesting instant, then
     /// `run_to_idle` to settle the work it released.
     pub async fn run_to_idle(&self) {
+        // Real-time leak guard (no-op unless `strict_wall_clock` is enabled):
+        // sample a REAL instant at entry and enforce the budget before
+        // returning, catching a real blocking sleep in a drained task.
+        let guard_start = self.wall_clock_guard_start();
+
         // Resolve the mounted app's DB pool once (a cheap, cloned Arc-backed
         // handle). Durable repository commit hooks are rows, so there is
         // nothing to drain when the app was built without a database (e.g. the
@@ -438,6 +580,8 @@ impl Sim {
                     crate::test::drain_ready_repository_commit_hooks(pool, MAX_DRAIN_STEPS).await;
             }
         }
+
+        self.enforce_wall_clock_budget(guard_start);
     }
 }
 
@@ -446,6 +590,45 @@ impl Sim {
 /// Generous relative to the handful of hops a job takes from the queue through
 /// its handler to completion under the single-threaded paused runtime.
 const MAX_DRAIN_STEPS: usize = 1024;
+
+/// Default real wall-clock budget for the `strict_wall_clock` leak guard
+/// ([`Sim::strict_wall_clock`]).
+///
+/// Deliberately generous (100 ms): the guard exists to catch a *real* blocking
+/// sleep escaping the virtual timer (seconds of wall time), so the budget must
+/// sit far above ordinary current-thread scheduling jitter to avoid false
+/// positives on a slow/contended CI runner. A legitimate virtual advance — even
+/// jumping a day of virtual time — costs microseconds of real time, orders of
+/// magnitude under this.
+const DEFAULT_STRICT_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Resolve the effective `strict_wall_clock` budget: the
+/// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment override when it holds a
+/// valid whole-millisecond value, otherwise `default`.
+///
+/// Mirrors the [`__seed_from_env`] / [`parse_seed`] idiom so a too-tight budget
+/// on a slow runner can be loosened globally without editing test code; a blank
+/// or unparseable value falls back to `default`.
+fn strict_budget_from_env_or(default: std::time::Duration) -> std::time::Duration {
+    std::env::var("AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS")
+        .ok()
+        .and_then(|raw| parse_strict_budget_ms(&raw))
+        .unwrap_or(default)
+}
+
+/// Parse a whole-millisecond budget string into a [`std::time::Duration`],
+/// returning `None` for empty/whitespace-only or unparseable input (so the
+/// caller can fall back to the configured default).
+fn parse_strict_budget_ms(raw: &str) -> Option<std::time::Duration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_millis)
+}
 
 /// The forward-only step [`Sim::advance_to`] resolves a target instant into.
 ///
@@ -718,7 +901,8 @@ pub fn __replay_line(seed: u64, pkg: &str, test: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        __replay_line, AdvancePlan, Sim, parse_seed, plan_advance_to, resolve_local_to_utc,
+        __replay_line, AdvancePlan, DEFAULT_STRICT_WALL_CLOCK_BUDGET, Sim, parse_seed,
+        parse_strict_budget_ms, plan_advance_to, resolve_local_to_utc, strict_budget_from_env_or,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use rand::RngCore;
@@ -792,6 +976,53 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2020, 1, 1, 1, 0, 0).unwrap();
         let target = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let _ = plan_advance_to(now, target);
+    }
+
+    #[test]
+    fn parse_strict_budget_ms_covers_valid_and_garbage() {
+        use std::time::Duration;
+        assert_eq!(
+            parse_strict_budget_ms("100"),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            parse_strict_budget_ms("  250  "),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(parse_strict_budget_ms("0"), Some(Duration::ZERO));
+        assert_eq!(parse_strict_budget_ms(""), None);
+        assert_eq!(parse_strict_budget_ms("   "), None);
+        assert_eq!(parse_strict_budget_ms("garbage"), None);
+        assert_eq!(parse_strict_budget_ms("-5"), None);
+        assert_eq!(parse_strict_budget_ms("1.5"), None);
+    }
+
+    #[test]
+    fn strict_budget_from_env_falls_back_to_default_when_unset() {
+        // The env var is not set in this unit-test process, so the default is
+        // returned verbatim (the override path is exercised via the public
+        // integration tests, which never set the var).
+        let default = std::time::Duration::from_millis(7);
+        assert_eq!(strict_budget_from_env_or(default), default);
+        assert_eq!(
+            strict_budget_from_env_or(DEFAULT_STRICT_WALL_CLOCK_BUDGET),
+            DEFAULT_STRICT_WALL_CLOCK_BUDGET
+        );
+    }
+
+    #[test]
+    fn strict_wall_clock_builders_set_the_budget() {
+        let mut sim = Sim::from_seed(0);
+        assert!(sim.strict_budget.is_none(), "guard is off by default");
+        sim.strict_wall_clock();
+        assert_eq!(sim.strict_budget, Some(DEFAULT_STRICT_WALL_CLOCK_BUDGET));
+
+        let mut custom = Sim::from_seed(0);
+        custom.strict_wall_clock_budget(std::time::Duration::from_millis(5));
+        assert_eq!(
+            custom.strict_budget,
+            Some(std::time::Duration::from_millis(5))
+        );
     }
 
     #[test]
