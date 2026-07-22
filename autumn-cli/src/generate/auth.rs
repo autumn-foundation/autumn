@@ -1159,6 +1159,10 @@ fn plan_auth_options_impl(
         for_revert,
     )?;
 
+    // Determine the target app's database backend so the scaffolded migrations
+    // emit backend-aware DDL (issue #1927), matching the base auth plan above.
+    let backend = super::detect_backend(project_root);
+
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let user_table = pluralize(&snake_name);
@@ -11195,9 +11199,7 @@ mod tests {
         for magic_link in [false, true] {
             let routes = render_routes_file("User", "user", "users", &[], false, magic_link);
             assert!(
-                routes.contains(
-                    "deadpool::Pool<::autumn_web::RuntimeConnection>"
-                ),
+                routes.contains("deadpool::Pool<::autumn_web::RuntimeConnection>"),
                 "session pool must be typed against RuntimeConnection (magic_link={magic_link}): {routes}"
             );
             assert!(
