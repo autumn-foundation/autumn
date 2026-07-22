@@ -56,7 +56,7 @@
 
 use std::sync::Arc;
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use uuid::Uuid;
@@ -84,6 +84,18 @@ pub mod substrate;
 pub mod chaos;
 
 pub use chaos::{Chaos, ChaosEvent, ChaosHook};
+
+// The W6 semantic core (issue #1797): the `always!` / `sometimes!` assertion
+// macros and the thread-local non-vacuity registry. Public (documented) module —
+// the macros are `#[macro_export]`ed at the crate root (`autumn_web::always` /
+// `autumn_web::sometimes`), and their hidden plumbing plus the sweep-facing
+// registry API live here.
+pub mod assert;
+
+pub use assert::{
+    SometimesRegistry, assert_all_sometimes_satisfied, reset_sometimes_registry,
+    sometimes_snapshot, sometimes_unsatisfied,
+};
 
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.
@@ -132,6 +144,16 @@ pub struct Sim {
     /// Built [`crate::test::TestClient`] handle, mounted by [`Sim::build`] on
     /// the paused runtime with the virtual clock installed.
     app: SimApp,
+
+    /// Real wall-clock budget for the `strict_wall_clock` real-time leak guard,
+    /// or `None` (the default) when the guard is off. Set once via
+    /// [`strict_wall_clock`](Sim::strict_wall_clock) /
+    /// [`strict_wall_clock_budget`](Sim::strict_wall_clock_budget) *before* the
+    /// run and only **read** by [`advance`](Sim::advance) /
+    /// [`run_to_idle`](Sim::run_to_idle), so it is a plain `Option` with no
+    /// interior mutability — that keeps `Sim: Sync` and the `&self`
+    /// advance/drain futures `Send` (a `Cell`/`RefCell` field would break both).
+    strict_budget: Option<std::time::Duration>,
 }
 
 impl Sim {
@@ -143,6 +165,10 @@ impl Sim {
     /// arrives in W2 via [`SimApp`].
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
+        // Each seed run starts with a clean reachability registry, so the sweep
+        // can attribute observed/satisfied `sometimes!` labels to exactly one
+        // seed before folding them into its cross-seed aggregate (W6, #1797).
+        assert::reset_sometimes_registry();
         let epoch = Utc
             .timestamp_opt(SIM_EPOCH_UNIX_SECS, 0)
             .single()
@@ -154,6 +180,7 @@ impl Sim {
             chaos: Chaos::default(),
             chaos_state: None,
             app: SimApp::default(),
+            strict_budget: None,
         }
     }
 
@@ -287,6 +314,110 @@ impl Sim {
         self.app.try_client()
     }
 
+    /// Enable the **real-time leak guard** (`strict_wall_clock`) with the
+    /// default budget, panicking if a paused-sim step burns more than that much
+    /// *real* wall-clock time.
+    ///
+    /// # What this guards (and what it deliberately does not)
+    ///
+    /// A paused sim runs on tokio's virtual timer: a
+    /// [`tokio::time::sleep`](https://docs.rs/tokio) / job backoff / delayed
+    /// enqueue consumes **zero** real time and only advances when
+    /// [`advance`](Sim::advance) steps the clock. The one thing that breaks that
+    /// invariant is code that escapes the virtual timer and blocks the real
+    /// thread — a `std::thread::sleep`, a `spawn_blocking`, or a blocking
+    /// syscall. This guard catches the **observable consequence** of that: real
+    /// wall-clock time leaking into a step that should have taken virtually none.
+    ///
+    /// It is **not** off-seam-read detection. It cannot tell you that some code
+    /// read `Utc::now()` / `Instant::now()` directly instead of through the
+    /// injected clock — a free-function `now()` call has no runtime interception
+    /// point in safe Rust, so its *absence* is not observable at runtime. Finding
+    /// those reads is a static-analysis (deny-lint) job; this guard is the
+    /// complementary runtime backstop for the worst pattern (a real blocking
+    /// sleep). Enabling it does not slow a legitimate virtual advance: jumping a
+    /// day of virtual time still costs microseconds of real time, well under
+    /// budget.
+    ///
+    /// # Budget & the `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` override
+    ///
+    /// The default budget is deliberately generous (100 ms) so ordinary CI
+    /// scheduling jitter never trips it — the target is a *real* sleep (seconds),
+    /// not sub-millisecond noise. Set the environment variable
+    /// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` (whole milliseconds) to override
+    /// the budget globally for a run; a blank or unparseable value is ignored and
+    /// the default (or the value passed to
+    /// [`strict_wall_clock_budget`](Sim::strict_wall_clock_budget)) applies. This
+    /// mirrors the `AUTUMN_SIM_SEED` idiom, so a too-tight budget on a slow
+    /// runner can be loosened without editing test code.
+    ///
+    /// The guard is read-only during the run: enable it (chainably) *before* the
+    /// first [`advance`](Sim::advance) / [`run_to_idle`](Sim::run_to_idle).
+    ///
+    /// ```rust,ignore
+    /// let mut sim = Sim::from_seed(0);
+    /// sim.strict_wall_clock();
+    /// sim.build(TestApp::new());
+    /// sim.advance(std::time::Duration::from_secs(24 * 3600)).await; // virtual, cheap
+    /// sim.run_to_idle().await;
+    /// ```
+    pub fn strict_wall_clock(&mut self) -> &mut Self {
+        self.strict_budget = Some(strict_budget_from_env_or(DEFAULT_STRICT_WALL_CLOCK_BUDGET));
+        self
+    }
+
+    /// Enable the real-time leak guard with an explicit `budget`.
+    ///
+    /// Identical to [`strict_wall_clock`](Sim::strict_wall_clock) but starts from
+    /// `budget` instead of the 100 ms default. The
+    /// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment variable still
+    /// overrides `budget` when it holds a valid whole-millisecond value (so CI
+    /// can loosen the guard globally); a blank/unparseable value leaves `budget`
+    /// in effect. See [`strict_wall_clock`](Sim::strict_wall_clock) for what the
+    /// guard does and does not catch.
+    ///
+    /// ```rust,ignore
+    /// let mut sim = Sim::from_seed(0);
+    /// sim.strict_wall_clock_budget(std::time::Duration::from_millis(5));
+    /// ```
+    pub fn strict_wall_clock_budget(&mut self, budget: std::time::Duration) -> &mut Self {
+        self.strict_budget = Some(strict_budget_from_env_or(budget));
+        self
+    }
+
+    /// Sample a real [`std::time::Instant`] at the start of a guarded step, or
+    /// `None` when the leak guard is off. Held across the step's `.await`s (an
+    /// `Instant` is `Send + Sync`, so the guarded `&self` futures stay `Send`).
+    fn wall_clock_guard_start(&self) -> Option<std::time::Instant> {
+        self.strict_budget.map(|_| std::time::Instant::now())
+    }
+
+    /// Enforce the real-time leak guard at the end of a step: panic if more than
+    /// the configured budget of *real* wall-clock time elapsed since `start`.
+    ///
+    /// A no-op when the guard is off (`start` / `strict_budget` are `None`). The
+    /// panic flows up through the [`#[sim_test]`](crate::sim_test) macro's
+    /// `catch_unwind`, so the `AUTUMN_SIM_SEED=…` replay line still prints.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the leak guard is enabled and real elapsed time exceeds the
+    /// budget (see [`strict_wall_clock`](Sim::strict_wall_clock)).
+    fn enforce_wall_clock_budget(&self, start: Option<std::time::Instant>) {
+        if let (Some(budget), Some(start)) = (self.strict_budget, start) {
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed <= budget,
+                "Sim::strict_wall_clock real-time leak guard tripped: {elapsed:?} of real \
+                 wall-clock time elapsed inside a paused-sim step, exceeding the {budget:?} \
+                 budget. This means real time leaked into the virtual timeline — usually a real \
+                 `std::thread::sleep`, blocking I/O, or `spawn_blocking` that escaped tokio's \
+                 paused timer. If this is CI scheduling jitter rather than a genuine leak, raise \
+                 the budget via the AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS environment variable."
+            );
+        }
+    }
+
     /// Advance virtual time by `duration`, stepping the injected wall clock and
     /// tokio's paused timer wheel **together**.
     ///
@@ -301,12 +432,152 @@ impl Sim {
     /// Pair with [`run_to_idle`](Sim::run_to_idle) to then drain the work the
     /// fired timers enqueued.
     pub async fn advance(&self, duration: std::time::Duration) {
+        // Real-time leak guard (no-op unless `strict_wall_clock` is enabled):
+        // sample a REAL instant (not tokio's paused time) at entry and check the
+        // real elapsed against the budget before returning. `advance_to` routes
+        // through here, so it inherits the guard for free.
+        let guard_start = self.wall_clock_guard_start();
         // Step the framework clock first so any task woken by the tokio timer
         // that reads the clock observes the already-advanced instant.
         self.clock.advance(duration);
         // Advance tokio's paused timer wheel; this fires due timers and yields
         // so their tasks are polled before returning.
         tokio::time::advance(duration).await;
+        self.enforce_wall_clock_budget(guard_start);
+    }
+
+    /// Advance virtual time **to** a specific zoned instant, resolving the
+    /// timezone (including any DST transition) to the correct UTC instant and
+    /// then stepping forward by the delta from the current sim instant.
+    ///
+    /// This is the timezone/DST-aware companion to [`advance`](Sim::advance):
+    /// where `advance` takes a raw [`std::time::Duration`], `advance_to` takes a
+    /// *wall-clock target in any timezone* and computes the real (UTC) delta for
+    /// you. It is generic over any [`chrono::TimeZone`] — pass a
+    /// `chrono::DateTime<Utc>`, a `chrono::DateTime<chrono::FixedOffset>`, or a
+    /// `chrono::DateTime<chrono_tz::Tz>` from the `chrono-tz` crate — so a caller
+    /// can express a zoned target without this crate hard-depending on any
+    /// particular timezone database.
+    ///
+    /// The target is converted to UTC via [`chrono::DateTime::with_timezone`],
+    /// which is unambiguous (every zoned `DateTime` already names a single
+    /// instant), and the sim then reuses [`advance`](Sim::advance) internally so
+    /// the injected wall clock and tokio's paused timer wheel stay in **exact
+    /// lockstep** — any `tokio::time::sleep` / job-backoff timer whose deadline
+    /// falls inside the crossed wall-clock window (a DST "spring-forward" gap
+    /// included) fires during the advance, then its task is polled before this
+    /// returns. Because the injected clock is UTC and monotonic, a spring-forward
+    /// boundary is just a shorter real interval — the timers inside it still fire
+    /// correctly.
+    ///
+    /// # Forward-only semantics
+    ///
+    /// Virtual time never moves backward:
+    ///
+    /// - **Target equals the current sim instant** → this is a **no-op** (no
+    ///   clock/timer step at all).
+    /// - **Target is strictly before the current sim instant** → this
+    ///   **panics** with a clear message. Silently doing nothing would hide a
+    ///   test bug (a target computed to be in the past almost always means the
+    ///   test's arithmetic is wrong), so the panic is deliberate.
+    ///
+    /// Pair with [`run_to_idle`](Sim::run_to_idle) afterward to drain the work
+    /// the fired timers enqueued.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `target` resolves to a UTC instant strictly before the current
+    /// sim instant (see *Forward-only semantics*).
+    ///
+    /// ```rust,ignore
+    /// use chrono::{TimeZone, Utc};
+    /// // Advance the sim clock to a specific UTC instant.
+    /// let target = Utc.with_ymd_and_hms(2020, 3, 8, 12, 0, 0).unwrap();
+    /// sim.advance_to(&target).await;
+    /// sim.run_to_idle().await;
+    /// ```
+    ///
+    /// Written as a non-`async fn` returning a future so the generic zoned
+    /// `target` is resolved to UTC **synchronously** and never captured across an
+    /// `.await` — the returned future holds only `&self` and the resolved
+    /// `DateTime<Utc>`, so it stays `Send` for any `Tz` (a borrowed or non-`Sync`
+    /// `Tz` would otherwise poison the future).
+    pub fn advance_to<Tz>(
+        &self,
+        target: &DateTime<Tz>,
+    ) -> impl std::future::Future<Output = ()> + '_
+    where
+        Tz: TimeZone,
+    {
+        let target_utc = target.with_timezone(&Utc);
+        self.advance_to_utc(target_utc)
+    }
+
+    /// Advance virtual time to a **naive local wall-clock time** interpreted in
+    /// timezone `tz`, resolving DST edge cases explicitly (no `.unwrap()` on a
+    /// [`chrono::LocalResult`]).
+    ///
+    /// Convenience wrapper over [`advance_to`](Sim::advance_to) for the common
+    /// "advance to 2:30 AM local on this date" shape, where the naive local time
+    /// must be mapped to a single UTC instant. `tz` is any
+    /// [`chrono::TimeZone`] (e.g. a `chrono_tz::Tz`); the forward-only /
+    /// panic-on-past semantics of [`advance_to`](Sim::advance_to) apply once the
+    /// instant is resolved.
+    ///
+    /// # DST resolution (deterministic)
+    ///
+    /// A naive local time need not correspond to exactly one UTC instant:
+    ///
+    /// - **Unambiguous** ([`LocalResult::Single`])
+    ///   → that instant.
+    /// - **Fall-back / ambiguous** ([`LocalResult::Ambiguous`],
+    ///   the wall time occurs twice as the clock rolls back) → the **earlier**
+    ///   of the two UTC instants.
+    /// - **Spring-forward gap** ([`LocalResult::None`],
+    ///   the wall time never occurs because the clock jumps forward) → the
+    ///   nonexistent wall time is carried **forward across** the gap to a single
+    ///   deterministic post-transition instant (it is resolved by looking up the
+    ///   zone's offset at the matching UTC-clock reading and applying it, which
+    ///   shifts the requested time past the boundary rather than erroring). For
+    ///   example a request for the nonexistent `02:30` on a US spring-forward
+    ///   day resolves to `03:30` local (the same instant, one gap-length later).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the resolved instant is strictly before the current sim instant
+    /// (see [`advance_to`](Sim::advance_to)).
+    ///
+    /// ```rust,ignore
+    /// use chrono::NaiveDate;
+    /// let local = NaiveDate::from_ymd_opt(2020, 3, 8).unwrap()
+    ///     .and_hms_opt(3, 30, 0).unwrap();
+    /// sim.advance_to_local(local, &chrono_tz::America::New_York).await;
+    /// ```
+    ///
+    /// Like [`advance_to`](Sim::advance_to), this is a non-`async fn` returning a
+    /// future: the `&tz` reference is used only while resolving the instant
+    /// synchronously and is **not** captured by the returned future, so the
+    /// future stays `Send` even though `Tz` need not be `Sync`.
+    pub fn advance_to_local<Tz>(
+        &self,
+        local: NaiveDateTime,
+        tz: &Tz,
+    ) -> impl std::future::Future<Output = ()> + '_
+    where
+        Tz: TimeZone,
+    {
+        self.advance_to_utc(resolve_local_to_utc(local, tz))
+    }
+
+    /// Shared UTC-target advance used by [`advance_to`](Sim::advance_to) and
+    /// [`advance_to_local`](Sim::advance_to_local): plan the step against the
+    /// current sim instant, then reuse [`advance`](Sim::advance) so the clock and
+    /// timer wheel stay in lockstep.
+    async fn advance_to_utc(&self, target: DateTime<Utc>) {
+        match plan_advance_to(self.clock.now(), target) {
+            AdvancePlan::NoOp => {}
+            AdvancePlan::Advance(delta) => self.advance(delta).await,
+        }
     }
 
     /// Drain all ready work — enqueued jobs the in-process runtime can run now,
@@ -327,6 +598,11 @@ impl Sim {
     /// [`advance`](Sim::advance) to the next interesting instant, then
     /// `run_to_idle` to settle the work it released.
     pub async fn run_to_idle(&self) {
+        // Real-time leak guard (no-op unless `strict_wall_clock` is enabled):
+        // sample a REAL instant at entry and enforce the budget before
+        // returning, catching a real blocking sleep in a drained task.
+        let guard_start = self.wall_clock_guard_start();
+
         // Resolve the mounted app's DB pool once (a cheap, cloned Arc-backed
         // handle). Durable repository commit hooks are rows, so there is
         // nothing to drain when the app was built without a database (e.g. the
@@ -365,6 +641,8 @@ impl Sim {
                     crate::test::drain_ready_repository_commit_hooks(pool, MAX_DRAIN_STEPS).await;
             }
         }
+
+        self.enforce_wall_clock_budget(guard_start);
     }
 }
 
@@ -373,6 +651,114 @@ impl Sim {
 /// Generous relative to the handful of hops a job takes from the queue through
 /// its handler to completion under the single-threaded paused runtime.
 const MAX_DRAIN_STEPS: usize = 1024;
+
+/// Default real wall-clock budget for the `strict_wall_clock` leak guard
+/// ([`Sim::strict_wall_clock`]).
+///
+/// Deliberately generous (100 ms): the guard exists to catch a *real* blocking
+/// sleep escaping the virtual timer (seconds of wall time), so the budget must
+/// sit far above ordinary current-thread scheduling jitter to avoid false
+/// positives on a slow/contended CI runner. A legitimate virtual advance — even
+/// jumping a day of virtual time — costs microseconds of real time, orders of
+/// magnitude under this.
+const DEFAULT_STRICT_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Resolve the effective `strict_wall_clock` budget: the
+/// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment override when it holds a
+/// valid whole-millisecond value, otherwise `default`.
+///
+/// Mirrors the [`__seed_from_env`] / [`parse_seed`] idiom so a too-tight budget
+/// on a slow runner can be loosened globally without editing test code; a blank
+/// or unparseable value falls back to `default`.
+fn strict_budget_from_env_or(default: std::time::Duration) -> std::time::Duration {
+    std::env::var("AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS")
+        .ok()
+        .and_then(|raw| parse_strict_budget_ms(&raw))
+        .unwrap_or(default)
+}
+
+/// Parse a whole-millisecond budget string into a [`std::time::Duration`],
+/// returning `None` for empty/whitespace-only or unparseable input (so the
+/// caller can fall back to the configured default).
+fn parse_strict_budget_ms(raw: &str) -> Option<std::time::Duration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_millis)
+}
+
+/// The forward-only step [`Sim::advance_to`] resolves a target instant into.
+///
+/// Kept as a small pure enum (rather than inlining the branch) so the
+/// forward-only / no-op / panic-on-past decision is unit-testable without a
+/// runtime or a paused clock.
+#[derive(Debug, PartialEq, Eq)]
+enum AdvancePlan {
+    /// Target equals the current instant — advancing does nothing.
+    NoOp,
+    /// Target is in the future — step forward by exactly this real delta.
+    Advance(std::time::Duration),
+}
+
+/// Decide how to advance from `now` to `target` under the forward-only clock
+/// contract of [`Sim::advance_to`].
+///
+/// Returns [`AdvancePlan::NoOp`] when `target == now` and
+/// [`AdvancePlan::Advance`] with the positive delta when `target` is in the
+/// future.
+///
+/// # Panics
+///
+/// Panics when `target` is strictly before `now`: virtual time is forward-only,
+/// and a past target signals a test-arithmetic bug that silent no-op behavior
+/// would hide.
+fn plan_advance_to(now: DateTime<Utc>, target: DateTime<Utc>) -> AdvancePlan {
+    let delta = target - now;
+    match delta.cmp(&chrono::Duration::zero()) {
+        std::cmp::Ordering::Equal => AdvancePlan::NoOp,
+        std::cmp::Ordering::Less => panic!(
+            "Sim::advance_to target {target} is strictly before the current sim instant {now}; \
+             virtual time is forward-only (advancing to a past instant is a test bug)"
+        ),
+        std::cmp::Ordering::Greater => AdvancePlan::Advance(
+            delta
+                .to_std()
+                .expect("a strictly-positive chrono delta always converts to std::time::Duration"),
+        ),
+    }
+}
+
+/// Resolve a naive local wall-clock time in timezone `tz` to a single UTC
+/// instant, handling DST edges deterministically (see
+/// [`Sim::advance_to_local`] for the documented policy).
+///
+/// Ambiguous (fall-back) local times resolve to the **earlier** instant; a
+/// nonexistent (spring-forward gap) local time is carried across the gap using
+/// the post-transition UTC offset. Never `.unwrap()`s a
+/// [`chrono::LocalResult`].
+fn resolve_local_to_utc<Tz>(local: NaiveDateTime, tz: &Tz) -> DateTime<Utc>
+where
+    Tz: TimeZone,
+{
+    match tz.from_local_datetime(&local) {
+        LocalResult::Single(dt) => dt.with_timezone(&Utc),
+        LocalResult::Ambiguous(earlier, _later) => earlier.with_timezone(&Utc),
+        LocalResult::None => {
+            // Spring-forward gap: the wall time never occurs. Resolve it by
+            // looking up the zone's offset at the UTC-clock reading numerically
+            // equal to the wall time and applying it — a total, deterministic
+            // mapping that carries the nonexistent time forward across the gap to
+            // a single post-transition instant.
+            let offset_secs =
+                i64::from(tz.offset_from_utc_datetime(&local).fix().local_minus_utc());
+            (local - chrono::Duration::seconds(offset_secs)).and_utc()
+        }
+    }
+}
 
 /// A seeded, deterministic random number generator handle.
 ///
@@ -481,6 +867,14 @@ impl SimClock {
     pub(crate) fn ticking(&self) -> TickingClock {
         self.inner.clone()
     }
+
+    /// The clock's current virtual UTC instant.
+    ///
+    /// Read by [`Sim::advance_to`] to compute the forward delta to a zoned
+    /// target.
+    pub(crate) fn now(&self) -> DateTime<Utc> {
+        crate::time::ClockSource::now(&self.inner)
+    }
 }
 
 /// The built application handle for a simulation.
@@ -558,7 +952,11 @@ pub fn __replay_line(seed: u64, pkg: &str, test: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{__replay_line, Sim, parse_seed};
+    use super::{
+        __replay_line, AdvancePlan, DEFAULT_STRICT_WALL_CLOCK_BUDGET, Sim, parse_seed,
+        parse_strict_budget_ms, plan_advance_to, resolve_local_to_utc, strict_budget_from_env_or,
+    };
+    use chrono::{NaiveDate, TimeZone, Utc};
     use rand::RngCore;
 
     #[test]
@@ -606,5 +1004,87 @@ mod tests {
         let da = a.rng().inner_mut().next_u64();
         let db = b.rng().inner_mut().next_u64();
         assert_eq!(da, db, "same seed must yield the same first RNG draw");
+    }
+
+    #[test]
+    fn plan_advance_to_equal_target_is_noop() {
+        let now = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(plan_advance_to(now, now), AdvancePlan::NoOp);
+    }
+
+    #[test]
+    fn plan_advance_to_future_target_is_exact_delta() {
+        let now = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let target = Utc.with_ymd_and_hms(2020, 1, 1, 1, 0, 0).unwrap();
+        assert_eq!(
+            plan_advance_to(now, target),
+            AdvancePlan::Advance(std::time::Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "forward-only")]
+    fn plan_advance_to_past_target_panics() {
+        let now = Utc.with_ymd_and_hms(2020, 1, 1, 1, 0, 0).unwrap();
+        let target = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let _ = plan_advance_to(now, target);
+    }
+
+    #[test]
+    fn parse_strict_budget_ms_covers_valid_and_garbage() {
+        use std::time::Duration;
+        assert_eq!(
+            parse_strict_budget_ms("100"),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            parse_strict_budget_ms("  250  "),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(parse_strict_budget_ms("0"), Some(Duration::ZERO));
+        assert_eq!(parse_strict_budget_ms(""), None);
+        assert_eq!(parse_strict_budget_ms("   "), None);
+        assert_eq!(parse_strict_budget_ms("garbage"), None);
+        assert_eq!(parse_strict_budget_ms("-5"), None);
+        assert_eq!(parse_strict_budget_ms("1.5"), None);
+    }
+
+    #[test]
+    fn strict_budget_from_env_falls_back_to_default_when_unset() {
+        // The env var is not set in this unit-test process, so the default is
+        // returned verbatim (the override path is exercised via the public
+        // integration tests, which never set the var).
+        let default = std::time::Duration::from_millis(7);
+        assert_eq!(strict_budget_from_env_or(default), default);
+        assert_eq!(
+            strict_budget_from_env_or(DEFAULT_STRICT_WALL_CLOCK_BUDGET),
+            DEFAULT_STRICT_WALL_CLOCK_BUDGET
+        );
+    }
+
+    #[test]
+    fn strict_wall_clock_builders_set_the_budget() {
+        let mut sim = Sim::from_seed(0);
+        assert!(sim.strict_budget.is_none(), "guard is off by default");
+        sim.strict_wall_clock();
+        assert_eq!(sim.strict_budget, Some(DEFAULT_STRICT_WALL_CLOCK_BUDGET));
+
+        let mut custom = Sim::from_seed(0);
+        custom.strict_wall_clock_budget(std::time::Duration::from_millis(5));
+        assert_eq!(
+            custom.strict_budget,
+            Some(std::time::Duration::from_millis(5))
+        );
+    }
+
+    #[test]
+    fn resolve_local_unambiguous_maps_to_single_instant() {
+        // A plain UTC-offset zone: 12:00 at +00:00 is exactly 12:00Z.
+        let local = NaiveDate::from_ymd_opt(2020, 6, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let got = resolve_local_to_utc(local, &Utc);
+        assert_eq!(got, Utc.with_ymd_and_hms(2020, 6, 1, 12, 0, 0).unwrap());
     }
 }
