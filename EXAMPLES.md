@@ -179,6 +179,24 @@ The committed tree here is the rendered form of the embedded starter; the
 
 ---
 
+### `examples/media-room` — Live Mesh Rooms
+
+<!-- catalog:example name=media-room tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building interactive video/audio who is evaluating `autumn-media-plugin` |
+| **Journey** | Install the media plugin with rooms → create a room from an app handler via the plugin-installed `RoomService` → list the created rooms |
+| **Key capabilities** | `MediaPlugin::new().config(media).with_rooms()`, the `RoomService` `AppState` extension, the plugin-mounted room routes under `/api/media`, a shared `AppState` extension |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p media-room` |
+| **Success proof** | `curl -X POST http://localhost:3000/rooms` then `curl http://localhost:3000/api/rooms` returns the created room's JSON |
+
+Boots with no database or `MediaMTX` server; the companion narrative is
+`docs/guide/media.md`.
+
+---
+
 ## Excluded Examples
 
 Excluded examples are intentionally kept out of the workspace and the normal
@@ -221,6 +239,7 @@ can pick the closest starting point without overlap.
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
 | Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
+| Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
 
 ---
 
