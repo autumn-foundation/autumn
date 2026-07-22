@@ -556,6 +556,167 @@ pub fn grade_database_url(
     }
 }
 
+/// How a deploy's configured `SQLite` data file resolves relative to the
+/// release-based install layout (issue #1909). This is the persistence-safety
+/// classification behind [`grade_sqlite_data_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqliteDataPath {
+    /// The configured database is not a `SQLite` target — nothing to persist.
+    NotSqlite,
+    /// An in-memory `SQLite` database (`:memory:` / `mode=memory`): no on-disk
+    /// file, so it cannot survive a restart, let alone a deploy cutover.
+    InMemory,
+    /// A relative file path — it resolves against the per-release working
+    /// directory, so each cutover starts a fresh empty database and orphans the
+    /// previous release's file.
+    Relative(String),
+    /// An absolute file path.
+    Absolute(PathBuf),
+}
+
+/// Classify a deploy target's configured database URL for `SQLite`
+/// data-file-persistence grading (issue #1909). Pure — reuses
+/// [`autumn_web::config::DatabaseBackend::detect`] for the `SQLite` decision, then
+/// mirrors the CLI's `normalize_sqlite_target` / `sqlite_file_path` path parsing
+/// (kept in lock-step so the deploy grader and the runtime resolve the same
+/// file). A non-`SQLite` URL classifies as [`SqliteDataPath::NotSqlite`].
+#[must_use]
+pub fn classify_sqlite_data_path(url: &str) -> SqliteDataPath {
+    if !matches!(
+        autumn_web::config::DatabaseBackend::detect(url),
+        Some(autumn_web::config::DatabaseBackend::Sqlite)
+    ) {
+        return SqliteDataPath::NotSqlite;
+    }
+
+    // Reduce the recognized spellings to the concrete `sqlite3_open` target.
+    let target = if url.starts_with("file:") {
+        url.to_owned()
+    } else {
+        let rest = url
+            .strip_prefix("sqlite://")
+            .or_else(|| url.strip_prefix("sqlite:"))
+            .unwrap_or(url);
+        if rest.is_empty() || rest == ":memory:" {
+            ":memory:".to_owned()
+        } else {
+            rest.to_owned()
+        }
+    };
+
+    if target.is_empty() || target == ":memory:" {
+        return SqliteDataPath::InMemory;
+    }
+    let path_str = match target.strip_prefix("file:") {
+        None => target.clone(),
+        Some(rest) => {
+            let (path_part, query) = rest.split_once('?').unwrap_or((rest, ""));
+            let path_part = path_part.strip_prefix("//").map_or(path_part, |after| {
+                after.find('/').map_or(after, |idx| &after[idx..])
+            });
+            let is_memory = path_part == ":memory:"
+                || query
+                    .split('&')
+                    .any(|kv| kv.trim().eq_ignore_ascii_case("mode=memory"));
+            if is_memory {
+                return SqliteDataPath::InMemory;
+            }
+            percent_encoding::percent_decode_str(path_part)
+                .decode_utf8_lossy()
+                .into_owned()
+        }
+    };
+
+    let path = PathBuf::from(&path_str);
+    if path.is_absolute() {
+        SqliteDataPath::Absolute(path)
+    } else {
+        SqliteDataPath::Relative(path_str)
+    }
+}
+
+/// Grade `SQLite` data-file persistence across deploy cutovers (issue #1909).
+///
+/// `autumn deploy` stages each release under `{app_dir}/releases/<ts>/` and flips
+/// the `{app_dir}/current` symlink at cutover, pruning old releases. A `SQLite` app
+/// therefore only keeps its database across a redeploy when the data file lives
+/// on a **stable path outside the per-release directories** — the persistent
+/// `{app_dir}/shared/` directory the deploy already provisions is the canonical
+/// home. This grader fails (blocking) the two footguns that silently lose or
+/// orphan the database on the next cutover:
+///
+/// * a **relative** `sqlite://` path (resolves against the per-release working
+///   dir, so each release starts an empty DB and orphans the old one), and
+/// * an **absolute** path **inside** `{app_dir}/releases/…` or through
+///   `{app_dir}/current/…` (pruned / repointed on cutover).
+///
+/// It also fails an **in-memory** target (nothing persists at all). A `Postgres`
+/// target, or a `SQLite` file on a stable path outside those directories, passes.
+#[must_use]
+pub fn grade_sqlite_data_file(
+    url: Option<&str>,
+    resolved: &ResolvedDeployConfig,
+) -> PreflightCheck {
+    let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) else {
+        return PreflightCheck::pass("sqlite_data_file", "no database URL to persist");
+    };
+
+    let shared = resolved.shared_dir();
+    match classify_sqlite_data_path(url) {
+        SqliteDataPath::NotSqlite => PreflightCheck::pass(
+            "sqlite_data_file",
+            "not a SQLite target (no data file to persist across releases)",
+        ),
+        SqliteDataPath::InMemory => PreflightCheck::fail(
+            "sqlite_data_file",
+            "the SQLite database is in-memory (`:memory:`), so all data is lost on \
+             every restart and deploy cutover",
+            "Point database.primary_url at a file-backed SQLite path on the persistent \
+             shared dir, e.g. sqlite://<app_dir>/shared/app.db",
+        ),
+        SqliteDataPath::Relative(path) => PreflightCheck::fail(
+            "sqlite_data_file",
+            format!(
+                "the SQLite data file {path:?} is a relative path: it resolves inside each \
+                 release's working directory and is orphaned on the next cutover (the new \
+                 release starts an empty database). Store it on the persistent shared dir \
+                 {shared:?} instead"
+            ),
+            "Use an absolute SQLite path under <app_dir>/shared, e.g. \
+             database.primary_url = sqlite://<app_dir>/shared/app.db",
+        ),
+        SqliteDataPath::Absolute(path) => {
+            // A path inside the per-release dirs (or reached through the `current`
+            // symlink) is pruned/repointed on cutover — the DB would not survive.
+            let releases_prefix = format!("{}/", resolved.releases_dir());
+            let current_prefix = format!("{}/", resolved.current_symlink());
+            let path_str = path.to_string_lossy();
+            if path_str.starts_with(&releases_prefix) || path_str.starts_with(&current_prefix) {
+                PreflightCheck::fail(
+                    "sqlite_data_file",
+                    format!(
+                        "the SQLite data file {} lives inside the release directories, which are \
+                         repointed/pruned on every cutover — the database would be lost or \
+                         orphaned. Store it on the persistent shared dir {shared:?} instead",
+                        path.display()
+                    ),
+                    "Move the SQLite file under <app_dir>/shared, e.g. \
+                     database.primary_url = sqlite://<app_dir>/shared/app.db",
+                )
+            } else {
+                PreflightCheck::pass(
+                    "sqlite_data_file",
+                    format!(
+                        "SQLite data file {} is on a stable path outside the release directories \
+                         — it persists across deploy cutovers",
+                        path.display()
+                    ),
+                )
+            }
+        }
+    }
+}
+
 /// Grade `migrate check`: reuse the migration safety classifier and fail when a
 /// pending migration is unsafe for a live rolling deploy. A project with no
 /// migrations directory passes (there is nothing to check).
@@ -1296,6 +1457,10 @@ fn collect_preflight(
             database_configured,
             requires_database_pool(config),
         ),
+        // SQLite data-file persistence across deploy cutovers (issue #1909): a
+        // relative / in-release / in-memory SQLite path is lost or orphaned on the
+        // next release flip. A no-op for Postgres targets.
+        grade_sqlite_data_file(resolve_writable_db_url(&config.database), resolved),
         grade_migrate_check(Path::new(MIGRATIONS_DIR)),
     ]
 }
@@ -2066,6 +2231,90 @@ mod tests {
     fn resolved_defaults() -> ResolvedDeployConfig {
         ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp")
             .expect("deploy config resolves")
+    }
+
+    // ── SQLite data-file persistence across cutovers (issue #1909) ────────────
+
+    #[test]
+    fn classify_sqlite_data_path_covers_the_shapes() {
+        // Non-SQLite targets are out of scope.
+        assert_eq!(
+            classify_sqlite_data_path("postgres://u@h/db"),
+            SqliteDataPath::NotSqlite
+        );
+        // In-memory spellings.
+        for mem in [
+            "sqlite::memory:",
+            "sqlite://:memory:",
+            "file:app?mode=memory",
+        ] {
+            assert_eq!(
+                classify_sqlite_data_path(mem),
+                SqliteDataPath::InMemory,
+                "{mem} is in-memory"
+            );
+        }
+        // Relative paths.
+        assert_eq!(
+            classify_sqlite_data_path("sqlite://app.db"),
+            SqliteDataPath::Relative("app.db".to_owned())
+        );
+        // Absolute paths (bare and `file:` forms).
+        assert_eq!(
+            classify_sqlite_data_path("sqlite:///srv/autumn/myapp/shared/app.db"),
+            SqliteDataPath::Absolute(PathBuf::from("/srv/autumn/myapp/shared/app.db"))
+        );
+        assert_eq!(
+            classify_sqlite_data_path("file:/srv/app.db"),
+            SqliteDataPath::Absolute(PathBuf::from("/srv/app.db"))
+        );
+    }
+
+    #[test]
+    fn grade_sqlite_data_file_passes_postgres_and_stable_paths() {
+        let resolved = resolved_defaults();
+        // Postgres → nothing to persist.
+        assert!(grade_sqlite_data_file(Some("postgres://u@h/db"), &resolved).passed);
+        // Absolute path under the persistent shared dir → persists across cutovers.
+        let stable =
+            grade_sqlite_data_file(Some("sqlite:///srv/autumn/myapp/shared/app.db"), &resolved);
+        assert!(stable.passed, "shared-dir path should pass: {stable:?}");
+        // Any absolute path outside the release dirs is fine too.
+        assert!(grade_sqlite_data_file(Some("sqlite:///var/lib/app.db"), &resolved).passed);
+        // No URL is a pass (nothing to persist).
+        assert!(grade_sqlite_data_file(None, &resolved).passed);
+    }
+
+    #[test]
+    fn grade_sqlite_data_file_blocks_orphaning_shapes() {
+        let resolved = resolved_defaults();
+
+        // Relative path → orphaned on cutover.
+        let rel = grade_sqlite_data_file(Some("sqlite://app.db"), &resolved);
+        assert!(rel.blocking(), "relative sqlite path must block: {rel:?}");
+        assert!(rel.detail.contains("shared"));
+
+        // In-memory → nothing persists.
+        let mem = grade_sqlite_data_file(Some("sqlite::memory:"), &resolved);
+        assert!(mem.blocking(), "in-memory must block: {mem:?}");
+
+        // Absolute path inside a release dir → pruned on cutover.
+        let in_release = grade_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/releases/20260101T000000Z/app.db"),
+            &resolved,
+        );
+        assert!(
+            in_release.blocking(),
+            "in-release path must block: {in_release:?}"
+        );
+
+        // Absolute path reached through the `current` symlink → repointed on cutover.
+        let via_current =
+            grade_sqlite_data_file(Some("sqlite:///srv/autumn/myapp/current/app.db"), &resolved);
+        assert!(
+            via_current.blocking(),
+            "current-symlink path must block: {via_current:?}"
+        );
     }
 
     #[test]

@@ -208,6 +208,20 @@ pub enum BackupError {
     /// the reference is malformed. Carries the bad reference (no secrets). The
     /// restore MUST fail rather than fall through to a local artifact.
     InvalidOffsiteRef { reference: String },
+    /// The configured `SQLite` database is in-memory (`:memory:` / `mode=memory`),
+    /// which has no on-disk file to snapshot or restore. Carries no URL — a
+    /// `SQLite` URL holds no credentials, but the message stays path-only anyway.
+    SqliteInMemory,
+    /// The `SQLite` source database file to back up does not exist on disk.
+    /// Carries the parsed filesystem path (a `SQLite` URL has no credentials).
+    SqliteSourceMissing { path: String },
+    /// The `SQLite` snapshot to restore is a valid `SQLite` file, but the live
+    /// database the app is configured to use is not a `SQLite` target — refusing
+    /// to write a `SQLite` file over a non-`SQLite` database.
+    SqliteTargetMismatch,
+    /// Offsite upload/restore of `SQLite` snapshots is not yet supported (the
+    /// offsite path is shaped around pg run directories). Tracked in #1909.
+    SqliteOffsiteUnsupported,
 }
 
 impl std::fmt::Display for BackupError {
@@ -281,6 +295,29 @@ impl std::fmt::Display for BackupError {
                 "Invalid offsite reference {reference:?}.\n  Expected \
                  offsite:<profile>/<timestamp|latest> (for example offsite:prod/latest)."
             ),
+            Self::SqliteInMemory => write!(
+                f,
+                "The configured SQLite database is in-memory (`:memory:` / `mode=memory`).\n  \
+                 There is no on-disk file to back up or restore — point database.primary_url at a \
+                 file-backed `sqlite://<path>` target."
+            ),
+            Self::SqliteSourceMissing { path } => write!(
+                f,
+                "The SQLite database file to back up does not exist: {path}\n  \
+                 Check database.primary_url (or DATABASE_URL) points at the live data file."
+            ),
+            Self::SqliteTargetMismatch => write!(
+                f,
+                "This is a SQLite snapshot, but the configured database is not a SQLite target.\n  \
+                 Restore it under a profile whose database.primary_url is a `sqlite://` URL."
+            ),
+            Self::SqliteOffsiteUnsupported => write!(
+                f,
+                "Offsite upload/restore is not yet supported for SQLite snapshots.\n  \
+                 Back up locally (a SQLite backup run directory is a portable single-file \
+                 snapshot you can copy offsite yourself). Tracked in \
+                 https://github.com/autumn-foundation/autumn/issues/1909."
+            ),
         }
     }
 }
@@ -327,13 +364,20 @@ pub fn run_restore(args: &RestoreArgs) {
 
 fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     let targets = resolve_targets(args.profile.as_deref(), &args.target)?;
+    let profile = migrate::effective_profile(args.profile.as_deref());
+
+    // SQLite backend (issue #1909): route to the native single-file snapshot
+    // engine (`VACUUM INTO` + integrity check) instead of `pg_dump`, so the
+    // Postgres path below is reached only for a genuinely Postgres target.
+    if targets_are_sqlite(&targets) {
+        return sqlite_backup(args, &targets, &profile);
+    }
+
     // Include the managed cluster's bundled tools (daemon/cron path, where
     // AUTUMN_MANAGED_PG_DATA_DIR isn't inherited) so a managed backup needs zero
     // external tools on PATH (issue #1595).
     let tools = PgTools::locate_with_extra(managed_pg_data_dir());
     let pg_dump = tools.require("pg_dump")?;
-
-    let profile = migrate::effective_profile(args.profile.as_deref());
 
     // Offsite pre-flight (issue #1619). Decide whether to upload with a LIGHT
     // probe that reads ONLY `[backup.offsite].auto_upload` (real env → `.env.<p>`
@@ -903,6 +947,15 @@ fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
     super::guard_destructive(&profile, args.force).map_err(|_| BackupError::ProductionRefused {
         profile: profile.clone(),
     })?;
+
+    // SQLite snapshot (issue #1909): a run directory whose manifest is `sqlite`,
+    // or a bare `.sqlite` file, restores through the native integrity-checked
+    // file-replacement path — never `pg_restore`. An offsite reference is never a
+    // local dir/file, so it deliberately falls through to the Postgres offsite
+    // path below (offsite is not yet supported for SQLite; see the docs).
+    if artifact_is_sqlite(&args.artifact) {
+        return sqlite_restore(args);
+    }
 
     // Offsite restore (issue #1619): when `--offsite` is set or the artifact is
     // an `offsite:<profile>/<ts|latest>` reference, download the run to a fresh
@@ -2736,6 +2789,375 @@ fn resolve_latest_run(
         })
 }
 
+// ─── SQLite backup / restore engine (issue #1909) ────────────────────────────
+//
+// When the resolved database is a `sqlite://` / `sqlite:` / `file:` target,
+// `autumn db backup` / `autumn db restore` never shell out to `pg_dump` /
+// `pg_restore`. Backup takes a consistent single-file snapshot with SQLite's
+// `VACUUM INTO` (which produces a clean, defragmented copy even while the source
+// database is open and in WAL mode — the running app keeps serving), verifies it
+// with `PRAGMA integrity_check`, and records it in the SAME self-describing run
+// directory + `manifest.json` layout the Postgres path uses (so `--keep`
+// retention works unchanged). Restore verifies the snapshot's integrity, then
+// atomically replaces the live data file (stage-next-to-dest → fsync → rename)
+// and clears the previous file's stale `-wal` / `-shm` sidecars.
+//
+// This engine uses `diesel::SqliteConnection` directly (a workspace dependency
+// available in every CLI build), so it needs no cargo-feature flip — a shipped
+// default `autumn` binary can back up and restore a SQLite-backed app. The
+// `MANIFEST_FILE` / run-directory / retention helpers are shared with the
+// Postgres path, so the two backends can never drift on layout or pruning.
+
+/// Manifest `format` value marking a `SQLite` single-file snapshot. Distinct from
+/// the `Postgres` `custom` / `plain` formats so restore routes to this engine.
+const SQLITE_FORMAT: &str = "sqlite";
+
+/// Artifact file extension for a `SQLite` snapshot.
+const SQLITE_EXTENSION: &str = "sqlite";
+
+/// Whether every resolved target is a `SQLite` URL — the signal that backup /
+/// restore should use the native snapshot engine instead of `pg_dump`. A `SQLite`
+/// primary can have no shards (config validation rejects them), so in practice
+/// this is the single control target.
+fn targets_are_sqlite(targets: &[ResolvedTarget]) -> bool {
+    !targets.is_empty()
+        && targets.iter().all(|t| {
+            matches!(
+                autumn_web::config::DatabaseBackend::detect(&t.url),
+                Some(autumn_web::config::DatabaseBackend::Sqlite)
+            )
+        })
+}
+
+/// Whether a restore artifact is a `SQLite` snapshot: a run directory whose
+/// `manifest.json` records `format = "sqlite"`, or a bare `.sqlite` file. An
+/// offsite reference (neither a dir nor a file on disk) is not `SQLite` here, so it
+/// falls through to the `Postgres` offsite path.
+fn artifact_is_sqlite(path: &Path) -> bool {
+    if path.is_dir() {
+        return read_manifest(path).is_ok_and(|m| m.format == SQLITE_FORMAT);
+    }
+    path.extension().and_then(|e| e.to_str()) == Some(SQLITE_EXTENSION)
+}
+
+/// Reduce a recognized `SQLite` URL spelling to the concrete target
+/// `SqliteConnection::establish` / `sqlite3_open` expects, mirroring autumn-web's
+/// own `normalize_sqlite_target` so the CLI connects to the same file the runtime
+/// does. `sqlite::memory:` / `sqlite://:memory:` / empty → `:memory:`; a `file:`
+/// URI passes through unchanged; any other spelling reduces to its path.
+fn sqlite_connect_target(url: &str) -> String {
+    if url.starts_with("file:") {
+        return url.to_owned();
+    }
+    let rest = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    if rest.is_empty() || rest == ":memory:" {
+        return ":memory:".to_owned();
+    }
+    rest.to_owned()
+}
+
+/// Classify a normalized `SQLite` target's on-disk file path, or `None` for an
+/// in-memory database (`:memory:`, `file::memory:`, or a `file:` URI with
+/// `mode=memory`). Mirrors introspect's `sqlite_existence_check_path`: the
+/// `file:` scheme/authority/query are stripped and the path percent-decoded.
+fn sqlite_file_path(target: &str) -> Option<PathBuf> {
+    if target.is_empty() || target == ":memory:" {
+        return None;
+    }
+    let Some(rest) = target.strip_prefix("file:") else {
+        // A bare filesystem path.
+        return Some(PathBuf::from(target));
+    };
+    let (path_part, query) = rest.split_once('?').unwrap_or((rest, ""));
+    // Strip an optional authority: `file://host/path` / `file:///path`.
+    let path_part = path_part.strip_prefix("//").map_or(path_part, |after| {
+        after.find('/').map_or(after, |idx| &after[idx..])
+    });
+    let is_memory = path_part == ":memory:"
+        || query
+            .split('&')
+            .any(|kv| kv.trim().eq_ignore_ascii_case("mode=memory"));
+    if is_memory {
+        return None;
+    }
+    let decoded = percent_encoding::percent_decode_str(path_part)
+        .decode_utf8_lossy()
+        .into_owned();
+    Some(PathBuf::from(decoded))
+}
+
+/// Snapshot a live `SQLite` database into `dest` with `VACUUM INTO`. `dest` must
+/// not already exist (a fresh run directory guarantees this). Works against an
+/// open, WAL-mode source: `VACUUM INTO` takes a read snapshot and writes a clean,
+/// consistent copy.
+fn sqlite_vacuum_into(source_target: &str, dest: &Path) -> Result<(), BackupError> {
+    use diesel::connection::SimpleConnection as _;
+    use diesel::{Connection as _, SqliteConnection};
+
+    let mut conn =
+        SqliteConnection::establish(source_target).map_err(|e| BackupError::ToolFailed {
+            tool: "sqlite".to_owned(),
+            context: format!("could not open the SQLite database: {e}"),
+        })?;
+    // `VACUUM INTO` takes a string-literal destination; escape single quotes.
+    let escaped = dest.to_string_lossy().replace('\'', "''");
+    conn.batch_execute(&format!("VACUUM INTO '{escaped}'"))
+        .map_err(|e| BackupError::ToolFailed {
+            tool: "sqlite".to_owned(),
+            context: format!("VACUUM INTO failed: {e}"),
+        })?;
+    Ok(())
+}
+
+/// Verify a `SQLite` snapshot before it counts as a successful backup (or before a
+/// restore overwrites the live database): the file must be non-empty and
+/// `PRAGMA integrity_check` must report exactly `ok`. A truncated / non-`SQLite` /
+/// structurally-corrupt file fails here — either `establish` or the pragma
+/// errors, or the pragma reports non-`ok` rows.
+fn sqlite_verify_artifact(path: &Path) -> Result<(), BackupError> {
+    use diesel::sql_types::Text;
+    use diesel::{Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query};
+
+    #[derive(QueryableByName)]
+    struct IntegrityRow {
+        #[diesel(sql_type = Text, column_name = "integrity_check")]
+        status: String,
+    }
+
+    let len = std::fs::metadata(path)
+        .map_err(BackupError::io(format!("stat {}", path.display())))?
+        .len();
+    if len == 0 {
+        return Err(BackupError::IntegrityFailed {
+            detail: "the SQLite snapshot is empty (0 bytes)".to_owned(),
+        });
+    }
+
+    let mut conn = SqliteConnection::establish(&path.to_string_lossy()).map_err(|e| {
+        BackupError::IntegrityFailed {
+            detail: format!("cannot open the SQLite snapshot: {e}"),
+        }
+    })?;
+    let rows: Vec<IntegrityRow> = sql_query("PRAGMA integrity_check")
+        .load(&mut conn)
+        .map_err(|e| BackupError::IntegrityFailed {
+            detail: format!("PRAGMA integrity_check failed: {e}"),
+        })?;
+    if rows.len() == 1 && rows[0].status == "ok" {
+        Ok(())
+    } else {
+        let detail = rows
+            .iter()
+            .map(|r| r.status.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(BackupError::IntegrityFailed {
+            detail: format!("SQLite integrity check reported: {detail}"),
+        })
+    }
+}
+
+/// Atomically replace the live `SQLite` data file at `dest` with `src`: copy into a
+/// temp file next to `dest` (same filesystem), `fsync` it, then `rename` over
+/// `dest`. After the swap the previous file's `-wal` / `-shm` sidecars describe
+/// the OLD database and would corrupt the restored one, so they are removed
+/// (`SQLite` recreates them on next open). The app should be stopped during a
+/// restore, exactly as for a `pg_restore` overwrite.
+fn sqlite_replace_file(src: &Path, dest: &Path) -> Result<(), BackupError> {
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    std::fs::create_dir_all(&parent)
+        .map_err(BackupError::io(format!("creating {}", parent.display())))?;
+
+    let file_name = dest.file_name().map_or_else(
+        || "database".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let tmp = parent.join(format!(".{file_name}.restore-{}.tmp", std::process::id()));
+
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::copy(src, &tmp).map_err(BackupError::io(format!(
+        "staging restore into {}",
+        tmp.display()
+    )))?;
+    {
+        let staged = std::fs::File::open(&tmp)
+            .map_err(BackupError::io(format!("open {}", tmp.display())))?;
+        staged
+            .sync_all()
+            .map_err(BackupError::io(format!("fsync {}", tmp.display())))?;
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        BackupError::io(format!("replacing {}", dest.display()))(e)
+    })?;
+
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = dest.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    }
+    Ok(())
+}
+
+/// Snapshot the control target into `run_dir` and write the run manifest. Pure
+/// over its inputs (no config resolution) so it is unit-testable with an explicit
+/// target.
+fn sqlite_backup_into(
+    run_dir: &Path,
+    target: &ResolvedTarget,
+    profile: &str,
+) -> Result<(), BackupError> {
+    let file_name = format!("{}.{SQLITE_EXTENSION}", sanitize_component(&target.label));
+    let out_path = run_dir.join(&file_name);
+
+    eprintln!(
+        "\u{2500}\u{2500} backing up {} (SQLite snapshot) \u{2500}\u{2500}",
+        target.label
+    );
+
+    let connect = sqlite_connect_target(&target.url);
+    let source_path = sqlite_file_path(&connect).ok_or(BackupError::SqliteInMemory)?;
+    if !source_path.exists() {
+        return Err(BackupError::SqliteSourceMissing {
+            path: source_path.display().to_string(),
+        });
+    }
+
+    sqlite_vacuum_into(&connect, &out_path)?;
+    sqlite_verify_artifact(&out_path)?;
+    eprintln!("  \u{2713} {file_name} verified.");
+
+    let manifest = Manifest {
+        autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
+        created_at: now_utc().to_rfc3339(),
+        profile: profile.to_owned(),
+        format: SQLITE_FORMAT.to_owned(),
+        targets: vec![ManifestTarget {
+            label: target.label.clone(),
+            file: file_name,
+            database: source_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        }],
+    };
+    write_manifest(run_dir, &manifest)
+}
+
+/// `autumn db backup` for a `SQLite` target. Reuses the shared run-directory +
+/// manifest + `--keep` retention machinery; the only backend-specific step is the
+/// `VACUUM INTO` snapshot in [`sqlite_backup_into`].
+fn sqlite_backup(
+    args: &BackupArgs,
+    targets: &[ResolvedTarget],
+    profile: &str,
+) -> Result<(), BackupError> {
+    // A SQLite primary has no shards (`resolve_targets` already rejects `--shard`
+    // against one), so only the control database is captured.
+    let target = targets
+        .iter()
+        .find(|t| t.label == "control")
+        .ok_or(BackupError::NoUrl)?;
+
+    // Offsite upload of SQLite snapshots is not yet wired; reject an explicit
+    // request rather than silently drop it.
+    if args.upload {
+        return Err(BackupError::SqliteOffsiteUnsupported);
+    }
+
+    let root = backup_root(args.dir.as_deref(), profile);
+    let run_dir = create_unique_run_dir(&root, &run_dir_name(&now_utc()))?;
+
+    // On ANY failure remove the whole run directory so a partial artifact is never
+    // left behind or counted toward retention (mirrors the Postgres path).
+    if let Err(e) = sqlite_backup_into(&run_dir, target, profile) {
+        let _ = std::fs::remove_dir_all(&run_dir);
+        return Err(e);
+    }
+
+    eprintln!(
+        "\n\u{2713} Backup complete: {} (SQLite snapshot).",
+        run_dir.display()
+    );
+
+    if let Some(keep) = args.keep {
+        prune(&root, keep)?;
+    }
+    Ok(())
+}
+
+/// Locate the single snapshot file inside a restore artifact: the control entry
+/// of a run directory's manifest, or the bare `.sqlite` file itself.
+fn sqlite_discover_artifact(path: &Path) -> Result<PathBuf, BackupError> {
+    if path.is_dir() {
+        let manifest = read_manifest(path)?;
+        let entry = manifest
+            .targets
+            .iter()
+            .find(|t| t.label == "control")
+            .or_else(|| manifest.targets.first())
+            .ok_or_else(|| BackupError::BadArtifact {
+                detail: format!("{} has no SQLite target in its manifest", path.display()),
+            })?;
+        return Ok(path.join(&entry.file));
+    }
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    Err(BackupError::BadArtifact {
+        detail: format!("{} does not exist", path.display()),
+    })
+}
+
+/// Resolve the live `SQLite` file the app reads, via the SAME migrate resolution
+/// `resolve_targets_for_restore` uses, so a restore writes exactly the file a
+/// backup would have captured under this profile.
+fn sqlite_restore_target(profile: Option<&str>) -> Result<PathBuf, BackupError> {
+    let control_entry = ManifestTarget {
+        label: "control".to_owned(),
+        file: String::new(),
+        database: String::new(),
+    };
+    let (_, url) = resolve_targets_for_restore(profile, std::slice::from_ref(&control_entry))?
+        .into_iter()
+        .next()
+        .ok_or(BackupError::NoUrl)?;
+
+    // Refuse to write a SQLite snapshot over a non-SQLite live target.
+    if !matches!(
+        autumn_web::config::DatabaseBackend::detect(&url),
+        Some(autumn_web::config::DatabaseBackend::Sqlite)
+    ) {
+        return Err(BackupError::SqliteTargetMismatch);
+    }
+
+    let connect = sqlite_connect_target(&url);
+    sqlite_file_path(&connect).ok_or(BackupError::SqliteInMemory)
+}
+
+/// `autumn db restore` for a `SQLite` snapshot: verify the artifact's integrity,
+/// then atomically replace the live data file. The production `guard_destructive`
+/// gate already ran in [`restore`].
+fn sqlite_restore(args: &RestoreArgs) -> Result<(), BackupError> {
+    let artifact_file = sqlite_discover_artifact(&args.artifact)?;
+    let dest = sqlite_restore_target(args.profile.as_deref())?;
+
+    // Verify BEFORE mutating anything — refuse to start a destructive restore we
+    // can't finish (parity with the Postgres verify-before-restore protocol).
+    sqlite_verify_artifact(&artifact_file)?;
+    eprintln!("  \u{2713} {} integrity verified.", artifact_file.display());
+
+    sqlite_replace_file(&artifact_file, &dest)?;
+    eprintln!("\n\u{2713} Restore complete: {} restored.", dest.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4403,5 +4825,291 @@ mod tests {
         assert_eq!(got, vec![(1, "alpha"), (2, "beta"), (3, "gamma")]);
 
         conn.batch_execute("DROP TABLE backup_rt;").ok();
+    }
+
+    // ─── SQLite backup / restore engine (issue #1909) ────────────────────────
+    //
+    // These run against a real, file-backed `diesel::SqliteConnection` (a
+    // workspace dependency in every build), so no cargo feature or external tool
+    // is needed — a plain `cargo test -p autumn-cli` exercises them.
+
+    #[test]
+    fn sqlite_targets_are_detected() {
+        let sqlite = |url: &str| ResolvedTarget {
+            label: "control".to_owned(),
+            url: url.to_owned(),
+        };
+        assert!(targets_are_sqlite(&[sqlite("sqlite://app.db")]));
+        assert!(targets_are_sqlite(&[sqlite("sqlite:/var/lib/app.db")]));
+        assert!(targets_are_sqlite(&[sqlite("file:/srv/app.db")]));
+        // A Postgres target must NOT route to the sqlite engine.
+        assert!(!targets_are_sqlite(&[sqlite("postgres://u@h/db")]));
+        // Empty set is not sqlite.
+        assert!(!targets_are_sqlite(&[]));
+    }
+
+    #[test]
+    fn artifact_is_sqlite_by_extension_and_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Bare `.sqlite` file → sqlite; `.dump` / `.sql` → not.
+        let snap = tmp.path().join("control.sqlite");
+        std::fs::write(&snap, b"x").unwrap();
+        assert!(artifact_is_sqlite(&snap));
+        let dump = tmp.path().join("control.dump");
+        std::fs::write(&dump, b"x").unwrap();
+        assert!(!artifact_is_sqlite(&dump));
+
+        // A run directory whose manifest is `sqlite` → sqlite; `custom` → not.
+        let sqlite_run = tmp.path().join("run-sqlite");
+        std::fs::create_dir(&sqlite_run).unwrap();
+        write_manifest(
+            &sqlite_run,
+            &Manifest {
+                autumn_version: "0".to_owned(),
+                created_at: "now".to_owned(),
+                profile: "dev".to_owned(),
+                format: SQLITE_FORMAT.to_owned(),
+                targets: vec![],
+            },
+        )
+        .unwrap();
+        assert!(artifact_is_sqlite(&sqlite_run));
+
+        let pg_run = tmp.path().join("run-pg");
+        std::fs::create_dir(&pg_run).unwrap();
+        write_manifest(
+            &pg_run,
+            &Manifest {
+                autumn_version: "0".to_owned(),
+                created_at: "now".to_owned(),
+                profile: "dev".to_owned(),
+                format: "custom".to_owned(),
+                targets: vec![],
+            },
+        )
+        .unwrap();
+        assert!(!artifact_is_sqlite(&pg_run));
+    }
+
+    #[test]
+    fn sqlite_target_and_path_classification() {
+        // URL spellings reduce to the concrete connect target.
+        assert_eq!(sqlite_connect_target("sqlite://app.db"), "app.db");
+        assert_eq!(sqlite_connect_target("sqlite:/var/app.db"), "/var/app.db");
+        assert_eq!(
+            sqlite_connect_target("file:/srv/app.db"),
+            "file:/srv/app.db"
+        );
+        assert_eq!(sqlite_connect_target("sqlite::memory:"), ":memory:");
+        assert_eq!(sqlite_connect_target("sqlite://"), ":memory:");
+
+        // In-memory targets have no file path.
+        for mem in [":memory:", "", "file::memory:", "file:app?mode=memory"] {
+            assert_eq!(sqlite_file_path(mem), None, "{mem} is in-memory");
+        }
+        // File-backed targets resolve to their path.
+        assert_eq!(
+            sqlite_file_path("/srv/app.db"),
+            Some(PathBuf::from("/srv/app.db"))
+        );
+        assert_eq!(
+            sqlite_file_path("file:/srv/app.db"),
+            Some(PathBuf::from("/srv/app.db"))
+        );
+    }
+
+    /// Seed a small file-backed `SQLite` database with three rows.
+    fn seed_sqlite_db(path: &Path) {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::{Connection as _, SqliteConnection};
+        let mut conn = SqliteConnection::establish(&path.to_string_lossy()).unwrap();
+        conn.batch_execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\n\
+             INSERT INTO t (id, name) VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');",
+        )
+        .unwrap();
+    }
+
+    /// Read back the seeded rows from a `SQLite` file.
+    fn read_sqlite_rows(path: &Path) -> Vec<(i32, String)> {
+        use diesel::sql_types::{Integer, Text};
+        use diesel::{
+            Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query,
+        };
+
+        #[derive(QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = Integer)]
+            id: i32,
+            #[diesel(sql_type = Text)]
+            name: String,
+        }
+        let mut conn = SqliteConnection::establish(&path.to_string_lossy()).unwrap();
+        sql_query("SELECT id, name FROM t ORDER BY id")
+            .load::<Row>(&mut conn)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.name))
+            .collect()
+    }
+
+    #[test]
+    fn sqlite_vacuum_verify_replace_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("live.db");
+        seed_sqlite_db(&src);
+
+        // Snapshot into a fresh path, verify it, then restore into a brand-new file.
+        let snapshot = tmp.path().join("snapshot.sqlite");
+        sqlite_vacuum_into(&src.to_string_lossy(), &snapshot).expect("vacuum into");
+        assert!(snapshot.exists(), "snapshot file was written");
+        sqlite_verify_artifact(&snapshot).expect("snapshot passes integrity check");
+
+        let restored = tmp.path().join("nested/restored.db");
+        sqlite_replace_file(&snapshot, &restored).expect("restore replaces atomically");
+
+        assert_eq!(
+            read_sqlite_rows(&restored),
+            vec![
+                (1, "alpha".to_owned()),
+                (2, "beta".to_owned()),
+                (3, "gamma".to_owned())
+            ],
+            "all rows survive backup → restore"
+        );
+    }
+
+    #[test]
+    fn sqlite_replace_overwrites_and_clears_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("live.db");
+        seed_sqlite_db(&src);
+        let snapshot = tmp.path().join("snapshot.sqlite");
+        sqlite_vacuum_into(&src.to_string_lossy(), &snapshot).unwrap();
+
+        // Pre-existing destination with stale WAL/SHM sidecars.
+        let dest = tmp.path().join("target.db");
+        std::fs::write(&dest, b"old contents").unwrap();
+        let wal = tmp.path().join("target.db-wal");
+        let shm = tmp.path().join("target.db-shm");
+        std::fs::write(&wal, b"stale-wal").unwrap();
+        std::fs::write(&shm, b"stale-shm").unwrap();
+
+        sqlite_replace_file(&snapshot, &dest).expect("replace over existing db");
+
+        assert_eq!(
+            read_sqlite_rows(&dest),
+            vec![
+                (1, "alpha".to_owned()),
+                (2, "beta".to_owned()),
+                (3, "gamma".to_owned())
+            ],
+        );
+        assert!(!wal.exists(), "stale -wal sidecar removed");
+        assert!(!shm.exists(), "stale -shm sidecar removed");
+    }
+
+    #[test]
+    fn sqlite_verify_rejects_a_corrupt_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A non-SQLite / corrupt file must fail the integrity check.
+        let corrupt = tmp.path().join("corrupt.sqlite");
+        std::fs::write(&corrupt, b"this is not a sqlite database at all").unwrap();
+        let err = sqlite_verify_artifact(&corrupt).expect_err("corrupt snapshot rejected");
+        assert!(
+            matches!(err, BackupError::IntegrityFailed { .. }),
+            "expected IntegrityFailed, got {err:?}"
+        );
+
+        // A truncated-but-valid-header file is also rejected.
+        let src = tmp.path().join("live.db");
+        seed_sqlite_db(&src);
+        let snapshot = tmp.path().join("snap.sqlite");
+        sqlite_vacuum_into(&src.to_string_lossy(), &snapshot).unwrap();
+        let full = std::fs::read(&snapshot).unwrap();
+        let truncated = tmp.path().join("truncated.sqlite");
+        std::fs::write(&truncated, &full[..full.len() / 2]).unwrap();
+        assert!(
+            matches!(
+                sqlite_verify_artifact(&truncated),
+                Err(BackupError::IntegrityFailed { .. })
+            ),
+            "truncated snapshot rejected"
+        );
+
+        // An empty file is rejected too.
+        let empty = tmp.path().join("empty.sqlite");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(matches!(
+            sqlite_verify_artifact(&empty),
+            Err(BackupError::IntegrityFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn sqlite_backup_into_writes_manifest_and_discovers_for_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("live.db");
+        seed_sqlite_db(&src);
+
+        let run_dir = tmp.path().join("run");
+        std::fs::create_dir(&run_dir).unwrap();
+        let target = ResolvedTarget {
+            label: "control".to_owned(),
+            url: format!("sqlite://{}", src.display()),
+        };
+        sqlite_backup_into(&run_dir, &target, "dev").expect("backup into run dir");
+
+        // The run directory is a self-describing sqlite backup.
+        assert!(artifact_is_sqlite(&run_dir));
+        let manifest = read_manifest(&run_dir).unwrap();
+        assert_eq!(manifest.format, SQLITE_FORMAT);
+        assert_eq!(manifest.targets.len(), 1);
+        assert_eq!(manifest.targets[0].file, "control.sqlite");
+
+        // Discover + restore from the run directory into a fresh file.
+        let artifact = sqlite_discover_artifact(&run_dir).expect("discover control snapshot");
+        assert_eq!(artifact, run_dir.join("control.sqlite"));
+        sqlite_verify_artifact(&artifact).expect("run-dir snapshot verifies");
+        let restored = tmp.path().join("restored.db");
+        sqlite_replace_file(&artifact, &restored).unwrap();
+        assert_eq!(read_sqlite_rows(&restored).len(), 3);
+
+        // A bare `.sqlite` file is also discoverable.
+        assert_eq!(
+            sqlite_discover_artifact(&artifact).unwrap(),
+            artifact,
+            "bare snapshot file discovers itself"
+        );
+    }
+
+    #[test]
+    fn sqlite_backup_into_rejects_in_memory_and_missing_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run");
+        std::fs::create_dir(&run_dir).unwrap();
+
+        // In-memory has no file to snapshot.
+        let mem = ResolvedTarget {
+            label: "control".to_owned(),
+            url: "sqlite::memory:".to_owned(),
+        };
+        assert!(matches!(
+            sqlite_backup_into(&run_dir, &mem, "dev"),
+            Err(BackupError::SqliteInMemory)
+        ));
+
+        // A missing source file is a clear error, not an empty snapshot.
+        let missing = ResolvedTarget {
+            label: "control".to_owned(),
+            url: format!(
+                "sqlite://{}",
+                tmp.path().join("does-not-exist.db").display()
+            ),
+        };
+        assert!(matches!(
+            sqlite_backup_into(&run_dir, &missing, "dev"),
+            Err(BackupError::SqliteSourceMissing { .. })
+        ));
     }
 }

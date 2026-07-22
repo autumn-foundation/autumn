@@ -2420,17 +2420,20 @@ fn check_pg_client_tools_with(tools: &crate::db::backup::PgTools) -> CheckResult
 /// `SQLite`-target variant of the pg-client-tools check (`SQLite` foundation,
 /// issue #1614). `pg_dump`/`pg_restore` are Postgres-only, so their absence is
 /// not a problem for a `SQLite` app — warning about them would be misleading.
-/// `SQLite` backup/restore is not yet wired (tracked in #1909), so this is an
-/// honest informational Pass rather than a claim that backups work today.
+/// `SQLite` backup/restore is now wired natively (issue #1909): `autumn db
+/// backup` / `autumn db restore` snapshot the data file with `VACUUM INTO` and an
+/// integrity-checked file replacement, needing no external client tools at all.
 fn check_pg_client_tools_sqlite() -> CheckResult {
     CheckResult {
         name: "pg_client_tools",
         status: CheckStatus::Pass,
         detail: Some(
-            "SQLite app: PostgreSQL client tools (pg_dump/pg_restore) are not required".into(),
+            "SQLite app: PostgreSQL client tools (pg_dump/pg_restore) are not required; \
+             `autumn db backup`/`restore` snapshot the data file natively"
+                .into(),
         ),
         hint: Some(
-            "SQLite backup/restore is tracked in https://github.com/autumn-foundation/autumn/issues/1909",
+            "SQLite backup/restore uses VACUUM INTO + an integrity-checked restore (issue #1909, https://github.com/autumn-foundation/autumn/issues/1909)",
         ),
     }
 }
@@ -13879,12 +13882,15 @@ foo = "bar"
 
     /// `SQLite` foundation (issue #1614): the pg-client-tools check must not warn
     /// about missing `pg_dump`/`pg_restore` on a `SQLite` app; it Passes and
-    /// points at #1909 (`SQLite` backup/restore is not yet wired).
+    /// cites #1909, where `SQLite` backup/restore is now wired natively (VACUUM
+    /// INTO + integrity-checked restore, no external client tools).
     #[test]
     fn pg_client_tools_sqlite_variant_passes_and_cites_1909() {
         let r = check_pg_client_tools_sqlite();
         assert_eq!(r.status, CheckStatus::Pass);
         assert!(r.hint.unwrap_or_default().contains("1909"));
+        // Must no longer claim backups aren't wired.
+        assert!(!r.detail.unwrap_or_default().contains("not yet"));
     }
 
     /// `SQLite` foundation (issue #1614), finding F20: the pending-migration

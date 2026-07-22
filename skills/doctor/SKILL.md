@@ -187,10 +187,12 @@ deploy, zero-downtime cutover with auto-rollback on redeploy, and on-demand
 
 For an app whose resolved primary database is `sqlite://…`, `autumn doctor`
 adapts Postgres-specific checks: the `pg_dump`/`pg_restore` client-tools check
-reports informationally (those tools are not required for a SQLite app;
-SQLite backup/restore is tracked in #1909) rather than warning misleadingly. A
-`sqlite://` URL is only accepted as the lone primary in a single-role,
-single-host topology (SQLite is single-writer / no read-replica role).
+reports informationally (those tools are not required for a SQLite app —
+`autumn db backup`/`restore` snapshot the data file natively via `VACUUM INTO` +
+an integrity-checked restore, no client tools and no cargo-feature flip; #1909)
+rather than warning misleadingly. A `sqlite://` URL is only accepted as the lone
+primary in a single-role, single-host topology (SQLite is single-writer / no
+read-replica role).
 
 ## Secrets redaction
 

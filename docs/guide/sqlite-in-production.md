@@ -142,10 +142,10 @@ buckets on SQLite:
 | `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** |
 | Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | ⛔ **Planned — #1905** (multi-replica boot-refuse ships now) |
 | Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | ⛔ **Planned — #1905** |
-| `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** |
+| `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). SQLite uses a native `VACUUM INTO` snapshot + integrity-checked restore — **no `pg_dump`/`pg_restore` and no cargo-feature flip needed** (works in the default `autumn` binary). | ✅ **Available now — #1909** |
 | `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
 | Retention sweeps | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
-| `autumn deploy` data-file persistence | ✅ | ✅ | SQLite data file treated as **persistent state**; deploy/rollback never clobbers it. | ⛔ **Planned — #1909** |
+| `autumn deploy` data-file persistence | ✅ | ✅ | SQLite data file treated as **persistent state**; deploy preflight blocks a relative / in-release / in-memory data path that a cutover would orphan, so the file must live on the persistent `shared/` path. | ✅ **Available now — #1909** (preflight guard; auto-relocation deferred) |
 | Read replicas (`replica_url`) | ✅ | ⛔ | **Boot-refuse.** No networked replicas on a single-file DB — out of scope. | ✅ **Available now — boot-refuse** |
 | Sharding / shard directory | ✅ | ⛔ | **Boot-refuse.** Native sharding is Postgres-only. | ✅ **Available now — boot-refuse** |
 | Full-text search (`--searchable` / `#[searchable]`) | ✅ `tsvector` + GIN | ✅ FTS5 | **Available now on both backends.** Postgres uses a `tsvector` generated column + GIN index; SQLite uses an external-content **FTS5** virtual table with `unicode61` tokenization and `bm25` ranking (weights from `#[searchable(weight=…)]`). The `--searchable` / `#[searchable]` scaffold generates on both (#1910 / #2047). | ✅ **Available now** |
@@ -203,8 +203,9 @@ Postgres-shaped. Tracked under the runtime slice #1905.
 
 The support-matrix rows still marked **Planned** name follow-on subsystem slices
 whose SQLite support has not landed yet (sessions/auth #1908, durable jobs and
-`#[scheduled]` tasks #1907, backup/restore/scrub/retention/deploy persistence
-#1909). A **Planned** row does **not** mean the app refuses to boot — the runtime
+`#[scheduled]` tasks #1907, `db scrub`/retention #1909). SQLite `db backup`/
+`restore` and the `autumn deploy` data-file-persistence preflight guard have
+landed (#1909). A **Planned** row does **not** mean the app refuses to boot — the runtime
 boots and serves; those subsystems are simply not wired for SQLite until their
 tracking issue lands.
 
@@ -274,10 +275,31 @@ be durable. See [Jobs](./jobs.md).
 ### Backup, restore, scrub, retention
 
 `autumn db backup` takes an **online-safe snapshot** of the SQLite file — safe to
-run against a live app, and it neither corrupts nor blocks it. `restore`,
-[`db scrub`](./daemon.md) (#1602), and retention sweeps (#1605) all operate on
-the SQLite file through the same command surface as Postgres. Snapshot backup —
-not streaming replication — is the durability story for this tier.
+run against a live app, and it neither corrupts nor blocks it. On a `sqlite://`
+target the command routes away from `pg_dump`/`pg_restore` entirely (#1909): it
+runs SQLite's `VACUUM INTO` to write a clean, consistent single-file snapshot
+(correct even while the app holds the database open in WAL mode), verifies it with
+`PRAGMA integrity_check`, and records it in the same self-describing run-directory
++ `manifest.json` layout the Postgres path uses (so `--keep` retention works
+unchanged). `autumn db restore` verifies the snapshot's integrity first, then
+atomically replaces the live data file (stage-next-to-destination → `fsync` →
+`rename`) and clears the previous file's stale `-wal`/`-shm` sidecars — stop the
+app during a restore, exactly as for a `pg_restore` overwrite. This needs **no
+external client tools and no cargo-feature flip**, so the shipped default `autumn`
+binary can back up and restore a SQLite app. `db offsite` upload of SQLite
+snapshots is not yet wired (a SQLite run directory is a portable single-file
+snapshot you can copy offsite yourself). [`db scrub`](./daemon.md) (#1602) and
+retention sweeps (#1605) still operate on the SQLite file through the same command
+surface as Postgres. Snapshot backup — not streaming replication — is the
+durability story for this tier.
+
+For `autumn deploy`, the SQLite data file must live on a **stable path outside the
+per-release directories** — the persistent `{app_dir}/shared/` directory the
+deploy already provisions is the canonical home — so a release cutover never
+orphans or clobbers it. Deploy preflight (#1909) blocks a deploy whose configured
+`sqlite://` path is relative (resolves inside a release's working dir), points
+inside `{app_dir}/releases/…` or through `{app_dir}/current/…`, or is in-memory,
+with an actionable message pointing at `sqlite://{app_dir}/shared/app.db`.
 
 ---
 

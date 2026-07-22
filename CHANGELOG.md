@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli:** `autumn db backup` / `autumn db restore` now support **SQLite**
+  targets natively (#1909). When the resolved database is a `sqlite://` /
+  `sqlite:` / `file:` URL, backup takes a consistent single-file snapshot with
+  SQLite's `VACUUM INTO` (clean even while the app holds the database open in WAL
+  mode), verifies it with `PRAGMA integrity_check`, and records it in the same
+  run-directory + `manifest.json` layout the Postgres path uses (so `--keep`
+  retention works unchanged); restore verifies the snapshot's integrity, then
+  atomically replaces the live data file (stage → `fsync` → `rename`) and clears
+  stale `-wal`/`-shm` sidecars. The engine uses the workspace `diesel` SQLite
+  backend directly — **no `pg_dump`/`pg_restore` and no cargo-feature flip** — so
+  the shipped default `autumn` binary can back up and restore a SQLite app; the
+  Postgres path is unchanged. `autumn doctor`'s SQLite client-tools note is
+  updated accordingly. Offsite upload of SQLite snapshots is not yet wired.
+  `autumn deploy` preflight additionally blocks a SQLite data-file path that a
+  release cutover would orphan (a relative path, one inside `releases/`/`current`,
+  or in-memory), pointing the operator at the persistent `shared/` directory so
+  the database survives deploys.
+
 - **test-support:** `autumn_web::test::drain_ready_repository_commit_hooks(pool, max_rows)`
   deterministically claims and runs ready durable repository commit hooks in
   integration tests — driving the real worker→drain wiring without starting the
