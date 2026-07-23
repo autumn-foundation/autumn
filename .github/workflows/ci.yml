@@ -363,7 +363,8 @@ jobs:
             --test sim_chaos \
             --test sqlite_jobs_scheduler_e2e \
             --test sim_sqlite_substrate \
-            --test sim_sqlite_integration
+            --test sim_sqlite_integration \
+            --test sim_chaos_crash
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings
