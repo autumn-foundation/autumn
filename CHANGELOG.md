@@ -262,8 +262,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TestApp` via `TestApp::with_db(...)`, which is exactly the seam W2's
   `Sim::build(TestApp)` consumes — so W2 wires it into the `Sim` app mount in a
   follow-up. (0.7.0 work — do not merge until v0.6.0 is cut.)
+- **sim-testing:** the deterministic simulation harness (#1797) gained its
+  **chaos lane** — a seed-driven fault-injection builder. `sim::Chaos`
+  (`#[non_exhaustive]`, opt-in via the new `Sim::chaos(...)` setter) turns on
+  three reproducible faults: `db_transient_errors(p)` (a probability that a `Db`
+  checkout returns a retryable `service_unavailable` error), `job_duplicate_delivery(p)`
+  (a probability that a job is delivered — and executed — twice, via an
+  enqueue-seam re-enqueue of the same `(name, payload)`, to test idempotency),
+  and `clock_skew(dur)` (a deterministic wall-clock offset in `[0, dur]` applied
+  through a wrapping `ClockSource`). Every fault decision is drawn from a
+  **dedicated seeded entropy stream** (`seed ^ salt`, independent of the
+  app-facing `Entropy` source), so the **same seed and configuration replay the
+  same fault schedule byte-for-byte**; the schedule is recorded and readable via
+  the hidden `Sim::__chaos_events()`. `Sim::build` installs the hooks (DB / job
+  interceptors + skew clock) only when the config is active, so a default
+  (empty) `Chaos` leaves the build byte-for-byte unchanged. Probabilities are
+  clamped to `[0.0, 1.0]`. This is W5.0 (chaos scaffolding + chaos-v1 base); the
+  richer per-fault surfaces build additively on it. [no-plugin]
 ### Fixed
 
+- **ci:** wire the `sim_sqlite_substrate` (W4) integration test into the
+  `sqlite-runtime` job's `cargo test --features "sqlite,test-support"`
+  invocation (alongside `sim_chaos`) so it actually runs in CI, and fix a
+  private/redundant intra-doc link in the `sim::Chaos` rustdoc that broke the
+  documentation-build gate (#1797). [no-plugin]
 - **migrate:** the two `SQLite` migration entry points — `run_pending_sqlite`
   (up) and `revert_user_migrations_sqlite` (down) — now serialize their whole
   list→plan→apply/revert sequence under a single shared `BEGIN IMMEDIATE` write

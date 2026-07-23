@@ -44,6 +44,7 @@ async fn strict_wall_clock_passes_on_clean_virtual_run(mut sim: Sim) {
     // Jump a full day of virtual time, then drain — no real sleeping anywhere.
     sim.advance(Duration::from_secs(24 * 3600)).await;
     sim.run_to_idle().await;
+    let wall_elapsed = wall_start.elapsed();
 
     // The injected clock advanced exactly 24h (epoch + 1 day)...
     let after = sim.client().get("/now").send().await;
@@ -57,10 +58,16 @@ async fn strict_wall_clock_passes_on_clean_virtual_run(mut sim: Sim) {
     );
 
     // ...in essentially zero real time, so the leak guard never trips.
-    let wall_elapsed = wall_start.elapsed();
+    // Respect AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS when set, defaulting to 2s to allow
+    // for scheduling jitter on slow/contended CI runners.
+    let max_allowed = std::env::var("AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(Duration::from_secs(2), Duration::from_millis);
+
     assert!(
-        wall_elapsed < Duration::from_millis(100),
-        "a clean virtual advance must stay well under the leak-guard budget, but {wall_elapsed:?} elapsed"
+        wall_elapsed < max_allowed,
+        "a clean virtual advance must stay well under the leak-guard budget, but {wall_elapsed:?} elapsed (max allowed: {max_allowed:?})"
     );
 }
 

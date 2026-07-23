@@ -475,7 +475,7 @@ fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
+const fn set_mode(_path: &Path, _mode: u32) {}
 
 /// Poll `systemctl is-system-running` over ssh until the container's systemd has
 /// finished booting (returns `running`/`degraded`), tolerating the early-boot

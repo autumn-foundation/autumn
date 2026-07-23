@@ -1162,7 +1162,6 @@ fn plan_auth_options_impl(
     // Determine the target app's database backend so the scaffolded migrations
     // emit backend-aware DDL (issue #1927), matching the base auth plan above.
     let backend = super::detect_backend(project_root);
-
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let user_table = pluralize(&snake_name);

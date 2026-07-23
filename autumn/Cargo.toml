@@ -644,6 +644,17 @@ path = "tests/sqlite_transactional_url_pool.rs"
 name = "sim_sqlite_substrate"
 path = "tests/sim_sqlite_substrate.rs"
 
+# W5.0 chaos DoD (issue #1797): deterministic fault injection over the in-memory
+# SQLite sim substrate. Same isolated-binary rationale as `sim_sqlite_substrate`
+# above — Postgres-typed consolidated binary does not compile under `sqlite`, and
+# it needs `test-support` for the public `TestApp` harness, so the file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]` and a default
+# `cargo test` compiles it to an empty (passing) binary. Runs without Docker. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_chaos`.
+[[test]]
+name = "sim_chaos"
+path = "tests/sim_chaos.rs"
+
 # Sim-testing W4 ↔ W2 integration (issue #1797): wires the merged W4
 # `sim::substrate::SqliteSubstrate` (#2106) through the merged W2 public `Sim` API
 # (#2104). Drives a 24h-backoff `#[job]` to completion via `sim.build` +
