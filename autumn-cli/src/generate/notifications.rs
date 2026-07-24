@@ -510,9 +510,14 @@ async fn main() {
             "_create_notifications/down.sql",
         ] {
             assert!(
-                plan.actions
-                    .iter()
-                    .any(|a| a.path().to_string_lossy().ends_with(suffix)),
+                plan.actions.iter().any(|a| {
+                    // Normalize so the assertion also holds under Windows
+                    // path separators.
+                    a.path()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .ends_with(suffix)
+                }),
                 "plan must include migrations/<ts>{suffix}"
             );
         }
