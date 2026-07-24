@@ -976,6 +976,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_store_round_trips_null_payload() {
+        // A JSON `null` payload must round-trip as `Value::Null`, not be
+        // confused with "no payload".
+        let notifications = Notifications::new(MemoryNotificationStore::new());
+        let n = notifications
+            .notify(1, "k", Value::Null)
+            .await
+            .expect("notify");
+        assert_eq!(n.payload, Value::Null);
+        let feed = notifications
+            .list(1, &ListQuery::default(), &PageRequest::default())
+            .await
+            .expect("list");
+        assert_eq!(feed.content[0].payload, Value::Null);
+    }
+
+    #[tokio::test]
     async fn memory_store_round_trips_payload() {
         let notifications = Notifications::new(MemoryNotificationStore::new());
         let n = notifications

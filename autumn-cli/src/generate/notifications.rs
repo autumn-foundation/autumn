@@ -147,22 +147,28 @@ pub fn plan_notifications(project_root: &Path) -> Result<Plan, GenerateError> {
 
 /// Fully-qualified route entries for `routes![...]` wiring in `main.rs`.
 ///
-/// The demo login is deliberately **absent**: it is a test-only
-/// session-seeding route declared inside the smoke test, never wired into
-/// the production router — shipping it would expose
-/// `POST /notifications/demo_login/{id}` and let an unauthenticated visitor
-/// impersonate any recipient (PR #2144 finding A).
+/// Only the **session-scoped read/mark** routes are wired by default — the
+/// recipient is derived server-side, so these are safe to deploy as-is.
+///
+/// Two handlers are deliberately **absent** from production wiring because
+/// each takes a recipient from the request and would be exploitable if
+/// shipped unguarded (PR #2144 findings A/C):
+/// - `demo_login` — a test-only session seeder, declared only in the smoke
+///   test (never in the production module); shipping it would let an
+///   unauthenticated visitor impersonate any recipient.
+/// - `notify` — a demo write handler present in the production module as an
+///   example, but not registered here: it accepts an arbitrary
+///   `recipient_id`/`kind`/`payload` from the body, so wiring it unguarded
+///   would let anyone create notifications for anyone. Wire it behind your
+///   own auth, or — preferred — delete it and call
+///   `notifications.notify(...)` directly from the domain action that
+///   triggers the notification. The smoke test registers it in its own test
+///   router to exercise the write path.
 fn route_entries() -> Vec<String> {
-    [
-        "notify",
-        "feed",
-        "unread_count",
-        "mark_read",
-        "mark_all_read",
-    ]
-    .iter()
-    .map(|handler| format!("notifications::{handler}"))
-    .collect()
+    ["feed", "unread_count", "mark_read", "mark_all_read"]
+        .iter()
+        .map(|handler| format!("notifications::{handler}"))
+        .collect()
 }
 
 /// The existing `migrations/<ts>_create_notifications/` directory, if the
@@ -299,18 +305,23 @@ pub struct NotifyBody {
     pub payload: serde_json::Value,
 }
 
-/// `POST /notifications` — create a notification from a JSON body and return
-/// the stored record.
+/// `POST /notifications` — DEMO write handler: create a notification from a
+/// JSON body and return the stored record.
 ///
-/// The recipient comes from the body here because server-side notifies are
-/// legitimately cross-recipient (one user's action notifies another) — but
-/// that makes this demo route a spam vector as-is.
+/// This is a worked example, **not wired into the app by default**: it is
+/// deliberately absent from `main.rs`'s `routes![...]` (see `route_entries`
+/// in the generator) because the recipient comes from the request body.
+/// Server-side notifies are legitimately cross-recipient (one user's action
+/// notifies another), which is exactly why the recipient can't be derived
+/// from the caller's session — and why an unguarded `POST /notifications`
+/// would let anyone spam anyone.
 ///
-/// SECURITY / TODO: before shipping, protect or remove this route — e.g.
-/// restrict it to an admin/service caller, or delete it and call
-/// `notifications.notify(...)` from the domain action that triggers the
-/// notification (a new comment, a mention, …). Otherwise anyone can notify
-/// anyone.
+/// SECURITY / TODO: to expose a write endpoint, register this behind your own
+/// authorization (restrict it to an admin/service caller). Preferred: delete
+/// this handler and call `notifications.notify(recipient_id, kind, payload)`
+/// directly from the domain action that triggers the notification (a new
+/// comment, a mention, …). The smoke test registers this handler in its own
+/// test router to exercise the write path.
 #[post("/notifications")]
 pub async fn notify(
     notifications: Notifications,
@@ -1057,7 +1068,6 @@ async fn main() {
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(main.contains("mod notifications;"), "{main}");
         for entry in [
-            "notifications::notify",
             "notifications::feed",
             "notifications::unread_count",
             "notifications::mark_read",
@@ -1072,6 +1082,19 @@ async fn main() {
         assert!(
             !main.contains("demo_login"),
             "main.rs must not register the test-only demo login: {main}"
+        );
+        // The demo `notify` write handler (arbitrary body-supplied recipient)
+        // must NOT be wired into the production router either (PR #2144
+        // finding C) — it stays an unregistered example in the module.
+        assert!(
+            !main.contains("notifications::notify"),
+            "main.rs must not register the unguarded demo notify route: {main}"
+        );
+        assert!(
+            fs::read_to_string(tmp.path().join("src/notifications.rs"))
+                .unwrap()
+                .contains("pub async fn notify("),
+            "the notify example handler still lives in the module, just unwired"
         );
     }
 
@@ -1310,7 +1333,7 @@ async fn main() {
             assert!(
                 fs::read_to_string(&main_path)
                     .unwrap()
-                    .contains("notifications::notify")
+                    .contains("notifications::feed")
             );
 
             let destroy_plan = plan_notifications(tmp.path()).unwrap();
