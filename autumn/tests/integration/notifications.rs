@@ -398,6 +398,146 @@ mod push {
     }
 }
 
+// ── Review-pass hardening tests ───────────────────────────────────────────
+
+/// A custom store registered on the builder pre-empts the default
+/// resolution and receives every service call made through the extractor.
+mod custom_store_registration {
+    use super::*;
+    use autumn_web::notifications::{NotificationStore, NotificationStoreError};
+    use autumn_web::prelude::*;
+    use autumn_web::test::TestApp;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Delegates to a memory store while counting notify calls, proving the
+    /// registered instance (not a lazily created default) serves requests.
+    struct CountingStore {
+        inner: MemoryNotificationStore,
+        notifies: Arc<AtomicUsize>,
+    }
+
+    impl NotificationStore for CountingStore {
+        async fn notify(
+            &self,
+            recipient_id: i64,
+            kind: String,
+            payload: serde_json::Value,
+        ) -> Result<Notification, NotificationStoreError> {
+            self.notifies.fetch_add(1, Ordering::SeqCst);
+            self.inner.notify(recipient_id, kind, payload).await
+        }
+        async fn list(
+            &self,
+            recipient_id: i64,
+            query: &ListQuery,
+            page: &PageRequest,
+        ) -> Result<Page<Notification>, NotificationStoreError> {
+            self.inner.list(recipient_id, query, page).await
+        }
+        async fn unread_count(&self, recipient_id: i64) -> Result<u64, NotificationStoreError> {
+            self.inner.unread_count(recipient_id).await
+        }
+        async fn mark_read(
+            &self,
+            id: i64,
+            recipient_id: Option<i64>,
+        ) -> Result<u64, NotificationStoreError> {
+            self.inner.mark_read(id, recipient_id).await
+        }
+        async fn mark_all_read(&self, recipient_id: i64) -> Result<u64, NotificationStoreError> {
+            self.inner.mark_all_read(recipient_id).await
+        }
+    }
+
+    #[post("/custom-notify/{rid}")]
+    async fn notify_route(
+        Path(rid): Path<i64>,
+        notifications: Notifications,
+    ) -> AutumnResult<Json<Notification>> {
+        Ok(Json(notifications.notify(rid, "custom", json!({})).await?))
+    }
+
+    #[tokio::test]
+    async fn with_notification_store_preempts_the_default_resolution() {
+        let notifies = Arc::new(AtomicUsize::new(0));
+        let client = TestApp::new()
+            .routes(routes![notify_route])
+            .with_notification_store(CountingStore {
+                inner: MemoryNotificationStore::new(),
+                notifies: Arc::clone(&notifies),
+            })
+            .build();
+
+        client.post("/custom-notify/1").send().await.assert_ok();
+        client.post("/custom-notify/1").send().await.assert_ok();
+
+        assert_eq!(
+            notifies.load(Ordering::SeqCst),
+            2,
+            "the registered store served the extractor's calls"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_created_at_sort_returns_oldest_first_with_id_tiebreak() {
+    let notifications = service();
+    for i in 0..3 {
+        notifications
+            .notify(6, format!("k{i}"), json!({}))
+            .await
+            .expect("notify");
+    }
+
+    let oldest_first = ListQuery::new(Some("created_at"), SortDir::Asc, &[]);
+    let feed = notifications
+        .list(6, &oldest_first, &PageRequest::default())
+        .await
+        .expect("list");
+    assert_eq!(
+        feed.content
+            .iter()
+            .map(|n| n.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["k0", "k1", "k2"],
+        "ascending created_at with monotonic-id tiebreak"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_notify_assigns_unique_ids() {
+    let notifications = service();
+    let handles: Vec<_> = (0..10)
+        .map(|i| {
+            let notifications = notifications.clone();
+            tokio::spawn(async move { notifications.notify(1, format!("k{i}"), json!({})).await })
+        })
+        .collect();
+
+    let mut ids = std::collections::HashSet::new();
+    for handle in handles {
+        let n = handle.await.expect("join").expect("notify");
+        assert!(ids.insert(n.id), "duplicate id {}", n.id);
+    }
+    assert_eq!(ids.len(), 10);
+    assert_eq!(notifications.unread_count(1).await.expect("count"), 10);
+}
+
+/// `notify_with_push` outside a request context (no channel registry) skips
+/// the push entirely and still persists.
+#[cfg(feature = "ws")]
+#[tokio::test]
+async fn notify_with_push_without_channels_still_persists() {
+    let notifications = service();
+    let n = notifications
+        .notify_with_push(2, "quiet", json!({}))
+        .await
+        .expect("notify_with_push without channels");
+    assert_eq!(n.kind, "quiet");
+    assert_eq!(notifications.unread_count(2).await.expect("count"), 1);
+}
+
 // ── Postgres-backed store (testcontainers, requires Docker) ───────────────
 
 // `not(feature = "sqlite")`: under the app-only `sqlite` feature (which
@@ -425,7 +565,11 @@ mod pg {
          read_at TIMESTAMPTZ, \
          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())";
 
-    async fn setup() -> (Notifications, testcontainers::ContainerAsync<Postgres>) {
+    async fn setup() -> (
+        Notifications,
+        Pool<AsyncPgConnection>,
+        testcontainers::ContainerAsync<Postgres>,
+    ) {
         let container = Postgres::default()
             .start()
             .await
@@ -444,7 +588,8 @@ mod pg {
         drop(conn);
 
         (
-            Notifications::new(DbNotificationStore::new(pool)),
+            Notifications::new(DbNotificationStore::new(pool.clone())),
+            pool,
             container,
         )
     }
@@ -452,7 +597,7 @@ mod pg {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn db_store_supports_the_full_feed_lifecycle() {
-        let (notifications, _container) = setup().await;
+        let (notifications, _pool, _container) = setup().await;
 
         // Write path: notify for a recipient with no prior notifications.
         let a = notifications
@@ -516,7 +661,7 @@ mod pg {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn db_store_mark_read_for_is_recipient_scoped() {
-        let (notifications, _container) = setup().await;
+        let (notifications, _pool, _container) = setup().await;
         let n = notifications
             .notify(1, "a", json!({}))
             .await
@@ -530,5 +675,122 @@ mod pg {
 
         notifications.mark_read_for(1, n.id).await.expect("owner");
         assert_eq!(notifications.unread_count(1).await.expect("count"), 0);
+    }
+
+    /// The `kind` filter, combined `unread`+`kind` filters, and explicit
+    /// `sort=created_at` ordering on the DB store.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn db_store_filters_and_created_at_sort() {
+        let (notifications, _pool, _container) = setup().await;
+        let a = notifications
+            .notify(1, "mention", json!({}))
+            .await
+            .expect("a");
+        let b = notifications.notify(1, "like", json!({})).await.expect("b");
+        let c = notifications
+            .notify(1, "mention", json!({}))
+            .await
+            .expect("c");
+        notifications.mark_read_for(1, a.id).await.expect("read a");
+
+        let page = PageRequest::default();
+        let kind_only = ListQuery::new(None, SortDir::default(), &[("kind", "mention")]);
+        let feed = notifications
+            .list(1, &kind_only, &page)
+            .await
+            .expect("kind");
+        assert_eq!(feed.total_elements, 2);
+        assert!(feed.content.iter().all(|n| n.kind == "mention"));
+
+        let combined = ListQuery::new(
+            None,
+            SortDir::default(),
+            &[("kind", "mention"), ("unread", "true")],
+        );
+        let feed = notifications
+            .list(1, &combined, &page)
+            .await
+            .expect("combined");
+        assert_eq!(feed.total_elements, 1);
+        assert_eq!(feed.content[0].id, c.id);
+
+        let oldest_first = ListQuery::new(Some("created_at"), SortDir::Asc, &[]);
+        let feed = notifications
+            .list(1, &oldest_first, &page)
+            .await
+            .expect("created_at asc");
+        assert_eq!(
+            feed.content.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![a.id, b.id, c.id],
+            "oldest first with id tiebreak"
+        );
+    }
+
+    /// A payload corrupted out of band degrades to a JSON string of the raw
+    /// text instead of failing the whole feed.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn db_store_degrades_unparseable_payload_to_string() {
+        let (notifications, pool, _container) = setup().await;
+        let n = notifications
+            .notify(1, "k", json!({"ok": true}))
+            .await
+            .expect("notify");
+
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query("UPDATE notifications SET payload = 'not json' WHERE id = $1")
+            .bind::<diesel::sql_types::BigInt, _>(n.id)
+            .execute(&mut conn)
+            .await
+            .expect("corrupt payload");
+        drop(conn);
+
+        let (query, page) = default_list();
+        let feed = notifications.list(1, &query, &page).await.expect("list");
+        assert_eq!(feed.content[0].payload, json!("not json"));
+    }
+
+    /// With a DB pool configured, the `Notifications` extractor auto-selects
+    /// the database-backed store (not the memory fallback): rows written
+    /// through a route land in the `notifications` table.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn extractor_auto_selects_db_store_when_pool_is_configured() {
+        use autumn_web::prelude::*;
+        use autumn_web::test::TestApp;
+
+        #[post("/pg-notify/{rid}")]
+        async fn notify_route(
+            Path(rid): Path<i64>,
+            notifications: Notifications,
+        ) -> AutumnResult<Json<Notification>> {
+            Ok(Json(notifications.notify(rid, "via-db", json!({})).await?))
+        }
+
+        #[derive(diesel::QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+
+        let (_notifications, pool, _container) = setup().await;
+        let client = TestApp::new()
+            .routes(routes![notify_route])
+            .with_db(pool.clone())
+            .build();
+
+        client.post("/pg-notify/42").send().await.assert_ok();
+
+        let mut conn = pool.get().await.expect("conn");
+        let row: CountRow =
+            diesel::sql_query("SELECT COUNT(*) AS n FROM notifications WHERE recipient_id = 42")
+                .get_result(&mut conn)
+                .await
+                .expect("count");
+        assert_eq!(
+            row.n, 1,
+            "row persisted in the database, not the memory fallback"
+        );
     }
 }

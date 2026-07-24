@@ -124,7 +124,8 @@ impl Notification {
 // ── Store error ─────────────────────────────────────────────────────────────
 
 /// Error returned by [`NotificationStore`] implementations.
-#[derive(Debug)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[error("notification store error: {message}")]
 pub struct NotificationStoreError {
     message: String,
 }
@@ -138,14 +139,6 @@ impl NotificationStoreError {
         }
     }
 }
-
-impl std::fmt::Display for NotificationStoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "notification store error: {}", self.message)
-    }
-}
-
-impl std::error::Error for NotificationStoreError {}
 
 // ── Store trait ─────────────────────────────────────────────────────────────
 
@@ -445,7 +438,10 @@ impl std::fmt::Debug for Notifications {
 }
 
 impl axum::extract::FromRequestParts<AppState> for Notifications {
-    type Rejection = AutumnError;
+    // Resolution always succeeds (a store fallback always exists); failures
+    // surface from the service methods, not extraction — same contract as
+    // `Session`.
+    type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(
         _parts: &mut axum::http::request::Parts,
@@ -468,9 +464,11 @@ impl axum::extract::FromRequestParts<AppState> for Notifications {
 // ── In-memory store ─────────────────────────────────────────────────────────
 
 /// Process-local [`NotificationStore`] used by default when no database is
-/// configured. Suitable for tests and DB-less development; contents are lost
-/// on restart and the store grows without bound (no eviction), so it is not
-/// a production store.
+/// configured.
+///
+/// Suitable for tests and DB-less development; contents are lost on restart
+/// and the store grows without bound (no eviction), so it is not a
+/// production store.
 #[derive(Debug, Default)]
 pub struct MemoryNotificationStore {
     inner: std::sync::Mutex<MemoryInner>,
@@ -769,6 +767,17 @@ mod db_store {
     }
 
     fn store_err(e: &diesel::result::Error) -> NotificationStoreError {
+        let message = e.to_string();
+        // A missing table means the app has a database but never scaffolded
+        // the notifications feed — turn the bare SQL error into an
+        // actionable one ("relation … does not exist" on Postgres, "no such
+        // table" on SQLite).
+        if message.contains("does not exist") || message.contains("no such table") {
+            return NotificationStoreError::new(format!(
+                "query failed: {e}. The `notifications` table is missing — scaffold it \
+                 with `autumn generate notifications`, then apply it with `autumn migrate`"
+            ));
+        }
         NotificationStoreError::new(format!("query failed: {e}"))
     }
 
