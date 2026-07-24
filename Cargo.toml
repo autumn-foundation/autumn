@@ -1,5 +1,5 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "examples/hello", "examples/flock", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "benchmarks/runtime/gate", "example-e2e"]
+members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "examples/hello", "examples/flock", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/media-room", "benchmarks/runtime/gate", "example-e2e"]
 # The cargo-fuzz crate builds only under nightly with sanitizers and pulls
 # `autumn` in as a path dependency. Excluding it keeps `cargo build/test
 # --workspace` (and the publish gate) untouched; `fuzz/Cargo.toml` is also its
@@ -95,7 +95,7 @@ testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "minio"] }
 # Keep time on the 0.3 release line for the testcontainers/bollard dependency
 # graph used by integration tests.
-time = { version = ">=0.3, <0.3.48" }
+time = { version = ">=0.3, <0.3.55" }
 
 csv = "1.3"
 rust_decimal = "1"

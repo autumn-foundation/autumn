@@ -9,6 +9,7 @@ use autumn_web::auth::{hash_password, validate_password, verify_password};
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::http::{HeaderMap, HeaderValue, header::SET_COOKIE};
 use autumn_web::reexports::axum::response::Response;
+use autumn_web::security::SubmitToken;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde::Deserialize;
@@ -43,7 +44,14 @@ const DUMMY_HASH: &str = "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfN
 /// Render the signup form, optionally with a validation error. The minimum
 /// length reflects the active `[auth.password]` policy so the `minlength`
 /// attribute always matches what the handler enforces.
-fn signup_page(min_len: usize, error: Option<&str>) -> Markup {
+///
+/// `submit_token` is a fresh one-time token embedded as a hidden
+/// `_submit_token` field. The framework's `SubmitTokenLayer` consumes it on the
+/// POST so a double-clicked or browser-retried signup runs exactly once and
+/// cannot create a duplicate account — no client-side JavaScript involved. A
+/// new token is minted on every render (including this error re-render), so the
+/// corrected resubmit carries a fresh token rather than a spent one.
+fn signup_page(min_len: usize, submit_token: &str, error: Option<&str>) -> Markup {
     layout(
         "Sign up",
         false,
@@ -53,6 +61,7 @@ fn signup_page(min_len: usize, error: Option<&str>) -> Markup {
                 p class="mb-4 text-sm text-red-600" role="alert" { (error) }
             }
             form action="/signup" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
+                input type="hidden" name="_submit_token" value=(submit_token);
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
                     input #email type="email" name="email" required autocomplete="email"
@@ -76,14 +85,22 @@ fn signup_page(min_len: usize, error: Option<&str>) -> Markup {
 }
 
 #[get("/signup")]
-pub async fn signup_form(State(state): State<AppState>) -> Markup {
-    signup_page(state.config().auth.password.min_length, None)
+pub async fn signup_form(State(state): State<AppState>, submit_token: SubmitToken) -> Markup {
+    signup_page(
+        state.config().auth.password.min_length,
+        submit_token.token(),
+        None,
+    )
 }
 
 #[post("/signup")]
 pub async fn signup(
     State(state): State<AppState>,
     session: Session,
+    // A fresh token for the error re-render below; the token that guarded THIS
+    // request has already been consumed by `SubmitTokenLayer` before the handler
+    // ran, so the re-rendered form must carry a new one.
+    submit_token: SubmitToken,
     mut db: Db,
     Form(form): Form<SignupForm>,
 ) -> AutumnResult<Response> {
@@ -121,7 +138,12 @@ pub async fn signup(
         } else {
             messages.join("\n")
         };
-        return Ok(signup_page(password_cfg.min_length, Some(&message)).into_response());
+        return Ok(signup_page(
+            password_cfg.min_length,
+            submit_token.token(),
+            Some(&message),
+        )
+        .into_response());
     }
 
     // Each account gets its own isolated tenant; email is the unique identifier

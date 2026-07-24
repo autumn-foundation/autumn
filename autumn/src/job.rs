@@ -637,6 +637,11 @@ pub struct JobClient {
     /// [`crate::entropy::OsEntropy`]; a simulation seeds it via the app's
     /// [`crate::state::AppState::with_entropy`] so job ids replay deterministically.
     entropy: Arc<dyn crate::entropy::Entropy>,
+    /// Injected clock source for recorded job timestamps (`enqueued_at`, due-at
+    /// filtering, backoff-delay math). Defaults to [`crate::time::SystemClock`];
+    /// a simulation pins it via the app's [`crate::state::AppState::with_clock`]
+    /// so recorded timestamps replay deterministically.
+    clock: Arc<dyn crate::time::ClockSource>,
 }
 
 /// Per-job configuration captured from [`JobInfo`] at runtime start.
@@ -1041,6 +1046,10 @@ struct JobAdminMemoryInner {
 #[derive(Clone)]
 pub struct JobAdminMemoryBackend {
     inner: Arc<RwLock<JobAdminMemoryInner>>,
+    /// Injected clock source for recorded lifecycle timestamps. Defaults to
+    /// [`crate::time::SystemClock`]; the built-in runtime threads the app's
+    /// injected clock in so a simulation records deterministic timestamps.
+    clock: Arc<dyn crate::time::ClockSource>,
 }
 
 impl JobAdminMemoryBackend {
@@ -1060,7 +1069,16 @@ impl JobAdminMemoryBackend {
                 history_limit: history_limit.max(1),
                 delay_cancelers: HashMap::new(),
             })),
+            clock: Arc::new(crate::time::SystemClock),
         }
+    }
+
+    /// Replace the injected clock (builder / simulation helper), sharing the
+    /// same underlying store. Mirrors [`crate::state::AppState::with_clock`].
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::ClockSource>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Record an enqueue that may carry a future due time. When `due_at` is in
@@ -1121,7 +1139,7 @@ impl JobAdminMemoryBackend {
         {
             let was_scheduled = record.status == JobAdminStatus::Scheduled;
             record.status = JobAdminStatus::Enqueued;
-            record.enqueued_at = Some(chrono::Utc::now());
+            record.enqueued_at = Some(self.clock.now());
             record.scheduled_for = None;
             record.started_at = None;
             record.finished_at = None;
@@ -1146,7 +1164,7 @@ impl JobAdminMemoryBackend {
             // which point it starts like any other enqueued job.
             JobAdminStatus::Enqueued | JobAdminStatus::Scheduled => {
                 record.status = JobAdminStatus::Running;
-                record.started_at = Some(chrono::Utc::now());
+                record.started_at = Some(self.clock.now());
                 record.scheduled_for = None;
                 record.finished_at = None;
                 record.attempt = attempt;
@@ -1162,7 +1180,7 @@ impl JobAdminMemoryBackend {
             && let Some(record) = inner.records.get_mut(id)
         {
             record.status = JobAdminStatus::Completed;
-            record.finished_at = Some(chrono::Utc::now());
+            record.finished_at = Some(self.clock.now());
             record.last_error = None;
             prune_job_admin_history(&mut inner);
         }
@@ -1173,7 +1191,7 @@ impl JobAdminMemoryBackend {
             && let Some(record) = inner.records.get_mut(id)
         {
             record.status = JobAdminStatus::Retrying;
-            record.finished_at = Some(chrono::Utc::now());
+            record.finished_at = Some(self.clock.now());
             record.last_error = Some(error.to_owned());
         }
     }
@@ -1183,7 +1201,7 @@ impl JobAdminMemoryBackend {
             && let Some(record) = inner.records.get_mut(id)
         {
             record.status = JobAdminStatus::Failed;
-            record.finished_at = Some(chrono::Utc::now());
+            record.finished_at = Some(self.clock.now());
             record.last_error = Some(error);
             prune_job_admin_history(&mut inner);
         }
@@ -1194,7 +1212,7 @@ impl JobAdminMemoryBackend {
             && let Some(record) = inner.records.get_mut(id)
         {
             record.status = JobAdminStatus::Canceled;
-            record.finished_at = Some(chrono::Utc::now());
+            record.finished_at = Some(self.clock.now());
         }
     }
 
@@ -1203,7 +1221,7 @@ impl JobAdminMemoryBackend {
             && let Some(record) = inner.records.get_mut(id)
         {
             record.status = JobAdminStatus::Deduplicated;
-            record.finished_at = Some(chrono::Utc::now());
+            record.finished_at = Some(self.clock.now());
             prune_job_admin_history(&mut inner);
         }
     }
@@ -1224,7 +1242,7 @@ impl JobAdminMemoryBackend {
         }
         let retry = (record.name.clone(), record.payload.clone());
         record.status = JobAdminStatus::Retried;
-        record.finished_at = Some(chrono::Utc::now());
+        record.finished_at = Some(self.clock.now());
         drop(inner);
         Ok(retry)
     }
@@ -1235,7 +1253,7 @@ impl JobAdminMemoryBackend {
             && record.status == JobAdminStatus::Retried
         {
             record.status = JobAdminStatus::Failed;
-            record.finished_at = Some(chrono::Utc::now());
+            record.finished_at = Some(self.clock.now());
         }
     }
 
@@ -1273,7 +1291,7 @@ impl JobAdminMemoryBackend {
             ));
         }
         record.status = JobAdminStatus::Discarded;
-        record.finished_at = Some(chrono::Utc::now());
+        record.finished_at = Some(self.clock.now());
         drop(inner);
         Ok(())
     }
@@ -1297,7 +1315,7 @@ impl JobAdminMemoryBackend {
         }
         record.status = JobAdminStatus::Canceled;
         record.scheduled_for = None;
-        record.finished_at = Some(chrono::Utc::now());
+        record.finished_at = Some(self.clock.now());
         // Pull any pending timer canceler out while we still hold the lock.
         let canceler = inner.delay_cancelers.remove(id);
         drop(inner);
@@ -1340,7 +1358,7 @@ impl JobAdminMemoryBackend {
         let Ok(inner) = self.inner.read() else {
             return JobAdminSnapshot::empty();
         };
-        let now = chrono::Utc::now();
+        let now = self.clock.now();
         let per_page = query.per_page.clamp(1, 100);
         JobAdminSnapshot {
             enqueued: paginate_job_admin_records(
@@ -1405,7 +1423,7 @@ impl JobAdminMemoryBackend {
             attempt,
             max_attempts,
             None,
-            chrono::Utc::now(),
+            self.clock.now(),
         );
         id
     }
@@ -1695,7 +1713,7 @@ fn first_payload_string(payload: &Value, keys: &[&str]) -> Option<String> {
 }
 
 fn default_job_admin_backend_for_state(state: &AppState) -> JobAdminMemoryBackend {
-    let backend = JobAdminMemoryBackend::new();
+    let backend = JobAdminMemoryBackend::new().with_clock(state.clock_arc());
     if job_admin_backend(state).is_none() {
         state.insert_extension(JobAdminBackendEntry(Arc::new(backend.clone())));
     }
@@ -2601,7 +2619,7 @@ impl JobClient {
         // Capture the reference instant once so every downstream decision
         // (filter, admin record status, local-backend sleep) uses a consistent
         // clock reading and near-due jobs cannot be misclassified.
-        let now = chrono::Utc::now();
+        let now = self.clock.now();
         // Only treat a due time strictly in the future as "delayed"; a past or
         // absent due time enqueues for immediate execution exactly as before.
         let due_at = due_at.filter(|due| *due > now);
@@ -2690,7 +2708,7 @@ impl JobClient {
                     // Recompute remaining delay at the moment actual_enqueue
                     // runs (after any interceptor) so the sleep duration stays
                     // accurate even if the interceptor took non-trivial time.
-                    let delay = (due - chrono::Utc::now())
+                    let delay = (due - self.clock.now())
                         .to_std()
                         .unwrap_or(std::time::Duration::ZERO);
                     let sender = sender.clone();
@@ -3192,7 +3210,7 @@ impl JobClient {
         due_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AutumnResult<()> {
         crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
-        let due_at = due_at.filter(|due| *due > chrono::Utc::now());
+        let due_at = due_at.filter(|due| *due > self.clock.now());
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -3641,6 +3659,7 @@ pub(crate) fn start_local_runtime_inner(
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
         entropy: state.entropy_arc(),
+        clock: state.clock_arc(),
         resilience_config: state
             .extension::<crate::config::AutumnConfig>()
             .map(|c| Arc::new(c.resilience.clone())),
@@ -6699,7 +6718,7 @@ fn start_redis_runtime(
     config: &crate::config::JobConfig,
     run_workers: bool,
 ) -> Result<(), AutumnError> {
-    let job_admin = JobAdminMemoryBackend::new();
+    let job_admin = JobAdminMemoryBackend::new().with_clock(state.clock_arc());
     let url = config
         .redis
         .url
@@ -6840,6 +6859,7 @@ fn start_redis_runtime(
                 .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
             entropy: state.entropy_arc(),
+            clock: state.clock_arc(),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
@@ -8091,7 +8111,7 @@ async fn pg_execute_job(
                 // actually claimable. A zero backoff is due-now (`None`).
                 let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
                 let ready_at_ms = (delay_ms > 0).then(|| {
-                    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+                    let now_ms = u64::try_from(state.clock().now().timestamp_millis()).unwrap_or(0);
                     now_ms.saturating_add(u64::try_from(delay_ms).unwrap_or(0))
                 });
                 PgLifecycleRecord::Retry {
@@ -8299,6 +8319,10 @@ struct PgJobAdminBackend {
     /// Job registry whose per-queue waiting gauges the admin-cancel path must
     /// decrement, mirroring the redis backend.
     registry: crate::actuator::JobRegistry,
+    /// Injected clock source for the snapshot window boundaries and the
+    /// admin-cancel scheduled/ready classification. Defaults to
+    /// [`crate::time::SystemClock`]; a simulation pins it for determinism.
+    clock: Arc<dyn crate::time::ClockSource>,
 }
 
 /// Decide which per-queue waiting mark an admin-cancel of a still-enqueued
@@ -8349,7 +8373,7 @@ impl PgJobAdminBackend {
             AutumnError::internal_server_error_msg(format!("pg admin pool error: {e}"))
         })?;
         let per_page = i64::try_from(query.per_page.clamp(1, 100)).unwrap_or(10);
-        let now = chrono::Utc::now();
+        let now = self.clock.now();
 
         let (enqueued, scheduled) = pg_enqueued_and_scheduled_pages(
             &mut conn,
@@ -8525,7 +8549,7 @@ impl PgJobAdminBackend {
         // process. Category-aware, mirroring the redis admin-cancel path and the
         // enqueue side: a still-future `run_at` was a scheduled mark, a
         // ready/past one a ready mark.
-        if pg_cancel_was_scheduled(row.run_at, chrono::Utc::now()) {
+        if pg_cancel_was_scheduled(row.run_at, self.clock.now()) {
             self.registry.record_cancel_scheduled(&row.name);
         } else {
             self.registry.record_cancel(&row.name);
@@ -8780,7 +8804,7 @@ fn start_postgres_runtime(
         ))
     })?;
 
-    let job_admin = JobAdminMemoryBackend::new();
+    let job_admin = JobAdminMemoryBackend::new().with_clock(state.clock_arc());
     let per_job_settings = build_per_job_settings(&jobs);
     let serialize_claims = any_job_has_concurrency(&jobs);
     let jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>> = Arc::new(RwLock::new(
@@ -8802,6 +8826,7 @@ fn start_postgres_runtime(
         state.insert_extension(JobAdminBackendEntry(Arc::new(PgJobAdminBackend {
             pool: pool.clone(),
             registry: state.job_registry.clone(),
+            clock: state.clock_arc(),
         })));
     }
 
@@ -8847,6 +8872,7 @@ fn start_postgres_runtime(
                 .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
             entropy: state.entropy_arc(),
+            clock: state.clock_arc(),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
@@ -9206,6 +9232,7 @@ mod tests {
                 per_job_settings,
                 interceptor: None,
                 entropy,
+                clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
             }
         }
@@ -9262,6 +9289,7 @@ mod tests {
                 per_job_settings: HashMap::new(),
                 interceptor: None,
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
             }
         }
@@ -9323,6 +9351,7 @@ mod tests {
             )]),
             interceptor: None,
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         });
 
@@ -9406,6 +9435,7 @@ mod tests {
             )]),
             interceptor: None,
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         });
 
@@ -9461,6 +9491,7 @@ mod tests {
             )]),
             interceptor: None,
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         });
 
@@ -9519,6 +9550,7 @@ mod tests {
             )]),
             interceptor: None,
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         });
 
@@ -9760,6 +9792,7 @@ mod tests {
             )]),
             interceptor: Some(Arc::new(PanickingEnqueueInterceptor)),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         };
 
@@ -9821,6 +9854,7 @@ mod tests {
             )]),
             interceptor: Some(Arc::new(AsyncPanickingEnqueueInterceptor)),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         };
 
@@ -12715,6 +12749,7 @@ mod tests {
             per_job_settings: HashMap::new(),
             interceptor: None,
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         });
         assert!(global_job_client().is_some());
@@ -14612,6 +14647,7 @@ mod tests {
                 per_job_settings: settings,
                 interceptor: None,
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
             };
 
@@ -14911,6 +14947,7 @@ mod tests {
             let backend = PgJobAdminBackend {
                 pool: pool.clone(),
                 registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
             };
             let snapshot = backend.snapshot(JobAdminQuery::default()).await.unwrap();
 
@@ -14941,6 +14978,7 @@ mod tests {
             let backend = PgJobAdminBackend {
                 pool: pool.clone(),
                 registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
             };
 
             // --- Retry ---
@@ -15035,6 +15073,7 @@ mod tests {
             let backend = PgJobAdminBackend {
                 pool: pool.clone(),
                 registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
             };
 
             let _guard = global_job_runtime_test_lock().lock().await;
@@ -15094,6 +15133,7 @@ mod tests {
             let backend = PgJobAdminBackend {
                 pool: pool.clone(),
                 registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
             };
 
             let _guard = global_job_runtime_test_lock().lock().await;
@@ -15638,6 +15678,7 @@ mod tests {
             let backend = PgJobAdminBackend {
                 pool: pool.clone(),
                 registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
             };
 
             let constraints = unique_constraints("invoice-3", JobUniquenessWindow::Running);
@@ -15752,6 +15793,7 @@ mod tests {
             )]),
             interceptor: None,
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         };
         (client, rx)
@@ -16141,6 +16183,7 @@ mod tests {
                 )]),
                 interceptor: None,
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
             };
             rt.block_on(async {
@@ -16193,6 +16236,7 @@ mod tests {
             per_job_settings: std::collections::HashMap::new(),
             interceptor: None,
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         };
 
@@ -16916,6 +16960,7 @@ mod tests {
             )]),
             interceptor: None,
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         });
 
@@ -16957,6 +17002,7 @@ mod tests {
             )]),
             interceptor: None,
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         });
 
@@ -17108,6 +17154,7 @@ mod tests {
             )]),
             interceptor: None,
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
         });
 

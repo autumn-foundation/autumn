@@ -61,6 +61,7 @@ and skips silently if any todos already exist.
 | GET    | `/`                   | Redirect to `/todos`           |
 | GET    | `/todos`              | List all todos                 |
 | GET    | `/todos/{id}`         | Todo detail page               |
+| GET    | `/todos/summary`      | Todo counts — HTML **or** JSON per `Accept` (content negotiation) |
 | POST   | `/todos`              | Create todo (form submission)  |
 | POST   | `/todos/{id}/toggle`  | Toggle completion (htmx)       |
 | DELETE | `/todos/{id}`         | Delete todo (htmx)             |
