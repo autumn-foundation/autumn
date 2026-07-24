@@ -1186,6 +1186,19 @@ impl TestApp {
         self
     }
 
+    /// Mirrors [`crate::app::AppBuilder::with_notification_store`].
+    #[must_use]
+    pub fn with_notification_store<S>(mut self, store: S) -> Self
+    where
+        S: crate::notifications::NotificationStore,
+    {
+        let service = crate::notifications::Notifications::new(store);
+        self.state_initializers.push(Box::new(move |state| {
+            state.insert_extension(service);
+        }));
+        self
+    }
+
     /// Apply a plugin directly to the test app.
     #[must_use]
     pub fn plugin<P: crate::plugin::Plugin>(mut self, plugin: P) -> Self {

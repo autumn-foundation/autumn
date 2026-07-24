@@ -357,6 +357,7 @@ pub mod middleware;
 /// Content-negotiated success responder (`Negotiate` / `Negotiated` / `Format`).
 #[cfg(feature = "maud")]
 pub mod negotiate;
+pub mod notifications;
 pub mod openapi;
 pub mod pagination;
 pub mod paths;

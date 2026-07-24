@@ -829,6 +829,48 @@ this is *provider-reported* failure.
   recipient fixed their mailbox); `store.suppress(addr, SuppressionReason::Manual)`
   adds one by hand.
 
+## In-app notifications (unreleased — trunk-dev, issue #1148)
+
+A first-class per-recipient notification store with read/unread state — do not
+hand-roll a notifications table, model, and unread-count queries. Scaffold with
+`autumn generate notifications` (backend-aware migration + feed routes + smoke
+test), then use the `Notifications` extractor (in the prelude, surfaced like
+`Session`):
+
+```rust
+use autumn_web::prelude::*;
+
+#[post("/comments")]
+async fn create_comment(notifications: Notifications) -> AutumnResult<&'static str> {
+    notifications
+        .notify(recipient_id, "comment.created", serde_json::json!({"post": 42}))
+        .await?;
+    Ok("ok")
+}
+```
+
+- **API:** `notify(recipient_id, kind, payload)`; `list(recipient_id, &ListQuery,
+  &PageRequest) -> Page<Notification>` (`?filter[unread]=true`,
+  `?filter[kind]=…`, `?sort=created_at|id`, newest-first default);
+  `unread_count(recipient_id)`; idempotent `mark_read(id)` /
+  `mark_read_for(recipient_id, id)` / `mark_all_read(recipient_id)`. In
+  user-facing handlers use `mark_read_for` — it refuses to touch other
+  recipients' rows.
+- **Storage resolution** (mirrors `SessionStore`): a store registered via
+  `AppBuilder::with_notification_store(...)` → `DbNotificationStore` when a DB
+  pool is configured (needs the generated `notifications` table) →
+  `MemoryNotificationStore` (process-local; what `TestApp` without a DB uses,
+  so generated smoke tests need no database).
+- **Realtime push (`ws` feature):** `notify_with_push(...)` persists then
+  publishes the notification JSON on `Notifications::topic(recipient_id)`
+  (`"notifications:{id}"`) — best-effort, a channel failure never fails the
+  notify. In the subscribing WS/SSE handler, derive the topic from the
+  **authenticated** user (`Auth`/session), never a client-supplied id — topics
+  are guessable and carry the full payload; use `subscribe_authorized` /
+  `sse::stream_authorized` for channel-level enforcement.
+- Guide: `docs/guide/notifications.md`. Out of scope by design: bell widget,
+  email/SMS channels, preferences/digests, cross-recipient fan-out.
+
 ## Background work
 
 Use built-in jobs and tasks before reaching for a workflow engine:

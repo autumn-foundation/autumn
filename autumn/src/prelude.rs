@@ -258,6 +258,9 @@ pub use crate::auth::RequireApiToken;
 /// actuator log buffer, the access line, any context-aware layer). See
 /// [`crate::log::context`] for the full surface.
 pub use crate::log::context::with_log_field;
+/// In-app notifications service/extractor (persistent per-recipient feed
+/// with read/unread state). See [`crate::notifications`] for the full surface.
+pub use crate::notifications::Notifications;
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
 /// Tenant extractor and context helpers.

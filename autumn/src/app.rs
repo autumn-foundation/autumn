@@ -2118,6 +2118,40 @@ impl AppBuilder {
         })
     }
 
+    /// Register a notification store, overriding the default resolution used
+    /// by the [`Notifications`] extractor.
+    ///
+    /// Without this call the extractor resolves its store automatically: the
+    /// database-backed [`DbNotificationStore`] when a pool is configured (the
+    /// `notifications` table is scaffolded by `autumn generate
+    /// notifications`), the process-local
+    /// [`MemoryNotificationStore`](crate::notifications::MemoryNotificationStore)
+    /// otherwise. Register a store explicitly to plug in a custom backend.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::notifications::MemoryNotificationStore;
+    ///
+    /// autumn_web::app()
+    ///     .with_notification_store(MemoryNotificationStore::new())
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// [`Notifications`]: crate::notifications::Notifications
+    /// [`DbNotificationStore`]: crate::notifications::DbNotificationStore
+    #[must_use]
+    pub fn with_notification_store<S>(self, store: S) -> Self
+    where
+        S: crate::notifications::NotificationStore,
+    {
+        let service = crate::notifications::Notifications::new(store);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
     /// Register an experiment store with a custom [`ExposureSink`].
     ///
     /// Use when you want to forward exposure events to an analytics pipeline
