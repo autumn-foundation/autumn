@@ -2154,6 +2154,38 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold the in-app notification feed: a `notifications` table
+    /// migration, notify/feed/unread-count/mark-read routes over the built-in
+    /// `Notifications` extractor, `main.rs` route wiring, and an in-process
+    /// smoke test.
+    ///
+    /// Notifications are a fixed, single-instance resource (the framework's
+    /// `Notifications` extractor reads one conventional `notifications`
+    /// table), so this command takes no name argument.
+    ///
+    /// Creates:
+    ///
+    /// - `migrations/<ts>_create_notifications/` — backend-aware table DDL
+    /// - `src/notifications.rs`  — notify / feed / unread-count / mark-read /
+    ///   mark-all-read route handlers
+    /// - `src/main.rs`           — `mod notifications;` + route registration
+    /// - `tests/notifications_feed.rs` — smoke test over the in-process
+    ///   `TestApp` (no database needed: memory-store fallback)
+    /// - `Cargo.toml`            — `serde`/`serde_json` deps and the tokio
+    ///   dev-dependency test features
+    ///
+    /// Example:
+    ///
+    ///   autumn generate notifications
+    #[command(verbatim_doc_comment)]
+    Notifications {
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate a complete browser authentication flow: signup, login, logout,
     /// account/profile, forgot-password, and reset-password.
     ///
@@ -3708,6 +3740,10 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 generate::channel::Transport::Sse
             };
             let plan = generate::channel::plan_channel(&resolve_cwd(), &name, transport);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Notifications { dry_run, force } => {
+            let plan = generate::notifications::plan_notifications(&resolve_cwd());
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::InboundMail {
@@ -6650,6 +6686,48 @@ mod tests {
     #[test]
     fn parse_generate_channel_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "channel"]).is_err());
+    }
+
+    // ── autumn generate notifications tests ────────────────────────────────
+
+    #[test]
+    fn parse_generate_notifications_takes_no_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "notifications"]).unwrap();
+        let Commands::Generate(GenerateCommands::Notifications { dry_run, force }) = cli.command
+        else {
+            panic!("expected generate notifications");
+        };
+        assert!(!dry_run);
+        assert!(!force);
+        // A fixed resource: a stray name argument must be rejected.
+        assert!(Cli::try_parse_from(["autumn", "generate", "notifications", "Feed"]).is_err());
+    }
+
+    #[test]
+    fn parse_generate_notifications_with_dry_run_and_force() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "notifications",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Notifications { dry_run, force }) = cli.command
+        else {
+            panic!("expected generate notifications");
+        };
+        assert!(dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_destroy_notifications() {
+        let cli = Cli::try_parse_from(["autumn", "destroy", "notifications"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Destroy(GenerateCommands::Notifications { .. })
+        ));
     }
 
     // ── autumn maintenance tests ───────────────────────────────────────────────
