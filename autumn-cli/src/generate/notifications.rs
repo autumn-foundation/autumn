@@ -90,11 +90,19 @@ pub fn plan_notifications(project_root: &Path) -> Result<Plan, GenerateError> {
     });
 
     // ── migrations/<ts>_create_notifications/{up,down}.sql ──────────────────
-    // Destroy matches migration directories by their `_create_notifications`
-    // suffix, so the fresh timestamp taken here never blocks a later revert.
-    let migration_dir = project_root
-        .join("migrations")
-        .join(format!("{}_create_{NOTIFICATIONS_TABLE}", timestamp_now()));
+    // Notifications are a singleton scaffold: re-running (especially with
+    // `--force` to refresh it) must not mint a SECOND
+    // `*_create_notifications` directory — two `CREATE TABLE notifications`
+    // migrations would fail the next `autumn migrate` on the duplicate table
+    // and make destroy's suffix match ambiguous (PR #2144 finding B). So
+    // reuse an existing `*_create_notifications` dir when one is present,
+    // minting a fresh timestamped dir only on a clean project. Destroy still
+    // matches by the `_create_notifications` suffix either way.
+    let migration_dir = existing_notifications_migration_dir(project_root).unwrap_or_else(|| {
+        project_root
+            .join("migrations")
+            .join(format!("{}_create_{NOTIFICATIONS_TABLE}", timestamp_now()))
+    });
     plan.create(migration_dir.join("up.sql"), migration_up_sql(backend));
     plan.create(
         migration_dir.join("down.sql"),
@@ -138,9 +146,14 @@ pub fn plan_notifications(project_root: &Path) -> Result<Plan, GenerateError> {
 }
 
 /// Fully-qualified route entries for `routes![...]` wiring in `main.rs`.
+///
+/// The demo login is deliberately **absent**: it is a test-only
+/// session-seeding route declared inside the smoke test, never wired into
+/// the production router — shipping it would expose
+/// `POST /notifications/demo_login/{id}` and let an unauthenticated visitor
+/// impersonate any recipient (PR #2144 finding A).
 fn route_entries() -> Vec<String> {
     [
-        "demo_login",
         "notify",
         "feed",
         "unread_count",
@@ -150,6 +163,33 @@ fn route_entries() -> Vec<String> {
     .iter()
     .map(|handler| format!("notifications::{handler}"))
     .collect()
+}
+
+/// The existing `migrations/<ts>_create_notifications/` directory, if the
+/// project already has one — so a re-run reuses it in place rather than
+/// minting a second singleton migration (PR #2144 finding B). Matched by the
+/// same `_create_notifications` suffix destroy uses (see
+/// `emit::resolve_migration_removal`), so the two stay in agreement.
+///
+/// If more than one somehow exists (a hand-added duplicate), the
+/// lexicographically-smallest is chosen deterministically — the same tie-break
+/// `emit`'s destroy scan applies — rather than depending on `read_dir` order.
+fn existing_notifications_migration_dir(project_root: &Path) -> Option<std::path::PathBuf> {
+    let suffix = format!("_create_{NOTIFICATIONS_TABLE}");
+    let mut matches: Vec<std::path::PathBuf> = std::fs::read_dir(project_root.join("migrations"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(&suffix))
+        })
+        .collect();
+    matches.sort();
+    matches.into_iter().next()
 }
 
 /// The four non-`id` columns of the `notifications` table, expressed in the
@@ -208,57 +248,46 @@ fn migration_up_sql(backend: DatabaseBackend) -> String {
 }
 
 /// The session key, `NotifyBody` type, `current_recipient_id` helper, and
-/// the six route handlers, shared **verbatim** by `src/notifications.rs` and
-/// `tests/notifications_feed.rs` — `tests/*.rs` integration binaries cannot
-/// import the app's own binary crate (there is no `src/lib.rs`), so the
-/// smoke test re-declares the production handlers, and rendering both files
-/// from this one blob keeps them byte-for-byte in sync by construction (the
-/// same contract `generate channel`'s smoke test promises).
+/// the five production route handlers, shared **verbatim** by
+/// `src/notifications.rs` and `tests/notifications_feed.rs` — `tests/*.rs`
+/// integration binaries cannot import the app's own binary crate (there is
+/// no `src/lib.rs`), so the smoke test re-declares the production handlers,
+/// and rendering both files from this one blob keeps them byte-for-byte in
+/// sync by construction (the same contract `generate channel`'s smoke test
+/// promises).
+///
+/// The demo login is **not** here — it is a test-only session-seeding route
+/// ([`render_test_only_demo_login`]) emitted only into the smoke test, never
+/// the production module, so a deployed app never exposes it (PR #2144
+/// finding A).
 ///
 /// Security shape (PR #2144 review): the feed/mark routes never take a
 /// recipient id from the request — the recipient is derived server-side
 /// from the signed session via `current_recipient_id`, so one user can
-/// never read or mark another user's feed. Only the clearly-marked
-/// demo-only login route names a recipient in its URL.
+/// never read or mark another user's feed. Until real auth populates the
+/// session key the feed simply 401s (a safe, dormant default).
 const fn render_handlers() -> &'static str {
-    r#"/// The session key `current_recipient_id` reads. Seeded by the demo login
-/// route below; replace both with your real auth (see the TODOs).
+    r#"/// The session key `current_recipient_id` reads. Populate it from your
+/// auth (see the TODO on `current_recipient_id`); until then the feed is
+/// dormant and every request 401s.
 const RECIPIENT_SESSION_KEY: &str = "notifications.recipient_id";
 
 /// Resolve the signed-in recipient for this request.
 ///
 /// The recipient is derived server-side from the signed session — never
 /// from a path or body parameter — so a caller can only ever see or mark
-/// their own feed. An unauthenticated request gets a 401.
+/// their own feed. An unauthenticated request gets a 401, so these routes
+/// stay dormant until real auth populates the session key.
 ///
 /// TODO: replace this session lookup with your real auth (e.g. an
-/// `Auth<CurrentUser>` extractor returning `user.id`) and delete the demo
-/// login route once sign-in exists.
+/// `Auth<CurrentUser>` extractor returning `user.id`), which is what should
+/// populate `RECIPIENT_SESSION_KEY` on sign-in.
 async fn current_recipient_id(session: &Session) -> AutumnResult<i64> {
     session
         .get(RECIPIENT_SESSION_KEY)
         .await
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| AutumnError::unauthorized_msg("not signed in"))
-}
-
-/// `POST /notifications/demo_login/{recipient_id}` — DEMO ONLY: signs this
-/// client's session in as `recipient_id` so the scaffold (and its smoke
-/// test) runs before any real auth exists.
-///
-/// SECURITY: this route lets anyone become any recipient — it must never
-/// ship. TODO: delete it (and its `routes![...]` entry) once real sign-in
-/// exists, and derive the recipient in `current_recipient_id` from your
-/// auth context instead.
-#[post("/notifications/demo_login/{recipient_id}")]
-pub async fn demo_login(
-    Path(recipient_id): Path<i64>,
-    session: Session,
-) -> AutumnResult<&'static str> {
-    session
-        .insert(RECIPIENT_SESSION_KEY, recipient_id.to_string())
-        .await;
-    Ok("signed in")
 }
 
 /// `POST /notifications` body: who to notify, an application-defined kind
@@ -353,10 +382,37 @@ pub async fn mark_all_read(
 "#
 }
 
+/// The **test-only** session-seeding handler emitted into
+/// `tests/notifications_feed.rs` — and deliberately nowhere else.
+///
+/// It is never part of [`render_handlers`] (so it never reaches the
+/// production `src/notifications.rs`) and never listed in [`route_entries`]
+/// (so it is never wired into the deployed router): a shipped
+/// `POST /notifications/demo_login/{recipient_id}` would let any
+/// unauthenticated visitor sign in as an arbitrary recipient and read or
+/// mark that user's feed (PR #2144 finding A). It exists only so the smoke
+/// test can establish a session the way a real login eventually will.
+const fn render_test_only_demo_login() -> &'static str {
+    r#"/// TEST-ONLY: seed the session with a recipient id so the session-scoped
+/// routes above are reachable from this smoke test. This handler is NOT part
+/// of the generated `src/notifications.rs` and is NOT registered in the real
+/// router — shipping it would be an impersonation endpoint (anyone could POST
+/// `/notifications/demo_login/<victim>`). A real app populates
+/// `RECIPIENT_SESSION_KEY` from its own authentication instead.
+#[post("/notifications/demo_login/{recipient_id}")]
+pub async fn demo_login(Path(recipient_id): Path<i64>, session: Session) -> &'static str {
+    session
+        .insert(RECIPIENT_SESSION_KEY, recipient_id.to_string())
+        .await;
+    "ok"
+}
+"#
+}
+
 /// Render `src/notifications.rs`.
 fn render_app_module() -> String {
     format!(
-        r"//! Generated by `autumn generate notifications`. Edit freely.
+        r#"//! Generated by `autumn generate notifications`. Edit freely.
 //!
 //! A minimal in-app notification feed over the framework's
 //! [`Notifications`] extractor (`autumn_web::notifications`). Storage
@@ -367,9 +423,12 @@ fn render_app_module() -> String {
 //!
 //! The feed/mark routes are session-scoped: the recipient is derived
 //! server-side (`current_recipient_id`), never from the request, so one
-//! user can never read or mark another user's feed. Wire your real auth in
-//! `current_recipient_id` and delete the demo login route — see the
-//! SECURITY/TODO comments below.
+//! user can never read or mark another user's feed. These routes stay
+//! dormant (every request 401s) until your real auth populates the session
+//! key — wire that in `current_recipient_id`; see the TODO there. There is
+//! deliberately no demo-login route in this module: seeding the session is
+//! done only by a test-only route in the generated smoke test, so a
+//! deployed app never exposes a "become any user" endpoint.
 //!
 //! Optional realtime push: with the `ws` feature enabled, swap `notify` for
 //! `notify_with_push` to also broadcast each stored notification on the
@@ -380,7 +439,7 @@ use autumn_web::notifications::{{Notification, Notifications}};
 use autumn_web::prelude::*;
 use serde::Deserialize;
 
-{handlers}",
+{handlers}"#,
         handlers = render_handlers(),
     )
 }
@@ -414,6 +473,7 @@ use autumn_web::test::TestApp;
 use serde::Deserialize;
 
 {handlers}
+{demo_login}
 #[tokio::test]
 async fn notifications_feed_round_trips_over_http() {{
     let client = TestApp::new()
@@ -532,6 +592,7 @@ async fn notifications_feed_round_trips_over_http() {{
 }}
 "#,
         handlers = render_handlers(),
+        demo_login = render_test_only_demo_login(),
     )
 }
 
@@ -751,6 +812,90 @@ async fn main() {
         });
     }
 
+    // ── GREEN: idempotent migration directory (PR #2144 finding B) ─────────
+
+    /// Count the `*_create_notifications` migration directories under `root`.
+    fn count_notification_migration_dirs(root: &Path) -> usize {
+        fs::read_dir(root.join("migrations")).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.path().is_dir()
+                        && e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.ends_with("_create_notifications"))
+                })
+                .count()
+        })
+    }
+
+    #[test]
+    fn first_run_mints_exactly_one_migration_dir() {
+        let tmp = project_with_main(default_main());
+        plan_notifications(tmp.path())
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert_eq!(count_notification_migration_dirs(tmp.path()), 1);
+    }
+
+    #[test]
+    fn rerun_reuses_existing_migration_dir_instead_of_minting_a_second() {
+        // PR #2144 finding B: re-running (esp. with --force to refresh this
+        // singleton scaffold) must not create a SECOND
+        // `*_create_notifications` dir — two `CREATE TABLE notifications`
+        // migrations would make `autumn migrate` fail on the duplicate table
+        // and make destroy's suffix match ambiguous.
+        //
+        // Seed a migration dir with an explicit PAST timestamp so the reuse
+        // is genuinely exercised: a fresh `timestamp_now()` would differ from
+        // it, so a plan that reused nothing would mint a second directory.
+        let tmp = project_with_main(default_main());
+        let existing = tmp
+            .path()
+            .join("migrations")
+            .join("20200101000000_create_notifications");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("up.sql"), "-- stale placeholder\n").unwrap();
+        fs::write(existing.join("down.sql"), "-- stale placeholder\n").unwrap();
+
+        // The plan must target the SAME existing directory (its past
+        // timestamp), not a freshly minted current-timestamp one.
+        let plan = plan_notifications(tmp.path()).unwrap();
+        assert!(
+            plan.actions.iter().any(|a| {
+                a.path()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with("20200101000000_create_notifications/up.sql")
+            }),
+            "re-run must write into the existing migration dir, not a new one: {:?}",
+            plan.actions
+                .iter()
+                .map(|a| a.path().to_owned())
+                .collect::<Vec<_>>()
+        );
+
+        // Applying it with --force overwrites the placeholder in place —
+        // still exactly one `*_create_notifications` dir, and it is the
+        // pre-existing one.
+        plan.execute(Flags {
+            force: true,
+            dry_run: false,
+        })
+        .unwrap();
+        assert_eq!(
+            count_notification_migration_dirs(tmp.path()),
+            1,
+            "a re-run must not mint a second migration directory"
+        );
+        let up = fs::read_to_string(existing.join("up.sql")).unwrap();
+        assert!(
+            up.contains("CREATE TABLE notifications"),
+            "the reused dir's up.sql must be refreshed with the real DDL: {up}"
+        );
+    }
+
     // ── GREEN: app module content ─────────────────────────────────────────
 
     #[test]
@@ -766,11 +911,14 @@ async fn main() {
             src.contains("use autumn_web::notifications::{Notification, Notifications};"),
             "{src}"
         );
-        // The six routes: a clearly-marked demo login, the demo notify, and
-        // the four session-scoped feed routes (no recipient in the URL).
+        // The five production routes: the demo notify plus the four
+        // session-scoped feed routes (no recipient in the URL). The demo
+        // login is TEST-ONLY and must never appear in the production
+        // module or its router (PR #2144 finding A).
         assert!(
-            src.contains(r#"#[post("/notifications/demo_login/{recipient_id}")]"#),
-            "{src}"
+            !src.contains("demo_login"),
+            "the demo login must be test-only — it must not exist in the \
+             production module: {src}"
         );
         assert!(src.contains(r#"#[post("/notifications")]"#), "{src}");
         assert!(src.contains(r#"#[get("/notifications")]"#), "{src}");
@@ -798,14 +946,15 @@ async fn main() {
             "feed, unread_count, mark_read, and mark_all_read must all resolve \
              the recipient from the session: {src}"
         );
-        // An unauthenticated request is rejected, not defaulted.
+        // An unauthenticated request is rejected, not defaulted — the feed is
+        // dormant until real auth populates the session key.
         assert!(src.contains("unauthorized"), "{src}");
         // The mark-read route must additionally use the recipient-scoped
         // (IDOR-safe) store variant, and say why.
         assert!(src.contains(".mark_read_for(recipient_id, id)"), "{src}");
         assert!(src.contains("IDOR"), "{src}");
-        // The demo login and demo notify must carry prominent
-        // SECURITY/TODO markers steering users to real auth.
+        // The demo notify must carry prominent SECURITY/TODO markers steering
+        // users to real auth / protecting the route.
         assert!(src.contains("SECURITY"), "{src}");
         assert!(src.contains("TODO"), "{src}");
         // The feed goes through the shipped pagination extractors.
@@ -815,12 +964,58 @@ async fn main() {
     }
 
     #[test]
-    fn generated_routes_never_take_the_recipient_from_the_url_except_demo_login() {
+    fn demo_login_is_test_only_never_in_production_router() {
+        // PR #2144 finding A (security regression): a production
+        // `demo_login` route lets an unauthenticated visitor POST
+        // `/notifications/demo_login/<victim>` and then read/mark the
+        // victim's feed. The demo login must be test-only — absent from
+        // `route_entries()`, from the emitted production module, and from
+        // `src/main.rs`'s `routes![...]` — while the smoke test seeds the
+        // session with its own local handler.
+        assert!(
+            !route_entries().iter().any(|e| e.contains("demo_login")),
+            "route_entries must not register demo_login: {:?}",
+            route_entries()
+        );
+
+        let tmp = project_with_main(default_main());
+        plan_notifications(tmp.path())
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let src = fs::read_to_string(tmp.path().join("src/notifications.rs")).unwrap();
+        assert!(
+            !src.contains("fn demo_login"),
+            "production module must not define a demo_login handler: {src}"
+        );
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            !main.contains("demo_login"),
+            "main.rs must not register a demo_login route: {main}"
+        );
+
+        // The smoke test still seeds the session (its own test-only route),
+        // so the flow stays runnable and honest.
+        let test_src = fs::read_to_string(tmp.path().join("tests/notifications_feed.rs")).unwrap();
+        assert!(
+            test_src.contains("fn demo_login"),
+            "smoke test must declare its own test-only session-seeding \
+             handler: {test_src}"
+        );
+        assert!(
+            test_src.contains("RECIPIENT_SESSION_KEY"),
+            "smoke test's seeding route must write the session key: {test_src}"
+        );
+    }
+
+    #[test]
+    fn production_routes_never_take_the_recipient_from_the_url() {
         // Regression test for the PR #2144 Codex review finding: a
         // `{recipient_id}` path segment on any real route lets any caller
         // read (or mark read) another user's feed — `mark_read_for` scopes
-        // to the *supplied* recipient, not the caller. Only the
-        // clearly-marked demo login may name a recipient in its URL.
+        // to the *supplied* recipient, not the caller. No production route
+        // may name a recipient in its URL (the demo login is test-only now).
         let tmp = project_with_main(default_main());
         plan_notifications(tmp.path())
             .unwrap()
@@ -833,15 +1028,15 @@ async fn main() {
             .map(str::trim)
             .filter(|l| l.starts_with("#[get(") || l.starts_with("#[post("))
             .collect();
-        assert_eq!(route_attrs.len(), 6, "six routes expected: {route_attrs:?}");
-        let recipient_in_url: Vec<&&str> = route_attrs
-            .iter()
-            .filter(|l| l.contains("{recipient_id}"))
-            .collect();
         assert_eq!(
-            recipient_in_url,
-            vec![&r#"#[post("/notifications/demo_login/{recipient_id}")]"#],
-            "only the demo login route may take a recipient id from the URL"
+            route_attrs.len(),
+            5,
+            "five routes expected: {route_attrs:?}"
+        );
+        assert!(
+            !route_attrs.iter().any(|l| l.contains("{recipient_id}")),
+            "no production route may take a recipient id from the URL: \
+             {route_attrs:?}"
         );
         // The demo notify's body-supplied recipient stays (server-side
         // notifies are legitimately cross-recipient), but it must warn that
@@ -862,7 +1057,6 @@ async fn main() {
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(main.contains("mod notifications;"), "{main}");
         for entry in [
-            "notifications::demo_login",
             "notifications::notify",
             "notifications::feed",
             "notifications::unread_count",
@@ -874,6 +1068,11 @@ async fn main() {
                 "main.rs must register {entry}: {main}"
             );
         }
+        // The test-only demo login must NOT be wired into the router.
+        assert!(
+            !main.contains("demo_login"),
+            "main.rs must not register the test-only demo login: {main}"
+        );
     }
 
     // ── GREEN: smoke test content ─────────────────────────────────────────
@@ -979,9 +1178,11 @@ async fn main() {
             }
             src[start..=end].to_owned()
         };
+        // `demo_login` is test-only (it lives only in the smoke test), so it
+        // is excluded from the parity contract — only the shared PRODUCTION
+        // handlers must be byte-for-byte identical between the two files.
         for name in [
             "current_recipient_id",
-            "demo_login",
             "notify",
             "feed",
             "unread_count",
@@ -995,6 +1196,17 @@ async fn main() {
                  byte-identical to the production handler"
             );
         }
+        // The shared session-key const must also be re-declared verbatim.
+        assert!(
+            production_src
+                .contains(r#"const RECIPIENT_SESSION_KEY: &str = "notifications.recipient_id";"#),
+            "{production_src}"
+        );
+        assert!(
+            test_src
+                .contains(r#"const RECIPIENT_SESSION_KEY: &str = "notifications.recipient_id";"#),
+            "{test_src}"
+        );
     }
 
     // ── GREEN: Cargo.toml ─────────────────────────────────────────────────
