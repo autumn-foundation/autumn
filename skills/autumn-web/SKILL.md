@@ -864,7 +864,10 @@ async fn create_comment(notifications: Notifications) -> AutumnResult<&'static s
 - **Realtime push (`ws` feature):** `notify_with_push(...)` persists then
   publishes the notification JSON on `Notifications::topic(recipient_id)`
   (`"notifications:{id}"`) — best-effort, a channel failure never fails the
-  notify. Subscribe with `state.channels().subscribe(&Notifications::topic(id))`.
+  notify. In the subscribing WS/SSE handler, derive the topic from the
+  **authenticated** user (`Auth`/session), never a client-supplied id — topics
+  are guessable and carry the full payload; use `subscribe_authorized` /
+  `sse::stream_authorized` for channel-level enforcement.
 - Guide: `docs/guide/notifications.md`. Out of scope by design: bell widget,
   email/SMS channels, preferences/digests, cross-recipient fan-out.
 

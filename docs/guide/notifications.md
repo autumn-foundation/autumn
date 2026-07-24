@@ -88,12 +88,15 @@ per app:
 2. `DbNotificationStore` when a database pool is configured — the persistent
    default, backed by the `notifications` table the generator scaffolds.
 3. `MemoryNotificationStore` otherwise — a process-local fallback for tests
-   and DB-less development (contents are lost on restart).
+   and DB-less development (contents are lost on restart, and the store grows
+   without bound — do not ship it as the production store).
 
 The `notifications` table stores `id`, `recipient_id`, `kind`, a JSON
 `payload` (TEXT-serialized, so it is identical on Postgres and SQLite), a
 nullable `read_at`, and `created_at`. Timestamps are `TIMESTAMPTZ` on
-Postgres and RFC 3339 `TEXT` on SQLite.
+Postgres and RFC 3339 `TEXT` on SQLite. Keep payloads small and
+reference-shaped (`{"post": 42}`, not the post body): they are stored
+verbatim per recipient and re-sent on every feed page.
 
 To plug in a custom backend, implement `NotificationStore` and register it:
 
@@ -139,6 +142,11 @@ let _ = state
 A WebSocket or SSE handler subscribes to the same topic to stream the feed:
 
 ```rust
+// SECURITY: derive the topic from the *authenticated* user (Auth/session),
+// never from a client-supplied id — topics are guessable and the pushed JSON
+// contains the full notification payload. For channel-level enforcement use
+// the authorized subscription helpers (`subscribe_authorized` /
+// `sse::stream_authorized`, see the realtime guide).
 let mut rx = state.channels().subscribe(&Notifications::topic(user.id));
 while let Ok(msg) = rx.recv().await {
     // forward msg (the notification JSON) to the client

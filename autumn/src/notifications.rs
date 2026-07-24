@@ -469,7 +469,8 @@ impl axum::extract::FromRequestParts<AppState> for Notifications {
 
 /// Process-local [`NotificationStore`] used by default when no database is
 /// configured. Suitable for tests and DB-less development; contents are lost
-/// on restart.
+/// on restart and the store grows without bound (no eviction), so it is not
+/// a production store.
 #[derive(Debug, Default)]
 pub struct MemoryNotificationStore {
     inner: std::sync::Mutex<MemoryInner>,
