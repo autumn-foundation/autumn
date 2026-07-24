@@ -400,7 +400,10 @@ mod push {
 
 // ── Postgres-backed store (testcontainers, requires Docker) ───────────────
 
-#[cfg(feature = "db")]
+// `not(feature = "sqlite")`: under the app-only `sqlite` feature (which
+// implies `db`) the runtime connection is SQLite, so this Postgres pool
+// would no longer type-check against `DbNotificationStore::new`.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod pg {
     use super::*;
     use autumn_web::notifications::DbNotificationStore;
