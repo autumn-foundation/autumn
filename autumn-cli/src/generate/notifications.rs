@@ -9,13 +9,18 @@
 //!   DDL for the `notifications` table, matching the framework store's
 //!   diesel `table!` mapping byte-for-type (see [`migration_up_sql`]).
 //! - `src/notifications.rs` — notify / feed / unread-count / mark-read /
-//!   mark-all-read route handlers over the `Notifications` extractor.
+//!   mark-all-read route handlers over the `Notifications` extractor. The
+//!   feed/mark routes are **session-scoped**: the recipient is derived
+//!   server-side from the `Session` (seeded by a clearly-marked demo-only
+//!   login route), never from a path or body parameter, so the scaffold
+//!   never teaches an IDOR pattern (PR #2144 review).
 //! - `src/main.rs` — `mod notifications;` declaration and the generated
 //!   routes registered in `routes![...]`.
 //! - `tests/notifications_feed.rs` — a smoke test exercising the full
-//!   notify → list → mark-read → unread-count flow through the in-process
-//!   `TestApp` (no database needed: with no DB configured the extractor
-//!   falls back to its in-process memory store).
+//!   demo-login → notify → list → mark-read → unread-count flow through
+//!   the in-process `TestApp`, including the cross-recipient isolation
+//!   check (no database needed: with no DB configured the extractor falls
+//!   back to its in-process memory store).
 //! - `Cargo.toml` — `serde`/`serde_json` dependencies and the `tokio`
 //!   dev-dependency features the smoke test needs for `#[tokio::test]`.
 
@@ -135,6 +140,7 @@ pub fn plan_notifications(project_root: &Path) -> Result<Plan, GenerateError> {
 /// Fully-qualified route entries for `routes![...]` wiring in `main.rs`.
 fn route_entries() -> Vec<String> {
     [
+        "demo_login",
         "notify",
         "feed",
         "unread_count",
@@ -201,15 +207,61 @@ fn migration_up_sql(backend: DatabaseBackend) -> String {
     }
 }
 
-/// The `NotifyBody` type and the five route handlers, shared **verbatim** by
-/// `src/notifications.rs` and `tests/notifications_feed.rs` — `tests/*.rs`
-/// integration binaries cannot import the app's own binary crate (there is
-/// no `src/lib.rs`), so the smoke test re-declares the production handlers,
-/// and rendering both files from this one blob keeps them byte-for-byte in
-/// sync by construction (the same contract `generate channel`'s smoke test
-/// promises).
+/// The session key, `NotifyBody` type, `current_recipient_id` helper, and
+/// the six route handlers, shared **verbatim** by `src/notifications.rs` and
+/// `tests/notifications_feed.rs` — `tests/*.rs` integration binaries cannot
+/// import the app's own binary crate (there is no `src/lib.rs`), so the
+/// smoke test re-declares the production handlers, and rendering both files
+/// from this one blob keeps them byte-for-byte in sync by construction (the
+/// same contract `generate channel`'s smoke test promises).
+///
+/// Security shape (PR #2144 review): the feed/mark routes never take a
+/// recipient id from the request — the recipient is derived server-side
+/// from the signed session via `current_recipient_id`, so one user can
+/// never read or mark another user's feed. Only the clearly-marked
+/// demo-only login route names a recipient in its URL.
 const fn render_handlers() -> &'static str {
-    r#"/// `POST /notifications` body: who to notify, an application-defined kind
+    r#"/// The session key `current_recipient_id` reads. Seeded by the demo login
+/// route below; replace both with your real auth (see the TODOs).
+const RECIPIENT_SESSION_KEY: &str = "notifications.recipient_id";
+
+/// Resolve the signed-in recipient for this request.
+///
+/// The recipient is derived server-side from the signed session — never
+/// from a path or body parameter — so a caller can only ever see or mark
+/// their own feed. An unauthenticated request gets a 401.
+///
+/// TODO: replace this session lookup with your real auth (e.g. an
+/// `Auth<CurrentUser>` extractor returning `user.id`) and delete the demo
+/// login route once sign-in exists.
+async fn current_recipient_id(session: &Session) -> AutumnResult<i64> {
+    session
+        .get(RECIPIENT_SESSION_KEY)
+        .await
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("not signed in"))
+}
+
+/// `POST /notifications/demo_login/{recipient_id}` — DEMO ONLY: signs this
+/// client's session in as `recipient_id` so the scaffold (and its smoke
+/// test) runs before any real auth exists.
+///
+/// SECURITY: this route lets anyone become any recipient — it must never
+/// ship. TODO: delete it (and its `routes![...]` entry) once real sign-in
+/// exists, and derive the recipient in `current_recipient_id` from your
+/// auth context instead.
+#[post("/notifications/demo_login/{recipient_id}")]
+pub async fn demo_login(
+    Path(recipient_id): Path<i64>,
+    session: Session,
+) -> AutumnResult<&'static str> {
+    session
+        .insert(RECIPIENT_SESSION_KEY, recipient_id.to_string())
+        .await;
+    Ok("signed in")
+}
+
+/// `POST /notifications` body: who to notify, an application-defined kind
 /// discriminator (e.g. `"comment.created"`), and a free-form JSON payload.
 #[derive(Deserialize)]
 pub struct NotifyBody {
@@ -221,10 +273,15 @@ pub struct NotifyBody {
 /// `POST /notifications` — create a notification from a JSON body and return
 /// the stored record.
 ///
-/// TODO: replace the body-supplied `recipient_id` with your auth context
-/// (e.g. a session/`Auth` extractor) once real sign-in exists — in
-/// production the *server* decides who a notification belongs to, never the
-/// request body.
+/// The recipient comes from the body here because server-side notifies are
+/// legitimately cross-recipient (one user's action notifies another) — but
+/// that makes this demo route a spam vector as-is.
+///
+/// SECURITY / TODO: before shipping, protect or remove this route — e.g.
+/// restrict it to an admin/service caller, or delete it and call
+/// `notifications.notify(...)` from the domain action that triggers the
+/// notification (a new comment, a mention, …). Otherwise anyone can notify
+/// anyone.
 #[post("/notifications")]
 pub async fn notify(
     notifications: Notifications,
@@ -236,52 +293,61 @@ pub async fn notify(
     Ok(Json(notification))
 }
 
-/// `GET /notifications/{recipient_id}` — one page of the recipient's feed.
+/// `GET /notifications` — one page of the signed-in recipient's feed.
 ///
 /// Supports `?page=`/`?size=` (the `PageRequest` extractor) plus
 /// `?filter[unread]=true`, `?filter[kind]=…`, and `?sort=id|created_at`
 /// (the `ListQuery` extractor); defaults to newest-first.
-#[get("/notifications/{recipient_id}")]
+#[get("/notifications")]
 pub async fn feed(
-    Path(recipient_id): Path<i64>,
+    session: Session,
     query: ListQuery,
     page: PageRequest,
     notifications: Notifications,
 ) -> AutumnResult<Json<Page<Notification>>> {
+    let recipient_id = current_recipient_id(&session).await?;
     Ok(Json(notifications.list(recipient_id, &query, &page).await?))
 }
 
-/// `GET /notifications/{recipient_id}/unread_count` — the bell-badge number.
-#[get("/notifications/{recipient_id}/unread_count")]
+/// `GET /notifications/unread_count` — the signed-in recipient's bell-badge
+/// number.
+#[get("/notifications/unread_count")]
 pub async fn unread_count(
-    Path(recipient_id): Path<i64>,
+    session: Session,
     notifications: Notifications,
 ) -> AutumnResult<Json<u64>> {
+    let recipient_id = current_recipient_id(&session).await?;
     Ok(Json(notifications.unread_count(recipient_id).await?))
 }
 
-/// `POST /notifications/{recipient_id}/read/{id}` — mark one notification read.
+/// `POST /notifications/{id}/read` — mark one of the signed-in recipient's
+/// notifications read.
 ///
-/// Uses the recipient-scoped `mark_read_for` rather than the unscoped
-/// `mark_read`: a notification owned by a different recipient is left
-/// untouched (a no-op, not an error), so one user can never mark another
-/// user's notification read (IDOR-safe). Idempotent on re-marking.
-#[post("/notifications/{recipient_id}/read/{id}")]
+/// Uses the recipient-scoped `mark_read_for` with the session-derived
+/// recipient, rather than the unscoped `mark_read`: a notification owned by
+/// a different recipient is left untouched (a no-op, not an error), so even
+/// a guessed `id` can never mark another user's notification read
+/// (IDOR-safe). Idempotent on re-marking.
+#[post("/notifications/{id}/read")]
 pub async fn mark_read(
-    Path((recipient_id, id)): Path<(i64, i64)>,
+    Path(id): Path<i64>,
+    session: Session,
     notifications: Notifications,
 ) -> AutumnResult<&'static str> {
+    let recipient_id = current_recipient_id(&session).await?;
     notifications.mark_read_for(recipient_id, id).await?;
     Ok("ok")
 }
 
-/// `POST /notifications/{recipient_id}/read_all` — mark the whole feed read;
-/// returns how many notifications transitioned (0 on a repeat call).
-#[post("/notifications/{recipient_id}/read_all")]
+/// `POST /notifications/read_all` — mark the signed-in recipient's whole
+/// feed read; returns how many notifications transitioned (0 on a repeat
+/// call).
+#[post("/notifications/read_all")]
 pub async fn mark_all_read(
-    Path(recipient_id): Path<i64>,
+    session: Session,
     notifications: Notifications,
 ) -> AutumnResult<Json<u64>> {
+    let recipient_id = current_recipient_id(&session).await?;
     Ok(Json(notifications.mark_all_read(recipient_id).await?))
 }
 "#
@@ -299,6 +365,12 @@ fn render_app_module() -> String {
 //! memory store otherwise — so these routes work before `autumn migrate`
 //! has ever run.
 //!
+//! The feed/mark routes are session-scoped: the recipient is derived
+//! server-side (`current_recipient_id`), never from the request, so one
+//! user can never read or mark another user's feed. Wire your real auth in
+//! `current_recipient_id` and delete the demo login route — see the
+//! SECURITY/TODO comments below.
+//!
 //! Optional realtime push: with the `ws` feature enabled, swap `notify` for
 //! `notify_with_push` to also broadcast each stored notification on the
 //! conventional `notifications:{{recipient_id}}` channel topic
@@ -313,19 +385,28 @@ use serde::Deserialize;
     )
 }
 
-/// Render `tests/notifications_feed.rs` — a real notify → list → mark-read →
-/// unread-count round trip over HTTP, no database required.
+/// Render `tests/notifications_feed.rs` — a real demo-login → notify →
+/// list → mark-read → unread-count round trip over HTTP (plus the
+/// cross-recipient isolation check), no database required.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one literal template for the generated smoke test; the length is the \
+              emitted file's, and splitting the flow across helpers would only \
+              obscure what the generated test contains"
+)]
 fn render_smoke_test() -> String {
     format!(
         r#"//! Smoke test generated by `autumn generate notifications`.
 //!
-//! Exercises the full notify → list → mark-read → unread-count flow over
-//! HTTP through the in-process `TestApp` — no database needed: with no DB
-//! configured the `Notifications` extractor falls back to its in-process
-//! memory store. The handlers below are re-declarations of
-//! `src/notifications.rs`'s handlers of the same names, kept byte-for-byte
-//! in sync — `tests/` integration binaries cannot import the app's own
-//! binary crate (there is no `src/lib.rs`).
+//! Exercises the full demo-login → notify → list → mark-read →
+//! unread-count flow over HTTP through the in-process `TestApp` — no
+//! database needed: with no DB configured the `Notifications` extractor
+//! falls back to its in-process memory store. `TestClient` carries a
+//! cookie jar, so the session set by the demo login is replayed on every
+//! later request, exactly like a browser. The handlers below are
+//! re-declarations of `src/notifications.rs`'s handlers of the same names,
+//! kept byte-for-byte in sync — `tests/` integration binaries cannot
+//! import the app's own binary crate (there is no `src/lib.rs`).
 
 use autumn_web::notifications::{{Notification, Notifications}};
 use autumn_web::prelude::*;
@@ -336,8 +417,26 @@ use serde::Deserialize;
 #[tokio::test]
 async fn notifications_feed_round_trips_over_http() {{
     let client = TestApp::new()
-        .routes(routes![notify, feed, unread_count, mark_read, mark_all_read])
+        .routes(routes![
+            demo_login,
+            notify,
+            feed,
+            unread_count,
+            mark_read,
+            mark_all_read
+        ])
         .build();
+
+    // Anonymous requests are rejected: the feed is session-scoped.
+    client.get("/notifications").send().await.assert_status(401);
+
+    // Demo sign-in as recipient 7 — the cookie jar keeps the session for
+    // the rest of the flow.
+    client
+        .post("/notifications/demo_login/7")
+        .send()
+        .await
+        .assert_ok();
 
     // Notify: POST a notification and get the stored record back.
     let created: Notification = client
@@ -354,9 +453,9 @@ async fn notifications_feed_round_trips_over_http() {{
     assert_eq!(created.recipient_id, 7);
     assert_eq!(created.kind, "comment.created");
 
-    // Feed: the new notification shows up.
+    // Feed (session-scoped): the new notification shows up.
     let feed_page: Page<Notification> = client
-        .get("/notifications/7")
+        .get("/notifications")
         .send()
         .await
         .assert_ok()
@@ -366,21 +465,21 @@ async fn notifications_feed_round_trips_over_http() {{
 
     // The unread badge counts it...
     let unread: u64 = client
-        .get("/notifications/7/unread_count")
+        .get("/notifications/unread_count")
         .send()
         .await
         .assert_ok()
         .json();
     assert_eq!(unread, 1);
 
-    // ...until it is marked read (recipient-scoped).
+    // ...until it is marked read (scoped to the session's recipient).
     client
-        .post(&format!("/notifications/7/read/{{}}", created.id))
+        .post(&format!("/notifications/{{}}/read", created.id))
         .send()
         .await
         .assert_ok();
     let unread: u64 = client
-        .get("/notifications/7/unread_count")
+        .get("/notifications/unread_count")
         .send()
         .await
         .assert_ok()
@@ -389,7 +488,7 @@ async fn notifications_feed_round_trips_over_http() {{
 
     // The unread-only feed is now empty.
     let unread_feed: Page<Notification> = client
-        .get("/notifications/7?filter[unread]=true")
+        .get("/notifications?filter[unread]=true")
         .send()
         .await
         .assert_ok()
@@ -408,19 +507,28 @@ async fn notifications_feed_round_trips_over_http() {{
         .await
         .assert_ok();
     let swept: u64 = client
-        .post("/notifications/7/read_all")
+        .post("/notifications/read_all")
         .send()
         .await
         .assert_ok()
         .json();
     assert_eq!(swept, 1);
-    let unread: u64 = client
-        .get("/notifications/7/unread_count")
+
+    // Cross-recipient isolation: signing in as a different recipient shows
+    // an empty feed — the recipient comes from the session, never a URL,
+    // so recipient 7's notifications are unreachable from this session.
+    client
+        .post("/notifications/demo_login/8")
+        .send()
+        .await
+        .assert_ok();
+    let other_feed: Page<Notification> = client
+        .get("/notifications")
         .send()
         .await
         .assert_ok()
         .json();
-    assert_eq!(unread, 0);
+    assert_eq!(other_feed.total_elements, 0);
 }}
 "#,
         handlers = render_handlers(),
@@ -646,7 +754,7 @@ async fn main() {
     // ── GREEN: app module content ─────────────────────────────────────────
 
     #[test]
-    fn execute_writes_app_module_with_five_handlers_over_the_extractor() {
+    fn execute_writes_app_module_with_session_scoped_handlers() {
         let tmp = project_with_main(default_main());
         plan_notifications(tmp.path())
             .unwrap()
@@ -658,34 +766,87 @@ async fn main() {
             src.contains("use autumn_web::notifications::{Notification, Notifications};"),
             "{src}"
         );
+        // The six routes: a clearly-marked demo login, the demo notify, and
+        // the four session-scoped feed routes (no recipient in the URL).
+        assert!(
+            src.contains(r#"#[post("/notifications/demo_login/{recipient_id}")]"#),
+            "{src}"
+        );
         assert!(src.contains(r#"#[post("/notifications")]"#), "{src}");
+        assert!(src.contains(r#"#[get("/notifications")]"#), "{src}");
         assert!(
-            src.contains(r#"#[get("/notifications/{recipient_id}")]"#),
+            src.contains(r#"#[get("/notifications/unread_count")]"#),
             "{src}"
         );
         assert!(
-            src.contains(r#"#[get("/notifications/{recipient_id}/unread_count")]"#),
+            src.contains(r#"#[post("/notifications/{id}/read")]"#),
             "{src}"
         );
         assert!(
-            src.contains(r#"#[post("/notifications/{recipient_id}/read/{id}")]"#),
+            src.contains(r#"#[post("/notifications/read_all")]"#),
             "{src}"
         );
+        // Every read/mark route derives the recipient server-side from the
+        // session through the shared helper — never from the request.
         assert!(
-            src.contains(r#"#[post("/notifications/{recipient_id}/read_all")]"#),
+            src.contains("async fn current_recipient_id(session: &Session)"),
             "{src}"
         );
-        // The mark-read route must use the recipient-scoped (IDOR-safe)
-        // variant, and say why.
+        assert_eq!(
+            src.matches("current_recipient_id(&session).await?").count(),
+            4,
+            "feed, unread_count, mark_read, and mark_all_read must all resolve \
+             the recipient from the session: {src}"
+        );
+        // An unauthenticated request is rejected, not defaulted.
+        assert!(src.contains("unauthorized"), "{src}");
+        // The mark-read route must additionally use the recipient-scoped
+        // (IDOR-safe) store variant, and say why.
         assert!(src.contains(".mark_read_for(recipient_id, id)"), "{src}");
         assert!(src.contains("IDOR"), "{src}");
-        // The demo notify handler must tell the user to swap the
-        // body-supplied recipient for their auth context.
-        assert!(src.contains("TODO:"), "{src}");
+        // The demo login and demo notify must carry prominent
+        // SECURITY/TODO markers steering users to real auth.
+        assert!(src.contains("SECURITY"), "{src}");
+        assert!(src.contains("TODO"), "{src}");
         // The feed goes through the shipped pagination extractors.
         assert!(src.contains("query: ListQuery"), "{src}");
         assert!(src.contains("page: PageRequest"), "{src}");
         assert!(src.contains("Json<Page<Notification>>"), "{src}");
+    }
+
+    #[test]
+    fn generated_routes_never_take_the_recipient_from_the_url_except_demo_login() {
+        // Regression test for the PR #2144 Codex review finding: a
+        // `{recipient_id}` path segment on any real route lets any caller
+        // read (or mark read) another user's feed — `mark_read_for` scopes
+        // to the *supplied* recipient, not the caller. Only the
+        // clearly-marked demo login may name a recipient in its URL.
+        let tmp = project_with_main(default_main());
+        plan_notifications(tmp.path())
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let src = fs::read_to_string(tmp.path().join("src/notifications.rs")).unwrap();
+        let route_attrs: Vec<&str> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("#[get(") || l.starts_with("#[post("))
+            .collect();
+        assert_eq!(route_attrs.len(), 6, "six routes expected: {route_attrs:?}");
+        let recipient_in_url: Vec<&&str> = route_attrs
+            .iter()
+            .filter(|l| l.contains("{recipient_id}"))
+            .collect();
+        assert_eq!(
+            recipient_in_url,
+            vec![&r#"#[post("/notifications/demo_login/{recipient_id}")]"#],
+            "only the demo login route may take a recipient id from the URL"
+        );
+        // The demo notify's body-supplied recipient stays (server-side
+        // notifies are legitimately cross-recipient), but it must warn that
+        // the route needs protection before production.
+        assert!(src.contains("pub recipient_id: i64"), "{src}");
     }
 
     // ── GREEN: main.rs wiring ─────────────────────────────────────────────
@@ -701,6 +862,7 @@ async fn main() {
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(main.contains("mod notifications;"), "{main}");
         for entry in [
+            "notifications::demo_login",
             "notifications::notify",
             "notifications::feed",
             "notifications::unread_count",
@@ -727,22 +889,36 @@ async fn main() {
         let test_src = fs::read_to_string(tmp.path().join("tests/notifications_feed.rs")).unwrap();
         assert!(test_src.contains("TestApp"), "{test_src}");
         assert!(test_src.contains("#[tokio::test]"), "{test_src}");
-        // The full HTTP flow: notify → list → mark_read → unread_count →
-        // unread-only feed empty.
+        // The full session-scoped HTTP flow: anonymous 401 → demo login →
+        // notify → list → mark_read → unread_count → unread-only feed empty.
+        // TestClient's cookie jar carries the session across requests.
+        assert!(test_src.contains("assert_status(401)"), "{test_src}");
+        assert!(
+            test_src.contains(r#".post("/notifications/demo_login/7")"#),
+            "{test_src}"
+        );
         assert!(
             test_src.contains(r#".post("/notifications")"#),
             "{test_src}"
         );
+        assert!(test_src.contains(r#".get("/notifications")"#), "{test_src}");
         assert!(
-            test_src.contains(r#".get("/notifications/7")"#),
+            test_src.contains("/notifications/unread_count"),
             "{test_src}"
         );
-        assert!(
-            test_src.contains("/notifications/7/unread_count"),
-            "{test_src}"
-        );
-        assert!(test_src.contains("/notifications/7/read/"), "{test_src}");
+        assert!(test_src.contains("/read"), "{test_src}");
         assert!(test_src.contains("filter[unread]=true"), "{test_src}");
+        // Cross-recipient protection: a different signed-in recipient sees
+        // an empty feed — the recipient comes from the session, not a URL.
+        assert!(
+            test_src.contains(r#".post("/notifications/demo_login/8")"#),
+            "{test_src}"
+        );
+        // No recipient id in any feed/mark URL.
+        assert!(
+            !test_src.contains("/notifications/7/"),
+            "feed/mark URLs must not carry a recipient id: {test_src}"
+        );
         assert!(
             !test_src.contains("todo!"),
             "must not be a stub: {test_src}"
@@ -804,6 +980,8 @@ async fn main() {
             src[start..=end].to_owned()
         };
         for name in [
+            "current_recipient_id",
+            "demo_login",
             "notify",
             "feed",
             "unread_count",
