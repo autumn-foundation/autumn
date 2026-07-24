@@ -128,6 +128,7 @@ mod negotiate;
 mod nested_form_atomic_save;
 #[cfg(feature = "maud")]
 mod nested_form_order_example;
+mod notifications;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]

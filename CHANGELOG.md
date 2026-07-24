@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **notifications:** first-class in-app notifications store with a read/unread
+  feed (#1148). A new `autumn_web::notifications` module ships a
+  `Notifications` service/extractor (surfaced like `Session`/`Auth`) with
+  `notify(recipient_id, kind, payload)`, `list(...)` returning the shipped
+  `Page`/`ListQuery` pagination (incl. `filter[unread]=true` and
+  `filter[kind]=...`), `unread_count`, and idempotent `mark_read` /
+  `mark_read_for` (recipient-scoped) / `mark_all_read`. Storage is a pluggable
+  `NotificationStore` — `DbNotificationStore` (Postgres or SQLite) by default
+  when a pool is configured, `MemoryNotificationStore` for DB-less dev/tests,
+  or a custom store via `AppBuilder::with_notification_store`. With the `ws`
+  feature, `notify_with_push` additionally publishes the stored notification
+  JSON on the per-recipient `notifications:{id}` channel topic, best-effort (a
+  channel failure never fails the notify). A new `autumn generate
+  notifications` command scaffolds the backend-aware migration, a minimal feed
+  module with registered routes, and an in-process `TestClient` smoke test.
+  Guide: `docs/guide/notifications.md`. All additions are additive — no
+  breaking change to existing surfaces.
 - **cli/generate:** `autumn generate auth` and `autumn generate mailer
   --list-unsubscribe` are now **backend-aware on SQLite** (#1927). On a SQLite
   app they scaffold SQLite-dialect migrations — `INTEGER PRIMARY KEY
