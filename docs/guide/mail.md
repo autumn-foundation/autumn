@@ -347,9 +347,13 @@ In `prod`/`production`, with an active mail transport and no durable backend
 registered, Autumn does **not** fail to start — apps that never call
 `deliver_later`/`deliver_later_eager` (e.g. only `mailer.send(...)`) are
 unaffected either way. Startup logs a warning, and the guard is enforced lazily
-at the call site instead: the first `deliver_later`/`deliver_later_eager` call
-returns `MailError::NoDurableQueueInProduction` until you either register a
-`MailDeliveryQueueHandle` or explicitly opt in:
+at the call site instead: `try_deliver_later`/`try_deliver_later_eager` return
+`MailError::NoDurableQueueInProduction` on the first deferred send, until you
+either register a `MailDeliveryQueueHandle` or explicitly opt in. The plain
+`deliver_later`/`deliver_later_eager` convenience methods call these
+fallible `try_*` variants but only log the error — they still return `()`, so
+a caller using them cannot observe or match on the typed error and should not
+assume the mail was scheduled just because the call returned.
 
 ```toml
 [mail]
@@ -399,11 +403,13 @@ build a `Mailer::with_transport(...)`.
 - Add a plain-text fallback for every HTML email.
 - Assert file-transport `.eml` contents in integration tests.
 - Register a `MailDeliveryQueueHandle` (Harvest, DB outbox, Redis, etc.) for
-  durable `deliver_later` retries. Without one, calling `deliver_later` in
-  `prod` fails at the call site unless
-  `mail.allow_in_process_deliver_later_in_production = true` is set, in which
-  case Autumn falls back to an in-process Tokio task and logs failures. Apps
-  that only use `mailer.send(...)` are unaffected and need neither.
+  durable `deliver_later` retries. Without one, `try_deliver_later`/
+  `try_deliver_later_eager` return `MailError::NoDurableQueueInProduction` in
+  `prod` unless `mail.allow_in_process_deliver_later_in_production = true` is
+  set, in which case Autumn falls back to an in-process Tokio task. The plain
+  `deliver_later`/`deliver_later_eager` methods only log that error — they
+  don't propagate it to the caller. Apps that only use `mailer.send(...)` are
+  unaffected and need neither.
 - For DB-write + mail-orchestration flows, use the [Transactions
   Guide](transactions.md) for the canonical atomic write pattern.
 - Shipping newsletters, digests, or other bulk mail? See
