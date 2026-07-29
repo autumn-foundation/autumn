@@ -298,6 +298,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   richer per-fault surfaces build additively on it. [no-plugin]
 ### Fixed
 
+- **mail:** the prod `deliver_later` durability guard no longer aborts app
+  startup for applications that never call `deliver_later`/`deliver_later_eager`
+  (#2142). Previously, `install_mailer` hard-failed at boot in `prod` whenever
+  no durable `MailDeliveryQueue` was registered and
+  `mail.allow_in_process_deliver_later_in_production` was unset — even for
+  apps that only ever call `Mailer::send`. The check is now enforced lazily:
+  startup logs a warning and continues, and `try_deliver_later`/
+  `try_deliver_later_eager` return the new `MailError::NoDurableQueueInProduction`
+  the first time deferred delivery is actually attempted without a durable
+  backend or explicit ack.
 - **ci:** wire the `sim_sqlite_substrate` (W4) integration test into the
   `sqlite-runtime` job's `cargo test --features "sqlite,test-support"`
   invocation (alongside `sim_chaos`) so it actually runs in CI, and fix a
