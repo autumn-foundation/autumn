@@ -184,6 +184,11 @@ pub const PLAYGROUND_BIN_NAME: &str = "playground";
 /// needs.
 pub const PLAYGROUND_FEATURE: &str = "playground";
 
+/// How many times `write_atomic` retries an exclusive temp-file create before
+/// giving up. Collisions only happen against our own concurrent runs, so a
+/// handful is ample.
+const MAX_TEMP_FILE_ATTEMPTS: u32 = 16;
+
 /// The `autumn-web` feature the scaffolded playground needs: it bootstraps
 /// through `autumn_web::seed::SeedContext`, which is gated on `seed`.
 const REQUIRED_FEATURE: &str = "seed";
@@ -352,7 +357,10 @@ fn package_name(manifest: &str) -> Option<String> {
 /// Edits go through `toml_edit`, so comments, key order, and hand-formatted
 /// arrays survive. A manifest that cannot be parsed is an error, never a
 /// best-effort rewrite.
-pub fn ensure_manifest_wiring(manifest: &str) -> Result<(String, ManifestChanges), ConsoleError> {
+pub fn ensure_manifest_wiring(
+    manifest: &str,
+    inherited_edition: Option<&str>,
+) -> Result<(String, ManifestChanges), ConsoleError> {
     let mut doc = manifest
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| ConsoleError::ManifestParse(e.to_string()))?;
@@ -379,7 +387,9 @@ pub fn ensure_manifest_wiring(manifest: &str) -> Result<(String, ManifestChanges
     }
     // Nothing declares the target yet and we cannot add it safely: a scaffolded
     // file would be auto-discovered as an ungated binary.
-    if declared_playground_bin(&doc).is_none() && adding_bin_would_break_autodiscovery(&doc) {
+    if declared_playground_bin(&doc).is_none()
+        && adding_bin_would_break_autodiscovery(&doc, inherited_edition)
+    {
         return Err(ConsoleError::CannotIsolateOnEdition2015);
     }
 
@@ -503,6 +513,15 @@ fn enabled_by(features: &toml_edit::Table, name: &str) -> Vec<String> {
 fn ensure_playground_feature(doc: &mut toml_edit::DocumentMut) -> Result<bool, ConsoleError> {
     use toml_edit::{Array, Item, Table, Value};
 
+    let optional_dep_named_playground = doc
+        .get("dependencies")
+        .and_then(|deps| deps.get(PLAYGROUND_FEATURE))
+        .is_some_and(|dep| {
+            dep.get("optional")
+                .and_then(toml_edit::Item::as_bool)
+                .unwrap_or(false)
+        });
+
     let features = doc
         .entry("features")
         .or_insert_with(|| Item::Table(Table::new()));
@@ -510,9 +529,21 @@ fn ensure_playground_feature(doc: &mut toml_edit::DocumentMut) -> Result<bool, C
         return Err(ConsoleError::UnusableFeaturesTable);
     };
 
-    let enables = features
-        .entry(PLAYGROUND_FEATURE)
-        .or_insert_with(|| Item::Value(Value::Array(Array::new())));
+    // An optional dependency named `playground` gets an implicit
+    // `playground = ["dep:playground"]` feature from Cargo. Declaring the key
+    // explicitly suppresses that, and Cargo then rejects the manifest outright
+    // ("optional dependency `playground` is not included in any feature"),
+    // breaking every command. Carry the edge over when we create the key; an
+    // already-explicit feature is the user's and Cargo has already validated
+    // it, so it is left alone.
+    let seed_with_dep = !features.contains_key(PLAYGROUND_FEATURE) && optional_dep_named_playground;
+    let enables = features.entry(PLAYGROUND_FEATURE).or_insert_with(|| {
+        let mut initial = Array::new();
+        if seed_with_dep {
+            initial.push(format!("dep:{PLAYGROUND_FEATURE}"));
+        }
+        Item::Value(Value::Array(initial))
+    });
     let Some(enables) = enables.as_array_mut() else {
         return Err(ConsoleError::UnusablePlaygroundFeature);
     };
@@ -597,24 +628,70 @@ fn declared_playground_bin(doc: &toml_edit::DocumentMut) -> Option<&toml_edit::T
 /// entry. Edition 2018 and later keep auto-discovery on unconditionally, and a
 /// manifest that already declares targets (or sets `autobins = false`) has
 /// nothing left to lose — both are safe.
-pub fn adding_bin_would_break_autodiscovery(doc: &toml_edit::DocumentMut) -> bool {
+pub fn adding_bin_would_break_autodiscovery(
+    doc: &toml_edit::DocumentMut,
+    inherited_edition: Option<&str>,
+) -> bool {
     let Some(package) = doc.get("package").and_then(toml_edit::Item::as_table) else {
         return false;
     };
-    let legacy_edition = matches!(
-        package.get("edition").and_then(toml_edit::Item::as_str),
-        None | Some("2015")
-    );
-    if !legacy_edition {
+    if !package_is_edition_2015(package, inherited_edition) {
         return false;
     }
-    // Already in manual-target mode? Then auto-discovery is off already and
-    // there is nothing our entry could remove.
-    let declares_targets = ["bin", "lib", "test", "bench", "example"]
-        .iter()
-        .any(|k| doc.get(k).is_some())
-        || package.get("autobins").is_some();
-    !declares_targets
+    // Only *binary* configuration proves bin auto-discovery is already off.
+    // A `[lib]`, `[[test]]`, or `[[example]]` says nothing about it: an
+    // edition-2015 package with `[lib]` and no `[[bin]]` still auto-discovers
+    // `src/main.rs` and `src/bin/*.rs`, so treating the library as evidence
+    // would let us append an entry that silently drops every one of them.
+    let bin_config_present = doc.get("bin").is_some() || package.get("autobins").is_some();
+    !bin_config_present
+}
+
+/// Whether the package is edition 2015, resolving the workspace-inherited
+/// form.
+///
+/// `edition` may be absent (genuinely 2015), a literal string, or the
+/// inherited `edition.workspace = true` shape — for which `as_str()` yields
+/// `None`. Reading that `None` as "2015" would misclassify most modern
+/// workspace members and refuse them for a legacy hazard they do not have, so
+/// the inherited case defers to the workspace root's value.
+fn package_is_edition_2015(package: &toml_edit::Table, inherited_edition: Option<&str>) -> bool {
+    package.get("edition").is_none_or(|item| {
+        item.as_str().map_or_else(
+            // Inherited: believe the workspace root. When it cannot be read,
+            // assume modern — `[workspace.package]` inheritance postdates
+            // edition 2015 by years, so an inherited 2015 is vanishingly rare
+            // while inherited 2021/2024 is the common case.
+            || inherited_edition == Some("2015"),
+            |edition| edition == "2015",
+        )
+    })
+}
+
+/// The `[workspace.package] edition` a member would inherit, found by walking
+/// up from the package directory to the workspace root.
+fn workspace_inherited_edition(project_dir: &Path) -> Option<String> {
+    for dir in project_dir.ancestors() {
+        let manifest = dir.join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let Ok(doc) = std::fs::read_to_string(&manifest)
+            .ok()?
+            .parse::<toml_edit::DocumentMut>()
+        else {
+            continue;
+        };
+        if let Some(edition) = doc
+            .get("workspace")
+            .and_then(|w| w.get("package"))
+            .and_then(|p| p.get("edition"))
+            .and_then(toml_edit::Item::as_str)
+        {
+            return Some(edition.to_owned());
+        }
+    }
+    None
 }
 
 /// Print an error and exit non-zero. `autumn console` never fails silently.
@@ -633,20 +710,55 @@ fn fail_io(path: &Path, err: &std::io::Error) -> ! {
 /// interruption (Ctrl-C, ENOSPC, a crash) can never leave a truncated file
 /// behind. `Cargo.toml` in particular is unrecoverable if half-written.
 fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!(
-        "{}.autumn-console-tmp",
-        path.extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or("")
-    ));
-    std::fs::write(&tmp, contents)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
+    use std::io::Write as _;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("autumn-console");
+
+    // The scratch file is created with O_EXCL, which fails outright if the
+    // path already exists — including when it exists as a *symlink*. A
+    // deterministic name opened with a plain write would instead follow such a
+    // link and truncate whatever it points at, anywhere on the filesystem, and
+    // the rename would then install the link in place of the real file. A
+    // checked-out repository can contain any name we might pick, so the
+    // exclusive create (not the name) is what makes this safe; the pid and
+    // counter only avoid colliding with our own concurrent runs.
+    for attempt in 0..MAX_TEMP_FILE_ATTEMPTS {
+        let tmp = dir.join(format!(
+            ".{stem}.autumn-console-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+
+        let written = file
+            .write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
             let _ = std::fs::remove_file(&tmp);
-            Err(e)
+            return Err(e);
         }
+        return Ok(());
     }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not create a temporary file next to {}",
+            path.display()
+        ),
+    ))
 }
 
 /// Resolve the package directory to operate on.
@@ -725,8 +837,11 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
     let project_dir = resolve_project_dir(package);
     let manifest_path = project_dir.join("Cargo.toml");
     let (manifest, doc) = load_manifest(&manifest_path, &project_dir);
-    let (updated_manifest, changes) =
-        ensure_manifest_wiring(&manifest).unwrap_or_else(|e| fail(&e));
+    let (updated_manifest, changes) = ensure_manifest_wiring(
+        &manifest,
+        workspace_inherited_edition(&project_dir).as_deref(),
+    )
+    .unwrap_or_else(|e| fail(&e));
 
     // Write the manifest FIRST. The playground is only ever compiled with
     // `--features playground`, so a manifest that never landed simply means
@@ -1012,7 +1127,7 @@ autumn-web = "0.6.0"
         // fails to compile (its `#[path]`-included repository referencing
         // `crate::routes`, say) would then break the bare `cargo build` that
         // `autumn dev` and `autumn build` run.
-        let (out, changes) = ensure_manifest_wiring(PLAIN_MANIFEST).unwrap();
+        let (out, changes) = ensure_manifest_wiring(PLAIN_MANIFEST, None).unwrap();
         assert!(changes.added_bin && changes.added_feature);
         assert!(
             out.contains("[[bin]]") && out.contains("name = \"playground\""),
@@ -1030,7 +1145,7 @@ autumn-web = "0.6.0"
 
     #[test]
     fn ensure_manifest_wiring_defines_the_playground_feature() {
-        let (out, changes) = ensure_manifest_wiring(PLAIN_MANIFEST).unwrap();
+        let (out, changes) = ensure_manifest_wiring(PLAIN_MANIFEST, None).unwrap();
         assert!(changes.added_feature);
         assert!(
             out.contains("playground = [\"autumn-web/seed\"]"),
@@ -1048,7 +1163,7 @@ autumn-web = "0.6.0"
         // the closing brace).
         let manifest = "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
                         [dependencies]\nautumn-web = \"0.6.0\" # pinned for the demo\n";
-        let (out, _) = ensure_manifest_wiring(manifest).unwrap();
+        let (out, _) = ensure_manifest_wiring(manifest, None).unwrap();
         assert!(
             out.contains("autumn-web = \"0.6.0\" # pinned for the demo"),
             "the dependency line must be byte-identical:\n{out}"
@@ -1073,7 +1188,7 @@ flash = ["autumn-web/flash"]
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        let (out, changes) = ensure_manifest_wiring(manifest).unwrap();
+        let (out, changes) = ensure_manifest_wiring(manifest, None).unwrap();
         assert!(changes.added_feature);
         assert!(
             out.contains("default = [\"flash\"]")
@@ -1096,7 +1211,7 @@ playground = ["autumn-web/seed", "autumn-web/redis"]
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        let (out, changes) = ensure_manifest_wiring(manifest).unwrap();
+        let (out, changes) = ensure_manifest_wiring(manifest, None).unwrap();
         assert!(!changes.added_feature);
         assert!(
             out.contains("\"autumn-web/redis\""),
@@ -1106,8 +1221,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn ensure_manifest_wiring_is_idempotent() {
-        let (once, _) = ensure_manifest_wiring(PLAIN_MANIFEST).unwrap();
-        let (twice, changes) = ensure_manifest_wiring(&once).unwrap();
+        let (once, _) = ensure_manifest_wiring(PLAIN_MANIFEST, None).unwrap();
+        let (twice, changes) = ensure_manifest_wiring(&once, None).unwrap();
         assert_eq!(
             changes,
             ManifestChanges::default(),
@@ -1130,7 +1245,7 @@ path = "src/bin/worker.rs"
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        let (out, _) = ensure_manifest_wiring(manifest).unwrap();
+        let (out, _) = ensure_manifest_wiring(manifest, None).unwrap();
         assert!(
             out.contains("name = \"worker\"") && out.contains("name = \"playground\""),
             "a user's own bin targets must survive alongside ours:\n{out}"
@@ -1153,7 +1268,7 @@ playground = []
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        let (out, changes) = ensure_manifest_wiring(manifest).unwrap();
+        let (out, changes) = ensure_manifest_wiring(manifest, None).unwrap();
         assert!(changes.added_feature);
         assert!(
             out.contains("\"autumn-web/seed\""),
@@ -1174,7 +1289,7 @@ playground = ["autumn-web/redis"]
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        let (out, changes) = ensure_manifest_wiring(manifest).unwrap();
+        let (out, changes) = ensure_manifest_wiring(manifest, None).unwrap();
         assert!(changes.added_feature);
         assert!(
             out.contains("\"autumn-web/redis\"") && out.contains("\"autumn-web/seed\""),
@@ -1196,7 +1311,7 @@ playground = "nonsense"
 autumn-web = "0.6.0"
 "#;
         assert_eq!(
-            ensure_manifest_wiring(manifest),
+            ensure_manifest_wiring(manifest, None),
             Err(ConsoleError::UnusablePlaygroundFeature)
         );
     }
@@ -1219,7 +1334,7 @@ required-features = ["playground"]
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        let (out, changes) = ensure_manifest_wiring(manifest).unwrap();
+        let (out, changes) = ensure_manifest_wiring(manifest, None).unwrap();
         assert!(!changes.added_bin, "the existing target must be recognised");
         assert_eq!(
             out.matches("name = \"playground\"").count(),
@@ -1248,7 +1363,7 @@ flash = []
 autumn-web = "0.6.0"
 "#;
         assert_eq!(
-            ensure_manifest_wiring(manifest),
+            ensure_manifest_wiring(manifest, None),
             Err(ConsoleError::PlaygroundFeatureIsDefault(
                 "default".to_owned()
             ))
@@ -1270,7 +1385,7 @@ bundle = ["playground"]
 autumn-web = "0.6.0"
 "#;
         assert_eq!(
-            ensure_manifest_wiring(manifest),
+            ensure_manifest_wiring(manifest, None),
             Err(ConsoleError::PlaygroundFeatureIsDefault(
                 "bundle".to_owned()
             )),
@@ -1294,7 +1409,7 @@ b = ["a"]
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        assert!(ensure_manifest_wiring(manifest).is_ok());
+        assert!(ensure_manifest_wiring(manifest, None).is_ok());
     }
 
     #[test]
@@ -1314,8 +1429,181 @@ path = "src/bin/playground.rs"
 autumn-web = "0.6.0"
 "#;
         assert_eq!(
-            ensure_manifest_wiring(manifest),
+            ensure_manifest_wiring(manifest, None),
             Err(ConsoleError::PlaygroundBinNotGated)
+        );
+    }
+
+    // ── isolation guards, round 3 ─────────────────────────────────────────
+
+    #[test]
+    fn edition_2015_lib_is_not_proof_that_bin_discovery_is_off() {
+        // Verified against cargo: with `[lib]` and no `[[bin]]`, an
+        // edition-2015 package still auto-discovers src/main.rs and
+        // src/bin/*.rs. Appending our entry turned targets
+        // [g-app, g_app, worker] into [g_app, playground].
+        let manifest = r#"[package]
+name = "legacy-app"
+version = "0.1.0"
+edition = "2015"
+
+[lib]
+name = "legacy_app"
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest, None),
+            Err(ConsoleError::CannotIsolateOnEdition2015),
+            "a [lib] says nothing about bin auto-discovery"
+        );
+    }
+
+    #[test]
+    fn edition_2015_with_an_existing_bin_entry_may_add_ours() {
+        let manifest = r#"[package]
+name = "legacy-app"
+version = "0.1.0"
+edition = "2015"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        let (_, changes) = ensure_manifest_wiring(manifest, None).unwrap();
+        assert!(
+            changes.added_bin,
+            "bin discovery is already off, so nothing more can be lost"
+        );
+    }
+
+    #[test]
+    fn inherited_edition_is_resolved_before_applying_the_2015_rule() {
+        // `edition.workspace = true` yields None from as_str(); reading that as
+        // "2015" would refuse a modern workspace member for a hazard it has no.
+        let manifest = r#"[package]
+name = "member"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        let (_, changes) = ensure_manifest_wiring(manifest, Some("2024")).unwrap();
+        assert!(changes.added_bin, "an inherited 2024 edition is not legacy");
+
+        assert_eq!(
+            ensure_manifest_wiring(manifest, Some("2015")),
+            Err(ConsoleError::CannotIsolateOnEdition2015),
+            "an inherited 2015 edition still gets the legacy treatment"
+        );
+    }
+
+    #[test]
+    fn playground_feature_preserves_an_implicit_optional_dependency() {
+        // Cargo synthesises `playground = ["dep:playground"]` for an optional
+        // dependency of that name. Declaring the key without the edge makes
+        // cargo reject the manifest: "optional dependency `playground` is not
+        // included in any feature" — verified against cargo.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = "0.6.0"
+playground = { version = "0.1", optional = true }
+"#;
+        let (out, _) = ensure_manifest_wiring(manifest, None).unwrap();
+        assert!(
+            out.contains("\"dep:playground\""),
+            "the implicit optional-dependency edge must survive:\n{out}"
+        );
+        assert!(
+            out.contains("\"autumn-web/seed\""),
+            "and the seed edge must still be added:\n{out}"
+        );
+    }
+
+    #[test]
+    fn playground_feature_does_not_invent_a_dep_edge_for_a_required_dependency() {
+        // Only an *optional* dependency gets an implicit feature.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = "0.6.0"
+playground = "0.1"
+"#;
+        let (out, _) = ensure_manifest_wiring(manifest, None).unwrap();
+        assert!(
+            !out.contains("dep:playground"),
+            "a required dependency has no implicit feature to preserve:\n{out}"
+        );
+    }
+
+    // ── write_atomic ──────────────────────────────────────────────────────
+
+    #[test]
+    fn write_atomic_does_not_write_through_a_symlinked_scratch_file() {
+        // A checked-out repo can contain any name we might pick for the temp
+        // file. Opening a deterministic path with a plain write would follow
+        // such a link and truncate its target anywhere on disk.
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, "SECRET").unwrap();
+
+        let target = tmp.path().join("Cargo.toml");
+        std::fs::write(&target, "original").unwrap();
+
+        // Pre-plant links across the whole space of names we might choose.
+        for attempt in 0..MAX_TEMP_FILE_ATTEMPTS {
+            let decoy = tmp.path().join(format!(
+                ".Cargo.toml.autumn-console-{}-{attempt}.tmp",
+                std::process::id()
+            ));
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&victim, &decoy).unwrap();
+            #[cfg(not(unix))]
+            std::fs::write(&decoy, "decoy").unwrap();
+        }
+
+        assert!(
+            write_atomic(&target, "new contents").is_err(),
+            "every candidate name is taken, so the write must fail rather than \
+             follow a link"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "SECRET",
+            "the symlink target must never be written through"
+        );
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_target_and_cleans_up() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("Cargo.toml");
+        std::fs::write(&target, "old").unwrap();
+
+        write_atomic(&target, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("autumn-console"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files must not linger: {leftovers:?}"
         );
     }
 
@@ -1341,7 +1629,7 @@ required-features = ["playground", "tools"]
 autumn-web = "0.6.0"
 "#;
         assert_eq!(
-            ensure_manifest_wiring(manifest),
+            ensure_manifest_wiring(manifest, None),
             Err(ConsoleError::PlaygroundBinGateUnsatisfiable(
                 "tools".to_owned()
             ))
@@ -1368,7 +1656,7 @@ required-features = ["playground", "tools"]
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        assert!(ensure_manifest_wiring(manifest).is_ok());
+        assert!(ensure_manifest_wiring(manifest, None).is_ok());
     }
 
     #[test]
@@ -1392,7 +1680,7 @@ required-features = ["playground", "flash"]
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        assert!(ensure_manifest_wiring(manifest).is_ok());
+        assert!(ensure_manifest_wiring(manifest, None).is_ok());
     }
 
     #[test]
@@ -1412,7 +1700,7 @@ required-features = ["tools"]
 autumn-web = "0.6.0"
 "#;
         assert_eq!(
-            ensure_manifest_wiring(manifest),
+            ensure_manifest_wiring(manifest, None),
             Err(ConsoleError::PlaygroundBinNotGated)
         );
     }
@@ -1426,7 +1714,7 @@ autumn-web = "0.6.0"
             "[package]\nname = \"a\"\nedition = \"2024\"\n\n[[bin]]\nname = \"playground\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
         ] {
             assert!(
-                ensure_manifest_wiring(manifest).is_err(),
+                ensure_manifest_wiring(manifest, None).is_err(),
                 "expected a refusal for:\n{manifest}"
             );
         }
@@ -1541,7 +1829,7 @@ required-features = ["playground"]
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        let (out, changes) = ensure_manifest_wiring(manifest).unwrap();
+        let (out, changes) = ensure_manifest_wiring(manifest, None).unwrap();
         assert!(!changes.added_bin);
         assert!(
             out.contains("path = \"custom/playground.rs\"")
@@ -1594,7 +1882,7 @@ autumn-web = "0.6.0"
         // file would be auto-discovered as an UNGATED binary that joins every
         // normal build — the exact outage the gate exists to prevent.
         assert_eq!(
-            ensure_manifest_wiring(manifest),
+            ensure_manifest_wiring(manifest, None),
             Err(ConsoleError::CannotIsolateOnEdition2015)
         );
     }
@@ -1613,7 +1901,7 @@ path = "src/main.rs"
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        let (_, changes) = ensure_manifest_wiring(manifest).unwrap();
+        let (_, changes) = ensure_manifest_wiring(manifest, None).unwrap();
         assert!(changes.added_bin);
     }
 
@@ -1624,7 +1912,7 @@ autumn-web = "0.6.0"
                 "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n\n\
                  [dependencies]\nautumn-web = \"0.6.0\"\n"
             );
-            let (_, changes) = ensure_manifest_wiring(&manifest).unwrap();
+            let (_, changes) = ensure_manifest_wiring(&manifest, None).unwrap();
             assert!(changes.added_bin, "edition {edition} keeps autobins on");
         }
     }
@@ -1635,14 +1923,14 @@ autumn-web = "0.6.0"
     fn ensure_manifest_wiring_errors_without_an_autumn_web_dependency() {
         let manifest = "[package]\nname = \"my-app\"\n\n[dependencies]\nserde = \"1\"\n";
         assert_eq!(
-            ensure_manifest_wiring(manifest),
+            ensure_manifest_wiring(manifest, None),
             Err(ConsoleError::MissingAutumnWebDependency)
         );
     }
 
     #[test]
     fn ensure_manifest_wiring_errors_on_an_unparsable_manifest() {
-        let err = ensure_manifest_wiring("this is not = = toml").unwrap_err();
+        let err = ensure_manifest_wiring("this is not = = toml", None).unwrap_err();
         assert!(matches!(err, ConsoleError::ManifestParse(_)));
     }
 
@@ -1657,7 +1945,7 @@ autumn-web = "0.6.0"
         let manifest = "features = \"nope\"\n\n[package]\nname = \"my-app\"\n\
                         edition = \"2024\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n";
         assert_eq!(
-            ensure_manifest_wiring(manifest),
+            ensure_manifest_wiring(manifest, None),
             Err(ConsoleError::UnusableFeaturesTable)
         );
     }
