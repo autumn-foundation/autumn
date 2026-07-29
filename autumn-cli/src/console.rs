@@ -91,8 +91,11 @@ pub enum ConsoleError {
          `{0}`, which `autumn console` does not enable — it activates the \
          default features plus `playground`, and `required-features` is an \
          all-of list, so Cargo would refuse to build the target. Either drop \
-         `{0}` from that entry, or make `playground` enable it:\n\n    \
-         [features]\n    playground = [\"autumn-web/seed\", \"{0}\"]\n\n\
+         `{0}` from that entry, or declare `{0}` and have `playground` enable \
+         it:\n\n    [features]\n    {0} = []\n    playground = \
+         [\"autumn-web/seed\", \"{0}\"]\n\n\
+         Note `default` is not implicitly present: a gate naming a feature the \
+         manifest never declares can never be satisfied.\n\
          See: docs/guide/console.md"
     )]
     PlaygroundBinGateUnsatisfiable(String),
@@ -497,12 +500,30 @@ fn playground_bin_gate_problem(
     }
 
     // What `cargo run --features playground` actually turns on. We never pass
-    // `--no-default-features`, so `default` is active too.
-    let activated = feature_closure(doc, &["default", PLAYGROUND_FEATURE]);
+    // `--no-default-features`, so the default set is active too — but only if
+    // the package declares one. A gate naming a feature that does not exist
+    // can never be satisfied: cargo warns "`default` is not present in
+    // [features] section" and refuses to build the target. Seeding `default`
+    // unconditionally would accept exactly that unrunnable gate.
+    let mut roots = vec![PLAYGROUND_FEATURE];
+    if declares_feature(doc, "default") {
+        roots.push("default");
+    }
+    let activated = feature_closure(doc, &roots);
     required
         .into_iter()
         .find(|f| f != PLAYGROUND_FEATURE && !activated.contains(f))
         .map(ConsoleError::PlaygroundBinGateUnsatisfiable)
+}
+
+/// Whether the package declares `[features] <name>` itself.
+///
+/// A `required-features` entry naming a feature the manifest never defines is
+/// unsatisfiable — including `default`, which is not implicitly present.
+fn declares_feature(doc: &toml_edit::DocumentMut, name: &str) -> bool {
+    doc.get("features")
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(|features| features.contains_key(name))
 }
 
 /// The feature chain by which `[features] default` reaches `playground`, if it
@@ -512,7 +533,9 @@ fn playground_bin_gate_problem(
 /// `required-features = ["playground"]` vacuous: the target rejoins the default
 /// build set and the whole isolation guarantee evaporates.
 fn default_feature_chain_to_playground(doc: &toml_edit::DocumentMut) -> Option<String> {
-    let features = doc.get("features").and_then(toml_edit::Item::as_table)?;
+    let features = doc
+        .get("features")
+        .and_then(toml_edit::Item::as_table_like)?;
     let mut queue: Vec<String> = vec!["default".to_owned()];
     let mut seen: Vec<String> = Vec::new();
 
@@ -533,7 +556,7 @@ fn default_feature_chain_to_playground(doc: &toml_edit::DocumentMut) -> Option<S
 
 /// Every package feature activated by turning on `roots`, transitively.
 fn feature_closure(doc: &toml_edit::DocumentMut, roots: &[&str]) -> Vec<String> {
-    let Some(features) = doc.get("features").and_then(toml_edit::Item::as_table) else {
+    let Some(features) = doc.get("features").and_then(toml_edit::Item::as_table_like) else {
         return roots.iter().map(|r| (*r).to_owned()).collect();
     };
     let mut queue: Vec<String> = roots.iter().map(|r| (*r).to_owned()).collect();
@@ -570,7 +593,7 @@ fn feature_closure(doc: &toml_edit::DocumentMut, roots: &[&str]) -> Vec<String> 
 ///   ours to follow.
 fn enabled_by(
     doc: &toml_edit::DocumentMut,
-    features: &toml_edit::Table,
+    features: &dyn toml_edit::TableLike,
     name: &str,
 ) -> Vec<String> {
     features
@@ -658,7 +681,7 @@ fn ensure_playground_feature(doc: &mut toml_edit::DocumentMut) -> Result<bool, C
     let features = doc
         .entry("features")
         .or_insert_with(|| Item::Table(Table::new()));
-    let Some(features) = features.as_table_mut() else {
+    let Some(features) = features.as_table_like_mut() else {
         return Err(ConsoleError::UnusableFeaturesTable);
     };
 
@@ -1980,6 +2003,118 @@ autumn-web = "0.6.0"
 default = ["autumn-web/mail"]
 "#;
         assert!(ensure_manifest_wiring(manifest, None).is_ok());
+    }
+
+    #[test]
+    fn an_inline_root_features_table_is_usable() {
+        // `features = { playground = [] }` at the document root is a valid
+        // manifest — cargo reports `features = {'playground': []}` for it — but
+        // toml_edit exposes it as an InlineTable, so an `as_table_mut()` check
+        // rejected EVERY console invocation on such a project. Same class of
+        // mistake as the dependency scan: enumerating representations instead
+        // of going through `as_table_like`.
+        //
+        // NOTE the key sits above the first table header. Placed after
+        // `[package]` it would nest inside it and be inert — which is how a
+        // first attempt at this repro accidentally passed.
+        let manifest = r#"features = { playground = [] }
+
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        let (updated, changes) = ensure_manifest_wiring(manifest, None).expect("accepted");
+        assert!(changes.added_feature, "the seed edge should be merged in");
+        assert!(
+            updated.contains("autumn-web/seed"),
+            "inline table should be edited in place: {updated}"
+        );
+    }
+
+    #[test]
+    fn an_inline_root_features_table_is_still_scanned_for_a_default_gate() {
+        // The read paths matter as much as the write: with an inline table the
+        // default-enables-playground guard used to see no features at all and
+        // wave the project through.
+        let manifest = r#"features = { default = ["playground"], playground = [] }
+
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest, None),
+            Err(ConsoleError::PlaygroundFeatureIsDefault(
+                "default".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_gate_naming_an_undeclared_default_feature_is_rejected() {
+        // `default` is not implicitly present. Verified against cargo:
+        //   warning: invalid feature `default` in required-features of target
+        //            `playground`: `default` is not present in [features]
+        //   error: target `playground` requires the features: `playground`, `default`
+        // so the target can never run and the gate must be refused.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+autumn-web = "0.6.0"
+
+[features]
+playground = []
+
+[[bin]]
+name = "playground"
+path = "src/bin/playground.rs"
+required-features = ["playground", "default"]
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest, None),
+            Err(ConsoleError::PlaygroundBinGateUnsatisfiable(
+                "default".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_gate_naming_a_declared_default_feature_is_accepted() {
+        // The accept case the fix must not swallow: when the package really
+        // does declare `default`, the runner activates it (no
+        // `--no-default-features` is ever passed), so the gate is satisfiable.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+autumn-web = "0.6.0"
+
+[features]
+default = []
+playground = []
+
+[[bin]]
+name = "playground"
+path = "src/bin/playground.rs"
+required-features = ["playground", "default"]
+"#;
+        assert!(
+            ensure_manifest_wiring(manifest, None).is_ok(),
+            "a declared `default` is activated by the runner and must be accepted"
+        );
     }
 
     // ── path containment ──────────────────────────────────────────────────
