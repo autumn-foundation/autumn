@@ -111,6 +111,10 @@ duplicating:
 - **An existing `playground` feature** keeps everything it already enables;
   `autumn-web/seed` is merged in as one extra entry if it isn't there already.
   (It has to be: the playground imports `autumn_web::seed::SeedContext`.)
+- **An optional dependency named `playground`** keeps working. Cargo gives it
+  an implicit `playground = ["dep:playground"]` feature; declaring the key
+  without that edge would make Cargo reject the manifest, so the edge is
+  carried over when the feature is created.
 - **An existing `[[bin]] name = "playground"`** is left exactly as written and
   the playground is scaffolded at *its* path — including when the entry has no
   `path` key, where Cargo infers `src/bin/playground.rs`. Appending a second
@@ -153,7 +157,7 @@ line to change:
 | `[[bin]] name = "playground"` exists without `required-features = ["playground"]` | Reusing an ungated target would put the seed-dependent playground into every `cargo build`. |
 | `[[bin]] name = "playground"`'s gate names a feature `playground` doesn't enable | `required-features` is an *all-of* list. `autumn console` activates the default features plus `playground`, so a gate like `["playground", "tools"]` can never be satisfied and Cargo would decline to build the target. Either drop the extra, or have `playground` enable it. |
 | `default` enables `playground` (directly or through another feature) | The gate becomes vacuous — the playground would be in every build. |
-| Edition 2015 with no hand-declared targets | Declaring the first target turns off auto-discovery of the rest, and a scaffolded file would meanwhile be auto-discovered as an *ungated* binary. Add the `[[bin]]` block yourself (the error prints it), then re-run. |
+| Edition 2015 with no hand-declared **binary** targets | Declaring the first `[[bin]]` turns off auto-discovery of the rest — dropping your `src/main.rs` and `src/bin/*.rs` from the build — and a scaffolded file would meanwhile be auto-discovered as an *ungated* binary. A `[lib]` doesn't count: bin auto-discovery is still on. Add the `[[bin]]` block yourself (the error prints it), then re-run. An `edition.workspace = true` member inherits the workspace's edition, so this only applies if *that* is 2015. |
 
 Each of these is a one-line fix in your `Cargo.toml`, after which `autumn
 console` proceeds normally.
