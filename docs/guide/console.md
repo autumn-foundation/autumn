@@ -41,7 +41,10 @@ Put your query between the `// ── your code here` markers:
 
 ```rust
 // ── your code here ─────────────────────────────────────────────────────
-let repo = repositories::post::PgPostRepository::with_pool_untracked(ctx.pool().clone());
+// The generated trait must be in scope for its methods to resolve:
+use repositories::post::{PgPostRepository, PostRepository};
+
+let repo = PgPostRepository::with_pool_untracked(ctx.pool().clone());
 for post in repo.find_all().await.unwrap() {
     println!("{} {}", post.id, post.title);
 }
@@ -63,6 +66,10 @@ autumn console
 | `--force` | Overwrite the playground with a fresh copy of the template. |
 | `--scaffold-only` | Scaffold and wire the playground, then stop — don't build or run it. |
 
+`--profile` also selects which `[profile.<name>.database]` section of
+`autumn.toml` supplies the URL, so `autumn console --profile demo` talks to the
+same database `autumn dev --profile demo` would.
+
 `autumn c` is a shorthand alias for `autumn console`.
 
 ## Your edits are safe
@@ -80,18 +87,54 @@ mistake for an empty result set.
 
 ## What it changes in your project
 
-On the first run, `autumn console` makes three idempotent edits to
-`Cargo.toml`, each reported on stderr:
+On the first run, `autumn console` makes two idempotent edits to `Cargo.toml`,
+each reported on stderr:
 
-1. registers the `playground` bin target;
-2. enables the `autumn-web` `seed` feature (the playground bootstraps through
-   `autumn_web::seed::SeedContext`, which is gated on it);
-3. sets `default-run` to your package name when it isn't already set — without
-   it, adding a second binary would make a bare `cargo run` ambiguous.
+```toml
+[features]
+playground = ["autumn-web/seed"]
 
-Edits go through a format-preserving TOML editor, so comments, key order, and
-hand-formatted arrays survive. A second `autumn console` leaves `Cargo.toml`
-byte-identical.
+[[bin]]
+name = "playground"
+path = "src/bin/playground.rs"
+required-features = ["playground"]
+```
+
+Edits go through a format-preserving TOML editor and are written atomically, so
+comments, key order, and hand-formatted arrays survive and an interrupted run
+cannot truncate the file. Your `autumn-web` dependency line is never touched. A
+second `autumn console` leaves `Cargo.toml` byte-identical.
+
+### Why the feature gate matters
+
+`required-features` keeps the playground **out of your default build**.
+`cargo build`, `cargo test`, `autumn dev`, and `autumn build` all skip the
+target; only `autumn console` (which passes `--features playground`) compiles
+it.
+
+That matters because the playground compiles your `models`, `repositories`, and
+`policies` into a *separate* crate, and generated code there isn't always
+self-contained — an `autumn generate scaffold --live` repository renders
+`crate::routes::posts::paths::show(...)`, and `routes` reaches into
+`src/main.rs`, which no binary target can see. Without the gate, a playground
+that failed to compile would break `autumn dev` for the whole project. With it,
+a compile error is a console problem you see immediately and nothing else
+changes.
+
+It also means the `seed` feature (which implies `db`) never reaches the normal
+builds of a deliberately database-free app.
+
+### Removing the playground
+
+Delete `src/bin/playground.rs` **and** its `[[bin]]` block. The `playground`
+feature can stay or go; it costs nothing when unused.
+
+### Edition 2015
+
+On a 2015-edition package, declaring any target by hand turns off Cargo's
+auto-discovery of the rest — so `autumn console` refuses to append the `[[bin]]`
+block there (it would silently drop your existing binaries from the build) and
+prints the snippet for you to add yourself.
 
 ## Not included
 

@@ -1609,7 +1609,30 @@ autumn db backup --keep 7        # dump control DB + shards to ./backups/<profil
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (unreleased — trunk-dev)
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
 autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
+autumn console                   # data playground: scaffolds src/bin/playground.rs (pre-wired config+pool), then builds and runs it; alias `autumn c`
+autumn console --force           # regenerate the playground from the template (never overwritten otherwise)
+autumn console --scaffold-only   # scaffold + wire Cargo.toml, then stop
 ```
+
+`autumn console` is Autumn's `rails console` equivalent. Rust has no stable
+`eval`, so it follows loco.rs's edit-and-run model instead of shipping a REPL:
+the playground is an ordinary Rust file you edit, and the command owns the
+compile-and-run loop. It resolves the database exactly like `autumn seed` and
+`autumn dev` (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` →
+`DATABASE_URL` → profile-aware `autumn.toml`) by bootstrapping through
+`autumn_web::seed::SeedContext`.
+
+Two things to know when advising on it:
+
+- The playground declares the app's `schema` / `models` / `repositories` /
+  `policies` modules with `#[path = "../…"]`, because a Cargo bin target is its
+  own crate and a generated Autumn app has no `src/lib.rs`. Users add their own
+  `use` lines (and can add more `#[path]` lines for other modules).
+- Its `[[bin]]` is gated behind `required-features = ["playground"]`, so
+  `cargo build`, `cargo test`, `autumn dev`, and `autumn build` skip it
+  entirely. Only `autumn console` compiles it. Never suggest removing that
+  gate: without it, a playground that fails to compile would break the app's
+  default build.
 
 `autumn i18n check` scans `**/*.rs` for string-literal keys passed to
 `t!(...)`, `.t(...)`, and `.t_with(...)`, loads every `i18n/<locale>.ftl` via
