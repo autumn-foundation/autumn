@@ -73,6 +73,10 @@ impl ManifestChanges {
 pub const PLAYGROUND_REL_PATH: &str = "src/bin/playground.rs";
 pub const PLAYGROUND_BIN_NAME: &str = "playground";
 
+/// The conventional path of the app's primary binary, used to resolve which
+/// target `default-run` should name.
+const MAIN_RS_REL_PATH: &str = "src/main.rs";
+
 /// The `autumn-web` feature the scaffolded playground needs: it bootstraps
 /// through `autumn_web::seed::SeedContext`, which is gated on `seed`.
 const REQUIRED_FEATURE: &str = "seed";
@@ -277,10 +281,33 @@ fn ensure_playground_bin(doc: &mut toml_edit::DocumentMut) -> bool {
     true
 }
 
-/// Set `default-run` to the package name so a bare `cargo run` keeps working
-/// now that the package has more than one binary. Never overrides an existing
-/// value.
+/// Set `default-run` to the app's primary binary so a bare `cargo run` keeps
+/// working now that the package has more than one binary. Never overrides an
+/// existing value.
+///
+/// The primary binary is normally the auto-discovered `src/main.rs` target,
+/// which Cargo names after the package. A package may instead declare an
+/// explicit `[[bin]]` whose `path` is `src/main.rs`, which *replaces* that
+/// auto-discovered target under a different name — writing `default-run =
+/// <package.name>` there would name a target that does not exist and make
+/// Cargo reject every command. So resolve the name from that entry when one
+/// is present, and fall back to the package name otherwise.
 fn ensure_default_run(doc: &mut toml_edit::DocumentMut) -> bool {
+    let explicit_main_bin = doc
+        .get("bin")
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .and_then(|bins| {
+            bins.iter()
+                .find(|t| {
+                    t.get("path")
+                        .and_then(toml_edit::Item::as_str)
+                        .is_some_and(|p| p.replace('\\', "/") == MAIN_RS_REL_PATH)
+                })
+                .and_then(|t| t.get("name"))
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_owned)
+        });
+
     let Some(package) = doc
         .get_mut("package")
         .and_then(toml_edit::Item::as_table_mut)
@@ -290,11 +317,12 @@ fn ensure_default_run(doc: &mut toml_edit::DocumentMut) -> bool {
     if package.contains_key("default-run") {
         return false;
     }
-    let Some(name) = package
-        .get("name")
-        .and_then(toml_edit::Item::as_str)
-        .map(str::to_owned)
-    else {
+    let Some(name) = explicit_main_bin.or_else(|| {
+        package
+            .get("name")
+            .and_then(toml_edit::Item::as_str)
+            .map(str::to_owned)
+    }) else {
         return false;
     };
     package.insert("default-run", toml_edit::value(name));
@@ -740,6 +768,34 @@ autumn-web = "0.6.0"
         assert!(
             out.contains("default-run = \"server\"") && !out.contains("default-run = \"my-app\""),
             "must not override the user's default-run:\n{out}"
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_default_run_follows_a_renamed_primary_bin() {
+        // An explicit `[[bin]]` on `src/main.rs` REPLACES the auto-discovered
+        // package-named target. Writing `default-run = "my-app"` here would
+        // name a nonexistent target and make cargo reject every command.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        let (out, changes) = ensure_manifest_wiring(manifest, true).unwrap();
+        assert!(changes.added_default_run);
+        assert!(
+            out.contains("default-run = \"server\""),
+            "default-run must name the real primary target, not the package:\n{out}"
+        );
+        assert!(
+            !out.contains("default-run = \"my-app\""),
+            "must not name a target that does not exist:\n{out}"
         );
     }
 
