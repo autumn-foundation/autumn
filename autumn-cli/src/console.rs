@@ -21,7 +21,7 @@ use std::process::Command;
 
 /// Errors surfaced by the console runner.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum ConsoleError {
+pub enum ConsoleError {
     #[error(
         "not an Autumn project: no `Cargo.toml` found in {0}\n\
          Run `autumn console` from a project root, or pass --package <name>.\n\
@@ -55,7 +55,7 @@ pub(crate) enum ConsoleError {
 
 /// What the scaffolder did (or would do) with the playground source file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScaffoldOutcome {
+pub enum ScaffoldOutcome {
     Created,
     Kept,
     Regenerated,
@@ -107,9 +107,9 @@ impl ScaffoldOutcome {
 /// uncompilable default build, and `seed`'s implied `db` feature never reaches
 /// a deliberately DB-free project's normal builds.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ManifestChanges {
-    pub(crate) added_bin: bool,
-    pub(crate) added_feature: bool,
+pub struct ManifestChanges {
+    pub added_bin: bool,
+    pub added_feature: bool,
 }
 
 impl ManifestChanges {
@@ -118,13 +118,13 @@ impl ManifestChanges {
     }
 }
 
-pub(crate) const PLAYGROUND_REL_PATH: &str = "src/bin/playground.rs";
-pub(crate) const PLAYGROUND_BIN_NAME: &str = "playground";
+pub const PLAYGROUND_REL_PATH: &str = "src/bin/playground.rs";
+pub const PLAYGROUND_BIN_NAME: &str = "playground";
 
 /// The cargo feature that gates the playground bin target. Enabling it turns
 /// on `autumn-web/seed`, which is what the template's `SeedContext` bootstrap
 /// needs.
-pub(crate) const PLAYGROUND_FEATURE: &str = "playground";
+pub const PLAYGROUND_FEATURE: &str = "playground";
 
 /// The `autumn-web` feature the scaffolded playground needs: it bootstraps
 /// through `autumn_web::seed::SeedContext`, which is gated on `seed`.
@@ -140,7 +140,7 @@ const PLAYGROUND_TEMPLATE: &str = include_str!("templates/playground.rs.tmpl");
 ///
 /// AC5: an existing, possibly user-edited playground is never overwritten;
 /// `--force` is the only path that regenerates it from the template.
-pub(crate) const fn scaffold_outcome(exists: bool, force: bool) -> ScaffoldOutcome {
+pub const fn scaffold_outcome(exists: bool, force: bool) -> ScaffoldOutcome {
     match (exists, force) {
         (false, _) => ScaffoldOutcome::Created,
         (true, false) => ScaffoldOutcome::Kept,
@@ -157,7 +157,7 @@ pub(crate) const fn scaffold_outcome(exists: bool, force: bool) -> ScaffoldOutco
 /// crate, which is what makes a model/repository round-trip possible with no
 /// further wiring (AC3). Both the `src/<name>.rs` and `src/<name>/mod.rs`
 /// layouts are supported; the directory layout wins when both exist.
-pub(crate) fn app_module_decls(project_root: &Path) -> String {
+pub fn app_module_decls(project_root: &Path) -> String {
     let src = project_root.join("src");
     let mut out = String::new();
     for name in APP_MODULES {
@@ -175,7 +175,7 @@ pub(crate) fn app_module_decls(project_root: &Path) -> String {
 
 /// Render the playground template for `project_name`, splicing in the app
 /// module declarations produced by [`app_module_decls`].
-pub(crate) fn render_playground(project_name: &str, app_modules: &str) -> String {
+pub fn render_playground(project_name: &str, app_modules: &str) -> String {
     let rendered = PLAYGROUND_TEMPLATE
         .replace("\r\n", "\n")
         .replace("{{project_name}}", project_name)
@@ -233,7 +233,7 @@ fn package_name(manifest: &str) -> Option<String> {
 /// Edits go through `toml_edit`, so comments, key order, and hand-formatted
 /// arrays survive. A manifest that cannot be parsed is an error, never a
 /// best-effort rewrite.
-pub(crate) fn ensure_manifest_wiring(manifest: &str) -> Result<(String, ManifestChanges), ConsoleError> {
+pub fn ensure_manifest_wiring(manifest: &str) -> Result<(String, ManifestChanges), ConsoleError> {
     let mut doc = manifest
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| ConsoleError::ManifestParse(e.to_string()))?;
@@ -281,7 +281,7 @@ fn ensure_playground_feature(doc: &mut toml_edit::DocumentMut) -> Result<bool, C
 /// with that name is already declared — which may be a user-owned entry
 /// pointing somewhere else, and is never rewritten.
 fn ensure_playground_bin(doc: &mut toml_edit::DocumentMut) -> bool {
-    use toml_edit::{ArrayOfTables, Array, Item, Table, Value, value};
+    use toml_edit::{Array, ArrayOfTables, Item, Table, Value, value};
 
     if declared_playground_path(doc).is_some() {
         return false;
@@ -300,10 +300,7 @@ fn ensure_playground_bin(doc: &mut toml_edit::DocumentMut) -> bool {
     let mut entry = Table::new();
     entry.insert("name", value(PLAYGROUND_BIN_NAME));
     entry.insert("path", value(PLAYGROUND_REL_PATH));
-    entry.insert(
-        "required-features",
-        Item::Value(Value::Array(required)),
-    );
+    entry.insert("required-features", Item::Value(Value::Array(required)));
     bins.push(entry);
     true
 }
@@ -314,7 +311,7 @@ fn ensure_playground_bin(doc: &mut toml_edit::DocumentMut) -> bool {
 /// location while their manifest points elsewhere would write a file Cargo
 /// de-duplicates away, so `autumn console` would report creating one program
 /// and then run a different one.
-pub(crate) fn declared_playground_path(doc: &toml_edit::DocumentMut) -> Option<String> {
+pub fn declared_playground_path(doc: &toml_edit::DocumentMut) -> Option<String> {
     doc.get("bin")
         .and_then(toml_edit::Item::as_array_of_tables)?
         .iter()
@@ -335,7 +332,7 @@ pub(crate) fn declared_playground_path(doc: &toml_edit::DocumentMut) -> Option<S
 /// entry. Edition 2018 and later keep auto-discovery on unconditionally, and a
 /// manifest that already declares targets (or sets `autobins = false`) has
 /// nothing left to lose — both are safe.
-pub(crate) fn adding_bin_would_break_autodiscovery(doc: &toml_edit::DocumentMut) -> bool {
+pub fn adding_bin_would_break_autodiscovery(doc: &toml_edit::DocumentMut) -> bool {
     let Some(package) = doc.get("package").and_then(toml_edit::Item::as_table) else {
         return false;
     };
@@ -373,7 +370,9 @@ fn fail_io(path: &Path, err: &std::io::Error) -> ! {
 fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let tmp = path.with_extension(format!(
         "{}.autumn-console-tmp",
-        path.extension().and_then(std::ffi::OsStr::to_str).unwrap_or("")
+        path.extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("")
     ));
     std::fs::write(&tmp, contents)?;
     match std::fs::rename(&tmp, path) {
@@ -385,74 +384,114 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     }
 }
 
-/// Entry point for `autumn console`.
-pub(crate) fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: bool) {
-    eprintln!("\u{1F342} autumn console\n");
-    eprintln!("  Profile: {profile}");
-
-    // A `--package` we cannot resolve is a hard error. Falling back to the
-    // current directory would silently scaffold into — and mutate the manifest
-    // of — a *different* package than the one the user named.
-    let project_dir: PathBuf = match package {
-        Some(pkg) => match crate::seed::find_package_dir(pkg) {
-            Some(dir) => dir,
-            None => fail(&ConsoleError::UnknownPackage(pkg.to_owned())),
-        },
-        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+/// Resolve the package directory to operate on.
+///
+/// A `--package` we cannot resolve is a hard error. Falling back to the current
+/// directory would silently scaffold into — and mutate the manifest of — a
+/// *different* package than the one the user named. (`autumn seed` can afford
+/// that fallback because it only reads afterwards; this command writes.)
+fn resolve_project_dir(package: Option<&str>) -> PathBuf {
+    let Some(pkg) = package else {
+        return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     };
+    crate::seed::find_package_dir(pkg)
+        .unwrap_or_else(|| fail(&ConsoleError::UnknownPackage(pkg.to_owned())))
+}
 
-    // Validate the project *before* writing anything, so a failed run leaves
-    // the working tree untouched.
-    let manifest_path = project_dir.join("Cargo.toml");
+/// Read and parse the project manifest, failing with an actionable error when
+/// this is not an Autumn project. Runs before any write, so a rejected project
+/// is left byte-identical.
+fn load_manifest(manifest_path: &Path, project_dir: &Path) -> (String, toml_edit::DocumentMut) {
     if !manifest_path.is_file() {
         fail(&ConsoleError::NotAProject(
             project_dir.display().to_string(),
         ));
     }
-    let manifest = match std::fs::read_to_string(&manifest_path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("\u{2717} could not read {}: {e}", manifest_path.display());
-            std::process::exit(1);
-        }
-    };
-    let doc = match manifest.parse::<toml_edit::DocumentMut>() {
-        Ok(doc) => doc,
-        Err(e) => fail(&ConsoleError::ManifestParse(e.to_string())),
-    };
-    let (updated_manifest, changes) = match ensure_manifest_wiring(&manifest) {
-        Ok(result) => result,
-        Err(e) => fail(&e),
-    };
+    let manifest = std::fs::read_to_string(manifest_path).unwrap_or_else(|e| {
+        eprintln!("\u{2717} could not read {}: {e}", manifest_path.display());
+        std::process::exit(1);
+    });
+    let doc = manifest
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap_or_else(|e| fail(&ConsoleError::ManifestParse(e.to_string())));
+    (manifest, doc)
+}
+
+/// Write the playground template to `path`, creating its parent directory.
+fn write_playground(path: &Path, project_dir: &Path, manifest: &str) {
+    let project_name = package_name(manifest).unwrap_or_else(|| project_dir.display().to_string());
+    let source = render_playground(&project_name, &app_module_decls(project_dir));
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("\u{2717} could not create {}: {e}", parent.display());
+        std::process::exit(1);
+    }
+    if let Err(e) = write_atomic(path, &source) {
+        fail_io(path, &e);
+    }
+}
+
+/// Report the manifest edits that were applied.
+fn report_manifest_edits(changes: ManifestChanges) {
+    let mut edits: Vec<String> = Vec::new();
+    if changes.added_feature {
+        edits.push(format!(
+            "[features] {PLAYGROUND_FEATURE} = [\"autumn-web/{REQUIRED_FEATURE}\"]"
+        ));
+    }
+    if changes.added_bin {
+        edits.push(format!(
+            "[[bin]] {PLAYGROUND_BIN_NAME} (required-features = [\"{PLAYGROUND_FEATURE}\"])"
+        ));
+    }
+    eprintln!("  Updated Cargo.toml ({})", edits.join(", "));
+}
+
+/// Tell the user what to paste when we deliberately declined to add the bin
+/// entry, rather than letting cargo's "no bin target named playground" be
+/// their first clue.
+fn warn_manual_bin_entry_required() {
+    eprintln!(
+        "  \u{26a0} This package uses Rust edition 2015, where declaring a \
+         target turns off Cargo's auto-discovery of the others.\n    \
+         Adding the playground entry automatically would drop your existing \
+         binaries from the build, so add it yourself:\n\n      \
+         [[bin]]\n      name = \"{PLAYGROUND_BIN_NAME}\"\n      path = \
+         \"{PLAYGROUND_REL_PATH}\"\n      required-features = \
+         [\"{PLAYGROUND_FEATURE}\"]\n"
+    );
+}
+
+/// Entry point for `autumn console`.
+pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: bool) {
+    eprintln!("\u{1F342} autumn console\n");
+    eprintln!("  Profile: {profile}");
+
+    let project_dir = resolve_project_dir(package);
+    let manifest_path = project_dir.join("Cargo.toml");
+    let (manifest, doc) = load_manifest(&manifest_path, &project_dir);
+    let (updated_manifest, changes) =
+        ensure_manifest_wiring(&manifest).unwrap_or_else(|e| fail(&e));
 
     // Write the manifest FIRST. The playground is only ever compiled with
     // `--features playground`, so a manifest that never landed simply means
     // `autumn console` cannot build it yet — whereas a playground file written
-    // against a manifest that failed to save would be a source file with no
-    // target, which is at worst inert. Manifest-first keeps the two consistent
-    // in the order that degrades most gracefully.
+    // against a manifest that failed to save is at worst an inert source file
+    // with no target. Manifest-first degrades in the gentler direction.
     if changes.any() {
         if let Err(e) = write_atomic(&manifest_path, &updated_manifest) {
             fail_io(&manifest_path, &e);
         }
-        let mut edits: Vec<String> = Vec::new();
-        if changes.added_feature {
-            edits.push(format!(
-                "[features] {PLAYGROUND_FEATURE} = [\"autumn-web/{REQUIRED_FEATURE}\"]"
-            ));
-        }
-        if changes.added_bin {
-            edits.push(format!(
-                "[[bin]] {PLAYGROUND_BIN_NAME} (required-features = [\"{PLAYGROUND_FEATURE}\"])"
-            ));
-        }
-        eprintln!("  Updated Cargo.toml ({})", edits.join(", "));
+        report_manifest_edits(changes);
     }
 
     // Honour a user-relocated playground: if their manifest already declares
     // the bin somewhere else, scaffold there rather than writing a file Cargo
     // would de-duplicate away and never run.
-    let playground_rel = declared_playground_path(&doc)
+    let declared = declared_playground_path(&doc);
+    let playground_rel = declared
+        .clone()
         .unwrap_or_else(|| PLAYGROUND_REL_PATH.to_owned());
     let playground_path = project_dir.join(&playground_rel);
     let exists = playground_path.is_file();
@@ -461,8 +500,7 @@ pub(crate) fn run(profile: &str, package: Option<&str>, force: bool, scaffold_on
     // regenerating the file the user named.
     if exists
         && force
-        && std::fs::symlink_metadata(&playground_path)
-            .is_ok_and(|m| m.file_type().is_symlink())
+        && std::fs::symlink_metadata(&playground_path).is_ok_and(|m| m.file_type().is_symlink())
     {
         eprintln!(
             "\u{2717} {playground_rel} is a symlink; refusing to --force through \
@@ -470,20 +508,10 @@ pub(crate) fn run(profile: &str, package: Option<&str>, force: bool, scaffold_on
         );
         std::process::exit(1);
     }
+
     let outcome = scaffold_outcome(exists, force);
     if outcome.writes_file() {
-        let project_name =
-            package_name(&manifest).unwrap_or_else(|| project_dir.display().to_string());
-        let source = render_playground(&project_name, &app_module_decls(&project_dir));
-        if let Some(parent) = playground_path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            eprintln!("\u{2717} could not create {}: {e}", parent.display());
-            std::process::exit(1);
-        }
-        if let Err(e) = write_atomic(&playground_path, &source) {
-            fail_io(&playground_path, &e);
-        }
+        write_playground(&playground_path, &project_dir, &manifest);
         eprintln!("  {} {playground_rel}", outcome.verb());
     } else {
         eprintln!(
@@ -492,29 +520,12 @@ pub(crate) fn run(profile: &str, package: Option<&str>, force: bool, scaffold_on
         );
     }
 
-    // Edition-2015 manifests lose auto-discovery the moment a target is
-    // declared by hand, so we refuse to add the entry there. Say what to paste
-    // rather than letting a "no bin target named playground" error be the
-    // user's first clue.
-    if !changes.added_bin
-        && declared_playground_path(&doc).is_none()
-        && adding_bin_would_break_autodiscovery(&doc)
-    {
-        eprintln!(
-            "  \u{26a0} This package uses Rust edition 2015, where declaring a \
-             target turns off Cargo's auto-discovery of the others.\n    \
-             Adding the playground entry automatically would drop your existing \
-             binaries from the build, so add it yourself:\n\n      \
-             [[bin]]\n      name = \"{PLAYGROUND_BIN_NAME}\"\n      path = \
-             \"{PLAYGROUND_REL_PATH}\"\n      required-features = \
-             [\"{PLAYGROUND_FEATURE}\"]\n"
-        );
+    if !changes.added_bin && declared.is_none() && adding_bin_would_break_autodiscovery(&doc) {
+        warn_manual_bin_entry_required();
     }
 
     if scaffold_only {
-        eprintln!(
-            "\n\u{2713} Playground ready. Edit {playground_rel}, then run `autumn console`."
-        );
+        eprintln!("\n\u{2713} Playground ready. Edit {playground_rel}, then run `autumn console`.");
         return;
     }
 

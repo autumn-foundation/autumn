@@ -60,7 +60,7 @@ fn seed_binary_exists_at(path: &Path) -> bool {
 ///
 /// Shared with `autumn console` (see `crate::console`) so both `--package`
 /// flags resolve a workspace member the same way.
-pub(crate) fn find_package_dir(package: &str) -> Option<PathBuf> {
+pub fn find_package_dir(package: &str) -> Option<PathBuf> {
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .output()

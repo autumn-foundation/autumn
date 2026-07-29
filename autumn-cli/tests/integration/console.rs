@@ -508,7 +508,11 @@ fn console_run_surfaces_a_compile_error_in_the_playground() {
         &project,
         &[("DATABASE_URL", "postgres://nobody@127.0.0.1:1/nodb")],
     );
-    assert_ne!(code, Some(0), "a playground that fails to build must not report success:\n{out}");
+    assert_ne!(
+        code,
+        Some(0),
+        "a playground that fails to build must not report success:\n{out}"
+    );
     assert!(
         out.contains("error"),
         "cargo's diagnostics must reach the user:\n{out}"
@@ -593,8 +597,10 @@ fn console_bare_playground_target_compiles_untouched() {
     run_autumn_ok(&project, &["console", "--scaffold-only"]);
 
     let src = fs::read_to_string(playground_path(&project)).unwrap();
+    // Match a real declaration, not the header prose that explains the
+    // mechanism — `#[path = "../…"]` only ever appears as emitted code.
     assert!(
-        !src.contains("#[path"),
+        !src.contains("#[path = \"../"),
         "a project with no data modules must render no #[path] declarations:\n{src}"
     );
 
