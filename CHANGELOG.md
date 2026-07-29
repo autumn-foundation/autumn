@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli:** `autumn console` (alias `autumn c`) — a one-command, pre-wired data
+  playground (#1039). Autumn's answer to `rails console` / `manage.py shell` /
+  `iex -S mix`: because Rust has no stable `eval`, it follows loco.rs's
+  edit-and-run model rather than building an interpreter. The first invocation
+  scaffolds `src/bin/playground.rs` already wired with the same config and
+  database-URL resolution `autumn seed`/`autumn dev` use
+  (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` → `DATABASE_URL` →
+  `autumn.toml`, profile-aware), a constructed async pool (`ctx.pool()`), a
+  checked-out connection (`db`), and a clearly-marked `// your code here`
+  region; every invocation compiles and runs it against the resolved
+  environment. Because a Cargo binary target is its own crate and a generated
+  app has no `src/lib.rs`, the playground declares the app's `schema`, `models`,
+  `repositories`, and `policies` modules with `#[path]`, so a
+  `find_all()`/`find_by_id()` round-trip compiles with no further wiring.
+  Re-running never overwrites an edited playground (`--force` regenerates from
+  the template); `--scaffold-only` stops before the build. The three
+  `Cargo.toml` edits — the `playground` bin target, the `autumn-web` `seed`
+  feature, and `default-run` (so a second binary doesn't make a bare `cargo
+  run` ambiguous) — go through a format-preserving TOML editor and are
+  idempotent. A config or database failure prints the underlying error and
+  exits non-zero from the playground out through the command's own exit status.
+  Guide: `docs/guide/console.md`. No `autumn-web` API change.
 - **notifications:** first-class in-app notifications store with a read/unread
   feed (#1148). A new `autumn_web::notifications` module ships a
   `Notifications` service/extractor (surfaced like `Session`/`Auth`) with

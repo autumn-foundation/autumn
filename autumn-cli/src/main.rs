@@ -8,6 +8,7 @@ mod canary;
 mod check;
 mod cold_start_driver;
 mod config;
+mod console;
 mod credentials;
 mod data;
 mod db;
@@ -453,6 +454,43 @@ enum Commands {
     ///   autumn data import posts --in posts.csv --upsert-by id
     #[command(subcommand, verbatim_doc_comment, name = "data")]
     Data(DataCommands),
+
+    /// Run a pre-wired data playground against the project's database.
+    ///
+    /// Autumn's answer to `rails console` / `manage.py shell`. Rust has no
+    /// stable `eval`, so instead of a line-by-line REPL this scaffolds an
+    /// editable binary — `src/bin/playground.rs` — already wired with the same
+    /// config and database-URL resolution `autumn dev` and `autumn seed` use
+    /// (`AUTUMN_DATABASE__*` → `DATABASE_URL` → `autumn.toml`), a constructed
+    /// async pool, and a checked-out connection. Put a query in the marked
+    /// region, re-run `autumn console`, and it compiles and executes against
+    /// the live database.
+    ///
+    /// An existing playground is never overwritten; pass `--force` to
+    /// regenerate it from the template.
+    ///
+    /// # Examples
+    ///
+    ///   autumn console
+    ///   autumn console --profile demo
+    ///   autumn console --force
+    #[command(visible_alias = "c", verbatim_doc_comment)]
+    Console {
+        /// Profile forwarded to the playground via `AUTUMN_ENV`
+        /// (default: `dev`).
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Overwrite an existing playground with a fresh copy of the template.
+        #[arg(long)]
+        force: bool,
+        /// Scaffold and wire the playground, then stop without building or
+        /// running it.
+        #[arg(long)]
+        scaffold_only: bool,
+    },
 
     /// Run the project's seed binary to populate the database with representative data.
     ///
@@ -2934,6 +2972,12 @@ fn run_command(command: Commands) {
             payload,
         }) => webhook::run_sim(&provider, &url, &secret, &payload),
         Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
+        Commands::Console {
+            profile,
+            package,
+            force,
+            scaffold_only,
+        } => console::run(&profile, package.as_deref(), force, scaffold_only),
         Commands::Seed {
             profile,
             package,
@@ -5241,6 +5285,66 @@ mod tests {
             panic!("expected db offsite list");
         };
         assert_eq!(profile.as_deref(), Some("prod"));
+    }
+
+    // ── autumn console tests (issue #1039) ─────────────────────────────────
+
+    #[test]
+    fn parse_console_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "console"]).unwrap();
+        match cli.command {
+            Commands::Console {
+                profile,
+                package,
+                force,
+                scaffold_only,
+            } => {
+                assert_eq!(profile, "dev");
+                assert!(package.is_none());
+                assert!(!force);
+                assert!(!scaffold_only);
+            }
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_short_alias_c() {
+        let cli = Cli::try_parse_from(["autumn", "c"]).unwrap();
+        assert!(matches!(cli.command, Commands::Console { .. }));
+    }
+
+    #[test]
+    fn parse_console_with_force() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--force"]).unwrap();
+        match cli.command {
+            Commands::Console { force, .. } => assert!(force),
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_with_scaffold_only() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--scaffold-only"]).unwrap();
+        match cli.command {
+            Commands::Console { scaffold_only, .. } => assert!(scaffold_only),
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_with_profile_and_package() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--profile", "demo", "-p", "my-app"])
+            .unwrap();
+        match cli.command {
+            Commands::Console {
+                profile, package, ..
+            } => {
+                assert_eq!(profile, "demo");
+                assert_eq!(package.as_deref(), Some("my-app"));
+            }
+            _ => panic!("expected Console command"),
+        }
     }
 
     // ── autumn seed tests ──────────────────────────────────────────────────
