@@ -788,7 +788,11 @@ pub fn adding_bin_would_break_autodiscovery(
     doc: &toml_edit::DocumentMut,
     inherited_edition: Option<&str>,
 ) -> bool {
-    let Some(package) = doc.get("package").and_then(toml_edit::Item::as_table) else {
+    // `as_table_like`, not `as_table`: `package = { name = "app", edition =
+    // "2015" }` is a valid inline declaration, and reading it as "no package"
+    // waved an edition-2015 project straight past this guard — appending the
+    // first `[[bin]]` and dropping every auto-discovered binary with it.
+    let Some(package) = doc.get("package").and_then(toml_edit::Item::as_table_like) else {
         return false;
     };
     if !package_is_edition_2015(package, inherited_edition) {
@@ -811,7 +815,10 @@ pub fn adding_bin_would_break_autodiscovery(
 /// `None`. Reading that `None` as "2015" would misclassify most modern
 /// workspace members and refuse them for a legacy hazard they do not have, so
 /// the inherited case defers to the workspace root's value.
-fn package_is_edition_2015(package: &toml_edit::Table, inherited_edition: Option<&str>) -> bool {
+fn package_is_edition_2015(
+    package: &dyn toml_edit::TableLike,
+    inherited_edition: Option<&str>,
+) -> bool {
     package.get("edition").is_none_or(|item| {
         item.as_str().map_or_else(
             // Inherited: believe the workspace root. When it cannot be read,
@@ -939,6 +946,19 @@ fn fail_io(path: &Path, err: &std::io::Error) -> ! {
 /// interruption (Ctrl-C, ENOSPC, a crash) can never leave a truncated file
 /// behind. `Cargo.toml` in particular is unrecoverable if half-written.
 fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let staged = stage_atomic(path, contents)?;
+    commit_staged(&staged, path)
+}
+
+/// Write `contents` to a scratch file next to `path`, returning its location.
+///
+/// Splitting the write in two is what lets `run` do all the *fallible* work —
+/// creating the file, writing the bytes, fsyncing — before it commits anything,
+/// then finish with a rename that is as close to atomic as the filesystem
+/// offers. The scratch name ends in `.tmp`, so even though it sits in
+/// `src/bin/` Cargo cannot auto-discover it: target discovery only matches
+/// `*.rs`.
+fn stage_atomic(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
     use std::io::Write as _;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -974,11 +994,11 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
             .write_all(contents.as_bytes())
             .and_then(|()| file.sync_all());
         drop(file);
-        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        return Ok(());
+        return Ok(tmp);
     }
 
     Err(std::io::Error::new(
@@ -988,6 +1008,13 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
             path.display()
         ),
     ))
+}
+
+/// Move a staged scratch file into its final place, cleaning up on failure.
+fn commit_staged(staged: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(staged, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(staged);
+    })
 }
 
 /// Resolve the package directory to operate on.
@@ -1028,7 +1055,7 @@ fn load_manifest(manifest_path: &Path, project_dir: &Path) -> (String, toml_edit
 /// `rel` is `path` relative to the package root; the `#[path]` module
 /// declarations are rebased against it so a relocated playground still reaches
 /// `src/`.
-fn write_playground(path: &Path, rel: &str, project_dir: &Path, manifest: &str) {
+fn stage_playground(path: &Path, rel: &str, project_dir: &Path, manifest: &str) -> PathBuf {
     let project_name = package_name(manifest).unwrap_or_else(|| project_dir.display().to_string());
     let source = render_playground(&project_name, &app_module_decls(project_dir, rel));
     if let Some(parent) = path.parent()
@@ -1037,8 +1064,9 @@ fn write_playground(path: &Path, rel: &str, project_dir: &Path, manifest: &str) 
         eprintln!("\u{2717} could not create {}: {e}", parent.display());
         std::process::exit(1);
     }
-    if let Err(e) = write_atomic(path, &source) {
-        fail_io(path, &e);
+    match stage_atomic(path, &source) {
+        Ok(staged) => staged,
+        Err(e) => fail_io(path, &e),
     }
 }
 
@@ -1056,6 +1084,38 @@ fn report_manifest_edits(changes: ManifestChanges) {
         ));
     }
     eprintln!("  Updated Cargo.toml ({})", edits.join(", "));
+}
+
+/// Move the staged playground into place, undoing the manifest edit if that
+/// last step fails.
+///
+/// The rename is the only fallible operation left once the manifest has landed,
+/// so it is also the only place a half-applied state can still appear: the
+/// feature and `[[bin]]` entry committed with no source file behind them.
+/// Restoring the original manifest bytes keeps the documented
+/// no-write-on-failure behaviour intact. A restore that itself fails is
+/// reported explicitly rather than swallowed — the user needs to know the
+/// manifest still carries the edits.
+fn commit_playground(
+    staged: &Path,
+    playground_path: &Path,
+    manifest_path: &Path,
+    original_manifest: &str,
+    manifest_was_edited: bool,
+) {
+    let Err(e) = commit_staged(staged, playground_path) else {
+        return;
+    };
+    if manifest_was_edited && let Err(restore) = write_atomic(manifest_path, original_manifest) {
+        eprintln!(
+            "\u{2717} could not restore {} after the playground write failed: \
+             {restore}. Cargo.toml still carries the console's edits; remove \
+             them by hand, or re-run once {} is writable.",
+            manifest_path.display(),
+            playground_path.display()
+        );
+    }
+    fail_io(playground_path, &e);
 }
 
 /// Entry point for `autumn console`.
@@ -1110,20 +1170,41 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
         fail(&ConsoleError::PlaygroundDestinationUnusable(problem));
     }
 
-    // Validation is complete. Write the manifest before the source file: the
-    // playground only ever compiles with `--features playground`, so a manifest
-    // that never landed just means `autumn console` cannot build it yet,
-    // whereas a source file written against an unsaved manifest is an inert
-    // file with no target. Manifest-first degrades in the gentler direction.
+    // Validation is complete, but writing can still fail for reasons no check
+    // can predict: a read-only `src`, a full disk, a revoked permission. So do
+    // every fallible part of the source write FIRST — create the directory,
+    // write the bytes, fsync — into a `.tmp` scratch file that Cargo cannot
+    // auto-discover (target discovery only matches `*.rs`). Only once that has
+    // succeeded is the manifest committed, and only then is the scratch file
+    // renamed into place.
+    //
+    // The ordering matters in both directions. Manifest-first left a failed run
+    // with the feature and `[[bin]]` entry persisted and no source file behind
+    // them. Source-first would be worse: an ungated `src/bin/playground.rs`
+    // with no `[[bin]]` entry is auto-discovered into the default build, which
+    // is the exact hazard the gate exists to prevent. Staging satisfies both.
+    let staged = outcome
+        .writes_file()
+        .then(|| stage_playground(&playground_path, &playground_rel, &project_dir, &manifest));
+
     if changes.any() {
         if let Err(e) = write_atomic(&manifest_path, &updated_manifest) {
+            if let Some(staged) = &staged {
+                let _ = std::fs::remove_file(staged);
+            }
             fail_io(&manifest_path, &e);
         }
         report_manifest_edits(changes);
     }
 
-    if outcome.writes_file() {
-        write_playground(&playground_path, &playground_rel, &project_dir, &manifest);
+    if let Some(staged) = staged {
+        commit_playground(
+            &staged,
+            &playground_path,
+            &manifest_path,
+            &manifest,
+            changes.any(),
+        );
         eprintln!("  {} {playground_rel}", outcome.verb());
     } else {
         eprintln!(
@@ -1724,6 +1805,61 @@ autumn-web = "0.6.0"
             changes.added_bin,
             "bin discovery is already off, so nothing more can be lost"
         );
+    }
+
+    #[test]
+    fn an_inline_package_table_is_still_guarded_on_edition_2015() {
+        // `package = { … }` is a valid inline declaration, and `as_table()`
+        // returned None for it — so the edition-2015 guard saw "no package",
+        // treated the project as safe, and appended the first `[[bin]]`.
+        // Verified against cargo: targets went from ['v-app', 'worker'] to
+        // ['playground'], dropping BOTH application binaries.
+        let manifest = r#"package = { name = "legacy-app", version = "0.1.0", edition = "2015" }
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest, None),
+            Err(ConsoleError::CannotIsolateOnEdition2015)
+        );
+    }
+
+    #[test]
+    fn an_inline_package_table_on_a_modern_edition_is_allowed() {
+        // The accept case: the inline shape itself must not become a refusal —
+        // only edition 2015 carries the auto-discovery hazard.
+        let manifest = r#"package = { name = "app", version = "0.1.0", edition = "2021" }
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        let (_, changes) = ensure_manifest_wiring(manifest, None).expect("accepted");
+        assert!(changes.added_bin, "a modern edition can take the gated bin");
+    }
+
+    #[test]
+    fn staging_does_not_publish_the_file_until_it_is_committed() {
+        // The ordering this enables is the point: every fallible part of the
+        // source write happens before the manifest is touched, but the file only
+        // becomes visible to Cargo afterwards. The scratch name must therefore
+        // not end in `.rs`, or auto-discovery would pick it up mid-run.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("playground.rs");
+
+        let staged = stage_atomic(&target, "fn main() {}").expect("staged");
+        assert!(staged.exists(), "the scratch file should exist");
+        assert!(!target.exists(), "the real path must not exist yet");
+        assert_ne!(
+            staged.extension().and_then(std::ffi::OsStr::to_str),
+            Some("rs"),
+            "a `*.rs` scratch file would be auto-discovered as a target: {}",
+            staged.display()
+        );
+
+        commit_staged(&staged, &target).expect("committed");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn main() {}");
+        assert!(!staged.exists(), "the scratch file should be gone");
     }
 
     #[test]
