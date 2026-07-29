@@ -87,6 +87,17 @@ pub enum ConsoleError {
     PlaygroundBinNotGated,
 
     #[error(
+        "Cargo.toml's `[[bin]] name = \"playground\"` requires the feature \
+         `{0}`, which `autumn console` does not enable — it activates the \
+         default features plus `playground`, and `required-features` is an \
+         all-of list, so Cargo would refuse to build the target. Either drop \
+         `{0}` from that entry, or make `playground` enable it:\n\n    \
+         [features]\n    playground = [\"autumn-web/seed\", \"{0}\"]\n\n\
+         See: docs/guide/console.md"
+    )]
+    PlaygroundBinGateUnsatisfiable(String),
+
+    #[error(
         "this package uses Rust edition 2015, where declaring a target turns off \
          Cargo's auto-discovery of the others — so `autumn console` cannot add \
          the playground entry without dropping your existing binaries from the \
@@ -212,29 +223,73 @@ pub const fn scaffold_outcome(exists: bool, force: bool) -> ScaffoldOutcome {
 /// that does not exist.
 pub fn app_module_decls(project_root: &Path, playground_rel: &str) -> String {
     let src = project_root.join("src");
-    let hop = ascent_to_package_root(playground_rel);
+    let playground_dir = lexically_normalize(&project_root.join(playground_rel.replace('\\', "/")));
+    let playground_dir = playground_dir
+        .parent()
+        .unwrap_or(&playground_dir)
+        .to_path_buf();
+
     let mut out = String::new();
     for name in APP_MODULES {
-        let rel = if src.join(name).join("mod.rs").is_file() {
-            format!("{hop}src/{name}/mod.rs")
+        let target = if src.join(name).join("mod.rs").is_file() {
+            src.join(name).join("mod.rs")
         } else if src.join(format!("{name}.rs")).is_file() {
-            format!("{hop}src/{name}.rs")
+            src.join(format!("{name}.rs"))
         } else {
             continue;
         };
+        let rel = relative_path_from(&playground_dir, &target);
         let _ = writeln!(out, "#[path = \"{rel}\"]\nmod {name};");
     }
     out
 }
 
-/// The `../`-chain that climbs from the directory holding `playground_rel`
-/// back to the package root — `src/bin/playground.rs` → `"../../"`.
-fn ascent_to_package_root(playground_rel: &str) -> String {
-    let normalised = playground_rel.replace('\\', "/");
-    let depth = Path::new(&normalised)
-        .parent()
-        .map_or(0, |p| p.components().count());
-    "../".repeat(depth)
+/// Resolve `.` and `x/..` segments without touching the filesystem.
+///
+/// The module file may not exist yet and symlinks must not be resolved, so
+/// `canonicalize` is the wrong tool; this is the purely lexical equivalent.
+/// A leading `..` that cannot be collapsed is preserved, which is what lets a
+/// `[[bin]] path` pointing outside the package still produce a correct answer.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The `/`-separated path that reaches `to` from directory `from_dir`.
+///
+/// Both sides are normalised first, so a `[[bin]]` path written as
+/// `./custom/playground.rs` yields the same answer as `custom/playground.rs`
+/// — counting raw components would have charged an extra `../` for the `.`.
+fn relative_path_from(from_dir: &Path, to: &Path) -> String {
+    let from = lexically_normalize(from_dir);
+    let to = lexically_normalize(to);
+
+    let mut from_parts = from.components().peekable();
+    let mut to_parts = to.components().peekable();
+    while from_parts.peek().is_some() && from_parts.peek() == to_parts.peek() {
+        from_parts.next();
+        to_parts.next();
+    }
+
+    let mut rel = "../".repeat(from_parts.count());
+    let tail: PathBuf = to_parts.collect();
+    rel.push_str(&tail.to_string_lossy().replace('\\', "/"));
+    rel
 }
 
 /// Render the playground template for `project_name`, splicing in the app
@@ -317,8 +372,10 @@ pub fn ensure_manifest_wiring(manifest: &str) -> Result<(String, ManifestChanges
     if let Some(via) = default_feature_chain_to_playground(&doc) {
         return Err(ConsoleError::PlaygroundFeatureIsDefault(via));
     }
-    if declared_playground_bin(&doc).is_some_and(|t| !bin_is_gated_on_playground(t)) {
-        return Err(ConsoleError::PlaygroundBinNotGated);
+    if let Some(entry) = declared_playground_bin(&doc)
+        && let Some(problem) = playground_bin_gate_problem(&doc, entry)
+    {
+        return Err(problem);
     }
     // Nothing declares the target yet and we cannot add it safely: a scaffolded
     // file would be auto-discovered as an ungated binary.
@@ -334,18 +391,40 @@ pub fn ensure_manifest_wiring(manifest: &str) -> Result<(String, ManifestChanges
     Ok((doc.to_string(), changes))
 }
 
-/// Whether a `[[bin]]` entry is gated on the `playground` feature.
+/// Why an existing `[[bin]] name = "playground"` cannot be driven by this
+/// command, if it cannot.
 ///
-/// An entry that is ungated, or gated on something else, is not one
-/// `autumn console` can drive: ungated puts the seed-dependent template into
-/// every normal build, and a foreign gate is never satisfied by the
-/// `--features playground` the runner passes, so Cargo silently declines to
-/// run it.
-fn bin_is_gated_on_playground(entry: &toml_edit::Table) -> bool {
-    entry
+/// `required-features` is an **all-of** list: Cargo builds the target only when
+/// every feature on it is active. The runner activates the default set plus
+/// `playground`, so a gate is usable only when it names `playground` *and*
+/// every other entry is reachable from that activation. A gate containing an
+/// unreachable feature (`["playground", "tools"]` where `playground` does not
+/// enable `tools`) looks gated but can never run — checking merely that
+/// `playground` appears somewhere in the list is not enough.
+fn playground_bin_gate_problem(
+    doc: &toml_edit::DocumentMut,
+    entry: &toml_edit::Table,
+) -> Option<ConsoleError> {
+    let required: Vec<String> = entry
         .get("required-features")
         .and_then(toml_edit::Item::as_array)
-        .is_some_and(|a| a.iter().any(|f| f.as_str() == Some(PLAYGROUND_FEATURE)))
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f.as_str())
+        .map(str::to_owned)
+        .collect();
+
+    if !required.iter().any(|f| f == PLAYGROUND_FEATURE) {
+        return Some(ConsoleError::PlaygroundBinNotGated);
+    }
+
+    // What `cargo run --features playground` actually turns on. We never pass
+    // `--no-default-features`, so `default` is active too.
+    let activated = feature_closure(doc, &["default", PLAYGROUND_FEATURE]);
+    required
+        .into_iter()
+        .find(|f| f != PLAYGROUND_FEATURE && !activated.contains(f))
+        .map(ConsoleError::PlaygroundBinGateUnsatisfiable)
 }
 
 /// The feature chain by which `[features] default` reaches `playground`, if it
@@ -363,16 +442,7 @@ fn default_feature_chain_to_playground(doc: &toml_edit::DocumentMut) -> Option<S
         if seen.contains(&name) {
             continue;
         }
-        let enables = features
-            .get(&name)
-            .and_then(toml_edit::Item::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str())
-            // `dep/feat` edges enable a dependency's feature, never one of ours.
-            .filter(|edge| !edge.contains('/'))
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        let enables = enabled_by(features, &name);
         seen.push(name.clone());
 
         if enables.iter().any(|e| e == PLAYGROUND_FEATURE) {
@@ -381,6 +451,39 @@ fn default_feature_chain_to_playground(doc: &toml_edit::DocumentMut) -> Option<S
         queue.extend(enables);
     }
     None
+}
+
+/// Every package feature activated by turning on `roots`, transitively.
+fn feature_closure(doc: &toml_edit::DocumentMut, roots: &[&str]) -> Vec<String> {
+    let Some(features) = doc.get("features").and_then(toml_edit::Item::as_table) else {
+        return roots.iter().map(|r| (*r).to_owned()).collect();
+    };
+    let mut queue: Vec<String> = roots.iter().map(|r| (*r).to_owned()).collect();
+    let mut seen: Vec<String> = Vec::new();
+
+    while let Some(name) = queue.pop() {
+        if seen.contains(&name) {
+            continue;
+        }
+        queue.extend(enabled_by(features, &name));
+        seen.push(name);
+    }
+    seen
+}
+
+/// The package's own features that `name` enables directly. `dep/feat` edges
+/// are skipped: they turn on a dependency's feature, never one of ours, so they
+/// can never satisfy a `required-features` entry.
+fn enabled_by(features: &toml_edit::Table, name: &str) -> Vec<String> {
+    features
+        .get(name)
+        .and_then(toml_edit::Item::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .filter(|edge| !edge.contains('/'))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Ensure `[features] playground` exists and enables `autumn-web/seed`.
@@ -847,12 +950,11 @@ mod tests {
         let tmp = project_with(&["src/main.rs", "src/schema.rs", "src/models/mod.rs"]);
         let decls = app_module_decls(tmp.path(), PLAYGROUND_REL_PATH);
         assert!(
-            decls.contains("#[path = \"../../src/schema.rs\"]") && decls.contains("mod schema;"),
+            decls.contains("#[path = \"../schema.rs\"]") && decls.contains("mod schema;"),
             "must wire src/schema.rs into the playground crate:\n{decls}"
         );
         assert!(
-            decls.contains("#[path = \"../../src/models/mod.rs\"]")
-                && decls.contains("mod models;"),
+            decls.contains("#[path = \"../models/mod.rs\"]") && decls.contains("mod models;"),
             "must wire src/models/mod.rs into the playground crate:\n{decls}"
         );
     }
@@ -862,7 +964,7 @@ mod tests {
         let tmp = project_with(&["src/main.rs", "src/models.rs"]);
         let decls = app_module_decls(tmp.path(), PLAYGROUND_REL_PATH);
         assert!(
-            decls.contains("#[path = \"../../src/models.rs\"]"),
+            decls.contains("#[path = \"../models.rs\"]"),
             "must support the single-file src/models.rs layout:\n{decls}"
         );
     }
@@ -887,7 +989,7 @@ mod tests {
             "must declare `models` exactly once:\n{decls}"
         );
         assert!(
-            decls.contains("src/models/mod.rs"),
+            decls.contains("../models/mod.rs"),
             "the directory layout must win over the stale single file:\n{decls}"
         );
     }
@@ -1218,6 +1320,82 @@ autumn-web = "0.6.0"
     }
 
     #[test]
+    fn ensure_manifest_wiring_rejects_a_partially_satisfiable_gate() {
+        // `required-features` is an ALL-of list. The runner enables the default
+        // set plus `playground`, so a gate naming `tools` as well can never be
+        // satisfied — checking only that `playground` appears is not enough.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+playground = ["autumn-web/seed"]
+tools = []
+
+[[bin]]
+name = "playground"
+required-features = ["playground", "tools"]
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest),
+            Err(ConsoleError::PlaygroundBinGateUnsatisfiable(
+                "tools".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_accepts_a_gate_whose_extras_playground_enables() {
+        // Same shape, but `playground` pulls `tools` in — so `--features
+        // playground` does satisfy the whole gate and the target is usable.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+playground = ["autumn-web/seed", "tools"]
+tools = []
+
+[[bin]]
+name = "playground"
+required-features = ["playground", "tools"]
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert!(ensure_manifest_wiring(manifest).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_accepts_a_gate_extra_that_is_a_default_feature() {
+        // The runner does not pass --no-default-features, so a default feature
+        // in the gate is satisfied too.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["flash"]
+flash = []
+playground = ["autumn-web/seed"]
+
+[[bin]]
+name = "playground"
+required-features = ["playground", "flash"]
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert!(ensure_manifest_wiring(manifest).is_ok());
+    }
+
+    #[test]
     fn ensure_manifest_wiring_rejects_a_foreign_gate_on_the_playground_bin() {
         // `--features playground` never satisfies `tools`, so cargo would
         // silently decline to run the target.
@@ -1272,15 +1450,66 @@ autumn-web = "0.6.0"
         let decls = app_module_decls(tmp.path(), "tools/dev/pg.rs");
         assert!(
             decls.contains("#[path = \"../../src/schema.rs\"]"),
-            "two directories deep needs two hops:\n{decls}"
+            "two directories deep needs two hops back to the package root:\n{decls}"
         );
     }
 
     #[test]
-    fn ascent_to_package_root_counts_directories() {
-        assert_eq!(ascent_to_package_root("playground.rs"), "");
-        assert_eq!(ascent_to_package_root("custom/playground.rs"), "../");
-        assert_eq!(ascent_to_package_root(PLAYGROUND_REL_PATH), "../../");
+    fn app_module_decls_normalize_a_dot_prefixed_playground_path() {
+        // `./custom/playground.rs` is a valid `[[bin]] path`. Counting raw
+        // components charges an extra `../` for the leading `.`, which would
+        // aim the declaration a directory too high.
+        let tmp = project_with(&["src/main.rs", "src/schema.rs"]);
+        assert_eq!(
+            app_module_decls(tmp.path(), "./custom/playground.rs"),
+            app_module_decls(tmp.path(), "custom/playground.rs"),
+            "a `./` prefix must not change the rebased path"
+        );
+    }
+
+    #[test]
+    fn app_module_decls_handle_a_playground_outside_the_package() {
+        // A `[[bin]] path` may point outside the package root; the ascent then
+        // has to climb back down into it by name rather than blindly counting.
+        let tmp = project_with(&["src/main.rs", "src/schema.rs"]);
+        let decls = app_module_decls(tmp.path(), "../tools/playground.rs");
+        let leaf = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            decls.contains(&format!("../{leaf}/src/schema.rs")),
+            "must descend back into the package by name:\n{decls}"
+        );
+    }
+
+    #[test]
+    fn relative_path_from_resolves_dot_and_parent_segments() {
+        assert_eq!(
+            relative_path_from(Path::new("/a/b/src/bin"), Path::new("/a/b/src/schema.rs")),
+            "../schema.rs"
+        );
+        assert_eq!(
+            relative_path_from(Path::new("/a/b/./custom"), Path::new("/a/b/src/schema.rs")),
+            "../src/schema.rs"
+        );
+        assert_eq!(
+            relative_path_from(
+                Path::new("/a/b/x/../custom"),
+                Path::new("/a/b/src/schema.rs")
+            ),
+            "../src/schema.rs"
+        );
+    }
+
+    #[test]
+    fn lexically_normalize_collapses_without_touching_the_filesystem() {
+        assert_eq!(lexically_normalize(Path::new("a/./b")), Path::new("a/b"));
+        assert_eq!(lexically_normalize(Path::new("a/b/../c")), Path::new("a/c"));
+        // A leading `..` has nothing to collapse into and must survive.
+        assert_eq!(lexically_normalize(Path::new("../a")), Path::new("../a"));
     }
 
     #[test]
