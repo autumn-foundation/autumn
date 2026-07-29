@@ -6394,9 +6394,11 @@ mod tests {
         let error = installed
             .try_deliver_later_eager(sample_mail())
             .expect_err("deliver_later_eager must fail the same way");
-        assert!(error
-            .to_string()
-            .contains("allow_in_process_deliver_later_in_production"));
+        assert!(
+            error
+                .to_string()
+                .contains("allow_in_process_deliver_later_in_production")
+        );
     }
 
     #[test]
