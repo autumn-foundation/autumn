@@ -151,7 +151,7 @@ line to change:
 | Situation | Why it's refused |
 | --- | --- |
 | `[[bin]] name = "playground"` exists without `required-features = ["playground"]` | Reusing an ungated target would put the seed-dependent playground into every `cargo build`. |
-| `[[bin]] name = "playground"` is gated on some *other* feature | `--features playground` would never satisfy it, so Cargo would quietly decline to run it. |
+| `[[bin]] name = "playground"`'s gate names a feature `playground` doesn't enable | `required-features` is an *all-of* list. `autumn console` activates the default features plus `playground`, so a gate like `["playground", "tools"]` can never be satisfied and Cargo would decline to build the target. Either drop the extra, or have `playground` enable it. |
 | `default` enables `playground` (directly or through another feature) | The gate becomes vacuous — the playground would be in every build. |
 | Edition 2015 with no hand-declared targets | Declaring the first target turns off auto-discovery of the rest, and a scaffolded file would meanwhile be auto-discovered as an *ungated* binary. Add the `[[bin]]` block yourself (the error prints it), then re-run. |
 
