@@ -653,6 +653,17 @@ fn console_and_seed_share_one_bootstrap() {
     }
 }
 
+/// Read a repository document with line endings normalised to LF.
+///
+/// Docs are checked out with CRLF on Windows (git `autocrlf`), so a multi-line
+/// `\n` needle would never match there. `repo_hygiene.rs` normalises the same
+/// way for the same reason.
+fn read_doc_lf(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
+}
+
 /// AC6: README and the CLI docs carry a one-line usage example.
 #[test]
 fn console_usage_is_documented() {
@@ -660,7 +671,7 @@ fn console_usage_is_documented() {
         .parent()
         .expect("workspace root");
 
-    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    let readme = read_doc_lf(&root.join("README.md"));
     assert!(
         readme.contains("autumn console"),
         "README must show `autumn console`"
@@ -670,7 +681,7 @@ fn console_usage_is_documented() {
         "README must link the data-playground guide"
     );
 
-    let guide = fs::read_to_string(root.join("docs/guide/console.md")).unwrap();
+    let guide = read_doc_lf(&root.join("docs/guide/console.md"));
     assert!(
         guide.contains("```bash\nautumn console\n```"),
         "the guide must show the one-line usage example:\n{guide}"
