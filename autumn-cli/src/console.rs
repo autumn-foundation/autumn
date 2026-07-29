@@ -253,6 +253,12 @@ pub fn app_module_decls(project_root: &Path, playground_rel: &str) -> String {
         .parent()
         .unwrap_or(&playground_dir)
         .to_path_buf();
+    // Resolve both ends through symlinks before measuring between them. The
+    // kernel applies `..` AFTER following a link, so a playground reached via
+    // `custom -> tools/bin` has its `#[path]` values resolved from
+    // `tools/bin/`, not from `custom/`. Measuring lexically would aim every
+    // declaration one directory tree sideways.
+    let playground_dir = resolve_through_symlinks(&playground_dir);
 
     let mut out = String::new();
     for name in APP_MODULES {
@@ -263,10 +269,35 @@ pub fn app_module_decls(project_root: &Path, playground_rel: &str) -> String {
         } else {
             continue;
         };
-        let rel = relative_path_from(&playground_dir, &target);
+        let rel = relative_path_from(&playground_dir, &resolve_through_symlinks(&target));
         let _ = writeln!(out, "#[path = \"{rel}\"]\nmod {name};");
     }
     out
+}
+
+/// The real location of `path`, following symlinks as far as the filesystem
+/// can — falling back to the deepest ancestor that does exist plus the
+/// remaining components, since the playground's directory need not exist yet.
+fn resolve_through_symlinks(path: &Path) -> PathBuf {
+    let normalized = lexically_normalize(path);
+    if let Ok(real) = normalized.canonicalize() {
+        return real;
+    }
+
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = normalized.as_path();
+    while let Some(parent) = probe.parent() {
+        if let Some(name) = probe.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        if let Ok(real) = parent.canonicalize() {
+            let mut resolved = real;
+            resolved.extend(suffix.iter().rev());
+            return resolved;
+        }
+        probe = parent;
+    }
+    normalized
 }
 
 /// Resolve `.` and `x/..` segments without touching the filesystem.
@@ -536,15 +567,23 @@ fn enabled_by(features: &toml_edit::Table, name: &str) -> Vec<String> {
 /// scanning only the top level would miss a real manifest and suppress an edge
 /// Cargo then demands, rejecting the manifest outright.
 fn has_optional_playground_dependency(doc: &toml_edit::DocumentMut) -> bool {
-    let declares_optional = |table: Option<&toml_edit::Item>| {
+    // Every lookup goes through `as_table_like`, which covers BOTH the header
+    // form (`[target.'cfg(unix)'.dependencies]`, a `Table`) and the inline form
+    // (`target = { 'cfg(unix)' = { dependencies = { … } } }`, an
+    // `InlineTable`). Enumerating representations is what left the two earlier
+    // versions of this scan incomplete: the same manifest written a different
+    // valid way slipped through each time.
+    fn declares_optional(table: Option<&toml_edit::Item>) -> bool {
         table
+            .and_then(toml_edit::Item::as_table_like)
             .and_then(|deps| deps.get(PLAYGROUND_FEATURE))
+            .and_then(toml_edit::Item::as_table_like)
             .is_some_and(|dep| {
                 dep.get("optional")
                     .and_then(toml_edit::Item::as_bool)
                     .unwrap_or(false)
             })
-    };
+    }
 
     if declares_optional(doc.get("dependencies"))
         || declares_optional(doc.get("build-dependencies"))
@@ -553,11 +592,13 @@ fn has_optional_playground_dependency(doc: &toml_edit::DocumentMut) -> bool {
     }
 
     doc.get("target")
-        .and_then(toml_edit::Item::as_table)
+        .and_then(toml_edit::Item::as_table_like)
         .is_some_and(|targets| {
             targets.iter().any(|(_, cfg)| {
-                declares_optional(cfg.get("dependencies"))
-                    || declares_optional(cfg.get("build-dependencies"))
+                cfg.as_table_like().is_some_and(|cfg| {
+                    declares_optional(cfg.get("dependencies"))
+                        || declares_optional(cfg.get("build-dependencies"))
+                })
             })
         })
 }
@@ -1682,6 +1723,73 @@ playground = "0.1"
         assert!(
             !out.contains("dep:playground"),
             "a required dependency has no implicit feature to preserve:\n{out}"
+        );
+    }
+
+    #[test]
+    fn playground_feature_preserves_an_inline_table_target_dependency() {
+        // The same optional dependency, written in Cargo's inline-table form.
+        // Two earlier versions of this scan enumerated representations and each
+        // missed one, so the lookup is now shape-agnostic (`as_table_like`).
+        let manifest = r#"target = { 'cfg(unix)' = { dependencies = { playground = { version = "0.1", optional = true } } } }
+
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        let (out, _) = ensure_manifest_wiring(manifest, None).unwrap();
+        assert!(
+            out.contains("\"dep:playground\""),
+            "an inline-table target dependency must be seen too:\n{out}"
+        );
+    }
+
+    #[test]
+    fn playground_feature_preserves_an_inline_top_level_dependency_table() {
+        let manifest = r#"dependencies = { autumn-web = "0.6.0", playground = { version = "0.1", optional = true } }
+
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+"#;
+        let (out, _) = ensure_manifest_wiring(manifest, None).unwrap();
+        assert!(
+            out.contains("\"dep:playground\""),
+            "an inline `dependencies` table must be seen too:\n{out}"
+        );
+    }
+
+    // ── symlink-resolved module paths ─────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn app_module_decls_resolve_a_symlinked_playground_directory() {
+        // `custom -> tools/bin`, both inside the package. Containment holds, so
+        // this is not refused — but the kernel applies `..` after following the
+        // link, so a lexically-measured `../src/schema.rs` would land in
+        // `tools/src/`. Verified against the filesystem below.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tools/bin")).unwrap();
+        std::fs::write(root.join("src/schema.rs"), "// schema\n").unwrap();
+        std::os::unix::fs::symlink("tools/bin", root.join("custom")).unwrap();
+
+        let decls = app_module_decls(root, "custom/playground.rs");
+        let emitted = decls
+            .lines()
+            .find_map(|l| l.strip_prefix("#[path = \"")?.strip_suffix("\"]"))
+            .expect("a schema declaration");
+
+        assert!(
+            root.join("custom").join(emitted).exists(),
+            "the emitted path must resolve to a real file when joined onto the \
+             playground's directory as rustc sees it; got {emitted}"
         );
     }
 
