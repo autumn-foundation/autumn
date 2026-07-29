@@ -108,6 +108,13 @@ pub enum ConsoleError {
     PlaygroundPathEscapesPackage(String),
 
     #[error(
+        "the playground destination is unusable: {0}. Nothing has been \
+         written — remove or rename it and re-run.\n\
+         See: docs/guide/console.md"
+    )]
+    PlaygroundDestinationUnusable(String),
+
+    #[error(
         "Cargo.toml has a root-level `bin` key that is not a `[[bin]]` table \
          array, so the playground target cannot be registered — and an \
          unregistered `src/bin/playground.rs` would be auto-discovered as an \
@@ -513,7 +520,7 @@ fn default_feature_chain_to_playground(doc: &toml_edit::DocumentMut) -> Option<S
         if seen.contains(&name) {
             continue;
         }
-        let enables = enabled_by(features, &name);
+        let enables = enabled_by(doc, features, &name);
         seen.push(name.clone());
 
         if enables.iter().any(|e| e == PLAYGROUND_FEATURE) {
@@ -536,7 +543,7 @@ fn feature_closure(doc: &toml_edit::DocumentMut, roots: &[&str]) -> Vec<String> 
         if seen.contains(&name) {
             continue;
         }
-        queue.extend(enabled_by(features, &name));
+        queue.extend(enabled_by(doc, features, &name));
         seen.push(name);
     }
     seen
@@ -547,16 +554,25 @@ fn feature_closure(doc: &toml_edit::DocumentMut, roots: &[&str]) -> Vec<String> 
 /// The `/` forms are not simply "someone else's features":
 ///
 /// * `dep/feat` (**strong**) activates the dependency `dep` as well as its
-///   feature. When `dep` is an optional dependency, that also turns on the
-///   implicit package feature named `dep` — so `default = ["playground/std"]`
-///   really does enable our `playground` gate, and dropping the edge would
-///   hide it. Verified against cargo, which reports
-///   `{'default': ['playground/std'], 'playground': ['dep:playground']}`.
+///   feature — but it turns on a package feature named `dep` only when `dep`
+///   is an **optional** dependency, because the thing it activates is the
+///   implicit `dep = ["dep:dep"]` feature Cargo synthesises for optional
+///   dependencies. Against a *required* dependency there is no such feature,
+///   and a same-named feature the package happens to declare itself stays off.
+///   Both halves are verified against cargo with a deliberately broken target
+///   gated on `required-features = ["playground"]`: with an optional
+///   dependency the target is built (feature active, with or without an
+///   explicit `[features] playground` entry), with a required one it is
+///   skipped (feature inactive).
 /// * `dep?/feat` (**weak**) only adds `feat` if `dep` is already active, so it
 ///   never activates anything on its own.
 /// * `dep:name` selects an optional dependency without creating a feature of
 ///   ours to follow.
-fn enabled_by(features: &toml_edit::Table, name: &str) -> Vec<String> {
+fn enabled_by(
+    doc: &toml_edit::DocumentMut,
+    features: &toml_edit::Table,
+    name: &str,
+) -> Vec<String> {
     features
         .get(name)
         .and_then(toml_edit::Item::as_array)
@@ -566,34 +582,34 @@ fn enabled_by(features: &toml_edit::Table, name: &str) -> Vec<String> {
         .filter_map(|edge| match edge.split_once('/') {
             // Weak: contributes nothing by itself.
             Some((dep, _)) if dep.ends_with('?') => None,
-            // Strong: activates the implicit feature named after the dependency.
-            Some((dep, _)) => Some(dep.to_owned()),
+            // Strong: activates the implicit feature named after the
+            // dependency — which exists only if that dependency is optional.
+            Some((dep, _)) => is_optional_dependency(doc, dep).then(|| dep.to_owned()),
             None if edge.starts_with("dep:") => None,
             None => Some(edge.to_owned()),
         })
         .collect()
 }
 
-/// Whether *any* dependency table declares an optional dependency named
-/// `playground`, for which Cargo synthesises an implicit
-/// `playground = ["dep:playground"]` feature.
+/// Whether *any* dependency table declares `name` as an optional dependency,
+/// for which Cargo synthesises an implicit `name = ["dep:name"]` feature.
 ///
 /// Cargo creates that implicit feature for optional dependencies wherever they
 /// are declared — `[dependencies]`, `[build-dependencies]`, and the
 /// target-specific `[target.'cfg(...)'.dependencies]` tables alike — so
 /// scanning only the top level would miss a real manifest and suppress an edge
 /// Cargo then demands, rejecting the manifest outright.
-fn has_optional_playground_dependency(doc: &toml_edit::DocumentMut) -> bool {
+fn is_optional_dependency(doc: &toml_edit::DocumentMut, name: &str) -> bool {
     // Every lookup goes through `as_table_like`, which covers BOTH the header
     // form (`[target.'cfg(unix)'.dependencies]`, a `Table`) and the inline form
     // (`target = { 'cfg(unix)' = { dependencies = { … } } }`, an
     // `InlineTable`). Enumerating representations is what left the two earlier
     // versions of this scan incomplete: the same manifest written a different
     // valid way slipped through each time.
-    fn declares_optional(table: Option<&toml_edit::Item>) -> bool {
+    fn declares_optional(table: Option<&toml_edit::Item>, name: &str) -> bool {
         table
             .and_then(toml_edit::Item::as_table_like)
-            .and_then(|deps| deps.get(PLAYGROUND_FEATURE))
+            .and_then(|deps| deps.get(name))
             .and_then(toml_edit::Item::as_table_like)
             .is_some_and(|dep| {
                 dep.get("optional")
@@ -602,8 +618,8 @@ fn has_optional_playground_dependency(doc: &toml_edit::DocumentMut) -> bool {
             })
     }
 
-    if declares_optional(doc.get("dependencies"))
-        || declares_optional(doc.get("build-dependencies"))
+    if declares_optional(doc.get("dependencies"), name)
+        || declares_optional(doc.get("build-dependencies"), name)
     {
         return true;
     }
@@ -613,8 +629,8 @@ fn has_optional_playground_dependency(doc: &toml_edit::DocumentMut) -> bool {
         .is_some_and(|targets| {
             targets.iter().any(|(_, cfg)| {
                 cfg.as_table_like().is_some_and(|cfg| {
-                    declares_optional(cfg.get("dependencies"))
-                        || declares_optional(cfg.get("build-dependencies"))
+                    declares_optional(cfg.get("dependencies"), name)
+                        || declares_optional(cfg.get("build-dependencies"), name)
                 })
             })
         })
@@ -637,7 +653,7 @@ fn has_optional_playground_dependency(doc: &toml_edit::DocumentMut) -> bool {
 fn ensure_playground_feature(doc: &mut toml_edit::DocumentMut) -> Result<bool, ConsoleError> {
     use toml_edit::{Array, Item, Table, Value};
 
-    let optional_dep_named_playground = has_optional_playground_dependency(doc);
+    let optional_dep_named_playground = is_optional_dependency(doc, PLAYGROUND_FEATURE);
 
     let features = doc
         .entry("features")
@@ -841,6 +857,49 @@ fn playground_path_escapes_package(project_dir: &Path, playground_rel: &str) -> 
     false
 }
 
+/// What makes the playground destination unwritable, if anything.
+///
+/// `scaffold_outcome` keys off `is_file()`, which is false for a *directory*
+/// sitting at the playground path exactly as it is for nothing at all — so the
+/// run would treat it as "create" and only discover the problem inside
+/// `write_playground`, as a raw I/O error, after `Cargo.toml` had already been
+/// committed. Same for a non-directory squatting on an ancestor we would have
+/// to create (a file at `src/bin`), which makes `create_dir_all` fail.
+///
+/// Both leave the feature and the `[[bin]]` entry persisted with no source
+/// file behind them, which is precisely the no-write-on-refusal behaviour the
+/// docs promise. Detecting them here keeps every rejection ahead of the first
+/// byte written.
+fn playground_destination_problem(project_dir: &Path, playground_rel: &str) -> Option<String> {
+    let root = lexically_normalize(project_dir);
+    let path = lexically_normalize(&project_dir.join(playground_rel.replace('\\', "/")));
+
+    // `symlink_metadata` rather than `exists`, so a dangling symlink counts as
+    // present: `is_file()` is false for one, and a plain write would silently
+    // replace the link instead of the file the user thinks they named.
+    if path.symlink_metadata().is_ok() && !path.is_file() {
+        return Some(format!(
+            "`{playground_rel}` exists but is not a regular file"
+        ));
+    }
+
+    let mut ancestor = path.parent();
+    while let Some(dir) = ancestor {
+        if dir == root || !dir.starts_with(&root) {
+            break;
+        }
+        if dir.symlink_metadata().is_ok() && !dir.is_dir() {
+            return Some(format!(
+                "`{}` exists but is not a directory, so the playground's parent \
+                 directory cannot be created",
+                relative_path_from(&root, dir)
+            ));
+        }
+        ancestor = dir.parent();
+    }
+    None
+}
+
 /// Print an error and exit non-zero. `autumn console` never fails silently.
 fn fail(err: &ConsoleError) -> ! {
     eprintln!("\u{2717} {err}");
@@ -1019,6 +1078,14 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
         );
         std::process::exit(1);
     }
+    // Only a run that will actually write the file needs a usable destination:
+    // an existing playground we are keeping is left alone either way.
+    let outcome = scaffold_outcome(exists, force);
+    if outcome.writes_file()
+        && let Some(problem) = playground_destination_problem(&project_dir, &playground_rel)
+    {
+        fail(&ConsoleError::PlaygroundDestinationUnusable(problem));
+    }
 
     // Validation is complete. Write the manifest before the source file: the
     // playground only ever compiles with `--features playground`, so a manifest
@@ -1032,7 +1099,6 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
         report_manifest_edits(changes);
     }
 
-    let outcome = scaffold_outcome(exists, force);
     if outcome.writes_file() {
         write_playground(&playground_path, &playground_rel, &project_dir, &manifest);
         eprintln!("  {} {playground_rel}", outcome.verb());
@@ -1844,6 +1910,38 @@ default = ["playground/std"]
     }
 
     #[test]
+    fn strong_edge_to_a_required_dependency_does_not_activate_a_local_feature() {
+        // The mirror of the case above, and the reason the strong-edge rule is
+        // conditional rather than blanket: a strong edge activates the package
+        // feature named after the dependency only when that dependency is
+        // OPTIONAL, because what it really activates is the implicit
+        // `playground = ["dep:playground"]` feature Cargo synthesises for one.
+        // Against a required dependency no such feature exists, and a
+        // same-named feature the package declares itself stays off — so this
+        // project is properly isolated and must be accepted.
+        //
+        // Verified against cargo with a deliberately broken target gated on
+        // `required-features = ["playground"]`: the build succeeds, i.e. the
+        // target was skipped, i.e. the local feature was never activated.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = "0.6.0"
+playground = { version = "0.1" }
+
+[features]
+default = ["playground/std"]
+playground = []
+"#;
+        let (updated, changes) = ensure_manifest_wiring(manifest, None).expect("accepted");
+        assert!(changes.added_bin, "the gated bin target should be added");
+        assert!(updated.contains("required-features = [\"playground\"]"));
+    }
+
+    #[test]
     fn ensure_manifest_wiring_allows_a_weak_dependency_feature_edge() {
         // `playground?/std` is WEAK: it adds `std` only if `playground` is
         // already active, so it never activates the gate by itself. Treating
@@ -1897,6 +1995,48 @@ default = ["autumn-web/mail"]
             tmp.path(),
             "custom/playground.rs"
         ));
+    }
+
+    #[test]
+    fn a_usable_destination_reports_no_problem() {
+        // The guard below must not fire on the ordinary cases: nothing there
+        // yet, or an existing regular file we are about to regenerate.
+        let tmp = project_with(&["src/main.rs"]);
+        assert_eq!(
+            playground_destination_problem(tmp.path(), PLAYGROUND_REL_PATH),
+            None
+        );
+        std::fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
+        std::fs::write(tmp.path().join(PLAYGROUND_REL_PATH), "fn main() {}").unwrap();
+        assert_eq!(
+            playground_destination_problem(tmp.path(), PLAYGROUND_REL_PATH),
+            None
+        );
+    }
+
+    #[test]
+    fn a_directory_at_the_playground_path_is_reported() {
+        // `is_file()` is false for a directory exactly as it is for nothing at
+        // all, so without this guard the run reads it as "create", commits the
+        // manifest, and only then fails with `Is a directory (os error 21)` —
+        // leaving the feature and `[[bin]]` entry behind with no source file.
+        let tmp = project_with(&["src/main.rs"]);
+        std::fs::create_dir_all(tmp.path().join(PLAYGROUND_REL_PATH)).unwrap();
+        let problem = playground_destination_problem(tmp.path(), PLAYGROUND_REL_PATH)
+            .expect("a directory at the destination is a problem");
+        assert!(problem.contains("not a regular file"), "{problem}");
+    }
+
+    #[test]
+    fn a_file_where_the_parent_directory_belongs_is_reported() {
+        // The other half: `create_dir_all` fails with `File exists` when a
+        // non-directory squats on an ancestor.
+        let tmp = project_with(&["src/main.rs"]);
+        std::fs::write(tmp.path().join("src/bin"), "not a directory").unwrap();
+        let problem = playground_destination_problem(tmp.path(), PLAYGROUND_REL_PATH)
+            .expect("a file at src/bin is a problem");
+        assert!(problem.contains("not a directory"), "{problem}");
+        assert!(problem.contains("src/bin"), "{problem}");
     }
 
     #[test]
