@@ -35,7 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   format-preserving TOML editor, are written atomically, never touch the
   `autumn-web` dependency line, and are idempotent. A config or database
   failure prints the underlying error and exits non-zero from the playground
-  out through the command's own exit status. Guide: `docs/guide/console.md`.
+  out through the command's own exit status. Because that isolation is a
+  guarantee rather than a best effort, `autumn console` refuses — before
+  writing anything, leaving `Cargo.toml` byte-identical — when a manifest is in
+  a state where it cannot hold: an existing `playground` bin target that is
+  ungated or gated on a different feature, a `default` feature list that
+  reaches `playground` (directly or transitively), or an edition-2015 package
+  where the scaffolded file would be auto-discovered as an ungated binary. Each
+  error names the one line to change. Guide: `docs/guide/console.md`.
   No `autumn-web` API change.
 - **notifications:** first-class in-app notifications store with a read/unread
   feed (#1148). A new `autumn_web::notifications` module ships a

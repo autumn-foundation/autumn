@@ -194,7 +194,9 @@ fn console_does_not_duplicate_a_path_less_playground_bin() {
     let manifest = fs::read_to_string(&manifest_path).unwrap();
     fs::write(
         &manifest_path,
-        format!("{manifest}\n[[bin]]\nname = \"playground\"\n"),
+        format!(
+            "{manifest}\n[[bin]]\nname = \"playground\"\nrequired-features = [\"playground\"]\n"
+        ),
     )
     .unwrap();
     fs::create_dir_all(project.join("src/bin")).unwrap();
@@ -223,6 +225,70 @@ fn console_does_not_duplicate_a_path_less_playground_bin() {
         1,
         "the pre-existing target must be recognised, not duplicated:\n{wired}"
     );
+}
+
+/// The isolation guarantee has to hold for configurations we did not create.
+/// Each of these would put the seed-dependent playground into the default
+/// build set, so `autumn console` refuses and leaves the project untouched
+/// rather than scaffolding a project-wide build failure.
+/// A manifest mutation that breaks isolation, plus the phrase the resulting
+/// error must contain.
+type IsolationGuardCase = (&'static str, fn(&str) -> String, &'static str);
+
+#[test]
+fn console_refuses_configurations_it_cannot_isolate() {
+    let cases: &[IsolationGuardCase] = &[
+        // An ungated pre-existing target would carry the template into every build.
+        (
+            "ungated-bin",
+            |m| format!("{m}\n[[bin]]\nname = \"playground\"\npath = \"src/bin/playground.rs\"\n"),
+            "required-features",
+        ),
+        // A default-enabled gate is no gate at all.
+        (
+            "default-feature",
+            |m| {
+                m.replace(
+                    "default = [\"flash\"]",
+                    "default = [\"flash\", \"playground\"]",
+                )
+            },
+            "default",
+        ),
+        // Edition 2015 auto-discovers the file as an ungated binary.
+        (
+            "edition-2015",
+            |m| m.replace("edition = \"2024\"", "edition = \"2015\""),
+            "edition 2015",
+        ),
+    ];
+
+    for (name, mutate, expected) in cases {
+        let (_tmp, project) = new_project(&format!("console-guard-{name}-app"));
+        let manifest_path = project.join("Cargo.toml");
+        let original = mutate(&fs::read_to_string(&manifest_path).unwrap());
+        fs::write(&manifest_path, &original).unwrap();
+
+        let out = run_autumn(&project, &["console", "--scaffold-only"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "[{name}] must refuse rather than break the default build:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(expected),
+            "[{name}] the error must name the problem (`{expected}`):\n{stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(&manifest_path).unwrap(),
+            original,
+            "[{name}] a refused project must keep its manifest byte-identical"
+        );
+        assert!(
+            !playground_path(&project).exists(),
+            "[{name}] nothing may be scaffolded when isolation cannot be guaranteed"
+        );
+    }
 }
 
 // ── AC3: model/repository APIs are reachable from the playground ───────────

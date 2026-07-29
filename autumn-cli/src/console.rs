@@ -59,6 +59,45 @@ pub enum ConsoleError {
          to see the available members"
     )]
     UnknownPackage(String),
+
+    // ── isolation guards ───────────────────────────────────────────────────
+    //
+    // The playground compiles the app's own modules into a separate crate and
+    // is not always self-contained, so it must never join the default build
+    // set — otherwise a broken playground breaks `cargo build`, and with it
+    // `autumn dev`. Each of these is a configuration we cannot make safe on
+    // the user's behalf, so we refuse before touching anything rather than
+    // scaffold a project-wide outage.
+    #[error(
+        "`[features] default` enables `playground`, so the playground would be \
+         built by a plain `cargo build` — the isolation `autumn console` relies \
+         on. Remove `playground` from the default feature list (directly or via \
+         `{0}`) and re-run.\n\
+         See: docs/guide/console.md"
+    )]
+    PlaygroundFeatureIsDefault(String),
+
+    #[error(
+        "Cargo.toml already declares `[[bin]] name = \"playground\"` without \
+         `required-features = [\"playground\"]`, so it would be built by a plain \
+         `cargo build`. Add this line to that entry and re-run:\n\n    \
+         required-features = [\"playground\"]\n\n\
+         See: docs/guide/console.md"
+    )]
+    PlaygroundBinNotGated,
+
+    #[error(
+        "this package uses Rust edition 2015, where declaring a target turns off \
+         Cargo's auto-discovery of the others — so `autumn console` cannot add \
+         the playground entry without dropping your existing binaries from the \
+         build. A scaffolded `src/bin/playground.rs` would meanwhile be \
+         auto-discovered as an ungated binary and join every normal build, so \
+         nothing has been written. Add this to Cargo.toml yourself, then re-run:\
+         \n\n    [[bin]]\n    name = \"playground\"\n    path = \
+         \"src/bin/playground.rs\"\n    required-features = [\"playground\"]\n\n\
+         See: docs/guide/console.md"
+    )]
+    CannotIsolateOnEdition2015,
 }
 
 /// What the scaffolder did (or would do) with the playground source file.
@@ -165,20 +204,37 @@ pub const fn scaffold_outcome(exists: bool, force: bool) -> ScaffoldOutcome {
 /// crate, which is what makes a model/repository round-trip possible with no
 /// further wiring (AC3). Both the `src/<name>.rs` and `src/<name>/mod.rs`
 /// layouts are supported; the directory layout wins when both exist.
-pub fn app_module_decls(project_root: &Path) -> String {
+/// `playground_rel` is the playground's path relative to the package root.
+/// `#[path]` resolves relative to the *directory holding the file*, so the
+/// declarations have to be rebased whenever the playground is not at the
+/// default location — a user-relocated `custom/playground.rs` would otherwise
+/// get `#[path = "../schema.rs"]`, which points at a package-root `schema.rs`
+/// that does not exist.
+pub fn app_module_decls(project_root: &Path, playground_rel: &str) -> String {
     let src = project_root.join("src");
+    let hop = ascent_to_package_root(playground_rel);
     let mut out = String::new();
     for name in APP_MODULES {
         let rel = if src.join(name).join("mod.rs").is_file() {
-            format!("../{name}/mod.rs")
+            format!("{hop}src/{name}/mod.rs")
         } else if src.join(format!("{name}.rs")).is_file() {
-            format!("../{name}.rs")
+            format!("{hop}src/{name}.rs")
         } else {
             continue;
         };
         let _ = writeln!(out, "#[path = \"{rel}\"]\nmod {name};");
     }
     out
+}
+
+/// The `../`-chain that climbs from the directory holding `playground_rel`
+/// back to the package root — `src/bin/playground.rs` → `"../../"`.
+fn ascent_to_package_root(playground_rel: &str) -> String {
+    let normalised = playground_rel.replace('\\', "/");
+    let depth = Path::new(&normalised)
+        .parent()
+        .map_or(0, |p| p.components().count());
+    "../".repeat(depth)
 }
 
 /// Render the playground template for `project_name`, splicing in the app
@@ -256,12 +312,75 @@ pub fn ensure_manifest_wiring(manifest: &str) -> Result<(String, ManifestChanges
         return Err(ConsoleError::MissingAutumnWebDependency);
     }
 
+    // Every isolation guard runs before the first edit is staged, so a manifest
+    // we refuse is returned to the caller byte-identical.
+    if let Some(via) = default_feature_chain_to_playground(&doc) {
+        return Err(ConsoleError::PlaygroundFeatureIsDefault(via));
+    }
+    if declared_playground_bin(&doc).is_some_and(|t| !bin_is_gated_on_playground(t)) {
+        return Err(ConsoleError::PlaygroundBinNotGated);
+    }
+    // Nothing declares the target yet and we cannot add it safely: a scaffolded
+    // file would be auto-discovered as an ungated binary.
+    if declared_playground_bin(&doc).is_none() && adding_bin_would_break_autodiscovery(&doc) {
+        return Err(ConsoleError::CannotIsolateOnEdition2015);
+    }
+
     let changes = ManifestChanges {
         added_feature: ensure_playground_feature(&mut doc)?,
-        added_bin: !adding_bin_would_break_autodiscovery(&doc) && ensure_playground_bin(&mut doc),
+        added_bin: ensure_playground_bin(&mut doc),
     };
 
     Ok((doc.to_string(), changes))
+}
+
+/// Whether a `[[bin]]` entry is gated on the `playground` feature.
+///
+/// An entry that is ungated, or gated on something else, is not one
+/// `autumn console` can drive: ungated puts the seed-dependent template into
+/// every normal build, and a foreign gate is never satisfied by the
+/// `--features playground` the runner passes, so Cargo silently declines to
+/// run it.
+fn bin_is_gated_on_playground(entry: &toml_edit::Table) -> bool {
+    entry
+        .get("required-features")
+        .and_then(toml_edit::Item::as_array)
+        .is_some_and(|a| a.iter().any(|f| f.as_str() == Some(PLAYGROUND_FEATURE)))
+}
+
+/// The feature chain by which `[features] default` reaches `playground`, if it
+/// does — `default` itself, or the intermediate feature that pulls it in.
+///
+/// A `playground` feature that is on by default makes
+/// `required-features = ["playground"]` vacuous: the target rejoins the default
+/// build set and the whole isolation guarantee evaporates.
+fn default_feature_chain_to_playground(doc: &toml_edit::DocumentMut) -> Option<String> {
+    let features = doc.get("features").and_then(toml_edit::Item::as_table)?;
+    let mut queue: Vec<String> = vec!["default".to_owned()];
+    let mut seen: Vec<String> = Vec::new();
+
+    while let Some(name) = queue.pop() {
+        if seen.contains(&name) {
+            continue;
+        }
+        let enables = features
+            .get(&name)
+            .and_then(toml_edit::Item::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            // `dep/feat` edges enable a dependency's feature, never one of ours.
+            .filter(|edge| !edge.contains('/'))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        seen.push(name.clone());
+
+        if enables.iter().any(|e| e == PLAYGROUND_FEATURE) {
+            return Some(name);
+        }
+        queue.extend(enables);
+    }
+    None
 }
 
 /// Ensure `[features] playground` exists and enables `autumn-web/seed`.
@@ -347,18 +466,21 @@ fn ensure_playground_bin(doc: &mut toml_edit::DocumentMut) -> bool {
 /// with no `path` is a perfectly valid declaration for which Cargo infers
 /// `src/bin/playground.rs` — the same location we would have used.
 pub fn declared_playground_path(doc: &toml_edit::DocumentMut) -> Option<String> {
-    let entry = doc
-        .get("bin")
-        .and_then(toml_edit::Item::as_array_of_tables)?
-        .iter()
-        .find(|t| t.get("name").and_then(toml_edit::Item::as_str) == Some(PLAYGROUND_BIN_NAME))?;
     Some(
-        entry
+        declared_playground_bin(doc)?
             .get("path")
             .and_then(toml_edit::Item::as_str)
             .unwrap_or(PLAYGROUND_REL_PATH)
             .to_owned(),
     )
+}
+
+/// The already-declared `[[bin]] name = "playground"` entry, if any.
+fn declared_playground_bin(doc: &toml_edit::DocumentMut) -> Option<&toml_edit::Table> {
+    doc.get("bin")
+        .and_then(toml_edit::Item::as_array_of_tables)?
+        .iter()
+        .find(|t| t.get("name").and_then(toml_edit::Item::as_str) == Some(PLAYGROUND_BIN_NAME))
 }
 
 /// Whether adding the *first* manual `[[bin]]` to this manifest would turn off
@@ -458,9 +580,13 @@ fn load_manifest(manifest_path: &Path, project_dir: &Path) -> (String, toml_edit
 }
 
 /// Write the playground template to `path`, creating its parent directory.
-fn write_playground(path: &Path, project_dir: &Path, manifest: &str) {
+///
+/// `rel` is `path` relative to the package root; the `#[path]` module
+/// declarations are rebased against it so a relocated playground still reaches
+/// `src/`.
+fn write_playground(path: &Path, rel: &str, project_dir: &Path, manifest: &str) {
     let project_name = package_name(manifest).unwrap_or_else(|| project_dir.display().to_string());
-    let source = render_playground(&project_name, &app_module_decls(project_dir));
+    let source = render_playground(&project_name, &app_module_decls(project_dir, rel));
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -486,21 +612,6 @@ fn report_manifest_edits(changes: ManifestChanges) {
         ));
     }
     eprintln!("  Updated Cargo.toml ({})", edits.join(", "));
-}
-
-/// Tell the user what to paste when we deliberately declined to add the bin
-/// entry, rather than letting cargo's "no bin target named playground" be
-/// their first clue.
-fn warn_manual_bin_entry_required() {
-    eprintln!(
-        "  \u{26a0} This package uses Rust edition 2015, where declaring a \
-         target turns off Cargo's auto-discovery of the others.\n    \
-         Adding the playground entry automatically would drop your existing \
-         binaries from the build, so add it yourself:\n\n      \
-         [[bin]]\n      name = \"{PLAYGROUND_BIN_NAME}\"\n      path = \
-         \"{PLAYGROUND_REL_PATH}\"\n      required-features = \
-         [\"{PLAYGROUND_FEATURE}\"]\n"
-    );
 }
 
 /// Entry point for `autumn console`.
@@ -529,10 +640,8 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
     // Honour a user-relocated playground: if their manifest already declares
     // the bin somewhere else, scaffold there rather than writing a file Cargo
     // would de-duplicate away and never run.
-    let declared = declared_playground_path(&doc);
-    let playground_rel = declared
-        .clone()
-        .unwrap_or_else(|| PLAYGROUND_REL_PATH.to_owned());
+    let playground_rel =
+        declared_playground_path(&doc).unwrap_or_else(|| PLAYGROUND_REL_PATH.to_owned());
     let playground_path = project_dir.join(&playground_rel);
     let exists = playground_path.is_file();
     // `--force` overwrites; refuse when the path is a symlink, so the write
@@ -551,17 +660,13 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
 
     let outcome = scaffold_outcome(exists, force);
     if outcome.writes_file() {
-        write_playground(&playground_path, &project_dir, &manifest);
+        write_playground(&playground_path, &playground_rel, &project_dir, &manifest);
         eprintln!("  {} {playground_rel}", outcome.verb());
     } else {
         eprintln!(
             "  {} {playground_rel} (pass --force to regenerate it from the template)",
             outcome.verb()
         );
-    }
-
-    if !changes.added_bin && declared.is_none() && adding_bin_would_break_autodiscovery(&doc) {
-        warn_manual_bin_entry_required();
     }
 
     if scaffold_only {
@@ -734,19 +839,20 @@ mod tests {
     #[test]
     fn app_module_decls_is_empty_for_a_bare_project() {
         let tmp = project_with(&["src/main.rs"]);
-        assert_eq!(app_module_decls(tmp.path()).trim(), "");
+        assert_eq!(app_module_decls(tmp.path(), PLAYGROUND_REL_PATH).trim(), "");
     }
 
     #[test]
     fn app_module_decls_detects_schema_and_models_directory() {
         let tmp = project_with(&["src/main.rs", "src/schema.rs", "src/models/mod.rs"]);
-        let decls = app_module_decls(tmp.path());
+        let decls = app_module_decls(tmp.path(), PLAYGROUND_REL_PATH);
         assert!(
-            decls.contains("#[path = \"../schema.rs\"]") && decls.contains("mod schema;"),
+            decls.contains("#[path = \"../../src/schema.rs\"]") && decls.contains("mod schema;"),
             "must wire src/schema.rs into the playground crate:\n{decls}"
         );
         assert!(
-            decls.contains("#[path = \"../models/mod.rs\"]") && decls.contains("mod models;"),
+            decls.contains("#[path = \"../../src/models/mod.rs\"]")
+                && decls.contains("mod models;"),
             "must wire src/models/mod.rs into the playground crate:\n{decls}"
         );
     }
@@ -754,9 +860,9 @@ mod tests {
     #[test]
     fn app_module_decls_detects_single_file_models() {
         let tmp = project_with(&["src/main.rs", "src/models.rs"]);
-        let decls = app_module_decls(tmp.path());
+        let decls = app_module_decls(tmp.path(), PLAYGROUND_REL_PATH);
         assert!(
-            decls.contains("#[path = \"../models.rs\"]"),
+            decls.contains("#[path = \"../../src/models.rs\"]"),
             "must support the single-file src/models.rs layout:\n{decls}"
         );
     }
@@ -764,7 +870,7 @@ mod tests {
     #[test]
     fn app_module_decls_detects_repositories() {
         let tmp = project_with(&["src/main.rs", "src/repositories/mod.rs"]);
-        let decls = app_module_decls(tmp.path());
+        let decls = app_module_decls(tmp.path(), PLAYGROUND_REL_PATH);
         assert!(
             decls.contains("mod repositories;"),
             "must wire src/repositories into the playground crate:\n{decls}"
@@ -774,14 +880,14 @@ mod tests {
     #[test]
     fn app_module_decls_prefers_mod_rs_over_single_file() {
         let tmp = project_with(&["src/models.rs", "src/models/mod.rs"]);
-        let decls = app_module_decls(tmp.path());
+        let decls = app_module_decls(tmp.path(), PLAYGROUND_REL_PATH);
         assert_eq!(
             decls.matches("mod models;").count(),
             1,
             "must declare `models` exactly once:\n{decls}"
         );
         assert!(
-            decls.contains("../models/mod.rs"),
+            decls.contains("src/models/mod.rs"),
             "the directory layout must win over the stale single file:\n{decls}"
         );
     }
@@ -979,6 +1085,7 @@ autumn-web = "0.6.0"
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
+edition = "2024"
 
 [features]
 playground = "nonsense"
@@ -1005,6 +1112,7 @@ edition = "2024"
 
 [[bin]]
 name = "playground"
+required-features = ["playground"]
 
 [dependencies]
 autumn-web = "0.6.0"
@@ -1016,6 +1124,163 @@ autumn-web = "0.6.0"
             1,
             "a duplicate binary name makes the manifest unparsable to cargo:\n{out}"
         );
+    }
+
+    // ── isolation guards (Codex review, a07f2f1..) ────────────────────────
+
+    #[test]
+    fn ensure_manifest_wiring_rejects_a_default_enabled_playground_feature() {
+        // `default = ["playground"]` satisfies `required-features` on every
+        // build, so the gate becomes vacuous and the playground rejoins the
+        // default build set.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["flash", "playground"]
+flash = []
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest),
+            Err(ConsoleError::PlaygroundFeatureIsDefault(
+                "default".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_rejects_a_transitively_default_playground_feature() {
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["bundle"]
+bundle = ["playground"]
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest),
+            Err(ConsoleError::PlaygroundFeatureIsDefault(
+                "bundle".to_owned()
+            )),
+            "the chain must be followed through intermediate features"
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_default_scan_terminates_on_a_feature_cycle() {
+        // A self-referential feature list must not hang the scan.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["a"]
+a = ["b"]
+b = ["a"]
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert!(ensure_manifest_wiring(manifest).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_rejects_an_ungated_existing_playground_bin() {
+        // Reusing an ungated target would put the seed-dependent template into
+        // every normal `cargo build`.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "playground"
+path = "src/bin/playground.rs"
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest),
+            Err(ConsoleError::PlaygroundBinNotGated)
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_rejects_a_foreign_gate_on_the_playground_bin() {
+        // `--features playground` never satisfies `tools`, so cargo would
+        // silently decline to run the target.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "playground"
+required-features = ["tools"]
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest),
+            Err(ConsoleError::PlaygroundBinNotGated)
+        );
+    }
+
+    #[test]
+    fn isolation_guards_leave_the_manifest_untouched() {
+        // Guards run before the first staged edit, so a refused project keeps
+        // its manifest byte-identical.
+        for manifest in [
+            "[package]\nname = \"a\"\nedition = \"2024\"\n\n[features]\ndefault = [\"playground\"]\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
+            "[package]\nname = \"a\"\nedition = \"2024\"\n\n[[bin]]\nname = \"playground\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
+        ] {
+            assert!(
+                ensure_manifest_wiring(manifest).is_err(),
+                "expected a refusal for:\n{manifest}"
+            );
+        }
+    }
+
+    // ── #[path] rebasing for a relocated playground ───────────────────────
+
+    #[test]
+    fn app_module_decls_rebase_for_a_relocated_playground() {
+        let tmp = project_with(&["src/main.rs", "src/schema.rs"]);
+        let decls = app_module_decls(tmp.path(), "custom/playground.rs");
+        assert!(
+            decls.contains("#[path = \"../src/schema.rs\"]"),
+            "a playground one level deep must reach src/ with a single hop:\n{decls}"
+        );
+    }
+
+    #[test]
+    fn app_module_decls_rebase_for_a_deeply_nested_playground() {
+        let tmp = project_with(&["src/main.rs", "src/schema.rs"]);
+        let decls = app_module_decls(tmp.path(), "tools/dev/pg.rs");
+        assert!(
+            decls.contains("#[path = \"../../src/schema.rs\"]"),
+            "two directories deep needs two hops:\n{decls}"
+        );
+    }
+
+    #[test]
+    fn ascent_to_package_root_counts_directories() {
+        assert_eq!(ascent_to_package_root("playground.rs"), "");
+        assert_eq!(ascent_to_package_root("custom/playground.rs"), "../");
+        assert_eq!(ascent_to_package_root(PLAYGROUND_REL_PATH), "../../");
     }
 
     #[test]
@@ -1042,6 +1307,7 @@ edition = "2024"
 [[bin]]
 name = "playground"
 path = "custom/playground.rs"
+required-features = ["playground"]
 
 [dependencies]
 autumn-web = "0.6.0"
@@ -1095,18 +1361,12 @@ version = "0.1.0"
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        let (out, changes) = ensure_manifest_wiring(manifest).unwrap();
-        assert!(
-            !changes.added_bin,
-            "must not append the first manual target to a 2015-edition manifest"
-        );
-        assert!(
-            !out.contains("[[bin]]"),
-            "must leave auto-discovery intact:\n{out}"
-        );
-        assert!(
-            changes.added_feature,
-            "the feature definition is still safe to add"
+        // Refused outright: we cannot add the gated entry, and a scaffolded
+        // file would be auto-discovered as an UNGATED binary that joins every
+        // normal build — the exact outage the gate exists to prevent.
+        assert_eq!(
+            ensure_manifest_wiring(manifest),
+            Err(ConsoleError::CannotIsolateOnEdition2015)
         );
     }
 

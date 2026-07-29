@@ -141,12 +141,22 @@ builds of a deliberately database-free app.
 Delete `src/bin/playground.rs` **and** its `[[bin]]` block. The `playground`
 feature can stay or go; it costs nothing when unused.
 
-### Edition 2015
+### When `autumn console` refuses
 
-On a 2015-edition package, declaring any target by hand turns off Cargo's
-auto-discovery of the rest — so `autumn console` refuses to append the `[[bin]]`
-block there (it would silently drop your existing binaries from the build) and
-prints the snippet for you to add yourself.
+The isolation above is a guarantee, not a best effort. If your manifest is in a
+state where it cannot hold, `autumn console` stops **before writing anything**
+— manifest byte-identical, no playground scaffolded — and tells you the one
+line to change:
+
+| Situation | Why it's refused |
+| --- | --- |
+| `[[bin]] name = "playground"` exists without `required-features = ["playground"]` | Reusing an ungated target would put the seed-dependent playground into every `cargo build`. |
+| `[[bin]] name = "playground"` is gated on some *other* feature | `--features playground` would never satisfy it, so Cargo would quietly decline to run it. |
+| `default` enables `playground` (directly or through another feature) | The gate becomes vacuous — the playground would be in every build. |
+| Edition 2015 with no hand-declared targets | Declaring the first target turns off auto-discovery of the rest, and a scaffolded file would meanwhile be auto-discovered as an *ungated* binary. Add the `[[bin]]` block yourself (the error prints it), then re-run. |
+
+Each of these is a one-line fix in your `Cargo.toml`, after which `autumn
+console` proceeds normally.
 
 ## Not included
 
