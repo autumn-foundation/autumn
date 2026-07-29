@@ -98,6 +98,26 @@ pub enum ConsoleError {
     PlaygroundBinGateUnsatisfiable(String),
 
     #[error(
+        "the playground would be written to `{0}`, which is outside this \
+         package. `autumn console` only ever writes inside the package \
+         directory, so nothing has been created. This happens when a \
+         `[[bin]] path` points outside the package, or when a directory on the \
+         way (e.g. `src/bin`) is a symlink leading out of the checkout.\n\
+         See: docs/guide/console.md"
+    )]
+    PlaygroundPathEscapesPackage(String),
+
+    #[error(
+        "Cargo.toml has a root-level `bin` key that is not a `[[bin]]` table \
+         array, so the playground target cannot be registered — and an \
+         unregistered `src/bin/playground.rs` would be auto-discovered as an \
+         ungated binary and join every normal build. Replace it with `[[bin]]` \
+         sections and re-run.\n\
+         See: docs/guide/console.md"
+    )]
+    UnusableBinTable,
+
+    #[error(
         "this package uses Rust edition 2015, where declaring a target turns off \
          Cargo's auto-discovery of the others — so `autumn console` cannot add \
          the playground entry without dropping your existing binaries from the \
@@ -385,6 +405,16 @@ pub fn ensure_manifest_wiring(
     {
         return Err(problem);
     }
+    // A `bin` key we cannot append to (e.g. a valid root-level `bin = []`,
+    // which toml_edit exposes as a plain array) means the target can never be
+    // registered — and the scaffolded file would then be auto-discovered
+    // ungated, rejoining the default build. Refuse rather than report success.
+    if doc
+        .get("bin")
+        .is_some_and(|b| b.as_array_of_tables().is_none())
+    {
+        return Err(ConsoleError::UnusableBinTable);
+    }
     // Nothing declares the target yet and we cannot add it safely: a scaffolded
     // file would be auto-discovered as an ungated binary.
     if declared_playground_bin(&doc).is_none()
@@ -496,6 +526,42 @@ fn enabled_by(features: &toml_edit::Table, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether *any* dependency table declares an optional dependency named
+/// `playground`, for which Cargo synthesises an implicit
+/// `playground = ["dep:playground"]` feature.
+///
+/// Cargo creates that implicit feature for optional dependencies wherever they
+/// are declared — `[dependencies]`, `[build-dependencies]`, and the
+/// target-specific `[target.'cfg(...)'.dependencies]` tables alike — so
+/// scanning only the top level would miss a real manifest and suppress an edge
+/// Cargo then demands, rejecting the manifest outright.
+fn has_optional_playground_dependency(doc: &toml_edit::DocumentMut) -> bool {
+    let declares_optional = |table: Option<&toml_edit::Item>| {
+        table
+            .and_then(|deps| deps.get(PLAYGROUND_FEATURE))
+            .is_some_and(|dep| {
+                dep.get("optional")
+                    .and_then(toml_edit::Item::as_bool)
+                    .unwrap_or(false)
+            })
+    };
+
+    if declares_optional(doc.get("dependencies"))
+        || declares_optional(doc.get("build-dependencies"))
+    {
+        return true;
+    }
+
+    doc.get("target")
+        .and_then(toml_edit::Item::as_table)
+        .is_some_and(|targets| {
+            targets.iter().any(|(_, cfg)| {
+                declares_optional(cfg.get("dependencies"))
+                    || declares_optional(cfg.get("build-dependencies"))
+            })
+        })
+}
+
 /// Ensure `[features] playground` exists and enables `autumn-web/seed`.
 ///
 /// The edge is *merged into* whatever is already there rather than replacing
@@ -513,14 +579,7 @@ fn enabled_by(features: &toml_edit::Table, name: &str) -> Vec<String> {
 fn ensure_playground_feature(doc: &mut toml_edit::DocumentMut) -> Result<bool, ConsoleError> {
     use toml_edit::{Array, Item, Table, Value};
 
-    let optional_dep_named_playground = doc
-        .get("dependencies")
-        .and_then(|deps| deps.get(PLAYGROUND_FEATURE))
-        .is_some_and(|dep| {
-            dep.get("optional")
-                .and_then(toml_edit::Item::as_bool)
-                .unwrap_or(false)
-        });
+    let optional_dep_named_playground = has_optional_playground_dependency(doc);
 
     let features = doc
         .entry("features")
@@ -694,6 +753,36 @@ fn workspace_inherited_edition(project_dir: &Path) -> Option<String> {
     None
 }
 
+/// Whether the playground would be written outside the package directory.
+///
+/// Two distinct escapes, both of which have to be caught before any directory
+/// is created:
+///
+/// * a **declared** `[[bin]] path` that climbs out (`../tools/playground.rs`) —
+///   caught lexically, since the file need not exist yet;
+/// * a **symlinked ancestor**, e.g. a checked-out `src/bin` pointing outside
+///   the repository — caught by canonicalizing the deepest ancestor that does
+///   exist. The final-component symlink check on `--force` cannot see this:
+///   the link is a directory partway up the path, and it bites on
+///   `--scaffold-only` too.
+fn playground_path_escapes_package(project_dir: &Path, playground_rel: &str) -> bool {
+    let root = lexically_normalize(project_dir);
+    let intended = lexically_normalize(&project_dir.join(playground_rel.replace('\\', "/")));
+    if !intended.starts_with(&root) {
+        return true;
+    }
+
+    let real_root = root.canonicalize().unwrap_or(root);
+    let mut ancestor = intended.parent();
+    while let Some(dir) = ancestor {
+        if let Ok(real) = dir.canonicalize() {
+            return !real.starts_with(&real_root);
+        }
+        ancestor = dir.parent();
+    }
+    false
+}
+
 /// Print an error and exit non-zero. `autumn console` never fails silently.
 fn fail(err: &ConsoleError) -> ! {
     eprintln!("\u{2717} {err}");
@@ -860,6 +949,9 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
     // would de-duplicate away and never run.
     let playground_rel =
         declared_playground_path(&doc).unwrap_or_else(|| PLAYGROUND_REL_PATH.to_owned());
+    if playground_path_escapes_package(&project_dir, &playground_rel) {
+        fail(&ConsoleError::PlaygroundPathEscapesPackage(playground_rel));
+    }
     let playground_path = project_dir.join(&playground_rel);
     let exists = playground_path.is_file();
     // `--force` overwrites; refuse when the path is a symlink, so the write
@@ -1530,6 +1622,51 @@ playground = { version = "0.1", optional = true }
     }
 
     #[test]
+    fn playground_feature_preserves_a_target_specific_optional_dependency() {
+        // Cargo synthesises the implicit feature for optional dependencies in
+        // `[target.'cfg(...)'.dependencies]` too — verified against cargo,
+        // which reports `{'playground': ['dep:playground']}` for this manifest.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = "0.6.0"
+
+[target.'cfg(unix)'.dependencies]
+playground = { version = "0.1", optional = true }
+"#;
+        let (out, _) = ensure_manifest_wiring(manifest, None).unwrap();
+        assert!(
+            out.contains("\"dep:playground\""),
+            "a target-specific optional dependency has the same implicit \
+             feature and must be preserved:\n{out}"
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_rejects_an_unusable_bin_key() {
+        // A root-level `bin = []` is valid TOML that cargo accepts, but it is
+        // not an array-of-tables, so the gated entry can never be appended and
+        // the scaffolded file would be auto-discovered UNGATED.
+        let manifest = r#"bin = []
+
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest, None),
+            Err(ConsoleError::UnusableBinTable)
+        );
+    }
+
+    #[test]
     fn playground_feature_does_not_invent_a_dep_edge_for_a_required_dependency() {
         // Only an *optional* dependency gets an implicit feature.
         let manifest = r#"[package]
@@ -1545,6 +1682,53 @@ playground = "0.1"
         assert!(
             !out.contains("dep:playground"),
             "a required dependency has no implicit feature to preserve:\n{out}"
+        );
+    }
+
+    // ── path containment ──────────────────────────────────────────────────
+
+    #[test]
+    fn playground_path_inside_the_package_is_accepted() {
+        let tmp = project_with(&["src/main.rs"]);
+        assert!(!playground_path_escapes_package(
+            tmp.path(),
+            PLAYGROUND_REL_PATH
+        ));
+        assert!(!playground_path_escapes_package(
+            tmp.path(),
+            "custom/playground.rs"
+        ));
+    }
+
+    #[test]
+    fn playground_path_climbing_out_of_the_package_is_rejected() {
+        let tmp = project_with(&["src/main.rs"]);
+        assert!(playground_path_escapes_package(
+            tmp.path(),
+            "../tools/playground.rs"
+        ));
+        assert!(playground_path_escapes_package(
+            tmp.path(),
+            "src/../../elsewhere/playground.rs"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn playground_path_through_a_symlinked_ancestor_is_rejected() {
+        // A checked-out `src/bin -> /elsewhere` writes outside the repository
+        // even though the declared path is the perfectly ordinary default.
+        // Only canonicalizing an existing ancestor catches this.
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("app");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join("src/bin")).unwrap();
+
+        assert!(
+            playground_path_escapes_package(&project, PLAYGROUND_REL_PATH),
+            "a symlinked ancestor directory must be treated as an escape"
         );
     }
 
