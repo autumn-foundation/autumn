@@ -105,6 +105,18 @@ comments, key order, and hand-formatted arrays survive and an interrupted run
 cannot truncate the file. Your `autumn-web` dependency line is never touched. A
 second `autumn console` leaves `Cargo.toml` byte-identical.
 
+If you already declare either of these, `autumn console` adapts rather than
+duplicating:
+
+- **An existing `playground` feature** keeps everything it already enables;
+  `autumn-web/seed` is merged in as one extra entry if it isn't there already.
+  (It has to be: the playground imports `autumn_web::seed::SeedContext`.)
+- **An existing `[[bin]] name = "playground"`** is left exactly as written and
+  the playground is scaffolded at *its* path — including when the entry has no
+  `path` key, where Cargo infers `src/bin/playground.rs`. Appending a second
+  target with the same name would make Cargo reject the manifest outright, so
+  the existing one is always reused.
+
 ### Why the feature gate matters
 
 `required-features` keeps the playground **out of your default build**.

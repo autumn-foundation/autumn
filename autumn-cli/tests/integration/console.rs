@@ -181,6 +181,50 @@ fn console_keeps_the_playground_out_of_the_default_build_set() {
     );
 }
 
+/// A project that already declares `[[bin]] name = "playground"` *without* a
+/// `path` (valid — Cargo infers `src/bin/playground.rs`) must survive
+/// `autumn console`. Appending a second same-named target makes cargo reject
+/// the manifest at parse time, which breaks every cargo command in the
+/// project, not merely the playground.
+#[test]
+fn console_does_not_duplicate_a_path_less_playground_bin() {
+    let (_tmp, project) = new_project("console-pathless-app");
+
+    let manifest_path = project.join("Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        format!("{manifest}\n[[bin]]\nname = \"playground\"\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(project.join("src/bin")).unwrap();
+    fs::write(playground_path(&project), "fn main() {}\n").unwrap();
+
+    let cargo_metadata_ok = |stage: &str| {
+        let out = Command::new("cargo")
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .current_dir(&project)
+            .output()
+            .expect("cargo metadata");
+        assert!(
+            out.status.success(),
+            "manifest must parse {stage} `autumn console`:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    cargo_metadata_ok("before");
+    run_autumn_ok(&project, &["console", "--scaffold-only"]);
+    cargo_metadata_ok("after");
+
+    let wired = fs::read_to_string(&manifest_path).unwrap();
+    assert_eq!(
+        wired.matches("name = \"playground\"").count(),
+        1,
+        "the pre-existing target must be recognised, not duplicated:\n{wired}"
+    );
+}
+
 // ── AC3: model/repository APIs are reachable from the playground ───────────
 
 #[test]

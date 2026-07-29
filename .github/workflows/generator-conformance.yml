@@ -172,7 +172,7 @@ jobs:
 
       # ── `autumn console` (#1039) ────────────────────────────────────────
       #
-      # These three are the ONLY machine proof of the console's central
+      # These four are the ONLY machine proof of the console's central
       # acceptance criterion — that the scaffolded playground compiles and
       # runs against the resolved environment with no wiring by hand. They
       # live in the consolidated `cli_tests` binary, whose only other CI

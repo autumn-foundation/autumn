@@ -47,6 +47,14 @@ pub enum ConsoleError {
     UnusableFeaturesTable,
 
     #[error(
+        "Cargo.toml's `[features] playground` is not an array, so \
+         `autumn-web/seed` cannot be added to it; rename that feature or make \
+         it a list and re-run\n\
+         See: docs/guide/console.md"
+    )]
+    UnusablePlaygroundFeature,
+
+    #[error(
         "no package named `{0}` in this workspace; run `cargo metadata --no-deps` \
          to see the available members"
     )]
@@ -256,8 +264,20 @@ pub fn ensure_manifest_wiring(manifest: &str) -> Result<(String, ManifestChanges
     Ok((doc.to_string(), changes))
 }
 
-/// Define `[features] playground = ["autumn-web/seed"]` unless the key is
-/// already present (in which case it is the user's, and we leave it).
+/// Ensure `[features] playground` exists and enables `autumn-web/seed`.
+///
+/// The edge is *merged into* whatever is already there rather than replacing
+/// it, and a `playground` feature that already has the edge is left untouched.
+/// Both halves matter:
+///
+/// * Skipping a pre-existing `playground` feature entirely would scaffold a
+///   playground that cannot compile — the template imports
+///   `autumn_web::seed::SeedContext`, which only exists with `autumn-web`'s
+///   `seed` feature on. `playground = []` is a valid manifest, so this is a
+///   real shape, not a hypothetical one.
+/// * Overwriting it would throw away whatever else the user's feature enables.
+///
+/// Adding one array element does neither.
 fn ensure_playground_feature(doc: &mut toml_edit::DocumentMut) -> Result<bool, ConsoleError> {
     use toml_edit::{Array, Item, Table, Value};
 
@@ -267,13 +287,19 @@ fn ensure_playground_feature(doc: &mut toml_edit::DocumentMut) -> Result<bool, C
     let Some(features) = features.as_table_mut() else {
         return Err(ConsoleError::UnusableFeaturesTable);
     };
-    if features.contains_key(PLAYGROUND_FEATURE) {
+
+    let enables = features
+        .entry(PLAYGROUND_FEATURE)
+        .or_insert_with(|| Item::Value(Value::Array(Array::new())));
+    let Some(enables) = enables.as_array_mut() else {
+        return Err(ConsoleError::UnusablePlaygroundFeature);
+    };
+
+    let edge = format!("autumn-web/{REQUIRED_FEATURE}");
+    if enables.iter().any(|f| f.as_str() == Some(edge.as_str())) {
         return Ok(false);
     }
-
-    let mut enables = Array::new();
-    enables.push(format!("autumn-web/{REQUIRED_FEATURE}"));
-    features.insert(PLAYGROUND_FEATURE, Item::Value(Value::Array(enables)));
+    enables.push(edge.as_str());
     Ok(true)
 }
 
@@ -305,20 +331,34 @@ fn ensure_playground_bin(doc: &mut toml_edit::DocumentMut) -> bool {
     true
 }
 
-/// The `path` of an already-declared `[[bin]] name = "playground"`, if any.
+/// The *effective* path of an already-declared `[[bin]] name = "playground"`,
+/// if the manifest declares one at all.
 ///
-/// A user who moved the playground keeps it there: scaffolding to the default
-/// location while their manifest points elsewhere would write a file Cargo
-/// de-duplicates away, so `autumn console` would report creating one program
-/// and then run a different one.
+/// Two callers depend on this, and both break if it under-reports:
+///
+/// * `ensure_playground_bin` uses it to decide whether a target already
+///   exists. Cargo rejects a manifest with two same-named binaries outright —
+///   `cargo metadata` itself fails, so *every* cargo command in the project
+///   stops working. Missing an existing entry here would brick the project.
+/// * `run` uses it so a user who relocated their playground keeps it there,
+///   rather than us writing a file Cargo de-duplicates away and never runs.
+///
+/// `path` is therefore optional, not required: `[[bin]] name = "playground"`
+/// with no `path` is a perfectly valid declaration for which Cargo infers
+/// `src/bin/playground.rs` — the same location we would have used.
 pub fn declared_playground_path(doc: &toml_edit::DocumentMut) -> Option<String> {
-    doc.get("bin")
+    let entry = doc
+        .get("bin")
         .and_then(toml_edit::Item::as_array_of_tables)?
         .iter()
-        .find(|t| t.get("name").and_then(toml_edit::Item::as_str) == Some(PLAYGROUND_BIN_NAME))?
-        .get("path")
-        .and_then(toml_edit::Item::as_str)
-        .map(str::to_owned)
+        .find(|t| t.get("name").and_then(toml_edit::Item::as_str) == Some(PLAYGROUND_BIN_NAME))?;
+    Some(
+        entry
+            .get("path")
+            .and_then(toml_edit::Item::as_str)
+            .unwrap_or(PLAYGROUND_REL_PATH)
+            .to_owned(),
+    )
 }
 
 /// Whether adding the *first* manual `[[bin]]` to this manifest would turn off
@@ -886,6 +926,109 @@ autumn-web = "0.6.0"
         assert!(
             out.contains("name = \"worker\"") && out.contains("name = \"playground\""),
             "a user's own bin targets must survive alongside ours:\n{out}"
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_merges_seed_into_an_existing_playground_feature() {
+        // `playground = []` is a valid manifest. Leaving it alone would scaffold
+        // a playground that cannot compile: the template imports
+        // `autumn_web::seed::SeedContext`, which needs `autumn-web/seed`.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+playground = []
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        let (out, changes) = ensure_manifest_wiring(manifest).unwrap();
+        assert!(changes.added_feature);
+        assert!(
+            out.contains("\"autumn-web/seed\""),
+            "the seed edge must be merged into an existing playground feature:\n{out}"
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_merge_preserves_a_user_tuned_playground_feature() {
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+playground = ["autumn-web/redis"]
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        let (out, changes) = ensure_manifest_wiring(manifest).unwrap();
+        assert!(changes.added_feature);
+        assert!(
+            out.contains("\"autumn-web/redis\"") && out.contains("\"autumn-web/seed\""),
+            "merging must add the edge without dropping the user's own:\n{out}"
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_errors_on_a_non_array_playground_feature() {
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+
+[features]
+playground = "nonsense"
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest),
+            Err(ConsoleError::UnusablePlaygroundFeature)
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_recognises_a_path_less_playground_bin() {
+        // `[[bin]] name = "playground"` with no `path` is valid — Cargo infers
+        // `src/bin/playground.rs`. Failing to see it and appending a second
+        // entry makes `cargo metadata` reject the manifest outright, which
+        // breaks EVERY cargo command in the project.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "playground"
+
+[dependencies]
+autumn-web = "0.6.0"
+"#;
+        let (out, changes) = ensure_manifest_wiring(manifest).unwrap();
+        assert!(!changes.added_bin, "the existing target must be recognised");
+        assert_eq!(
+            out.matches("name = \"playground\"").count(),
+            1,
+            "a duplicate binary name makes the manifest unparsable to cargo:\n{out}"
+        );
+    }
+
+    #[test]
+    fn declared_playground_path_infers_the_default_for_a_path_less_entry() {
+        let doc = r#"[[bin]]
+name = "playground"
+"#
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+        assert_eq!(
+            declared_playground_path(&doc).as_deref(),
+            Some(PLAYGROUND_REL_PATH),
+            "a path-less entry resolves to the location Cargo infers"
         );
     }
 
