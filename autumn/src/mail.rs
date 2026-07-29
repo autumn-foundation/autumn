@@ -1031,6 +1031,16 @@ pub enum MailError {
     /// stable if those loaders are ever enabled.
     #[error("failed to inline CSS into HTML mail body: {0}")]
     CssInline(String),
+    /// `deliver_later`/`deliver_later_eager` was called in `prod` with a
+    /// non-disabled transport, no durable [`MailDeliveryQueue`] registered, and
+    /// no explicit [`MailConfig::allow_in_process_deliver_later_in_production`]
+    /// opt-in (issue #2142). Enforced lazily at the first deferred send rather
+    /// than at boot, so applications that never call `deliver_later` are
+    /// unaffected.
+    #[error(
+        "mail.deliver_later has no durable backend in prod: register a MailDeliveryQueueHandle on AppState or set mail.allow_in_process_deliver_later_in_production = true to opt into the in-process Tokio fallback"
+    )]
+    NoDurableQueueInProduction,
 }
 
 /// Escape hatch for custom transports.
@@ -1545,6 +1555,12 @@ pub struct Mailer {
     /// Default for CSS inlining of HTML bodies when a message does not set its
     /// own [`Mail::inline_css`] override. Sourced from [`MailConfig::inline_css`].
     inline_css_default: bool,
+    /// Set by `install_mailer` when running in `prod` with a non-disabled
+    /// transport but no durable [`MailDeliveryQueue`] and no explicit
+    /// [`MailConfig::allow_in_process_deliver_later_in_production`] ack
+    /// (issue #2142). Rather than failing app startup for apps that never call
+    /// `deliver_later`, the check is deferred to the first actual call.
+    block_deliver_later_without_durable_queue: bool,
 }
 
 impl Mailer {
@@ -1596,6 +1612,7 @@ impl Mailer {
             unsubscribe: None,
             suppression: None,
             inline_css_default: false,
+            block_deliver_later_without_durable_queue: false,
         }
     }
 
@@ -1887,6 +1904,9 @@ impl Mailer {
         if self.transport.is_disabled() {
             return Ok(());
         }
+        if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
+            return Err(MailError::NoDurableQueueInProduction);
+        }
         let mut mail = mail.with_defaults(&self.defaults);
         // Resolve the CSS-inlining default onto the message once, at the top of
         // the deferred path, so BOTH the durable-queue branch (persisted for a
@@ -1956,6 +1976,9 @@ impl Mailer {
     pub fn try_deliver_later_eager(&self, mail: Mail) -> Result<(), MailError> {
         if self.transport.is_disabled() {
             return Ok(());
+        }
+        if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
+            return Err(MailError::NoDurableQueueInProduction);
         }
         let mut mail = mail.with_defaults(&self.defaults);
         self.freeze_inline_css_default(&mut mail);
@@ -2138,6 +2161,7 @@ impl MailerBuilder {
             unsubscribe: None,
             suppression: None,
             inline_css_default: self.inline_css,
+            block_deliver_later_without_durable_queue: false,
         })
     }
 }
@@ -3354,15 +3378,20 @@ impl MailTransport for InterceptedMailTransport {
 /// Picks up a runtime-installed [`MailDeliveryQueueHandle`] from
 /// [`AppState`] extensions when present, so plugins (Harvest, Redis-backed,
 /// etc.) can register durable delivery before this runs. In `prod` with a
-/// non-`Disabled` transport, startup fails when neither a durable queue nor
-/// [`MailConfig::allow_in_process_deliver_later_in_production`] is set, unless
-/// `enforce_durable_guard` is `false` (used by short-lived contexts like
-/// static-site builds where `deliver_later` semantics don't apply).
+/// non-`Disabled` transport, when neither a durable queue nor
+/// [`MailConfig::allow_in_process_deliver_later_in_production`] is set, startup
+/// still succeeds — apps that never call `deliver_later` should not be crashed
+/// for a code path they don't use (issue #2142). Instead, a startup warning is
+/// logged and the installed [`Mailer`] is marked so that
+/// [`Mailer::try_deliver_later`]/[`Mailer::try_deliver_later_eager`] fail with
+/// [`MailError::NoDurableQueueInProduction`] the first time deferred delivery
+/// is actually attempted. `enforce_durable_guard` set to `false` (used by
+/// short-lived contexts like static-site builds where `deliver_later`
+/// semantics don't apply) skips this check entirely.
 ///
 /// # Errors
 ///
-/// Returns an Autumn error when the configured transport cannot be created or
-/// when the production `deliver_later` guard is not satisfied.
+/// Returns an Autumn error when the configured transport cannot be created.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn install_mailer(
     state: &AppState,
@@ -3398,11 +3427,17 @@ pub(crate) fn install_mailer(
     if enforce_durable_guard && in_production && transport_sends_mail {
         let has_durable_queue = mailer.delivery_queue.is_some();
         if !has_durable_queue && !config.allow_in_process_deliver_later_in_production {
-            return Err(AutumnError::service_unavailable_msg(
-                "mail.deliver_later has no durable backend in prod: register a MailDeliveryQueueHandle on AppState or set mail.allow_in_process_deliver_later_in_production = true to opt into the in-process Tokio fallback",
-            ));
-        }
-        if !has_durable_queue {
+            // Issue #2142: don't hard-fail app boot over an unused code path.
+            // Apps that only call `send()` are never affected; apps that do
+            // call `deliver_later` in this state find out at the call site
+            // (see `Mailer::try_deliver_later`), not by crashing at startup.
+            tracing::warn!(
+                "mail.deliver_later has no durable backend in prod: deliver_later/deliver_later_eager will fail if called; \
+                 register a MailDeliveryQueueHandle on AppState, or set mail.allow_in_process_deliver_later_in_production = true \
+                 to opt into the non-durable in-process Tokio fallback. Apps that only use mail.send() are unaffected."
+            );
+            mailer.block_deliver_later_without_durable_queue = true;
+        } else if !has_durable_queue {
             tracing::warn!(
                 "mail.deliver_later is using the in-process Tokio fallback in prod; this is acknowledged via mail.allow_in_process_deliver_later_in_production but is not durable across restarts or replicas"
             );
@@ -6333,18 +6368,35 @@ mod tests {
     }
 
     #[test]
-    fn install_mailer_rejects_in_process_fallback_in_prod_without_ack() {
+    fn install_mailer_boots_in_prod_without_ack_but_blocks_deliver_later() {
+        // Issue #2142: a missing durable queue + ack must not crash app
+        // startup — only the `deliver_later` call path should fail, and only
+        // if the app actually reaches it.
         let state = crate::AppState::for_test().with_profile("prod");
         let config = sample_smtp_config();
 
-        let error = install_mailer(&state, &config, true)
-            .expect_err("prod must reject in-process deliver_later fallback without ack");
+        install_mailer(&state, &config, true)
+            .expect("missing durable queue/ack must not fail app boot");
 
+        let installed = state
+            .extension::<Mailer>()
+            .expect("install_mailer should store a Mailer extension");
+
+        let error = installed
+            .try_deliver_later(sample_mail())
+            .expect_err("deliver_later without a durable queue or ack must fail lazily in prod");
         let message = error.to_string();
         assert!(
             message.contains("allow_in_process_deliver_later_in_production"),
             "error should explain how to opt in: {message}"
         );
+
+        let error = installed
+            .try_deliver_later_eager(sample_mail())
+            .expect_err("deliver_later_eager must fail the same way");
+        assert!(error
+            .to_string()
+            .contains("allow_in_process_deliver_later_in_production"));
     }
 
     #[test]

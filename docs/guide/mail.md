@@ -343,8 +343,13 @@ imply durable delivery on their own. The framework provides two paths:
 
 ### Production Guard
 
-In `prod`/`production`, Autumn refuses to start with an active mail transport
-and no durable backend unless you explicitly opt in:
+In `prod`/`production`, with an active mail transport and no durable backend
+registered, Autumn does **not** fail to start — apps that never call
+`deliver_later`/`deliver_later_eager` (e.g. only `mailer.send(...)`) are
+unaffected either way. Startup logs a warning, and the guard is enforced lazily
+at the call site instead: the first `deliver_later`/`deliver_later_eager` call
+returns `MailError::NoDurableQueueInProduction` until you either register a
+`MailDeliveryQueueHandle` or explicitly opt in:
 
 ```toml
 [mail]
@@ -352,9 +357,10 @@ transport = "smtp"
 allow_in_process_deliver_later_in_production = true
 ```
 
-Without that flag, startup fails with a clear message asking you to either
-install a `MailDeliveryQueueHandle` or set the flag. The flag is intended as an
-acknowledged single-replica escape hatch, not a recommended production setup.
+The flag is intended as an acknowledged single-replica escape hatch, not a
+recommended production setup — with it set, `deliver_later` falls back to an
+in-process Tokio task instead of failing, but delivery is not durable across
+restarts or replicas.
 
 ### DB-Write + Mail Patterns (Outbox)
 
@@ -393,9 +399,11 @@ build a `Mailer::with_transport(...)`.
 - Add a plain-text fallback for every HTML email.
 - Assert file-transport `.eml` contents in integration tests.
 - Register a `MailDeliveryQueueHandle` (Harvest, DB outbox, Redis, etc.) for
-  durable `deliver_later` retries. Without one, `prod` startup fails unless
+  durable `deliver_later` retries. Without one, calling `deliver_later` in
+  `prod` fails at the call site unless
   `mail.allow_in_process_deliver_later_in_production = true` is set, in which
-  case Autumn falls back to an in-process Tokio task and logs failures.
+  case Autumn falls back to an in-process Tokio task and logs failures. Apps
+  that only use `mailer.send(...)` are unaffected and need neither.
 - For DB-write + mail-orchestration flows, use the [Transactions
   Guide](transactions.md) for the canonical atomic write pattern.
 - Shipping newsletters, digests, or other bulk mail? See
