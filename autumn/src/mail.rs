@@ -1894,8 +1894,11 @@ impl Mailer {
     ///
     /// # Errors
     ///
-    /// Returns an error when no active Tokio runtime is available to host the
-    /// background task.
+    /// Returns [`MailError::NoDurableQueueInProduction`] when this `Mailer` was
+    /// installed in `prod` with no durable [`MailDeliveryQueue`] and no
+    /// [`MailConfig::allow_in_process_deliver_later_in_production`] opt-in (issue
+    /// #2142). Otherwise returns an error when no active Tokio runtime is
+    /// available to host the background task.
     ///
     /// # Panics
     ///
@@ -1972,7 +1975,11 @@ impl Mailer {
     ///
     /// # Errors
     ///
-    /// Returns an error when no active Tokio runtime is available.
+    /// Returns [`MailError::NoDurableQueueInProduction`] when this `Mailer` was
+    /// installed in `prod` with no durable [`MailDeliveryQueue`] and no
+    /// [`MailConfig::allow_in_process_deliver_later_in_production`] opt-in (issue
+    /// #2142). Otherwise returns an error when no active Tokio runtime is
+    /// available.
     pub fn try_deliver_later_eager(&self, mail: Mail) -> Result<(), MailError> {
         if self.transport.is_disabled() {
             return Ok(());
