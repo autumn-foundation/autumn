@@ -105,6 +105,11 @@ comments, key order, and hand-formatted arrays survive and an interrupted run
 cannot truncate the file. Your `autumn-web` dependency line is never touched. A
 second `autumn console` leaves `Cargo.toml` byte-identical.
 
+The playground source is written in two steps — staged next to its destination
+first, moved into place only after `Cargo.toml` has been saved. So a run that
+cannot write the source at all (read-only `src`, full disk) leaves your manifest
+exactly as it was, rather than registering a target with no file behind it.
+
 If you already declare either of these, `autumn console` adapts rather than
 duplicating:
 
