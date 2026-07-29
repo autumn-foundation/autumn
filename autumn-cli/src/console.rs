@@ -542,9 +542,20 @@ fn feature_closure(doc: &toml_edit::DocumentMut, roots: &[&str]) -> Vec<String> 
     seen
 }
 
-/// The package's own features that `name` enables directly. `dep/feat` edges
-/// are skipped: they turn on a dependency's feature, never one of ours, so they
-/// can never satisfy a `required-features` entry.
+/// The package features that `name` enables directly.
+///
+/// The `/` forms are not simply "someone else's features":
+///
+/// * `dep/feat` (**strong**) activates the dependency `dep` as well as its
+///   feature. When `dep` is an optional dependency, that also turns on the
+///   implicit package feature named `dep` — so `default = ["playground/std"]`
+///   really does enable our `playground` gate, and dropping the edge would
+///   hide it. Verified against cargo, which reports
+///   `{'default': ['playground/std'], 'playground': ['dep:playground']}`.
+/// * `dep?/feat` (**weak**) only adds `feat` if `dep` is already active, so it
+///   never activates anything on its own.
+/// * `dep:name` selects an optional dependency without creating a feature of
+///   ours to follow.
 fn enabled_by(features: &toml_edit::Table, name: &str) -> Vec<String> {
     features
         .get(name)
@@ -552,8 +563,14 @@ fn enabled_by(features: &toml_edit::Table, name: &str) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|v| v.as_str())
-        .filter(|edge| !edge.contains('/'))
-        .map(str::to_owned)
+        .filter_map(|edge| match edge.split_once('/') {
+            // Weak: contributes nothing by itself.
+            Some((dep, _)) if dep.ends_with('?') => None,
+            // Strong: activates the implicit feature named after the dependency.
+            Some((dep, _)) => Some(dep.to_owned()),
+            None if edge.starts_with("dep:") => None,
+            None => Some(edge.to_owned()),
+        })
         .collect()
 }
 
@@ -973,18 +990,12 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
     )
     .unwrap_or_else(|e| fail(&e));
 
-    // Write the manifest FIRST. The playground is only ever compiled with
-    // `--features playground`, so a manifest that never landed simply means
-    // `autumn console` cannot build it yet — whereas a playground file written
-    // against a manifest that failed to save is at worst an inert source file
-    // with no target. Manifest-first degrades in the gentler direction.
-    if changes.any() {
-        if let Err(e) = write_atomic(&manifest_path, &updated_manifest) {
-            fail_io(&manifest_path, &e);
-        }
-        report_manifest_edits(changes);
-    }
-
+    // EVERY rejection has to happen before the first byte is written. The
+    // manifest edit used to land here, ahead of the path checks below, so a
+    // project refused for an out-of-package playground was left with a
+    // modified `Cargo.toml` while the error said "nothing has been created".
+    // Resolve and validate the destination first; only then commit anything.
+    //
     // Honour a user-relocated playground: if their manifest already declares
     // the bin somewhere else, scaffold there rather than writing a file Cargo
     // would de-duplicate away and never run.
@@ -1007,6 +1018,18 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
              it. Remove the link first if you want a fresh playground."
         );
         std::process::exit(1);
+    }
+
+    // Validation is complete. Write the manifest before the source file: the
+    // playground only ever compiles with `--features playground`, so a manifest
+    // that never landed just means `autumn console` cannot build it yet,
+    // whereas a source file written against an unsaved manifest is an inert
+    // file with no target. Manifest-first degrades in the gentler direction.
+    if changes.any() {
+        if let Err(e) = write_atomic(&manifest_path, &updated_manifest) {
+            fail_io(&manifest_path, &e);
+        }
+        report_manifest_edits(changes);
     }
 
     let outcome = scaffold_outcome(exists, force);
@@ -1791,6 +1814,74 @@ edition = "2024"
             "the emitted path must resolve to a real file when joined onto the \
              playground's directory as rustc sees it; got {emitted}"
         );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_rejects_a_strong_dependency_feature_edge_to_playground() {
+        // `default = ["playground/std"]` is a STRONG edge: it activates the
+        // optional dependency `playground`, and with it the implicit package
+        // feature of the same name — so the gate is on in every normal build.
+        // Verified against cargo:
+        //   {'default': ['playground/std'], 'playground': ['dep:playground']}
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = "0.6.0"
+playground = { version = "0.1", optional = true }
+
+[features]
+default = ["playground/std"]
+"#;
+        assert_eq!(
+            ensure_manifest_wiring(manifest, None),
+            Err(ConsoleError::PlaygroundFeatureIsDefault(
+                "default".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_allows_a_weak_dependency_feature_edge() {
+        // `playground?/std` is WEAK: it adds `std` only if `playground` is
+        // already active, so it never activates the gate by itself. Treating
+        // both forms alike would refuse a project that is perfectly safe.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = "0.6.0"
+playground = { version = "0.1", optional = true }
+
+[features]
+default = ["playground?/std"]
+"#;
+        assert!(
+            ensure_manifest_wiring(manifest, None).is_ok(),
+            "a weak edge must not be read as activating the gate"
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_wiring_ignores_an_unrelated_strong_edge() {
+        // `autumn-web/mail` names a required dependency, so there is no
+        // implicit `autumn-web` package feature and nothing to follow.
+        let manifest = r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = "0.6.0"
+
+[features]
+default = ["autumn-web/mail"]
+"#;
+        assert!(ensure_manifest_wiring(manifest, None).is_ok());
     }
 
     // ── path containment ──────────────────────────────────────────────────
