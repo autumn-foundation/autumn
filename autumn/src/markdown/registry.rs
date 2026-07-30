@@ -543,6 +543,7 @@ mod tests {
             name: "test_show_doc",
             revalidate: None,
             params_fn: Some(doc_params),
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
 
         let tmp = tempfile::tempdir().unwrap();

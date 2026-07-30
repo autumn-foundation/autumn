@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **seo:** route-level meta tag defaults via a `seo(...)` route attribute
+  argument, closing the acceptance criterion deferred from the SEO toolkit
+  (#1182, deferred from #830). Static per-page metadata no longer has to be
+  rebuilt by hand in every handler: declare it once on the route —
+  `#[get("/about", seo(title = "About • My Blog", description = "Learn about
+  us"))]` — and take a `SeoMeta` parameter, which now implements
+  `FromRequestParts` and arrives pre-populated with the declared values. The
+  extractor is infallible, so a handler on a route that never mentions
+  `seo(...)` simply receives an empty builder; the builder is consuming as
+  before, so a handler refines the defaults with per-request data
+  (`seo.title(format!("{} • Blog", post.title))`) and its value wins for the
+  keys it touches while the untouched attribute keys survive. Every `SeoMeta`
+  builder method has a matching key (`title`, `description`, `canonical`,
+  `og_title`, `og_description`, `og_image`, `og_type`, `og_url`,
+  `twitter_card`, `twitter_title`, `twitter_description`, `twitter_image`,
+  `robots`); a typo'd, repeated, or empty `seo(...)` is a compile error naming
+  the supported set, rather than metadata that silently never renders.
+  `#[static_get]` accepts the same argument, so pre-rendered pages carry the
+  tags too — static generation drives the same router, so no separate wiring
+  was needed. A static route declaring `robots = "noindex"` is now also left
+  out of the generated `sitemap.xml`, so Autumn no longer advertises a URL it
+  derived itself while also asking crawlers not to index it. This covers the
+  paths Autumn derives from `#[static_get]` routes; entries from a
+  `SitemapSource` you register are an explicit, application-authored URL list
+  and are passed through unfiltered (a `SitemapEntry` carries only a `loc`,
+  with nothing tying it back to a route). `#[ws]` is the one route macro
+  that rejects `seo(...)` — a WebSocket upgrade serves no crawlable document —
+  and says so rather than failing with a bare parse error. The
+  declared values are recorded on the new `Route::seo` field as a `Copy`,
+  `&'static str`-backed `SeoRouteDefaults`, and the router installs the request
+  extension only for routes that declared something, so routes without
+  `seo(...)` pay nothing. As before, the attribute supplies *values*, not
+  markup: handlers still decide where to emit them, normally via
+  `SeoMeta::render()` inside a layout. **Breaking for code that constructs
+  `autumn_web::Route { .. }` or `autumn_web::static_gen::StaticRouteMeta { .. }`
+  literally** (plugins building a `Vec<Route>` by hand rather than through
+  `routes![]`): add `seo: autumn_web::seo::SeoRouteDefaults::EMPTY`.
+  `SeoRouteDefaults` is itself `#[non_exhaustive]` and built by chaining its
+  `const fn with_*` setters from `EMPTY`, so future SEO keys stay additive.
 - **cli:** `autumn console` (alias `autumn c`) — a one-command, pre-wired data
   playground (#1039). Autumn's answer to `rails console` / `manage.py shell` /
   `iex -S mix`: because Rust has no stable `eval`, it follows loco.rs's
