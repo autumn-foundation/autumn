@@ -4,7 +4,9 @@ mod support;
 
 mod backfill;
 mod embedding;
+mod extensibility;
 mod memory_backend;
+mod plugin_runtime;
 mod plugin_wiring;
 mod postgres_backend;
 mod reindex;

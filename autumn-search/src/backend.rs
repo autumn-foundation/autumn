@@ -10,8 +10,10 @@
 //! # Adding operations without breaking implementors
 //!
 //! Every query/result struct is `#[non_exhaustive]` with builder methods, and
-//! every non-core trait method has a default implementation that returns
-//! [`SearchError::Unsupported`]. New capabilities are therefore additive.
+//! every trait method beyond the required core has a default implementation —
+//! [`SearchBackend::capabilities`] reports a keyword-only backend, and the
+//! vector methods return [`SearchError::Unsupported`]. New capabilities are
+//! therefore additive.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -127,6 +129,14 @@ impl SearchFilter {
     }
 
     /// Add an exact-match predicate on an indexed field.
+    ///
+    /// `field` must name a field the index declares (or the reserved
+    /// [`TENANT_FILTER_KEY`]). A key that does not is **not** an error here —
+    /// it makes the filter match nothing, in both the in-Rust
+    /// ([`SearchFilter::permits`]) and SQL paths. Backends must never
+    /// interpolate an undeclared key into a query: the value is bound, but a
+    /// key is an identifier position, so an unchecked one would let request
+    /// text terminate the predicate and `OR` away the restrictions before it.
     #[must_use]
     pub fn equals(mut self, field: impl Into<String>, value: impl Into<String>) -> Self {
         self.equals.insert(field.into(), value.into());
@@ -305,6 +315,7 @@ impl VectorQuery {
 /// the app's job (see `SearchClient::search_hydrated`), which keeps the index
 /// from becoming a second, staler copy of the database that can leak columns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SearchHit {
     /// Index the hit came from.
     pub index: String,
@@ -354,6 +365,37 @@ impl Default for BackendCapabilities {
             weighted_fields: false,
             embedding_readback: false,
         }
+    }
+}
+
+impl BackendCapabilities {
+    /// Declare vector / k-NN support.
+    #[must_use]
+    pub const fn with_vector(mut self, supported: bool) -> Self {
+        self.vector = supported;
+        self
+    }
+
+    /// Declare per-field weighting support.
+    #[must_use]
+    pub const fn with_weighted_fields(mut self, supported: bool) -> Self {
+        self.weighted_fields = supported;
+        self
+    }
+
+    /// Declare stored-embedding read-back support (`similar_to`).
+    #[must_use]
+    pub const fn with_embedding_readback(mut self, supported: bool) -> Self {
+        self.embedding_readback = supported;
+        self
+    }
+
+    /// Declare keyword-search support. Backends that cannot answer a keyword
+    /// query at all set this `false`.
+    #[must_use]
+    pub const fn with_keyword(mut self, supported: bool) -> Self {
+        self.keyword = supported;
+        self
     }
 }
 
@@ -426,10 +468,18 @@ pub trait SearchBackend: Send + Sync + 'static {
 
     /// Read back the stored embedding for one record, so "find records like
     /// *this* one" needs no re-embedding.
+    ///
+    /// `filter` is **not** optional: this read is a query like any other, and
+    /// the seed record is caller-supplied. Returning an embedding the caller
+    /// may not see would be a cross-tenant inference channel — the caller
+    /// could rank their *own* probe documents against a record they cannot
+    /// read. Implementations MUST return `None` for a record the filter
+    /// excludes, exactly as if it were not indexed.
     fn embedding<'a>(
         &'a self,
         _definition: &'a IndexDefinition,
         _id: i64,
+        _filter: &'a SearchFilter,
     ) -> BoxFuture<'a, SearchResult<Option<Vec<f32>>>> {
         let name = self.name();
         Box::pin(async move {
@@ -555,6 +605,23 @@ mod tests {
         assert!(!caps.vector);
         assert!(!caps.weighted_fields);
         assert!(!caps.embedding_readback);
+    }
+
+    #[test]
+    fn capabilities_are_declarable_from_outside_this_crate() {
+        // `#[non_exhaustive]` forbids a struct literal downstream, so without
+        // these builders a third-party backend could only ever report the
+        // keyword-only default — it could never advertise vector support.
+        let caps = BackendCapabilities::default()
+            .with_vector(true)
+            .with_weighted_fields(true)
+            .with_embedding_readback(true);
+        assert!(caps.keyword);
+        assert!(caps.vector);
+        assert!(caps.weighted_fields);
+        assert!(caps.embedding_readback);
+
+        assert!(!BackendCapabilities::default().with_keyword(false).keyword);
     }
 
     #[test]

@@ -23,12 +23,11 @@ pub struct Article {
     #[searchable(weight = "B", embed)] pub body: String,
 }
 
-// 2. Keep the index in sync from the record lifecycle.
-#[autumn_web::repository(
-    Article,
-    hooks = SearchSyncHooks<Article, NewArticle, UpdateArticle>,
-    commit_hooks = true,
-)]
+// 2. Keep the index in sync from the record lifecycle. `#[repository]` takes a
+//    plain type NAME for `hooks`, so alias the generic first.
+type ArticleSearchHooks = SearchSyncHooks<Article, NewArticle, UpdateArticle>;
+
+#[autumn_web::repository(Article, hooks = ArticleSearchHooks, commit_hooks = true)]
 pub trait ArticleRepository {}
 
 // 3. Mount the plugin.
@@ -46,6 +45,9 @@ autumn_web::app()
 ## What you get
 
 ```rust
+// The plugin installs the client as an `AppState` extension.
+let search = state.extension::<autumn_search::SearchClient>().expect("SearchPlugin");
+
 // ranked + paginated keyword search, as a `Page`
 let page = search.search::<Article>("rust web framework", &page_req).await?;
 
@@ -100,6 +102,10 @@ batch_size = 500            # rows per backfill batch
 enabled = true              # false ⇒ index writes are no-ops (incident switch)
 embedding_dimensions = 768  # enables the pgvector fast path
 ```
+
+The plugin reads this itself at boot, so `enabled = false` is a config change
+rather than a deploy. Pass `SearchPlugin::config(...)` (or any of the builder
+overrides) to configure it in code instead.
 
 ## Documentation
 

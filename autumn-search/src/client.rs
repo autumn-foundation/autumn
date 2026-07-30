@@ -22,7 +22,7 @@ use autumn_web::authorization::PolicyContext;
 use autumn_web::pagination::{ListQuery, Page, PageRequest};
 use autumn_web::search::{IndexDefinition, SearchDocument, SearchIndexed};
 
-use crate::authz::{SearchVisibility, current_tenant_filter};
+use crate::authz::{SearchVisibility, ambient_tenant_filter};
 use crate::backend::{
     IndexedDocument, KeywordQuery, SearchBackend, SearchFilter, SearchHit, TENANT_FILTER_KEY,
     VectorQuery, empty_page,
@@ -120,6 +120,7 @@ struct ClientInner {
     visibility: Option<Arc<dyn SearchVisibility>>,
     indexes: BTreeMap<String, IndexDefinition>,
     enabled: bool,
+    batch_size: usize,
 }
 
 impl std::fmt::Debug for SearchClient {
@@ -144,6 +145,7 @@ pub struct SearchClientBuilder {
     visibility: Option<Arc<dyn SearchVisibility>>,
     indexes: BTreeMap<String, IndexDefinition>,
     enabled: bool,
+    batch_size: usize,
 }
 
 impl SearchClientBuilder {
@@ -152,6 +154,7 @@ impl SearchClientBuilder {
     pub fn new() -> Self {
         Self {
             enabled: true,
+            batch_size: DEFAULT_BACKFILL_BATCH,
             ..Self::default()
         }
     }
@@ -192,7 +195,14 @@ impl SearchClientBuilder {
         self
     }
 
-    /// Register an index definition directly (for a non-`#[model]` corpus).
+    /// Register an index definition directly, for a corpus that is not a
+    /// `#[model]` — or to adjust a derived one (clearing `tenant_scoped` on a
+    /// model whose `tenant_id` column is not a tenant, say).
+    ///
+    /// A genuinely non-model corpus also needs its own
+    /// [`crate::DocumentSource`]: the shipped Postgres source projects
+    /// `FROM "<index name>"` and expects an `id` column plus a real column per
+    /// indexed field.
     #[must_use]
     pub fn index_definition(mut self, definition: IndexDefinition) -> Self {
         self.indexes.insert(definition.name.to_owned(), definition);
@@ -204,6 +214,18 @@ impl SearchClientBuilder {
     #[must_use]
     pub const fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    /// Default rows per backfill batch, used when a backfill request does not
+    /// name its own. `0` is clamped to the built-in default.
+    #[must_use]
+    pub const fn batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = if batch_size == 0 {
+            DEFAULT_BACKFILL_BATCH
+        } else {
+            batch_size
+        };
         self
     }
 
@@ -221,6 +243,7 @@ impl SearchClientBuilder {
                 visibility: self.visibility,
                 indexes: self.indexes,
                 enabled: self.enabled,
+                batch_size: self.batch_size,
             }),
         }
     }
@@ -243,6 +266,12 @@ impl SearchClient {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.inner.enabled
+    }
+
+    /// Configured default rows per backfill batch (`[search] batch_size`).
+    #[must_use]
+    pub fn default_batch_size(&self) -> usize {
+        self.inner.batch_size
     }
 
     /// Registered index names, sorted.
@@ -413,7 +442,7 @@ impl SearchClient {
             return Ok(empty_page(request));
         }
         let definition = self.definition(M::SEARCH_INDEX)?;
-        let filter = current_tenant_filter().intersect(filter);
+        let filter = ambient_tenant_filter(definition)?.intersect(filter);
         let keyword = KeywordQuery::new(query, *request).filter(filter);
         self.inner
             .backend
@@ -439,6 +468,12 @@ impl SearchClient {
         list: &ListQuery,
         request: &PageRequest,
     ) -> SearchResult<Page<SearchHit>> {
+        // Checked before resolving the index so a disabled client behaves the
+        // same here as in `search` (an empty page), rather than surfacing an
+        // `UnknownIndex` for an index it was never going to query.
+        if !self.inner.enabled {
+            return Ok(empty_page(request));
+        }
         let definition = self.definition(M::SEARCH_INDEX)?;
         let filter = filter_from_list_query(definition, list);
         self.search_filtered::<M>(query, request, filter).await
@@ -464,10 +499,18 @@ impl SearchClient {
     /// Keyword search whose hits are turned back into records by `loader`.
     ///
     /// The loader receives the ranked ids and may return them in any order, or
-    /// omit records it cannot produce (deleted between search and load, or
-    /// filtered by its own authorization). The client re-applies the ranked
-    /// order and drops the gaps, and preserves the pre-hydration
-    /// `total_elements` so the pager stays consistent.
+    /// omit records that vanished between the search and the load. The client
+    /// re-applies the ranked order and drops the gaps.
+    ///
+    /// # The loader is a hydrator, not an authorization boundary
+    ///
+    /// Authorize with [`Self::search_for`] and a registered
+    /// [`SearchVisibility`], which restricts the query itself. Dropping
+    /// records in the loader instead leaves a **count oracle**: the caller
+    /// still learns how many records matched. To blunt that, every record the
+    /// loader omits is also subtracted from `total_elements` — but the totals
+    /// then only approximate the current page, so this is damage limitation,
+    /// not a substitute for filtering the query.
     ///
     /// # Errors
     ///
@@ -503,23 +546,24 @@ impl SearchClient {
         Fut: Future<Output = SearchResult<Vec<M>>> + Send,
     {
         let order: Vec<i64> = hits.content.iter().map(|hit| hit.id).collect();
+        let request = PageRequest::new(hits.page, hits.size);
         let records = loader(order.clone()).await?;
 
+        // Keyed by id, so a loader that returns duplicates cannot produce a
+        // page longer than the ranked set — and the ranked order wins over
+        // whatever order the loader used.
         let mut by_id: BTreeMap<i64, M> = records
             .into_iter()
             .map(|record| (record.search_id(), record))
             .collect();
         let content: Vec<M> = order.iter().filter_map(|id| by_id.remove(id)).collect();
 
-        Ok(Page {
-            content,
-            page: hits.page,
-            size: hits.size,
-            total_elements: hits.total_elements,
-            total_pages: hits.total_pages,
-            has_next: hits.has_next,
-            has_previous: hits.has_previous,
-        })
+        // Subtract what the loader could not produce, so the pager does not
+        // advertise records the caller never received.
+        let dropped = u64::try_from(order.len().saturating_sub(content.len())).unwrap_or(0);
+        let total = i64::try_from(hits.total_elements.saturating_sub(dropped)).unwrap_or(i64::MAX);
+
+        Ok(Page::new(content, total, &request))
     }
 
     // ── Vector queries ──────────────────────────────────────────────────────
@@ -591,24 +635,73 @@ impl SearchClient {
     /// Reads the record's stored embedding rather than re-embedding it, and
     /// excludes the record itself from its own neighbour list.
     ///
+    /// The **seed read is filtered too**. `id` is caller-supplied, so an
+    /// unfiltered read would be an inference channel: the caller could rank
+    /// their own probe documents against a record they are not allowed to see,
+    /// and learn both that it exists and roughly what it says. A seed the
+    /// filter excludes reads back as absent, so the result is an empty
+    /// neighbour list — exactly as if the record were not indexed.
+    ///
     /// # Errors
     ///
-    /// [`SearchError::UnknownIndex`], [`SearchError::VectorUnsupported`], plus
-    /// any backend failure. A record with no stored embedding yields an empty
-    /// neighbour list rather than an error.
+    /// [`SearchError::UnknownIndex`], [`SearchError::VectorUnsupported`],
+    /// [`SearchError::TenantContextMissing`], plus any backend failure. A
+    /// record with no stored embedding yields an empty neighbour list rather
+    /// than an error.
     pub async fn similar_to<M: SearchIndexed>(
         &self,
         id: i64,
         limit: usize,
     ) -> SearchResult<Vec<SearchHit>> {
+        self.similar_to_filtered::<M>(id, limit, SearchFilter::default())
+            .await
+    }
+
+    /// Authorization-aware "more like this".
+    ///
+    /// The registered [`SearchVisibility`] gates **both** the seed read and
+    /// the neighbour query, so this is not a back door around `search_for`.
+    ///
+    /// # Errors
+    ///
+    /// [`SearchError::VisibilityUnavailable`] when no hook is registered, plus
+    /// whatever [`Self::similar_to`] returns.
+    pub async fn similar_to_for<M: SearchIndexed>(
+        &self,
+        ctx: &PolicyContext,
+        id: i64,
+        limit: usize,
+    ) -> SearchResult<Vec<SearchHit>> {
+        let filter = self.visibility_filter(ctx, M::SEARCH_INDEX).await?;
+        self.similar_to_filtered::<M>(id, limit, filter).await
+    }
+
+    /// [`Self::similar_to`] with an explicit filter applied to the seed read
+    /// and the neighbour query alike.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::similar_to`].
+    pub async fn similar_to_filtered<M: SearchIndexed>(
+        &self,
+        id: i64,
+        limit: usize,
+        filter: SearchFilter,
+    ) -> SearchResult<Vec<SearchHit>> {
         if !self.inner.enabled {
             return Ok(Vec::new());
         }
         let definition = self.definition(M::SEARCH_INDEX)?;
-        let Some(vector) = self.inner.backend.embedding(definition, id).await? else {
+        let seed_filter = ambient_tenant_filter(definition)?.intersect(filter.clone());
+        let Some(vector) = self
+            .inner
+            .backend
+            .embedding(definition, id, &seed_filter)
+            .await?
+        else {
             return Ok(Vec::new());
         };
-        self.similar_to_vector::<M>(vector, limit, SearchFilter::default().exclude_ids([id]))
+        self.similar_to_vector::<M>(vector, limit, filter.exclude_ids([id]))
             .await
     }
 
@@ -628,7 +721,7 @@ impl SearchClient {
             return Ok(Vec::new());
         }
         let definition = self.definition(M::SEARCH_INDEX)?;
-        let filter = current_tenant_filter().intersect(filter);
+        let filter = ambient_tenant_filter(definition)?.intersect(filter);
         let query = VectorQuery::new(vector, limit).filter(filter);
         self.inner.backend.vector_search(definition, &query).await
     }
@@ -661,10 +754,13 @@ impl SearchClient {
     /// [`SearchError::UnknownIndex`], [`SearchError::SourceUnavailable`] for
     /// an upsert with no document source, plus any backend failure.
     pub async fn reindex(&self, args: &ReindexArgs) -> SearchResult<()> {
-        let definition = self.definition(&args.index)?;
+        // Checked FIRST: with search disabled, an in-flight job for an index
+        // the app no longer registers must no-op, not fail five times and
+        // dead-letter.
         if !self.inner.enabled {
             return Ok(());
         }
+        let definition = self.definition(&args.index)?;
 
         if args.op == ReindexOp::Delete {
             return self.inner.backend.delete(definition, &[args.id]).await;
@@ -697,6 +793,16 @@ impl SearchClient {
         index: &str,
         options: &BackfillOptions,
     ) -> SearchResult<BackfillReport> {
+        if !self.inner.enabled {
+            // The incident kill switch must stop writes, and a `purge`
+            // backfill is the most destructive write there is.
+            return Ok(BackfillReport {
+                index: index.to_owned(),
+                indexed: 0,
+                batches: 0,
+                purged: false,
+            });
+        }
         let definition = self.definition(index)?;
         let source = self
             .inner
@@ -797,7 +903,7 @@ mod tests {
     ];
 
     fn definition() -> IndexDefinition {
-        IndexDefinition::new("articles", "english", FIELDS, Some("body"))
+        IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
     }
 
     #[test]

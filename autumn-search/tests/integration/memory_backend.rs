@@ -13,7 +13,10 @@ use autumn_search::{
 use autumn_web::pagination::PageRequest;
 use autumn_web::search::SearchIndexed as _;
 
-use super::support::{Article, article, seeded_backend, tenant_article};
+use super::support::{
+    Article, TenantArticle, article, seeded_backend, seeded_tenant_backend, tenant_article,
+    untenanted_article,
+};
 
 fn corpus() -> Vec<Article> {
     vec![
@@ -223,13 +226,13 @@ async fn ensure_index_is_idempotent_and_rejects_an_invalid_definition() {
 
 #[tokio::test]
 async fn a_tenant_filter_never_returns_another_tenants_records() {
-    let backend = seeded_backend(&[
+    let backend = seeded_tenant_backend(&[
         tenant_article(1, "Rust at acme", "internal", "acme"),
         tenant_article(2, "Rust at globex", "internal", "globex"),
-        article(3, "Rust in public", "no tenant"),
+        untenanted_article(3, "Rust in public", "no tenant"),
     ])
     .await;
-    let def = Article::index_definition();
+    let def = TenantArticle::index_definition();
 
     let query =
         KeywordQuery::new("rust", page(1, 10)).filter(SearchFilter::default().tenant("acme"));

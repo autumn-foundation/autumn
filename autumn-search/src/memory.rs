@@ -21,8 +21,8 @@ use autumn_web::pagination::{Page, PageRequest};
 use autumn_web::search::{IndexDefinition, weight_factor};
 
 use crate::backend::{
-    BackendCapabilities, BoxFuture, IndexedDocument, KeywordQuery, SearchBackend, SearchHit,
-    VectorQuery, empty_page,
+    BackendCapabilities, BoxFuture, IndexedDocument, KeywordQuery, SearchBackend, SearchFilter,
+    SearchHit, VectorQuery, empty_page,
 };
 use crate::embedding::cosine_similarity;
 use crate::error::{SearchError, SearchResult};
@@ -49,7 +49,9 @@ impl MemorySearchBackend {
     pub fn document_count(&self, index: &str) -> usize {
         self.indexes
             .read()
-            .map_or(0, |guard| guard.get(index).map_or(0, HashMap::len))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(index)
+            .map_or(0, HashMap::len)
     }
 
     /// Names of every index that has been created.
@@ -58,23 +60,28 @@ impl MemorySearchBackend {
         let mut names: Vec<String> = self
             .indexes
             .read()
-            .map(|guard| guard.keys().cloned().collect())
-            .unwrap_or_default();
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
         names.sort();
         names
     }
 
     /// Run `f` against the (created-on-demand) document map for `definition`.
+    /// Recovers from a poisoned lock rather than propagating, per
+    /// CONTRIBUTING.md's contract: the guarded data is a plain document map
+    /// with no invariant a panicking writer could have left half-applied.
     fn with_index<T>(
         &self,
         definition: &IndexDefinition,
         f: impl FnOnce(&mut HashMap<i64, IndexedDocument>) -> T,
-    ) -> SearchResult<T> {
+    ) -> T {
         let mut guard = self
             .indexes
             .write()
-            .map_err(|_| SearchError::Backend("in-memory index lock poisoned".to_owned()))?;
-        Ok(f(guard.entry(definition.name.to_owned()).or_default()))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(guard.entry(definition.name.to_owned()).or_default())
     }
 
     /// Run `f` against a read view of the documents for `definition`.
@@ -82,12 +89,12 @@ impl MemorySearchBackend {
         &self,
         definition: &IndexDefinition,
         f: impl FnOnce(Option<&HashMap<i64, IndexedDocument>>) -> T,
-    ) -> SearchResult<T> {
+    ) -> T {
         let guard = self
             .indexes
             .read()
-            .map_err(|_| SearchError::Backend("in-memory index lock poisoned".to_owned()))?;
-        Ok(f(guard.get(definition.name)))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(guard.get(definition.name))
     }
 }
 
@@ -128,12 +135,12 @@ fn score(document: &IndexedDocument, tokens: &[String]) -> Option<f32> {
 /// Sort hits into the canonical order: score descending, then id ascending so
 /// ties are stable across calls (and so pagination never skips or repeats).
 fn sort_hits(hits: &mut [SearchHit]) {
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    // `total_cmp`, not `partial_cmp(..).unwrap_or(Equal)`: mapping NaN to
+    // `Equal` yields a non-transitive comparator, and `sort_by` panics on one
+    // ("user-provided comparison function does not correctly implement a total
+    // order"). No in-tree producer emits NaN, but a third-party backend or a
+    // hand-built `SearchHit` can.
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
 }
 
 /// Take the `request`-th page of `hits`, preserving the pre-slice total.
@@ -151,12 +158,10 @@ impl SearchBackend for MemorySearchBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            keyword: true,
-            vector: true,
-            weighted_fields: true,
-            embedding_readback: true,
-        }
+        BackendCapabilities::default()
+            .with_vector(true)
+            .with_weighted_fields(true)
+            .with_embedding_readback(true)
     }
 
     fn ensure_index<'a>(
@@ -167,7 +172,7 @@ impl SearchBackend for MemorySearchBackend {
             definition
                 .validate()
                 .map_err(|e| SearchError::InvalidIndex(e.to_string()))?;
-            self.with_index(definition, |_| ())?;
+            self.with_index(definition, |_| ());
             Ok(())
         })
     }
@@ -187,7 +192,8 @@ impl SearchBackend for MemorySearchBackend {
                     // at-least-once delivery can never duplicate a document.
                     index.insert(document.id(), document.clone());
                 }
-            })
+            });
+            Ok(())
         })
     }
 
@@ -202,12 +208,16 @@ impl SearchBackend for MemorySearchBackend {
                     // Absent ids are a no-op: deletes are replayed.
                     index.remove(id);
                 }
-            })
+            });
+            Ok(())
         })
     }
 
     fn clear<'a>(&'a self, definition: &'a IndexDefinition) -> BoxFuture<'a, SearchResult<()>> {
-        Box::pin(async move { self.with_index(definition, HashMap::clear) })
+        Box::pin(async move {
+            self.with_index(definition, HashMap::clear);
+            Ok(())
+        })
     }
 
     fn keyword_search<'a>(
@@ -236,7 +246,7 @@ impl SearchBackend for MemorySearchBackend {
                     }
                 }
                 hits
-            })?;
+            });
 
             sort_hits(&mut hits);
             Ok(paginate(hits, &query.page))
@@ -264,6 +274,14 @@ impl SearchBackend for MemorySearchBackend {
                     let Some(embedding) = &document.embedding else {
                         continue;
                     };
+                    // Filter FIRST: a document the caller cannot see must not
+                    // influence the outcome at all. Checking the width before
+                    // the filter would let one tenant's differently-sized
+                    // embedding abort every other tenant's vector search, and
+                    // leak that document's width in the error.
+                    if !query.filter.permits(&document.document) {
+                        continue;
+                    }
                     // A width disagreement means the index was built with a
                     // different embedder — scoring it would silently return
                     // garbage, so surface it instead.
@@ -273,9 +291,6 @@ impl SearchBackend for MemorySearchBackend {
                             actual: query.vector.len(),
                         });
                     }
-                    if !query.filter.permits(&document.document) {
-                        continue;
-                    }
                     let score = cosine_similarity(embedding, &query.vector);
                     if query.min_score.is_some_and(|min| score < min) {
                         continue;
@@ -283,7 +298,7 @@ impl SearchBackend for MemorySearchBackend {
                     hits.push(SearchHit::new(definition.name, document.id(), score));
                 }
                 None
-            })?;
+            });
             if let Some(error) = mismatch {
                 return Err(error);
             }
@@ -298,13 +313,18 @@ impl SearchBackend for MemorySearchBackend {
         &'a self,
         definition: &'a IndexDefinition,
         id: i64,
+        filter: &'a SearchFilter,
     ) -> BoxFuture<'a, SearchResult<Option<Vec<f32>>>> {
         Box::pin(async move {
-            self.read_index(definition, |index| {
+            Ok(self.read_index(definition, |index| {
                 index
                     .and_then(|documents| documents.get(&id))
+                    // A record the filter excludes reads back as absent, so a
+                    // "more like this" seed cannot be a record the caller
+                    // cannot see.
+                    .filter(|document| filter.permits(&document.document))
                     .and_then(|document| document.embedding.clone())
-            })
+            }))
         })
     }
 }
@@ -312,8 +332,6 @@ impl SearchBackend for MemorySearchBackend {
 #[cfg(test)]
 mod tests {
     use autumn_web::search::{SearchDocument, SearchIndexField};
-
-    use crate::backend::SearchFilter;
 
     use super::*;
 
@@ -323,7 +341,7 @@ mod tests {
     ];
 
     fn definition() -> IndexDefinition {
-        IndexDefinition::new("articles", "english", FIELDS, Some("body"))
+        IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
     }
 
     fn doc(id: i64, title: &str, body: &str) -> IndexedDocument {
@@ -432,10 +450,48 @@ mod tests {
         backend.ensure_index(&definition).await.expect("ensure");
         assert!(
             backend
-                .embedding(&definition, 42)
+                .embedding(&definition, 42, &SearchFilter::default())
                 .await
                 .expect("read")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_readback_honours_the_filter() {
+        // "Find records like this one" must not become an oracle: reading the
+        // seed record's vector is a query, and a record the filter excludes
+        // must read back as absent.
+        let backend = MemorySearchBackend::new();
+        let definition = definition();
+        backend.ensure_index(&definition).await.expect("ensure");
+        backend
+            .index(
+                &definition,
+                &[IndexedDocument::new(
+                    SearchDocument::new("articles", 1)
+                        .with_field("title", 'A', "secret")
+                        .with_tenant("globex"),
+                )
+                .with_embedding(vec![1.0, 0.0])],
+            )
+            .await
+            .expect("index");
+
+        assert!(
+            backend
+                .embedding(&definition, 1, &SearchFilter::default().tenant("acme"))
+                .await
+                .expect("read")
+                .is_none(),
+            "another tenant's embedding must not be readable"
+        );
+        assert!(
+            backend
+                .embedding(&definition, 1, &SearchFilter::default().tenant("globex"))
+                .await
+                .expect("read")
+                .is_some()
         );
     }
 

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SearchConfig {
     /// Named `#[job]` queue the reindex and backfill jobs are routed to.
     ///
@@ -66,6 +67,7 @@ impl Default for SearchConfig {
 
 /// Why a `[search]` section was rejected.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SearchConfigError {
     /// The TOML did not parse, or `[search]` had an unknown/ill-typed key.
     #[error("invalid [search] configuration: {0}")]
@@ -73,6 +75,26 @@ pub enum SearchConfigError {
 }
 
 impl SearchConfig {
+    /// Read `[search]` from the `autumn.toml` at `path`.
+    ///
+    /// Matches `autumn-media-plugin`'s `MediaConfig::from_autumn_toml`, which
+    /// also takes a **path** — the string-taking form here is
+    /// [`SearchConfig::from_toml_str`], so a caller who passes `"autumn.toml"`
+    /// to the wrong one gets a compile error rather than a TOML parse error
+    /// about the filename.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchConfigError::Invalid`] when the file cannot be read or
+    /// its `[search]` table is malformed.
+    pub fn from_autumn_toml(path: impl AsRef<std::path::Path>) -> Result<Self, SearchConfigError> {
+        let path = path.as_ref();
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            SearchConfigError::Invalid(format!("cannot read {}: {e}", path.display()))
+        })?;
+        Self::from_toml_str(&contents)
+    }
+
     /// Parse the `[search]` table out of an `autumn.toml` document.
     ///
     /// A missing section yields the defaults. An unknown key is an **error**,
@@ -84,7 +106,7 @@ impl SearchConfig {
     /// Returns [`SearchConfigError::Invalid`] when the document does not
     /// parse, when `[search]` has an unknown or ill-typed key, or when a value
     /// is out of range.
-    pub fn from_autumn_toml(contents: &str) -> Result<Self, SearchConfigError> {
+    pub fn from_toml_str(contents: &str) -> Result<Self, SearchConfigError> {
         #[derive(Deserialize)]
         struct Document {
             #[serde(default)]
@@ -145,7 +167,7 @@ mod tests {
     #[test]
     fn a_partial_section_keeps_the_other_defaults() {
         let config =
-            SearchConfig::from_autumn_toml("[search]\nqueue = \"indexing\"\n").expect("parse");
+            SearchConfig::from_toml_str("[search]\nqueue = \"indexing\"\n").expect("parse");
         assert_eq!(config.queue, "indexing");
         assert_eq!(config.batch_size, 500);
         assert!(config.enabled);
@@ -154,30 +176,30 @@ mod tests {
     #[test]
     fn an_unrelated_document_yields_the_defaults() {
         assert_eq!(
-            SearchConfig::from_autumn_toml("[server]\nport = 3000\n").expect("parse"),
+            SearchConfig::from_toml_str("[server]\nport = 3000\n").expect("parse"),
             SearchConfig::default()
         );
         assert_eq!(
-            SearchConfig::from_autumn_toml("").expect("parse"),
+            SearchConfig::from_toml_str("").expect("parse"),
             SearchConfig::default()
         );
     }
 
     #[test]
     fn a_typo_is_an_error_rather_than_a_silent_default() {
-        assert!(SearchConfig::from_autumn_toml("[search]\nqueu = \"x\"\n").is_err());
+        assert!(SearchConfig::from_toml_str("[search]\nqueu = \"x\"\n").is_err());
     }
 
     #[test]
     fn out_of_range_values_are_rejected() {
-        assert!(SearchConfig::from_autumn_toml("[search]\nbatch_size = 0\n").is_err());
-        assert!(SearchConfig::from_autumn_toml("[search]\nqueue = \"\"\n").is_err());
-        assert!(SearchConfig::from_autumn_toml("[search]\nembedding_dimensions = 0\n").is_err());
+        assert!(SearchConfig::from_toml_str("[search]\nbatch_size = 0\n").is_err());
+        assert!(SearchConfig::from_toml_str("[search]\nqueue = \"\"\n").is_err());
+        assert!(SearchConfig::from_toml_str("[search]\nembedding_dimensions = 0\n").is_err());
     }
 
     #[test]
     fn an_ill_typed_value_is_rejected() {
-        assert!(SearchConfig::from_autumn_toml("[search]\nbatch_size = \"lots\"\n").is_err());
+        assert!(SearchConfig::from_toml_str("[search]\nbatch_size = \"lots\"\n").is_err());
     }
 
     #[test]
@@ -190,7 +212,7 @@ mod tests {
         };
         let document = format!("[search]\n{}", toml::to_string(&config).expect("serialize"));
         assert_eq!(
-            SearchConfig::from_autumn_toml(&document).expect("parse"),
+            SearchConfig::from_toml_str(&document).expect("parse"),
             config
         );
     }

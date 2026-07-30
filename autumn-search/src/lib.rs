@@ -25,12 +25,11 @@
 //!     #[searchable(weight = "B", embed)] pub body: String,
 //! }
 //!
-//! // 2. Keep the index in sync from the record lifecycle.
-//! #[autumn_web::repository(
-//!     Article,
-//!     hooks = SearchSyncHooks<Article, NewArticle, UpdateArticle>,
-//!     commit_hooks = true,
-//! )]
+//! // 2. Keep the index in sync from the record lifecycle. `#[repository]`
+//! //    takes a plain type NAME for `hooks`, so alias the generic first.
+//! type ArticleSearchHooks = SearchSyncHooks<Article, NewArticle, UpdateArticle>;
+//!
+//! #[autumn_web::repository(Article, hooks = ArticleSearchHooks, commit_hooks = true)]
 //! pub trait ArticleRepository {}
 //!
 //! // 3. Mount the plugin.
@@ -44,10 +43,14 @@
 //!     .run()
 //!     .await;
 //!
-//! // 4. Query it.
+//! // 4. Query it. The plugin installs the client as an `AppState` extension.
+//! let search = state.extension::<SearchClient>().expect("SearchPlugin installed");
 //! let page = search.search::<Article>("rust web framework", &page_req).await?;
 //! let similar = search.similar::<Article>("how do I add auth?", 5).await?;
 //! ```
+//!
+//! Configuration comes from `[search]` in `autumn.toml`, which the plugin
+//! loads itself unless the app passes `SearchPlugin::config(...)`.
 //!
 //! # How the pieces fit
 //!
@@ -86,6 +89,7 @@
     not(test),
     deny(
         clippy::unwrap_used,
+        clippy::expect_used,
         clippy::panic,
         clippy::unreachable,
         clippy::todo,
@@ -134,4 +138,10 @@ pub use text::{query_tokens, tokenize};
 // on `autumn_web::search` directly.
 pub use autumn_web::search::{
     IndexDefinition, SearchDocument, SearchFieldValue, SearchIndexField, SearchIndexed,
+    SearchTextValue,
 };
+
+// Results are `Page`-shaped and queries are `PageRequest`/`ListQuery`-shaped,
+// so re-export those too rather than making every call site reach into
+// `autumn_web::pagination`.
+pub use autumn_web::pagination::{ListQuery, Page, PageRequest};

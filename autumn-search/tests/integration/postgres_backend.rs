@@ -29,16 +29,26 @@ use diesel_async::pooled_connection::deadpool::Pool;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
-use super::support::{Article, article, tenant_article};
+use super::support::{
+    Article, TenantArticle, article, tenant_article, untenanted_article, with_tenant,
+};
 
-const CREATE_TABLE_SQL: &str = "
-    CREATE TABLE IF NOT EXISTS search_articles (
-        id        BIGSERIAL PRIMARY KEY,
-        title     TEXT NOT NULL,
-        body      TEXT NOT NULL,
-        tenant_id TEXT
-    )
-";
+const CREATE_TABLES_SQL: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS search_articles (
+        id    BIGSERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        body  TEXT NOT NULL
+    )",
+    // The tenant-scoped model's table, plus a `deleted_at` column so the
+    // soft-delete exclusion has something to exclude.
+    "CREATE TABLE IF NOT EXISTS search_tenant_articles (
+        id         BIGSERIAL PRIMARY KEY,
+        title      TEXT NOT NULL,
+        body       TEXT NOT NULL,
+        tenant_id  TEXT,
+        deleted_at TIMESTAMPTZ
+    )",
+];
 
 /// A running Postgres plus a store wired to it.
 struct Fixture {
@@ -65,10 +75,12 @@ impl Fixture {
         let pool = Pool::builder(manager).max_size(4).build().expect("pool");
 
         let mut conn = pool.get().await.expect("conn");
-        diesel::sql_query(CREATE_TABLE_SQL)
-            .execute(&mut conn)
-            .await
-            .expect("create source table");
+        for statement in CREATE_TABLES_SQL {
+            diesel::sql_query(*statement)
+                .execute(&mut conn)
+                .await
+                .expect("create source table");
+        }
         drop(conn);
 
         let store = Arc::new(PostgresSearchStore::new(dimensions));
@@ -77,6 +89,10 @@ impl Fixture {
             .ensure_index(&Article::index_definition())
             .await
             .expect("ensure_index");
+        store
+            .ensure_index(&TenantArticle::index_definition())
+            .await
+            .expect("ensure_index (tenant)");
 
         Self {
             store,
@@ -93,7 +109,23 @@ impl Fixture {
     async fn insert(&self, record: &Article) {
         let mut conn = self.pool.get().await.expect("conn");
         diesel::sql_query(
-            "INSERT INTO search_articles (id, title, body, tenant_id) VALUES ($1, $2, $3, $4) \
+            "INSERT INTO search_articles (id, title, body) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(record.id)
+        .bind::<diesel::sql_types::Text, _>(record.title.clone())
+        .bind::<diesel::sql_types::Text, _>(record.body.clone())
+        .execute(&mut conn)
+        .await
+        .expect("insert source row");
+    }
+
+    /// Insert a row into the tenant-scoped source table.
+    async fn insert_tenant(&self, record: &TenantArticle) {
+        let mut conn = self.pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO search_tenant_articles (id, title, body, tenant_id) \
+             VALUES ($1, $2, $3, $4) \
              ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, \
              tenant_id = EXCLUDED.tenant_id",
         )
@@ -103,7 +135,45 @@ impl Fixture {
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(record.tenant_id.clone())
         .execute(&mut conn)
         .await
-        .expect("insert source row");
+        .expect("insert tenant source row");
+    }
+
+    /// Soft-delete a tenant-scoped source row.
+    async fn soft_delete_tenant(&self, id: i64) {
+        let mut conn = self.pool.get().await.expect("conn");
+        diesel::sql_query("UPDATE search_tenant_articles SET deleted_at = NOW() WHERE id = $1")
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .execute(&mut conn)
+            .await
+            .expect("soft delete");
+    }
+
+    /// Index tenant-scoped documents directly.
+    async fn index_tenant(&self, records: &[TenantArticle]) {
+        let documents: Vec<IndexedDocument> = records
+            .iter()
+            .map(|r| IndexedDocument::new(r.search_document()))
+            .collect();
+        self.store
+            .index(&TenantArticle::index_definition(), &documents)
+            .await
+            .expect("index tenant");
+    }
+
+    /// Keyword search the tenant-scoped index.
+    async fn tenant_search(&self, query: &str, filter: SearchFilter) -> (Vec<i64>, u64) {
+        let page = self
+            .store
+            .keyword_search(
+                &TenantArticle::index_definition(),
+                &KeywordQuery::new(query, PageRequest::default()).filter(filter),
+            )
+            .await
+            .expect("keyword search");
+        (
+            page.content.iter().map(|hit| hit.id).collect(),
+            page.total_elements,
+        )
     }
 
     async fn delete_source(&self, id: i64) {
@@ -149,6 +219,7 @@ impl Fixture {
             .source(Arc::clone(&self.store) as Arc<dyn autumn_search::DocumentSource>)
             .embedder(Arc::new(HashingEmbedder::new(64)))
             .index::<Article>()
+            .index::<TenantArticle>()
             .build()
     }
 }
@@ -356,16 +427,16 @@ async fn clearing_empties_the_index() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_tenant_filter_never_crosses_tenants() {
     let fixture = Fixture::start().await;
-    for record in [
-        tenant_article(1, "Rust at acme", "internal", "acme"),
-        tenant_article(2, "Rust at globex", "internal", "globex"),
-        article(3, "Rust in public", "no tenant"),
-    ] {
-        fixture.index(&[doc(&record)]).await;
-    }
+    fixture
+        .index_tenant(&[
+            tenant_article(1, "Rust at acme", "internal", "acme"),
+            tenant_article(2, "Rust at globex", "internal", "globex"),
+            untenanted_article(3, "Rust in public", "no tenant"),
+        ])
+        .await;
 
     let (ids, total) = fixture
-        .search_filtered("rust", SearchFilter::default().tenant("acme"))
+        .tenant_search("rust", SearchFilter::default().tenant("acme"))
         .await;
     assert_eq!(ids, vec![1]);
     assert_eq!(total, 1, "the total must reflect the filtered set");
@@ -376,11 +447,11 @@ async fn a_tenant_filter_never_crosses_tenants() {
 async fn a_tenant_value_containing_sql_is_bound_not_interpolated() {
     let fixture = Fixture::start().await;
     fixture
-        .index(&[doc(&tenant_article(1, "Rust", "x", "acme"))])
+        .index_tenant(&[tenant_article(1, "Rust", "x", "acme")])
         .await;
 
     let (ids, _) = fixture
-        .search_filtered(
+        .tenant_search(
             "rust",
             SearchFilter::default().tenant("acme'; DROP TABLE autumn_search_documents; --"),
         )
@@ -389,7 +460,7 @@ async fn a_tenant_value_containing_sql_is_bound_not_interpolated() {
 
     // The index table survived, so the value was bound rather than executed.
     let (ids, _) = fixture
-        .search_filtered("rust", SearchFilter::default().tenant("acme"))
+        .tenant_search("rust", SearchFilter::default().tenant("acme"))
         .await;
     assert_eq!(ids, vec![1]);
 }
@@ -540,14 +611,14 @@ async fn an_embedding_round_trips_through_the_index() {
 
     let stored = fixture
         .store
-        .embedding(&Fixture::definition(), 1)
+        .embedding(&Fixture::definition(), 1, &SearchFilter::default())
         .await
         .expect("read back");
     assert_eq!(stored, Some(vec![0.5, -0.25, 0.75]));
     assert_eq!(
         fixture
             .store
-            .embedding(&Fixture::definition(), 99)
+            .embedding(&Fixture::definition(), 99, &SearchFilter::default())
             .await
             .expect("read back"),
         None
@@ -561,12 +632,12 @@ async fn an_embedding_round_trips_through_the_index() {
 async fn the_document_source_projects_a_model_table_generically() {
     let fixture = Fixture::start().await;
     fixture
-        .insert(&tenant_article(1, "Rust", "a rust web framework", "acme"))
+        .insert_tenant(&tenant_article(1, "Rust", "a rust web framework", "acme"))
         .await;
 
     let documents = fixture
         .store
-        .fetch(&Fixture::definition(), &[1])
+        .fetch(&TenantArticle::index_definition(), &[1])
         .await
         .expect("fetch");
 
@@ -790,24 +861,136 @@ async fn a_search_never_returns_a_record_the_visibility_filter_excluded() {
         tenant_article(1, "Rust at acme", "a rust framework", "acme"),
         tenant_article(2, "Rust at globex", "a rust framework", "globex"),
     ] {
-        fixture.insert(&record).await;
+        fixture.insert_tenant(&record).await;
     }
     client
-        .backfill("search_articles", &BackfillOptions::default())
+        .backfill("search_tenant_articles", &BackfillOptions::default())
         .await
         .expect("backfill");
 
-    let page = client
-        .search_filtered::<Article>(
-            "rust",
-            &PageRequest::default(),
-            SearchFilter::default().tenant("acme"),
-        )
-        .await
-        .expect("search");
+    // No filter argument: the ambient tenant alone confines the query, and the
+    // total is computed after the restriction.
+    let page = with_tenant("acme", async {
+        client
+            .search::<TenantArticle>("rust", &PageRequest::default())
+            .await
+    })
+    .await
+    .expect("search");
     assert_eq!(
         page.content.iter().map(|h| h.id).collect::<Vec<_>>(),
         vec![1]
     );
     assert_eq!(page.total_elements, 1);
+
+    // And an unscoped query is refused outright rather than run across both.
+    let error = client
+        .search::<TenantArticle>("rust", &PageRequest::default())
+        .await
+        .expect_err("an unscoped query on a tenant-scoped index must be refused");
+    assert!(
+        matches!(
+            error,
+            autumn_search::SearchError::TenantContextMissing { .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_soft_deleted_row_is_not_put_back_by_a_backfill() {
+    // `after_delete_commit` removes the document; without a `deleted_at`
+    // exclusion in the source projection, the next backfill would put it
+    // straight back — searchable while `find` hides it.
+    let fixture = Fixture::start().await;
+    let client = fixture.client();
+
+    fixture
+        .insert_tenant(&tenant_article(1, "Rust one", "a rust framework", "acme"))
+        .await;
+    fixture
+        .insert_tenant(&tenant_article(2, "Rust two", "a rust framework", "acme"))
+        .await;
+    client
+        .backfill("search_tenant_articles", &BackfillOptions::default())
+        .await
+        .expect("backfill");
+    assert_eq!(
+        fixture
+            .tenant_search("rust", SearchFilter::default())
+            .await
+            .0,
+        vec![1, 2]
+    );
+
+    fixture.soft_delete_tenant(2).await;
+    client
+        .backfill(
+            "search_tenant_articles",
+            &BackfillOptions::default().purge(true),
+        )
+        .await
+        .expect("backfill after soft delete");
+    assert_eq!(
+        fixture
+            .tenant_search("rust", SearchFilter::default())
+            .await
+            .0,
+        vec![1],
+        "a soft-deleted row must not be re-indexed"
+    );
+
+    // A targeted reindex of the soft-deleted row removes it rather than
+    // restoring it: the source no longer produces the row, so the reindex
+    // converges to "absent".
+    fixture
+        .index_tenant(&[tenant_article(2, "Rust two", "a rust framework", "acme")])
+        .await;
+    client
+        .reindex(&ReindexArgs::upsert("search_tenant_articles", 2))
+        .await
+        .expect("reindex");
+    assert_eq!(
+        fixture
+            .tenant_search("rust", SearchFilter::default())
+            .await
+            .0,
+        vec![1]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_undeclared_filter_key_cannot_widen_the_query() {
+    // A request-supplied facet key sits in an IDENTIFIER position. Unchecked,
+    // `title' = 'x' OR '1'='1` would close the quote and OR away the tenant
+    // restriction that precedes it.
+    let fixture = Fixture::start().await;
+    fixture
+        .index_tenant(&[
+            tenant_article(1, "Rust at acme", "internal", "acme"),
+            tenant_article(2, "Rust at globex", "internal", "globex"),
+        ])
+        .await;
+
+    let (ids, total) = fixture
+        .tenant_search(
+            "rust",
+            SearchFilter::default()
+                .tenant("acme")
+                .equals("title' = 'x' OR '1'='1", "boom"),
+        )
+        .await;
+    assert!(
+        ids.is_empty(),
+        "an undeclared key must match nothing, not widen: {ids:?}"
+    );
+    assert_eq!(total, 0);
+
+    // The index is intact and the tenant restriction still holds.
+    let (ids, _) = fixture
+        .tenant_search("rust", SearchFilter::default().tenant("acme"))
+        .await;
+    assert_eq!(ids, vec![1]);
 }

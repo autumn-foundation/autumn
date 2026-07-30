@@ -2050,6 +2050,31 @@ struct FieldSearchableConfig {
     embed: bool,
 }
 
+/// Whether `ty` is `String` or `Option<String>` — the shape the tenancy path
+/// assumes for a `tenant_id` column.
+fn is_string_or_option_string(ty: &syn::Type) -> bool {
+    fn is_string(ty: &syn::Type) -> bool {
+        matches!(ty, syn::Type::Path(tp) if tp.path.segments.last()
+            .is_some_and(|s| s.ident == "String"))
+    }
+    if is_string(ty) {
+        return true;
+    }
+    let syn::Type::Path(tp) = ty else {
+        return false;
+    };
+    let Some(segment) = tp.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Option" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    matches!(args.args.first(), Some(syn::GenericArgument::Type(inner)) if is_string(inner))
+}
+
 /// Parse the full field-level `#[searchable(weight = "...", embed)]` config.
 fn parse_field_searchable(field: &syn::Field) -> syn::Result<FieldSearchableConfig> {
     for attr in &field.attrs {
@@ -3706,11 +3731,21 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
             );
             // A model with a `tenant_id` column carries its tenant into the
-            // document so every backend can fail closed on cross-tenant reads.
-            let tenant_extract = if all_fields
-                .iter()
-                .any(|f| f.ident.as_ref().is_some_and(|i| i == "tenant_id"))
-            {
+            // document so every backend can fail closed on cross-tenant reads,
+            // and marks the index tenant-scoped so a query with no tenant
+            // context is refused rather than silently run across tenants
+            // (matching `#[repository(tenant_scoped)]`, which errors).
+            // Keyed on the name AND the type. An unrelated `tenant_id: i64`
+            // would otherwise stamp `tenant_id = "42"` on every document and
+            // make every real-tenant search return nothing; a `tenant_id` of
+            // some other type would fail to compile INSIDE generated code,
+            // pointing at a trait the user never mentioned. The rest of the
+            // macro's tenancy path already assumes `String`/`Option<String>`.
+            let is_tenant_scoped = all_fields.iter().any(|f| {
+                f.ident.as_ref().is_some_and(|i| i == "tenant_id")
+                    && is_string_or_option_string(&f.ty)
+            });
+            let tenant_extract = if is_tenant_scoped {
                 quote! {
                     let __autumn_tenant =
                         ::autumn_web::search::SearchTextValue::search_text_value(&self.tenant_id);
@@ -3740,6 +3775,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #search_language,
                             __AUTUMN_SEARCH_INDEX_FIELDS,
                             #embed_const,
+                            #is_tenant_scoped,
                         )
                     }
 
@@ -6897,6 +6933,43 @@ mod tests {
     }
 
     // ── #1191: `#[searchable(embed)]` parsing ───────────────────────────────
+
+    #[test]
+    fn tenant_id_detection_requires_a_string_shaped_column() {
+        assert!(is_string_or_option_string(&syn::parse_quote!(String)));
+        assert!(is_string_or_option_string(&syn::parse_quote!(
+            Option<String>
+        )));
+        assert!(is_string_or_option_string(&syn::parse_quote!(
+            ::std::option::Option<::std::string::String>
+        )));
+        // An unrelated `tenant_id: i64` must NOT make the index tenant-scoped.
+        assert!(!is_string_or_option_string(&syn::parse_quote!(i64)));
+        assert!(!is_string_or_option_string(&syn::parse_quote!(Option<i64>)));
+        assert!(!is_string_or_option_string(&syn::parse_quote!(Uuid)));
+    }
+
+    #[test]
+    fn a_non_string_tenant_id_column_does_not_make_the_index_tenant_scoped() {
+        let input: TokenStream = quote! {
+            #[searchable]
+            pub struct Reading {
+                #[id]
+                pub id: i64,
+                #[searchable]
+                pub label: String,
+                // A sensor reading's "tenant_id" that is really a device id.
+                pub tenant_id: i64,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(expanded.contains("SearchIndexed for Reading"), "{expanded}");
+        // The tenant extraction (and the tenant_scoped flag) must be absent.
+        assert!(
+            !expanded.contains("__autumn_tenant"),
+            "a non-String tenant_id must not be extracted: {expanded}"
+        );
+    }
 
     #[test]
     fn searchable_embed_flag_is_parsed_alongside_the_weight() {

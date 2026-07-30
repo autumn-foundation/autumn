@@ -58,8 +58,23 @@ Rules the macro enforces at compile time:
 A `#[searchable]` model whose primary key is not `i64` keeps its #842 behaviour
 and simply has no plugin index — search indexes key on `i64`.
 
-A `tenant_id` column is picked up automatically and carried into every
-document, so tenant isolation does not depend on remembering to configure it.
+A `tenant_id` column of type `String` / `Option<String>` is picked up
+automatically: its value is carried into every document, and the index is
+marked **tenant-scoped**. Querying a tenant-scoped index with no tenant in
+scope is then `SearchError::TenantContextMissing`, not a search across every
+tenant — the same posture `#[repository(tenant_scoped)]` takes, and it is what
+protects the paths that are easy to forget (a route mounted outside the tenancy
+layer, a `#[job]`, a background task).
+
+A model with no `tenant_id` column is unaffected and needs no tenant scope. If
+a model has a `tenant_id` column that is *not* a tenant (a device id, say),
+register a definition with the flag cleared:
+
+```rust
+let mut definition = Reading::index_definition();
+definition.tenant_scoped = false;
+SearchPlugin::new().index_definition(definition)
+```
 
 ---
 
@@ -68,11 +83,11 @@ document, so tenant isolation does not depend on remembering to configure it.
 ```rust
 use autumn_search::SearchSyncHooks;
 
-#[autumn_web::repository(
-    Article,
-    hooks = SearchSyncHooks<Article, NewArticle, UpdateArticle>,
-    commit_hooks = true,
-)]
+// `#[repository]`'s `hooks =` takes a plain type NAME, not a generic type
+// expression, so alias the generic first.
+type ArticleSearchHooks = SearchSyncHooks<Article, NewArticle, UpdateArticle>;
+
+#[autumn_web::repository(Article, hooks = ArticleSearchHooks, commit_hooks = true)]
 pub trait ArticleRepository {}
 ```
 
@@ -135,8 +150,11 @@ enabled = true              # false ⇒ index writes are no-ops, queries empty
 embedding_dimensions = 768  # declared width; enables the pgvector fast path
 ```
 
-`enabled = false` is the incident switch: turning search off must not require a
-deploy, and must not start failing writes to the model.
+The plugin reads `autumn.toml` itself at boot, so `enabled = false` is the
+incident switch it claims to be: a config change, not a deploy — and it stops
+index writes (including a purging backfill) without failing writes to the
+model. Pass `SearchPlugin::config(...)` to configure in code instead; doing so
+also stops the file being read.
 
 An unknown key under `[search]` is an **error**, not a warning — a typo'd
 `queu = "indexing"` would otherwise silently leave indexing on the default
@@ -145,6 +163,15 @@ queue with no signal at all.
 ---
 
 ## 4. Query it
+
+The plugin installs the client as an `AppState` extension, so a handler reaches
+it the same way it reaches a `BlobStore`:
+
+```rust
+let search = state
+    .extension::<autumn_search::SearchClient>()
+    .expect("SearchPlugin is installed");
+```
 
 ```rust
 // Ranked + paginated keyword search, as an ordinary `Page`.
@@ -155,6 +182,8 @@ let page: Page<SearchHit> = search.search::<Article>("rust web", &page_req).awai
 let page = search.search_list::<Article>("rust web", &list, &page_req).await?;
 
 // Turn hits back into records; ranked order is re-applied for you.
+// The loader returns `SearchResult<Vec<Article>>`; an `AutumnError` from a
+// repository call converts with `?`, so this is the whole loader.
 let page: Page<Article> = search
     .search_hydrated::<Article, _, _>("rust web", &page_req, |ids| async move {
         Ok(repo.find_all(&ids).await?)
@@ -242,7 +271,10 @@ Four properties make this enforceable rather than advisory:
 
 Because a `SearchFilter` is plain data, an out-of-scope engine (Meilisearch, a
 vector store) receives the same tenant/visibility restriction. The ambient
-tenant from `CURRENT_TENANT` is intersected into **every** query automatically.
+tenant from `CURRENT_TENANT` is intersected into **every** query automatically,
+and `similar_to` filters the *seed* read as well as the neighbour query — an
+unfiltered seed read would be an inference channel, letting a caller rank their
+own probe documents against a record they cannot see.
 
 ---
 
@@ -362,7 +394,7 @@ while indexing and errors on a semantic query.
 | Variant | Status | Meaning |
 |---|---|---|
 | `VectorUnsupported`, `DimensionMismatch` | 400 | the caller asked for something this index cannot answer |
-| `UnknownIndex`, `EmbedderUnavailable`, `VisibilityUnavailable`, `SourceUnavailable`, `InvalidIndex`, `Unsupported`, `Embedding`, `Backend` | 500 | a configuration gap or a genuine failure |
+| `UnknownIndex`, `EmbedderUnavailable`, `VisibilityUnavailable`, `SourceUnavailable`, `TenantContextMissing`, `InvalidIndex`, `Unsupported`, `Embedding`, `Backend` | 500 | a configuration gap or a genuine failure |
 
 Every message names the builder call that fixes it.
 

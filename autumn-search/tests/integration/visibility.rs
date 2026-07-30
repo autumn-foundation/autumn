@@ -23,7 +23,9 @@ use autumn_search::{
 use autumn_web::authorization::PolicyContext;
 use autumn_web::pagination::PageRequest;
 
-use super::support::{Article, article, policy_context, tenant_article};
+use super::support::{
+    Article, TenantArticle, article, policy_context, tenant_article, with_tenant,
+};
 
 async fn client_with(
     articles: &[Article],
@@ -33,6 +35,25 @@ async fn client_with(
         .backend(Arc::new(MemorySearchBackend::new()))
         .embedder(Arc::new(HashingEmbedder::new(64)))
         .index::<Article>();
+    if let Some(v) = visibility {
+        builder = builder.visibility(v);
+    }
+    let client = builder.build();
+    client.ensure_indexes().await.expect("ensure");
+    for a in articles {
+        client.index_record(a).await.expect("index");
+    }
+    client
+}
+
+async fn tenant_client_with(
+    articles: &[TenantArticle],
+    visibility: Option<Arc<dyn SearchVisibility>>,
+) -> SearchClient {
+    let mut builder = SearchClient::builder()
+        .backend(Arc::new(MemorySearchBackend::new()))
+        .embedder(Arc::new(HashingEmbedder::new(64)))
+        .index::<TenantArticle>();
     if let Some(v) = visibility {
         builder = builder.visibility(v);
     }
@@ -155,8 +176,28 @@ async fn vector_search_goes_through_the_same_visibility_hook() {
 }
 
 #[tokio::test]
-async fn the_default_visibility_is_tenant_isolation() {
-    let client = client_with(
+async fn the_default_visibility_reads_the_ambient_tenant() {
+    // Outside a tenant scope there is nothing to scope by …
+    let filter = TenantVisibility
+        .filter(&anonymous_ctx().await, "search_tenant_articles")
+        .await
+        .expect("filter");
+    assert_eq!(filter.tenant_id, None);
+
+    // … and inside one, the hook restricts to it with no app code.
+    let filter = with_tenant("acme", async {
+        TenantVisibility
+            .filter(&anonymous_ctx().await, "search_tenant_articles")
+            .await
+    })
+    .await
+    .expect("filter");
+    assert_eq!(filter.tenant_id.as_deref(), Some("acme"));
+}
+
+#[tokio::test]
+async fn a_tenant_scoped_search_never_crosses_tenants() {
+    let client = tenant_client_with(
         &[
             tenant_article(1, "Rust at acme", "rust", "acme"),
             tenant_article(2, "Rust at globex", "rust", "globex"),
@@ -165,26 +206,54 @@ async fn the_default_visibility_is_tenant_isolation() {
     )
     .await;
 
-    let filter = TenantVisibility
-        .filter(&anonymous_ctx().await, "search_articles")
-        .await
-        .expect("filter");
-    // With no ambient tenant there is nothing to scope by; the plugin's own
-    // tenant filter is additive to whatever the app supplies.
-    assert_eq!(filter.tenant_id, None);
-
-    let page = client
-        .search_filtered::<Article>(
-            "rust",
-            &PageRequest::default(),
-            SearchFilter::default().tenant("globex"),
-        )
-        .await
-        .expect("search");
+    let page = with_tenant("globex", async {
+        client
+            .search_for::<TenantArticle>(&anonymous_ctx().await, "rust", &PageRequest::default())
+            .await
+    })
+    .await
+    .expect("search");
     assert_eq!(
         page.content.iter().map(|h| h.id).collect::<Vec<_>>(),
         vec![2]
     );
+}
+
+#[tokio::test]
+async fn deny_all_is_actually_consulted_and_returns_nothing() {
+    let client = client_with(&corpus(), Some(Arc::new(autumn_search::DenyAll))).await;
+
+    let page = client
+        .search_for::<Article>(&ctx_for("alice").await, "rust", &PageRequest::default())
+        .await
+        .expect("search");
+    assert!(page.content.is_empty(), "DenyAll must match nothing");
+    assert_eq!(page.total_elements, 0);
+}
+
+#[tokio::test]
+async fn similar_to_will_not_read_a_seed_the_hook_excluded() {
+    // "More like this" reads the seed record's stored vector. Left unfiltered
+    // that is an inference channel: rank your own probe documents against a
+    // record you cannot see and learn roughly what it says.
+    let client = client_with(&corpus(), Some(Arc::new(OwnerVisibility))).await;
+
+    // Alice may see record 1 only, so seeding from record 2 yields nothing.
+    let hits = client
+        .similar_to_for::<Article>(&ctx_for("alice").await, 2, 5)
+        .await
+        .expect("similar_to_for");
+    assert!(
+        hits.is_empty(),
+        "the excluded seed must read back as absent"
+    );
+
+    // Her own record is a usable seed (and is excluded from its own results).
+    let hits = client
+        .similar_to_for::<Article>(&ctx_for("alice").await, 1, 5)
+        .await
+        .expect("similar_to_for");
+    assert!(hits.iter().all(|h| h.id != 1), "{hits:?}");
 }
 
 #[tokio::test]

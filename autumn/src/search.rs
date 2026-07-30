@@ -85,6 +85,7 @@ pub const fn weight_factor(weight: char) -> f32 {
 /// even though they originate from developer-written attributes rather than
 /// request input.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InvalidIndexDefinition {
     /// Human-readable explanation.
     pub message: String,
@@ -159,6 +160,13 @@ pub struct IndexDefinition {
     /// Field whose value is embedded for vector search
     /// (`#[searchable(embed)]`), if any.
     pub embed_field: Option<&'static str>,
+    /// Whether the model carries a `tenant_id` column.
+    ///
+    /// Set by `#[model]` from the struct's own fields. A consumer **must**
+    /// fail closed on a tenant-scoped index queried with no tenant context —
+    /// the same posture `#[repository(tenant_scoped)]` takes, where a missing
+    /// tenant is an error rather than an unscoped read.
+    pub tenant_scoped: bool,
 }
 
 impl IndexDefinition {
@@ -169,12 +177,14 @@ impl IndexDefinition {
         language: &'static str,
         fields: &'static [SearchIndexField],
         embed_field: Option<&'static str>,
+        tenant_scoped: bool,
     ) -> Self {
         Self {
             name,
             language,
             fields: Cow::Borrowed(fields),
             embed_field,
+            tenant_scoped,
         }
     }
 
@@ -189,6 +199,30 @@ impl IndexDefinition {
     /// Field names in declaration order.
     pub fn field_names(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.fields.iter().map(|f| f.name)
+    }
+
+    /// Whether `field` is one of this index's declared fields.
+    ///
+    /// The allowlist every backend must consult before interpolating a field
+    /// name into a query: a `SearchFilter` predicate keyed on anything else is
+    /// caller-supplied text and must never reach SQL.
+    #[must_use]
+    pub fn has_field(&self, field: &str) -> bool {
+        self.fields.iter().any(|f| f.name == field)
+    }
+
+    /// The declared weight class for `field`, if it is indexed.
+    ///
+    /// Backends rank with **this** weight rather than the one on an incoming
+    /// document, so a hand-built or third-party
+    /// [`SearchDocument`](crate::search::SearchDocument) cannot smuggle an
+    /// out-of-range weight into a query.
+    #[must_use]
+    pub fn weight_of(&self, field: &str) -> Option<char> {
+        self.fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.weight)
     }
 
     /// Validate every identifier a backend may interpolate into a query, plus
@@ -248,6 +282,7 @@ impl IndexDefinition {
 
 /// One extracted field value of a [`SearchDocument`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct SearchFieldValue {
     /// Column / attribute name.
     pub name: &'static str,
@@ -470,7 +505,7 @@ mod tests {
     ];
 
     fn def() -> IndexDefinition {
-        IndexDefinition::new("articles", "english", FIELDS, Some("body"))
+        IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
     }
 
     #[test]
@@ -536,6 +571,29 @@ mod tests {
         let mut d = def();
         d.embed_field = Some("nope");
         assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn has_field_is_the_allowlist_backends_consult() {
+        let d = def();
+        assert!(d.has_field("title"));
+        assert!(d.has_field("body"));
+        assert!(!d.has_field("tenant_id"), "not a declared searchable field");
+        assert!(!d.has_field("title' = 'x' OR '1'='1"));
+    }
+
+    #[test]
+    fn weight_of_returns_the_declared_weight_not_a_documents_claim() {
+        let d = def();
+        assert_eq!(d.weight_of("title"), Some('A'));
+        assert_eq!(d.weight_of("body"), Some('B'));
+        assert_eq!(d.weight_of("missing"), None);
+    }
+
+    #[test]
+    fn tenant_scoped_is_carried_so_consumers_can_fail_closed() {
+        assert!(!def().tenant_scoped);
+        assert!(IndexDefinition::new("articles", "english", FIELDS, None, true).tenant_scoped);
     }
 
     #[test]

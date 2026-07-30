@@ -16,7 +16,7 @@ use std::sync::RwLock;
 use autumn_web::search::{IndexDefinition, SearchDocument, SearchIndexed};
 
 use crate::backend::BoxFuture;
-use crate::error::{SearchError, SearchResult};
+use crate::error::SearchResult;
 
 /// Reads records out of the system of record and extracts them into
 /// [`SearchDocument`]s.
@@ -65,24 +65,27 @@ impl MemoryDocumentSource {
 
     /// Insert or replace `record`'s document.
     pub fn upsert<M: SearchIndexed>(&self, record: &M) {
-        let document = record.search_document();
-        if let Ok(mut guard) = self.documents.write() {
-            guard.insert((document.index.to_owned(), document.id), document);
-        }
+        self.upsert_document(record.search_document());
     }
 
     /// Insert or replace an already-extracted document.
     pub fn upsert_document(&self, document: SearchDocument) {
-        if let Ok(mut guard) = self.documents.write() {
-            guard.insert((document.index.to_owned(), document.id), document);
-        }
+        // `PoisonError::into_inner` rather than `if let Ok(...)`: swallowing a
+        // poisoned lock would make every subsequent write a silent no-op that
+        // still looks like a success.
+        let mut guard = self
+            .documents
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert((document.index.to_owned(), document.id), document);
     }
 
     /// Remove a record from every index in this source.
     pub fn remove(&self, id: i64) {
-        if let Ok(mut guard) = self.documents.write() {
-            guard.retain(|(_, key), _| *key != id);
-        }
+        self.documents
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(_, key), _| *key != id);
     }
 
     /// How many times `id` has been fetched.
@@ -90,14 +93,19 @@ impl MemoryDocumentSource {
     pub fn fetch_calls_for(&self, id: i64) -> usize {
         self.fetches
             .read()
-            .map_or(0, |guard| guard.get(&id).copied().unwrap_or(0))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn record_fetch(&self, ids: &[i64]) {
-        if let Ok(mut guard) = self.fetches.write() {
-            for id in ids {
-                *guard.entry(*id).or_insert(0) += 1;
-            }
+        let mut guard = self
+            .fetches
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for id in ids {
+            *guard.entry(*id).or_insert(0) += 1;
         }
     }
 }
@@ -113,7 +121,7 @@ impl DocumentSource for MemoryDocumentSource {
             let guard = self
                 .documents
                 .read()
-                .map_err(|_| SearchError::Backend("document source lock poisoned".to_owned()))?;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Ok(ids
                 .iter()
                 .filter_map(|id| guard.get(&(definition.name.to_owned(), *id)).cloned())
@@ -131,7 +139,7 @@ impl DocumentSource for MemoryDocumentSource {
             let guard = self
                 .documents
                 .read()
-                .map_err(|_| SearchError::Backend("document source lock poisoned".to_owned()))?;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Ok(guard
                 .iter()
                 .filter(|((index, id), _)| {
@@ -153,7 +161,7 @@ mod tests {
     const FIELDS: &[SearchIndexField] = &[SearchIndexField::new("title", 'A')];
 
     fn definition() -> IndexDefinition {
-        IndexDefinition::new("articles", "simple", FIELDS, None)
+        IndexDefinition::new("articles", "simple", FIELDS, None, false)
     }
 
     fn document(id: i64) -> SearchDocument {

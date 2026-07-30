@@ -81,7 +81,7 @@ fn config_parses_the_search_section_of_autumn_toml() {
         enabled = false
         embedding_dimensions = 768
     "#;
-    let config = SearchConfig::from_autumn_toml(toml).expect("parse");
+    let config = SearchConfig::from_toml_str(toml).expect("parse");
     assert_eq!(config.queue, "indexing");
     assert_eq!(config.batch_size, 42);
     assert!(!config.enabled);
@@ -90,18 +90,18 @@ fn config_parses_the_search_section_of_autumn_toml() {
 
 #[test]
 fn a_missing_search_section_yields_the_defaults() {
-    let config = SearchConfig::from_autumn_toml("[server]\nport = 3000\n").expect("parse");
+    let config = SearchConfig::from_toml_str("[server]\nport = 3000\n").expect("parse");
     assert_eq!(config, SearchConfig::default());
 }
 
 #[test]
 fn an_unknown_search_key_is_rejected_rather_than_silently_ignored() {
     let toml = "[search]\nqueu = \"typo\"\n";
-    assert!(SearchConfig::from_autumn_toml(toml).is_err());
+    assert!(SearchConfig::from_toml_str(toml).is_err());
 }
 
 #[test]
 fn a_zero_batch_size_in_config_is_rejected() {
     let toml = "[search]\nbatch_size = 0\n";
-    assert!(SearchConfig::from_autumn_toml(toml).is_err());
+    assert!(SearchConfig::from_toml_str(toml).is_err());
 }

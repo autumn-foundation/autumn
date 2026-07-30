@@ -32,11 +32,12 @@
 //! speed — so the plugin is deployable on a managed Postgres without
 //! `pgvector`, and gets the fast path for free where it exists.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use autumn_web::pagination::Page;
 use autumn_web::search::{IndexDefinition, SearchDocument};
-use diesel::sql_types::{BigInt, Double, Nullable, Text};
+use diesel::sql_types::{Array, BigInt, Double, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -50,11 +51,19 @@ use crate::text::query_tokens;
 
 type RuntimePool = Pool<autumn_web::RuntimeConnection>;
 
+/// A `sql_query` with its parameters still to be bound.
+type BoxedQuery<'a> = diesel::query_builder::BoxedSqlQuery<
+    'a,
+    autumn_web::RuntimeBackend,
+    diesel::query_builder::SqlQuery,
+>;
+
 /// Physical table every index's documents live in.
 pub const DOCUMENTS_TABLE: &str = "autumn_search_documents";
 
 /// How embeddings are physically stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VectorMode {
     /// `pgvector` is installed and a dimension is configured: a `vector(N)`
     /// column plus an ivfflat index, queried with `<=>`.
@@ -108,9 +117,27 @@ struct SourceRow {
 }
 
 #[derive(diesel::QueryableByName)]
+struct WidthRow {
+    #[diesel(sql_type = BigInt)]
+    width: i64,
+}
+
+#[derive(diesel::QueryableByName)]
 struct ExistsRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     present: bool,
+}
+
+/// Which optional framework columns a model's table carries.
+///
+/// `bool_or` over zero rows is NULL, so both fields are nullable — a table
+/// that does not exist yet reads as "neither column".
+#[derive(diesel::QueryableByName)]
+struct OptionalColumnsRow {
+    #[diesel(sql_type = Nullable<diesel::sql_types::Bool>)]
+    has_tenant: Option<bool>,
+    #[diesel(sql_type = Nullable<diesel::sql_types::Bool>)]
+    has_deleted_at: Option<bool>,
 }
 
 // ── The store ───────────────────────────────────────────────────────────────
@@ -131,6 +158,20 @@ pub struct PostgresSearchStore {
     dimensions: Option<usize>,
     /// Resolved at `ensure_index` time, once per process.
     vector_mode: RwLock<Option<VectorMode>>,
+    /// Whether the shared DDL has already run in this process. The statements
+    /// are identical for every index, so running them per index is N× the work
+    /// and N× the concurrent-boot race window.
+    schema_ready: AtomicBool,
+    /// Cache of the optional framework columns each source table carries, so a
+    /// backfill does not re-probe `pg_attribute` on every batch.
+    optional_columns: RwLock<std::collections::HashMap<&'static str, OptionalColumns>>,
+}
+
+/// Which optional framework columns one source table carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OptionalColumns {
+    tenant_id: bool,
+    deleted_at: bool,
 }
 
 impl std::fmt::Debug for PostgresSearchStore {
@@ -139,18 +180,25 @@ impl std::fmt::Debug for PostgresSearchStore {
             .field("pool_installed", &self.pool.get().is_some())
             .field("dimensions", &self.dimensions)
             .field("vector_mode", &self.vector_mode())
-            .finish()
+            // UFCS: `RunQueryDsl::load` is in scope and shadows `AtomicBool::load`.
+            .field(
+                "schema_ready",
+                &AtomicBool::load(&self.schema_ready, Ordering::SeqCst),
+            )
+            .finish_non_exhaustive()
     }
 }
 
 impl PostgresSearchStore {
     /// Create a store whose pool is installed later.
     #[must_use]
-    pub const fn new(dimensions: Option<usize>) -> Self {
+    pub fn new(dimensions: Option<usize>) -> Self {
         Self {
             pool: OnceLock::new(),
             dimensions,
             vector_mode: RwLock::new(None),
+            schema_ready: AtomicBool::new(false),
+            optional_columns: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -253,16 +301,29 @@ fn parse_vector(raw: &str) -> Vec<f32> {
 /// SQL fragment restricting a query to `filter`, plus the parameters it needs.
 ///
 /// Only **literal, developer-controlled** values are interpolated: record ids
-/// (`i64`, formatted by Rust) and field names already validated as bare
-/// identifiers. Every caller-supplied *value* is bound, never interpolated.
-fn filter_sql(filter: &SearchFilter, next_param: &mut usize, binds: &mut Vec<String>) -> String {
+/// (`i64`, formatted by Rust) and field names taken from `definition`, which
+/// `IndexDefinition::validate` has already checked are bare identifiers. Every
+/// caller-supplied *value* is bound, never interpolated.
+///
+/// An `equals` key that `definition` does not declare renders as `AND FALSE`
+/// rather than reaching SQL. A key is an identifier position, so an unchecked
+/// one would let request text close the quote and `OR` away every restriction
+/// that preceded it — a full widening past the visibility filter, not merely
+/// an injection. Failing closed also matches [`SearchFilter::permits`], which
+/// returns `false` for a field the document does not carry.
+fn filter_sql(
+    definition: &IndexDefinition,
+    filter: &SearchFilter,
+    next_param: &mut usize,
+    binds: &mut Vec<Bound>,
+) -> String {
     use std::fmt::Write as _;
 
     let mut sql = String::new();
 
     if let Some(tenant) = &filter.tenant_id {
         let _ = write!(sql, " AND tenant_id = ${next_param}");
-        binds.push(tenant.clone());
+        binds.push(Bound::Text(tenant.clone()));
         *next_param += 1;
     }
     if let Some(allowed) = &filter.allowed_ids {
@@ -271,26 +332,63 @@ fn filter_sql(filter: &SearchFilter, next_param: &mut usize, binds: &mut Vec<Str
             // `matches_nothing`), but keep the SQL itself fail-closed.
             sql.push_str(" AND FALSE");
         } else {
-            let ids: Vec<String> = allowed.iter().map(i64::to_string).collect();
-            let _ = write!(sql, " AND record_id IN ({})", ids.join(","));
+            // `= ANY($n)` with a bound array, not an interpolated `IN (…)`
+            // list: the literal form would mint a distinct prepared statement
+            // for every distinct id set.
+            let _ = write!(sql, " AND record_id = ANY(${next_param})");
+            binds.push(Bound::Ids(allowed.clone()));
+            *next_param += 1;
         }
     }
     if !filter.excluded_ids.is_empty() {
-        let ids: Vec<String> = filter.excluded_ids.iter().map(i64::to_string).collect();
-        let _ = write!(sql, " AND record_id NOT IN ({})", ids.join(","));
+        let _ = write!(sql, " AND NOT (record_id = ANY(${next_param}))");
+        binds.push(Bound::Ids(filter.excluded_ids.clone()));
+        *next_param += 1;
     }
     for (field, value) in &filter.equals {
         if field == crate::backend::TENANT_FILTER_KEY {
             let _ = write!(sql, " AND tenant_id = ${next_param}");
-        } else {
-            // `field` is an indexed field name, already validated as a bare
-            // identifier by `IndexDefinition::validate`; the *value* is bound.
+        } else if definition.has_field(field) {
+            // Allowlisted against the definition, whose field names
+            // `IndexDefinition::validate` has already checked are bare
+            // identifiers; the *value* is bound.
             let _ = write!(sql, " AND fields ->> '{field}' = ${next_param}");
+        } else {
+            // Not a declared field: match nothing, bind nothing, and do NOT
+            // advance the parameter counter.
+            sql.push_str(" AND FALSE");
+            continue;
         }
-        binds.push(value.clone());
+        binds.push(Bound::Text(value.clone()));
         *next_param += 1;
     }
     sql
+}
+
+/// One bound parameter.
+///
+/// Exists so a query can be assembled as `(sql, Vec<Bound>)` and bound in one
+/// place, rather than every call site tracking two parallel lists of differing
+/// SQL types.
+#[derive(Debug, Clone, PartialEq)]
+enum Bound {
+    Text(String),
+    NullableText(Option<String>),
+    BigInt(i64),
+    Ids(Vec<i64>),
+}
+
+/// Bind `binds`, in order, onto a boxed query.
+fn bind_all(mut query: BoxedQuery<'_>, binds: impl IntoIterator<Item = Bound>) -> BoxedQuery<'_> {
+    for bound in binds {
+        query = match bound {
+            Bound::Text(value) => query.bind::<Text, _>(value),
+            Bound::NullableText(value) => query.bind::<Nullable<Text>, _>(value),
+            Bound::BigInt(value) => query.bind::<BigInt, _>(value),
+            Bound::Ids(values) => query.bind::<Array<BigInt>, _>(values),
+        };
+    }
+    query
 }
 
 impl SearchBackend for PostgresSearchStore {
@@ -299,12 +397,10 @@ impl SearchBackend for PostgresSearchStore {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            keyword: true,
-            vector: true,
-            weighted_fields: true,
-            embedding_readback: true,
-        }
+        BackendCapabilities::default()
+            .with_vector(true)
+            .with_weighted_fields(true)
+            .with_embedding_readback(true)
     }
 
     fn ensure_index<'a>(
@@ -315,11 +411,15 @@ impl SearchBackend for PostgresSearchStore {
             checked(definition)?;
             let mut conn = self.conn().await?;
 
-            for statement in SCHEMA_STATEMENTS {
-                diesel::sql_query(*statement)
-                    .execute(&mut conn)
-                    .await
-                    .map_err(SearchError::backend)?;
+            // The DDL is the same for every index, so run it once per process
+            // rather than once per registered model.
+            if !self.schema_ready.swap(true, Ordering::SeqCst)
+                && let Err(error) = Self::apply_schema(&mut conn).await
+            {
+                // Let a later index retry the DDL rather than leaving the
+                // process permanently believing the schema exists.
+                self.schema_ready.store(false, Ordering::SeqCst);
+                return Err(error);
             }
 
             // Resolve the vector storage mode once per process. A managed
@@ -327,7 +427,9 @@ impl SearchBackend for PostgresSearchStore {
             // `CREATE EXTENSION` degrades rather than aborting boot.
             if self.vector_mode().is_none() {
                 let mode = match self.dimensions {
-                    Some(dimensions) if self.try_enable_pgvector(dimensions).await? => {
+                    // Threaded `&mut conn` rather than acquiring a second
+                    // connection: holding two at boot deadlocks a pool of one.
+                    Some(dimensions) if self.try_enable_pgvector(&mut conn, dimensions).await? => {
                         VectorMode::PgVector { dimensions }
                     }
                     _ => VectorMode::Array,
@@ -354,62 +456,83 @@ impl SearchBackend for PostgresSearchStore {
                 return Ok(());
             }
             let mut conn = self.conn().await?;
-            let pgvector = self.vector_mode().is_some_and(VectorMode::is_pgvector);
+            // The column exists once `try_enable_pgvector` has added it, and
+            // it must be WRITTEN whenever it exists — even in Array mode.
+            // Skipping it would leave a stale `embedding_vec` behind after an
+            // upsert, and a pgvector-mode reader (another replica, or this one
+            // after a config change) would then rank on the old vector.
+            let has_vector_column = self.vector_mode().is_some_and(VectorMode::is_pgvector);
 
             for document in documents {
                 // The weighted tsvector, built exactly as #842 does:
                 // `setweight(to_tsvector(<lang>, <value>), <weight>)` per
-                // field, concatenated. Every value is BOUND; only the language
-                // dictionary and the weight letter — both from the validated
-                // definition — are interpolated.
+                // field, concatenated.
                 //
-                // Bound parameters: $1 index_name, $2 tenant_id, $3 fields
-                // json, $4 language, $5 content, then one per field value.
+                // The weight letter is interpolated, so it comes from the
+                // VALIDATED definition rather than from the document: a
+                // hand-built document (or a third-party `DocumentSource`) can
+                // carry any `char`. A field the index does not declare is
+                // skipped entirely.
+                //
+                // Bound: $1 index_name, $2 record_id, $3 tenant_id, $4 fields
+                // json, $5 language, $6 content, $7 embedding, ($8 vector),
+                // then one per field value.
+                let mut binds = vec![
+                    Bound::Text(definition.name.to_owned()),
+                    Bound::BigInt(document.id()),
+                    Bound::NullableText(document.document.tenant_id.clone()),
+                    Bound::Text(fields_json(document)?),
+                    Bound::Text(definition.language.to_owned()),
+                    Bound::Text(document.document.text()),
+                    Bound::NullableText(document.embedding.as_deref().map(array_literal)),
+                ];
+                if has_vector_column {
+                    binds.push(Bound::NullableText(
+                        document.embedding.as_deref().map(vector_literal),
+                    ));
+                }
+
                 let mut vector_sql = String::new();
-                let mut binds: Vec<String> = Vec::new();
-                for (param, field) in (6_usize..).zip(document.document.fields.iter()) {
+                let mut param = binds.len() + 1;
+                for field in &document.document.fields {
+                    let Some(weight) = definition.weight_of(field.name) else {
+                        continue;
+                    };
                     if !vector_sql.is_empty() {
                         vector_sql.push_str(" || ");
                     }
+                    // `$5::text::regconfig`, not `$5::regconfig`: the same
+                    // parameter is also the `language` column value, and the
+                    // untyped form is "inconsistent types deduced for
+                    // parameter" under any client that does not declare bind
+                    // types.
                     let _ = write!(
                         vector_sql,
-                        "setweight(to_tsvector($4::regconfig, ${param}), '{}')",
-                        field.weight
+                        "setweight(to_tsvector($5::text::regconfig, ${param}), '{weight}')"
                     );
-                    binds.push(field.value.clone());
+                    binds.push(Bound::Text(field.value.clone()));
+                    param += 1;
                 }
                 if vector_sql.is_empty() {
-                    "to_tsvector($4::regconfig, '')".clone_into(&mut vector_sql);
+                    "to_tsvector($5::text::regconfig, '')".clone_into(&mut vector_sql);
                 }
 
-                let embedding = document.embedding.as_ref().map_or_else(
-                    || "NULL".to_owned(),
-                    |v| format!("'{}'::double precision[]", array_literal(v)),
-                );
-
-                // `embedding_vec` only exists when `try_enable_pgvector`
-                // added it, so it must be absent from the column list in the
-                // portable mode — naming a column that does not exist would
-                // fail every write.
-                let (vec_column, vec_value, vec_update) = if pgvector {
-                    let value = document.embedding.as_ref().map_or_else(
-                        || "NULL".to_owned(),
-                        |v| format!("'{}'::vector", vector_literal(v)),
-                    );
+                let (vec_column, vec_value, vec_update) = if has_vector_column {
                     (
                         ", embedding_vec",
-                        format!(", {value}"),
+                        ", $8::vector",
                         ", embedding_vec = EXCLUDED.embedding_vec",
                     )
                 } else {
-                    ("", String::new(), "")
+                    ("", "", "")
                 };
 
                 let sql = format!(
                     "INSERT INTO {DOCUMENTS_TABLE} \
                        (index_name, record_id, tenant_id, language, fields, content, \
                         search_vector, embedding{vec_column}) \
-                     VALUES ($1, {id}, $2, $4, $3::jsonb, $5, {vector_sql}, {embedding}{vec_value}) \
+                     VALUES ($1, $2, $3, $5, $4::jsonb, $6, {vector_sql}, \
+                             $7::double precision[]{vec_value}) \
                      ON CONFLICT (index_name, record_id) DO UPDATE SET \
                        tenant_id = EXCLUDED.tenant_id, \
                        language = EXCLUDED.language, \
@@ -417,34 +540,16 @@ impl SearchBackend for PostgresSearchStore {
                        content = EXCLUDED.content, \
                        search_vector = EXCLUDED.search_vector, \
                        embedding = EXCLUDED.embedding{vec_update}, \
-                       updated_at = NOW()",
-                    id = document.id(),
+                       updated_at = NOW()"
                 );
 
-                let fields_json = serde_json::to_string(
-                    &document
-                        .document
-                        .fields
-                        .iter()
-                        .map(|f| (f.name, f.value.clone()))
-                        .collect::<std::collections::BTreeMap<_, _>>(),
+                bind_all(
+                    diesel::sql_query(sql).into_boxed::<autumn_web::RuntimeBackend>(),
+                    binds,
                 )
+                .execute(&mut conn)
+                .await
                 .map_err(SearchError::backend)?;
-
-                let mut query = diesel::sql_query(sql)
-                    .into_boxed::<autumn_web::RuntimeBackend>()
-                    .bind::<Text, _>(definition.name.to_owned())
-                    .bind::<Nullable<Text>, _>(document.document.tenant_id.clone())
-                    .bind::<Text, _>(fields_json)
-                    .bind::<Text, _>(definition.language.to_owned())
-                    .bind::<Text, _>(document.document.text());
-                for value in binds {
-                    query = query.bind::<Text, _>(value);
-                }
-                query
-                    .execute(&mut conn)
-                    .await
-                    .map_err(SearchError::backend)?;
             }
             Ok(())
         })
@@ -457,16 +562,22 @@ impl SearchBackend for PostgresSearchStore {
     ) -> BoxFuture<'a, SearchResult<()>> {
         Box::pin(async move {
             checked(definition)?;
+            // `IN ()` is a syntax error, so an empty slice must never reach SQL.
             if ids.is_empty() {
                 return Ok(());
             }
             let mut conn = self.conn().await?;
-            let list: Vec<String> = ids.iter().map(i64::to_string).collect();
-            diesel::sql_query(format!(
-                "DELETE FROM {DOCUMENTS_TABLE} WHERE index_name = $1 AND record_id IN ({})",
-                list.join(",")
-            ))
-            .bind::<Text, _>(definition.name.to_owned())
+            bind_all(
+                diesel::sql_query(format!(
+                    "DELETE FROM {DOCUMENTS_TABLE} \
+                     WHERE index_name = $1 AND record_id = ANY($2)"
+                ))
+                .into_boxed::<autumn_web::RuntimeBackend>(),
+                [
+                    Bound::Text(definition.name.to_owned()),
+                    Bound::Ids(ids.to_vec()),
+                ],
+            )
             .execute(&mut conn)
             .await
             .map_err(SearchError::backend)?;
@@ -505,55 +616,63 @@ impl SearchBackend for PostgresSearchStore {
             let mut conn = self.conn().await?;
             // $1 index_name, $2 language, $3 query text.
             let mut param = 4_usize;
-            let mut binds: Vec<String> = Vec::new();
-            let predicate = filter_sql(&query.filter, &mut param, &mut binds);
+            let mut binds: Vec<Bound> = Vec::new();
+            let predicate = filter_sql(definition, &query.filter, &mut param, &mut binds);
+            let head = [
+                Bound::Text(definition.name.to_owned()),
+                Bound::Text(definition.language.to_owned()),
+                Bound::Text(query.text.clone()),
+            ];
 
             // `plainto_tsquery` (not `websearch_to_tsquery`): the documented
             // cross-backend contract is "every token must match, operators are
             // not syntax". It is parameterized, so a hostile query string can
             // neither inject nor widen the result set.
             let where_clause = format!(
-                "index_name = $1 AND search_vector @@ plainto_tsquery($2::regconfig, $3){predicate}"
+                "index_name = $1 \
+                 AND search_vector @@ plainto_tsquery($2::text::regconfig, $3){predicate}"
             );
 
-            let mut count = diesel::sql_query(format!(
-                "SELECT COUNT(*)::bigint AS total FROM {DOCUMENTS_TABLE} WHERE {where_clause}"
-            ))
-            .into_boxed::<autumn_web::RuntimeBackend>()
-            .bind::<Text, _>(definition.name.to_owned())
-            .bind::<Text, _>(definition.language.to_owned())
-            .bind::<Text, _>(query.text.clone());
-            for value in &binds {
-                count = count.bind::<Text, _>(value.clone());
-            }
-            let total = count
-                .get_result::<CountRow>(&mut conn)
-                .await
-                .map_err(SearchError::backend)?
-                .total;
+            let total = bind_all(
+                diesel::sql_query(format!(
+                    "SELECT COUNT(*)::bigint AS total FROM {DOCUMENTS_TABLE} WHERE {where_clause}"
+                ))
+                .into_boxed::<autumn_web::RuntimeBackend>(),
+                head.iter().cloned().chain(binds.iter().cloned()),
+            )
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .map_err(SearchError::backend)?
+            .total;
 
+            // LIMIT/OFFSET are BOUND: interpolating them would mint a distinct
+            // prepared statement per page, which the unbounded statement cache
+            // never evicts.
+            let limit_param = param;
+            let offset_param = param + 1;
             let size = i64::from(query.page.size());
             let offset = i64::from(query.page.page().saturating_sub(1)) * size;
-            let mut rows = diesel::sql_query(format!(
-                "SELECT record_id, \
-                        ts_rank_cd(search_vector, plainto_tsquery($2::regconfig, $3))::double precision AS score \
-                 FROM {DOCUMENTS_TABLE} WHERE {where_clause} \
-                 ORDER BY score DESC, record_id ASC LIMIT {size} OFFSET {offset}"
-            ))
-            .into_boxed::<autumn_web::RuntimeBackend>()
-            .bind::<Text, _>(definition.name.to_owned())
-            .bind::<Text, _>(definition.language.to_owned())
-            .bind::<Text, _>(query.text.clone());
-            for value in &binds {
-                rows = rows.bind::<Text, _>(value.clone());
-            }
-            let hits = rows
-                .load::<HitRow>(&mut conn)
-                .await
-                .map_err(SearchError::backend)?;
+            let rows = bind_all(
+                diesel::sql_query(format!(
+                    "SELECT record_id, \
+                            ts_rank_cd(search_vector, \
+                                       plainto_tsquery($2::text::regconfig, $3))::double precision \
+                              AS score \
+                     FROM {DOCUMENTS_TABLE} WHERE {where_clause} \
+                     ORDER BY score DESC, record_id ASC \
+                     LIMIT ${limit_param} OFFSET ${offset_param}"
+                ))
+                .into_boxed::<autumn_web::RuntimeBackend>(),
+                head.into_iter()
+                    .chain(binds)
+                    .chain([Bound::BigInt(size), Bound::BigInt(offset)]),
+            )
+            .load::<HitRow>(&mut conn)
+            .await
+            .map_err(SearchError::backend)?;
 
             Ok(Page::new(
-                hits.into_iter()
+                rows.into_iter()
                     .map(|row| {
                         SearchHit::new(definition.name, row.record_id, narrow_score(row.score))
                     })
@@ -581,64 +700,83 @@ impl SearchBackend for PostgresSearchStore {
             }
 
             let mut conn = self.conn().await?;
-            let mut param = 2_usize; // $1 index_name
-            let mut binds: Vec<String> = Vec::new();
-            let predicate = filter_sql(&query.filter, &mut param, &mut binds);
+            // $1 index_name, $2 the query vector (bound as text, cast in SQL).
+            let mut param = 3_usize;
+            let mut binds: Vec<Bound> = Vec::new();
+            let predicate = filter_sql(definition, &query.filter, &mut param, &mut binds);
 
-            // Cosine *similarity* in both modes, so the two paths order
-            // identically: pgvector's `<=>` is cosine distance, hence `1 - d`.
-            //
-            // Width mismatch: `<=>` errors on it, while `unnest(a, b)` would
-            // silently pad the shorter array with NULLs and return a wrong
-            // score. The portable path therefore filters mismatched documents
-            // out with `array_length`, so a re-embedding at a new width
-            // degrades to "no results" rather than to wrong results. (The
-            // in-memory backend raises `DimensionMismatch` instead — it can
-            // afford to inspect every document; SQL cannot.)
+            let pgvector = self.vector_mode().is_some_and(VectorMode::is_pgvector);
             let width = query.vector.len();
-            let (score_expr, embedding_predicate) =
-                if self.vector_mode().is_some_and(VectorMode::is_pgvector) {
-                    (
-                        format!(
-                            "(1 - (embedding_vec <=> '{}'::vector))::double precision",
-                            vector_literal(&query.vector)
-                        ),
-                        "embedding_vec IS NOT NULL".to_owned(),
-                    )
-                } else {
-                    (
-                        format!(
-                            "autumn_search_cosine(embedding, '{}'::double precision[])",
-                            array_literal(&query.vector)
-                        ),
-                        format!("embedding IS NOT NULL AND array_length(embedding, 1) = {width}"),
-                    )
-                };
+            // Both modes score cosine SIMILARITY so the two orderings agree
+            // (pgvector's `<=>` is cosine distance, hence `1 - d`).
+            //
+            // Ordering differs, though, and deliberately: an ivfflat index can
+            // only serve `ORDER BY col <=> const ASC`. Ordering by the derived
+            // `1 - d` expression is opaque to the planner and forces an exact
+            // full scan, which would make the whole pgvector fast path buy
+            // nothing. So pgvector mode orders by DISTANCE ascending and
+            // converts to similarity only in the select list.
+            let (query_vector, distance, score_expr, order_by, embedding_predicate) = if pgvector {
+                (
+                    vector_literal(&query.vector),
+                    "(embedding_vec <=> $2::vector)".to_owned(),
+                    "(1 - (embedding_vec <=> $2::vector))::double precision".to_owned(),
+                    "ORDER BY (embedding_vec <=> $2::vector) ASC, record_id ASC".to_owned(),
+                    "embedding_vec IS NOT NULL".to_owned(),
+                )
+            } else {
+                let expr = "autumn_search_cosine(embedding, $2::double precision[])".to_owned();
+                (
+                    array_literal(&query.vector),
+                    String::new(),
+                    expr.clone(),
+                    format!("ORDER BY {expr} DESC, record_id ASC"),
+                    // `unnest(a, b)` pads the shorter array with NULLs and
+                    // silently mis-scores, so a width mismatch is excluded
+                    // rather than ranked. (pgvector's `<=>` errors instead —
+                    // documented divergence.)
+                    format!("embedding IS NOT NULL AND array_length(embedding, 1) = {width}"),
+                )
+            };
+            let _ = distance;
 
             // Only emit the threshold when one was asked for: it repeats the
-            // (non-trivial) score expression, so an unconditional
-            // `>= -3.4e38` would be pure cost.
+            // (non-trivial) score expression. A non-finite bound would render
+            // as a bare `NaN`/`inf` identifier and turn the query into a
+            // syntax error, so drop it — no threshold is the safe reading of
+            // "not a number".
             let threshold = query
                 .min_score
-                .map_or_else(String::new, |min| format!(" AND {score_expr} >= {min}"));
-            let limit = query.limit;
-            let mut rows = diesel::sql_query(format!(
-                "SELECT record_id, {score_expr} AS score FROM {DOCUMENTS_TABLE} \
-                 WHERE index_name = $1 AND {embedding_predicate}{predicate}{threshold} \
-                 ORDER BY score DESC, record_id ASC LIMIT {limit}"
-            ))
-            .into_boxed::<autumn_web::RuntimeBackend>()
-            .bind::<Text, _>(definition.name.to_owned());
-            for value in &binds {
-                rows = rows.bind::<Text, _>(value.clone());
-            }
-            let hits = rows
-                .load::<HitRow>(&mut conn)
-                .await
-                .map_err(SearchError::backend)?;
+                .filter(|min| min.is_finite())
+                .map_or_else(String::new, |min| format!(" AND {score_expr} >= {min:?}"));
 
-            Ok(hits
+            let limit_param = param;
+            let limit = i64::try_from(query.limit).unwrap_or(i64::MAX);
+            let rows = bind_all(
+                diesel::sql_query(format!(
+                    "SELECT record_id, {score_expr} AS score FROM {DOCUMENTS_TABLE} \
+                     WHERE index_name = $1 AND {embedding_predicate}{predicate}{threshold} \
+                     {order_by} LIMIT ${limit_param}"
+                ))
+                .into_boxed::<autumn_web::RuntimeBackend>(),
+                [
+                    Bound::Text(definition.name.to_owned()),
+                    Bound::Text(query_vector),
+                ]
                 .into_iter()
+                .chain(binds)
+                .chain([Bound::BigInt(limit)]),
+            )
+            .load::<HitRow>(&mut conn)
+            .await
+            .map_err(SearchError::backend)?;
+
+            Ok(rows
+                .into_iter()
+                // A zero-norm vector makes pgvector's `<=>` return NaN, which
+                // sorts FIRST under `DESC` — a garbage row would rank #1 with
+                // a displayed score of 0. Drop those rather than surface them.
+                .filter(|row| row.score.is_finite())
                 .map(|row| SearchHit::new(definition.name, row.record_id, narrow_score(row.score)))
                 .collect())
         })
@@ -648,20 +786,36 @@ impl SearchBackend for PostgresSearchStore {
         &'a self,
         definition: &'a IndexDefinition,
         id: i64,
+        filter: &'a SearchFilter,
     ) -> BoxFuture<'a, SearchResult<Option<Vec<f32>>>> {
         Box::pin(async move {
             checked(definition)?;
+            // A record the filter excludes reads back as absent — this is a
+            // query like any other, and the seed id is caller-supplied.
+            if filter.matches_nothing() {
+                return Ok(None);
+            }
             let mut conn = self.conn().await?;
-            let row = diesel::sql_query(format!(
-                "SELECT embedding::text AS embedding FROM {DOCUMENTS_TABLE} \
-                 WHERE index_name = $1 AND record_id = {id}"
-            ))
-            .bind::<Text, _>(definition.name.to_owned())
-            .get_results::<EmbeddingRow>(&mut conn)
+            // $1 index_name, $2 record_id.
+            let mut param = 3_usize;
+            let mut binds: Vec<Bound> = Vec::new();
+            let predicate = filter_sql(definition, filter, &mut param, &mut binds);
+
+            let rows = bind_all(
+                diesel::sql_query(format!(
+                    "SELECT embedding::text AS embedding FROM {DOCUMENTS_TABLE} \
+                     WHERE index_name = $1 AND record_id = $2{predicate}"
+                ))
+                .into_boxed::<autumn_web::RuntimeBackend>(),
+                [Bound::Text(definition.name.to_owned()), Bound::BigInt(id)]
+                    .into_iter()
+                    .chain(binds),
+            )
+            .load::<EmbeddingRow>(&mut conn)
             .await
             .map_err(SearchError::backend)?;
 
-            Ok(row
+            Ok(rows
                 .into_iter()
                 .next()
                 .and_then(|row| row.embedding)
@@ -671,16 +825,58 @@ impl SearchBackend for PostgresSearchStore {
 }
 
 impl PostgresSearchStore {
+    /// Apply the shared DDL under an advisory lock.
+    ///
+    /// `CREATE TABLE/INDEX IF NOT EXISTS` and `CREATE OR REPLACE FUNCTION` are
+    /// **not** race-free: concurrent boots hit `duplicate key value violates
+    /// unique constraint "pg_type_typname_nsp_index"` and `tuple concurrently
+    /// updated`. Without this, a rolling deploy would intermittently abort a
+    /// replica's boot. A session-level advisory lock serializes them; it is
+    /// released explicitly below and, if the process dies, when the connection
+    /// closes.
+    async fn apply_schema(
+        conn: &mut diesel_async::pooled_connection::deadpool::Object<autumn_web::RuntimeConnection>,
+    ) -> SearchResult<()> {
+        const LOCK: &str = "hashtext('autumn_search_schema')::bigint";
+
+        diesel::sql_query(format!("SELECT pg_advisory_lock({LOCK})"))
+            .execute(&mut *conn)
+            .await
+            .map_err(SearchError::backend)?;
+
+        let mut outcome = Ok(());
+        for statement in SCHEMA_STATEMENTS {
+            if let Err(error) = diesel::sql_query(*statement).execute(&mut *conn).await {
+                outcome = Err(SearchError::backend(error));
+                break;
+            }
+        }
+
+        // Released on every path, including the error one. Each DDL statement
+        // is its own transaction under autocommit, so a failure above does not
+        // leave the session unable to run this.
+        let _ = diesel::sql_query(format!("SELECT pg_advisory_unlock({LOCK})"))
+            .execute(&mut *conn)
+            .await;
+
+        outcome
+    }
+
     /// Try to install `pgvector` and add the accelerated column + index.
     ///
     /// Returns `false` (rather than erroring) when the extension is not
     /// available: the portable array path is a complete implementation, so a
     /// managed Postgres without `pgvector` must boot, not crash.
-    async fn try_enable_pgvector(&self, dimensions: usize) -> SearchResult<bool> {
-        let mut conn = self.conn().await?;
-
+    ///
+    /// Takes the caller's connection: acquiring a second one while the caller
+    /// holds the first deadlocks a pool of size 1 at boot.
+    async fn try_enable_pgvector(
+        &self,
+        conn: &mut diesel_async::pooled_connection::deadpool::Object<autumn_web::RuntimeConnection>,
+        dimensions: usize,
+    ) -> SearchResult<bool> {
         if diesel::sql_query("CREATE EXTENSION IF NOT EXISTS vector")
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .await
             .is_err()
         {
@@ -694,7 +890,7 @@ impl PostgresSearchStore {
         let present = diesel::sql_query(
             "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') AS present",
         )
-        .get_result::<ExistsRow>(&mut conn)
+        .get_result::<ExistsRow>(&mut *conn)
         .await
         .map_err(SearchError::backend)?
         .present;
@@ -705,9 +901,51 @@ impl PostgresSearchStore {
         // `dimensions` is a `usize` from config, formatted by Rust — no caller
         // text reaches this statement.
         diesel::sql_query(format!(
-            "ALTER TABLE {DOCUMENTS_TABLE} ADD COLUMN IF NOT EXISTS embedding_vec vector({dimensions})"
+            "ALTER TABLE {DOCUMENTS_TABLE} \
+             ADD COLUMN IF NOT EXISTS embedding_vec vector({dimensions})"
         ))
-        .execute(&mut conn)
+        .execute(&mut *conn)
+        .await
+        .map_err(SearchError::backend)?;
+
+        // `ADD COLUMN IF NOT EXISTS` is a silent no-op against an existing
+        // column of a DIFFERENT width, which would leave the store believing
+        // it is in `PgVector{new}` while every insert fails with "expected
+        // <old> dimensions". Verify what is actually there.
+        let actual = diesel::sql_query(format!(
+            "SELECT COALESCE(atttypmod, 0)::bigint AS width FROM pg_attribute \
+             WHERE attrelid = to_regclass('{DOCUMENTS_TABLE}') \
+               AND attname = 'embedding_vec' AND NOT attisdropped"
+        ))
+        .get_results::<WidthRow>(&mut *conn)
+        .await
+        .map_err(SearchError::backend)?;
+        let existing_width = actual.into_iter().next().map(|row| row.width);
+        if let Some(width) = existing_width
+            && width > 0
+            && usize::try_from(width).unwrap_or(0) != dimensions
+        {
+            tracing::warn!(
+                configured = dimensions,
+                existing = width,
+                "autumn-search: the pgvector column has a different width than \
+                 `search.embedding_dimensions`; falling back to the portable \
+                 double precision[] path. Drop `autumn_search_documents.embedding_vec` \
+                 and re-run a full backfill to adopt the new width."
+            );
+            return Ok(false);
+        }
+
+        // Adopt embeddings written while the store was in Array mode —
+        // otherwise every pre-existing document silently vanishes from k-NN
+        // (the query filters `embedding_vec IS NOT NULL`) until a full
+        // backfill happens to run.
+        diesel::sql_query(format!(
+            "UPDATE {DOCUMENTS_TABLE} SET embedding_vec = embedding::text::vector \
+             WHERE embedding IS NOT NULL AND embedding_vec IS NULL \
+               AND array_length(embedding, 1) = {dimensions}"
+        ))
+        .execute(&mut *conn)
         .await
         .map_err(SearchError::backend)?;
 
@@ -716,16 +954,15 @@ impl PostgresSearchStore {
         // correctness, so never fail boot for it.
         let _ = diesel::sql_query(format!(
             "CREATE INDEX IF NOT EXISTS autumn_search_documents_embedding_vec_idx \
-             ON {DOCUMENTS_TABLE} USING ivfflat (embedding_vec vector_cosine_ops)"
+             ON {DOCUMENTS_TABLE} USING ivfflat (embedding_vec vector_cosine_ops) \
+             WITH (lists = 100)"
         ))
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await;
 
         Ok(true)
     }
 }
-
-// ── Document source ─────────────────────────────────────────────────────────
 
 impl DocumentSource for PostgresSearchStore {
     fn fetch<'a>(
@@ -738,13 +975,7 @@ impl DocumentSource for PostgresSearchStore {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let list: Vec<String> = ids.iter().map(i64::to_string).collect();
-            self.load_documents(
-                definition,
-                &format!("WHERE id IN ({})", list.join(",")),
-                None,
-            )
-            .await
+            self.load_documents(definition, Selection::Ids(ids)).await
         })
     }
 
@@ -756,64 +987,132 @@ impl DocumentSource for PostgresSearchStore {
     ) -> BoxFuture<'a, SearchResult<Vec<SearchDocument>>> {
         Box::pin(async move {
             checked(definition)?;
-            let where_clause =
-                after.map_or_else(String::new, |after| format!("WHERE id > {after}"));
-            self.load_documents(definition, &where_clause, Some(limit))
+            self.load_documents(definition, Selection::After { after, limit })
                 .await
         })
     }
 }
 
+/// Which source rows to project.
+enum Selection<'a> {
+    /// Exactly these ids (a reindex).
+    Ids(&'a [i64]),
+    /// The next `limit` rows after `after`, by ascending id (a backfill).
+    After { after: Option<i64>, limit: usize },
+}
+
 impl PostgresSearchStore {
+    /// The optional framework columns `definition`'s source table carries,
+    /// cached per index.
+    ///
+    /// Resolved through `to_regclass`, which follows the connection's
+    /// `search_path` exactly as the projection below does. An
+    /// `information_schema` probe filtered on `current_schema()` would answer
+    /// about a different table whenever the model lives in a non-first schema
+    /// — silently blanking `tenant_id` and re-indexing soft-deleted rows.
+    async fn optional_columns(
+        &self,
+        definition: &IndexDefinition,
+        conn: &mut diesel_async::pooled_connection::deadpool::Object<autumn_web::RuntimeConnection>,
+    ) -> SearchResult<OptionalColumns> {
+        if let Ok(cache) = self.optional_columns.read()
+            && let Some(columns) = cache.get(definition.name)
+        {
+            return Ok(*columns);
+        }
+
+        let row = diesel::sql_query(
+            "SELECT bool_or(attname = 'tenant_id')  AS has_tenant, \
+                    bool_or(attname = 'deleted_at') AS has_deleted_at \
+             FROM pg_attribute \
+             WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped",
+        )
+        .bind::<Text, _>(definition.name.to_owned())
+        .get_result::<OptionalColumnsRow>(conn)
+        .await
+        .map_err(SearchError::backend)?;
+
+        let columns = OptionalColumns {
+            tenant_id: row.has_tenant.unwrap_or(false),
+            deleted_at: row.has_deleted_at.unwrap_or(false),
+        };
+        if let Ok(mut cache) = self.optional_columns.write() {
+            cache.insert(definition.name, columns);
+        }
+        Ok(columns)
+    }
+
     /// Project a model's table into `(id, fields json, tenant_id)`.
     ///
     /// Fully generic: the column list comes from the validated
     /// [`IndexDefinition`], so no per-model code is generated anywhere. The
     /// values are returned as one JSON object rather than N columns, which is
     /// what lets a single `QueryableByName` struct serve every model.
+    ///
+    /// **The source table's primary key must be the `id` column** — the same
+    /// assumption the in-core FTS `search()` makes. A `#[searchable]` model
+    /// whose key column is named otherwise needs its own `DocumentSource`.
     async fn load_documents(
         &self,
         definition: &IndexDefinition,
-        where_clause: &str,
-        limit: Option<usize>,
+        selection: Selection<'_>,
     ) -> SearchResult<Vec<SearchDocument>> {
         // ONE connection for both statements: acquiring a second while holding
         // the first deadlocks a small pool.
         let mut conn = self.conn().await?;
+        let columns = self.optional_columns(definition, &mut conn).await?;
 
-        let has_tenant = diesel::sql_query(
-            "SELECT EXISTS ( \
-               SELECT 1 FROM information_schema.columns \
-               WHERE table_schema = current_schema() \
-                 AND table_name = $1 \
-                 AND column_name = 'tenant_id' \
-             ) AS present",
-        )
-        .bind::<Text, _>(definition.name.to_owned())
-        .get_result::<ExistsRow>(&mut conn)
-        .await
-        .map_err(SearchError::backend)?
-        .present;
+        let mut binds: Vec<Bound> = Vec::new();
+        let mut param = 1_usize;
+        let mut predicates: Vec<String> = Vec::new();
+        let mut limit_clause = String::new();
 
-        // Identifiers only — every name here passed `IndexDefinition::validate`.
-        let projection: Vec<String> = definition
-            .fields
-            .iter()
-            .map(|field| format!("'{0}', COALESCE(\"{0}\"::text, '')", field.name))
-            .collect();
-        let tenant = if has_tenant {
+        match selection {
+            Selection::Ids(ids) => {
+                predicates.push(format!("id = ANY(${param})"));
+                binds.push(Bound::Ids(ids.to_vec()));
+            }
+            Selection::After { after, limit } => {
+                if let Some(after) = after {
+                    predicates.push(format!("id > ${param}"));
+                    binds.push(Bound::BigInt(after));
+                    param += 1;
+                }
+                limit_clause = format!(" LIMIT ${param}");
+                binds.push(Bound::BigInt(i64::try_from(limit).unwrap_or(i64::MAX)));
+            }
+        }
+        if columns.deleted_at {
+            // A soft-deleted row must not be re-indexed: `after_delete_commit`
+            // removes its document, and a later backfill would otherwise put
+            // it straight back — searchable while `find` hides it.
+            predicates.push("deleted_at IS NULL".to_owned());
+        }
+        let where_clause = if predicates.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", predicates.join(" AND "))
+        };
+
+        let tenant = if columns.tenant_id {
             "tenant_id::text"
         } else {
             "NULL::text"
         };
-        let limit_clause = limit.map_or_else(String::new, |limit| format!(" LIMIT {limit}"));
 
-        let rows = diesel::sql_query(format!(
-            "SELECT id, jsonb_build_object({})::text AS fields, {tenant} AS tenant_id \
-             FROM \"{}\" {where_clause} ORDER BY id ASC{limit_clause}",
-            projection.join(", "),
-            definition.name,
-        ))
+        // `id::bigint`: the row is decoded as `BigInt`, so an `integer`/
+        // `serial` key column would be a runtime deserialization error the
+        // compiler cannot see.
+        let rows = bind_all(
+            diesel::sql_query(format!(
+                "SELECT id::bigint AS id, {} AS fields, {tenant} AS tenant_id \
+                 FROM \"{}\" {where_clause} ORDER BY id ASC{limit_clause}",
+                fields_projection(definition),
+                definition.name,
+            ))
+            .into_boxed::<autumn_web::RuntimeBackend>(),
+            binds,
+        )
         .load::<SourceRow>(&mut conn)
         .await
         .map_err(SearchError::backend)?;
@@ -838,6 +1137,45 @@ impl PostgresSearchStore {
         }
         Ok(documents)
     }
+}
+
+/// The `jsonb_build_object(...)` projection for `definition`'s fields.
+///
+/// Chunked and concatenated with `||`: `jsonb_build_object` is variadic-"any"
+/// and Postgres caps a function call at **100 arguments**, so a model with
+/// more than 50 searchable fields would otherwise be a hard
+/// `cannot pass more than 100 arguments to a function` error.
+fn fields_projection(definition: &IndexDefinition) -> String {
+    /// 40 pairs = 80 arguments, comfortably under the cap.
+    const PAIRS_PER_CHUNK: usize = 40;
+
+    let pairs: Vec<String> = definition
+        .fields
+        .iter()
+        .map(|field| format!("'{0}', COALESCE(\"{0}\"::text, '')", field.name))
+        .collect();
+    if pairs.is_empty() {
+        return "'{}'::jsonb::text".to_owned();
+    }
+    pairs
+        .chunks(PAIRS_PER_CHUNK)
+        .map(|chunk| format!("jsonb_build_object({})", chunk.join(", ")))
+        .collect::<Vec<_>>()
+        .join(" || ")
+        + "::text"
+}
+
+/// The `fields` JSON one document is stored with.
+fn fields_json(document: &IndexedDocument) -> SearchResult<String> {
+    serde_json::to_string(
+        &document
+            .document
+            .fields
+            .iter()
+            .map(|f| (f.name, f.value.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    )
+    .map_err(SearchError::backend)
 }
 
 /// DDL for the framework-owned index, applied idempotently on every boot.
@@ -887,7 +1225,7 @@ mod tests {
     ];
 
     fn definition() -> IndexDefinition {
-        IndexDefinition::new("articles", "english", FIELDS, Some("body"))
+        IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
     }
 
     #[test]
@@ -918,7 +1256,12 @@ mod tests {
         let mut param = 2;
         let mut binds = Vec::new();
         assert_eq!(
-            filter_sql(&SearchFilter::default(), &mut param, &mut binds),
+            filter_sql(
+                &definition(),
+                &SearchFilter::default(),
+                &mut param,
+                &mut binds
+            ),
             ""
         );
         assert_eq!(param, 2);
@@ -930,12 +1273,16 @@ mod tests {
         let mut param = 2;
         let mut binds = Vec::new();
         let sql = filter_sql(
+            &definition(),
             &SearchFilter::default().tenant("acme'; DROP TABLE users; --"),
             &mut param,
             &mut binds,
         );
         assert_eq!(sql, " AND tenant_id = $2");
-        assert_eq!(binds, vec!["acme'; DROP TABLE users; --".to_owned()]);
+        assert_eq!(
+            binds,
+            vec![Bound::Text("acme'; DROP TABLE users; --".to_owned())]
+        );
         assert_eq!(param, 3);
     }
 
@@ -944,6 +1291,7 @@ mod tests {
         let mut param = 2;
         let mut binds = Vec::new();
         let sql = filter_sql(
+            &definition(),
             &SearchFilter::default().allow_ids(Vec::<i64>::new()),
             &mut param,
             &mut binds,
@@ -952,19 +1300,27 @@ mod tests {
     }
 
     #[test]
-    fn id_lists_are_rendered_from_integers_only() {
+    fn id_lists_are_bound_as_arrays_never_interpolated() {
         let mut param = 2;
         let mut binds = Vec::new();
         let sql = filter_sql(
+            &definition(),
             &SearchFilter::default()
                 .allow_ids([1_i64, 2])
                 .exclude_ids([3_i64]),
             &mut param,
             &mut binds,
         );
-        assert!(sql.contains("record_id IN (1,2)"), "{sql}");
-        assert!(sql.contains("record_id NOT IN (3)"), "{sql}");
-        assert!(binds.is_empty(), "ids are integers, nothing to bind");
+        // Bound arrays, not interpolated `IN (…)` lists: the literal form
+        // would mint a distinct (never-evicted) prepared statement for every
+        // distinct id set a caller happens to filter on.
+        assert!(sql.contains("record_id = ANY($2)"), "{sql}");
+        assert!(sql.contains("NOT (record_id = ANY($3))"), "{sql}");
+        assert!(
+            !sql.contains("IN ("),
+            "ids must never be interpolated: {sql}"
+        );
+        assert_eq!(binds, vec![Bound::Ids(vec![1, 2]), Bound::Ids(vec![3])]);
     }
 
     #[test]
@@ -972,6 +1328,7 @@ mod tests {
         let mut param = 4;
         let mut binds = Vec::new();
         let sql = filter_sql(
+            &definition(),
             &SearchFilter::default()
                 .equals("title", "Hello")
                 .equals("body", "World"),
@@ -981,8 +1338,71 @@ mod tests {
         // BTreeMap iterates in key order: body, then title.
         assert!(sql.contains("fields ->> 'body' = $4"), "{sql}");
         assert!(sql.contains("fields ->> 'title' = $5"), "{sql}");
-        assert_eq!(binds, vec!["World".to_owned(), "Hello".to_owned()]);
+        assert_eq!(
+            binds,
+            vec![
+                Bound::Text("World".to_owned()),
+                Bound::Text("Hello".to_owned())
+            ]
+        );
         assert_eq!(param, 6);
+    }
+
+    #[test]
+    fn an_undeclared_equals_key_never_reaches_sql() {
+        // A field name is an IDENTIFIER position. Left unchecked, a
+        // request-supplied facet key like `title' = 'x' OR '1'='1` would close
+        // the quote and OR away the tenant and allowlist predicates that
+        // precede it — widening past the visibility filter, not merely
+        // injecting. It must fail closed instead.
+        let mut param = 4;
+        let mut binds = Vec::new();
+        let sql = filter_sql(
+            &definition(),
+            &SearchFilter::default().equals("title' = 'x' OR '1'='1", "boom"),
+            &mut param,
+            &mut binds,
+        );
+
+        assert_eq!(sql, " AND FALSE", "{sql}");
+        assert!(!sql.contains("OR"), "{sql}");
+        assert!(binds.is_empty(), "nothing may be bound for a dropped key");
+        assert_eq!(param, 4, "the parameter counter must not advance");
+    }
+
+    #[test]
+    fn an_undeclared_key_does_not_disturb_the_numbering_of_declared_ones() {
+        let mut param = 4;
+        let mut binds = Vec::new();
+        let sql = filter_sql(
+            &definition(),
+            &SearchFilter::default()
+                .equals("aaa_not_a_field", "x")
+                .equals("title", "Hello"),
+            &mut param,
+            &mut binds,
+        );
+
+        // BTreeMap order puts the bogus key first; the real one must still
+        // bind at $4.
+        assert!(sql.contains("fields ->> 'title' = $4"), "{sql}");
+        assert!(sql.contains("AND FALSE"), "{sql}");
+        assert_eq!(binds, vec![Bound::Text("Hello".to_owned())]);
+        assert_eq!(param, 5);
+    }
+
+    #[test]
+    fn the_reserved_tenant_key_is_still_honoured() {
+        let mut param = 2;
+        let mut binds = Vec::new();
+        let sql = filter_sql(
+            &definition(),
+            &SearchFilter::default().equals(crate::backend::TENANT_FILTER_KEY, "acme"),
+            &mut param,
+            &mut binds,
+        );
+        assert_eq!(sql, " AND tenant_id = $2");
+        assert_eq!(binds, vec![Bound::Text("acme".to_owned())]);
     }
 
     #[test]

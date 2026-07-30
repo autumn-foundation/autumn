@@ -41,13 +41,19 @@ autumn_web::app()
 
 | Kind | Crate name | Struct name |
 |------|------------|-------------|
-| First-party (lives in this repo) | `autumn-<name>-plugin` | `<Name>Plugin` |
+| First-party, adds a *subsystem* | `autumn-<name>-plugin` | `<Name>Plugin` |
+| First-party, *implements a seam* for a named technology | `autumn-<subsystem>-<technology>` or `autumn-<name>` | `<Name>Plugin` |
 | Autumn companion (separate release train) | `autumn-<name>` or `autumn-<name>-plugin` | `<Name>Plugin` |
 | Third-party (lives on crates.io) | `autumn-plugin-<name>` | `<Name>Plugin` |
 
 Third-party crates keep the `autumn-plugin-` prefix so the ecosystem
 is easy to search on crates.io. First-party crates reverse the order so
 they cluster with the crate they extend.
+
+The second row is what `autumn-storage-s3`, `autumn-cache-redis`, and
+`autumn-search` follow: the crate name says which subsystem it provides rather
+than repeating `-plugin`, because the interesting part of the name is the seam,
+not the fact that it happens to ship as a plugin.
 
 Companion crates can live outside this repository when their dependency graph
 points back at `autumn-web`. Autumn Harvest is the main example: it provides

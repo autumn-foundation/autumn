@@ -99,6 +99,7 @@ after checking this table and `docs/guide/`.
 | Admin plugin crate | `autumn-admin-plugin` |
 | S3 storage plugin crate | `autumn-storage-s3` |
 | Redis cache plugin crate | `autumn-cache-redis` |
+| Search plugin crate | `autumn-search` |
 | Main entry macro | `#[autumn_web::main]`, not `#[autumn::main]` |
 
 The name `autumn` is the CLI binary, not the framework crate. In code, import
@@ -183,6 +184,7 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 
 For S3 storage add `autumn-storage-s3 = "0.5"`; `storage-s3` is no longer an
 `autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.5"`.
+For keyword + vector search with lifecycle-synced indexes add `autumn-search`.
 
 ## main.rs pattern
 
@@ -999,6 +1001,47 @@ let store = autumn_storage_s3::S3BlobStore::from_config(&config.storage.s3)
     .expect("S3 store");
 autumn_web::app().with_blob_store(store).run().await;
 ```
+
+For keyword **and** vector search with an index that stays in sync:
+
+```toml
+autumn-search = "0.6"
+```
+
+```rust
+#[autumn_web::model]
+#[searchable(language = "english")]
+pub struct Article {
+    #[id] pub id: i64,
+    #[searchable(weight = "A")] pub title: String,
+    #[searchable(weight = "B", embed)] pub body: String,   // embed => vector search
+}
+
+// `#[repository(hooks = ...)]` takes a plain type NAME, so alias the generic.
+type ArticleSearchHooks =
+    autumn_search::SearchSyncHooks<Article, NewArticle, UpdateArticle>;
+
+#[autumn_web::repository(Article, hooks = ArticleSearchHooks, commit_hooks = true)]
+pub trait ArticleRepository {}
+
+autumn_web::app()
+    .plugin(
+        autumn_search::SearchPlugin::new()
+            .postgres()
+            .embedder(std::sync::Arc::new(MyEmbedder))
+            .index::<Article>(),
+    )
+    .run()
+    .await;
+
+// In a handler: the plugin installs the client as an AppState extension.
+let search = state.extension::<autumn_search::SearchClient>().expect("SearchPlugin");
+let page = search.search::<Article>("rust web", &page_req).await?;   // ranked Page
+let hits = search.similar::<Article>("how do I add auth?", 5).await?; // k-NN
+```
+
+`autumn search reindex [--index NAME] [--purge]` rebuilds an index. See
+`docs/guide/search.md`.
 
 For shared Redis cache:
 
@@ -1837,7 +1880,7 @@ signing secrets, and other config problems without printing credentials.
 - Release tag for this line is `v0.5.0`.
 - Published crates are released together at the same workspace version:
   `autumn-macros`, `autumn-web`, `autumn-cli`, `autumn-admin-plugin`,
-  `autumn-storage-s3`, and `autumn-cache-redis`.
+  `autumn-storage-s3`, `autumn-cache-redis`, and `autumn-search`.
 - The publish gate checks crate metadata, package dry-runs, full docs,
   semver compatibility, release-note alignment, and downstream smoke tests.
 - Use `docs/release-checklist.md`, `docs/guide/docs-smoke.md`,

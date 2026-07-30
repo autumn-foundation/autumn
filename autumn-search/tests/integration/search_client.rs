@@ -11,14 +11,28 @@ use autumn_search::{
 };
 use autumn_web::pagination::{ListQuery, PageRequest, SortDir};
 
-use super::support::{Article, article, tenant_article};
+use super::support::{Article, TenantArticle, article, tenant_article, with_tenant};
 
 async fn client(articles: &[Article]) -> SearchClient {
-    let backend = Arc::new(MemorySearchBackend::new());
     let client = SearchClient::builder()
-        .backend(backend)
+        .backend(Arc::new(MemorySearchBackend::new()))
         .embedder(Arc::new(HashingEmbedder::new(128)))
         .index::<Article>()
+        .index::<TenantArticle>()
+        .build();
+    client.ensure_indexes().await.expect("ensure indexes");
+    for a in articles {
+        client.index_record(a).await.expect("index record");
+    }
+    client
+}
+
+/// A client seeded with tenant-scoped records.
+async fn tenant_client(articles: &[TenantArticle]) -> SearchClient {
+    let client = SearchClient::builder()
+        .backend(Arc::new(MemorySearchBackend::new()))
+        .embedder(Arc::new(HashingEmbedder::new(128)))
+        .index::<TenantArticle>()
         .build();
     client.ensure_indexes().await.expect("ensure indexes");
     for a in articles {
@@ -60,17 +74,20 @@ async fn search_accepts_a_list_query_so_it_composes_with_existing_endpoints() {
     // carries the paging. `search_list` reuses both exactly as a generated
     // `list()` endpoint does — search drops into an existing index handler
     // without a second query-parameter vocabulary.
-    let client = client(&[
+    let client = tenant_client(&[
         tenant_article(1, "Rust at acme", "rust framework", "acme"),
         tenant_article(2, "Rust at globex", "rust framework", "globex"),
     ])
     .await;
 
     let list = ListQuery::new(None, SortDir::Asc, &[("tenant_id", "globex")]);
-    let page = client
-        .search_list::<Article>("rust", &list, &PageRequest::default())
-        .await
-        .expect("search_list");
+    let page = with_tenant("globex", async {
+        client
+            .search_list::<TenantArticle>("rust", &list, &PageRequest::default())
+            .await
+    })
+    .await
+    .expect("search_list");
 
     assert_eq!(
         page.content.iter().map(|h| h.id).collect::<Vec<_>>(),
@@ -162,9 +179,12 @@ async fn hydrating_a_page_preserves_rank_order_and_pagination_metadata() {
 
 #[tokio::test]
 async fn hydration_drops_records_the_loader_could_not_return() {
-    // A hit whose record vanished between the search and the load (deleted, or
-    // filtered out by the loader's own authorization) must not become a hole
-    // or a panic — it is simply absent.
+    // A hit whose record vanished between the search and the load must not
+    // become a hole or a panic — it is simply absent, and it is subtracted
+    // from the total so the pager cannot advertise a record the caller never
+    // received. (That total is damage limitation, not authorization: filtering
+    // in the loader still leaks a count. `search_for` is the authorization
+    // path.)
     let client = client(&corpus()).await;
 
     let page = client
@@ -183,8 +203,8 @@ async fn hydration_drops_records_the_loader_could_not_return() {
         vec![2]
     );
     assert_eq!(
-        page.total_elements, 2,
-        "the pre-hydration total is preserved"
+        page.total_elements, 1,
+        "a record the loader could not produce is not counted"
     );
 }
 
@@ -309,20 +329,23 @@ async fn a_record_update_changes_recall_with_no_manual_reindex_call() {
 
 #[tokio::test]
 async fn an_explicit_filter_is_passed_through_to_the_backend() {
-    let client = client(&[
+    let client = tenant_client(&[
         tenant_article(1, "Rust at acme", "internal", "acme"),
         tenant_article(2, "Rust at globex", "internal", "globex"),
     ])
     .await;
 
-    let page = client
-        .search_filtered::<Article>(
-            "rust",
-            &PageRequest::default(),
-            SearchFilter::default().tenant("acme"),
-        )
-        .await
-        .expect("search");
+    let page = with_tenant("acme", async {
+        client
+            .search_filtered::<TenantArticle>(
+                "rust",
+                &PageRequest::default(),
+                SearchFilter::default().tenant("acme"),
+            )
+            .await
+    })
+    .await
+    .expect("search");
 
     assert_eq!(
         page.content.iter().map(|h| h.id).collect::<Vec<_>>(),

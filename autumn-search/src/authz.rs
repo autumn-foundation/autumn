@@ -19,9 +19,10 @@
 //!    [`SearchError::VisibilityUnavailable`], not an unfiltered read.
 
 use autumn_web::authorization::PolicyContext;
+use autumn_web::search::IndexDefinition;
 
 use crate::backend::{BoxFuture, SearchFilter};
-use crate::error::SearchResult;
+use crate::error::{SearchError, SearchResult};
 
 /// Turns a request context into the restriction a search must run under.
 ///
@@ -63,11 +64,40 @@ impl SearchVisibility for TenantVisibility {
     }
 }
 
+/// The ambient-tenant restriction for `definition`, applied by the client to
+/// **every** query on top of whatever the registered [`SearchVisibility`]
+/// returns — so tenant isolation does not depend on an app remembering to
+/// implement it.
+///
+/// Fails **closed**: querying a tenant-scoped index (one whose model carries a
+/// `tenant_id` column) with no tenant in scope is
+/// [`SearchError::TenantContextMissing`], not an unscoped read across every
+/// tenant. That matches `#[repository(tenant_scoped)]`, which errors for the
+/// same reason — and it matters most on exactly the paths that are easy to
+/// forget: a `#[job]`, a background task, or a route mounted outside the
+/// tenancy layer.
+///
+/// An index that is not tenant-scoped is unaffected.
+///
+/// # Errors
+///
+/// [`SearchError::TenantContextMissing`] when `definition.tenant_scoped` is
+/// set and no tenant is established.
+pub fn ambient_tenant_filter(definition: &IndexDefinition) -> SearchResult<SearchFilter> {
+    let filter = current_tenant_filter();
+    if definition.tenant_scoped && filter.tenant_id.is_none() {
+        return Err(SearchError::TenantContextMissing {
+            index: definition.name.to_owned(),
+        });
+    }
+    Ok(filter)
+}
+
 /// The ambient-tenant restriction, or an empty filter outside a tenant scope.
 ///
-/// Applied by the client to **every** query, on top of whatever the registered
-/// [`SearchVisibility`] returns, so tenant isolation does not depend on an app
-/// remembering to implement it.
+/// Prefer [`ambient_tenant_filter`], which additionally refuses an unscoped
+/// query against a tenant-scoped index. This raw form is for callers that
+/// already know the index is not tenant-scoped.
 #[must_use]
 pub fn current_tenant_filter() -> SearchFilter {
     autumn_web::tenancy::CURRENT_TENANT
@@ -111,6 +141,38 @@ mod tests {
         autumn_web::tenancy::CURRENT_TENANT
             .scope(Some("acme".to_owned()), async {
                 assert_eq!(current_tenant_filter().tenant_id.as_deref(), Some("acme"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_tenant_scoped_index_refuses_an_unscoped_query() {
+        // The leak this prevents: a search endpoint mounted outside the
+        // tenancy layer (or a job, where `CURRENT_TENANT` is deliberately
+        // unset) would otherwise return every tenant's rows, with
+        // `total_elements` counted across all of them.
+        const FIELDS: &[autumn_web::search::SearchIndexField] =
+            &[autumn_web::search::SearchIndexField::new("title", 'A')];
+        let scoped = IndexDefinition::new("articles", "simple", FIELDS, None, true);
+        let unscoped = IndexDefinition::new("notes", "simple", FIELDS, None, false);
+
+        let error = ambient_tenant_filter(&scoped).expect_err("must refuse");
+        assert!(
+            matches!(error, SearchError::TenantContextMissing { ref index } if index == "articles"),
+            "{error:?}"
+        );
+
+        // A model with no `tenant_id` column is unaffected.
+        assert_eq!(
+            ambient_tenant_filter(&unscoped).expect("no tenant column"),
+            SearchFilter::default()
+        );
+
+        // Inside a tenant scope the scoped index is allowed, and restricted.
+        autumn_web::tenancy::CURRENT_TENANT
+            .scope(Some("acme".to_owned()), async {
+                let filter = ambient_tenant_filter(&scoped).expect("in scope");
+                assert_eq!(filter.tenant_id.as_deref(), Some("acme"));
             })
             .await;
     }

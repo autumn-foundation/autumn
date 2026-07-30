@@ -16,7 +16,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use autumn_web::job::{JobHandler, JobInfo};
+use autumn_web::job::{JobHandler, JobInfo, JobUniqueness, JobUniquenessWindow};
 use autumn_web::{AppState, AutumnError, AutumnResult};
 use serde::{Deserialize, Serialize};
 
@@ -152,7 +152,9 @@ fn backfill_handler(state: AppState, args: serde_json::Value) -> JobFuture {
             AutumnError::internal_server_error_msg(format!("invalid backfill payload: {e}"))
         })?;
         let client = client_from_state(&state)?;
-        let options = args.options(BackfillOptions::default().batch_size);
+        // The app's configured `[search] batch_size`, not the compiled-in
+        // default — otherwise configuring it would only affect the CLI path.
+        let options = args.options(client.default_batch_size());
         match &args.index {
             Some(index) => {
                 client.backfill(index, &options).await?;
@@ -175,18 +177,36 @@ fn backfill_handler(state: AppState, args: serde_json::Value) -> JobFuture {
 pub fn search_job_infos(queue: &str) -> Vec<JobInfo> {
     let reindex: JobHandler = reindex_handler;
     let backfill: JobHandler = backfill_handler;
-    [
-        // Reindex is cheap and idempotent — retry it eagerly.
-        JobInfo::new(REINDEX_JOB, 5, 250, reindex),
-        // A backfill is long and expensive; a tight retry loop would stampede.
-        JobInfo::new(BACKFILL_JOB, 3, 30_000, backfill),
-    ]
-    .into_iter()
-    .map(|mut info| {
-        queue.clone_into(&mut info.queue);
-        info
-    })
-    .collect()
+
+    // Repeated writes to the same record collapse to one pending reindex. The
+    // job re-reads the row, so N queued reindexes of the same id would each
+    // read the same final state — only the last does distinct work. Keyed on
+    // `index` + `id` (NOT `op`), because an upsert and a delete for the same
+    // record must not both sit in the queue racing each other.
+    let mut reindex = JobInfo::new(REINDEX_JOB, 5, 250, reindex);
+    reindex.uniqueness = Some(JobUniqueness {
+        by: vec!["index".to_owned(), "id".to_owned()],
+        // Released when the job starts, not when it finishes: a write that
+        // lands *while* a reindex is running still needs its own reindex, or
+        // the index would keep the pre-write text.
+        window: JobUniquenessWindow::Pending,
+    });
+
+    // A backfill is long and expensive; a tight retry loop would stampede, and
+    // two concurrent full rebuilds of one index are pure waste.
+    let mut backfill = JobInfo::new(BACKFILL_JOB, 3, 30_000, backfill);
+    backfill.uniqueness = Some(JobUniqueness {
+        by: vec!["index".to_owned()],
+        window: JobUniquenessWindow::Running,
+    });
+
+    [reindex, backfill]
+        .into_iter()
+        .map(|mut info| {
+            queue.clone_into(&mut info.queue);
+            info
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -249,6 +269,38 @@ mod tests {
             ReindexArgs::upsert("articles", 7).unique_key(),
             ReindexArgs::upsert("notes", 7).unique_key()
         );
+    }
+
+    #[test]
+    fn the_reindex_job_actually_declares_that_dedup_to_the_queue() {
+        // The key above is only real if it is registered: `JobInfo.uniqueness`
+        // is what the enqueue chokepoint consults. Without this the doc on
+        // `unique_key` would be a claim about nothing.
+        let infos = search_job_infos("search");
+        let reindex = infos
+            .iter()
+            .find(|i| i.name == REINDEX_JOB)
+            .expect("reindex");
+        let uniqueness = reindex.uniqueness.as_ref().expect("reindex must dedup");
+        assert_eq!(uniqueness.by, vec!["index".to_owned(), "id".to_owned()]);
+        // Not keyed on `op`: an upsert and a delete for one record must not
+        // both sit in the queue racing each other.
+        assert!(!uniqueness.by.contains(&"op".to_owned()));
+        // Released when the job starts, so a write landing mid-reindex still
+        // gets its own reindex.
+        assert_eq!(uniqueness.window, JobUniquenessWindow::Pending);
+    }
+
+    #[test]
+    fn concurrent_full_rebuilds_of_one_index_are_deduped_while_running() {
+        let infos = search_job_infos("search");
+        let backfill = infos
+            .iter()
+            .find(|i| i.name == BACKFILL_JOB)
+            .expect("backfill");
+        let uniqueness = backfill.uniqueness.as_ref().expect("backfill must dedup");
+        assert_eq!(uniqueness.by, vec!["index".to_owned()]);
+        assert_eq!(uniqueness.window, JobUniquenessWindow::Running);
     }
 
     #[test]

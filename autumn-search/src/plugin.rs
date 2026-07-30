@@ -51,7 +51,12 @@ pub struct SearchPlugin {
     source: Option<Arc<dyn DocumentSource>>,
     visibility: Option<Arc<dyn SearchVisibility>>,
     indexes: Vec<IndexDefinition>,
-    postgres: Option<Arc<PostgresSearchStore>>,
+    /// Whether `postgres()` was requested. The store itself is built in
+    /// `Plugin::build`, after the configuration is final.
+    use_postgres: bool,
+    /// Set once the app supplies configuration explicitly, so `build` does not
+    /// then overwrite it from `autumn.toml`.
+    config_explicit: bool,
 }
 
 impl Default for SearchPlugin {
@@ -71,29 +76,45 @@ impl SearchPlugin {
             source: None,
             visibility: None,
             indexes: Vec::new(),
-            postgres: None,
+            use_postgres: false,
+            config_explicit: false,
         }
     }
 
     /// Replace the whole `[search]` configuration.
+    ///
+    /// Setting it explicitly also stops [`Plugin::build`] from loading
+    /// `[search]` out of `autumn.toml`.
     #[must_use]
     pub fn config(mut self, config: SearchConfig) -> Self {
         self.config = config;
+        self.config_explicit = true;
         self
     }
 
     /// Route the reindex/backfill jobs to a named queue.
+    ///
+    /// Overrides `[search] queue` in `autumn.toml`.
     #[must_use]
     pub fn queue(mut self, queue: impl Into<String>) -> Self {
         self.config.queue = queue.into();
+        self.config_explicit = true;
         self
     }
 
     /// Install the search engine.
+    ///
+    /// Overrides a previous [`Self::postgres`], **including** the document
+    /// source it installed: leaving that behind would ship a
+    /// [`PostgresSearchStore`] whose pool the startup hook no longer installs,
+    /// so every reindex and backfill would fail at runtime with "the search
+    /// store has no database pool".
     #[must_use]
     pub fn backend(mut self, backend: Arc<dyn SearchBackend>) -> Self {
         self.backend = Some(backend);
-        self.postgres = None;
+        if std::mem::take(&mut self.use_postgres) {
+            self.source = None;
+        }
         self
     }
 
@@ -102,12 +123,13 @@ impl SearchPlugin {
     ///
     /// One [`PostgresSearchStore`] serves as both; its connection pool is
     /// installed from `AppState` at startup, so there is nothing to pass in.
+    /// Builder order does not matter: the store is created in
+    /// [`Plugin::build`], once the configuration is final, so
+    /// `.postgres().config(cfg)` and `.config(cfg).postgres()` behave
+    /// identically.
     #[must_use]
-    pub fn postgres(mut self) -> Self {
-        let store = Arc::new(PostgresSearchStore::new(self.config.embedding_dimensions));
-        self.postgres = Some(Arc::clone(&store));
-        self.backend = Some(store.clone() as Arc<dyn SearchBackend>);
-        self.source = Some(store as Arc<dyn DocumentSource>);
+    pub const fn postgres(mut self) -> Self {
+        self.use_postgres = true;
         self
     }
 
@@ -139,7 +161,9 @@ impl SearchPlugin {
         self
     }
 
-    /// Register an index definition directly.
+    /// Register an index definition directly — for a corpus that is not a
+    /// `#[model]`, or to adjust a derived one. See
+    /// [`SearchClientBuilder::index_definition`](crate::SearchClientBuilder::index_definition).
     #[must_use]
     pub fn index_definition(mut self, definition: IndexDefinition) -> Self {
         self.indexes.push(definition);
@@ -149,7 +173,7 @@ impl SearchPlugin {
     /// Whether the Postgres backend is in use.
     #[must_use]
     pub const fn uses_postgres(&self) -> bool {
-        self.postgres.is_some()
+        self.use_postgres
     }
 
     /// The effective configuration.
@@ -168,7 +192,9 @@ impl SearchPlugin {
     }
 
     fn client_builder(&self) -> SearchClientBuilder {
-        let mut builder = SearchClient::builder().enabled(self.config.enabled);
+        let mut builder = SearchClient::builder()
+            .enabled(self.config.enabled)
+            .batch_size(self.config.batch_size);
         if let Some(backend) = &self.backend {
             builder = builder.backend(Arc::clone(backend));
         }
@@ -190,6 +216,7 @@ impl SearchPlugin {
 
 /// What a one-shot backfill boot was asked to rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BackfillTarget {
     /// Every registered index (`AUTUMN_SEARCH_BACKFILL=all`).
     AllIndexes,
@@ -243,20 +270,58 @@ fn parse_purge_flag(raw: Option<&str>) -> bool {
     raw.is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
 }
 
+/// Read `[search]` from `autumn.toml` in the working directory.
+///
+/// `Ok(None)` means the file is absent — an app with no `autumn.toml` is a
+/// supported zero-config setup, so that is not an error. A file that exists
+/// but has a malformed `[search]` **is**.
+fn load_config_file() -> Result<Option<SearchConfig>, crate::config::SearchConfigError> {
+    let Ok(contents) = std::fs::read_to_string("autumn.toml") else {
+        return Ok(None);
+    };
+    SearchConfig::from_toml_str(&contents).map(Some)
+}
+
 impl Plugin for SearchPlugin {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("autumn-search")
     }
 
-    fn build(self, app: AppBuilder) -> AppBuilder {
+    fn build(mut self, app: AppBuilder) -> AppBuilder {
         // Declare the plugin-owned `[search]` table first, so a host app with
         // `server.strict_config = true` boots instead of failing on an
         // "unknown key" — and so every return path below carries it.
         let app = app.config_section("search");
 
+        // Pick up `[search]` from `autumn.toml` unless the app configured the
+        // plugin explicitly. Without this, `enabled = false` — documented as
+        // the incident kill switch — would need a code change and a deploy,
+        // which is exactly what a kill switch must not need.
+        let mut config_error = None;
+        if !self.config_explicit {
+            match load_config_file() {
+                Ok(Some(config)) => self.config = config,
+                Ok(None) => {}
+                // A malformed `[search]` must not silently fall back to
+                // defaults: an unknown key there is how a typo'd kill switch
+                // would go unnoticed. `Plugin::build` cannot return an error,
+                // so surface it from the startup hook, which aborts boot.
+                Err(error) => config_error = Some(error.to_string()),
+            }
+        }
+
+        // Built HERE, not in `postgres()`, so the configuration it snapshots
+        // (`embedding_dimensions`, which gates the pgvector fast path) is
+        // final regardless of builder-call order.
+        let postgres = self.use_postgres.then(|| {
+            let store = Arc::new(PostgresSearchStore::new(self.config.embedding_dimensions));
+            self.backend = Some(Arc::clone(&store) as Arc<dyn SearchBackend>);
+            self.source = Some(Arc::clone(&store) as Arc<dyn DocumentSource>);
+            store
+        });
+
         let jobs = search_job_infos(&self.config.queue);
         let config = self.config.clone();
-        let postgres = self.postgres.clone();
         // The client is fully assembled here: every part is an `Arc` supplied
         // by the app's own builder call. Only the Postgres pool has to wait
         // for `AppState`, and the store takes it lazily — so the startup hook
@@ -267,11 +332,18 @@ impl Plugin for SearchPlugin {
             let client = client.clone();
             let postgres = postgres.clone();
             let config = config.clone();
+            let config_error = config_error.clone();
             async move {
+                if let Some(message) = config_error {
+                    return Err(autumn_web::AutumnError::internal_server_error_msg(format!(
+                        "autumn-search: {message}"
+                    )));
+                }
                 if let Some(store) = &postgres {
                     let pool = state.pool().cloned().ok_or_else(|| {
                         autumn_web::AutumnError::internal_server_error_msg(
-                            "SearchPlugin::postgres() needs a database pool; configure                              `database.primary_url` or install a different backend",
+                            "SearchPlugin::postgres() needs a database pool; configure \
+                             `database.primary_url` or install a different backend",
                         )
                     })?;
                     store.install_pool(pool);

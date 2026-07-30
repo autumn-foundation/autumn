@@ -86,9 +86,15 @@ impl HashingEmbedder {
     ///
     /// # Panics
     ///
-    /// Panics if `dimensions` is `0`. Use [`HashingEmbedder::try_new`] to
-    /// handle a runtime-supplied value.
+    /// Panics if `dimensions` is `0`. This is a *construction-time* argument
+    /// check, not a request path — a 0-dimension embedder would map every text
+    /// to the same vector, so failing at construction is the only honest
+    /// outcome. Use [`HashingEmbedder::try_new`] for a runtime-supplied value.
     #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "construction-time argument validation; no request path reaches this"
+    )]
     pub const fn new(dimensions: usize) -> Self {
         Self::try_new(dimensions).expect(
             "HashingEmbedder requires at least one dimension; 0 would make every text identical",
