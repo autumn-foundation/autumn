@@ -284,6 +284,37 @@ async fn ws() -> impl autumn_web::ws::WsHandler {
 Route functions are collected with `routes![...]`. Static routes also need
 `static_routes![...]` so `autumn build` can pre-render them.
 
+**Route-level SEO defaults (issue #1182, unreleased — trunk-dev):** declare
+per-page meta tag values once on the route with a `seo(...)` argument instead of
+rebuilding a `SeoMeta` in every handler. `SeoMeta` is an extractor, so a handler
+that takes one receives a builder pre-populated with the declared values:
+
+```rust
+use autumn_web::seo::SeoMeta;
+
+#[get("/about", seo(title = "About • My Blog", description = "Learn about us"))]
+async fn about(seo: SeoMeta) -> Markup { html! { head { (seo.render()) } } }
+
+// Static default on the attribute, dynamic fields filled in by the handler.
+// The builder is consuming, so the handler's value wins for the keys it
+// touches while the untouched attribute keys survive.
+#[get("/posts/{slug}", seo(og_type = "article"))]
+async fn show(Path(slug): Path<String>, seo: SeoMeta, db: Db) -> AutumnResult<Markup> {
+    let post = Post::find_by_slug(&slug, db).await?;
+    let seo = seo.title(format!("{} • Blog", post.title));
+    Ok(layout_with_seo(seo, html! { /* ... */ }))
+}
+```
+
+Keys mirror the `SeoMeta` builder: `title`, `description`, `canonical`,
+`og_title`, `og_description`, `og_image`, `og_type`, `og_url`, `twitter_card`,
+`twitter_title`, `twitter_description`, `twitter_image`, `robots`. Values must
+be string literals; an unknown or repeated key is a compile error. `#[static_get]`
+accepts the same argument, so pre-rendered pages carry the tags. The extractor
+never fails — on a route without `seo(...)` it yields an empty builder. Note the
+attribute supplies *values*, not markup: the handler still emits them, normally
+via `seo.render()` inside the layout's `<head>`.
+
 **Duplicate-route preflight (issue #1012, unreleased — trunk-dev):** two
 handlers that resolve to the same `(method, path)` after `.scoped(...)` prefix
 resolution — including `#[repository]`-generated API routes — fail app build
