@@ -57,8 +57,8 @@
 //! The argument works on every HTTP route macro — [`get`](crate::get),
 //! [`post`](crate::post), [`put`](crate::put), [`patch`](crate::patch),
 //! [`delete`](crate::delete) — and on [`static_get`](crate::static_get), so
-//! pre-rendered pages carry the same tags. ([`ws`](crate::ws) takes a path
-//! only: a WebSocket upgrade serves no crawlable document.)
+//! pre-rendered pages carry the same tags. ([`ws`](macro@crate::ws) takes a
+//! path only: a WebSocket upgrade serves no crawlable document.)
 //!
 //! It supplies *values*, not markup — the handler still chooses where to emit
 //! them, normally by embedding [`SeoMeta::render`] in a layout, so declaring
