@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **search:** a new optional plugin crate, `autumn-search`, turning the in-core
+  full-text primitives (#842) into a **search subsystem**: mark a model
+  searchable and get an index that stays in sync with the record lifecycle,
+  plus semantic / vector retrieval, behind one engine-agnostic API (#1191).
+  The `#[searchable]` attribute you already write is the single source of
+  truth — `#[model]` now also derives an engine-agnostic `IndexDefinition`
+  (index name, language, weighted fields) and a per-record `SearchDocument`
+  from it, and a new `#[searchable(embed)]` field flag nominates the one field
+  whose text is embedded for "find similar" / RAG retrieval. Two `embed`
+  fields, or `embed` without the model-level `#[searchable]`, are compile
+  errors that say so rather than a silent last-wins. Index sync is
+  `SearchSyncHooks`, a ready-made `MutationHooks` you name once on the
+  repository: create/update/delete then enqueue a durable `#[job]` reindex, so
+  indexing is off-request and survives a restart. The job payload is
+  `(index, id)` and **not** the record — the handler re-reads the row, so a
+  present row upserts and an absent row deletes. That single idempotent
+  operation makes at-least-once delivery safe and lets a lost delete event or
+  a row changed by direct SQL repair itself. Queries reuse `Page`/`ListQuery`
+  (`search`, `search_list`, `search_hydrated`, `similar`, `similar_to`), and
+  `autumn search reindex [--index NAME] [--purge]` rebuilds an index by running
+  the application binary — the same technique `autumn jobs manifest` uses,
+  because only the app knows which models, backend, and embedder are
+  registered. Backfill walks the source by keyset (`WHERE id > $after`), never
+  `OFFSET`, so a live table cannot skip or repeat rows. Backends are pluggable
+  behind a `SearchBackend` trait shaped so an external engine (Meilisearch,
+  Tantivy, a vector store) is a new `impl` rather than a breaking change: the
+  Postgres backend ships first, reusing `to_tsvector`/`setweight`/`ts_rank_cd`
+  and adding `pgvector` when the extension is present — with a portable
+  `double precision[]` + `autumn_search_cosine()` fallback so a managed
+  Postgres without `pgvector` still boots and still answers k-NN queries, at
+  the same ordering and lower speed. A `MemorySearchBackend` gives complete
+  keyword *and* vector coverage with no Docker and no network. Embedding is
+  pluggable via an `Embedder` trait; the crate ships **no** model, runtime, or
+  vendor SDK — only a `NoEmbedder` that refuses (so a missing provider is a
+  typed error, never invented vectors) and a deterministic `HashingEmbedder`
+  for dev and tests. Search respects existing authorization: a
+  `SearchVisibility` hook turns a `PolicyContext` into a `SearchFilter` that is
+  pushed *into* the engine query rather than applied afterwards, so page totals
+  and neighbour counts are computed post-restriction; filters **intersect**, so
+  a caller can only narrow what authorization allowed; a failing hook aborts
+  the search instead of widening it; and calling the authorization-aware entry
+  point with no hook registered is a typed error rather than an unfiltered
+  read. Because a `SearchFilter` is plain data, an out-of-scope engine gets the
+  same tenant/visibility restriction, and the ambient `CURRENT_TENANT` is
+  intersected into every query automatically. Query text is a bag of words
+  across every backend — each token must match, operator syntax (`OR`,
+  `field:`, `*`) is never interpreted, and a blank query returns an empty page
+  having issued no query — which keeps results consistent between engines and
+  makes a hostile query string structurally incapable of widening the result
+  set. The in-core `#[repository(searchable)]` `search()` and its
+  `websearch_to_tsquery` semantics are untouched; this subsumes #842 as one
+  backend, it does not replace it. See `docs/guide/search.md`.
+
 - **seo:** route-level meta tag defaults via a `seo(...)` route attribute
   argument, closing the acceptance criterion deferred from the SEO toolkit
   (#1182, deferred from #830). Static per-page metadata no longer has to be

@@ -50,7 +50,7 @@ cargo doc -p autumn-web --no-deps \
 
 # All other publishable crates: use their default features (no
 # [package.metadata.docs.rs] section means docs.rs uses defaults).
-for crate in autumn-macros autumn-cli autumn-admin-plugin autumn-storage-s3 autumn-cache-redis; do
+for crate in autumn-macros autumn-cli autumn-admin-plugin autumn-storage-s3 autumn-cache-redis autumn-search; do
   echo ""
   echo "==> $crate (default features)"
   cargo doc -p "$crate" --no-deps 2>&1

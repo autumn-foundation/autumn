@@ -125,6 +125,12 @@ pub mod hooks;
 pub mod i18n;
 pub mod idempotency;
 pub mod range;
+/// Engine-agnostic search vocabulary.
+///
+/// Index definitions and extracted documents, shared by `#[model]
+/// #[searchable]` and the optional `autumn-search` plugin.
+#[cfg(feature = "db")]
+pub mod search;
 pub mod seo;
 /// Translation lookup macro with compile-time key validation.
 ///

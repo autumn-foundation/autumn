@@ -40,6 +40,7 @@ mod routes;
 mod routes_audit;
 mod scaling_driver;
 mod schema;
+mod search;
 mod seed;
 mod serve;
 mod setup;
@@ -166,6 +167,46 @@ pub enum LifecycleSubcommands {
         /// Write the diagram(s) to this file instead of stdout.
         #[arg(long, value_name = "FILE")]
         out: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn search`.
+#[derive(Subcommand)]
+pub enum SearchSubcommands {
+    /// Rebuild search indexes from the system of record.
+    ///
+    /// Runs the application binary with `AUTUMN_SEARCH_BACKFILL` set, which
+    /// makes `autumn-search`'s startup hook run a full backfill and exit
+    /// instead of serving traffic. Only the app knows which models are
+    /// searchable and which backend/embedder are installed, so the reindex has
+    /// to run inside it — the same technique `autumn jobs manifest` uses.
+    ///
+    /// # Examples
+    ///
+    ///   autumn search reindex
+    ///   autumn search reindex --index articles
+    ///   autumn search reindex --purge
+    #[command(verbatim_doc_comment)]
+    Reindex {
+        /// Index to rebuild. Omit to rebuild every registered index.
+        #[arg(long)]
+        index: Option<String>,
+
+        /// Clear each index before rebuilding it.
+        ///
+        /// Use after a schema change, when documents the source no longer
+        /// produces would otherwise survive. Searches return nothing until the
+        /// rebuild finishes.
+        #[arg(long)]
+        purge: bool,
+
+        /// Package to run (for workspaces).
+        #[arg(long)]
+        package: Option<String>,
+
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long)]
+        bin: Option<String>,
     },
 }
 
@@ -792,6 +833,12 @@ enum Commands {
     Jobs {
         #[command(subcommand)]
         action: JobsSubcommands,
+    },
+
+    /// Operate the application's search indexes (`autumn-search`).
+    Search {
+        #[command(subcommand)]
+        action: SearchSubcommands,
     },
 
     /// Run conformance checks against a plugin's route contributions.
@@ -3207,6 +3254,21 @@ fn run_command(command: Commands) {
                     package: package.as_deref(),
                     bin: bin.as_deref(),
                     output: &path,
+                });
+            }
+        },
+        Commands::Search { action } => match action {
+            SearchSubcommands::Reindex {
+                index,
+                purge,
+                package,
+                bin,
+            } => {
+                search::run(&search::ReindexOptions {
+                    package: package.as_deref(),
+                    bin: bin.as_deref(),
+                    index: index.as_deref(),
+                    purge,
                 });
             }
         },

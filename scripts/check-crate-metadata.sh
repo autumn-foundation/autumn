@@ -42,6 +42,7 @@ declare -a CRATES=(
   "autumn-admin-plugin:autumn-admin-plugin/Cargo.toml"
   "autumn-storage-s3:autumn-storage-s3/Cargo.toml"
   "autumn-cache-redis:autumn-cache-redis/Cargo.toml"
+  "autumn-search:autumn-search/Cargo.toml"
 )
 
 # Required fields that must appear in [package] (inline, quoted, array, or

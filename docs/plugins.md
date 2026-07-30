@@ -27,6 +27,16 @@ autumn_web::app()
     .await;
 ```
 
+## First-party plugin crates
+
+| Crate | What it adds | Guide |
+|---|---|---|
+| `autumn-admin-plugin` | Admin UI and API-token administration | [Admin](./guide/admin.md) |
+| `autumn-media-plugin` | Live-streaming media (broadcast + rooms) | — |
+| `autumn-storage-s3` | S3-backed object storage | [Storage](./guide/storage.md) |
+| `autumn-cache-redis` | Redis-backed shared cache | [Cache stampede](./guide/cache-stampede.md) |
+| `autumn-search` | Keyword **and** vector search with lifecycle-synced indexes | [Search](./guide/search.md) |
+
 ## Naming conventions
 
 | Kind | Crate name | Struct name |
