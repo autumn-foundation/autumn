@@ -429,7 +429,11 @@ cooloff_secs = 900    # 15 minutes
 ```
 
 Each maps to an env override (`AUTUMN_AUTH__LOCKOUT__THRESHOLD`, …). Lockout
-state lives in Postgres, so all replicas agree.
+state is columns on the account row, so it lives in whichever database the app
+is configured against and every replica sharing that database agrees. On a
+[SQLite](./sqlite-in-production.md) deployment where each replica has its own
+file, the counters are per-replica and the lockout threshold is effectively
+multiplied by the replica count.
 
 `window_secs` is not yet enforced — failures currently accumulate since the last
 successful login rather than over a sliding window.
@@ -504,12 +508,42 @@ generated auth stack persists one row per login, keyed by the **digest** of the
 session id, holding the user, login IP, parsed user-agent, an optional device
 label, `created_at`, and `last_seen_at`.
 
-That row — not the cookie — is the source of truth. Authenticated handlers load
-it by digest; if it is gone the request is rejected and the cookie session is
-destroyed, so a revoked session dies on its very next request even if the cookie
-is replayed. `last_seen_at` is refreshed at most once per window, bounding a busy
-session to one `UPDATE` per window rather than one per request. The raw session
-id never reaches the database, so a database leak cannot be replayed as a cookie.
+Revoking a device deletes its row. **That deletion is enforced only where a
+handler looks the row up** — `require_tracked_session(&session, &mut db,
+&state)`, which loads the row by digest and, when it is gone, destroys the
+cookie session and rejects with `401`. The generated auth routes call it; so
+must yours.
+
+This is the part to get right, because the failure mode is silent:
+
+```rust,ignore
+// Enforces revocation — the row is checked on every request.
+#[get("/dashboard")]
+async fn dashboard(session: Session, mut db: Db, State(state): State<AppState>)
+    -> AutumnResult<Markup>
+{
+    let user = require_tracked_session(&session, &mut db, &state).await?;
+    // …
+}
+
+// Does NOT enforce revocation. `#[secured]` checks only that the session
+// carries the auth key, so a revoked device keeps reaching this route until it
+// hits a handler that does the lookup.
+#[get("/dashboard")]
+#[secured]
+async fn dashboard() -> AutumnResult<Markup> { /* … */ }
+```
+
+`#[secured]` and `RequireAuth` answer "is there a session key?", not "is this
+session still authorized to exist" — revocation deletes the tracking row, not
+the record in the session store. If revocation must hold across your whole app,
+call `require_tracked_session` in every authenticated handler, or wrap the check
+in [middleware](./middleware.md) layered over the authenticated subtree so no
+route can forget it.
+
+`last_seen_at` is refreshed at most once per window, bounding a busy session to
+one `UPDATE` per window rather than one per request. The raw session id never
+reaches the database, so a database leak cannot be replayed as a cookie.
 
 `GET /account/sessions` renders the device list with per-row revoke, a device
 label form, and "sign out everywhere else" (htmx in-place swaps, with plain form
@@ -572,6 +606,9 @@ indistinguishable, and that logout makes the old cookie unusable. See the
 - [ ] `[auth.password]` reviewed; consider `breach_check = "fail_open"`.
 - [ ] `[auth.lockout]` left enabled, `AUTUMN_ADMIN_SECRET` set, and the unlock
       route network-restricted.
+- [ ] Every authenticated route reaches `require_tracked_session` (directly or
+      via middleware) if you rely on session revocation — `#[secured]` alone
+      does not enforce it.
 - [ ] `/login` and `/forgot-password` carry [`#[throttle]`](./rate-limiting.md).
 - [ ] Sensitive routes carry [`#[step_up]`](./step-up-authentication.md).
 - [ ] `autumn routes audit` shows no unintentionally public route — see the
