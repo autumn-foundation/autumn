@@ -94,6 +94,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **docs/examples:** a runnable state-machine / lifecycle demonstration (`#[state_machine]` transition effects) in the `wiki` example — the `Page::status` machine now declares per-edge `on = "..."` effects that append the audit `Revision` inside the transition's transaction, driven from the transitions handler via `transition_status_to_on_conn` under one `Db::tx_with` — cross-linked from the state-machines guide (#2099). [no-plugin]
 - **docs:** an **aggregate queries** guide (`docs/guide/aggregates.md`) documenting GROUP BY roll-ups, paired with a runnable `GET /stats` roll-up route in the `bookmarks` example (#2099). [no-plugin]
 - **docs:** an **audit logging** guide (`docs/guide/audit-logging.md`) documenting audit events with actor auto-attribution, with a minimal audit sink wired into the `reddit-clone` example (#2099). [no-plugin]
+- **docs:** a core **authentication** guide (`docs/guide/authentication.md`) —
+  the session-auth hub that was previously rustdoc-only: the `Session`
+  extractor and its store backends, `[session]` cookie configuration, password
+  hashing and the `[auth.password]` policy (weak-list, context similarity, HIBP
+  k-anonymity), login/logout anatomy (session-id rotation, non-enumeration),
+  `#[secured]`/`RequireAuth`/`Auth<T>`, `[auth.lockout]`, rotating remember-me
+  tokens with theft detection, active-session revocation, `acting_as` in tests,
+  and a production checklist — cross-linked from the OAuth, step-up,
+  authorization, and testing guides and from the `saas`/`reddit-clone` login
+  handlers (#2099). [no-plugin]
 - **sim-testing:** add the `always!` / `sometimes!` simulation assertion macros
   (W6 op-driver assertion core, #1797) — hard-invariant + reachability assertions
   for `#[sim_test]`, with a non-vacuity registry the forthcoming sim-sweep

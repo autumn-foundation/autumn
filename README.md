@@ -231,6 +231,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 ## Documentation
 
 - [Getting Started Guide](docs/guide/getting-started.md)
+- [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
 - [Dev-Loop Latency Budget](docs/guide/dev-loop-latency.md) — p50/p95/max budgets per change class, measurement methodology, and CI gates for `autumn dev`
 - [Signed Webhook Intake](docs/guide/signed-webhooks.md)
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
