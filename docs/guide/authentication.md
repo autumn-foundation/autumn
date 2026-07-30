@@ -312,8 +312,17 @@ Three properties are worth naming explicitly:
   is deleted on save.
 - **Non-enumeration.** Wrong password, unknown address, unconfirmed account, and
   locked account all return the *same* status and body. The dummy-hash
-  verification keeps the timing uniform too — otherwise a fast rejection is a
-  free "this email is not registered" oracle.
+  verification removes the dominant timing signal — without it, an unknown
+  address skips bcrypt entirely and returns in a fraction of the time, which is
+  a free "this email is not registered" oracle.
+
+  It narrows the gap rather than closing it. A wrong password against a *real*
+  account still writes a `failed_attempts` update, and a successful or
+  confirmed login writes a counter reset, where an unknown address returns
+  straight after the dummy verify with no write at all. That residual
+  difference is a DB round-trip, not a bcrypt cost, but it is measurable in
+  aggregate — so pair it with [rate limiting](./rate-limiting.md) on `/login`
+  rather than treating the timing as truly uniform.
 - **Bounded work.** Cap input lengths before touching the database or bcrypt.
 
 Logout tears the session down and, if you issue them, revokes the device's
@@ -352,6 +361,16 @@ record. Use `destroy()` when you also want the cookie expired outright.
 If you issue neither remember cookies nor tracking rows, the two helper calls
 and the `Set-Cookie` drop out and logout really is just `clear()` +
 `rotate_id()`. Add them back the moment you turn remember-me on.
+
+**Logout is best-effort against database failure.** Both generated helpers
+swallow their delete errors (`let _ = …`) and return `()`, so the handler has
+nothing to propagate: if the `DELETE` fails, the browser still gets a cleared
+cookie and a destroyed session, but the remember chain survives server-side and
+a copy of that cookie can still authenticate later. The session teardown itself
+is unaffected. If your threat model does not tolerate that, delete the chain
+yourself with a checked query and fail the logout — or queue a
+[durable job](./jobs.md) to retry the deletion — instead of relying on the
+best-effort helper.
 
 Working code: [`examples/saas/src/routes/auth.rs`](../../examples/saas/src/routes/auth.rs)
 (signup with policy enforcement, [submit tokens](./submit-tokens.md), and
@@ -645,7 +664,9 @@ indistinguishable, and that logout makes the old cookie unusable. See the
 - [ ] `session.secure = true`, `http_only = true`, `same_site = "Lax"` (or
       `"Strict"`), and a `max_age_secs` you actually want.
 - [ ] Login, signup, and password reset all call `rotate_id()`.
-- [ ] Login responses are non-enumerating in body, status, **and** timing.
+- [ ] Login responses are non-enumerating in body and status, with the
+      dummy-hash verify in place so timing does not separate known from unknown
+      addresses by a bcrypt's width.
 - [ ] `[auth.password]` reviewed; consider `breach_check = "fail_open"`.
 - [ ] `[auth.lockout]` left enabled, `AUTUMN_ADMIN_SECRET` set, and the unlock
       route network-restricted. That variable (or `SECRET_KEY_BASE`) also salts
