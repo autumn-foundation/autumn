@@ -978,6 +978,12 @@ pub(crate) fn robots_directive_is_noindex(directive: &str) -> bool {
 }
 
 /// Whether these route-level defaults exclude the page from the sitemap.
+///
+/// This governs only the paths Autumn *derives on its own* — the concrete
+/// `#[static_get]` route paths it would otherwise add automatically. Entries
+/// coming from a [`SitemapSource`] the application registered via
+/// [`AppBuilder::seo_source`](crate::app::AppBuilder::seo_source) are passed
+/// through untouched; see [`assemble_seo_bodies`] for why.
 #[must_use]
 pub(crate) fn defaults_exclude_from_sitemap(defaults: SeoRouteDefaults) -> bool {
     defaults.robots.is_some_and(robots_directive_is_noindex)
@@ -985,6 +991,30 @@ pub(crate) fn defaults_exclude_from_sitemap(defaults: SeoRouteDefaults) -> bool 
 
 /// Collect sitemap entries from dynamic sources and static path hints, then
 /// build the `robots.txt` and `sitemap.xml` bodies.
+///
+/// # Which entries route-level `robots = "noindex"` filters
+///
+/// `static_paths` arrives already filtered by
+/// [`defaults_exclude_from_sitemap`]: a `#[static_get]` route declaring
+/// `noindex` is dropped before it gets here, so Autumn never advertises a URL
+/// it derived itself while also asking crawlers not to index it.
+///
+/// `sources` are **not** filtered, deliberately. A [`SitemapSource`] is an
+/// explicit, application-authored list of URLs, and its
+/// [`SitemapEntry`] values carry only a `loc` string — nothing ties an entry
+/// back to the route that serves it. Silently dropping entries an application
+/// asked for would be its own surprise ("I registered this source, why is my
+/// URL missing?"), and matching concrete URLs back to route templates would
+/// mean guessing which of two contradictory instructions the author meant.
+///
+/// The practical consequence: a parameterized route such as
+/// `#[static_get("/posts/{slug}", params = …, seo(robots = "noindex"))]`
+/// contributes nothing to the sitemap on its own — its template is skipped for
+/// containing `{`, and `params_fn` output is used for pre-rendering only, never
+/// for the sitemap. Its concrete URLs appear only if the application also
+/// registers a `SitemapSource` emitting them, which is a contradiction in the
+/// application's own configuration rather than something Autumn introduces.
+/// Omit those URLs from the source to resolve it.
 ///
 /// Called by both `AppBuilder::run` (server mode) and
 /// `AppBuilder::run_build_mode` (static build mode).
@@ -1280,6 +1310,56 @@ mod tests {
         assert!(defaults_exclude_from_sitemap(
             SeoRouteDefaults::EMPTY.with_robots("noindex, nofollow")
         ));
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_does_not_filter_registered_source_entries() {
+        // A registered `SitemapSource` is the application's explicit URL list.
+        // Route-level `robots = "noindex"` filters the paths Autumn derives on
+        // its own (done before this call), never a source's entries — dropping
+        // those silently would make `seo_source` lossy. Pinned so the boundary
+        // stays a decision rather than an accident.
+        let source = Arc::new(SimpleSitemapSource {
+            entries: vec![SitemapEntry::new("https://example.com/posts/hello")],
+        }) as Arc<dyn SitemapSource>;
+
+        let (_, sitemap) = assemble_seo_bodies(
+            "prod",
+            Some("https://example.com"),
+            None,
+            &[],
+            &[source],
+            // The caller already dropped any noindex static route, and a
+            // parameterized template would be skipped for containing `{`.
+            &[],
+        )
+        .await;
+
+        assert!(
+            sitemap.contains("https://example.com/posts/hello"),
+            "explicitly registered source entries must survive; got:\n{sitemap}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_skips_parameterized_templates() {
+        // The other half of the same story: a parameterized static route
+        // contributes nothing on its own, so a noindex one cannot leak in
+        // through the template path either.
+        let (_, sitemap) = assemble_seo_bodies(
+            "prod",
+            Some("https://example.com"),
+            None,
+            &[],
+            &[],
+            &["/posts/{slug}"],
+        )
+        .await;
+
+        assert!(
+            !sitemap.contains("/posts/"),
+            "parameterized templates must never be advertised; got:\n{sitemap}"
+        );
     }
 
     #[test]

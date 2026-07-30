@@ -75,8 +75,13 @@ pub struct StaticRouteMeta {
     ///
     /// Carried here as well as on [`Route`](crate::Route) so the sitemap
     /// builder can honour a declared `robots = "noindex…"` and leave the page
-    /// out of `sitemap.xml` — otherwise the app would advertise a URL it also
+    /// out of `sitemap.xml` — otherwise Autumn would advertise a URL it also
     /// asks crawlers not to index.
+    ///
+    /// This governs the paths Autumn derives from static routes. URLs supplied
+    /// by a [`SitemapSource`](crate::seo::SitemapSource) the application
+    /// registered are passed through unfiltered; see
+    /// `seo::assemble_seo_bodies` for the reasoning.
     pub seo: crate::seo::SeoRouteDefaults,
 }
 

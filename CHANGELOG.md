@@ -29,8 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[static_get]` accepts the same argument, so pre-rendered pages carry the
   tags too — static generation drives the same router, so no separate wiring
   was needed. A static route declaring `robots = "noindex"` is now also left
-  out of the generated `sitemap.xml`, so the app no longer advertises a URL it
-  simultaneously asks crawlers not to index. `#[ws]` is the one route macro
+  out of the generated `sitemap.xml`, so Autumn no longer advertises a URL it
+  derived itself while also asking crawlers not to index it. This covers the
+  paths Autumn derives from `#[static_get]` routes; entries from a
+  `SitemapSource` you register are an explicit, application-authored URL list
+  and are passed through unfiltered (a `SitemapEntry` carries only a `loc`,
+  with nothing tying it back to a route). `#[ws]` is the one route macro
   that rejects `seo(...)` — a WebSocket upgrade serves no crawlable document —
   and says so rather than failing with a bare parse error. The
   declared values are recorded on the new `Route::seo` field as a `Copy`,
