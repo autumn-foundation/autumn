@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli:** `autumn console` (alias `autumn c`) — a one-command, pre-wired data
+  playground (#1039). Autumn's answer to `rails console` / `manage.py shell` /
+  `iex -S mix`: because Rust has no stable `eval`, it follows loco.rs's
+  edit-and-run model rather than building an interpreter. The first invocation
+  scaffolds `src/bin/playground.rs` already wired with the same config and
+  database-URL resolution `autumn seed`/`autumn dev` use
+  (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` → `DATABASE_URL` →
+  `autumn.toml`, profile-aware, via `autumn_web::seed::SeedContext`), a
+  constructed async pool (`ctx.pool()`), a checked-out connection (`db`), and a
+  clearly-marked `// your code here` region; every invocation compiles and runs
+  it against the resolved environment. Because a Cargo binary target is its own
+  crate and a generated app has no `src/lib.rs`, the playground declares the
+  app's `schema`, `models`, `repositories`, and `policies` modules with
+  `#[path]`, so a `find_all()`/`find_by_id()` round-trip compiles with no
+  further wiring. The playground's `[[bin]]` is gated behind
+  `required-features = ["playground"]`, so `cargo build`, `cargo test`, `autumn
+  dev`, and `autumn build` skip it entirely and only `autumn console` ever
+  compiles it — a playground that doesn't compile can never break the app's
+  default build, and the `seed` feature's implied `db` never reaches a
+  DB-free project's normal builds. Re-running never overwrites an edited
+  playground (`--force` regenerates from the template, and refuses to follow a
+  symlink); `--scaffold-only` stops before the build. The two `Cargo.toml`
+  edits — the `playground` feature and the gated bin target — go through a
+  format-preserving TOML editor, are written atomically, never touch the
+  `autumn-web` dependency line, and are idempotent. A config or database
+  failure prints the underlying error and exits non-zero from the playground
+  out through the command's own exit status. Because that isolation is a
+  guarantee rather than a best effort, `autumn console` refuses — before
+  writing anything, leaving `Cargo.toml` byte-identical — when a manifest is in
+  a state where it cannot hold: an existing `playground` bin target that is
+  ungated or gated on a different feature, a `default` feature list that
+  reaches `playground` (directly or transitively), or an edition-2015 package
+  where the scaffolded file would be auto-discovered as an ungated binary. Each
+  error names the one line to change. Guide: `docs/guide/console.md`.
+  No `autumn-web` API change.
 - **notifications:** first-class in-app notifications store with a read/unread
   feed (#1148). A new `autumn_web::notifications` module ships a
   `Notifications` service/extractor (surfaced like `Session`/`Auth`) with

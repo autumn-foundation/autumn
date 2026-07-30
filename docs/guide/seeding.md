@@ -225,3 +225,5 @@ autumn migrate && autumn seed && autumn dev
 - [`docs/guide/getting-started.md`](getting-started.md) — includes
   `autumn seed` in the quickstart flow
 - [`docs/guide/generators.md`](generators.md) — `autumn generate model` / scaffold
+- [`docs/guide/console.md`](console.md) — `autumn console`, the data playground
+  that shares this `SeedContext` bootstrap

@@ -1,0 +1,74 @@
+//! Data playground for {{project_name}} — Autumn's answer to `rails console`.
+//!
+//! Scaffolded by `autumn console`. This file is yours: put a query in the
+//! marked region below, then re-run `autumn console` to compile and execute it
+//! against the live database.
+//!
+//! `autumn console` never overwrites this file once it exists — pass `--force`
+//! to regenerate it from the template.
+//!
+//! Everything below the header is already wired, so there is no boilerplate to
+//! re-author:
+//!
+//!   * config + database-URL resolution identical to `autumn dev` and
+//!     `autumn seed` (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL`
+//!     → `DATABASE_URL` → `autumn.toml`, profile-aware);
+//!   * a constructed async connection pool — `ctx.pool()`;
+//!   * a checked-out connection — `db` — ready for Diesel, model, and
+//!     repository calls.
+//!
+//! A Cargo binary target is its own crate and cannot see the app's `src/`
+//! modules, so the app's data modules are pulled in with `#[path]` below. Add
+//! more `#[path]` lines the same way if your queries need them.
+#![allow(dead_code, unused_imports, unused_mut, unused_variables)]
+
+{{app_modules}}
+use autumn_web::seed::SeedContext;
+
+#[autumn_web::main]
+async fn main() {
+    let ctx = match SeedContext::build() {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            eprintln!(
+                "autumn console: could not resolve configuration or build the database pool: {err}"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("autumn console: profile `{}`", ctx.profile());
+
+    let mut db = match ctx.conn().await {
+        Ok(db) => db,
+        Err(err) => {
+            eprintln!("autumn console: could not connect to the database: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    // ── your code here ─────────────────────────────────────────────────────
+    //
+    // `db` is a live pooled connection: pass `&mut db` (or `&mut *db`) to
+    // Diesel and model calls. `ctx.pool()` hands you the pool itself for the
+    // APIs that want one — repositories and factories, for example.
+    //
+    //   // A repository round-trip (`autumn generate scaffold Post …`). The
+    //   // generated trait must be in scope for its methods to resolve:
+    //   use repositories::post::{PgPostRepository, PostRepository};
+    //   let repo = PgPostRepository::with_pool_untracked(ctx.pool().clone());
+    //   for post in repo.find_all().await.unwrap() {
+    //       println!("{} {}", post.id, post.title);
+    //   }
+    //
+    //   // A raw Diesel round-trip against the generated schema:
+    //   use autumn_web::reexports::diesel::prelude::*;
+    //   use autumn_web::reexports::diesel_async::RunQueryDsl;
+    //   let count: i64 = schema::posts::table.count().get_result(&mut db).await.unwrap();
+    //   println!("{count} post(s)");
+    //
+    // ───────────────────────────────────────────────────────────────────────
+
+    drop(db);
+    eprintln!("autumn console: done.");
+}
