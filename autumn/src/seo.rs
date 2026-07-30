@@ -54,12 +54,17 @@
 //! `twitter_description`, `twitter_image`, and `robots`. Values must be string
 //! literals; unknown or repeated keys are compile errors.
 //!
-//! The argument works on every route macro, including
-//! [`static_get`](crate::static_get), so pre-rendered pages carry the same
-//! tags. It supplies *values*, not markup — the handler still chooses where to
-//! emit them, normally by embedding [`SeoMeta::render`] in a layout. A handler
-//! that takes `SeoMeta` on a route without `seo(...)` simply receives an empty
-//! builder; the extractor never fails.
+//! The argument works on every HTTP route macro — [`get`](crate::get),
+//! [`post`](crate::post), [`put`](crate::put), [`patch`](crate::patch),
+//! [`delete`](crate::delete) — and on [`static_get`](crate::static_get), so
+//! pre-rendered pages carry the same tags. ([`ws`](crate::ws) takes a path
+//! only: a WebSocket upgrade serves no crawlable document.)
+//!
+//! It supplies *values*, not markup — the handler still chooses where to emit
+//! them, normally by embedding [`SeoMeta::render`] in a layout, so declaring
+//! `seo(...)` on a handler that never takes a `SeoMeta` parameter renders
+//! nothing. A handler that takes `SeoMeta` on a route without `seo(...)`
+//! simply receives an empty builder; the extractor never fails.
 //!
 //! ## Sitemap
 //!
@@ -580,16 +585,36 @@ impl SeoMeta {
 /// # Example
 ///
 /// ```rust,no_run
+/// # #[cfg(feature = "maud")]
+/// # {
 /// use autumn_web::prelude::*;
-/// use autumn_web::seo::SeoMeta;
 ///
 /// #[get("/about", seo(title = "About • My Blog", description = "Learn about us"))]
 /// async fn about(seo: SeoMeta) -> Markup {
 ///     // `seo` already carries the attribute's title and description.
 ///     html! { head { (seo.render()) } }
 /// }
+/// # }
+/// ```
+///
+/// # Constructing one by hand
+///
+/// The type is `#[non_exhaustive]`, because the set of useful SEO keys is
+/// open-ended and new ones must stay additive. Start from
+/// [`EMPTY`](Self::EMPTY) and chain the `with_*` setters, all of which are
+/// `const`:
+///
+/// ```rust
+/// use autumn_web::seo::SeoRouteDefaults;
+///
+/// const DEFAULTS: SeoRouteDefaults = SeoRouteDefaults::EMPTY
+///     .with_title("About • My Blog")
+///     .with_og_type("website");
+///
+/// assert_eq!(DEFAULTS.title, Some("About • My Blog"));
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SeoRouteDefaults {
     /// Default page `<title>`.
     pub title: Option<&'static str>,
@@ -623,8 +648,10 @@ impl SeoRouteDefaults {
     /// Defaults with every key unset — what a route without a `seo(...)`
     /// argument records.
     ///
-    /// Route macros use this as the struct-update base so only the keys named
-    /// on the attribute appear in generated code.
+    /// Route macros use this as the base of a `with_*` setter chain, so only
+    /// the keys named on the attribute appear in generated code — and no
+    /// struct literal for this type is ever emitted into a user's crate, which
+    /// is what lets it stay `#[non_exhaustive]`.
     pub const EMPTY: Self = Self {
         title: None,
         description: None,
@@ -640,6 +667,97 @@ impl SeoRouteDefaults {
         twitter_image: None,
         robots: None,
     };
+
+    /// Set the default page `<title>`.
+    #[must_use]
+    pub const fn with_title(mut self, value: &'static str) -> Self {
+        self.title = Some(value);
+        self
+    }
+
+    /// Set the default `<meta name="description">`.
+    #[must_use]
+    pub const fn with_description(mut self, value: &'static str) -> Self {
+        self.description = Some(value);
+        self
+    }
+
+    /// Set the default `<link rel="canonical">`.
+    #[must_use]
+    pub const fn with_canonical(mut self, value: &'static str) -> Self {
+        self.canonical = Some(value);
+        self
+    }
+
+    /// Set the default `og:title`.
+    #[must_use]
+    pub const fn with_og_title(mut self, value: &'static str) -> Self {
+        self.og_title = Some(value);
+        self
+    }
+
+    /// Set the default `og:description`.
+    #[must_use]
+    pub const fn with_og_description(mut self, value: &'static str) -> Self {
+        self.og_description = Some(value);
+        self
+    }
+
+    /// Set the default `og:image`.
+    #[must_use]
+    pub const fn with_og_image(mut self, value: &'static str) -> Self {
+        self.og_image = Some(value);
+        self
+    }
+
+    /// Set the default `og:type`.
+    #[must_use]
+    pub const fn with_og_type(mut self, value: &'static str) -> Self {
+        self.og_type = Some(value);
+        self
+    }
+
+    /// Set the default `og:url`.
+    #[must_use]
+    pub const fn with_og_url(mut self, value: &'static str) -> Self {
+        self.og_url = Some(value);
+        self
+    }
+
+    /// Set the default `twitter:card` type.
+    #[must_use]
+    pub const fn with_twitter_card(mut self, value: &'static str) -> Self {
+        self.twitter_card = Some(value);
+        self
+    }
+
+    /// Set the default `twitter:title`.
+    #[must_use]
+    pub const fn with_twitter_title(mut self, value: &'static str) -> Self {
+        self.twitter_title = Some(value);
+        self
+    }
+
+    /// Set the default `twitter:description`.
+    #[must_use]
+    pub const fn with_twitter_description(mut self, value: &'static str) -> Self {
+        self.twitter_description = Some(value);
+        self
+    }
+
+    /// Set the default `twitter:image`.
+    #[must_use]
+    pub const fn with_twitter_image(mut self, value: &'static str) -> Self {
+        self.twitter_image = Some(value);
+        self
+    }
+
+    /// Set the default `<meta name="robots">` directive.
+    #[must_use]
+    pub const fn with_robots(mut self, value: &'static str) -> Self {
+        self.robots = Some(value);
+        self
+    }
 
     /// Whether no key was declared.
     ///
@@ -845,6 +963,24 @@ pub(crate) const fn effective_seo_profile(raw_profile: &str, allow_all: Option<b
         Some(false) => "dev",
         None => raw_profile,
     }
+}
+
+/// Whether a route's declared `robots` directive asks crawlers not to index the
+/// page, in which case it must not be advertised in `sitemap.xml`.
+///
+/// Matches `noindex` as a comma-separated directive anywhere in the value, so
+/// `"noindex"`, `"noindex, nofollow"`, and `"nofollow, noindex"` all count
+/// while an unrelated value like `"noarchive"` does not.
+pub(crate) fn robots_directive_is_noindex(directive: &str) -> bool {
+    directive
+        .split(',')
+        .any(|part| part.trim().eq_ignore_ascii_case("noindex"))
+}
+
+/// Whether these route-level defaults exclude the page from the sitemap.
+#[must_use]
+pub(crate) fn defaults_exclude_from_sitemap(defaults: SeoRouteDefaults) -> bool {
+    defaults.robots.is_some_and(robots_directive_is_noindex)
 }
 
 /// Collect sitemap entries from dynamic sources and static path hints, then
@@ -1118,6 +1254,43 @@ mod tests {
     }
 
     // ── SeoRouteDefaults / SeoMeta extractor (#1182) ─────────────────────────
+
+    #[test]
+    fn robots_directive_noindex_detection() {
+        assert!(robots_directive_is_noindex("noindex"));
+        assert!(robots_directive_is_noindex("noindex, nofollow"));
+        assert!(robots_directive_is_noindex("nofollow, noindex"));
+        assert!(robots_directive_is_noindex("NoIndex"));
+        assert!(robots_directive_is_noindex(" noindex "));
+        // Substring matches must not count.
+        assert!(!robots_directive_is_noindex("noarchive"));
+        assert!(!robots_directive_is_noindex("index, follow"));
+        assert!(!robots_directive_is_noindex("max-snippet:-1"));
+    }
+
+    #[test]
+    fn defaults_exclude_from_sitemap_only_for_noindex() {
+        assert!(!defaults_exclude_from_sitemap(SeoRouteDefaults::EMPTY));
+        assert!(!defaults_exclude_from_sitemap(
+            SeoRouteDefaults::EMPTY.with_title("About")
+        ));
+        assert!(!defaults_exclude_from_sitemap(
+            SeoRouteDefaults::EMPTY.with_robots("nofollow")
+        ));
+        assert!(defaults_exclude_from_sitemap(
+            SeoRouteDefaults::EMPTY.with_robots("noindex, nofollow")
+        ));
+    }
+
+    #[test]
+    fn route_defaults_setters_are_const_and_chainable() {
+        const DEFAULTS: SeoRouteDefaults = SeoRouteDefaults::EMPTY
+            .with_title("About")
+            .with_og_type("website");
+        assert_eq!(DEFAULTS.title, Some("About"));
+        assert_eq!(DEFAULTS.og_type, Some("website"));
+        assert_eq!(DEFAULTS.description, None);
+    }
 
     #[test]
     fn route_defaults_empty_is_default() {

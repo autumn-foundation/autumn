@@ -101,9 +101,14 @@ use proc_macro::TokenStream;
 /// Accepted keys mirror the `SeoMeta` builder: `title`, `description`,
 /// `canonical`, `og_title`, `og_description`, `og_image`, `og_type`, `og_url`,
 /// `twitter_card`, `twitter_title`, `twitter_description`, `twitter_image`,
-/// and `robots`. Values must be string literals; an unknown or repeated key is
-/// a compile error. The argument is accepted by every route macro, including
-/// [`macro@static_get`].
+/// and `robots`. Values must be string literals; an unknown, repeated, or
+/// empty `seo(...)` is a compile error. Every HTTP route macro accepts the
+/// argument, as does [`macro@static_get`]; [`macro@ws`] does not, since a
+/// WebSocket upgrade serves no crawlable document.
+///
+/// The argument supplies *values*, not markup: a handler that never takes a
+/// `SeoMeta` parameter renders nothing regardless of what the attribute
+/// declares.
 #[proc_macro_attribute]
 pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
     route::route_macro("GET", "get", attr.into(), item.into()).into()

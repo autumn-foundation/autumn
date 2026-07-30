@@ -70,6 +70,14 @@ pub struct StaticRouteMeta {
     /// Optional async function that returns parameter sets for
     /// parameterized routes. `None` for simple (non-parameterized) routes.
     pub params_fn: Option<ParamsFn>,
+    /// SEO meta tag defaults declared via the route attribute's `seo(...)`
+    /// argument (#1182).
+    ///
+    /// Carried here as well as on [`Route`](crate::Route) so the sitemap
+    /// builder can honour a declared `robots = "noindex…"` and leave the page
+    /// out of `sitemap.xml` — otherwise the app would advertise a URL it also
+    /// asks crawlers not to index.
+    pub seo: crate::seo::SeoRouteDefaults,
 }
 
 impl std::fmt::Debug for StaticRouteMeta {
@@ -79,6 +87,7 @@ impl std::fmt::Debug for StaticRouteMeta {
             .field("name", &self.name)
             .field("revalidate", &self.revalidate)
             .field("params_fn", &self.params_fn.as_ref().map(|_| "..."))
+            .field("seo", &self.seo)
             .finish()
     }
 }
@@ -224,6 +233,7 @@ mod tests {
             name: "test_handler",
             revalidate: Some(60),
             params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
         let copy = meta.clone();
         // Use original after clone to prove it's a real copy, not a move
@@ -270,6 +280,7 @@ mod tests {
             name: "show_post",
             revalidate: None,
             params_fn: Some(dummy_params),
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
         assert!(meta.params_fn.is_some());
         assert_eq!(meta.path, "/posts/{slug}");
@@ -282,6 +293,7 @@ mod tests {
             name: "test",
             revalidate: None,
             params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
         let debug = format!("{meta:?}");
         assert!(debug.contains("test"));

@@ -1700,6 +1700,34 @@ fn reject_duplicate_user_routes(
     Ok(())
 }
 
+/// Attach a route's declared SEO defaults (#1182) as a request extension so the
+/// [`SeoMeta`](crate::seo::SeoMeta) extractor can hand the handler a
+/// pre-populated builder.
+///
+/// Attaching them here — rather than inside the route macro — keeps the layer
+/// clear of the macro-ordering dance with the signature-rewriting guards
+/// (`#[secured]`, `#[throttle]`, `#[step_up]`, `#[authorize]`), and means
+/// static pre-rendering picks them up for free, since it drives this same
+/// router.
+///
+/// Called from **both** mounting paths — [`group_and_mount_routes`] and
+/// [`mount_scoped_groups`] — because a scoped route is just as entitled to its
+/// declared defaults, and the extractor's infallibility means a miss would show
+/// up as silently absent meta tags rather than an error.
+///
+/// Routes that never declared `seo(...)` skip the layer entirely and pay
+/// nothing per request. The layer is applied to the route's own
+/// `MethodRouter`, so sibling verbs mounted on the same path do not inherit it.
+fn attach_seo_defaults(
+    handler: axum::routing::MethodRouter<AppState>,
+    seo: crate::seo::SeoRouteDefaults,
+) -> axum::routing::MethodRouter<AppState> {
+    if seo.is_empty() {
+        return handler;
+    }
+    handler.layer(axum::Extension(seo))
+}
+
 fn group_and_mount_routes(
     route_list: Vec<Route>,
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
@@ -1727,17 +1755,7 @@ fn group_and_mount_routes(
         if let Some(layer) = selected_layer {
             handler = handler.layer(layer.clone());
         }
-        // Route-level SEO defaults (#1182) ride along as a request extension so
-        // the `SeoMeta` extractor can hand handlers a pre-populated builder.
-        // Attaching them here — rather than inside the route macro — keeps the
-        // layer clear of the macro-ordering dance with the signature-rewriting
-        // guards (`#[secured]`, `#[throttle]`, `#[step_up]`, `#[authorize]`),
-        // and means static pre-rendering picks them up for free, since it
-        // drives this same router. Routes that never declared `seo(...)` skip
-        // the layer entirely and pay nothing per request.
-        if !route.seo.is_empty() {
-            handler = handler.layer(axum::Extension(route.seo));
-        }
+        handler = attach_seo_defaults(handler, route.seo);
         if let Some(version) = route.api_version {
             handler = handler.layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -2143,10 +2161,12 @@ fn mount_scoped_groups(
             // fail closed instead of replaying through a generated stop inside
             // the scoped route.
             let selected_layer = idempotency_layers.map(|layers| &layers.manual);
+            let seo = route.seo;
             let mut handler = route.handler;
             if let Some(layer) = selected_layer {
                 handler = handler.layer(layer.clone());
             }
+            handler = attach_seo_defaults(handler, seo);
             if let Some(version) = route.api_version {
                 handler = handler.layer(axum::middleware::from_fn_with_state(
                     state.clone(),

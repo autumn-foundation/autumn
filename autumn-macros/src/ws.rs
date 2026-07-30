@@ -11,6 +11,25 @@ use quote::{format_ident, quote};
 use crate::parse;
 
 /// Check if a type pattern looks like `AppState` (bare identifier).
+/// Return a purpose-written compile error when a `#[ws]` attribute carries a
+/// `seo(...)` argument, which the other route macros accept but this one
+/// deliberately does not.
+fn reject_seo_argument(attr: &TokenStream) -> Option<TokenStream> {
+    let seo_ident = attr.clone().into_iter().find_map(|tree| match tree {
+        proc_macro2::TokenTree::Ident(ident) if ident == "seo" => Some(ident),
+        _ => None,
+    })?;
+    Some(
+        syn::Error::new(
+            seo_ident.span(),
+            "`#[ws]` does not accept a `seo(...)` argument: a WebSocket upgrade \
+             serves no crawlable document. Declare SEO defaults on the HTML route \
+             that links to this socket instead.",
+        )
+        .to_compile_error(),
+    )
+}
+
 fn is_app_state_type(ty: &syn::Type) -> bool {
     if let syn::Type::Path(type_path) = ty
         && type_path.qself.is_none()
@@ -46,7 +65,15 @@ fn is_app_state_type(ty: &syn::Type) -> bool {
 /// The user's function parameters are treated as follows:
 /// - `AppState` parameters receive the extracted app state directly
 /// - All other parameters become Axum extractors on the upgrade handler
+#[allow(clippy::too_many_lines)]
 pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // `#[ws]` takes a path and nothing else, so a stray `seo(...)` would fail
+    // with syn's bare "unexpected token" pointing at the comma. Every other
+    // misuse of `seo(...)` gets a purpose-written error; say why this one is
+    // rejected rather than leaving the user to guess.
+    if let Some(err) = reject_seo_argument(&attr) {
+        return err;
+    }
     let path = match parse::parse_route_path(attr) {
         Ok(p) => p,
         Err(err) => return err,
@@ -244,6 +271,40 @@ mod tests {
         assert!(
             generated.contains("public : true"),
             "a ws route macro over an expanded #[public] marker must record public = true: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_seo_argument_with_a_purpose_written_error() {
+        // Every other route macro accepts `seo(...)`. `#[ws]` deliberately does
+        // not, so it must say why rather than falling through to syn's bare
+        // "unexpected token" on the comma (#1182).
+        let generated = ws_macro(
+            quote! { "/live", seo(title = "Live") },
+            quote! { async fn live() -> impl WsHandler { |socket| async move {} } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "seo(...) on #[ws] must be a compile error: {generated}"
+        );
+        assert!(
+            generated.contains("does not accept a `seo(...)` argument"),
+            "the error must explain why #[ws] rejects it: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_still_accepts_a_bare_path() {
+        let generated = ws_macro(
+            quote! { "/live" },
+            quote! { async fn live() -> impl WsHandler { |socket| async move {} } },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("compile_error"),
+            "a plain #[ws(\"/path\")] must keep compiling: {generated}"
         );
     }
 }

@@ -383,6 +383,9 @@ pub use presence::presence_stream;
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
 pub use route::{RepositoryApiMeta, Route, RouteIdempotency, RouteTimeout};
+// Re-exported alongside the other `Route` field types so a hand-built
+// `Route { .. }` needs only the `autumn_web::` prefix.
+pub use seo::SeoRouteDefaults;
 /// First-class Markdown rendering with frontmatter parsing and SSG integration.
 ///
 /// Enable with the Cargo feature `markdown`.

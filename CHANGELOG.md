@@ -24,16 +24,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   builder method has a matching key (`title`, `description`, `canonical`,
   `og_title`, `og_description`, `og_image`, `og_type`, `og_url`,
   `twitter_card`, `twitter_title`, `twitter_description`, `twitter_image`,
-  `robots`); a typo'd or repeated key is a compile error naming the supported
-  set, rather than metadata that silently never renders. `#[static_get]`
-  accepts the same argument, so pre-rendered pages carry the tags too — static
-  generation drives the same router, so no separate wiring was needed. The
+  `robots`); a typo'd, repeated, or empty `seo(...)` is a compile error naming
+  the supported set, rather than metadata that silently never renders.
+  `#[static_get]` accepts the same argument, so pre-rendered pages carry the
+  tags too — static generation drives the same router, so no separate wiring
+  was needed. A static route declaring `robots = "noindex"` is now also left
+  out of the generated `sitemap.xml`, so the app no longer advertises a URL it
+  simultaneously asks crawlers not to index. `#[ws]` is the one route macro
+  that rejects `seo(...)` — a WebSocket upgrade serves no crawlable document —
+  and says so rather than failing with a bare parse error. The
   declared values are recorded on the new `Route::seo` field as a `Copy`,
   `&'static str`-backed `SeoRouteDefaults`, and the router installs the request
   extension only for routes that declared something, so routes without
   `seo(...)` pay nothing. As before, the attribute supplies *values*, not
   markup: handlers still decide where to emit them, normally via
-  `SeoMeta::render()` inside a layout.
+  `SeoMeta::render()` inside a layout. **Breaking for code that constructs
+  `autumn_web::Route { .. }` or `autumn_web::static_gen::StaticRouteMeta { .. }`
+  literally** (plugins building a `Vec<Route>` by hand rather than through
+  `routes![]`): add `seo: autumn_web::seo::SeoRouteDefaults::EMPTY`.
+  `SeoRouteDefaults` is itself `#[non_exhaustive]` and built by chaining its
+  `const fn with_*` setters from `EMPTY`, so future SEO keys stay additive.
 - **cli:** `autumn console` (alias `autumn c`) — a one-command, pre-wired data
   playground (#1039). Autumn's answer to `rails console` / `manage.py shell` /
   `iex -S mix`: because Rust has no stable `eval`, it follows loco.rs's

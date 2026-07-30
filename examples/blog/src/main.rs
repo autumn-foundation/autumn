@@ -160,12 +160,13 @@ mod tests {
         let locale = autumn_web::i18n::Locale::new("en").with_bundle(std::sync::Arc::new(bundle));
 
         // The page's meta tags are declared on the `#[static_get]` attribute
-        // and normally reach the handler through the `SeoMeta` extractor;
-        // calling the handler directly, we feed it the same route-level
-        // defaults the router would have injected.
-        let seo = super::routes::about::__autumn_route_info_about()
-            .seo
-            .to_meta();
+        // and normally reach the handler through the `SeoMeta` extractor. This
+        // test calls the handler directly, so it stands in for the router by
+        // passing the same values the attribute declares.
+        let seo = autumn_web::seo::SeoMeta::new()
+            .title("About \u{2022} Autumn Blog")
+            .description("Why this blog exists and what the Autumn web framework is for.")
+            .og_type("website");
         let html = super::routes::about::about(locale, seo).await.into_string();
 
         assert!(html.contains("Autumn Blog"), "html: {html}");

@@ -250,6 +250,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: ::core::stringify!(#fn_name),
                 revalidate: #revalidate_expr,
                 params_fn: #params_fn_expr,
+                seo: #seo_defaults,
             }
         }
     }
@@ -316,11 +317,11 @@ mod tests {
         )
         .to_string();
         assert!(
-            generated.contains("title : :: core :: option :: Option :: Some (\"About\")"),
+            generated.contains("with_title (\"About\")"),
             "seo(title = ...) must populate the static route defaults: {generated}"
         );
         assert!(
-            generated.contains("og_type : :: core :: option :: Option :: Some (\"website\")"),
+            generated.contains("with_og_type (\"website\")"),
             "seo(og_type = ...) must populate the static route defaults: {generated}"
         );
     }
@@ -333,7 +334,7 @@ mod tests {
         )
         .to_string();
         assert!(
-            generated.contains("Some (\"article\")"),
+            generated.contains("with_og_type (\"article\")"),
             "seo(...) must parse alongside params/revalidate: {generated}"
         );
         assert!(
@@ -356,6 +357,74 @@ mod tests {
         assert!(
             generated.contains("compile_error"),
             "an unknown seo key must be a compile error on static routes: {generated}"
+        );
+    }
+
+    // `#[static_get]` has its own attribute parser, so the rejection paths the
+    // `#[get]` family covers are re-asserted here rather than assumed.
+
+    #[test]
+    fn static_get_rejects_duplicate_seo_key() {
+        let generated = static_get_macro(
+            quote! { "/about", seo(title = "A", title = "B") },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "a duplicate seo key must be a compile error on static routes: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_non_string_seo_value() {
+        let generated = static_get_macro(
+            quote! { "/about", seo(title = 42) },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "a non-string seo value must be a compile error on static routes: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_seo_without_parentheses() {
+        let generated = static_get_macro(
+            quote! { "/about", seo = "title" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "`seo = ...` must be rejected on static routes too: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_empty_seo_group() {
+        let generated = static_get_macro(
+            quote! { "/about", seo() },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "an empty seo() must be a compile error on static routes: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_repeated_seo_argument() {
+        let generated = static_get_macro(
+            quote! { "/about", seo(title = "A"), seo(og_type = "website") },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "a second seo(...) argument must be a compile error on static routes: {generated}"
         );
     }
 

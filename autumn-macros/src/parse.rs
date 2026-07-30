@@ -8,6 +8,15 @@ use syn::{Attribute, Ident, ItemFn, LitStr, Token};
 /// Keys accepted inside a route attribute's `seo(...)` argument, in the order
 /// they are documented. Each one maps 1:1 onto a
 /// `autumn_web::seo::SeoRouteDefaults` field and a `SeoMeta` builder method.
+///
+/// [`SeoAttrArgs::emit`] derives the setter call for a key by concatenating
+/// `with_` onto it, and that setter lives in the *other* crate — so adding a
+/// key here without adding the matching
+/// `SeoRouteDefaults::with_<key>` still compiles this crate and only fails in
+/// a user's crate ("no method named `with_…`"). The
+/// `every_supported_key_round_trips` integration test in
+/// `autumn/tests/integration/seo.rs` exercises all of them and is what catches
+/// that mismatch; extend it when extending this list.
 const SEO_KEYS: &[&str] = &[
     "title",
     "description",
@@ -31,7 +40,10 @@ const SEO_KEYS: &[&str] = &[
 /// `SeoRouteDefaults::EMPTY`.
 #[derive(Default)]
 pub struct SeoAttrArgs {
-    fields: Vec<(Ident, LitStr)>,
+    /// Declared `(key, value)` pairs in source order. The key is stored as a
+    /// plain `String` (raw-ident prefix already stripped) because it is only
+    /// ever used to build a `with_<key>` setter name.
+    fields: Vec<(String, LitStr)>,
 }
 
 impl SeoAttrArgs {
@@ -41,13 +53,17 @@ impl SeoAttrArgs {
     /// Rejects unknown keys, repeated keys, and non-string values so a typo
     /// surfaces as a compile error rather than silently-dropped metadata.
     pub fn parse_group(input: ParseStream) -> syn::Result<Self> {
+        let span = input.span();
         let content;
         syn::parenthesized!(content in input);
 
-        let mut fields: Vec<(Ident, LitStr)> = Vec::new();
+        let mut fields: Vec<(String, LitStr)> = Vec::new();
         while !content.is_empty() {
             let key: Ident = content.parse()?;
+            // Compare against the unprefixed name so `r#title` isn't reported
+            // as unknown while the diagnostic lists `title` as supported.
             let key_name = key.to_string();
+            let key_name = key_name.strip_prefix("r#").unwrap_or(&key_name).to_owned();
             if !SEO_KEYS.contains(&key_name.as_str()) {
                 return Err(syn::Error::new(
                     key.span(),
@@ -57,20 +73,23 @@ impl SeoAttrArgs {
                     ),
                 ));
             }
-            if fields.iter().any(|(existing, _)| *existing == key) {
+            if fields.iter().any(|(existing, _)| *existing == key_name) {
                 return Err(syn::Error::new(
                     key.span(),
                     format!("duplicate `seo(...)` key `{key_name}`. Declare each key once."),
                 ));
             }
             let _eq: Token![=] = content.parse()?;
+            // Span the *value*, not the key: with `seo(og_image = OG_URL)` the
+            // key is the part the user got right.
+            let value_span = content.span();
             let value: LitStr = content.parse().map_err(|_| {
                 syn::Error::new(
-                    key.span(),
+                    value_span,
                     format!("`seo({key_name} = ...)` expects a string literal."),
                 )
             })?;
-            fields.push((key, value));
+            fields.push((key_name, value));
 
             if content.peek(Token![,]) {
                 let _comma: Token![,] = content.parse()?;
@@ -85,34 +104,38 @@ impl SeoAttrArgs {
             return Err(content.error("expected `,` between `seo(...)` keys"));
         }
 
+        // An empty `seo()` is almost certainly an unfinished edit. Rejecting it
+        // is consistent with rejecting typo'd keys: the whole point is that
+        // declared SEO metadata never silently fails to render.
+        if fields.is_empty() {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "empty `seo(...)`. Declare at least one key, e.g. \
+                     `seo(title = \"…\")`. Supported keys: `{}`.",
+                    SEO_KEYS.join("`, `")
+                ),
+            ));
+        }
+
         Ok(Self { fields })
     }
 
-    /// Emit the `autumn_web::seo::SeoRouteDefaults` initializer for these
-    /// declared keys, falling back to `SeoRouteDefaults::EMPTY` for the rest.
+    /// Emit the `autumn_web::seo::SeoRouteDefaults` value for these declared
+    /// keys, leaving the rest at their `SeoRouteDefaults::EMPTY` value.
+    ///
+    /// Deliberately built by chaining the `const fn with_*` setters rather than
+    /// by emitting a struct literal. A literal in the *user's* crate would pin
+    /// `SeoRouteDefaults` as exhaustively-constructible forever — adding a
+    /// fourteenth SEO key later would then be a breaking change — and it would
+    /// also trip `clippy::needless_update` there once every key is spelled out.
     pub fn emit(&self) -> TokenStream {
-        if self.fields.is_empty() {
-            return quote! { ::autumn_web::seo::SeoRouteDefaults::EMPTY };
-        }
-        let assignments = self.fields.iter().map(|(key, value)| {
-            quote! { #key: ::core::option::Option::Some(#value) }
+        let setters = self.fields.iter().map(|(key, value)| {
+            let setter = format_ident!("with_{}", key);
+            quote! { .#setter(#value) }
         });
-        // Omit the struct-update tail once every key is spelled out: it would
-        // have no effect there, and `clippy::needless_update` fires on
-        // macro-generated code inside the *user's* crate, where they cannot
-        // reasonably silence it.
-        if self.fields.len() == SEO_KEYS.len() {
-            return quote! {
-                ::autumn_web::seo::SeoRouteDefaults {
-                    #(#assignments,)*
-                }
-            };
-        }
         quote! {
-            ::autumn_web::seo::SeoRouteDefaults {
-                #(#assignments,)*
-                ..::autumn_web::seo::SeoRouteDefaults::EMPTY
-            }
+            ::autumn_web::seo::SeoRouteDefaults::EMPTY #(#setters)*
         }
     }
 }

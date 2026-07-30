@@ -17,6 +17,7 @@ fn compile_fail_tests() {
     // compile errors rather than silently-ignored metadata.
     t.compile_fail("tests/compile-fail/route_seo_unknown_key.rs");
     t.compile_fail("tests/compile-fail/route_seo_duplicate_key.rs");
+    t.compile_fail("tests/compile-fail/route_seo_empty_group.rs");
 
     // Static route macro failures
     t.compile_fail("tests/compile-fail/static_get_path_params.rs");

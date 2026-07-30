@@ -810,16 +810,15 @@ mod tests {
         .to_string();
 
         assert!(
-            generated.contains("title : :: core :: option :: Option :: Some (\"About\")"),
+            generated.contains("with_title (\"About\")"),
             "seo(title = ...) must populate the title default: {generated}"
         );
         assert!(
-            generated
-                .contains("description : :: core :: option :: Option :: Some (\"Learn about us\")"),
+            generated.contains("with_description (\"Learn about us\")"),
             "seo(description = ...) must populate the description default: {generated}"
         );
         assert!(
-            generated.contains(".. :: autumn_web :: seo :: SeoRouteDefaults :: EMPTY"),
+            generated.contains("SeoRouteDefaults :: EMPTY . with_title"),
             "unset seo keys must fall back to the empty defaults: {generated}"
         );
     }
@@ -835,7 +834,7 @@ mod tests {
         .to_string();
 
         assert!(
-            generated.contains("Some (\"About\")"),
+            generated.contains("with_title (\"About\")"),
             "seo(...) must parse when it precedes other keys: {generated}"
         );
         assert!(
@@ -849,10 +848,12 @@ mod tests {
     }
 
     #[test]
-    fn route_macro_omits_struct_update_when_every_seo_key_is_declared() {
-        // A fully-specified initializer plus `..EMPTY` trips
-        // `clippy::needless_update` inside the *user's* crate, where the lint
-        // cannot reasonably be silenced — so the tail must be dropped.
+    fn route_macro_never_emits_a_seo_struct_literal() {
+        // The expansion lands in the *user's* crate, so a struct literal there
+        // would pin `SeoRouteDefaults` as exhaustively constructible forever —
+        // a fourteenth SEO key could then never be added without a breaking
+        // change — and would trip `clippy::needless_update` once every key is
+        // spelled out. Chained `const fn` setters avoid both.
         let generated = route_macro(
             "GET",
             "get",
@@ -879,12 +880,77 @@ mod tests {
         .to_string();
 
         assert!(
-            generated.contains("robots : :: core :: option :: Option :: Some (\"noindex\")"),
+            generated.contains("with_robots (\"noindex\")"),
             "every declared key must still be emitted: {generated}"
         );
         assert!(
-            !generated.contains(".. :: autumn_web :: seo :: SeoRouteDefaults :: EMPTY"),
-            "a fully-specified initializer must not carry a struct-update tail: {generated}"
+            !generated.contains("SeoRouteDefaults {"),
+            "the expansion must not construct SeoRouteDefaults by struct literal: {generated}"
+        );
+        // Scoped to the emitted `seo:` value. The surrounding expansion
+        // legitimately contains `..Default::default()` in other literals, so
+        // asserting over the whole token stream would be a trap for future
+        // edits (the `#[static_get]` expansion already trips it).
+        let seo_value = generated
+            .split("seo : ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .expect("expansion should assign the seo field");
+        assert!(
+            seo_value.contains("SeoRouteDefaults :: EMPTY"),
+            "sanity: seo value should build from EMPTY: {seo_value}"
+        );
+        assert!(
+            !seo_value.contains(".."),
+            "the seo value must not use struct-update syntax: {seo_value}"
+        );
+    }
+
+    #[test]
+    fn route_macro_rejects_empty_seo_group() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about", seo() },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "an empty seo() must be a compile error, not a silent no-op: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_rejects_repeated_seo_argument() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about", seo(title = "A"), seo(og_type = "website") },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a second seo(...) argument must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_rejects_seo_keys_without_separating_comma() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about", seo(title = "A" og_type = "website") },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a missing comma must be rejected rather than dropping later keys: {generated}"
         );
     }
 

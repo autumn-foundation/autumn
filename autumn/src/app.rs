@@ -3354,7 +3354,14 @@ impl AppBuilder {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
             let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
-            let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
+            // A static route that declared `seo(robots = "noindex")` must not
+            // be advertised in sitemap.xml — otherwise the app tells crawlers
+            // "here is this URL" and "do not index it" at the same time (#1182).
+            let static_paths: Vec<&str> = static_metas
+                .iter()
+                .filter(|m| !crate::seo::defaults_exclude_from_sitemap(m.seo))
+                .map(|m| m.path)
+                .collect();
             let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
                 profile,
                 seo_cfg.base_url.as_deref(),
@@ -4763,7 +4770,14 @@ impl AppBuilder {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
             let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
-            let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
+            // A static route that declared `seo(robots = "noindex")` must not
+            // be advertised in sitemap.xml — otherwise the app tells crawlers
+            // "here is this URL" and "do not index it" at the same time (#1182).
+            let static_paths: Vec<&str> = static_metas
+                .iter()
+                .filter(|m| !crate::seo::defaults_exclude_from_sitemap(m.seo))
+                .map(|m| m.path)
+                .collect();
             let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
                 profile,
                 seo_cfg.base_url.as_deref(),
@@ -10862,6 +10876,7 @@ mod tests {
                 name: "localized",
                 revalidate: None,
                 params_fn: None,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
             }],
             &dist,
         )
@@ -11754,6 +11769,7 @@ mod tests {
                     name: "about",
                     revalidate: None,
                     params_fn: None,
+                    seo: crate::seo::SeoRouteDefaults::EMPTY,
                 }],
                 &dist,
             )
@@ -11953,6 +11969,7 @@ mod tests {
             name: "about",
             revalidate: None,
             params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         }];
         let builder = app().static_routes(metas);
         assert_eq!(builder.static_metas.len(), 1);
