@@ -176,10 +176,18 @@ Unavailable` — sessions fail closed, they do not silently degrade to
 ### Cookie integrity
 
 When a [signing secret](./signing-secrets.md) is configured, the session id in
-the cookie is HMAC-signed and a tampered cookie is rejected. In `dev`/`test`
-profiles the key is ephemeral and per-process, so every restart invalidates
-existing sessions — that is intentional, and it is why production needs a real
-secret provisioned before boot.
+the cookie is HMAC-signed and a tampered cookie is rejected. The same is true in
+production whether or not you configure one, because the production profile
+fails fast without a secret.
+
+**Without a configured secret in `dev`/`test`, session cookies are not signed at
+all.** The router only threads signing keys into the session layer when a secret
+is set or the profile is production; otherwise the cookie carries the raw
+session id. In practice that is masked by the default memory store — its data
+dies with the process, so a restart ends the session regardless. Point a dev
+process at Redis or another persistent store, though, and an old cookie still
+resolves across restarts, because there is no signature whose key changed. Set a
+secret locally if you want dev to behave like production here.
 
 ---
 
