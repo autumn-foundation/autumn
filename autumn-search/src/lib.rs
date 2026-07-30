@@ -112,7 +112,9 @@ mod source;
 mod sync;
 mod text;
 
-pub use authz::{DenyAll, SearchVisibility, TenantVisibility, current_tenant_filter};
+pub use authz::{
+    DenyAll, SearchVisibility, TenantVisibility, ambient_tenant_filter, current_tenant_filter,
+};
 pub use backend::{
     BackendCapabilities, BoxFuture, IndexedDocument, KeywordQuery, SearchBackend, SearchFilter,
     SearchHit, TENANT_FILTER_KEY, VectorQuery, empty_page,

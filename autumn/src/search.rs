@@ -215,7 +215,7 @@ impl IndexDefinition {
     ///
     /// Backends rank with **this** weight rather than the one on an incoming
     /// document, so a hand-built or third-party
-    /// [`SearchDocument`](crate::search::SearchDocument) cannot smuggle an
+    /// [`SearchDocument`] cannot smuggle an
     /// out-of-range weight into a query.
     #[must_use]
     pub fn weight_of(&self, field: &str) -> Option<char> {
