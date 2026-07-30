@@ -185,6 +185,9 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 timeout: ::autumn_web::RouteTimeout::Inherit,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
+                // A WebSocket upgrade serves no crawlable HTML document, so
+                // `#[ws]` does not accept the `seo(...)` route argument.
+                seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
             }
         }
     }

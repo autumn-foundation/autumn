@@ -269,26 +269,33 @@ pub async fn index(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
 }
 
 /// View a single published post by slug.
-#[get("/posts/{slug}")]
-pub async fn show(locale: Locale, slug: Path<String>, mut db: Db) -> AutumnResult<Markup> {
+///
+/// `og_type` never varies per post, so it is declared once on the route via
+/// `seo(...)`; the [`SeoMeta`] extractor hands the handler a builder already
+/// carrying it, and the handler layers the per-post title and description on
+/// top.
+#[get("/posts/{slug}", seo(og_type = "article"))]
+pub async fn show(
+    locale: Locale,
+    slug: Path<String>,
+    seo: SeoMeta,
+    mut db: Db,
+) -> AutumnResult<Markup> {
     let p = Post::find_by_slug(&slug, &mut db).await?;
     let date = p.created_at.format("%B %d, %Y");
 
     // Simple paragraph rendering — split on double newlines
     let paragraphs: Vec<&str> = p.body.split("\n\n").collect();
 
-    let seo = SeoMeta::new()
-        .title(format!("{} • Autumn Blog", p.title))
-        .description(
-            p.body
-                .split('\n')
-                .next()
-                .unwrap_or(&p.title)
-                .chars()
-                .take(160)
-                .collect::<String>(),
-        )
-        .og_type("article");
+    let seo = seo.title(format!("{} • Autumn Blog", p.title)).description(
+        p.body
+            .split('\n')
+            .next()
+            .unwrap_or(&p.title)
+            .chars()
+            .take(160)
+            .collect::<String>(),
+    );
 
     Ok(layout_with_seo(
         &locale,

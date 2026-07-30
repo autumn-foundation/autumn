@@ -9,6 +9,7 @@
 //! - `#[static_get("/about")]` -- simple static route
 //! - `#[static_get("/posts/{slug}", params = list_slugs)]` -- parameterized
 //! - `#[static_get("/posts/{slug}", params = list_slugs, revalidate = 60)]` -- with ISR
+//! - `#[static_get("/about", seo(title = "About"))]` -- route-level SEO defaults
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -20,6 +21,8 @@ struct StaticGetAttrs {
     path: LitStr,
     params_fn: Option<syn::Path>,
     revalidate: Option<u64>,
+    /// Route-level SEO meta tag defaults from the `seo(...)` argument (#1182).
+    seo: crate::parse::SeoAttrArgs,
 }
 
 impl Parse for StaticGetAttrs {
@@ -28,6 +31,8 @@ impl Parse for StaticGetAttrs {
 
         let mut params_fn = None;
         let mut revalidate = None;
+        let mut seo = crate::parse::SeoAttrArgs::default();
+        let mut seen_seo = false;
 
         while input.peek(Token![,]) {
             let _comma: Token![,] = input.parse()?;
@@ -38,6 +43,28 @@ impl Parse for StaticGetAttrs {
             }
 
             let key: Ident = input.parse()?;
+
+            // `seo(...)` is the one call-shaped argument; everything else is
+            // `key = value`, so branch before consuming the `=`.
+            if key == "seo" {
+                if !input.peek(syn::token::Paren) {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "`seo` takes parenthesized keys, e.g. \
+                         `seo(title = \"About\", description = \"…\")`.",
+                    ));
+                }
+                if seen_seo {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "duplicate `seo(...)` argument. Declare all SEO keys in one `seo(...)`.",
+                    ));
+                }
+                seen_seo = true;
+                seo = crate::parse::SeoAttrArgs::parse_group(input)?;
+                continue;
+            }
+
             let _eq: Token![=] = input.parse()?;
 
             match key.to_string().as_str() {
@@ -52,7 +79,10 @@ impl Parse for StaticGetAttrs {
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("Unknown attribute `{other}`. Expected `params` or `revalidate`."),
+                        format!(
+                            "Unknown attribute `{other}`. Expected `params`, `revalidate`, \
+                             or `seo(...)`."
+                        ),
                     ));
                 }
             }
@@ -62,6 +92,7 @@ impl Parse for StaticGetAttrs {
             path,
             params_fn,
             revalidate,
+            seo,
         })
     }
 }
@@ -162,6 +193,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let path_value = path.value();
     let path_params = crate::api_doc::extract_path_params(&path_value);
     let path_params_tokens = crate::api_doc::emit_path_param_slice(&path_params);
+    let seo_defaults = attrs.seo.emit();
 
     quote! {
         #input_fn
@@ -207,6 +239,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 timeout: ::autumn_web::RouteTimeout::Inherit,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
+                seo: #seo_defaults,
             }
         }
 
@@ -257,6 +290,72 @@ mod tests {
         assert!(
             generated.contains("public : true"),
             "a #[public] static route must record public = true: {generated}"
+        );
+    }
+
+    // ── seo(...) route-level defaults (#1182) ───────────────────────────────
+
+    #[test]
+    fn static_get_defaults_seo_to_empty() {
+        let generated = static_get_macro(
+            quote! { "/about" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("SeoRouteDefaults :: EMPTY"),
+            "a static route without seo(...) must record the empty defaults: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_emits_declared_seo_defaults() {
+        let generated = static_get_macro(
+            quote! { "/about", seo(title = "About", og_type = "website") },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("title : :: core :: option :: Option :: Some (\"About\")"),
+            "seo(title = ...) must populate the static route defaults: {generated}"
+        );
+        assert!(
+            generated.contains("og_type : :: core :: option :: Option :: Some (\"website\")"),
+            "seo(og_type = ...) must populate the static route defaults: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_seo_composes_with_params_and_revalidate() {
+        let generated = static_get_macro(
+            quote! { "/posts/{slug}", seo(og_type = "article"), params = list_slugs, revalidate = 60 },
+            quote! { async fn show() -> &'static str { "post" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("Some (\"article\")"),
+            "seo(...) must parse alongside params/revalidate: {generated}"
+        );
+        assert!(
+            generated.contains("list_slugs"),
+            "params must still parse after seo(...): {generated}"
+        );
+        assert!(
+            generated.contains("60"),
+            "revalidate must still parse after seo(...): {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_unknown_seo_key() {
+        let generated = static_get_macro(
+            quote! { "/about", seo(titel = "About") },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "an unknown seo key must be a compile error on static routes: {generated}"
         );
     }
 

@@ -13,10 +13,16 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/non_function.rs");
     t.compile_fail("tests/compile-fail/routes_nonexistent.rs");
 
+    // Route-level `seo(...)` defaults (#1182): typos and repeated keys are
+    // compile errors rather than silently-ignored metadata.
+    t.compile_fail("tests/compile-fail/route_seo_unknown_key.rs");
+    t.compile_fail("tests/compile-fail/route_seo_duplicate_key.rs");
+
     // Static route macro failures
     t.compile_fail("tests/compile-fail/static_get_path_params.rs");
     t.compile_fail("tests/compile-fail/static_get_non_async.rs");
     t.compile_fail("tests/compile-fail/static_get_params_no_placeholders.rs");
+    t.compile_fail("tests/compile-fail/static_get_seo_unknown_key.rs");
 
     // Lifecycle macro failures (always available — the `lifecycle` macro is not
     // feature-gated). Firing an undeclared transition, leaving a terminal

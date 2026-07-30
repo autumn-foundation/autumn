@@ -189,6 +189,7 @@ pub fn route_macro(
         }
     };
     let has_policy_val = has_policy_only(&input_fn);
+    let seo_defaults = route_args.seo.emit();
 
     // ── Path helper ─────────────────────────────────────────────
     let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
@@ -230,6 +231,7 @@ pub fn route_macro(
                 repository: ::core::option::Option::None,
                 idempotency: #route_idempotency,
                 timeout: #route_timeout,
+                seo: #seo_defaults,
             }
         }
 
@@ -776,6 +778,181 @@ mod tests {
         assert!(
             generated.contains("public : true"),
             "a route macro over an expanded #[public] marker must record public = true: {generated}"
+        );
+    }
+
+    // ── seo(...) route-level defaults (#1182) ───────────────────────────────
+
+    #[test]
+    fn route_macro_defaults_seo_to_empty() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("SeoRouteDefaults :: EMPTY"),
+            "a route without seo(...) must record the empty defaults: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_emits_declared_seo_defaults() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about", seo(title = "About", description = "Learn about us") },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("title : :: core :: option :: Option :: Some (\"About\")"),
+            "seo(title = ...) must populate the title default: {generated}"
+        );
+        assert!(
+            generated
+                .contains("description : :: core :: option :: Option :: Some (\"Learn about us\")"),
+            "seo(description = ...) must populate the description default: {generated}"
+        );
+        assert!(
+            generated.contains(".. :: autumn_web :: seo :: SeoRouteDefaults :: EMPTY"),
+            "unset seo keys must fall back to the empty defaults: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_seo_composes_with_other_keys() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about", seo(title = "About"), name = "about_page", timeout_ms = 500 },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("Some (\"About\")"),
+            "seo(...) must parse when it precedes other keys: {generated}"
+        );
+        assert!(
+            generated.contains("RouteTimeout :: Override"),
+            "keys after seo(...) must still parse: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_path_about_page"),
+            "name override after seo(...) must still apply: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_omits_struct_update_when_every_seo_key_is_declared() {
+        // A fully-specified initializer plus `..EMPTY` trips
+        // `clippy::needless_update` inside the *user's* crate, where the lint
+        // cannot reasonably be silenced — so the tail must be dropped.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {
+                "/full",
+                seo(
+                    title = "t",
+                    description = "d",
+                    canonical = "c",
+                    og_title = "ot",
+                    og_description = "od",
+                    og_image = "oi",
+                    og_type = "oty",
+                    og_url = "ou",
+                    twitter_card = "tc",
+                    twitter_title = "tt",
+                    twitter_description = "td",
+                    twitter_image = "ti",
+                    robots = "noindex"
+                )
+            },
+            quote! { async fn full() -> &'static str { "full" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("robots : :: core :: option :: Option :: Some (\"noindex\")"),
+            "every declared key must still be emitted: {generated}"
+        );
+        assert!(
+            !generated.contains(".. :: autumn_web :: seo :: SeoRouteDefaults :: EMPTY"),
+            "a fully-specified initializer must not carry a struct-update tail: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_rejects_unknown_seo_key() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about", seo(titel = "About") },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "an unknown seo key must be a compile error: {generated}"
+        );
+        assert!(
+            generated.contains("titel"),
+            "the error must name the offending key: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_rejects_duplicate_seo_key() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about", seo(title = "A", title = "B") },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a duplicate seo key must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_rejects_non_string_seo_value() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about", seo(title = 42) },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a non-string seo value must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_rejects_seo_without_parentheses() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/about", seo = "title" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "`seo = ...` must be rejected in favour of `seo(...)`: {generated}"
         );
     }
 

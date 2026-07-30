@@ -1727,6 +1727,17 @@ fn group_and_mount_routes(
         if let Some(layer) = selected_layer {
             handler = handler.layer(layer.clone());
         }
+        // Route-level SEO defaults (#1182) ride along as a request extension so
+        // the `SeoMeta` extractor can hand handlers a pre-populated builder.
+        // Attaching them here — rather than inside the route macro — keeps the
+        // layer clear of the macro-ordering dance with the signature-rewriting
+        // guards (`#[secured]`, `#[throttle]`, `#[step_up]`, `#[authorize]`),
+        // and means static pre-rendering picks them up for free, since it
+        // drives this same router. Routes that never declared `seo(...)` skip
+        // the layer entirely and pay nothing per request.
+        if !route.seo.is_empty() {
+            handler = handler.layer(axum::Extension(route.seo));
+        }
         if let Some(version) = route.api_version {
             handler = handler.layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -4580,6 +4591,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -5131,6 +5143,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -5981,6 +5994,7 @@ enabled = true
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             }],
@@ -6187,6 +6201,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -6254,6 +6269,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -6427,6 +6443,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -6505,6 +6522,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -6794,6 +6812,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         }
@@ -7936,6 +7955,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::default(),
             timeout: crate::route::RouteTimeout::default(),
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
 
         // Manifest does NOT contain /dynamic, so the request falls through to
@@ -9115,6 +9135,7 @@ mod trusted_host_tests {
             timeout,
             api_version: None,
             sunset_opt_out: false,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         }
     }
 
@@ -9352,6 +9373,7 @@ mod trusted_host_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -9447,6 +9469,7 @@ mod trusted_host_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };

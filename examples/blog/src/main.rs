@@ -159,10 +159,21 @@ mod tests {
         .expect("blog i18n bundle");
         let locale = autumn_web::i18n::Locale::new("en").with_bundle(std::sync::Arc::new(bundle));
 
-        let html = super::routes::about::about(locale).await.into_string();
+        // The page's meta tags are declared on the `#[static_get]` attribute
+        // and normally reach the handler through the `SeoMeta` extractor;
+        // calling the handler directly, we feed it the same route-level
+        // defaults the router would have injected.
+        let seo = super::routes::about::__autumn_route_info_about()
+            .seo
+            .to_meta();
+        let html = super::routes::about::about(locale, seo).await.into_string();
 
         assert!(html.contains("Autumn Blog"), "html: {html}");
         assert!(!html.contains("nav.brand"), "html: {html}");
+        assert!(
+            html.contains("<title>About \u{2022} Autumn Blog</title>"),
+            "route-level seo(title = ...) should render into the layout; html: {html}"
+        );
     }
 
     #[tokio::test]

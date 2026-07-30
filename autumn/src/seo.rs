@@ -25,6 +25,42 @@
 //! }
 //! ```
 //!
+//! ## Route-level meta tag defaults
+//!
+//! Static values can be declared once on the route attribute instead of being
+//! rebuilt in every handler. Add a `seo(...)` argument, then take a [`SeoMeta`]
+//! parameter — it arrives pre-populated with the declared defaults:
+//!
+//! ```rust,ignore
+//! use autumn_web::prelude::*;
+//! use autumn_web::seo::SeoMeta;
+//!
+//! #[get("/about", seo(title = "About • My Blog", description = "Learn about us"))]
+//! async fn about(seo: SeoMeta) -> Markup {
+//!     html! { head { (seo.render()) } }
+//! }
+//!
+//! // The handler refines the attribute defaults with per-request values:
+//! #[get("/posts/{slug}", seo(og_type = "article"))]
+//! async fn show(slug: Path<String>, seo: SeoMeta) -> Markup {
+//!     let seo = seo.title(format!("{} • Blog", *slug));
+//!     html! { head { (seo.render()) } }
+//! }
+//! ```
+//!
+//! Every [`SeoMeta`] builder method has a matching `seo(...)` key: `title`,
+//! `description`, `canonical`, `og_title`, `og_description`, `og_image`,
+//! `og_type`, `og_url`, `twitter_card`, `twitter_title`,
+//! `twitter_description`, `twitter_image`, and `robots`. Values must be string
+//! literals; unknown or repeated keys are compile errors.
+//!
+//! The argument works on every route macro, including
+//! [`static_get`](crate::static_get), so pre-rendered pages carry the same
+//! tags. It supplies *values*, not markup — the handler still chooses where to
+//! emit them, normally by embedding [`SeoMeta::render`] in a layout. A handler
+//! that takes `SeoMeta` on a route without `seo(...)` simply receives an empty
+//! builder; the extractor never fails.
+//!
 //! ## Sitemap
 //!
 //! Register a [`SitemapSource`] on the app builder for dynamic routes:
@@ -343,7 +379,7 @@ fn xml_escape(s: &str) -> String {
 /// // html! { head { (meta.render()) } }
 /// # }
 /// ```
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SeoMeta {
     title: Option<String>,
     description: Option<String>,
@@ -522,6 +558,187 @@ impl SeoMeta {
                 meta name="twitter:image" content=(img);
             }
         }
+    }
+}
+
+// ── SeoRouteDefaults (route-level defaults) ───────────────────────────────────
+
+/// Route-level SEO defaults declared on a route attribute.
+///
+/// Emitted by the route macros for
+/// `#[get("/about", seo(title = "About", description = "…"))]` (and the same
+/// `seo(...)` argument on [`post`](crate::post), [`static_get`](crate::static_get),
+/// and friends), stored on [`Route::seo`](crate::Route::seo), and attached to
+/// each matching request as an extension so the [`SeoMeta`] extractor can hand
+/// the handler a pre-populated builder.
+///
+/// Every field borrows a `&'static str` straight out of the attribute literal,
+/// which keeps the type [`Copy`] and allocation-free until a handler asks for
+/// it. Applications rarely name this type: declare the values on the attribute
+/// and take a [`SeoMeta`] parameter in the handler.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use autumn_web::seo::SeoMeta;
+///
+/// #[get("/about", seo(title = "About • My Blog", description = "Learn about us"))]
+/// async fn about(seo: SeoMeta) -> Markup {
+///     // `seo` already carries the attribute's title and description.
+///     html! { head { (seo.render()) } }
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeoRouteDefaults {
+    /// Default page `<title>`.
+    pub title: Option<&'static str>,
+    /// Default `<meta name="description">`.
+    pub description: Option<&'static str>,
+    /// Default `<link rel="canonical">`.
+    pub canonical: Option<&'static str>,
+    /// Default `og:title`.
+    pub og_title: Option<&'static str>,
+    /// Default `og:description`.
+    pub og_description: Option<&'static str>,
+    /// Default `og:image`.
+    pub og_image: Option<&'static str>,
+    /// Default `og:type` (e.g. `"article"`).
+    pub og_type: Option<&'static str>,
+    /// Default `og:url`.
+    pub og_url: Option<&'static str>,
+    /// Default `twitter:card` type.
+    pub twitter_card: Option<&'static str>,
+    /// Default `twitter:title`.
+    pub twitter_title: Option<&'static str>,
+    /// Default `twitter:description`.
+    pub twitter_description: Option<&'static str>,
+    /// Default `twitter:image`.
+    pub twitter_image: Option<&'static str>,
+    /// Default `<meta name="robots">` directive.
+    pub robots: Option<&'static str>,
+}
+
+impl SeoRouteDefaults {
+    /// Defaults with every key unset — what a route without a `seo(...)`
+    /// argument records.
+    ///
+    /// Route macros use this as the struct-update base so only the keys named
+    /// on the attribute appear in generated code.
+    pub const EMPTY: Self = Self {
+        title: None,
+        description: None,
+        canonical: None,
+        og_title: None,
+        og_description: None,
+        og_image: None,
+        og_type: None,
+        og_url: None,
+        twitter_card: None,
+        twitter_title: None,
+        twitter_description: None,
+        twitter_image: None,
+        robots: None,
+    };
+
+    /// Whether no key was declared.
+    ///
+    /// The router skips installing the request extension for empty defaults, so
+    /// routes that never mention `seo(...)` pay nothing at request time.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.description.is_none()
+            && self.canonical.is_none()
+            && self.og_title.is_none()
+            && self.og_description.is_none()
+            && self.og_image.is_none()
+            && self.og_type.is_none()
+            && self.og_url.is_none()
+            && self.twitter_card.is_none()
+            && self.twitter_title.is_none()
+            && self.twitter_description.is_none()
+            && self.twitter_image.is_none()
+            && self.robots.is_none()
+    }
+
+    /// Expand these defaults into an owned [`SeoMeta`] builder that a handler
+    /// can refine further.
+    #[must_use]
+    pub fn to_meta(&self) -> SeoMeta {
+        let mut meta = SeoMeta::new();
+        if let Some(v) = self.title {
+            meta = meta.title(v);
+        }
+        if let Some(v) = self.description {
+            meta = meta.description(v);
+        }
+        if let Some(v) = self.canonical {
+            meta = meta.canonical(v);
+        }
+        if let Some(v) = self.og_title {
+            meta = meta.og_title(v);
+        }
+        if let Some(v) = self.og_description {
+            meta = meta.og_description(v);
+        }
+        if let Some(v) = self.og_image {
+            meta = meta.og_image(v);
+        }
+        if let Some(v) = self.og_type {
+            meta = meta.og_type(v);
+        }
+        if let Some(v) = self.og_url {
+            meta = meta.og_url(v);
+        }
+        if let Some(v) = self.twitter_card {
+            meta = meta.twitter_card(v);
+        }
+        if let Some(v) = self.twitter_title {
+            meta = meta.twitter_title(v);
+        }
+        if let Some(v) = self.twitter_description {
+            meta = meta.twitter_description(v);
+        }
+        if let Some(v) = self.twitter_image {
+            meta = meta.twitter_image(v);
+        }
+        if let Some(v) = self.robots {
+            meta = meta.robots(v);
+        }
+        meta
+    }
+}
+
+impl From<SeoRouteDefaults> for SeoMeta {
+    fn from(defaults: SeoRouteDefaults) -> Self {
+        defaults.to_meta()
+    }
+}
+
+/// Extract the route's declared SEO defaults as a refinable [`SeoMeta`].
+///
+/// This extractor never fails. A route with no `seo(...)` argument yields an
+/// empty builder, exactly as if the handler had called [`SeoMeta::new`], so
+/// adding the parameter is always safe.
+///
+/// Note that the attribute supplies *values*, not markup: the handler (or its
+/// layout) still decides where to emit them, normally via
+/// [`SeoMeta::render`].
+impl<S> axum::extract::FromRequestParts<S> for SeoMeta
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<SeoRouteDefaults>()
+            .map_or_else(Self::new, SeoRouteDefaults::to_meta))
     }
 }
 
@@ -897,6 +1114,122 @@ mod tests {
         assert!(
             robots.contains("Sitemap: https://cdn.example.com/sitemap.xml"),
             "should use override url; got:\n{robots}"
+        );
+    }
+
+    // ── SeoRouteDefaults / SeoMeta extractor (#1182) ─────────────────────────
+
+    #[test]
+    fn route_defaults_empty_is_default() {
+        assert_eq!(SeoRouteDefaults::default(), SeoRouteDefaults::EMPTY);
+        assert!(SeoRouteDefaults::EMPTY.is_empty());
+    }
+
+    #[test]
+    fn route_defaults_is_empty_false_when_any_key_set() {
+        let defaults = SeoRouteDefaults {
+            og_type: Some("article"),
+            ..SeoRouteDefaults::EMPTY
+        };
+        assert!(!defaults.is_empty());
+    }
+
+    #[test]
+    fn route_defaults_to_meta_populates_every_key() {
+        let defaults = SeoRouteDefaults {
+            title: Some("T"),
+            description: Some("D"),
+            canonical: Some("C"),
+            og_title: Some("OT"),
+            og_description: Some("OD"),
+            og_image: Some("OI"),
+            og_type: Some("OTY"),
+            og_url: Some("OU"),
+            twitter_card: Some("TC"),
+            twitter_title: Some("TT"),
+            twitter_description: Some("TD"),
+            twitter_image: Some("TI"),
+            robots: Some("noindex"),
+        };
+        let expected = SeoMeta::new()
+            .title("T")
+            .description("D")
+            .canonical("C")
+            .og_title("OT")
+            .og_description("OD")
+            .og_image("OI")
+            .og_type("OTY")
+            .og_url("OU")
+            .twitter_card("TC")
+            .twitter_title("TT")
+            .twitter_description("TD")
+            .twitter_image("TI")
+            .robots("noindex");
+        assert_eq!(defaults.to_meta(), expected);
+    }
+
+    #[test]
+    fn route_defaults_empty_to_meta_is_empty_builder() {
+        assert_eq!(SeoRouteDefaults::EMPTY.to_meta(), SeoMeta::new());
+    }
+
+    #[tokio::test]
+    async fn extractor_resolves_route_defaults_from_extension() {
+        use axum::extract::FromRequestParts;
+
+        let mut parts = axum::http::Request::builder()
+            .uri("/about")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        parts.extensions.insert(SeoRouteDefaults {
+            title: Some("About"),
+            ..SeoRouteDefaults::EMPTY
+        });
+
+        let meta = SeoMeta::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(meta, SeoMeta::new().title("About"));
+    }
+
+    #[tokio::test]
+    async fn extractor_yields_empty_builder_without_extension() {
+        use axum::extract::FromRequestParts;
+
+        let mut parts = axum::http::Request::builder()
+            .uri("/bare")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+
+        let meta = SeoMeta::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(meta, SeoMeta::new());
+    }
+
+    #[tokio::test]
+    async fn extractor_result_is_refinable_by_the_handler() {
+        use axum::extract::FromRequestParts;
+
+        let mut parts = axum::http::Request::builder()
+            .uri("/posts/hello")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        parts.extensions.insert(SeoRouteDefaults {
+            og_type: Some("article"),
+            title: Some("Attribute Title"),
+            ..SeoRouteDefaults::EMPTY
+        });
+
+        let meta = SeoMeta::from_request_parts(&mut parts, &())
+            .await
+            .unwrap()
+            .title("Handler Title");
+        assert_eq!(
+            meta,
+            SeoMeta::new().og_type("article").title("Handler Title")
         );
     }
 
