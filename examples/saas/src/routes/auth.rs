@@ -4,9 +4,6 @@
 //! `hash_password`/`verify_password` (bcrypt) for credentials, and plain Diesel
 //! for the user row. On success we store both `user_id` and `tenant_id` in the
 //! session; the dashboard reads `tenant_id` back to scope every query.
-//!
-//! Narrative walkthrough of these primitives — sessions, password policy,
-//! lockout, remember-me: `docs/guide/authentication.md`.
 
 use autumn_web::auth::{hash_password, validate_password, verify_password};
 use autumn_web::prelude::*;
