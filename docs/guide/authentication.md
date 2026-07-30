@@ -664,8 +664,10 @@ indistinguishable, and that logout makes the old cookie unusable. See the
 
 ## Production checklist
 
-- [ ] A [signing secret](./signing-secrets.md) is provisioned — otherwise every
-      restart invalidates all sessions and signed state.
+- [ ] A [signing secret](./signing-secrets.md) is provisioned. The production
+      profile fails fast without one, so this is really a check on every
+      *other* environment you care about: without it the router installs no
+      signing keys and session cookies carry unsigned ids.
 - [ ] `session.backend = "redis"` (with the `redis` feature) for any
       multi-replica or restart-sensitive deployment, or
       `allow_memory_in_production = true` set deliberately.
