@@ -196,9 +196,14 @@ let ok = verify_password(&form.password, &digest).await?;
 
 Both run the bcrypt work on a blocking thread pool, so a login storm does not
 stall the async runtime. `verify_password` also verifies against a dummy hash
-when the stored value is not a well-formed bcrypt digest, so a malformed or
-missing hash costs the same wall time as a real mismatch instead of returning
-instantly and leaking that fact.
+when the stored value fails a cheap shape check — 60 characters starting with
+`$` — so an empty or obviously non-bcrypt column costs the same wall time as a
+real mismatch instead of returning instantly and leaking that fact. The check is
+shape-only: a 60-character `$`-prefixed string that is *not* a valid bcrypt
+digest is passed straight to `bcrypt::verify`, which can reject it on parse
+without doing cost-12 work. Corrupted or badly imported hashes can therefore
+still be distinguished by timing; keep the uniform-timing guarantee for the
+unknown-account path (below), which is the one an attacker probes.
 
 `hash_password` hashes at a fixed cost of 12. `[auth].bcrypt_cost` is surfaced on
 `AuthConfig` for applications that call bcrypt themselves; changing it does not
@@ -316,16 +321,37 @@ Logout tears the session down and, if you issue them, revokes the device's
 
 ```rust,ignore
 #[post("/logout")]
-pub async fn logout(session: Session) -> AutumnResult<Response> {
+pub async fn logout(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    headers: HeaderMap,
+) -> AutumnResult<Response> {
+    let remember_cfg = state.config().auth.remember.clone();
+
+    // Drop this device's tracking row, then revoke its remember chain — before
+    // the session teardown, and only a no-op when neither is in play. Skipping
+    // this is the classic bug: the session dies, the remember cookie survives,
+    // and the next request logs the browser straight back in.
+    let _ = untrack_current_session(&mut db, &session).await;
+    revoke_remember_from_cookie(&mut db, &remember_cfg, &headers).await;
+
     session.clear().await;
     session.rotate_id().await;   // old cookie can no longer be replayed
-    Ok(Redirect::to("/").into_response())
+
+    let mut response = Redirect::to("/").into_response();
+    append_set_cookie(&mut response, &build_remember_clear_cookie(&remember_cfg));
+    Ok(response)
 }
 ```
 
 `clear()` + `rotate_id()` keeps a fresh session available to carry a one-shot
 [flash message](./flash.md) to the next page while still destroying the old
 record. Use `destroy()` when you also want the cookie expired outright.
+
+If you issue neither remember cookies nor tracking rows, the two helper calls
+and the `Set-Cookie` drop out and logout really is just `clear()` +
+`rotate_id()`. Add them back the moment you turn remember-me on.
 
 Working code: [`examples/saas/src/routes/auth.rs`](../../examples/saas/src/routes/auth.rs)
 (signup with policy enforcement, [submit tokens](./submit-tokens.md), and
@@ -411,9 +437,17 @@ generated login handler therefore also counts failures **per account**:
 
 1. Each failed login increments `failed_attempts` on the account row.
 2. At `threshold`, `locked_at` is stamped and a `tracing::warn!` fires with
-   `event = "account_locked"`, a SHA-256-truncated account digest, and an
-   IP prefix (IPv4 /24, IPv6 /64) — identifiable for incident response, not
-   reversible.
+   `event = "account_locked"`, a salted SHA-256 account digest truncated to 8
+   bytes, and an IP prefix (IPv4 /24, IPv6 /64) — correlatable across log lines
+   for incident response without putting a raw account id in the logs.
+
+   **Set the salt.** The digest is salted from `SECRET_KEY_BASE`, falling back
+   to `AUTUMN_ADMIN_SECRET`, falling back to a compiled-in constant. With
+   neither variable set, the salt is public and account ids are small sequential
+   integers, so anyone holding the logs can hash candidates and recover the id.
+   Export one of the two in production — note this digest does not read
+   `AUTUMN_SECURITY__SIGNING_SECRET`, so provisioning only the
+   [signing secret](./signing-secrets.md) leaves the fallback in place.
 3. While locked, *every* attempt — including the correct password — returns the
    same response as a wrong password, so the endpoint never reveals which
    accounts are locked.
@@ -476,10 +510,19 @@ match evaluate_remember(&presented_token, record.as_ref(), now, default_rotation
 ```
 
 `Theft` is the point of the scheme: replaying a rotated-out token for a *known*
-series can only mean two parties hold the chain, so the entire chain is
-destroyed and both are logged out. The 60-second rotation grace
-(`DEFAULT_ROTATION_GRACE_SECS`) keeps concurrent requests that raced a rotation
-from false-firing that alarm.
+series can only mean two parties hold the chain, so the whole series is deleted
+and the cookie cleared — neither party can use remember-me to authenticate
+again. The 60-second rotation grace (`DEFAULT_ROTATION_GRACE_SECS`) keeps
+concurrent requests that raced a rotation from false-firing that alarm.
+
+Scope that precisely: `Theft` revokes the **remember chain**, not existing
+logins. The generated middleware deletes the series and clears the cookie on
+that one unauthenticated request; it does not destroy session records or delete
+[tracking rows](#active-sessions-and-revocation), and it skips remember
+processing entirely for a request that already carries a session identity. A
+victim and an attacker who each hold a live session cookie both stay logged in
+until those sessions end. If a theft signal should log everyone out, pair it
+with `revoke_all_sessions` on that account.
 
 ```toml
 [auth.remember]
@@ -605,7 +648,10 @@ indistinguishable, and that logout makes the old cookie unusable. See the
 - [ ] Login responses are non-enumerating in body, status, **and** timing.
 - [ ] `[auth.password]` reviewed; consider `breach_check = "fail_open"`.
 - [ ] `[auth.lockout]` left enabled, `AUTUMN_ADMIN_SECRET` set, and the unlock
-      route network-restricted.
+      route network-restricted. That variable (or `SECRET_KEY_BASE`) also salts
+      the `account_locked` log digest — without either, the digest is reversible.
+- [ ] Logout revokes the remember chain and the tracking row, not just the
+      session.
 - [ ] Every authenticated route reaches `require_tracked_session` (directly or
       via middleware) if you rely on session revocation — `#[secured]` alone
       does not enforce it.
