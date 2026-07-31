@@ -878,9 +878,14 @@ impl SearchClient {
             report.indexed += count;
             report.batches += 1;
 
-            if usize::try_from(count).unwrap_or(usize::MAX) < batch_size {
-                break;
-            }
+            // No early exit on a short batch. `DocumentSource::scan` returns
+            // **up to** `limit` documents, so a short-but-non-empty batch does
+            // not mean the source is exhausted — a custom source that filters
+            // after reading, or reads a fixed page and drops soft-deleted
+            // rows, legitimately returns fewer. Stopping there would silently
+            // truncate the rebuild at that batch and report success. An empty
+            // batch is the only end-of-source signal, at the cost of one extra
+            // scan per backfill.
         }
 
         tracing::info!(

@@ -75,6 +75,20 @@ pub struct SearchPlugin {
     /// instance `build` installs ever receives the connection pool. A second
     /// one would be permanently pool-less.
     postgres_store: OnceLock<Arc<PostgresSearchStore>>,
+    /// The in-memory backend used when the app installs none, created once.
+    ///
+    /// Memoized for the same reason `postgres_store` is: `client()` and
+    /// `Plugin::build` each assemble a client, and a fresh
+    /// `MemorySearchBackend` per call would give them **separate indexes** —
+    /// an app following the documented outside-request path would write to one
+    /// and serve requests from the other.
+    default_backend: OnceLock<Arc<dyn SearchBackend>>,
+    /// The `[search]` section as finally resolved, memoized so `client()` and
+    /// `Plugin::build` cannot disagree about it.
+    ///
+    /// `Err` is kept rather than discarded: `Plugin::build` cannot return an
+    /// error, so a malformed section has to be surfaced from the startup hook.
+    resolved_config: OnceLock<Result<SearchConfig, String>>,
     /// Set once the app supplies configuration explicitly, so `build` does not
     /// then overwrite it from the app's config files.
     config_explicit: bool,
@@ -100,6 +114,8 @@ impl SearchPlugin {
             use_postgres: false,
             queue_override: None,
             postgres_store: OnceLock::new(),
+            default_backend: OnceLock::new(),
+            resolved_config: OnceLock::new(),
             config_explicit: false,
         }
     }
@@ -217,10 +233,51 @@ impl SearchPlugin {
         config
     }
 
+    /// The `[search]` section as the plugin will actually use it: builder
+    /// intent, then the app's config files and environment (unless
+    /// [`Self::config`] was called), then the [`Self::queue`] override.
+    ///
+    /// Resolved **once** and memoized, so a client taken before
+    /// [`Plugin::build`] and the one `build` installs cannot disagree — in
+    /// particular, an app that keeps a pre-build handle must not keep serving
+    /// searches after the resolved config said `enabled = false`.
+    fn resolved_config(&self) -> &Result<SearchConfig, String> {
+        self.resolved_config.get_or_init(|| {
+            if self.config_explicit {
+                return Ok(self.search_config());
+            }
+            SearchConfig::resolve()
+                .map(|mut config| {
+                    // Builder overrides land on TOP of the file, never instead
+                    // of it.
+                    if let Some(queue) = &self.queue_override {
+                        config.queue.clone_from(queue);
+                    }
+                    config
+                })
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// [`Self::resolved_config`], falling back to builder intent when
+    /// resolution failed. The error itself aborts boot from the startup hook;
+    /// this keeps every other path total.
+    fn effective_config(&self) -> SearchConfig {
+        self.resolved_config()
+            .as_ref()
+            .map_or_else(|_| self.search_config(), Clone::clone)
+    }
+
     /// Build the [`SearchClient`] this plugin would install.
     ///
     /// Exposed so tests (and an app that drives search outside a request) can
-    /// obtain the same client the plugin registers.
+    /// obtain the same client the plugin registers. Every shared part — the
+    /// backend, the document source, the resolved configuration — is memoized
+    /// on the plugin, so this client and the one [`Plugin::build`] installs
+    /// address the same index and honour the same `[search]` section.
+    ///
+    /// It does reflect the builder *as configured so far*: calls made after
+    /// this one land on the plugin, not on an already-built client.
     #[must_use]
     pub fn client(&self) -> SearchClient {
         self.client_builder().build()
@@ -235,13 +292,19 @@ impl SearchPlugin {
         }
         Some(self.postgres_store.get_or_init(|| {
             Arc::new(PostgresSearchStore::new(
-                self.search_config().embedding_dimensions,
+                self.effective_config().embedding_dimensions,
             ))
         }))
     }
 
+    /// The shared in-memory backend used when the app installs none.
+    fn default_backend(&self) -> &Arc<dyn SearchBackend> {
+        self.default_backend
+            .get_or_init(|| Arc::new(crate::MemorySearchBackend::new()) as Arc<dyn SearchBackend>)
+    }
+
     fn client_builder(&self) -> SearchClientBuilder {
-        let config = self.search_config();
+        let config = self.effective_config();
         let mut builder = SearchClient::builder()
             .enabled(config.enabled)
             .batch_size(config.batch_size);
@@ -256,6 +319,13 @@ impl SearchPlugin {
         }
         if let Some(backend) = &self.backend {
             builder = builder.backend(Arc::clone(backend));
+        } else if self.postgres_store().is_none() {
+            // No backend configured: fall back to the in-memory one, but the
+            // SAME instance every time. Letting `SearchClientBuilder` mint its
+            // own default per call would give `client()` and `Plugin::build`
+            // separate indexes — an app that indexed through the pre-build
+            // handle would then serve requests from an empty one.
+            builder = builder.backend(Arc::clone(self.default_backend()));
         }
         if let Some(embedder) = &self.embedder {
             builder = builder.embedder(Arc::clone(embedder));
@@ -334,46 +404,35 @@ impl Plugin for SearchPlugin {
         Cow::Borrowed("autumn-search")
     }
 
-    fn build(mut self, app: AppBuilder) -> AppBuilder {
+    fn build(self, app: AppBuilder) -> AppBuilder {
         // Declare the plugin-owned `[search]` table first, so a host app with
         // `server.strict_config = true` boots instead of failing on an
         // "unknown key" — and so every return path below carries it.
         let app = app.config_section("search");
 
-        // Pick up `[search]` from the app's config unless the plugin was
-        // configured explicitly in code. Without this, `enabled = false` —
+        // `[search]` comes from the app's config unless the plugin was
+        // configured explicitly in code. Without that, `enabled = false` —
         // documented as the incident kill switch — would need a code change
         // and a deploy, which is exactly what a kill switch must not need.
         //
-        // `resolve()`, not a single-file read: the section is resolved through
-        // the same profile layering core applies, so `[profile.prod.search]`
-        // and `autumn-prod.toml` are honoured. A kill switch that works in dev
-        // and is ignored in prod is worse than no kill switch.
-        let mut config_error = None;
-        if !self.config_explicit {
-            match SearchConfig::resolve() {
-                Ok(config) => self.config = config,
-                // A malformed `[search]` must not silently fall back to
-                // defaults: an unknown key there is how a typo'd kill switch
-                // would go unnoticed. `Plugin::build` cannot return an error,
-                // so surface it from the startup hook, which aborts boot.
-                Err(error) => config_error = Some(error.to_string()),
-            }
-        }
-        // Builder overrides land on TOP of the file, never instead of it.
-        if let Some(queue) = self.queue_override.take() {
-            self.config.queue = queue;
-        }
+        // Read through the memoized `resolved_config`, NOT resolved afresh:
+        // an app that took a `client()` handle before mounting the plugin has
+        // already pinned this value, and resolving twice would let the two
+        // disagree. A malformed `[search]` is kept as an error rather than
+        // falling back to defaults — an unknown key there is how a typo'd kill
+        // switch goes unnoticed — and since `Plugin::build` cannot return one,
+        // it is surfaced from the startup hook, which aborts boot.
+        let config_error = self.resolved_config().as_ref().err().cloned();
+        let config = self.effective_config();
 
         // Resolved (and memoized) here rather than in `postgres()`, so the
         // configuration it snapshots — `embedding_dimensions`, which gates the
-        // pgvector fast path — reflects the file config loaded just above,
-        // regardless of builder-call order. `client()` shares this instance:
-        // only the one installed here receives the pool.
+        // pgvector fast path — reflects the resolved config regardless of
+        // builder-call order. `client()` shares this instance: only the one
+        // installed here receives the pool.
         let postgres = self.postgres_store().map(Arc::clone);
 
-        let jobs = search_job_infos(&self.config.queue);
-        let config = self.config.clone();
+        let jobs = search_job_infos(&config.queue);
         // The client is fully assembled here: every part is an `Arc` supplied
         // by the app's own builder call. Only the Postgres pool has to wait
         // for `AppState`, and the store takes it lazily — so the startup hook

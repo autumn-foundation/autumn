@@ -27,19 +27,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **not** the record — the handler re-reads the row, so a present row upserts
   and an absent row deletes. That single idempotent operation makes
   at-least-once delivery safe and lets a lost delete event, a soft delete, or a
-  row changed by direct SQL repair itself. Queries reuse `Page`/`ListQuery`
+  row changed by direct SQL repair itself. The dedup key is released when a job
+  *starts* (so a write landing mid-reindex is never swallowed), and a
+  concurrency cap of one **per record** keeps the two jobs that implies from
+  interleaving a stale read over a newer write. Queries reuse `Page`/`ListQuery`
   (`search`, `search_list`, `search_hydrated`, `similar`, `similar_to`), and
   `autumn search reindex [--index NAME] [--purge]` rebuilds an index by running
   the application binary — the same technique `autumn jobs manifest` uses,
   because only the app knows which models, backend, and embedder are
-  registered. Backfill walks the source by keyset (`WHERE id > $after`), never
-  `OFFSET`, so a live table cannot skip or repeat rows. Backends are pluggable
+  registered. Backfill walks the source by keyset (`WHERE <key> > $after`),
+  never `OFFSET`, so a live table cannot skip or repeat rows, and it stops only
+  on an empty batch — `scan` returns *up to* `limit`, so a source that filters
+  after reading yields short batches with rows still behind them. Backends are pluggable
   behind a `SearchBackend` trait shaped so an external engine (Meilisearch,
   Tantivy, a vector store) is a new `impl` rather than a breaking change: query
   and result types are `#[non_exhaustive]`, capabilities are declarable from
   outside the crate, and a keyword-only engine is a complete implementation.
   The Postgres backend ships first, reusing
-  `to_tsvector`/`setweight`/`ts_rank_cd` and adding `pgvector` when the
+  `to_tsvector`/`setweight`/`ts_rank_cd` — with the framework's own weight
+  array rather than Postgres' default, which differs at `B` and would otherwise
+  rank a body-field match differently from every other backend — and adding
+  `pgvector` when the
   extension is present — with a portable `double precision[]` +
   `autumn_search_cosine()` fallback so a managed Postgres without `pgvector`
   still boots and still answers k-NN queries. A `MemorySearchBackend` gives

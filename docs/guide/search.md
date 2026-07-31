@@ -128,6 +128,17 @@ writes collapse to one job precisely because the ops are interchangeable.
 `DocumentSource` installed a delete still removes the document (it needs
 nothing to re-read), while an upsert reports `SourceUnavailable`.
 
+Convergence needs one more thing to hold on a multi-worker deployment. The
+dedup key is released when a job **starts**, not when it finishes — otherwise a
+write landing mid-reindex would be swallowed and the index would keep the
+pre-write text. That means two jobs for one record can be in flight at once,
+and because each re-reads the source they can interleave badly: A reads, a
+write lands, B reads and writes the new state, then A writes the old one. So
+the reindex job also carries a **concurrency cap of one per record**
+(`(index, id)`, not per job type — distinct records still reindex fully in
+parallel). The follow-up job is still enqueued immediately; it just waits for
+the running one, then re-reads and converges.
+
 ---
 
 ## 3. Mount the plugin
@@ -344,10 +355,17 @@ let report = search.backfill("articles", &BackfillOptions::default()).await?;
 let reports = search.backfill_all(&BackfillOptions::default().purge(true)).await?;
 ```
 
-The backfill walks the source with **keyset** pagination (`WHERE id > $after
-ORDER BY id`), never `OFFSET`, so a live table's concurrent writes cannot make
-it skip or repeat rows. It writes through the exact same path as an incremental
-reindex, so bootstrapping and steady state cannot disagree.
+The backfill walks the source with **keyset** pagination
+(`WHERE <key> > $after ORDER BY <key>`), never `OFFSET`, so a live table's
+concurrent writes cannot make it skip or repeat rows. It writes through the
+exact same path as an incremental reindex, so bootstrapping and steady state
+cannot disagree.
+
+It stops only on an **empty** batch, never on a short one. `DocumentSource::scan`
+returns *up to* `limit` documents, so a source that filters after reading —
+soft-deleted rows, a tenant check, an empty embed field — legitimately returns
+a short batch with rows still behind it. Stopping there would truncate the
+rebuild and report success.
 
 `purge` is off by default: emptying the index is the wrong trade for a routine
 repair run. Turn it on when documents the source no longer produces would
@@ -377,6 +395,14 @@ That buys three things the per-table column cannot:
 
 Your model's own `#[searchable]` column and `#[repository(searchable)]`
 `search()` are untouched.
+
+Ranking passes the framework's own weight array to `ts_rank_cd`
+(`{D, C, B, A}` = `{0.1, 0.2, 0.5, 1.0}`, the normalized form of
+`weight_factor`'s `1/2/5/10`) rather than taking Postgres' default
+`{0.1, 0.2, 0.4, 1.0}`. The two differ only at `B` — which is the weight a
+body field usually carries, so leaving it defaulted would rank Postgres
+differently from `MemorySearchBackend` on the most ordinary model there is,
+and the two suites assert they implement the *same* contract.
 
 ### `pgvector`, and life without it
 

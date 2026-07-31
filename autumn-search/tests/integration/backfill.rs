@@ -166,3 +166,100 @@ async fn backfill_without_a_document_source_is_a_typed_error() {
         .unwrap_err();
     assert!(matches!(err, SearchError::SourceUnavailable), "{err:?}");
 }
+
+// ── A source that returns short batches ─────────────────────────────────────
+
+/// A `DocumentSource` that reads a fixed window of `limit` rows and then drops
+/// the ones that do not qualify — so it returns **up to** `limit` documents,
+/// as the trait allows, and a short batch does not mean "no more rows".
+///
+/// This is not contrived: any source that filters after reading behaves this
+/// way — soft-deleted rows, rows failing a tenant check, rows whose embed text
+/// is empty. Here, even ids are the ones dropped.
+struct FilteringSource {
+    documents: Vec<autumn_web::search::SearchDocument>,
+}
+
+impl autumn_search::DocumentSource for FilteringSource {
+    fn fetch<'a>(
+        &'a self,
+        _definition: &'a autumn_search::IndexDefinition,
+        ids: &'a [i64],
+    ) -> autumn_search::BoxFuture<
+        'a,
+        autumn_search::SearchResult<Vec<autumn_web::search::SearchDocument>>,
+    > {
+        Box::pin(async move {
+            Ok(self
+                .documents
+                .iter()
+                .filter(|document| ids.contains(&document.id) && document.id % 2 == 1)
+                .cloned()
+                .collect())
+        })
+    }
+
+    fn scan<'a>(
+        &'a self,
+        _definition: &'a autumn_search::IndexDefinition,
+        after: Option<i64>,
+        limit: usize,
+    ) -> autumn_search::BoxFuture<
+        'a,
+        autumn_search::SearchResult<Vec<autumn_web::search::SearchDocument>>,
+    > {
+        Box::pin(async move {
+            let after = after.unwrap_or(0);
+            Ok(self
+                .documents
+                .iter()
+                .filter(|document| document.id > after)
+                // Read the window first…
+                .take(limit)
+                // …then drop what does not qualify. The batch is short, but
+                // rows remain beyond it.
+                .filter(|document| document.id % 2 == 1)
+                .cloned()
+                .collect())
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_short_batch_does_not_end_the_backfill() {
+    use autumn_web::search::SearchIndexed as _;
+
+    // 30 rows, half of which the source filters out. With a batch size of 10,
+    // every batch comes back short (5 of 10) while 20 more rows still remain.
+    // Treating "short" as "exhausted" indexes 5 records and reports success —
+    // a silently truncated rebuild, which is the worst kind.
+    let source = Arc::new(FilteringSource {
+        documents: (1..=30)
+            .map(|id| article(id, &format!("Record {id}"), "rust web framework").search_document())
+            .collect(),
+    });
+    let client = SearchClient::builder()
+        .backend(Arc::new(MemorySearchBackend::new()))
+        .source(source)
+        .index::<Article>()
+        .build();
+    client.ensure_indexes().await.expect("ensure");
+
+    let report = client
+        .backfill(
+            "search_articles",
+            &BackfillOptions::default().batch_size(10),
+        )
+        .await
+        .expect("backfill");
+
+    assert_eq!(
+        report.indexed, 15,
+        "every odd id in 1..=30 must be indexed, not just the first batch"
+    );
+    let page = client
+        .search::<Article>("rust", &PageRequest::default())
+        .await
+        .expect("search");
+    assert_eq!(page.total_elements, 15);
+}

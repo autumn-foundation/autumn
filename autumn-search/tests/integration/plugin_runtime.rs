@@ -120,9 +120,13 @@ async fn a_lifecycle_reindex_flows_through_the_job_queue_into_the_index() {
     autumn_search::enqueue_reindex(&ReindexArgs::upsert("search_articles", 1))
         .await
         .expect("enqueue");
+    // Serialized from the constructor rather than hand-written, so the
+    // assertion tracks the payload contract instead of pinning a snapshot of
+    // it — `scope` was added for the per-record concurrency cap and is part of
+    // what actually goes on the wire.
     test.assert_job_enqueued_with(
         REINDEX_JOB,
-        serde_json::json!({"index": "search_articles", "id": 1, "op": "upsert"}),
+        serde_json::to_value(ReindexArgs::upsert("search_articles", 1)).expect("serialize"),
     );
 
     let performed = test.perform_enqueued_jobs().await;
@@ -162,7 +166,7 @@ async fn a_delete_instruction_removes_the_record_through_the_same_job() {
         .expect("enqueue");
     test.assert_job_enqueued_with(
         REINDEX_JOB,
-        serde_json::json!({"index": "search_articles", "id": 1, "op": "delete"}),
+        serde_json::to_value(ReindexArgs::delete("search_articles", 1)).expect("serialize"),
     );
     test.perform_enqueued_jobs().await.assert_all_succeeded();
 

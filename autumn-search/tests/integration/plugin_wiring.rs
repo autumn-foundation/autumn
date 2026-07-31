@@ -124,3 +124,59 @@ fn a_zero_batch_size_in_config_is_rejected() {
     let toml = "[search]\nbatch_size = 0\n";
     assert!(SearchConfig::from_toml_str(toml).is_err());
 }
+
+// ── The client taken before the plugin is mounted ───────────────────────────
+
+#[tokio::test]
+async fn every_client_the_plugin_hands_out_shares_one_index() {
+    // The documented outside-request path forces `client()` to be called
+    // *before* the plugin is moved into `app.plugin(...)`. If each call minted
+    // its own default `MemorySearchBackend`, the retained handle and the one
+    // the startup hook installs would address separate indexes: the app would
+    // write through one and serve requests from the other, and every search
+    // would come back empty with nothing in the logs.
+    let plugin = SearchPlugin::new()
+        .embedder(Arc::new(HashingEmbedder::new(32)))
+        .index::<Article>();
+
+    let retained = plugin.client();
+    let installed = plugin.client();
+    retained.ensure_indexes().await.expect("ensure");
+
+    retained
+        .index_record(&super::support::article(1, "Rust web", "a survey"))
+        .await
+        .expect("index through the retained handle");
+
+    let page = installed
+        .search::<Article>("rust", &autumn_search::PageRequest::default())
+        .await
+        .expect("search through the installed handle");
+    assert_eq!(
+        page.content.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1],
+        "both handles must address the same index"
+    );
+}
+
+#[test]
+fn a_client_taken_before_build_still_honours_the_resolved_config() {
+    // `enabled` is resolved from the app's config, which happens at build
+    // time — but a handle taken before then must not keep serving searches
+    // that the resolved section turned off. Resolution is memoized on the
+    // plugin, so both sides see one answer.
+    //
+    // Driven through `config(...)` here because a test process has no
+    // `autumn.toml`; the point is that `client()` reads the same resolved
+    // value `Plugin::build` does, not where that value came from.
+    let disabled = SearchConfig::from_toml_str("[search]\nenabled = false\n").expect("parse");
+    let plugin = SearchPlugin::new().config(disabled).index::<Article>();
+
+    assert!(
+        !plugin.client().is_enabled(),
+        "a pre-build handle must not bypass the kill switch"
+    );
+
+    let app = autumn_web::app().plugin(plugin);
+    assert!(app.has_plugin("autumn-search"));
+}

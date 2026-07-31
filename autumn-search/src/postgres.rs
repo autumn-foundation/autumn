@@ -61,6 +61,19 @@ type BoxedQuery<'a> = diesel::query_builder::BoxedSqlQuery<
 /// Physical table every index's documents live in.
 pub const DOCUMENTS_TABLE: &str = "autumn_search_documents";
 
+/// `ts_rank_cd`'s `{D, C, B, A}` weight array, matching
+/// [`weight_factor`](autumn_web::search::weight_factor).
+///
+/// Postgres' default is `{0.1, 0.2, 0.4, 1.0}`, but the framework's
+/// cross-backend ranking contract is `D:1, C:2, B:5, A:10` — `0.5` for `B`,
+/// not `0.4`. Leaving it defaulted means a query whose `B` and `C` matches
+/// compete ranks differently here than in `MemorySearchBackend`, which the two
+/// suites assert is the *same* contract. Kept as a literal (not formatted at
+/// call time) so the statement text is stable for the prepared-statement
+/// cache; `ts_rank_weights_track_the_framework_factors` fails if
+/// `weight_factor` changes without this.
+const TS_RANK_WEIGHTS: &str = "'{0.1, 0.2, 0.5, 1.0}'::float4[]";
+
 /// How embeddings are physically stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -715,7 +728,7 @@ impl SearchBackend for PostgresSearchStore {
             let rows = bind_all(
                 diesel::sql_query(format!(
                     "SELECT record_id, \
-                            ts_rank_cd(search_vector, \
+                            ts_rank_cd({TS_RANK_WEIGHTS}, search_vector, \
                                        plainto_tsquery($2::text::regconfig, $3))::double precision \
                               AS score \
                      FROM {DOCUMENTS_TABLE} WHERE {where_clause} \
@@ -1314,6 +1327,44 @@ mod tests {
 
     fn definition() -> IndexDefinition {
         IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
+    }
+
+    #[test]
+    fn ts_rank_weights_track_the_framework_factors() {
+        // Postgres' own default is `{0.1, 0.2, 0.4, 1.0}`; the framework's
+        // contract normalizes to `{0.1, 0.2, 0.5, 1.0}`. `B` is the one that
+        // differs, which is precisely the weight `#[searchable(weight = "B")]`
+        // gives a body field — so leaving it defaulted makes Postgres rank
+        // differently from `MemorySearchBackend` on the most common model
+        // shape there is.
+        use autumn_web::search::weight_factor;
+
+        // Compared numerically, not as text: a string comparison would depend
+        // on float formatting (`1.0` renders as `1`) and a fixed-precision
+        // format would hide a genuine drift in a small ratio.
+        let declared = parse_vector(
+            TS_RANK_WEIGHTS
+                .trim_end_matches("::float4[]")
+                .trim_matches('\''),
+        );
+        let top = weight_factor('A');
+        let expected: Vec<f32> = ['D', 'C', 'B', 'A']
+            .into_iter()
+            .map(|weight| weight_factor(weight) / top)
+            .collect();
+        assert_eq!(
+            declared.len(),
+            expected.len(),
+            "ts_rank_cd takes exactly {{D, C, B, A}}: {TS_RANK_WEIGHTS}"
+        );
+        for (index, (got, want)) in declared.iter().zip(&expected).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "weight {} is {got}, expected {want} — the SQL array must stay in step with \
+                 `weight_factor`",
+                ['D', 'C', 'B', 'A'][index]
+            );
+        }
     }
 
     #[test]

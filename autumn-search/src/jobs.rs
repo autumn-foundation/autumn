@@ -44,6 +44,25 @@ pub enum ReindexOp {
     Delete,
 }
 
+/// Payload field naming the per-record concurrency scope.
+///
+/// The framework resolves a concurrency scope from **one** payload field, so
+/// the composite `(index, id)` key has to exist as a field rather than be
+/// computed from two. See [`reindex_concurrency`].
+pub const REINDEX_SCOPE_FIELD: &str = "scope";
+
+/// At most one in-flight reindex per record.
+///
+/// Scoped by [`REINDEX_SCOPE_FIELD`], so distinct records still reindex fully
+/// in parallel — the cap is per `(index, id)`, not per job type.
+#[must_use]
+pub fn reindex_concurrency() -> autumn_web::job::JobConcurrency {
+    autumn_web::job::JobConcurrency {
+        limit: 1,
+        key: Some(REINDEX_SCOPE_FIELD.to_owned()),
+    }
+}
+
 /// Payload of the [`REINDEX_JOB`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReindexArgs {
@@ -53,26 +72,42 @@ pub struct ReindexArgs {
     pub id: i64,
     /// The operation.
     pub op: ReindexOp,
+    /// `"{index}:{id}"` — the per-record concurrency scope.
+    ///
+    /// Denormalized into the payload on purpose: it is redundant with `index`
+    /// and `id`, but the concurrency limiter reads a single named field, and
+    /// scoping on `id` alone would needlessly serialize record 7 of one index
+    /// against record 7 of another (auto-increment keys collide constantly
+    /// across tables).
+    ///
+    /// `#[serde(default)]` so a payload enqueued by an older deploy still
+    /// deserializes; it lands in a shared scope, which over-serializes for the
+    /// length of the rollout rather than losing the guarantee.
+    #[serde(default)]
+    pub scope: String,
 }
 
 impl ReindexArgs {
     /// An upsert instruction (create or update).
     #[must_use]
     pub fn upsert(index: impl Into<String>, id: i64) -> Self {
-        Self {
-            index: index.into(),
-            id,
-            op: ReindexOp::Upsert,
-        }
+        Self::new(index, id, ReindexOp::Upsert)
     }
 
     /// A delete instruction.
     #[must_use]
     pub fn delete(index: impl Into<String>, id: i64) -> Self {
+        Self::new(index, id, ReindexOp::Delete)
+    }
+
+    /// Build an instruction, deriving [`scope`](Self::scope).
+    fn new(index: impl Into<String>, id: i64, op: ReindexOp) -> Self {
+        let index = index.into();
         Self {
-            index: index.into(),
+            scope: format!("{index}:{id}"),
+            index,
             id,
-            op: ReindexOp::Delete,
+            op,
         }
     }
 
@@ -85,7 +120,7 @@ impl ReindexArgs {
     /// this scheme, so collapsing them is safe rather than lossy.
     #[must_use]
     pub fn unique_key(&self) -> String {
-        format!("{}:{}", self.index, self.id)
+        self.scope.clone()
     }
 }
 
@@ -196,6 +231,20 @@ pub fn search_job_infos(queue: &str) -> Vec<JobInfo> {
         // the index would keep the pre-write text.
         window: JobUniquenessWindow::Pending,
     });
+    // …and because the key is released at start, two jobs for one record can
+    // be in flight at once on a multi-worker deployment. Both re-read the
+    // source, so they interleave as: A reads (state 1) → write lands (state 2)
+    // → B reads (state 2) → B writes state 2 → A writes state 1. The index
+    // keeps the STALE text until the next mutation or backfill, and the same
+    // ordering resurrects a document whose row B had just seen deleted. The
+    // window is not narrow either: an embedding provider call sits between A's
+    // read and A's write.
+    //
+    // A per-record cap of one closes it without giving up the follow-up. The
+    // second job is still enqueued immediately (that is what `Pending` buys),
+    // it simply cannot start until the first finishes — at which point it
+    // re-reads and converges on the latest state.
+    reindex.concurrency = Some(reindex_concurrency());
 
     // A backfill is long and expensive; a tight retry loop would stampede, and
     // two concurrent full rebuilds of one index are pure waste.
@@ -238,6 +287,66 @@ mod tests {
             .find(|i| i.name == BACKFILL_JOB)
             .expect("backfill");
         assert!(backfill.initial_backoff_ms > reindex.initial_backoff_ms);
+    }
+
+    #[test]
+    fn reindex_is_capped_at_one_in_flight_job_per_record() {
+        // Uniqueness releases the key when the job STARTS, so without this cap
+        // two jobs for one record run concurrently and the slower one's stale
+        // read overwrites the newer one's write.
+        let reindex = search_job_infos("search")
+            .into_iter()
+            .find(|i| i.name == REINDEX_JOB)
+            .expect("reindex");
+        let concurrency = reindex.concurrency.expect("a per-record cap");
+        assert_eq!(concurrency.limit, 1);
+        assert_eq!(concurrency.key.as_deref(), Some(REINDEX_SCOPE_FIELD));
+    }
+
+    #[test]
+    fn the_concurrency_scope_is_a_real_payload_field_and_is_per_record() {
+        // The limiter resolves the scope by looking `key` up in the serialized
+        // payload. If the field name and the declared key ever drift, EVERY
+        // payload resolves to the same missing-field scope and a limit of 1
+        // silently becomes a global serialization of all reindexing — slow,
+        // and with no signal that the per-record guarantee was lost.
+        let args = ReindexArgs::upsert("articles", 7);
+        let json = serde_json::to_value(&args).expect("serialize");
+        assert_eq!(
+            json.get(REINDEX_SCOPE_FIELD).and_then(|v| v.as_str()),
+            Some("articles:7"),
+            "the declared concurrency key must name a field that is actually there: {json}"
+        );
+
+        // Per RECORD, not per id: auto-increment keys collide across tables,
+        // and scoping on `id` alone would serialize unrelated records.
+        assert_ne!(
+            ReindexArgs::upsert("articles", 7).scope,
+            ReindexArgs::upsert("notes", 7).scope
+        );
+        assert_ne!(
+            ReindexArgs::upsert("articles", 7).scope,
+            ReindexArgs::upsert("articles", 8).scope
+        );
+        // An upsert and a delete for one record DO share a scope: they are the
+        // pair that must not interleave.
+        assert_eq!(
+            ReindexArgs::upsert("articles", 7).scope,
+            ReindexArgs::delete("articles", 7).scope
+        );
+    }
+
+    #[test]
+    fn a_payload_without_a_scope_still_deserializes() {
+        // An in-flight payload enqueued by an older deploy has no `scope`. It
+        // must still run — it lands in a shared concurrency scope, which
+        // over-serializes for the length of the rollout rather than failing.
+        let args: ReindexArgs =
+            serde_json::from_str(r#"{"index":"articles","id":7,"op":"upsert"}"#).expect("legacy");
+        assert_eq!(args.index, "articles");
+        assert_eq!(args.id, 7);
+        assert_eq!(args.op, ReindexOp::Upsert);
+        assert_eq!(args.scope, "");
     }
 
     #[test]
