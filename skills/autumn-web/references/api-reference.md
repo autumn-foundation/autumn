@@ -17,6 +17,7 @@ the `trunk-dev` workspace is versioned **0.6.0 (unpublished)**. Entries marked
 | `autumn-admin-plugin` | `autumn-admin-plugin/` | First-party admin UI plugin |
 | `autumn-storage-s3` | `autumn-storage-s3/` | S3-compatible `BlobStore` plugin |
 | `autumn-cache-redis` | `autumn-cache-redis/` | Redis cache plugin |
+| `autumn-search` | `autumn-search/` | Keyword + vector search plugin |
 
 All publishable crates share the `[workspace.package]` version and release
 together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).

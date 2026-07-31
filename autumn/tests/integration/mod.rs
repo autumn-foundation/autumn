@@ -191,6 +191,8 @@ mod routes_macro;
 mod scheduled_coordination;
 mod schema_drift_guard;
 mod scoped_tokens;
+#[cfg(feature = "db")]
+mod search_index_definition;
 mod security;
 mod seo;
 mod server_timing;

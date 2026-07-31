@@ -9,6 +9,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **search:** a new optional plugin crate, `autumn-search`, turning the in-core
+  full-text primitives (#842) into a **search subsystem**: mark a model
+  searchable and get an index that stays in sync with the record lifecycle,
+  plus semantic / vector retrieval, behind one engine-agnostic API (#1191).
+  The `#[searchable]` attribute you already write is the single source of
+  truth — `#[model]` now also derives an engine-agnostic `IndexDefinition`
+  (index name, language, weighted fields) and a per-record `SearchDocument`
+  from it, and a new `#[searchable(embed)]` field flag nominates the one field
+  whose text is embedded for "find similar" / RAG retrieval. Two `embed`
+  fields, or `embed` without the model-level `#[searchable]`, are compile
+  errors that say so rather than a silent last-wins. Index sync is
+  `SearchSyncHooks`, a ready-made `MutationHooks` you name once on the
+  repository: create/update/delete then enqueue a durable `#[job]` reindex, so
+  indexing is off-request and survives a restart, and repeated writes to one
+  record coalesce into a single pending job. The payload is `(index, id)` and
+  **not** the record — the handler re-reads the row, so a present row upserts
+  and an absent row deletes. That single idempotent operation makes
+  at-least-once delivery safe and lets a lost delete event, a soft delete, or a
+  row changed by direct SQL repair itself. The dedup key is released when a job
+  *starts* (so a write landing mid-reindex is never swallowed), and a
+  concurrency cap of one **per record** keeps the two jobs that implies from
+  interleaving a stale read over a newer write. Queries reuse `Page`/`ListQuery`
+  (`search`, `search_list`, `search_hydrated`, `similar`, `similar_to`), and
+  `autumn search reindex [--index NAME] [--purge] [--profile NAME]` rebuilds an
+  index by running the application binary — the same technique `autumn jobs manifest` uses,
+  because only the app knows which models, backend, and embedder are
+  registered. A one-shot reindex against a profile with
+  `enabled = false` exits non-zero rather than reporting a successful rebuild
+  of nothing. `--profile` matters there: that binary resolves its own
+  `[search]` section, and the CLI builds a debug binary, which core reads as
+  `dev` — so a production rebuild must say so or it rebuilds the development
+  index and reports success. Backfill walks the source by keyset (`WHERE <key> > $after`),
+  never `OFFSET`, so a live table cannot skip or repeat rows, and it stops only
+  on an empty batch — `scan` returns *up to* `limit`, so a source that filters
+  after reading yields short batches with rows still behind them. Backends are pluggable
+  behind a `SearchBackend` trait shaped so an external engine (Meilisearch,
+  Tantivy, a vector store) is a new `impl` rather than a breaking change: query
+  and result types are `#[non_exhaustive]`, capabilities are declarable from
+  outside the crate, and a keyword-only engine is a complete implementation.
+  The Postgres backend ships first, reusing
+  `to_tsvector`/`setweight`/`ts_rank_cd` — with the framework's own weight
+  array rather than Postgres' default, which differs at `B` and would otherwise
+  rank a body-field match differently from every other backend — and adding
+  `pgvector` when the
+  extension is present — with a portable `double precision[]` +
+  `autumn_search_cosine()` fallback so a managed Postgres without `pgvector`
+  still boots and still answers k-NN queries. A `MemorySearchBackend` gives
+  complete keyword *and* vector coverage with no Docker and no network, and
+  doubles as the executable specification for the backend contract.
+  Embedding is pluggable via an `Embedder` trait; the crate ships **no** model,
+  runtime, or vendor SDK — only a `NoEmbedder` that refuses (so a missing
+  provider is a typed error, never invented vectors) and a deterministic
+  `HashingEmbedder` for dev and tests.
+  Search respects existing authorization, and enforces it rather than advising
+  it: a `SearchVisibility` hook turns a `PolicyContext` into a `SearchFilter`
+  that is a *required argument* of the backend query methods, so page totals
+  and k-NN neighbour counts are computed after the restriction rather than
+  before; filters **intersect**, so a caller can only narrow what authorization
+  allowed, and two incompatible constraints collapse to "match nothing" rather
+  than to an arbitrary winner; a failing hook aborts the search instead of
+  widening it; calling the authorization-aware entry point with no hook
+  registered is a typed error rather than an unfiltered read; and `similar_to`
+  filters the *seed* read as well as the neighbour query, so "more like this"
+  cannot become an inference channel over records the caller may not see. A
+  model with a `tenant_id` column marks its index tenant-scoped, and querying
+  one with no tenant in scope is refused — matching
+  `#[repository(tenant_scoped)]`, and closing the case where a search route
+  mounted outside the tenancy layer would otherwise have returned every
+  tenant's rows. Because a `SearchFilter` is plain data, an out-of-scope engine
+  gets the same tenant/visibility restriction.
+  Query text is a bag of words across every backend — each token must match,
+  operator syntax (`OR`, `field:`, `*`) is never interpreted, a blank query
+  returns an empty page having issued no query, and a filter key that is not a
+  declared field never reaches SQL — which keeps results consistent between
+  engines and makes a hostile query string structurally incapable of widening
+  the result set. `[search]` is resolved through the same profile layering the
+  runtime uses — base `autumn.toml`, then `[profile.<name>.search]`, then
+  `autumn-<profile>.toml`, then `AUTUMN_SEARCH__*` env vars — so
+  `enabled = false` is a working incident switch *per environment*: it stops
+  index writes (including a purging backfill) without failing writes to the
+  model, and cannot be set in prod only to be ignored there. The declared
+  `embedding_dimensions` is checked against the installed `Embedder` at
+  startup and a disagreement refuses the boot, because the alternative is a
+  silent one: writes keep succeeding while the vector column rejects every
+  value and semantic search returns nothing. The index definition also carries
+  the model's real key column, so a `#[id] pub note_id: i64` over a legacy
+  table that still has an unrelated `id` backfills off the right one. The
+  section is read through core's own `Env` abstraction, so the macro-supplied
+  crate directory and build mode are visible and a release binary resolves the
+  same profile core does. A `deleted_at` column is not by itself a tombstone:
+  the source follows the repository's `soft_delete` opt-in, so audit-history
+  rows stay indexed exactly as the model's finders return them.
+  Request-controlled values — pagination, the k-NN minimum score, the query
+  vector's width — are bound rather than formatted into the SQL, because
+  diesel's statement cache is keyed on query text and never evicts. `[search]`
+  is resolved through core's `.env` overlay too, so a kill switch set there
+  takes effect. A *filtered* k-NN query skips the ivfflat index deliberately:
+  it probes candidate lists before the `WHERE` runs, so a selective
+  authorization filter could otherwise return short or empty while qualifying
+  neighbours sat in unprobed lists. A disabled subsystem initializes
+  nothing — no `ensure_index`, no DDL, no width check — so a search outage
+  cannot abort application startup after the switch has been thrown. A backfill
+  takes a write watermark up front and never overwrites — or re-creates — a
+  record a concurrent reindex touched after it started, so the bulk and
+  per-record writers converge instead of racing; deletes are recorded in a
+  ledger that outlives the document — written in the same statement that removes
+  it and cleared in the same statement that re-creates the record, so no
+  concurrent write can observe half of either — and a mid-backfill delete
+  cannot be undone by a stale batch. Tenant scoping, like soft delete, follows the repository's
+  opt-in rather than the mere presence of a column. The in-core
+  `#[repository(searchable)]` `search()` and its `websearch_to_tsquery`
+  semantics are untouched; this subsumes #842 as one backend, it does not
+  replace it. See `docs/guide/search.md`.
+
 - **seo:** route-level meta tag defaults via a `seo(...)` route attribute
   argument, closing the acceptance criterion deferred from the SEO toolkit
   (#1182, deferred from #830). Static per-page metadata no longer has to be

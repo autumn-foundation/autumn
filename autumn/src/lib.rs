@@ -125,6 +125,14 @@ pub mod hooks;
 pub mod i18n;
 pub mod idempotency;
 pub mod range;
+// NOTE: no outer `///` doc here. rustdoc MERGES an outer doc on a `pub mod`
+// declaration with the module's own `//!` header and resolves the combined
+// text in THIS scope (the crate root), where `IndexDefinition` /
+// `SearchDocument` are not in scope — so adding one turns every intra-doc link
+// in `search.rs`'s header into a `broken_intra_doc_links` error. The module's
+// own header is the documentation.
+#[cfg(feature = "db")]
+pub mod search;
 pub mod seo;
 /// Translation lookup macro with compile-time key validation.
 ///
