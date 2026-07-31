@@ -567,8 +567,9 @@ pub(crate) fn inject_oob_attr(html: &str, value: &str) -> String {
         let after_lt = &html[lt + 1..];
         if let Some(pos) = after_lt.find([' ', '>']) {
             let insert_at = lt + 1 + pos;
+            let escaped_val = crate::htmx::escape_attribute_string(value);
             return format!(
-                "{} hx-swap-oob=\"{value}\"{}",
+                "{} hx-swap-oob=\"{escaped_val}\"{}",
                 &html[..insert_at],
                 &html[insert_at..]
             );
@@ -2340,5 +2341,17 @@ mod tests {
     fn inject_oob_attr_fallback_no_boundary() {
         let result = inject_oob_attr("<", "true");
         assert_eq!(result, "<", "fallback must return html unchanged");
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn test_inject_oob_attr_escapes_input() {
+        let result = inject_oob_attr("<div></div>", "\"><script>alert(1)</script>");
+        assert!(!result.contains("<script>alert(1)</script>"), "channels::inject_oob_attr is vulnerable!");
+        assert!(result.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
 }
