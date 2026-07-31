@@ -340,7 +340,8 @@ fn __autumn_route_info_echo() -> ::autumn_web::Route { /* method GET, hidden fro
 Enriches a route's auto-generated OpenAPI documentation with fields that can't
 be inferred from the signature. It does **not** stand alone: it folds its
 metadata into the *paired* route macro's `ApiDoc`. Applied without a route
-macro, it is a no-op.
+macro, it is a no-op. For what ends up in the served document, see the
+[OpenAPI guide](openapi.md).
 
 **You write:**
 

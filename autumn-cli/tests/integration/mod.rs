@@ -1,6 +1,7 @@
 mod a11y_verify;
 mod api_scaffold;
 mod cloud_native_scaffold;
+mod console;
 mod db;
 mod db_pull;
 mod deploy;

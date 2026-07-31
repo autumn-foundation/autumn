@@ -128,6 +128,7 @@ mod negotiate;
 mod nested_form_atomic_save;
 #[cfg(feature = "maud")]
 mod nested_form_order_example;
+mod notifications;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
@@ -190,6 +191,8 @@ mod routes_macro;
 mod scheduled_coordination;
 mod schema_drift_guard;
 mod scoped_tokens;
+#[cfg(feature = "db")]
+mod search_index_definition;
 mod security;
 mod seo;
 mod server_timing;
@@ -203,9 +206,13 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+mod sim_advance_to;
 mod sim_clock_drain;
 mod sim_deterministic_ids;
+mod sim_job_clock;
 mod sim_llm_stub;
+mod sim_rate_limit_clock;
+mod sim_strict_wall_clock;
 mod sim_test_smoke;
 #[cfg(feature = "ws")]
 mod sse_replay;

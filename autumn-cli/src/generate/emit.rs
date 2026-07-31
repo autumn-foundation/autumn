@@ -1461,6 +1461,9 @@ const SHARED_MAIN_MODULE_NAMES: &[&str] = &[
     "mailers",
     "inbound_mailers",
     "policies",
+    // A fixed single-file module (`src/notifications.rs`, no directory) —
+    // `shared_module_backing_path_exists` already handles that shape.
+    "notifications",
 ];
 
 /// Whether `name`'s backing module still exists on disk — either as

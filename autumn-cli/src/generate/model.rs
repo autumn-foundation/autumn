@@ -159,12 +159,14 @@ pub fn plan_model_with_options(
     if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
         return Err(super::sqlite_uuid_pk_unsupported_error());
     }
-    // Several DSL field kinds render to Rust model types with no working diesel
-    // SQLite FromSql/ToSql (Uuid, Attachment, Decimal). The SQLite column/schema
-    // mapping changes the DDL, but the `#[model]` struct field keeps its Rust
-    // type, so a generated SQLite app using one of these would fail to compile.
-    // Reject at generate time rather than emit uncompilable code (AC #4); real
-    // conversions are tracked in #1924.
+    // A few DSL field kinds still render to Rust model types with no working
+    // diesel SQLite FromSql/ToSql (Uuid, Decimal, Enum). #1924 wired DateTime<Utc>
+    // (TimestamptzSqlite) and Attachment (autumn-web's local Blob Text/Sqlite
+    // impls) so those now round-trip, but the remaining kinds' Rust types are
+    // foreign to autumn-web (orphan rule) with only Postgres-side diesel impls,
+    // so a generated SQLite app using one of them would fail to compile. Reject
+    // at generate time rather than emit uncompilable code (AC #4); wrapper-based
+    // support for the rest is tracked in #1924.
     if backend == autumn_web::config::DatabaseBackend::Sqlite {
         super::reject_sqlite_unsupported_field_kinds(&fields)?;
     }
@@ -2832,11 +2834,10 @@ mod tests {
             let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
             // `NaiveDateTime` uses the core, ungated `Timestamp` sql-type.
             assert!(schema.contains("naive -> Timestamp,"), "schema: {schema}");
-            // Neither the Postgres-only `Timestamptz` / `Jsonb` diesel types nor
-            // the sqlite-feature-gated `TimestamptzSqlite` (which the generated
-            // app's Postgres-oriented deps do not export) may leak: `DateTime`
-            // is now rejected at generate time (#1924), so no timestamptz sql-
-            // type of any spelling should appear in a SQLite schema.
+            // This model declares only a `NaiveDateTime` field, so no
+            // timestamptz sql-type of any spelling (the Postgres-only
+            // `Timestamptz` or the SQLite `TimestamptzSqlite` that a
+            // `DateTime<Utc>` field would emit, #1924) may appear here.
             assert!(
                 !schema.contains("Timestamptz"),
                 "SQLite schema.rs leaked a timestamptz sql-type: {schema}"
@@ -2848,21 +2849,19 @@ mod tests {
         });
     }
 
-    /// A `SQLite` app rejects field kinds whose Rust model type has no working
-    /// diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`,
-    /// `DateTime<Utc>`, and `Enum`) at generate time, citing #1924 (issue #1614
-    /// AC #4) — rather than emit a model that fails to compile. `DateTime<Utc>`
-    /// would need the feature-gated `TimestamptzSqlite`; `Enum` renders only
-    /// Postgres (`Pg`) diesel conversions.
+    /// A `SQLite` app rejects field kinds whose Rust model type still has no
+    /// working diesel `SQLite` conversion (`Uuid`, `Decimal`, and `Enum`) at
+    /// generate time, citing #1924 (issue #1614 AC #4) — rather than emit a
+    /// model that fails to compile. `uuid::Uuid`/`rust_decimal::Decimal` are
+    /// foreign to `autumn-web` (orphan rule) with Postgres-only diesel impls;
+    /// `Enum` renders only Postgres (`Pg`) diesel conversions.
     #[test]
     fn sqlite_app_rejects_field_kinds_without_diesel_conversion_citing_1924() {
         with_no_db_env(|| {
             let tmp = project_with_db_url("sqlite://app.db");
             for (token, rust_type) in [
                 ("token:Uuid", "uuid::Uuid"),
-                ("cover:Attachment", "autumn_web::storage::Blob"),
                 ("price:decimal{10,2}", "rust_decimal::Decimal"),
-                ("at:DateTime", "chrono::DateTime<chrono::Utc>"),
                 // `Enum` reports its generated enum type name (`Status`), not
                 // the `String` storage-representation fallback.
                 ("status:enum{draft,published}", "Status"),
@@ -2885,6 +2884,59 @@ mod tests {
                     "`{token}` message must name the Rust type `{rust_type}`: {msg}"
                 );
             }
+        });
+    }
+
+    /// A `SQLite` app now ACCEPTS `DateTime<Utc>` and `Attachment` fields at
+    /// generate time (issue #1924): `DateTime<Utc>` maps to diesel's
+    /// `TimestamptzSqlite` sql-type and `Attachment` (`Blob`) rides
+    /// `autumn-web`'s local `Text`/`Sqlite` conversion. This is the un-rejection
+    /// half of the contract — these tokens must plan cleanly (no `Config`
+    /// error), and the emitted `SQLite` schema/DDL must use the right types.
+    #[test]
+    fn sqlite_app_accepts_datetime_and_attachment_after_1924() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let plan = plan_model(
+                tmp.path(),
+                "Post",
+                &[
+                    "title:String".into(),
+                    "at:DateTime".into(),
+                    "cover:Attachment".into(),
+                ],
+                "20260427000000",
+            )
+            .expect("DateTime + Attachment fields are accepted on SQLite (#1924)");
+            plan.execute(Flags::default()).unwrap();
+
+            // SQLite DDL: DateTime and Attachment both store as TEXT.
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(up.contains("at TEXT NOT NULL"), "up.sql: {up}");
+            // `Attachment` is nullable-by-default (Option<Blob>).
+            assert!(up.contains("cover TEXT"), "up.sql: {up}");
+            for leak in ["TIMESTAMPTZ", "JSONB", "NUMERIC"] {
+                assert!(!up.contains(leak), "SQLite up.sql leaked `{leak}`: {up}");
+            }
+
+            // schema.rs: DateTime -> TimestamptzSqlite, Attachment -> Nullable<Text>.
+            let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+            assert!(
+                schema.contains("at -> TimestamptzSqlite,"),
+                "schema: {schema}"
+            );
+            assert!(
+                schema.contains("cover -> Nullable<Text>,"),
+                "schema: {schema}"
+            );
+            assert!(
+                !schema.contains("Jsonb"),
+                "SQLite schema.rs leaked `Jsonb`: {schema}"
+            );
         });
     }
 

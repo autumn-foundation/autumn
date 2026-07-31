@@ -9,6 +9,317 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **search:** a new optional plugin crate, `autumn-search`, turning the in-core
+  full-text primitives (#842) into a **search subsystem**: mark a model
+  searchable and get an index that stays in sync with the record lifecycle,
+  plus semantic / vector retrieval, behind one engine-agnostic API (#1191).
+  The `#[searchable]` attribute you already write is the single source of
+  truth — `#[model]` now also derives an engine-agnostic `IndexDefinition`
+  (index name, language, weighted fields) and a per-record `SearchDocument`
+  from it, and a new `#[searchable(embed)]` field flag nominates the one field
+  whose text is embedded for "find similar" / RAG retrieval. Two `embed`
+  fields, or `embed` without the model-level `#[searchable]`, are compile
+  errors that say so rather than a silent last-wins. Index sync is
+  `SearchSyncHooks`, a ready-made `MutationHooks` you name once on the
+  repository: create/update/delete then enqueue a durable `#[job]` reindex, so
+  indexing is off-request and survives a restart, and repeated writes to one
+  record coalesce into a single pending job. The payload is `(index, id)` and
+  **not** the record — the handler re-reads the row, so a present row upserts
+  and an absent row deletes. That single idempotent operation makes
+  at-least-once delivery safe and lets a lost delete event, a soft delete, or a
+  row changed by direct SQL repair itself. The dedup key is released when a job
+  *starts* (so a write landing mid-reindex is never swallowed), and a
+  concurrency cap of one **per record** keeps the two jobs that implies from
+  interleaving a stale read over a newer write. Queries reuse `Page`/`ListQuery`
+  (`search`, `search_list`, `search_hydrated`, `similar`, `similar_to`), and
+  `autumn search reindex [--index NAME] [--purge] [--profile NAME]` rebuilds an
+  index by running the application binary — the same technique `autumn jobs manifest` uses,
+  because only the app knows which models, backend, and embedder are
+  registered. A one-shot reindex against a profile with
+  `enabled = false` exits non-zero rather than reporting a successful rebuild
+  of nothing. `--profile` matters there: that binary resolves its own
+  `[search]` section, and the CLI builds a debug binary, which core reads as
+  `dev` — so a production rebuild must say so or it rebuilds the development
+  index and reports success. Backfill walks the source by keyset (`WHERE <key> > $after`),
+  never `OFFSET`, so a live table cannot skip or repeat rows, and it stops only
+  on an empty batch — `scan` returns *up to* `limit`, so a source that filters
+  after reading yields short batches with rows still behind them. Backends are pluggable
+  behind a `SearchBackend` trait shaped so an external engine (Meilisearch,
+  Tantivy, a vector store) is a new `impl` rather than a breaking change: query
+  and result types are `#[non_exhaustive]`, capabilities are declarable from
+  outside the crate, and a keyword-only engine is a complete implementation.
+  The Postgres backend ships first, reusing
+  `to_tsvector`/`setweight`/`ts_rank_cd` — with the framework's own weight
+  array rather than Postgres' default, which differs at `B` and would otherwise
+  rank a body-field match differently from every other backend — and adding
+  `pgvector` when the
+  extension is present — with a portable `double precision[]` +
+  `autumn_search_cosine()` fallback so a managed Postgres without `pgvector`
+  still boots and still answers k-NN queries. A `MemorySearchBackend` gives
+  complete keyword *and* vector coverage with no Docker and no network, and
+  doubles as the executable specification for the backend contract.
+  Embedding is pluggable via an `Embedder` trait; the crate ships **no** model,
+  runtime, or vendor SDK — only a `NoEmbedder` that refuses (so a missing
+  provider is a typed error, never invented vectors) and a deterministic
+  `HashingEmbedder` for dev and tests.
+  Search respects existing authorization, and enforces it rather than advising
+  it: a `SearchVisibility` hook turns a `PolicyContext` into a `SearchFilter`
+  that is a *required argument* of the backend query methods, so page totals
+  and k-NN neighbour counts are computed after the restriction rather than
+  before; filters **intersect**, so a caller can only narrow what authorization
+  allowed, and two incompatible constraints collapse to "match nothing" rather
+  than to an arbitrary winner; a failing hook aborts the search instead of
+  widening it; calling the authorization-aware entry point with no hook
+  registered is a typed error rather than an unfiltered read; and `similar_to`
+  filters the *seed* read as well as the neighbour query, so "more like this"
+  cannot become an inference channel over records the caller may not see. A
+  model with a `tenant_id` column marks its index tenant-scoped, and querying
+  one with no tenant in scope is refused — matching
+  `#[repository(tenant_scoped)]`, and closing the case where a search route
+  mounted outside the tenancy layer would otherwise have returned every
+  tenant's rows. Because a `SearchFilter` is plain data, an out-of-scope engine
+  gets the same tenant/visibility restriction.
+  Query text is a bag of words across every backend — each token must match,
+  operator syntax (`OR`, `field:`, `*`) is never interpreted, a blank query
+  returns an empty page having issued no query, and a filter key that is not a
+  declared field never reaches SQL — which keeps results consistent between
+  engines and makes a hostile query string structurally incapable of widening
+  the result set. `[search]` is resolved through the same profile layering the
+  runtime uses — base `autumn.toml`, then `[profile.<name>.search]`, then
+  `autumn-<profile>.toml`, then `AUTUMN_SEARCH__*` env vars — so
+  `enabled = false` is a working incident switch *per environment*: it stops
+  index writes (including a purging backfill) without failing writes to the
+  model, and cannot be set in prod only to be ignored there. The declared
+  `embedding_dimensions` is checked against the installed `Embedder` at
+  startup and a disagreement refuses the boot, because the alternative is a
+  silent one: writes keep succeeding while the vector column rejects every
+  value and semantic search returns nothing. The index definition also carries
+  the model's real key column, so a `#[id] pub note_id: i64` over a legacy
+  table that still has an unrelated `id` backfills off the right one. The
+  section is read through core's own `Env` abstraction, so the macro-supplied
+  crate directory and build mode are visible and a release binary resolves the
+  same profile core does. A `deleted_at` column is not by itself a tombstone:
+  the source follows the repository's `soft_delete` opt-in, so audit-history
+  rows stay indexed exactly as the model's finders return them.
+  Request-controlled values — pagination, the k-NN minimum score, the query
+  vector's width — are bound rather than formatted into the SQL, because
+  diesel's statement cache is keyed on query text and never evicts. `[search]`
+  is resolved through core's `.env` overlay too, so a kill switch set there
+  takes effect. A *filtered* k-NN query skips the ivfflat index deliberately:
+  it probes candidate lists before the `WHERE` runs, so a selective
+  authorization filter could otherwise return short or empty while qualifying
+  neighbours sat in unprobed lists. A disabled subsystem initializes
+  nothing — no `ensure_index`, no DDL, no width check — so a search outage
+  cannot abort application startup after the switch has been thrown. A backfill
+  takes a write watermark up front and never overwrites — or re-creates — a
+  record a concurrent reindex touched after it started, so the bulk and
+  per-record writers converge instead of racing; deletes are recorded in a
+  ledger that outlives the document — written in the same statement that removes
+  it and cleared in the same statement that re-creates the record, so no
+  concurrent write can observe half of either — and a mid-backfill delete
+  cannot be undone by a stale batch. Tenant scoping, like soft delete, follows the repository's
+  opt-in rather than the mere presence of a column. The in-core
+  `#[repository(searchable)]` `search()` and its `websearch_to_tsquery`
+  semantics are untouched; this subsumes #842 as one backend, it does not
+  replace it. See `docs/guide/search.md`.
+
+- **seo:** route-level meta tag defaults via a `seo(...)` route attribute
+  argument, closing the acceptance criterion deferred from the SEO toolkit
+  (#1182, deferred from #830). Static per-page metadata no longer has to be
+  rebuilt by hand in every handler: declare it once on the route —
+  `#[get("/about", seo(title = "About • My Blog", description = "Learn about
+  us"))]` — and take a `SeoMeta` parameter, which now implements
+  `FromRequestParts` and arrives pre-populated with the declared values. The
+  extractor is infallible, so a handler on a route that never mentions
+  `seo(...)` simply receives an empty builder; the builder is consuming as
+  before, so a handler refines the defaults with per-request data
+  (`seo.title(format!("{} • Blog", post.title))`) and its value wins for the
+  keys it touches while the untouched attribute keys survive. Every `SeoMeta`
+  builder method has a matching key (`title`, `description`, `canonical`,
+  `og_title`, `og_description`, `og_image`, `og_type`, `og_url`,
+  `twitter_card`, `twitter_title`, `twitter_description`, `twitter_image`,
+  `robots`); a typo'd, repeated, or empty `seo(...)` is a compile error naming
+  the supported set, rather than metadata that silently never renders.
+  `#[static_get]` accepts the same argument, so pre-rendered pages carry the
+  tags too — static generation drives the same router, so no separate wiring
+  was needed. A static route declaring `robots = "noindex"` is now also left
+  out of the generated `sitemap.xml`, so Autumn no longer advertises a URL it
+  derived itself while also asking crawlers not to index it. This covers the
+  paths Autumn derives from `#[static_get]` routes; entries from a
+  `SitemapSource` you register are an explicit, application-authored URL list
+  and are passed through unfiltered (a `SitemapEntry` carries only a `loc`,
+  with nothing tying it back to a route). `#[ws]` is the one route macro
+  that rejects `seo(...)` — a WebSocket upgrade serves no crawlable document —
+  and says so rather than failing with a bare parse error. The
+  declared values are recorded on the new `Route::seo` field as a `Copy`,
+  `&'static str`-backed `SeoRouteDefaults`, and the router installs the request
+  extension only for routes that declared something, so routes without
+  `seo(...)` pay nothing. As before, the attribute supplies *values*, not
+  markup: handlers still decide where to emit them, normally via
+  `SeoMeta::render()` inside a layout. **Breaking for code that constructs
+  `autumn_web::Route { .. }` or `autumn_web::static_gen::StaticRouteMeta { .. }`
+  literally** (plugins building a `Vec<Route>` by hand rather than through
+  `routes![]`): add `seo: autumn_web::seo::SeoRouteDefaults::EMPTY`.
+  `SeoRouteDefaults` is itself `#[non_exhaustive]` and built by chaining its
+  `const fn with_*` setters from `EMPTY`, so future SEO keys stay additive.
+- **cli:** `autumn console` (alias `autumn c`) — a one-command, pre-wired data
+  playground (#1039). Autumn's answer to `rails console` / `manage.py shell` /
+  `iex -S mix`: because Rust has no stable `eval`, it follows loco.rs's
+  edit-and-run model rather than building an interpreter. The first invocation
+  scaffolds `src/bin/playground.rs` already wired with the same config and
+  database-URL resolution `autumn seed`/`autumn dev` use
+  (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` → `DATABASE_URL` →
+  `autumn.toml`, profile-aware, via `autumn_web::seed::SeedContext`), a
+  constructed async pool (`ctx.pool()`), a checked-out connection (`db`), and a
+  clearly-marked `// your code here` region; every invocation compiles and runs
+  it against the resolved environment. Because a Cargo binary target is its own
+  crate and a generated app has no `src/lib.rs`, the playground declares the
+  app's `schema`, `models`, `repositories`, and `policies` modules with
+  `#[path]`, so a `find_all()`/`find_by_id()` round-trip compiles with no
+  further wiring. The playground's `[[bin]]` is gated behind
+  `required-features = ["playground"]`, so `cargo build`, `cargo test`, `autumn
+  dev`, and `autumn build` skip it entirely and only `autumn console` ever
+  compiles it — a playground that doesn't compile can never break the app's
+  default build, and the `seed` feature's implied `db` never reaches a
+  DB-free project's normal builds. Re-running never overwrites an edited
+  playground (`--force` regenerates from the template, and refuses to follow a
+  symlink); `--scaffold-only` stops before the build. The two `Cargo.toml`
+  edits — the `playground` feature and the gated bin target — go through a
+  format-preserving TOML editor, are written atomically, never touch the
+  `autumn-web` dependency line, and are idempotent. A config or database
+  failure prints the underlying error and exits non-zero from the playground
+  out through the command's own exit status. Because that isolation is a
+  guarantee rather than a best effort, `autumn console` refuses — before
+  writing anything, leaving `Cargo.toml` byte-identical — when a manifest is in
+  a state where it cannot hold: an existing `playground` bin target that is
+  ungated or gated on a different feature, a `default` feature list that
+  reaches `playground` (directly or transitively), or an edition-2015 package
+  where the scaffolded file would be auto-discovered as an ungated binary. Each
+  error names the one line to change. Guide: `docs/guide/console.md`.
+  No `autumn-web` API change.
+- **notifications:** first-class in-app notifications store with a read/unread
+  feed (#1148). A new `autumn_web::notifications` module ships a
+  `Notifications` service/extractor (surfaced like `Session`/`Auth`) with
+  `notify(recipient_id, kind, payload)`, `list(...)` returning the shipped
+  `Page`/`ListQuery` pagination (incl. `filter[unread]=true` and
+  `filter[kind]=...`), `unread_count`, and idempotent `mark_read` /
+  `mark_read_for` (recipient-scoped) / `mark_all_read`. Storage is a pluggable
+  `NotificationStore` — `DbNotificationStore` (Postgres or SQLite) by default
+  when a pool is configured, `MemoryNotificationStore` for DB-less dev/tests,
+  or a custom store via `AppBuilder::with_notification_store`. With the `ws`
+  feature, `notify_with_push` additionally publishes the stored notification
+  JSON on the per-recipient `notifications:{id}` channel topic, best-effort (a
+  channel failure never fails the notify). A new `autumn generate
+  notifications` command scaffolds the backend-aware migration, a minimal feed
+  module with registered routes, and an in-process `TestClient` smoke test.
+  Guide: `docs/guide/notifications.md`. All additions are additive — no
+  breaking change to existing surfaces.
+- **cli/generate:** `autumn generate auth` and `autumn generate mailer
+  --list-unsubscribe` are now **backend-aware on SQLite** (#1927). On a SQLite
+  app they scaffold SQLite-dialect migrations — `INTEGER PRIMARY KEY
+  AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`, and `INTEGER` foreign keys, across
+  the users/sessions/remember-token tables and the optional `--totp`,
+  `--magic-link`, `--oauth`, `--passkeys`, and `mail_unsubscribes` tables —
+  instead of being rejected at generate time. Postgres output is byte-for-byte
+  unchanged.
+- **cli/generate:** the generated `autumn generate auth` **DB-backed session
+  store now works on SQLite** (#1908): its connection pools are typed against
+  `::autumn_web::RuntimeConnection` (resolving to `AsyncPgConnection` by default
+  and the SQLite connection under the `sqlite` feature) rather than a hard-coded
+  `diesel_async::AsyncPgConnection`, so the generated app compiles on whichever
+  backend it selected.
+- **generate/sqlite:** `DateTime<Utc>` and `Attachment` model fields now compile
+  and round-trip on the SQLite backend, reaching Postgres parity (#1924). A
+  `DateTime<Utc>` column maps to diesel's `TimestamptzSqlite` sql-type, stored as
+  an RFC 3339 UTC string (SQLite `TEXT` affinity) that sorts and compares
+  chronologically; an `Attachment` (`autumn_web::storage::Blob`) column stores
+  its metadata JSON in a `TEXT` column via new local `FromSql`/`ToSql<Text,
+  Sqlite>` impls on `Blob`. Both kinds are now accepted by `generate model` /
+  `generate scaffold` / column migrations on a SQLite app instead of being
+  rejected at generate time. `Uuid` and `Decimal` remain rejected on SQLite
+  (their `uuid::Uuid` / `rust_decimal::Decimal` types are foreign to autumn-web,
+  so the orphan rule blocks a direct SQLite conversion, and diesel /
+  `rust_decimal` provide only Postgres-side impls) — a wrapper-based follow-up
+  tracked under #1924.
+- **docs:** a **feeds** guide (`docs/guide/feeds.md`) documenting Atom/RSS feed
+  generation, cross-linking the runnable `examples/blog` `/feed.xml` route
+  (#2099). [no-plugin]
+- **docs/examples:** a runnable state-machine / lifecycle demonstration (`#[state_machine]` transition effects) in the `wiki` example — the `Page::status` machine now declares per-edge `on = "..."` effects that append the audit `Revision` inside the transition's transaction, driven from the transitions handler via `transition_status_to_on_conn` under one `Db::tx_with` — cross-linked from the state-machines guide (#2099). [no-plugin]
+- **docs:** an **aggregate queries** guide (`docs/guide/aggregates.md`) documenting GROUP BY roll-ups, paired with a runnable `GET /stats` roll-up route in the `bookmarks` example (#2099). [no-plugin]
+- **docs:** an **audit logging** guide (`docs/guide/audit-logging.md`) documenting audit events with actor auto-attribution, with a minimal audit sink wired into the `reddit-clone` example (#2099). [no-plugin]
+- **docs:** a core **authentication** guide (`docs/guide/authentication.md`) —
+  the session-auth hub that was previously rustdoc-only: the `Session`
+  extractor and its store backends, `[session]` cookie configuration, password
+  hashing and the `[auth.password]` policy (weak-list, context similarity, HIBP
+  k-anonymity), login/logout anatomy (session-id rotation, non-enumeration),
+  `#[secured]`/`RequireAuth`/`Auth<T>`, `[auth.lockout]`, rotating remember-me
+  tokens with theft detection, active-session revocation, `acting_as` in tests,
+  and a production checklist — cross-linked from the OAuth, step-up,
+  authorization, and testing guides and from the `saas`/`reddit-clone` login
+  handlers (#2099). [no-plugin]
+- **docs:** an **OpenAPI generation** guide (`docs/guide/openapi.md`) — the
+  spec pipeline was previously rustdoc-only despite the runnable `bookmarks`
+  example: what the route macros infer from a handler signature (path params,
+  `Query<T>`, `Json<T>`/`Valid<Json<T>>` bodies, `Vec`/`Option`, tuple and
+  `Result` returns), the full `#[api_doc(...)]` key table and its attribute
+  ordering rules, where component schemas come from (`#[model]`,
+  `#[derive(OpenApiSchema)]`, `register_schema`, and the placeholder fallback)
+  plus collision-resolved component keys, the shared `ProblemDetails` error
+  responses, `SessionAuth`/`BearerAuth` derivation from `#[secured]`, version
+  deprecation/sunset in the spec, scoped-group paths, the `[openapi]` profile
+  gate and tenancy `public_paths` note, `autumn build`'s
+  `dist/openapi.{json,yaml}` export (and the static-routes prerequisite that
+  gates it), and spec assertions with `TestApp` —
+  cross-linked from the MCP, API-versioning, routes-CLI, and macro-transparency
+  guides (#2099). Also corrects stale rustdoc that advertised a `/v3/api-docs`
+  default (the served default is `/openapi.json`) and an "OpenAPI 3.0" document
+  (the generator emits 3.1.0). [no-plugin]
+- **sim-testing:** add the `always!` / `sometimes!` simulation assertion macros
+  (W6 op-driver assertion core, #1797) — hard-invariant + reachability assertions
+  for `#[sim_test]`, with a non-vacuity registry the forthcoming sim-sweep
+  aggregates. `always!(cond[, "fmt", …])` panics on a false invariant with a
+  greppable message (the `#[sim_test]` harness prints the `AUTUMN_SIM_SEED=…`
+  replay line); `sometimes!(cond, "label")` records a reachability target in a
+  thread-local registry (observed vs satisfied) that `Sim::from_seed` resets per
+  seed, exposed via `sometimes_snapshot` / `assert_all_sometimes_satisfied` for
+  the sweep to fail a green-but-vacuous run. [no-plugin]
+
+- **docs/examples:** documented the `autumn-media-plugin` media subsystem
+  (broadcast + mesh rooms + MediaMTX). Adds the `docs/guide/media.md` guide
+  (install/mount, `MediaConfig` profile loading, the `RoomService`/`RoomStore`
+  rooms surface incl. the `memory` vs multi-process `db` backend,
+  `MediaMtxClient`/`MediaUrls`, and the durable encode jobs / `MediaArtifactSink`)
+  and a new runnable `examples/media-room` crate that installs the plugin with
+  rooms and serves create/join/list routes, wired into the example drift gate
+  (workspace member, EXAMPLES.md catalog entry, README table, quickstart
+  README). [no-plugin]
+
+- **docs:** a **content negotiation** guide (`docs/guide/content-negotiation.md`)
+  documenting the `Negotiate` extractor and its `.respond(html, json)` responder —
+  one handler serving HTML to browsers and JSON to API clients from a single
+  source of truth, including `Accept` q-value precedence, `q=0` exclusions, the
+  `406 Not Acceptable` arm, and `default_format`. Paired with a runnable
+  `GET /todos/summary` dual-render route in the `todo-app` example (#2099).
+  [no-plugin]
+- **docs/examples:** a `docs/guide/nested-forms.md` guide for nested (`has_many`)
+  form binding (`NestedChangesetForm<P, C>`, `NestedChild`, `inputs_for`,
+  `_destroy`, atomic saves) plus a runnable master–detail form in
+  `examples/wiki` — the new **Collections** feature, where a collection (parent)
+  owns many links (children), created/edited/removed in one transaction-backed
+  form. `[no-plugin]`
+- **docs:** a `docs/guide/downloads.md` guide covering the typed `Download`
+  response — the `from_bytes` / `from_stream` / `from_async_read` / `from_blob`
+  constructors, the `.filename` / `.content_type` / `.inline` / `.etag` /
+  `.last_modified` builders, and `into_response_ranged` for RFC 7233 `Range`
+  requests / `206 Partial Content` — plus a range-capable CSV export route
+  (`GET /bookmarks/export.csv`) added to the `bookmarks` example. `[no-plugin]`
+- **docs:** a `docs/guide/submit-tokens.md` guide for one-time submit tokens
+  (at-most-once form submissions) — the double-submit / duplicate-POST problem,
+  how the default-on `SubmitTokenLayer` + hidden `_submit_token` field +
+  `SubmitToken` extractor close it with no client JS, how it differs from CSRF
+  and `Idempotency-Key`, and the `[security.submit_token]` config knobs. The
+  `saas` example now guards its signup POST with a one-time submit token so a
+  double-clicked signup cannot create a duplicate account. [no-plugin]
 - **test-support:** `autumn_web::test::drain_ready_repository_commit_hooks(pool, max_rows)`
   deterministically claims and runs ready durable repository commit hooks in
   integration tests — driving the real worker→drain wiring without starting the
@@ -35,7 +346,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockstep; and `Sim::run_to_idle()` cooperatively drains ready jobs and
   timer-woken work to quiescence. A job whose retry backs off 24h now fires in
   virtual time with zero wall-clock sleep. [no-plugin]
-
+- **sim-testing / rate-limit:** the built-in token-bucket rate limiter now reads
+  its refill clock from the framework's injected `ClockSource` instead of
+  `Instant::now()` / `SystemTime::now()` (#1797). `RateLimitLayer::with_clock`
+  threads `AppState`'s clock through the limiter, both bucket stores, and both
+  construction sites (the global rate-limit middleware and the `#[throttle]`
+  path); a per-key bucket's `last_refill` is stored as a `DateTime<Utc>` with a
+  fail-safe clamp of negative wall-clock deltas to zero refill (mirroring the
+  Redis Lua's `math.max(0, …)`). A `#[sim_test]` can now deterministically
+  **exhaust** a bucket and then **refill** it under virtual time via
+  `Sim::advance`, with zero real sleep. Production behavior under the default
+  `SystemClock` is unchanged, and `rate_limit.lua` is untouched (the timestamp is
+  still supplied as a Rust-computed `ARGV`). [no-plugin]
+- **sim-testing:** `Sim::advance_to(target)` advances the virtual clock **to** a
+  zoned instant (#1797), the DST/timezone-aware companion to `Sim::advance(dur)`.
+  It is generic over any `chrono::TimeZone` (pass a `chrono::DateTime<Utc>`, a
+  `FixedOffset` datetime, or a `chrono_tz::Tz` datetime — no new hard dependency)
+  and resolves the target to the correct UTC instant before reusing `advance`
+  internally, so the injected clock and tokio's paused timer wheel stay in
+  lockstep across a DST spring-forward boundary and any timer due inside the
+  crossed window still fires. Time is forward-only: advancing to the current
+  instant is a no-op and advancing to a strictly-past instant panics. A companion
+  `Sim::advance_to_local(naive, &tz)` resolves a naive wall time with explicit,
+  deterministic DST-edge handling (ambiguous fall-back → earlier instant; spring
+  -forward gap → carried across the gap), never `.unwrap()`ing a `LocalResult`.
+  [no-plugin]
+- **sim-testing:** wire the W4 `SQLite` sim DB lane through the W2 `Sim` API
+  end-to-end (#1797). A new standalone integration test (`sim_sqlite_integration`)
+  attaches a fresh, migrated, in-process in-memory `SqliteSubstrate` pool to a
+  `TestApp` via `TestApp::with_db`, mounts it through the real public
+  `Sim::build(app)`, and drives a 24h-backoff `#[job]` to completion purely via
+  `Sim::advance` + `Sim::run_to_idle` — no `perform_enqueued_jobs`, no wall-clock
+  sleep — then reads back (with real SQL) the row the job's successful retry wrote,
+  proving the W2 virtual-clock drain runs against the W4 substrate over the
+  representative in-process scheduler + local job-runtime paths. Additive: no
+  changes to the `Sim`/`SimApp`/`SqliteSubstrate` public surface. `SqliteSubstrate`
+  now applies the framework's `SQLite` repository-commit-hook migration set itself
+  (before any caller migrations), so the `autumn_repository_commit_hooks`
+  control-plane table always exists and `Sim::run_to_idle` no longer panics with
+  "no such table" when draining an app mounted on a bare substrate — this test
+  therefore registers only its own app migration, with no copied framework-DDL
+  fixture to drift. [no-plugin]
+- **sim-testing:** `Sim::strict_wall_clock()` (and `Sim::strict_wall_clock_budget(dur)`)
+  add an opt-in **real-time leak guard** (#1797): with it enabled, `Sim::advance`
+  / `Sim::run_to_idle` panic if a paused-sim step burns more than a budget of
+  *real* wall-clock time (default 100 ms; overridable per run via the
+  `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment variable), catching a real
+  `std::thread::sleep` / blocking I/O / `spawn_blocking` that escaped tokio's
+  paused virtual timer. The panic flows through the `#[sim_test]` macro's
+  `catch_unwind`, so the `AUTUMN_SIM_SEED=…` replay line still prints. This is a
+  **runtime backstop for the worst off-seam pattern (a real blocking sleep), not
+  off-seam-read detection** — a free-function `Utc::now()` / `Instant::now()` has
+  no runtime interception point in safe Rust, so finding those reads stays the
+  Phase-2 deny-lint's job; the two are complementary. Off by default; the field
+  is a plain read-only `Option<Duration>` (no interior mutability), so the
+  `&self` advance/drain futures stay `Send`. [no-plugin]
 - **dev:** add `scripts/pre-push-check.sh`, a pre-push gate that mirrors CI's
   `lint` + `test` jobs (`cargo fmt --all -- --check`, `cargo clippy --workspace
   --all-targets`, a compile-only `cargo test --workspace --no-run`, and a
@@ -52,7 +417,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   infra-free and disk-cheap because doctests are overwhelmingly `no_run`/`ignore`
   (still compiled, so the break is caught) and `--doc` never triggers trybuild.
   Documented in CONTRIBUTING.md "Before you push". [no-plugin]
-
 - **media:** the mesh-room `RoomStore` seam (#1974) is now **async** and gained a
   shared, **multi-process-safe** database-backed implementation. The `RoomStore`
   trait, `RoomService`, and the four room HTTP handlers are now `async` (via
@@ -90,6 +454,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Changed
+
+- **jobs:** routed the job runtime's recorded timestamps (enqueued_at/started_at/finished_at, due-at filtering, and the backoff-delay computation) through the injected `ClockSource` seam instead of reading `Utc::now()` directly, so recorded job timestamps are deterministic under the sim harness (production defaults to `SystemClock`, behavior unchanged). The in-memory/sim job path is now fully deterministic; the Postgres durable path still uses server-side SQL `NOW()` (#2111). [no-plugin]
+
+- **admin-plugin:** made the core connection surface backend-agnostic so
+  SQLite-backend apps can compile it — flipped every hardcoded
+  `diesel_async::AsyncPgConnection` to `autumn_web::RuntimeConnection` across
+  `routes.rs`, `tokens.rs`, `traits.rs`, `registry.rs`, and the
+  `token_admin_db` test, mirroring `autumn-media-plugin`'s `rooms_db.rs`
+  (#2090) and `DbSuppressionStore` (#2100). This is an incremental step toward
+  #2108: the token admin surface now compiles clean under both Postgres and
+  SQLite, but the `experiments`/`feature_flags` models remain Postgres-only
+  pending a separate typed-DSL / `Timestamptz` rewrite (tracked in #2108).
+  [no-plugin]
 
 - **cli:** aligned the remaining stale `autumn-web = "0.5.0"` test fixtures in
   the `generate` modules (tauri sidecar, scaffold, pwa) to the current `0.6.0`
@@ -150,13 +527,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Recorded calls are readable via `SeededLlm::calls()`. Standalone and additive
   — it does not route through the `Chaos` builder and touches no default build.
   This is W5.b; it stacks on W5.0 and is a sibling of W5.a (item 5). [no-plugin]
+- **sim-testing:** the chaos lane gained a **deterministic SMTP transport fault
+  schedule** (W5.a, item 5, #1797), gated on the `mail` feature. `Chaos::smtp_faults([(7, MailFault::Fail), (8, MailFault::Timeout)])`
+  maps a **1-based send index** to a `MailFault` (`#[non_exhaustive]`; `Fail`
+  returns a permanent-ish `MailError::RuntimeUnavailable`, `Timeout` a
+  timeout-shaped `MailError::Io`/`TimedOut`) — the ratified "send #7 fails, #8
+  times out" example — so a test can adversarially exercise a throttled-resume /
+  retry path against faults that are **deterministic by construction** (a
+  scheduled send draws no entropy and never perturbs the DB/job stream).
+  Installed at `Sim::build` as a fault-injecting `MailInterceptor`, each send is
+  recorded as a new `ChaosHook::MailSend` event on the same
+  `Sim::__chaos_events()` log. Under the paused sim runtime a `Timeout` is a
+  timeout-shaped error returned immediately (never a real hang), keeping the
+  schedule byte-for-byte reproducible. An optional `Chaos::smtp_transient_errors(p)`
+  adds a probabilistic lane (drawn from a dedicated mail sub-stream) for parity
+  with `db_transient_errors`; an explicit schedule entry always wins. An empty
+  schedule / zero rate installs nothing, so a default `Chaos` is unchanged. This
+  is W5.a; it stacks on W5.0 and is a sibling of W5.b (item 6). [no-plugin]
 ### Fixed
 
+- **mail:** the prod `deliver_later` durability guard no longer aborts app
+  startup for applications that never call `deliver_later`/`deliver_later_eager`
+  (#2142). Previously, `install_mailer` hard-failed at boot in `prod` whenever
+  no durable `MailDeliveryQueue` was registered and
+  `mail.allow_in_process_deliver_later_in_production` was unset — even for
+  apps that only ever call `Mailer::send`. The check is now enforced lazily:
+  startup logs a warning and continues, and `try_deliver_later`/
+  `try_deliver_later_eager` return the new `MailError::NoDurableQueueInProduction`
+  the first time deferred delivery is actually attempted without a durable
+  backend or explicit ack.
 - **ci:** wire the `sim_sqlite_substrate` (W4) integration test into the
   `sqlite-runtime` job's `cargo test --features "sqlite,test-support"`
   invocation (alongside `sim_chaos`) so it actually runs in CI, and fix a
   private/redundant intra-doc link in the `sim::Chaos` rustdoc that broke the
   documentation-build gate (#1797). [no-plugin]
+- **migrate:** the two `SQLite` migration entry points — `run_pending_sqlite`
+  (up) and `revert_user_migrations_sqlite` (down) — now serialize their whole
+  list→plan→apply/revert sequence under a single shared `BEGIN IMMEDIATE` write
+  lock (#2065, the deferred follow-up from #2062). Previously the read→plan→apply
+  window was unlocked, so two concurrent `autumn migrate` / `autumn schema
+  migrate` processes against the same file could each read the same pending (or
+  applied) set before either wrote, and the loser then re-ran an already-applied
+  `up.sql` (or already-reverted `down.sql`) and reported a **false** migration
+  failure. The lock is taken through diesel's `AnsiTransactionManager` so diesel's
+  own per-migration transactions nest as savepoints (no "cannot start a
+  transaction within a transaction"), and a concurrent migrator now queues on the
+  connection's `busy_timeout`, re-reads an already-drained set, and cleanly
+  no-ops. There is still **no Postgres advisory lock** on the `SQLite` path —
+  `SQLite` has no such primitive; the on-disk write lock is the entire
+  serialization mechanism. Single-process migrate/revert behaviour is unchanged.
+  [no-plugin]
 - Docs and crate metadata: updated repository/homepage URLs, README badges, install scripts, and the CI workflow template from the old `madmax983/autumn` owner to `autumn-foundation/autumn` after the GitHub org transfer. Old links still redirect; this makes the canonical URLs correct.
 - **migrate:** startup migration auto-apply is now profile-agnostic (#1903).
   Previously the opt-in was name-gated to `prod`/`production`, so a custom

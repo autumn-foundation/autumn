@@ -53,6 +53,15 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 | `generated_scaffold_cargo_checks` | `generate.rs` | `generate scaffold` → `cargo check --tests` |
 | `generated_scaffold_config_cargo_checks` | `generate.rs` | config-driven scaffold → `cargo check --tests` |
 | `generated_scaffold_serves_posts_index_and_json_api` | `generate.rs` | scaffold + Postgres migrations + live HTTP |
+| `console_bare_playground_target_compiles_untouched` | `integration/console.rs` | `autumn console` first-run scaffold → `cargo check --bin playground` |
+| `console_playground_target_compiles_with_a_repository_round_trip` | `integration/console.rs` | playground + `repo.find_all()` → `cargo check --bin playground` |
+| `console_run_exits_non_zero_when_the_database_is_unreachable` | `integration/console.rs` | `autumn console` propagates config/connection failures non-zero |
+| `console_run_surfaces_a_compile_error_in_the_playground` | `integration/console.rs` | a broken playground edit surfaces cargo diagnostics, non-zero |
+
+The four `console.rs` entries compile into the consolidated `cli_tests` binary,
+whose only other CI `--ignored` invocation filters on `offsite`. They are
+therefore named **explicitly** in `.github/workflows/generator-conformance.yml`;
+a new `#[ignore]`d console test that is not added there will never run in CI.
 
 ### Why `#[ignore]`?
 

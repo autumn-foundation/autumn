@@ -2,6 +2,8 @@
 //!
 //! Demonstrates: Session extractor, password hashing (bcrypt),
 //! session.insert / clear / rotate_id, flash messages, `CsrfToken`, form handling.
+//!
+//! Narrative walkthrough of these primitives: `docs/guide/authentication.md`.
 
 use autumn_web::auth::{hash_password, verify_password};
 use autumn_web::extract::Path;

@@ -1,0 +1,5 @@
+error: unknown `seo(...)` key `titel`. Supported keys: `title`, `description`, `canonical`, `og_title`, `og_description`, `og_image`, `og_type`, `og_url`, `twitter_card`, `twitter_title`, `twitter_description`, `twitter_image`, `robots`.
+ --> tests/compile-fail/route_seo_unknown_key.rs:3:21
+  |
+3 | #[get("/about", seo(titel = "About"))]
+  |                     ^^^^^

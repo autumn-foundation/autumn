@@ -103,6 +103,7 @@ CRATES=(
   autumn-admin-plugin
   autumn-storage-s3
   autumn-cache-redis
+  autumn-search
 )
 
 breaking_failures=0

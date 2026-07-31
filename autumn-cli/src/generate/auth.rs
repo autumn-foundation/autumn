@@ -465,22 +465,15 @@ fn plan_auth_with_providers_ex_impl(
     for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
-    // SQLite foundation (issue #1614 AC #4): this generator scaffolds
-    // users/sessions/recovery-code migrations that emit Postgres-only DDL
-    // (`BIGSERIAL PRIMARY KEY`, `DEFAULT NOW()`), so reject before writing any
-    // files on a SQLite app (follow-up: issue #1927).
-    //
-    // Generate-time guard only. `autumn destroy auth` recomputes this same plan
-    // before [`Plan::revert`], so rejecting here on the destroy path would strand
-    // the very files cleanup is meant to remove (including files generated before
-    // the gate landed). Skip it when `for_revert` is set — same rationale as the
-    // shared-layout preflight below.
-    if !for_revert
-        && super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite
-    {
-        return Err(super::sqlite_generator_unsupported_error("auth"));
-    }
     super::model::validate_resource_name(name)?;
+
+    // Determine the target app's database backend so the scaffolded migrations
+    // emit backend-aware DDL (issue #1927): a SQLite app gets SQLite-dialect DDL
+    // (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`) instead
+    // of the Postgres-only `BIGSERIAL`/`NOW()` form. Detected identically on the
+    // generate and destroy/revert paths (both read the same config), so a
+    // `destroy auth` round-trip recomputes byte-identical migration content.
+    let backend = super::detect_backend(project_root);
 
     let pascal_name = pascal(name);
     let snake_name = snake(name);
@@ -562,7 +555,7 @@ fn plan_auth_with_providers_ex_impl(
         .join(format!("{timestamp}_create_{table}"));
     plan.create(
         mig_dir.join("up.sql"),
-        render_migration_up(&snake_name, &table, totp, magic_link),
+        render_migration_up(backend, &snake_name, &table, totp, magic_link),
     );
     plan.create(
         mig_dir.join("down.sql"),
@@ -1166,6 +1159,9 @@ fn plan_auth_options_impl(
         for_revert,
     )?;
 
+    // Determine the target app's database backend so the scaffolded migrations
+    // emit backend-aware DDL (issue #1927), matching the base auth plan above.
+    let backend = super::detect_backend(project_root);
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let user_table = pluralize(&snake_name);
@@ -1182,7 +1178,7 @@ fn plan_auth_options_impl(
             .join(format!("{oauth_ts_str}_create_oauth_identities"));
         plan.create(
             mig_dir.join("up.sql"),
-            render_oauth_migration_up(&user_table),
+            render_oauth_migration_up(backend, &user_table),
         );
         plan.create(mig_dir.join("down.sql"), render_oauth_migration_down());
 
@@ -1331,7 +1327,7 @@ fn plan_auth_options_impl(
             .join(format!("{passkey_ts_str}_create_webauthn_credentials"));
         plan.create(
             mig_dir.join("up.sql"),
-            render_passkey_migration_up(&user_table),
+            render_passkey_migration_up(backend, &user_table),
         );
         plan.create(mig_dir.join("down.sql"), render_passkey_migration_down());
 
@@ -1891,6 +1887,60 @@ scope = "openid profile email"
 
 // ── Template rendering ────────────────────────────────────────────────────────
 
+/// Backend-specific SQL fragments for the hand-written auth migration DDL
+/// (issue #1927).
+///
+/// The auth generator scaffolds several tables (users, sessions, remember
+/// tokens, recovery codes, magic-link tokens, OAuth identities, `WebAuthn`
+/// credentials) via hand-written `CREATE TABLE` strings. This carries the small
+/// set of column-type fragments that differ between backends so the Postgres
+/// output stays byte-for-byte identical while a `SQLite` app gets valid DDL:
+/// `INTEGER PRIMARY KEY AUTOINCREMENT` for auto-increment ids (`SQLite` has no
+/// `BIGSERIAL`), plain `INTEGER` for `BIGINT`/`INT`, and ISO-8601 `TEXT`
+/// timestamps defaulted to `CURRENT_TIMESTAMP` (`SQLite` has no dedicated
+/// timestamp type nor `NOW()`). Portable pieces (`TEXT`, `REFERENCES`, `UNIQUE`,
+/// `CREATE INDEX`) are shared and unchanged. Mirrors the dialect mapping the
+/// backend-aware model/migration generators use
+/// (`super::dsl::IdType::pk_sql_for` / `FieldKind::sqlite_sql_type`).
+#[derive(Clone, Copy)]
+struct AuthDdl {
+    /// Auto-increment primary-key column definition (the SQL after `id `).
+    pk: &'static str,
+    /// A `BIGINT` foreign-key / integer column type.
+    big_int: &'static str,
+    /// A nullable timestamp column type (used as `{ts} NULL`).
+    ts: &'static str,
+    /// A `NOT NULL` timestamp column defaulted to the creation time.
+    ts_not_null_default_now: &'static str,
+    /// A `BOOLEAN NOT NULL DEFAULT FALSE` column.
+    bool_not_null_false: &'static str,
+    /// A small-integer `NOT NULL DEFAULT 0` column (`failed_attempts`).
+    int_not_null_zero: &'static str,
+}
+
+impl AuthDdl {
+    const fn for_backend(backend: autumn_web::config::DatabaseBackend) -> Self {
+        match backend {
+            autumn_web::config::DatabaseBackend::Postgres => Self {
+                pk: "BIGSERIAL PRIMARY KEY",
+                big_int: "BIGINT",
+                ts: "TIMESTAMP",
+                ts_not_null_default_now: "TIMESTAMP NOT NULL DEFAULT NOW()",
+                bool_not_null_false: "BOOLEAN NOT NULL DEFAULT FALSE",
+                int_not_null_zero: "INT NOT NULL DEFAULT 0",
+            },
+            autumn_web::config::DatabaseBackend::Sqlite => Self {
+                pk: "INTEGER PRIMARY KEY AUTOINCREMENT",
+                big_int: "INTEGER",
+                ts: "TEXT",
+                ts_not_null_default_now: "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                bool_not_null_false: "INTEGER NOT NULL DEFAULT 0",
+                int_not_null_zero: "INTEGER NOT NULL DEFAULT 0",
+            },
+        }
+    }
+}
+
 /// Name of the per-login session-tracking table (issue #819), derived from
 /// the auth resource: `User` → `user_sessions`, `Account` → `account_sessions`.
 fn sessions_table_name(snake_name: &str) -> String {
@@ -1903,57 +1953,73 @@ fn remember_table_name(snake_name: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_migration_up(snake_name: &str, table: &str, totp: bool, magic_link: bool) -> String {
+fn render_migration_up(
+    backend: autumn_web::config::DatabaseBackend,
+    snake_name: &str,
+    table: &str,
+    totp: bool,
+    magic_link: bool,
+) -> String {
+    let d = AuthDdl::for_backend(backend);
     // TOTP columns are inserted after password_digest so the column order
     // matches the generated model struct and `schema.rs` block.
     let totp_columns = if totp {
-        "\x20   totp_secret_encrypted TEXT NULL,\n\
-         \x20   totp_enabled BOOLEAN NOT NULL DEFAULT FALSE,\n\
-         \x20   totp_last_used_step BIGINT NULL,\n"
+        format!(
+            "\x20   totp_secret_encrypted TEXT NULL,\n\
+             \x20   totp_enabled {bool_default_false},\n\
+             \x20   totp_last_used_step {big_int} NULL,\n",
+            bool_default_false = d.bool_not_null_false,
+            big_int = d.big_int,
+        )
     } else {
-        ""
+        String::new()
     };
     let mut out = format!(
         "CREATE TABLE {table} (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
+         \x20   id {pk},\n\
          \x20   email TEXT NOT NULL,\n\
          \x20   time_zone TEXT NULL,\n\
          \x20   password_digest TEXT NOT NULL,\n\
          {totp_columns}\
-         \x20   failed_attempts INT NOT NULL DEFAULT 0,\n\
-         \x20   locked_at TIMESTAMP NULL,\n\
+         \x20   failed_attempts {int_zero},\n\
+         \x20   locked_at {ts} NULL,\n\
          \x20   reset_token_digest TEXT NULL,\n\
-         \x20   reset_token_expires_at TIMESTAMP NULL,\n\
+         \x20   reset_token_expires_at {ts} NULL,\n\
          \x20   confirm_token_digest TEXT NULL,\n\
-         \x20   confirm_token_expires_at TIMESTAMP NULL,\n\
-         \x20   email_confirmed_at TIMESTAMP NULL,\n\
+         \x20   confirm_token_expires_at {ts} NULL,\n\
+         \x20   email_confirmed_at {ts} NULL,\n\
          \x20   pending_email TEXT NULL,\n\
-         \x20   export_requested_at TIMESTAMP NULL,\n\
-         \x20   delete_requested_at TIMESTAMP NULL,\n\
-         \x20   delete_scheduled_at TIMESTAMP NULL,\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
-         );\n"
+         \x20   export_requested_at {ts} NULL,\n\
+         \x20   delete_requested_at {ts} NULL,\n\
+         \x20   delete_scheduled_at {ts} NULL,\n\
+         \x20   created_at {created_at}\n\
+         );\n",
+        pk = d.pk,
+        int_zero = d.int_not_null_zero,
+        ts = d.ts,
+        created_at = d.ts_not_null_default_now,
     );
     // `email`'s uniqueness is expressed through the same shared primitive
     // `field:String:unique` scaffolds elsewhere (issue #1032), rather than a
     // parallel hand-rolled `UNIQUE` column constraint.
     out.push_str(&unique_index_sql(table, "email", &[]));
     if totp {
-        out.push_str(
+        let _ = write!(
+            out,
             "\n\
              CREATE TABLE recovery_codes (\n\
-             \x20   id BIGSERIAL PRIMARY KEY,\n\
-             \x20   user_id BIGINT NOT NULL REFERENCES ",
-        );
-        out.push_str(table);
-        out.push_str(
-            "(id) ON DELETE CASCADE,\n\
+             \x20   id {pk},\n\
+             \x20   user_id {big_int} NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
              \x20   code_digest TEXT NOT NULL,\n\
-             \x20   used_at TIMESTAMP NULL,\n\
-             \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+             \x20   used_at {ts} NULL,\n\
+             \x20   created_at {created_at}\n\
              );\n\
              \n\
              CREATE INDEX recovery_codes_user_id_idx ON recovery_codes (user_id);\n",
+            pk = d.pk,
+            big_int = d.big_int,
+            ts = d.ts,
+            created_at = d.ts_not_null_default_now,
         );
     }
     // Active login sessions (issue #819): one row per login, keyed by the
@@ -1964,8 +2030,8 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool, magic_link: bo
         out,
         "\n\
          CREATE TABLE {sess_table} (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
-         \x20   user_id BIGINT NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
+         \x20   id {pk},\n\
+         \x20   user_id {big_int} NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
          \x20   token_digest TEXT NOT NULL UNIQUE,\n\
          \x20   ip TEXT NOT NULL DEFAULT '',\n\
          \x20   user_agent TEXT NOT NULL DEFAULT '',\n\
@@ -1973,11 +2039,14 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool, magic_link: bo
          \x20   ua_os TEXT NOT NULL DEFAULT '',\n\
          \x20   ua_device TEXT NOT NULL DEFAULT '',\n\
          \x20   label TEXT NULL,\n\
-         \x20   last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+         \x20   last_seen_at {created_at},\n\
+         \x20   created_at {created_at}\n\
          );\n\
          \n\
          CREATE INDEX {sess_table}_user_id_idx ON {sess_table} (user_id);\n",
+        pk = d.pk,
+        big_int = d.big_int,
+        created_at = d.ts_not_null_default_now,
     );
     // Persistent "remember-me" login chains (issue #1397): one row per device
     // login-chain, keyed by the stable opaque `series`. `token_hash` rotates on
@@ -1989,24 +2058,28 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool, magic_link: bo
         out,
         "\n\
          CREATE TABLE {rem_table} (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
+         \x20   id {pk},\n\
          \x20   series TEXT NOT NULL UNIQUE,\n\
-         \x20   user_id BIGINT NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
+         \x20   user_id {big_int} NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
          \x20   token_hash TEXT NOT NULL,\n\
          \x20   previous_token_hash TEXT NULL,\n\
-         \x20   rotated_at TIMESTAMP NULL,\n\
-         \x20   expires_at TIMESTAMP NOT NULL,\n\
+         \x20   rotated_at {ts} NULL,\n\
+         \x20   expires_at {ts} NOT NULL,\n\
          \x20   ip TEXT NOT NULL DEFAULT '',\n\
          \x20   user_agent TEXT NOT NULL DEFAULT '',\n\
          \x20   ua_family TEXT NOT NULL DEFAULT '',\n\
          \x20   ua_os TEXT NOT NULL DEFAULT '',\n\
          \x20   ua_device TEXT NOT NULL DEFAULT '',\n\
          \x20   label TEXT NULL,\n\
-         \x20   last_used_at TIMESTAMP NULL,\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+         \x20   last_used_at {ts} NULL,\n\
+         \x20   created_at {created_at}\n\
          );\n\
          \n\
          CREATE INDEX {rem_table}_user_id_idx ON {rem_table} (user_id);\n",
+        pk = d.pk,
+        big_int = d.big_int,
+        ts = d.ts,
+        created_at = d.ts_not_null_default_now,
     );
     // Passwordless magic-link tokens (issue #1328): one row per issued link,
     // keyed by the SHA-256 digest of the raw token. Only the digest is stored —
@@ -2017,15 +2090,19 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool, magic_link: bo
             out,
             "\n\
              CREATE TABLE magic_link_tokens (\n\
-             \x20   id BIGSERIAL PRIMARY KEY,\n\
-             \x20   user_id BIGINT NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
+             \x20   id {pk},\n\
+             \x20   user_id {big_int} NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
              \x20   token_digest TEXT NOT NULL UNIQUE,\n\
-             \x20   expires_at TIMESTAMP NOT NULL,\n\
-             \x20   consumed_at TIMESTAMP NULL,\n\
-             \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+             \x20   expires_at {ts} NOT NULL,\n\
+             \x20   consumed_at {ts} NULL,\n\
+             \x20   created_at {created_at}\n\
              );\n\
              \n\
              CREATE INDEX magic_link_tokens_user_id_idx ON magic_link_tokens (user_id);\n",
+            pk = d.pk,
+            big_int = d.big_int,
+            ts = d.ts,
+            created_at = d.ts_not_null_default_now,
         );
     }
     out
@@ -2779,7 +2856,7 @@ fn redirect_to(url: &str) -> Response {{
 /// `AUTUMN_AUTH__REMEMBER__*`) are honoured instead of the compiled defaults
 /// (issue #1397.2).
 struct RememberMiddlewareState {{
-    pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    pool: diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
     config: RememberConfig,
     // The configured `[auth].session_key` (default `"user_id"`), captured at
     // startup so a remember-me restore writes the SAME identity key that
@@ -2794,7 +2871,7 @@ static REMEMBER_STATE: std::sync::OnceLock<RememberMiddlewareState> = std::sync:
 /// remember middleware uses. Idempotent — a second call is ignored. Called by
 /// `remember_me_startup`.
 pub fn init_remember_pool(
-    pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    pool: diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
     config: RememberConfig,
     auth_session_key: String,
 ) {{
@@ -2932,7 +3009,7 @@ fn to_remember_record(r: &{pascal_name}RememberToken) -> RememberRecord {{
 /// + #1397).
 async fn establish_remember_login(
     session: &Session,
-    pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
     auth_session_key: &str,
     {snake_name}_id: i64,
     ip: std::net::IpAddr,
@@ -7735,20 +7812,27 @@ fn oauth_route_entries() -> Vec<String> {
     ]
 }
 
-fn render_oauth_migration_up(user_table: &str) -> String {
+fn render_oauth_migration_up(
+    backend: autumn_web::config::DatabaseBackend,
+    user_table: &str,
+) -> String {
+    let d = AuthDdl::for_backend(backend);
     format!(
         "CREATE TABLE oauth_identities (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
+         \x20   id {pk},\n\
          \x20   provider TEXT NOT NULL,\n\
          \x20   subject TEXT NOT NULL,\n\
-         \x20   user_id BIGINT NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
+         \x20   user_id {big_int} NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
          \x20   email TEXT NULL,\n\
          \x20   name TEXT NULL,\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW(),\n\
+         \x20   created_at {created_at},\n\
          \x20   UNIQUE (provider, subject)\n\
          );\n\
          \n\
-         CREATE INDEX oauth_identities_user_id_idx ON oauth_identities (user_id);\n"
+         CREATE INDEX oauth_identities_user_id_idx ON oauth_identities (user_id);\n",
+        pk = d.pk,
+        big_int = d.big_int,
+        created_at = d.ts_not_null_default_now,
     )
 }
 
@@ -9873,19 +9957,27 @@ fn passkey_route_entries() -> Vec<String> {
     ]
 }
 
-fn render_passkey_migration_up(user_table: &str) -> String {
+fn render_passkey_migration_up(
+    backend: autumn_web::config::DatabaseBackend,
+    user_table: &str,
+) -> String {
+    let d = AuthDdl::for_backend(backend);
     format!(
         "CREATE TABLE webauthn_credentials (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
-         \x20   user_id BIGINT NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
+         \x20   id {pk},\n\
+         \x20   user_id {big_int} NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
          \x20   credential_id TEXT NOT NULL UNIQUE,\n\
          \x20   credential_json TEXT NOT NULL,\n\
          \x20   name TEXT NOT NULL DEFAULT 'Passkey',\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW(),\n\
-         \x20   last_used_at TIMESTAMP NULL\n\
+         \x20   created_at {created_at},\n\
+         \x20   last_used_at {ts} NULL\n\
          );\n\
          \n\
-         CREATE INDEX webauthn_credentials_user_id_idx ON webauthn_credentials (user_id);\n"
+         CREATE INDEX webauthn_credentials_user_id_idx ON webauthn_credentials (user_id);\n",
+        pk = d.pk,
+        big_int = d.big_int,
+        ts = d.ts,
+        created_at = d.ts_not_null_default_now,
     )
 }
 
@@ -10989,27 +11081,168 @@ mod tests {
     // is undone. These tests assert the round trip is byte-identical for the
     // base scaffold plus each optional feature flag.
 
-    /// `SQLite` foundation (issue #1614 AC #4, finding F11): `generate auth`
-    /// scaffolds users/sessions/recovery-code migrations that emit Postgres-only
-    /// DDL, so it must be rejected at generate time on a `SQLite` app, citing the
-    /// backend-aware follow-up (issue #1927) — before any files are written.
+    /// Backend-aware DDL (issue #1927): `generate auth` on a `SQLite` app now
+    /// scaffolds its migrations in `SQLite` dialect (`INTEGER PRIMARY KEY
+    /// AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`) instead of being rejected —
+    /// covering the users table AND the DB-backed sessions table (issue #1908) —
+    /// and no Postgres-only `BIGSERIAL` / `BIGINT` / `NOW()` leaks into the
+    /// `SQLite` migration.
     #[test]
-    fn plan_auth_rejected_on_sqlite_app_citing_1927() {
+    fn plan_auth_emits_sqlite_ddl_including_sessions() {
         let tmp = project_with_main();
         fs::write(
             tmp.path().join("autumn.toml"),
             "[database]\nprimary_url = \"sqlite://app.db\"\n",
         )
         .unwrap();
-        let err = plan_auth(tmp.path(), "User", "20260508000000").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("SQLite"), "message must name SQLite: {msg}");
+        // `--totp`/`--magic-link` cover the recovery-code + magic-link-token
+        // tables too, so every hand-written auth DDL string is exercised.
+        plan_auth_full_ex2(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions {
+                providers: Vec::new(),
+            },
+            true,  // totp
+            false, // passkeys
+            true,  // magic_link
+        )
+        .expect("generate auth must scaffold on a SQLite app")
+        .execute(Flags::default())
+        .unwrap();
+        assert!(tmp.path().join("src/models/user.rs").exists());
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        // Every auto-increment id uses the SQLite spelling.
         assert!(
-            msg.contains("issues/1927"),
-            "message must cite issue #1927: {msg}"
+            up.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+            "SQLite up.sql must use INTEGER PRIMARY KEY AUTOINCREMENT: {up}"
         );
-        // No model files written on rejection.
-        assert!(!tmp.path().join("src/models/user.rs").exists());
+        // The DB-backed sessions table (#1908) is created in SQLite dialect.
+        assert!(
+            up.contains("CREATE TABLE user_sessions (")
+                && up.contains("last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            "user_sessions must be SQLite-dialect: {up}"
+        );
+        // The recovery-code (--totp) and magic-link (--magic-link) tables too.
+        assert!(
+            up.contains("CREATE TABLE recovery_codes (")
+                && up.contains("CREATE TABLE magic_link_tokens ("),
+            "totp + magic-link tables must be scaffolded: {up}"
+        );
+        // Foreign keys and timestamp columns are SQLite-typed.
+        assert!(
+            up.contains("user_id INTEGER NOT NULL REFERENCES users(id)"),
+            "FK columns must be INTEGER on SQLite: {up}"
+        );
+        assert!(
+            up.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            "created_at must default to CURRENT_TIMESTAMP on SQLite: {up}"
+        );
+        for leak in ["BIGSERIAL", "BIGINT", "NOW()"] {
+            assert!(
+                !up.contains(leak),
+                "SQLite up.sql leaked Postgres-only `{leak}`: {up}"
+            );
+        }
+    }
+
+    /// Regression guard: on a Postgres app (the default) the auth migration
+    /// stays byte-for-byte the historical Postgres DDL.
+    #[test]
+    fn plan_auth_emits_postgres_ddl_by_default() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        plan_auth(tmp.path(), "User", "20260508000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("id BIGSERIAL PRIMARY KEY"),
+            "Postgres up.sql must keep BIGSERIAL PRIMARY KEY: {up}"
+        );
+        assert!(
+            up.contains("CREATE TABLE user_sessions (")
+                && up.contains("last_seen_at TIMESTAMP NOT NULL DEFAULT NOW()"),
+            "Postgres user_sessions must keep TIMESTAMP DEFAULT NOW(): {up}"
+        );
+        assert!(
+            up.contains("user_id BIGINT NOT NULL REFERENCES users(id)"),
+            "Postgres FK columns must stay BIGINT: {up}"
+        );
+    }
+
+    /// DB-backed sessions store on `SQLite` (issue #1908): the generated
+    /// `routes/auth.rs` types its connection pools against the backend-agnostic
+    /// `::autumn_web::RuntimeConnection` alias (which resolves to `AsyncPgConnection`
+    /// on Postgres and the `SQLite` connection under the `sqlite` feature), never a
+    /// hard-coded `diesel_async::AsyncPgConnection`, so the generated app compiles
+    /// on whichever backend it selected.
+    #[test]
+    fn generated_session_pool_uses_runtime_connection_not_pg() {
+        // magic-link on/off both emit the remember-me middleware pool sites.
+        for magic_link in [false, true] {
+            let routes = render_routes_file("User", "user", "users", &[], false, magic_link);
+            assert!(
+                routes.contains("deadpool::Pool<::autumn_web::RuntimeConnection>"),
+                "session pool must be typed against RuntimeConnection (magic_link={magic_link}): {routes}"
+            );
+            assert!(
+                !routes.contains("Pool<diesel_async::AsyncPgConnection>"),
+                "session pool must not hard-code AsyncPgConnection (magic_link={magic_link})"
+            );
+        }
+    }
+
+    /// The `--oauth` (`oauth_identities`) and `--passkeys`
+    /// (`webauthn_credentials`) migrations are backend-aware too (issue #1927):
+    /// `SQLite` dialect on a `SQLite` app, historical Postgres DDL otherwise.
+    #[test]
+    fn oauth_and_passkey_migrations_are_backend_aware() {
+        use autumn_web::config::DatabaseBackend;
+
+        for (render, table) in [
+            (
+                render_oauth_migration_up as fn(DatabaseBackend, &str) -> String,
+                "oauth_identities",
+            ),
+            (render_passkey_migration_up, "webauthn_credentials"),
+        ] {
+            let sqlite = render(DatabaseBackend::Sqlite, "users");
+            assert!(
+                sqlite.contains("id INTEGER PRIMARY KEY AUTOINCREMENT")
+                    && sqlite.contains("user_id INTEGER NOT NULL REFERENCES users(id)")
+                    && sqlite.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+                "{table} SQLite DDL must use SQLite dialect: {sqlite}"
+            );
+            for leak in ["BIGSERIAL", "BIGINT", "NOW()"] {
+                assert!(
+                    !sqlite.contains(leak),
+                    "{table} SQLite DDL leaked `{leak}`: {sqlite}"
+                );
+            }
+            let pg = render(DatabaseBackend::Postgres, "users");
+            assert!(
+                pg.contains("id BIGSERIAL PRIMARY KEY")
+                    && pg.contains("user_id BIGINT NOT NULL REFERENCES users(id)")
+                    && pg.contains("created_at TIMESTAMP NOT NULL DEFAULT NOW()"),
+                "{table} Postgres DDL must stay historical: {pg}"
+            );
+        }
     }
 
     /// A Postgres app (the default) is not rejected — `generate auth` still
@@ -11025,10 +11258,12 @@ mod tests {
         assert!(plan_auth(tmp.path(), "User", "20260508000000").is_ok());
     }
 
-    /// The `SQLite` rejection is generate-only (finding F18): `autumn destroy
-    /// auth` recomputes this same plan via the `for_revert` builder before
-    /// [`Plan::revert`], so it must NOT be rejected on a `SQLite` app — otherwise
-    /// files generated before the gate landed could never be cleaned up.
+    /// `autumn destroy auth` recomputes this same plan via the `for_revert`
+    /// builder before [`Plan::revert`], so it must build a revert plan on a
+    /// `SQLite` app (the `for_revert` flag still suppresses the generate-only
+    /// shared-layout preflight — issue #1927 made the migrations SQLite-valid, so
+    /// generate no longer rejects, but the preflight-suppression path must stay
+    /// exercised).
     #[test]
     fn plan_auth_for_revert_not_rejected_on_sqlite_app() {
         let tmp = project_with_main();

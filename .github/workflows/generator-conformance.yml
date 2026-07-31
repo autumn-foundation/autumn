@@ -20,11 +20,13 @@ on:
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
+      - "autumn-cli/src/console.rs"
       - "autumn-cli/src/main.rs"
       - "autumn-cli/src/migrate.rs"
       - "autumn-cli/Cargo.toml"
       - "autumn-cli/tests/e2e.rs"
       - "autumn-cli/tests/generate.rs"
+      - "autumn-cli/tests/integration/console.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -36,11 +38,13 @@ on:
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
+      - "autumn-cli/src/console.rs"
       - "autumn-cli/src/main.rs"
       - "autumn-cli/src/migrate.rs"
       - "autumn-cli/Cargo.toml"
       - "autumn-cli/tests/e2e.rs"
       - "autumn-cli/tests/generate.rs"
+      - "autumn-cli/tests/integration/console.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -165,6 +169,38 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_channel_smoke_test_passes -- --ignored --exact
+
+      # ── `autumn console` (#1039) ────────────────────────────────────────
+      #
+      # These four are the ONLY machine proof of the console's central
+      # acceptance criterion — that the scaffolded playground compiles and
+      # runs against the resolved environment with no wiring by hand. They
+      # live in the consolidated `cli_tests` binary, whose only other CI
+      # `--ignored` invocation filters on `offsite`, so they must be named
+      # explicitly here or they never execute anywhere.
+      - name: console_bare_playground_target_compiles_untouched
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::console::console_bare_playground_target_compiles_untouched \
+            -- --ignored --exact
+
+      - name: console_playground_target_compiles_with_a_repository_round_trip
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::console::console_playground_target_compiles_with_a_repository_round_trip \
+            -- --ignored --exact
+
+      - name: console_run_exits_non_zero_when_the_database_is_unreachable
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::console::console_run_exits_non_zero_when_the_database_is_unreachable \
+            -- --ignored --exact
+
+      - name: console_run_surfaces_a_compile_error_in_the_playground
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::console::console_run_surfaces_a_compile_error_in_the_playground \
+            -- --ignored --exact
 
   # ── Generated-app variant conformance matrix ────────────────────────────────
   #

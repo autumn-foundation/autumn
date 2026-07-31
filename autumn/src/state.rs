@@ -507,6 +507,15 @@ impl AppState {
         self
     }
 
+    /// Clone the shared clock handle, e.g. to thread into a subsystem that needs
+    /// the injected clock without going through Axum's extractor machinery.
+    ///
+    /// Mirrors [`Self::entropy_arc`].
+    #[must_use]
+    pub(crate) fn clock_arc(&self) -> Arc<dyn ClockSource> {
+        Arc::clone(&self.clock)
+    }
+
     /// Returns the active entropy source wired into this state.
     ///
     /// Handlers should prefer the [`crate::entropy::Rng`] extractor; this

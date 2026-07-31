@@ -134,6 +134,9 @@ jobs:
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           cargo test -p autumn-cache-redis -- --ignored
+          # autumn-search (#1191): the Postgres SearchBackend + DocumentSource
+          # suites are testcontainer-managed, so no `services:` block is needed.
+          cargo test -p autumn-search -- --ignored
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
@@ -286,6 +289,7 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
+          cargo llvm-cov --no-report -p autumn-search -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
@@ -341,7 +345,7 @@ jobs:
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
         # sqlite_transactional_url_pool) and is additive/harmless for the rest.
         run: |
-          cargo test -p autumn-web --features "sqlite,test-support" \
+          cargo test -p autumn-web --features "sqlite,test-support,storage" \
             --test sqlite_boot_serve \
             --test sqlite_migrations \
             --test sqlite_foreign_keys \
@@ -356,11 +360,21 @@ jobs:
             --test sqlite_immediate_transaction \
             --test sqlite_statement_timeout_fail_closed \
             --test sqlite_crud_basic \
+            --test sqlite_field_conversions \
             --test sqlite_upsert_isolation \
             --test sqlite_dependent_destroy \
             --test sqlite_commit_hook_worker \
             --test sim_chaos \
-            --test sim_sqlite_substrate
+            --test sqlite_jobs_scheduler_e2e \
+            --test sim_sqlite_substrate \
+            --test sim_sqlite_integration
+      - name: Run the sqlite mail-chaos suite (W5.a, issue #1797)
+        # `sim_chaos_mail` needs the `mail` feature for the mail
+        # interceptor/transport surface, so it runs as its own invocation to
+        # avoid widening the feature set of the other sqlite tests above.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support,mail" \
+            --test sim_chaos_mail
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings

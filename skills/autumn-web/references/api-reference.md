@@ -17,6 +17,7 @@ the `trunk-dev` workspace is versioned **0.6.0 (unpublished)**. Entries marked
 | `autumn-admin-plugin` | `autumn-admin-plugin/` | First-party admin UI plugin |
 | `autumn-storage-s3` | `autumn-storage-s3/` | S3-compatible `BlobStore` plugin |
 | `autumn-cache-redis` | `autumn-cache-redis/` | Redis cache plugin |
+| `autumn-search` | `autumn-search/` | Keyword + vector search plugin |
 
 All publishable crates share the `[workspace.package]` version and release
 together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
@@ -99,10 +100,10 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 
 | Macro | Purpose |
 |---|---|
-| `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers |
+| `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, and `seo(...)` |
 | `routes![...]` | Collect route handlers |
 | `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap |
-| `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build` |
+| `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)` |
 | `#[ws]` | WebSocket route handler (`ws`) |
 | `#[model]` | Diesel model derives (`db`) |
 | `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools |
@@ -124,6 +125,19 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 | `#[step_up]` | Step-up authentication guard |
 | `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**unreleased**) |
 | `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**unreleased**) — publish via the `Events` extractor, register with `.listeners(...)` |
+
+Route macros accept a `seo(...)` argument declaring per-page meta tag defaults
+(**unreleased** — trunk-dev, #1182):
+`#[get("/about", seo(title = "About", description = "…"))]`. Keys mirror the
+`SeoMeta` builder — `title`, `description`, `canonical`, `og_title`,
+`og_description`, `og_image`, `og_type`, `og_url`, `twitter_card`,
+`twitter_title`, `twitter_description`, `twitter_image`, `robots` — and values
+must be string literals; unknown or repeated keys are compile errors. Handlers
+receive the declared values by taking a `SeoMeta` parameter (it implements
+`FromRequestParts` and never fails; a route without `seo(...)` yields an empty
+builder), then refine them with per-request data before calling
+`seo.render()`. `#[static_get]` honours the argument too. The declared values
+are also recorded on `Route::seo` as a `SeoRouteDefaults`.
 
 `#[model]` also recognizes `#[belongs_to]` / `#[has_many]` / `#[has_one]`
 struct-level attributes (**unreleased** — trunk-dev, not in published 0.5.0)

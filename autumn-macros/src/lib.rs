@@ -74,6 +74,41 @@ use proc_macro::TokenStream;
 ///     "Hello, Autumn!"
 /// }
 /// ```
+///
+/// # Route-level SEO defaults
+///
+/// A `seo(...)` argument declares per-page meta tag values once on the route
+/// instead of rebuilding them in every handler. Take a `SeoMeta` parameter and
+/// it arrives pre-populated; the builder is consuming, so the handler refines
+/// the defaults with per-request data:
+///
+/// ```ignore
+/// use autumn_web::get;
+/// use autumn_web::seo::SeoMeta;
+///
+/// #[get("/about", seo(title = "About • My Blog", description = "Learn about us"))]
+/// async fn about(seo: SeoMeta) -> Markup {
+///     html! { head { (seo.render()) } }
+/// }
+///
+/// #[get("/posts/{slug}", seo(og_type = "article"))]
+/// async fn show(slug: Path<String>, seo: SeoMeta) -> Markup {
+///     let seo = seo.title(format!("{} • Blog", *slug));
+///     html! { head { (seo.render()) } }
+/// }
+/// ```
+///
+/// Accepted keys mirror the `SeoMeta` builder: `title`, `description`,
+/// `canonical`, `og_title`, `og_description`, `og_image`, `og_type`, `og_url`,
+/// `twitter_card`, `twitter_title`, `twitter_description`, `twitter_image`,
+/// and `robots`. Values must be string literals; an unknown, repeated, or
+/// empty `seo(...)` is a compile error. Every HTTP route macro accepts the
+/// argument, as does [`macro@static_get`]; [`macro@ws`] does not, since a
+/// WebSocket upgrade serves no crawlable document.
+///
+/// The argument supplies *values*, not markup: a handler that never takes a
+/// `SeoMeta` parameter renders nothing regardless of what the attribute
+/// declares.
 #[proc_macro_attribute]
 pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
     route::route_macro("GET", "get", attr.into(), item.into()).into()
@@ -653,6 +688,20 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// #[static_get("/about")]
 /// async fn about() -> &'static str {
 ///     "About us"
+/// }
+/// ```
+///
+/// # Route-level SEO defaults
+///
+/// Accepts the same `seo(...)` argument as [`macro@get`], so pre-rendered
+/// pages carry the declared meta tags. Static generation drives the same
+/// router as the live server, so the values reach the handler identically in
+/// both modes:
+///
+/// ```ignore
+/// #[static_get("/about", seo(title = "About • My Blog", og_type = "website"))]
+/// async fn about(seo: SeoMeta) -> Markup {
+///     html! { head { (seo.render()) } }
 /// }
 /// ```
 #[proc_macro_attribute]
