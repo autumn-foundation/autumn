@@ -117,14 +117,19 @@ alone rather than guessed at, because a wrong schema is worse than an absent
 one. A handler returning `impl IntoResponse`, `Markup`, `Sse`, or a redirect
 contributes an operation with no response body schema.
 
-> **`Query<T>` must be flat.** The `style: form, explode: true` mapping is
-> accurate only while `T`'s fields are scalars (or arrays of scalars).
-> `Query<T>` decodes with `serde_urlencoded`, which cannot parse a nested
-> object or an array of objects — but the generator will still happily
-> advertise that nested shape, so a client following the spec sends a request
-> the handler rejects. Autumn's MCP projection detects this case and refuses to
-> build a tool for it; the OpenAPI document has no such guard. Take structured
-> input as a JSON body instead.
+> **`Query<T>` must be flat — scalars only.** The `style: form, explode: true`
+> mapping is accurate only while every field of `T` is a scalar. `Query<T>`
+> decodes with `serde_urlencoded`, which handles neither nested objects nor
+> **sequences**: a `Vec<String>` field advertised as an array is sent by a
+> conforming client as `?tags=a&tags=b` and fails to deserialize with
+> `invalid type: string "a", expected a sequence`. The generator advertises
+> both shapes anyway, so the spec can describe a query the handler cannot
+> accept. Take anything but scalars as a JSON body.
+>
+> The MCP projection notices the nested-object case and logs a build-time
+> `tracing::warn`, but it still publishes the tool — so it appears in
+> `tools/list` and fails when an agent calls it. Neither output refuses to
+> generate; both only warn at best.
 
 ### A worked example
 
