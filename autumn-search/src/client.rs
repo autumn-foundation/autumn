@@ -743,16 +743,29 @@ impl SearchClient {
 
     /// Apply one reindex instruction.
     ///
-    /// This is the whole of index sync: an **upsert** re-reads the row and
-    /// writes it (or deletes the document when the row is gone), and a
-    /// **delete** removes the document without touching the source. Both are
-    /// idempotent, so at-least-once job delivery is safe, and both converge to
-    /// the same state whichever order they arrive in.
+    /// This is the whole of index sync, and **both** operations do the same
+    /// thing: re-read the row and make the index agree. Present ⇒ upsert;
+    /// absent (hard-deleted, or soft-deleted and therefore filtered out by the
+    /// source) ⇒ remove the document.
+    ///
+    /// Convergence is why the delete op re-reads too, rather than deleting
+    /// unconditionally. Consider a record deleted and then re-created under the
+    /// same primary key: a delete job that retries, or simply arrives after the
+    /// re-create's upsert already ran, would otherwise remove a live record and
+    /// leave it missing until some later mutation. Because both ops are
+    /// "converge this id", **any** order and any duplication of instructions
+    /// reaches the same state — which is what makes at-least-once delivery and
+    /// the `(index, id)` dedup key safe.
+    ///
+    /// [`ReindexOp`] survives as intent, and as the one place the two paths
+    /// differ: with no [`crate::DocumentSource`] installed there is nothing to
+    /// re-read, so a delete still removes the document (it needs no source)
+    /// while an upsert reports [`SearchError::SourceUnavailable`].
     ///
     /// # Errors
     ///
-    /// [`SearchError::UnknownIndex`], [`SearchError::SourceUnavailable`] for
-    /// an upsert with no document source, plus any backend failure.
+    /// [`SearchError::UnknownIndex`], [`SearchError::SourceUnavailable`] for an
+    /// upsert with no document source, plus any backend failure.
     pub async fn reindex(&self, args: &ReindexArgs) -> SearchResult<()> {
         // Checked FIRST: with search disabled, an in-flight job for an index
         // the app no longer registers must no-op, not fail five times and
@@ -762,20 +775,20 @@ impl SearchClient {
         }
         let definition = self.definition(&args.index)?;
 
-        if args.op == ReindexOp::Delete {
-            return self.inner.backend.delete(definition, &[args.id]).await;
-        }
+        let Some(source) = self.inner.source.as_ref() else {
+            return match args.op {
+                // A delete needs no source: "not in the index" is reachable
+                // without knowing anything about the row.
+                ReindexOp::Delete => self.inner.backend.delete(definition, &[args.id]).await,
+                ReindexOp::Upsert => Err(SearchError::SourceUnavailable),
+            };
+        };
 
-        let source = self
-            .inner
-            .source
-            .as_ref()
-            .ok_or(SearchError::SourceUnavailable)?;
         let documents = source.fetch(definition, &[args.id]).await?;
         if documents.is_empty() {
             // The row is gone. Converge by removing the document — this is how
-            // a lost delete event, or a row removed by direct SQL, repairs
-            // itself.
+            // a lost delete event, a soft delete, or a row removed by direct
+            // SQL repairs itself.
             return self.inner.backend.delete(definition, &[args.id]).await;
         }
         let prepared = self.embed_documents(documents).await?;

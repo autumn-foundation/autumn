@@ -104,15 +104,23 @@ your own `after_*_commit`.
 ### Why the job payload is `(index, id)` and not the record
 
 A reindex instruction carries the index name and the primary key. The handler
-**re-reads the row**:
+**re-reads the row** — for a delete as much as an upsert:
 
 - row present ⇒ upsert the document;
-- row absent ⇒ delete the document.
+- row absent (hard-deleted, or soft-deleted and therefore filtered out by the
+  source) ⇒ delete the document.
 
-That one idempotent operation means create, update, delete, a replayed job, a
-lost delete event, and a row changed by direct SQL all converge to the same
-index state. At-least-once delivery is safe by construction, and a stale
-payload can never write stale text into the index.
+Every instruction is the same operation: *converge this id*. So create, update,
+delete, a replayed job, a lost delete event, and a row changed by direct SQL all
+reach the same index state, in any order. At-least-once delivery is safe by
+construction, a stale payload can never write stale text into the index, and a
+late delete cannot evict a record that has since been recreated under the same
+primary key. It is also what makes the `(index, id)` dedup key sound: repeated
+writes collapse to one job precisely because the ops are interchangeable.
+
+`ReindexOp` survives as intent, and as the one place the paths differ: with no
+`DocumentSource` installed a delete still removes the document (it needs
+nothing to re-read), while an upsert reports `SourceUnavailable`.
 
 ---
 

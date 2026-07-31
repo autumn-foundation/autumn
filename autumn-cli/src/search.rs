@@ -11,7 +11,10 @@
 //! `SearchPlugin::…` builder call. The standalone CLI links `autumn-web` but
 //! never the user's models, so it cannot see any of them.
 
-use std::process::Command;
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crate::routes::{compile_binary, find_binary};
 
@@ -26,6 +29,20 @@ const BACKFILL_ENV: &str = "AUTUMN_SEARCH_BACKFILL";
 ///
 /// Must stay in sync with `autumn_search::BACKFILL_PURGE_ENV`.
 const BACKFILL_PURGE_ENV: &str = "AUTUMN_SEARCH_BACKFILL_PURGE";
+
+/// Line the plugin prints as soon as it begins the backfill.
+///
+/// Must stay in sync with `autumn_search::BACKFILL_STARTED_MARKER`.
+const BACKFILL_STARTED_MARKER: &str = "autumn-search: backfill starting";
+
+/// How long to wait for [`BACKFILL_STARTED_MARKER`] before concluding that the
+/// application never installed `SearchPlugin`.
+///
+/// This bounds only *startup* — config load, pool connect, migrations,
+/// `ensure_index`. Once the marker arrives the CLI waits indefinitely, because
+/// a real backfill over a large table legitimately takes minutes to hours and
+/// must never be cut short by a timer.
+const STARTUP_GRACE: Duration = Duration::from_secs(120);
 
 /// Options for `autumn search reindex`.
 pub struct ReindexOptions<'a> {
@@ -48,6 +65,12 @@ pub fn backfill_target(index: Option<&str>) -> String {
     index.unwrap_or("all").to_owned()
 }
 
+/// Whether `line` is the plugin's backfill-started announcement.
+#[must_use]
+pub fn is_started_marker(line: &str) -> bool {
+    line.starts_with(BACKFILL_STARTED_MARKER)
+}
+
 /// Run `autumn search reindex`.
 pub fn run(opts: &ReindexOptions<'_>) {
     eprintln!("\u{1F342} autumn search reindex\n");
@@ -67,19 +90,66 @@ pub fn run(opts: &ReindexOptions<'_>) {
         command.env(BACKFILL_PURGE_ENV, "1");
     }
 
-    let status = command
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
+    // stdout is piped so the CLI can watch for the plugin's start marker; it is
+    // forwarded line by line so the app's own output still reaches the user.
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
         .unwrap_or_else(|e| {
             eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
             std::process::exit(1);
         });
 
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let (tx, rx) = mpsc::channel::<()>();
+    let forwarder = std::thread::spawn(move || {
+        let mut announced = false;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            println!("{line}");
+            let _ = std::io::stdout().flush();
+            if !announced && is_started_marker(&line) {
+                announced = true;
+                // A closed receiver just means the main thread stopped caring.
+                let _ = tx.send(());
+            }
+        }
+    });
+
+    // If the app does not install `SearchPlugin`, nothing consumes
+    // `AUTUMN_SEARCH_BACKFILL` and the process falls through to serving HTTP —
+    // forever. Waiting unconditionally would look like a hang, so bound the
+    // wait for the marker (not the backfill itself).
+    if rx.recv_timeout(STARTUP_GRACE).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(forwarder);
+        eprintln!(
+            "\n\u{2717} The application did not start a search backfill within {}s.\n\
+             \n\
+             The most likely cause is that it does not install `SearchPlugin`, so nothing\n\
+             consumed {BACKFILL_ENV} and the process went on to serve HTTP instead.\n\
+             Add the plugin to the app builder:\n\
+             \n\
+             .plugin(SearchPlugin::new().postgres().index::<YourModel>())\n\
+             \n\
+             If the app is simply slow to boot (migrations, a cold pool), re-run once it is warm.",
+            STARTUP_GRACE.as_secs()
+        );
+        std::process::exit(1);
+    }
+
+    // The backfill is genuinely under way: wait as long as it takes.
+    let status = child.wait().unwrap_or_else(|e| {
+        eprintln!("\u{2717} Failed to wait for {}: {e}", binary.display());
+        std::process::exit(1);
+    });
+    let _ = forwarder.join();
+
     if !status.success() {
         eprintln!(
             "\u{2717} Reindex failed (exit status {status}). \
-             Is `SearchPlugin` installed and the database reachable?"
+             Is the database reachable?"
         );
         std::process::exit(status.code().unwrap_or(1));
     }
@@ -106,5 +176,28 @@ mod tests {
         // does not depend on `autumn-search`, so nothing else pins them.
         assert_eq!(BACKFILL_ENV, "AUTUMN_SEARCH_BACKFILL");
         assert_eq!(BACKFILL_PURGE_ENV, "AUTUMN_SEARCH_BACKFILL_PURGE");
+        assert_eq!(BACKFILL_STARTED_MARKER, "autumn-search: backfill starting");
+    }
+
+    #[test]
+    fn the_start_marker_is_recognised_with_its_target_suffix() {
+        // The plugin appends the target, so this must be a prefix match.
+        assert!(is_started_marker("autumn-search: backfill starting all"));
+        assert!(is_started_marker(
+            "autumn-search: backfill starting articles"
+        ));
+        assert!(!is_started_marker(
+            "autumn-search: reindexed articles (3 documents)"
+        ));
+        assert!(!is_started_marker("Listening on http://0.0.0.0:3000"));
+        assert!(!is_started_marker(""));
+    }
+
+    #[test]
+    fn the_startup_grace_bounds_boot_not_the_backfill() {
+        // Long enough for migrations and a cold pool; the CLI waits
+        // indefinitely once the marker lands, so a large table is never cut
+        // short by this value.
+        assert!(STARTUP_GRACE >= Duration::from_secs(60));
     }
 }

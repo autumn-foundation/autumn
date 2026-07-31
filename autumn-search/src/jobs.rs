@@ -33,11 +33,14 @@ pub const BACKFILL_JOB: &str = "autumn_search_backfill";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReindexOp {
-    /// Re-read the row and write it — or delete the document if the row is
-    /// gone. This covers create **and** update, because both mean "the row
-    /// changed; make the index agree".
+    /// The record was created or updated. Re-reads the row and writes it — or
+    /// deletes the document if the row is gone. Create and update are the same
+    /// instruction, because both mean "the row changed; make the index agree".
     Upsert,
-    /// Remove the document without consulting the source.
+    /// The record was deleted. Still re-reads the source and converges — a
+    /// row that has been recreated under the same primary key must survive a
+    /// late or retried delete. With no `DocumentSource` installed this falls
+    /// back to removing the document outright, which needs no source.
     Delete,
 }
 
@@ -76,8 +79,10 @@ impl ReindexArgs {
     /// The dedup key for this instruction.
     ///
     /// Repeated writes to the same record inside one queue window collapse to
-    /// one reindex — the job re-reads the row, so only the *last* one would
-    /// have done any distinct work anyway.
+    /// one reindex — every instruction re-reads the row, so they are all the
+    /// same operation and only one need run. Deliberately **not** keyed on
+    /// `op`: an upsert and a delete for one record are interchangeable under
+    /// this scheme, so collapsing them is safe rather than lossy.
     #[must_use]
     pub fn unique_key(&self) -> String {
         format!("{}:{}", self.index, self.id)

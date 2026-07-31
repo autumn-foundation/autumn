@@ -22,8 +22,11 @@
 //!   transaction as the mutation. A process dying between commit and enqueue
 //!   is recovered by the queue, not lost.
 //! - It enqueues `(index, id)` and **not the record**. The job re-reads the
-//!   row, so a stale or reordered payload cannot write stale text into the
-//!   index — see [`crate::SearchClient::reindex`].
+//!   row — for a delete as well as an upsert — so every instruction means
+//!   "converge this id". A stale or reordered payload therefore cannot write
+//!   stale text into the index, and a late delete cannot evict a record that
+//!   has since been recreated under the same key. See
+//!   [`crate::SearchClient::reindex`].
 //!
 //! An app that already has hooks composes instead of replacing: call
 //! [`enqueue_reindex`] from its own `after_*_commit`.

@@ -165,6 +165,15 @@ pub struct PostgresSearchStore {
     /// Cache of the optional framework columns each source table carries, so a
     /// backfill does not re-probe `pg_attribute` on every batch.
     optional_columns: RwLock<std::collections::HashMap<&'static str, OptionalColumns>>,
+    /// Declared width of the PHYSICAL `embedding_vec` column, if it exists —
+    /// which is NOT the same question as "is this process in pgvector mode".
+    ///
+    /// An earlier pgvector-enabled deployment can leave the column behind while
+    /// this process falls back to `Array` (dimensions unset, or a width
+    /// mismatch). Writes must still keep that column in step, or stale vectors
+    /// survive every upsert and a pgvector-mode reader — another replica, or
+    /// this one after a config change — silently ranks on obsolete content.
+    vector_column_width: RwLock<Option<usize>>,
 }
 
 /// Which optional framework columns one source table carries.
@@ -199,6 +208,7 @@ impl PostgresSearchStore {
             vector_mode: RwLock::new(None),
             schema_ready: AtomicBool::new(false),
             optional_columns: RwLock::new(std::collections::HashMap::new()),
+            vector_column_width: RwLock::new(None),
         }
     }
 
@@ -212,6 +222,18 @@ impl PostgresSearchStore {
     #[must_use]
     pub fn vector_mode(&self) -> Option<VectorMode> {
         self.vector_mode.read().ok().and_then(|guard| *guard)
+    }
+
+    /// Declared width of the physical `embedding_vec` column, if it exists.
+    ///
+    /// Independent of [`Self::vector_mode`]: the column can outlive the mode
+    /// that created it.
+    #[must_use]
+    pub fn vector_column_width(&self) -> Option<usize> {
+        self.vector_column_width
+            .read()
+            .ok()
+            .and_then(|guard| *guard)
     }
 
     fn pool(&self) -> SearchResult<&RuntimePool> {
@@ -437,7 +459,19 @@ impl SearchBackend for PostgresSearchStore {
                 if let Ok(mut guard) = self.vector_mode.write() {
                     *guard = Some(mode);
                 }
-                tracing::info!(?mode, "autumn-search postgres vector storage resolved");
+
+                // Probe the PHYSICAL column regardless of the resolved mode: it
+                // may have been created by an earlier deployment, and writes
+                // have to keep it in step either way.
+                let width = Self::vector_column_width_of(&mut conn).await?;
+                if let Ok(mut guard) = self.vector_column_width.write() {
+                    *guard = width;
+                }
+                tracing::info!(
+                    ?mode,
+                    vector_column_width = ?width,
+                    "autumn-search postgres vector storage resolved"
+                );
             }
             Ok(())
         })
@@ -456,12 +490,13 @@ impl SearchBackend for PostgresSearchStore {
                 return Ok(());
             }
             let mut conn = self.conn().await?;
-            // The column exists once `try_enable_pgvector` has added it, and
-            // it must be WRITTEN whenever it exists — even in Array mode.
-            // Skipping it would leave a stale `embedding_vec` behind after an
-            // upsert, and a pgvector-mode reader (another replica, or this one
-            // after a config change) would then rank on the old vector.
-            let has_vector_column = self.vector_mode().is_some_and(VectorMode::is_pgvector);
+            // Keyed on the PHYSICAL column, not on this process's mode. The
+            // column can outlive the mode that created it (dimensions unset, a
+            // width mismatch, a mixed fleet), and skipping it then leaves a
+            // stale `embedding_vec` behind after every upsert — which a
+            // pgvector-mode reader silently ranks on. `None` width means the
+            // column is absent and must stay out of the column list entirely.
+            let vector_width = self.vector_column_width();
 
             for document in documents {
                 // The weighted tsvector, built exactly as #842 does:
@@ -486,9 +521,17 @@ impl SearchBackend for PostgresSearchStore {
                     Bound::Text(document.document.text()),
                     Bound::NullableText(document.embedding.as_deref().map(array_literal)),
                 ];
-                if has_vector_column {
+                if let Some(width) = vector_width {
+                    // Write the real vector when it fits the declared width,
+                    // and NULL when it does not — a width the column cannot
+                    // hold would fail the insert, and leaving the old value in
+                    // place is exactly the staleness this avoids.
                     binds.push(Bound::NullableText(
-                        document.embedding.as_deref().map(vector_literal),
+                        document
+                            .embedding
+                            .as_deref()
+                            .filter(|embedding| embedding.len() == width)
+                            .map(vector_literal),
                     ));
                 }
 
@@ -517,7 +560,7 @@ impl SearchBackend for PostgresSearchStore {
                     "to_tsvector($5::text::regconfig, '')".clone_into(&mut vector_sql);
                 }
 
-                let (vec_column, vec_value, vec_update) = if has_vector_column {
+                let (vec_column, vec_value, vec_update) = if vector_width.is_some() {
                     (
                         ", embedding_vec",
                         ", $8::vector",
@@ -862,6 +905,29 @@ impl PostgresSearchStore {
         outcome
     }
 
+    /// Declared width of the physical `embedding_vec` column, or `None` when
+    /// the column does not exist.
+    ///
+    /// `atttypmod` carries a `vector`'s declared dimension count. Resolved via
+    /// `to_regclass` so it follows the same `search_path` the queries do.
+    async fn vector_column_width_of(
+        conn: &mut diesel_async::pooled_connection::deadpool::Object<autumn_web::RuntimeConnection>,
+    ) -> SearchResult<Option<usize>> {
+        let rows = diesel::sql_query(format!(
+            "SELECT COALESCE(atttypmod, 0)::bigint AS width FROM pg_attribute \
+             WHERE attrelid = to_regclass('{DOCUMENTS_TABLE}') \
+               AND attname = 'embedding_vec' AND NOT attisdropped"
+        ))
+        .get_results::<WidthRow>(conn)
+        .await
+        .map_err(SearchError::backend)?;
+
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|row| usize::try_from(row.width).ok()))
+    }
+
     /// Try to install `pgvector` and add the accelerated column + index.
     ///
     /// Returns `false` (rather than erroring) when the extension is not
@@ -912,15 +978,9 @@ impl PostgresSearchStore {
         // column of a DIFFERENT width, which would leave the store believing
         // it is in `PgVector{new}` while every insert fails with "expected
         // <old> dimensions". Verify what is actually there.
-        let actual = diesel::sql_query(format!(
-            "SELECT COALESCE(atttypmod, 0)::bigint AS width FROM pg_attribute \
-             WHERE attrelid = to_regclass('{DOCUMENTS_TABLE}') \
-               AND attname = 'embedding_vec' AND NOT attisdropped"
-        ))
-        .get_results::<WidthRow>(&mut *conn)
-        .await
-        .map_err(SearchError::backend)?;
-        let existing_width = actual.into_iter().next().map(|row| row.width);
+        let existing_width = Self::vector_column_width_of(conn)
+            .await?
+            .and_then(|w| i64::try_from(w).ok());
         if let Some(width) = existing_width
             && width > 0
             && usize::try_from(width).unwrap_or(0) != dimensions
@@ -939,7 +999,9 @@ impl PostgresSearchStore {
         // Adopt embeddings written while the store was in Array mode —
         // otherwise every pre-existing document silently vanishes from k-NN
         // (the query filters `embedding_vec IS NOT NULL`) until a full
-        // backfill happens to run.
+        // backfill happens to run. Rows written *after* this point stay in step
+        // via `index()`, which keys on the physical column rather than on the
+        // mode.
         diesel::sql_query(format!(
             "UPDATE {DOCUMENTS_TABLE} SET embedding_vec = embedding::text::vector \
              WHERE embedding IS NOT NULL AND embedding_vec IS NULL \

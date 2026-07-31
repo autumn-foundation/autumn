@@ -102,30 +102,113 @@ async fn reindexing_a_row_that_no_longer_exists_removes_it_from_the_index() {
 }
 
 #[tokio::test]
-async fn an_explicit_delete_op_never_re_reads_the_source() {
-    // A delete must not race a re-created row back into the index, and must
-    // work even when the source is unavailable.
+async fn a_delete_op_removes_the_document_when_the_row_is_gone() {
     let (client, source) = client_and_source(&corpus()).await;
     client
         .reindex(&ReindexArgs::upsert("search_articles", 1))
         .await
         .expect("index");
 
+    source.remove(1);
     client
         .reindex(&ReindexArgs::delete("search_articles", 1))
         .await
         .expect("delete");
-    assert_eq!(
-        source.fetch_calls_for(1),
-        1,
-        "the delete op must not re-read the row"
-    );
 
     let page = client
         .search::<Article>("rust", &PageRequest::default())
         .await
         .expect("search");
     assert!(page.content.is_empty());
+}
+
+#[tokio::test]
+async fn a_late_delete_cannot_remove_a_record_that_was_recreated() {
+    // The ordering hazard: id 1 is deleted, then re-created under the SAME
+    // primary key, and the re-create's upsert runs first. A delete that
+    // retries — or simply arrives late — must NOT remove the live record.
+    // Both ops re-read, so the instruction means "converge this id" and the
+    // order stops mattering.
+    let (client, source) = client_and_source(&corpus()).await;
+
+    // The record is deleted, then recreated with new content.
+    source.remove(1);
+    source.upsert(&article(1, "Rust reborn", "a rust web framework"));
+    client
+        .reindex(&ReindexArgs::upsert("search_articles", 1))
+        .await
+        .expect("upsert for the recreated row");
+
+    // The stale delete finally lands.
+    client
+        .reindex(&ReindexArgs::delete("search_articles", 1))
+        .await
+        .expect("late delete");
+
+    let page = client
+        .search::<Article>("rust", &PageRequest::default())
+        .await
+        .expect("search");
+    assert_eq!(
+        page.content.iter().map(|h| h.id).collect::<Vec<_>>(),
+        vec![1],
+        "a live row must survive a stale delete instruction"
+    );
+}
+
+#[tokio::test]
+async fn either_op_reaches_the_same_state_in_either_order() {
+    // The property the `(index, id)` dedup key depends on: instructions are
+    // convergent, so duplication and reordering are both safe.
+    for ops in [
+        [ReindexOp::Upsert, ReindexOp::Delete],
+        [ReindexOp::Delete, ReindexOp::Upsert],
+        [ReindexOp::Delete, ReindexOp::Delete],
+        [ReindexOp::Upsert, ReindexOp::Upsert],
+    ] {
+        let (client, _source) = client_and_source(&corpus()).await;
+        for op in ops {
+            // `ReindexOp` is deliberately exhaustive — it is a wire type, so a
+            // new variant must be a conscious, compile-breaking decision.
+            let args = match op {
+                ReindexOp::Upsert => ReindexArgs::upsert("search_articles", 1),
+                ReindexOp::Delete => ReindexArgs::delete("search_articles", 1),
+            };
+            client.reindex(&args).await.expect("reindex");
+        }
+
+        let page = client
+            .search::<Article>("rust", &PageRequest::default())
+            .await
+            .expect("search");
+        assert_eq!(
+            page.content.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![1],
+            "the row exists, so every ordering of {ops:?} must leave it indexed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delete_still_works_with_no_document_source_installed() {
+    // A delete needs no source: "absent from the index" is reachable without
+    // knowing anything about the row. An upsert cannot say the same.
+    let client = SearchClient::builder()
+        .backend(Arc::new(MemorySearchBackend::new()))
+        .index::<Article>()
+        .build();
+    client.ensure_indexes().await.expect("ensure");
+
+    client
+        .reindex(&ReindexArgs::delete("search_articles", 1))
+        .await
+        .expect("delete needs no source");
+
+    let error = client
+        .reindex(&ReindexArgs::upsert("search_articles", 1))
+        .await
+        .expect_err("an upsert has nothing to read");
+    assert!(matches!(error, SearchError::SourceUnavailable), "{error:?}");
 }
 
 #[tokio::test]

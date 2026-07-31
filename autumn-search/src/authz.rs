@@ -64,10 +64,11 @@ impl SearchVisibility for TenantVisibility {
     }
 }
 
-/// The ambient-tenant restriction for `definition`, applied by the client to
-/// **every** query on top of whatever the registered [`SearchVisibility`]
-/// returns — so tenant isolation does not depend on an app remembering to
-/// implement it.
+/// The ambient-tenant restriction for `definition`.
+///
+/// Applied by the client to **every** query, on top of whatever the registered
+/// [`SearchVisibility`] returns — so tenant isolation does not depend on an app
+/// remembering to implement it.
 ///
 /// Fails **closed**: querying a tenant-scoped index (one whose model carries a
 /// `tenant_id` column) with no tenant in scope is

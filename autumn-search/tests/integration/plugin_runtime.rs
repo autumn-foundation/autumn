@@ -144,7 +144,7 @@ async fn a_delete_instruction_removes_the_record_through_the_same_job() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let (test, _source) = app_with(&corpus(), SearchConfig::default());
+    let (test, source) = app_with(&corpus(), SearchConfig::default());
     let search = installed_client(&test);
 
     autumn_search::enqueue_reindex(&ReindexArgs::upsert("search_articles", 1))
@@ -152,6 +152,11 @@ async fn a_delete_instruction_removes_the_record_through_the_same_job() {
         .expect("enqueue");
     test.perform_enqueued_jobs().await.assert_all_succeeded();
 
+    // A real delete removes the row first; the hook then enqueues the
+    // instruction. Both ops re-read, so the *row's* absence is what removes
+    // the document — which is precisely what stops a stale delete from
+    // evicting a record that has since been recreated.
+    source.remove(1);
     autumn_search::enqueue_reindex(&ReindexArgs::delete("search_articles", 1))
         .await
         .expect("enqueue");

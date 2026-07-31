@@ -30,6 +30,15 @@ pub const BACKFILL_ENV: &str = "AUTUMN_SEARCH_BACKFILL";
 /// Environment variable that makes the one-shot backfill purge first.
 pub const BACKFILL_PURGE_ENV: &str = "AUTUMN_SEARCH_BACKFILL_PURGE";
 
+/// Line the plugin prints to stdout the moment a one-shot backfill begins.
+///
+/// Without it `autumn search reindex` cannot distinguish "the backfill is
+/// running and will take a while" from "this app never installed
+/// `SearchPlugin`, so nothing consumed [`BACKFILL_ENV`] and it is now serving
+/// HTTP forever" — and the CLI would appear to hang until interrupted. The CLI
+/// waits a bounded time for this line and only then waits indefinitely.
+pub const BACKFILL_STARTED_MARKER: &str = "autumn-search: backfill starting";
+
 /// Keyword + vector search for `autumn-web` applications.
 ///
 /// ```rust,ignore
@@ -54,6 +63,9 @@ pub struct SearchPlugin {
     /// Whether `postgres()` was requested. The store itself is built in
     /// `Plugin::build`, after the configuration is final.
     use_postgres: bool,
+    /// A `queue(...)` builder override, applied ON TOP of the file config
+    /// rather than instead of it.
+    queue_override: Option<String>,
     /// Set once the app supplies configuration explicitly, so `build` does not
     /// then overwrite it from `autumn.toml`.
     config_explicit: bool,
@@ -77,6 +89,7 @@ impl SearchPlugin {
             visibility: None,
             indexes: Vec::new(),
             use_postgres: false,
+            queue_override: None,
             config_explicit: false,
         }
     }
@@ -94,11 +107,14 @@ impl SearchPlugin {
 
     /// Route the reindex/backfill jobs to a named queue.
     ///
-    /// Overrides `[search] queue` in `autumn.toml`.
+    /// Overrides **only** `[search] queue`; every other key still comes from
+    /// `autumn.toml`. Suppressing the whole file here would mean an app that
+    /// picks a queue in code silently loses `enabled = false` — i.e. the
+    /// documented incident kill switch would stop working because of an
+    /// unrelated builder call.
     #[must_use]
     pub fn queue(mut self, queue: impl Into<String>) -> Self {
-        self.config.queue = queue.into();
-        self.config_explicit = true;
+        self.queue_override = Some(queue.into());
         self
     }
 
@@ -176,10 +192,18 @@ impl SearchPlugin {
         self.use_postgres
     }
 
-    /// The effective configuration.
+    /// The configuration as it stands, with any builder overrides applied.
+    ///
+    /// Before [`Plugin::build`] this does **not** include `autumn.toml` — the
+    /// file is read at build time so a test or a caller can inspect the
+    /// builder's own intent without touching the filesystem.
     #[must_use]
-    pub const fn search_config(&self) -> &SearchConfig {
-        &self.config
+    pub fn search_config(&self) -> SearchConfig {
+        let mut config = self.config.clone();
+        if let Some(queue) = &self.queue_override {
+            config.queue.clone_from(queue);
+        }
+        config
     }
 
     /// Build the [`SearchClient`] this plugin would install.
@@ -270,16 +294,45 @@ fn parse_purge_flag(raw: Option<&str>) -> bool {
     raw.is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
 }
 
-/// Read `[search]` from `autumn.toml` in the working directory.
+/// Read `[search]` from the application's `autumn.toml`.
 ///
-/// `Ok(None)` means the file is absent — an app with no `autumn.toml` is a
+/// Resolution mirrors core's own config loader (`find_config_file_named` in
+/// `autumn/src/config.rs`): the app's crate directory via
+/// `AUTUMN_MANIFEST_DIR` first, then the process working directory. The two
+/// differ whenever the binary is launched from somewhere other than the crate
+/// root — `autumn search reindex --package app` from a workspace root, for
+/// instance — and reading the wrong file (or none) would silently ignore
+/// `enabled = false` or pick the wrong embedding mode.
+///
+/// `Ok(None)` means no file was found — an app with no `autumn.toml` is a
 /// supported zero-config setup, so that is not an error. A file that exists
 /// but has a malformed `[search]` **is**.
 fn load_config_file() -> Result<Option<SearchConfig>, crate::config::SearchConfigError> {
-    let Ok(contents) = std::fs::read_to_string("autumn.toml") else {
-        return Ok(None);
-    };
-    SearchConfig::from_toml_str(&contents).map(Some)
+    for path in config_file_candidates() {
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => return SearchConfig::from_toml_str(&contents).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // A file that exists but cannot be read is a real problem — a
+            // permissions mistake must not read as "zero-config".
+            Err(error) => {
+                return Err(crate::config::SearchConfigError::Invalid(format!(
+                    "cannot read {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Candidate `autumn.toml` paths, in core's precedence order.
+fn config_file_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Ok(manifest_dir) = std::env::var("AUTUMN_MANIFEST_DIR") {
+        candidates.push(std::path::PathBuf::from(manifest_dir).join("autumn.toml"));
+    }
+    candidates.push(std::path::PathBuf::from("autumn.toml"));
+    candidates
 }
 
 impl Plugin for SearchPlugin {
@@ -308,6 +361,10 @@ impl Plugin for SearchPlugin {
                 // so surface it from the startup hook, which aborts boot.
                 Err(error) => config_error = Some(error.to_string()),
             }
+        }
+        // Builder overrides land on TOP of the file, never instead of it.
+        if let Some(queue) = self.queue_override.take() {
+            self.config.queue = queue;
         }
 
         // Built HERE, not in `postgres()`, so the configuration it snapshots
@@ -380,6 +437,16 @@ async fn run_backfill_and_exit(
     target: &BackfillTarget,
     options: &BackfillOptions,
 ) -> ! {
+    // Announced BEFORE the work starts: this is the CLI's proof that the
+    // plugin exists and consumed the request. Flushed explicitly — stdout is
+    // line-buffered when attached to a terminal but block-buffered through a
+    // pipe, which is exactly how the CLI reads it.
+    println!(
+        "{BACKFILL_STARTED_MARKER} {}",
+        target.name().unwrap_or("all")
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
     let result = match target.name() {
         Some(index) => client.backfill(index, options).await.map(|r| vec![r]),
         None => client.backfill_all(options).await,
@@ -425,6 +492,32 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_override_does_not_suppress_the_rest_of_the_file_config() {
+        // The trap: if `queue(...)` marked the whole config explicit, an app
+        // that picks a queue in code would silently lose `enabled = false`
+        // from `autumn.toml` — the incident kill switch defeated by an
+        // unrelated builder call.
+        let plugin = SearchPlugin::new().queue("indexing");
+        assert!(
+            !plugin.config_explicit,
+            "a queue override must leave the file config in play"
+        );
+
+        // `config(...)` IS a whole-config replacement, and does suppress it.
+        let plugin = SearchPlugin::new().config(SearchConfig::default());
+        assert!(plugin.config_explicit);
+    }
+
+    #[test]
+    fn an_explicit_config_still_honours_a_later_queue_override() {
+        let config = SearchConfig::from_toml_str("[search]\nbatch_size = 7\n").expect("parse");
+        let plugin = SearchPlugin::new().config(config).queue("indexing");
+        let effective = plugin.search_config();
+        assert_eq!(effective.queue, "indexing");
+        assert_eq!(effective.batch_size, 7, "the rest of the config survives");
+    }
+
+    #[test]
     fn an_explicit_backend_turns_off_the_postgres_default() {
         let plugin = SearchPlugin::new()
             .postgres()
@@ -460,6 +553,30 @@ mod tests {
             BackfillTarget::Index("articles".to_owned()).name(),
             Some("articles")
         );
+    }
+
+    #[test]
+    fn config_resolution_prefers_the_manifest_directory_over_the_cwd() {
+        // `autumn search reindex --package app` runs the binary from the
+        // workspace root, where the CWD holds a different `autumn.toml` (or
+        // none). Core resolves through `AUTUMN_MANIFEST_DIR` first; the
+        // plugin-owned section must resolve the same way or it reads a
+        // different file than the rest of the config.
+        let candidates = config_file_candidates();
+        assert_eq!(
+            candidates.last().map(|p| p.to_string_lossy().into_owned()),
+            Some("autumn.toml".to_owned()),
+            "the CWD is always the last resort"
+        );
+        // The manifest-dir candidate is present only when the env var is set,
+        // and when present it must come FIRST.
+        match std::env::var("AUTUMN_MANIFEST_DIR") {
+            Ok(dir) => {
+                assert_eq!(candidates.len(), 2);
+                assert!(candidates[0].starts_with(&dir), "{candidates:?}");
+            }
+            Err(_) => assert_eq!(candidates.len(), 1),
+        }
     }
 
     #[test]
