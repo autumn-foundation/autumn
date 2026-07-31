@@ -173,6 +173,23 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 /// `#[static_get]` routes); an app that adds one should exempt its consent
 /// routes' path prefix, or route visitors through a dynamic page at least
 /// once before relying on the static-served banner's buttons.
+///
+/// # Known limitation: no true streaming for an undecided visitor
+///
+/// Deliberately mirroring `crate::middleware::dev::inject_live_reload`'s
+/// own buffer-then-splice design (see the module docs), this middleware
+/// waits for the *entire* HTML body (up to `MAX_SPLICE_BODY_BYTES`) before
+/// sending any bytes to the client, rather than forwarding chunks as they
+/// arrive. A page that streams progressively (or simply takes a long time to
+/// fully render) therefore loses that streaming behavior for any visitor who
+/// still needs prompting — the visitor sees nothing until the handler
+/// finishes, even though the eventual response comfortably fits the cap.
+/// True incremental splicing would require scanning the stream chunk-by-chunk
+/// for `</body>` without buffering it whole; that is a meaningfully more
+/// complex streaming transform than this scaffold's cookie-consent banner
+/// warrants, so — like the buffer-then-splice dev-mode injector it mirrors —
+/// it is accepted as a tradeoff for a large majority of ordinary pages rather
+/// than solved here.
 pub async fn inject_consent_banner(
     mut request: Request<Body>,
     next: Next,
@@ -238,7 +255,9 @@ fn is_html_response(response: &Response<Body>) -> bool {
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|content_type| content_type.contains("text/html"))
+        // HTTP media-type tokens are case-insensitive (RFC 9110 8.3.1) — a
+        // handler returning `Text/HTML` is exactly as valid as `text/html`.
+        .is_some_and(|content_type| content_type.to_ascii_lowercase().contains("text/html"))
 }
 
 /// Outcome of bounding how much of a body [`collect_body_prefix`] buffers.
@@ -540,6 +559,16 @@ mod tests {
     fn html_response_detected_by_content_type() {
         let response = Response::builder()
             .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::empty())
+            .unwrap();
+        assert!(is_html_response(&response));
+    }
+
+    #[test]
+    fn html_response_detected_regardless_of_media_type_case() {
+        // HTTP media-type tokens are case-insensitive (RFC 9110 8.3.1).
+        let response = Response::builder()
+            .header(CONTENT_TYPE, "Text/HTML; charset=utf-8")
             .body(Body::empty())
             .unwrap();
         assert!(is_html_response(&response));
