@@ -35,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn search reindex [--index NAME] [--purge] [--profile NAME]` rebuilds an
   index by running the application binary — the same technique `autumn jobs manifest` uses,
   because only the app knows which models, backend, and embedder are
-  registered. `--profile` matters there: that binary resolves its own
+  registered. A one-shot reindex against a profile with
+  `enabled = false` exits non-zero rather than reporting a successful rebuild
+  of nothing. `--profile` matters there: that binary resolves its own
   `[search]` section, and the CLI builds a debug binary, which core reads as
   `dev` — so a production rebuild must say so or it rebuilds the development
   index and reports success. Backfill walks the source by keyset (`WHERE <key> > $after`),

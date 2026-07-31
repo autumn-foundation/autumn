@@ -547,6 +547,27 @@ async fn run_backfill_and_exit(
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
+    // A one-shot reindex against a DISABLED subsystem must fail, loudly.
+    //
+    // `backfill` honours the kill switch by returning a successful zero-document
+    // report — right for an in-process call, and exactly wrong here: the
+    // process would print "reindexed 0 documents", exit 0, and the CLI would
+    // say "Reindex complete". An operator would then re-enable search believing
+    // production had been rebuilt. Nothing was written, and no backend was even
+    // initialized, because the startup hook skips setup while disabled.
+    //
+    // Checked here rather than inside `backfill` because the two callers want
+    // opposite things from the same state: a job should no-op, an operator
+    // asking for a rebuild should be told it did not happen.
+    if !client.is_enabled() {
+        eprintln!(
+            "\u{2717} autumn-search: `[search] enabled = false` for this profile — nothing was \
+             rebuilt.\n  Re-enable search (or pick the right profile with `--profile`) and run \
+             the reindex again."
+        );
+        std::process::exit(1);
+    }
+
     let result = match target.name() {
         Some(index) => client.backfill(index, options).await.map(|r| vec![r]),
         None => client.backfill_all(options).await,

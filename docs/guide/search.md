@@ -116,6 +116,15 @@ If the repository already has hooks, compose instead of replacing — call
 `autumn_search::enqueue_reindex_for(&record)` (or `enqueue_unindex_for`) from
 your own `after_*_commit`.
 
+> **Known gap: `restore()` and `purge()`.** `#[repository(soft_delete)]` also
+> generates `restore(id)` and `purge(id)`, and both write to the table directly
+> without running `MutationHooks`. No reindex is enqueued for either, so a
+> restored record stays missing from the index and a purged one can stay
+> searchable, until the next mutation or a backfill. The fix belongs in the
+> repository macro; until then, call `enqueue_reindex_for` / `enqueue_reindex`
+> yourself after either call. Because the handler re-reads the row, sending
+> either instruction converges correctly regardless of which one you send.
+
 ### Why the job payload is `(index, id)` and not the record
 
 A reindex instruction carries the index name and the primary key. The handler

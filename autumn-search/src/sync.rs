@@ -30,6 +30,28 @@
 //!
 //! An app that already has hooks composes instead of replacing: call
 //! [`enqueue_reindex`] from its own `after_*_commit`.
+//!
+//! # `restore()` and `purge()` are NOT covered
+//!
+//! `#[repository(soft_delete)]` also generates `restore(id)` and `purge(id)`.
+//! Both write to the table directly and do **not** run `MutationHooks`, so no
+//! reindex is enqueued for either — a restored record stays missing from the
+//! index (the earlier soft delete removed its document), and a purged record
+//! can stay searchable. Both persist until the next mutation or a backfill.
+//!
+//! That gap is in the repository macro, not here: these hooks cannot fire for
+//! a call that never invokes them. Until it is closed, converge explicitly:
+//!
+//! ```rust,ignore
+//! repo.restore(id).await?;
+//! autumn_search::enqueue_reindex_for(&repo.find(id).await?).await?;
+//!
+//! repo.purge(id).await?;
+//! autumn_search::enqueue_reindex(&ReindexArgs::delete(Article::SEARCH_INDEX, id)).await?;
+//! ```
+//!
+//! Either instruction is safe to send in either case — the handler re-reads
+//! the row and converges on what it finds, so the op is intent, not a command.
 
 use std::marker::PhantomData;
 
