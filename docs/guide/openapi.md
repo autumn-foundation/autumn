@@ -70,8 +70,17 @@ let config = OpenApiConfig::new("My API", "1.0.0")
 Both paths must start with `/`, and they must differ from each other and from
 any `GET` route Autumn already owns. A conflict is a `RouterBuildError`
 (`OpenApiPathCollision` / a duplicate-path error) raised **before** any router
-is mounted, naming both sides — not a mid-boot panic. See
+is mounted, naming both sides — not a mid-boot panic. The check covers your
+`routes![]` handlers, scoped groups, framework `GET`s (probes, actuator, htmx
+assets, dev live-reload), and `AppBuilder::nest` prefixes. See
 [route collision diagnostics](./getting-started.md#route-collision-diagnostics).
+
+> **One exception: `AppBuilder::merge`.** Axum does not expose a raw merged
+> router's route table, so Autumn cannot introspect it. Merging a router that
+> serves `GET /openapi.json`, the Swagger UI path, or one of its asset paths
+> gets you a startup **panic**, not a clean `RouterBuildError` — the pre-mount
+> check logs a `tracing::warn!` saying it was skipped rather than failing. If
+> you use `merge`, pick OpenAPI paths you know its handlers don't claim.
 
 ---
 
@@ -545,6 +554,7 @@ document or from the handler. See [Exposing your API as MCP tools](./mcp.md).
 | `#[api_doc]` had no effect | It is on a `#[static_get]`/`#[ws]` handler, above `#[oauth2_callback]`, or on a function with no route macro at all |
 | The success status is `200` on a `201`-returning handler | Add `#[api_doc(status = 201)]` |
 | Boot fails with an OpenAPI path collision | `openapi_json_path`/`swagger_ui_path` equals another `GET` route or each other |
+| Startup *panics* on a duplicate route instead of erroring cleanly | The colliding handler came from `AppBuilder::merge`, which the pre-mount check cannot inspect ([§1](#1-turn-it-on)) |
 | `/openapi.json` 404s in production | `[openapi] enabled = false` in that profile, or `.openapi(...)` was never called |
 | `autumn build` wrote no `dist/openapi.json` | It printed `No static routes registered` and exited first — the export rides along with static generation ([§11](#11-exporting-the-spec)) |
 | A query struct documents one opaque `object` parameter | Expected shape — `style: form, explode: true` means clients send its fields as individual keys |
