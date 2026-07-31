@@ -336,3 +336,43 @@ async fn the_configured_queue_reaches_the_registered_jobs() {
     assert!(infos.iter().all(|info| info.queue == "indexing"));
     assert_eq!(infos.len(), 2);
 }
+
+// ── The kill switch beats the authorization hook ────────────────────────────
+
+#[tokio::test]
+async fn disabled_search_returns_an_empty_page_even_with_no_visibility_hook() {
+    // Ordering matters: consulting `SearchVisibility` first would turn the
+    // documented empty page into `VisibilityUnavailable`, so the kill switch
+    // would be ineffective on precisely the authorization-aware endpoints an
+    // app is most likely to have.
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let disabled = SearchConfig::from_toml_str("[search]\nenabled = false\n").expect("parse");
+    let (test, _source) = app_with(&corpus(), disabled);
+    let search = installed_client(&test);
+    let ctx = super::support::policy_context(Some("alice")).await;
+
+    let page = search
+        .search_for::<Article>(&ctx, "rust", &PageRequest::default())
+        .await
+        .expect("a disabled search must not demand a visibility hook");
+    assert!(page.content.is_empty());
+    assert_eq!(page.total_elements, 0);
+
+    // The two semantic entry points have the same ordering.
+    assert!(
+        search
+            .similar_for::<Article>(&ctx, "rust", 5)
+            .await
+            .expect("similar_for")
+            .is_empty()
+    );
+    assert!(
+        search
+            .similar_to_for::<Article>(&ctx, 1, 5)
+            .await
+            .expect("similar_to_for")
+            .is_empty()
+    );
+}

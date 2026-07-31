@@ -1219,12 +1219,18 @@ fn fields_projection(definition: &IndexDefinition) -> String {
     if pairs.is_empty() {
         return "'{}'::jsonb::text".to_owned();
     }
-    pairs
+    let merged = pairs
         .chunks(PAIRS_PER_CHUNK)
         .map(|chunk| format!("jsonb_build_object({})", chunk.join(", ")))
         .collect::<Vec<_>>()
-        .join(" || ")
-        + "::text"
+        .join(" || ");
+    // Parenthesized before the cast: `::` binds TIGHTER than `||`, so
+    // `a || b::text` casts only the final chunk and then asks Postgres for
+    // `jsonb || text` — which is not a jsonb merge. The result is either an
+    // operator error or two objects concatenated into invalid JSON that
+    // `load_documents` then fails to deserialize. Only reachable past the
+    // chunk boundary, which is exactly the case the chunking exists to serve.
+    format!("({merged})::text")
 }
 
 /// The `fields` JSON one document is stored with.
@@ -1465,6 +1471,50 @@ mod tests {
         );
         assert_eq!(sql, " AND tenant_id = $2");
         assert_eq!(binds, vec![Bound::Text("acme".to_owned())]);
+    }
+
+    #[test]
+    fn the_fields_projection_casts_the_whole_merge_not_just_the_last_chunk() {
+        // `::` binds tighter than `||`, so an unparenthesized
+        // `a || b::text` would cast only `b` and stop being a jsonb merge.
+        const PAIRS_PER_CHUNK: usize = 40;
+
+        // Under the chunk boundary: one call, still parenthesized.
+        let single = fields_projection(&definition());
+        assert!(single.starts_with("(jsonb_build_object("), "{single}");
+        assert!(single.ends_with(")::text"), "{single}");
+        assert_eq!(single.matches("jsonb_build_object(").count(), 1);
+
+        // Past it: several calls merged with `||`, and the cast must apply to
+        // the whole expression.
+        let fields: Vec<SearchIndexField> = (0..=(PAIRS_PER_CHUNK * 2))
+            .map(|i| SearchIndexField::new(format!("field_{i}").leak(), 'D'))
+            .collect();
+        let mut wide = definition();
+        wide.fields = std::borrow::Cow::Owned(fields);
+        wide.embed_field = None;
+
+        let projection = fields_projection(&wide);
+        assert_eq!(
+            projection.matches("jsonb_build_object(").count(),
+            3,
+            "81 pairs at 40/chunk is 3 calls: {projection}"
+        );
+        assert!(projection.contains(" || "), "{projection}");
+        assert!(projection.starts_with('('), "{projection}");
+        assert!(projection.ends_with(")::text"), "{projection}");
+        // The cast must not sit directly on a chunk.
+        assert!(
+            !projection.contains(")::text ||"),
+            "the cast must wrap the merge, not a chunk: {projection}"
+        );
+    }
+
+    #[test]
+    fn an_empty_field_list_still_yields_valid_json() {
+        let mut empty = definition();
+        empty.fields = std::borrow::Cow::Borrowed(&[]);
+        assert_eq!(fields_projection(&empty), "'{}'::jsonb::text");
     }
 
     #[test]

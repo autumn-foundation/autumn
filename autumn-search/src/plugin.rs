@@ -1,7 +1,7 @@
 //! The [`Plugin`] that mounts the whole subsystem with one builder call.
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use autumn_web::app::AppBuilder;
 use autumn_web::plugin::Plugin;
@@ -66,6 +66,15 @@ pub struct SearchPlugin {
     /// A `queue(...)` builder override, applied ON TOP of the file config
     /// rather than instead of it.
     queue_override: Option<String>,
+    /// The Postgres store, created on first need and shared by `client()` and
+    /// `Plugin::build`.
+    ///
+    /// Memoized rather than built in `postgres()` so the configuration it
+    /// snapshots (`embedding_dimensions`, which gates the pgvector fast path)
+    /// is as late as possible — and rather than built twice, because only the
+    /// instance `build` installs ever receives the connection pool. A second
+    /// one would be permanently pool-less.
+    postgres_store: OnceLock<Arc<PostgresSearchStore>>,
     /// Set once the app supplies configuration explicitly, so `build` does not
     /// then overwrite it from `autumn.toml`.
     config_explicit: bool,
@@ -90,6 +99,7 @@ impl SearchPlugin {
             indexes: Vec::new(),
             use_postgres: false,
             queue_override: None,
+            postgres_store: OnceLock::new(),
             config_explicit: false,
         }
     }
@@ -130,6 +140,7 @@ impl SearchPlugin {
         self.backend = Some(backend);
         if std::mem::take(&mut self.use_postgres) {
             self.source = None;
+            self.postgres_store = OnceLock::new();
         }
         self
     }
@@ -215,10 +226,34 @@ impl SearchPlugin {
         self.client_builder().build()
     }
 
+    /// The Postgres store this plugin will install, created once.
+    ///
+    /// `None` unless [`Self::postgres`] was requested.
+    fn postgres_store(&self) -> Option<&Arc<PostgresSearchStore>> {
+        if !self.use_postgres {
+            return None;
+        }
+        Some(self.postgres_store.get_or_init(|| {
+            Arc::new(PostgresSearchStore::new(
+                self.search_config().embedding_dimensions,
+            ))
+        }))
+    }
+
     fn client_builder(&self) -> SearchClientBuilder {
+        let config = self.search_config();
         let mut builder = SearchClient::builder()
-            .enabled(self.config.enabled)
-            .batch_size(self.config.batch_size);
+            .enabled(config.enabled)
+            .batch_size(config.batch_size);
+        // `postgres()` only records the intent, so resolve the store here —
+        // otherwise `SearchPlugin::new().postgres().client()` would silently
+        // hand back an isolated in-memory index instead of the configured
+        // persistent backend.
+        if let Some(store) = self.postgres_store() {
+            builder = builder
+                .backend(Arc::clone(store) as Arc<dyn SearchBackend>)
+                .source(Arc::clone(store) as Arc<dyn DocumentSource>);
+        }
         if let Some(backend) = &self.backend {
             builder = builder.backend(Arc::clone(backend));
         }
@@ -367,15 +402,12 @@ impl Plugin for SearchPlugin {
             self.config.queue = queue;
         }
 
-        // Built HERE, not in `postgres()`, so the configuration it snapshots
-        // (`embedding_dimensions`, which gates the pgvector fast path) is
-        // final regardless of builder-call order.
-        let postgres = self.use_postgres.then(|| {
-            let store = Arc::new(PostgresSearchStore::new(self.config.embedding_dimensions));
-            self.backend = Some(Arc::clone(&store) as Arc<dyn SearchBackend>);
-            self.source = Some(Arc::clone(&store) as Arc<dyn DocumentSource>);
-            store
-        });
+        // Resolved (and memoized) here rather than in `postgres()`, so the
+        // configuration it snapshots — `embedding_dimensions`, which gates the
+        // pgvector fast path — reflects the file config loaded just above,
+        // regardless of builder-call order. `client()` shares this instance:
+        // only the one installed here receives the pool.
+        let postgres = self.postgres_store().map(Arc::clone);
 
         let jobs = search_job_infos(&self.config.queue);
         let config = self.config.clone();

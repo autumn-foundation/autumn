@@ -47,6 +47,25 @@ fn the_plugin_registers_its_reindex_and_backfill_jobs_on_the_configured_queue() 
     assert!(infos.iter().all(|i| i.queue == "indexing"));
 }
 
+#[test]
+fn the_client_honours_a_postgres_request() {
+    // `postgres()` only records the intent — the store is created at build
+    // time. If `client()` did not resolve it, this would silently hand back an
+    // isolated in-memory index instead of the configured persistent backend.
+    let plugin = SearchPlugin::new().postgres().index::<Article>();
+    assert!(plugin.uses_postgres());
+    assert_eq!(plugin.client().backend().name(), "postgres");
+
+    // And an explicit backend still wins, without leaving the Postgres store
+    // behind as a pool-less document source.
+    let plugin = SearchPlugin::new()
+        .postgres()
+        .backend(Arc::new(MemorySearchBackend::new()))
+        .index::<Article>();
+    assert!(!plugin.uses_postgres());
+    assert_eq!(plugin.client().backend().name(), "memory");
+}
+
 #[tokio::test]
 async fn the_plugin_exposes_a_ready_to_use_client() {
     let plugin = SearchPlugin::new()

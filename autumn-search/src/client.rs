@@ -492,6 +492,13 @@ impl SearchClient {
         query: &str,
         request: &PageRequest,
     ) -> SearchResult<Page<SearchHit>> {
+        // Checked before the hook: with search off there is nothing to
+        // authorize, and a missing or failing `SearchVisibility` must not turn
+        // the documented empty page into an error. Otherwise the kill switch
+        // would be ineffective on exactly the endpoints that use it.
+        if !self.inner.enabled {
+            return Ok(empty_page(request));
+        }
         let filter = self.visibility_filter(ctx, M::SEARCH_INDEX).await?;
         self.search_filtered::<M>(query, request, filter).await
     }
@@ -626,6 +633,9 @@ impl SearchClient {
         text: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchHit>> {
+        if !self.inner.enabled {
+            return Ok(Vec::new());
+        }
         let filter = self.visibility_filter(ctx, M::SEARCH_INDEX).await?;
         self.similar_filtered::<M>(text, limit, filter).await
     }
@@ -672,6 +682,9 @@ impl SearchClient {
         id: i64,
         limit: usize,
     ) -> SearchResult<Vec<SearchHit>> {
+        if !self.inner.enabled {
+            return Ok(Vec::new());
+        }
         let filter = self.visibility_filter(ctx, M::SEARCH_INDEX).await?;
         self.similar_to_filtered::<M>(id, limit, filter).await
     }
