@@ -460,13 +460,20 @@ layer, or serve JSON only (`swagger_ui_path(None)`) and ship the UI elsewhere.
 
 ## 11. Exporting the spec
 
-**At build time.** `autumn build` (which runs the app with
-`AUTUMN_BUILD_STATIC=1`) writes both `dist/openapi.json` and
-`dist/openapi.yaml` next to the pre-rendered pages whenever `.openapi(...)` is
+**At build time — if your app pre-renders.** `autumn build` (which runs the app
+with `AUTUMN_BUILD_STATIC=1`) writes both `dist/openapi.json` and
+`dist/openapi.yaml` next to the pre-rendered pages when `.openapi(...)` is
 configured. That artifact is what you publish, feed to a client generator, or
 diff between releases.
 
-**From a running app**, anything that speaks HTTP works:
+> **The spec export rides along with static generation.** `autumn build` bails
+> out early — `No static routes registered. Nothing to build.` — before it
+> reaches the OpenAPI writer, so an app with no `#[static_get]` routes gets no
+> `dist/openapi.json` no matter how `.openapi(...)` is configured. A pure JSON
+> API (`examples/bookmarks` among them) has to take the spec from the running
+> endpoint instead.
+
+**From a running app** — the path that always works, pre-rendering or not:
 
 ```bash
 curl -fsS http://127.0.0.1:3000/openapi.json > openapi.json
@@ -539,6 +546,7 @@ document or from the handler. See [Exposing your API as MCP tools](./mcp.md).
 | The success status is `200` on a `201`-returning handler | Add `#[api_doc(status = 201)]` |
 | Boot fails with an OpenAPI path collision | `openapi_json_path`/`swagger_ui_path` equals another `GET` route or each other |
 | `/openapi.json` 404s in production | `[openapi] enabled = false` in that profile, or `.openapi(...)` was never called |
+| `autumn build` wrote no `dist/openapi.json` | It printed `No static routes registered` and exited first — the export rides along with static generation ([§11](#11-exporting-the-spec)) |
 | A query struct documents one opaque `object` parameter | Expected shape — `style: form, explode: true` means clients send its fields as individual keys |
 
 ---

@@ -154,7 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   responses, `SessionAuth`/`BearerAuth` derivation from `#[secured]`, version
   deprecation/sunset in the spec, scoped-group paths, the `[openapi]` profile
   gate and tenancy `public_paths` note, `autumn build`'s
-  `dist/openapi.{json,yaml}` export, and spec assertions with `TestApp` —
+  `dist/openapi.{json,yaml}` export (and the static-routes prerequisite that
+  gates it), and spec assertions with `TestApp` —
   cross-linked from the MCP, API-versioning, routes-CLI, and macro-transparency
   guides (#2099). Also corrects stale rustdoc that advertised a `/v3/api-docs`
   default (the served default is `/openapi.json`) and an "OpenAPI 3.0" document
