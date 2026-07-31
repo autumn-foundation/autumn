@@ -662,7 +662,7 @@ pub(crate) fn append_framework_routes(
     ));
 }
 
-/// Append `OpenAPI` documentation routes (`/v3/api-docs`, `/swagger-ui`).
+/// Append `OpenAPI` documentation routes (`/openapi.json`, `/swagger-ui`).
 ///
 /// Only compiled when the `openapi` feature is enabled.
 #[cfg(feature = "openapi")]

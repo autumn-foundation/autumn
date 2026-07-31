@@ -402,7 +402,7 @@ pub struct AppBuilder {
     /// destinations are used. See [`crate::alerts`].
     pub(crate) alert_channels: Vec<Arc<dyn crate::alerts::AlertChannel>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
-    /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
+    /// `/openapi.json` (serving the generated spec) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
     ///
     /// Gated behind the `openapi` feature: apps that don't need a
@@ -736,12 +736,14 @@ impl AppBuilder {
     /// [`ApiDoc`](crate::openapi::ApiDoc) metadata — inferred at compile
     /// time from the route path, HTTP method, extractor types, and any
     /// [`#[api_doc(...)]`](crate::api_doc) overrides — and serves an
-    /// `OpenAPI` 3.0 JSON document at `OpenApiConfig::openapi_json_path`
-    /// (default `/v3/api-docs`). If
+    /// `OpenAPI` 3.1 JSON document at `OpenApiConfig::openapi_json_path`
+    /// (default `/openapi.json`). If
     /// `OpenApiConfig::swagger_ui_path` is set (default `/swagger-ui`),
     /// a Swagger UI HTML page is served there too.
     ///
     /// Routes marked `#[api_doc(hidden)]` are excluded.
+    ///
+    /// Narrative guide: `docs/guide/openapi.md`.
     ///
     /// **Gated behind the `openapi` Cargo feature.** Add
     /// `features = ["openapi"]` to your `autumn-web` dependency to

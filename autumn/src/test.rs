@@ -917,7 +917,7 @@ impl TestApp {
     /// Enable `OpenAPI` spec generation for the test app.
     ///
     /// Mirrors [`crate::app::AppBuilder::openapi`] so integration tests
-    /// can exercise the `/v3/api-docs` and `/swagger-ui` endpoints.
+    /// can exercise the `/openapi.json` and `/swagger-ui` endpoints.
     ///
     /// Gated behind the `openapi` Cargo feature.
     #[cfg(feature = "openapi")]

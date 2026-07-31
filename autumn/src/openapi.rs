@@ -5,11 +5,13 @@
 
 //! OpenAPI (Swagger) specification auto-generation.
 //!
-//! Autumn automatically infers an OpenAPI 3.0 document from your
+//! Autumn automatically infers an OpenAPI 3.1 document from your
 //! annotated routes ([`get`](crate::get), [`post`](crate::post), etc.),
 //! their path parameters, and the extractor / response types in each
-//! handler signature. The generated spec is served at `/v3/api-docs` and
+//! handler signature. The generated spec is served at `/openapi.json` and
 //! a Swagger UI is served at `/swagger-ui` when the feature is enabled.
+//!
+//! Narrative guide: `docs/guide/openapi.md`.
 //!
 //! # Quick start
 //!
@@ -37,7 +39,7 @@
 //! ```
 //!
 //! With `.openapi(...)` enabled, the following endpoints are mounted:
-//! * `GET /v3/api-docs` — serves the generated `openapi.json`.
+//! * `GET /openapi.json` — serves the generated spec document.
 //! * `GET /swagger-ui` — serves a Swagger UI HTML page loading the JSON
 //!   above.
 //!
@@ -277,7 +279,7 @@ pub struct OpenApiConfig {
     pub version: String,
     /// Optional free-form API description (Markdown permitted in UI).
     pub description: Option<String>,
-    /// Path serving the raw `openapi.json`. Defaults to `/v3/api-docs`.
+    /// Path serving the raw `openapi.json`. Defaults to `/openapi.json`.
     pub openapi_json_path: String,
     /// Path serving the Swagger UI HTML. Defaults to `/swagger-ui`. Set
     /// to `None` to disable the UI while still exposing the JSON.
@@ -500,7 +502,7 @@ impl SchemaRegistry {
 }
 
 // ──────────────────────────────────────────────────────────────────
-// Serializable OpenAPI 3.0 document types.
+// Serializable OpenAPI 3.1 document types.
 //
 // Only the fields Autumn actually populates are modelled — unused
 // OpenAPI keys (callbacks, links, discriminators…) are intentionally
@@ -510,10 +512,10 @@ impl SchemaRegistry {
 // ──────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "openapi")]
-/// Represents a root OpenAPI 3.0 specification document.
+/// Represents a root OpenAPI 3.1 specification document.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenApiSpec {
-    /// The OpenAPI version string (e.g., `3.0.3`).
+    /// The OpenAPI version string (e.g., `3.1.0`).
     pub openapi: String,
     /// General information about the API.
     pub info: Info,

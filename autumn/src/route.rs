@@ -154,7 +154,7 @@ pub struct Route {
     /// `OpenAPI` metadata inferred from the handler's signature and any
     /// [`#[api_doc(...)]`](crate::api_doc) overrides. Consumed by
     /// `AppBuilder::openapi` when
-    /// generating `/v3/api-docs`.
+    /// generating `/openapi.json`.
     pub api_doc: ApiDoc,
 
     /// API version of the route (e.g. "v1")

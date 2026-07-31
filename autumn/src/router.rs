@@ -1395,7 +1395,7 @@ fn reject_mcp_path_collisions(
 ///
 /// `axum::Router::merge` panics when the merged routers have method
 /// handlers on the same path (e.g. two `GET` handlers on
-/// `/v3/api-docs`). We surface that as a recoverable
+/// `/openapi.json`). We surface that as a recoverable
 /// [`RouterBuildError::OpenApiPathCollision`] so misconfiguration
 /// produces an actionable error instead of a crash on startup.
 ///

@@ -143,6 +143,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a production checklist — cross-linked from the OAuth, step-up,
   authorization, and testing guides and from the `saas`/`reddit-clone` login
   handlers (#2099). [no-plugin]
+- **docs:** an **OpenAPI generation** guide (`docs/guide/openapi.md`) — the
+  spec pipeline was previously rustdoc-only despite the runnable `bookmarks`
+  example: what the route macros infer from a handler signature (path params,
+  `Query<T>`, `Json<T>`/`Valid<Json<T>>` bodies, `Vec`/`Option`, tuple and
+  `Result` returns), the full `#[api_doc(...)]` key table and its attribute
+  ordering rules, where component schemas come from (`#[model]`,
+  `#[derive(OpenApiSchema)]`, `register_schema`, and the placeholder fallback)
+  plus collision-resolved component keys, the shared `ProblemDetails` error
+  responses, `SessionAuth`/`BearerAuth` derivation from `#[secured]`, version
+  deprecation/sunset in the spec, scoped-group paths, the `[openapi]` profile
+  gate and tenancy `public_paths` note, `autumn build`'s
+  `dist/openapi.{json,yaml}` export (and the static-routes prerequisite that
+  gates it), and spec assertions with `TestApp` —
+  cross-linked from the MCP, API-versioning, routes-CLI, and macro-transparency
+  guides (#2099). Also corrects stale rustdoc that advertised a `/v3/api-docs`
+  default (the served default is `/openapi.json`) and an "OpenAPI 3.0" document
+  (the generator emits 3.1.0). [no-plugin]
 - **sim-testing:** add the `always!` / `sometimes!` simulation assertion macros
   (W6 op-driver assertion core, #1797) — hard-invariant + reachability assertions
   for `#[sim_test]`, with a non-vacuity registry the forthcoming sim-sweep
