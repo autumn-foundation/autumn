@@ -28,9 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reader defends against cookie tossing the same way the session cookie
   reader does, and injecting the banner (which embeds a live per-visitor CSRF
   token) marks the response `Cache-Control: private, no-store` /
-  `Vary: Cookie` so it's never shared across visitors by a cache. Additive;
-  the `--api` JSON-first scaffold is unaffected (no HTML layout to show a
-  banner in).
+  `Vary: Cookie` so it's never shared across visitors by a cache. An oversized
+  HTML response is served intact rather than emptied, conditional-request
+  headers are stripped while a prompt is pending so an `EtagLayer` can't
+  short-circuit to a banner-less cached `304`, the CSRF cookie/form-field
+  names are explicit parameters (`DEFAULT_CSRF_COOKIE_NAME` /
+  `DEFAULT_CSRF_FORM_FIELD`) rather than read off request state, an internal
+  `autumn build` / ISR render is passed through untouched instead of baking
+  the banner into the static file on disk, and the banner uses
+  `position: sticky` so it always reserves its own real, responsive height
+  instead of a fixed CSS estimate. Additive; the `--api` JSON-first scaffold
+  is unaffected (no HTML layout to show a banner in).
 - **search:** a new optional plugin crate, `autumn-search`, turning the in-core
   full-text primitives (#842) into a **search subsystem**: mark a model
   searchable and get an index that stays in sync with the record lifecycle,

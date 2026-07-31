@@ -74,6 +74,19 @@ pub const CONSENT_COOKIE_NAME: &str = "autumn.consent";
 #[cfg(feature = "maud")]
 pub const DEFAULT_CSRF_COOKIE_NAME: &str = "autumn-csrf";
 
+/// Default CSRF form-field name, matching `security::csrf::CsrfConfig`'s own
+/// default.
+///
+/// [`inject_consent_banner`] uses this as the banner forms' hidden CSRF input
+/// name; pass the app's configured name if `security.csrf.form_field` has
+/// been customized. A request-time lookup is not an option here: the
+/// documented layer stack always places user (`AppBuilder::layer`) middleware
+/// like this one outside `CsrfLayer`, so `CsrfLayer`'s `CsrfFormField` request
+/// extension does not exist yet when this middleware's request-side code
+/// runs, and it is config-derived rather than request-derived anyway.
+#[cfg(feature = "maud")]
+pub const DEFAULT_CSRF_FORM_FIELD: &str = "_csrf";
+
 /// Category name that is always allowed by [`Consent::allows`].
 ///
 /// Strictly-necessary cookies (session, CSRF) never actually go through this

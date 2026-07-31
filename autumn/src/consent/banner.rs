@@ -14,10 +14,9 @@ use axum::http::header::{
     CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, IF_MODIFIED_SINCE,
     IF_NONE_MATCH, SET_COOKIE, VARY,
 };
-use axum::http::{HeaderName, HeaderValue, Request, Response};
+use axum::http::{HeaderValue, Request, Response};
 use axum::middleware::Next;
 use futures::StreamExt as _;
-use maud::PreEscaped;
 
 use super::{Consent, find_cookie};
 
@@ -32,17 +31,6 @@ use super::{Consent, find_cookie};
 /// A body over this cap is served **unmodified** (see [`collect_body_prefix`])
 /// rather than dropped — a large page without the banner beats an empty one.
 const MAX_SPLICE_BODY_BYTES: usize = 2 * 1024 * 1024;
-
-/// Bare CSS for [`BANNER_SPACE_RESERVATION_CSS`]'s `<style>` element — reserves
-/// room at the bottom of the viewport so the fixed-position banner never
-/// permanently hides page content (e.g. a `<footer>`) underneath it. Emitted
-/// only alongside the banner itself, so it never affects layout once consent
-/// has been decided. Uses an inline `<style>` tag rather than a JS height
-/// measurement, matching `crate::error_pages::dev_badge`'s own
-/// inline-CSS-only convention; carries the request's CSP nonce (see
-/// [`inject_consent_banner`]) so it isn't dropped under
-/// `security.headers.csp_nonce.enabled = true`.
-const BANNER_SPACE_RESERVATION_CSS: &str = "body{padding-bottom:6.5rem}";
 
 /// Render the consent-banner markup.
 ///
@@ -59,17 +47,10 @@ const BANNER_SPACE_RESERVATION_CSS: &str = "body{padding-bottom:6.5rem}";
 /// it's configured under — see `security.csrf.cookie_name`); pass `None`
 /// only when CSRF protection is disabled entirely. `csrf_field_name` is the
 /// form field the token is submitted under — `"_csrf"` unless the app
-/// customized `security.csrf.form_field`. `nonce` is the request's CSP nonce
-/// (see `security.headers.csp_nonce`) applied to the reservation `<style>`;
-/// pass `None` when CSP nonces are disabled (the default).
+/// customized `security.csrf.form_field`.
 #[must_use]
-pub fn consent_banner_markup(
-    csrf_token: Option<&str>,
-    csrf_field_name: &str,
-    nonce: Option<&str>,
-) -> maud::Markup {
+pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) -> maud::Markup {
     maud::html! {
-        style nonce=[nonce] { (PreEscaped(BANNER_SPACE_RESERVATION_CSS)) }
         section class="autumn-consent-banner" role="region" aria-label="Cookie consent" {
             p class="autumn-consent-banner__message" {
                 "This site uses cookies. Strictly-necessary cookies (login, security) are always on. "
@@ -115,27 +96,39 @@ pub fn consent_banner_markup(
 ///             next,
 ///             CONSENT_POLICY_VERSION,
 ///             autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME,
+///             autumn_web::consent::DEFAULT_CSRF_FORM_FIELD,
 ///         ).await
 ///     }));
 /// ```
 ///
 /// Reads the visitor's consent cookie and the CSRF cookie directly off the
 /// incoming request's `Cookie` header before calling `next`, so it has no
-/// dependency on where `CsrfLayer` sits in the layer stack. Non-HTML and
+/// dependency on where `CsrfLayer` sits in the layer stack. `csrf_form_field`
+/// is likewise taken as an explicit parameter rather than read from a
+/// `CsrfFormField` request extension: the documented layer stack always
+/// places user (`AppBuilder::layer`) middleware like this one outside
+/// `CsrfLayer`, so that extension does not exist yet on the request side —
+/// pass `security.csrf.form_field`'s configured value (or
+/// [`super::DEFAULT_CSRF_FORM_FIELD`] if unconfigured). Non-HTML and
 /// `Content-Encoding`-bearing responses (compressed bodies) pass through
 /// untouched, exactly like the dev-mode live-reload injector.
+///
+/// An internal `autumn build` / ISR background-regeneration render — tagged
+/// with a [`crate::static_gen::RenderDeadlineExempt`] request extension, per
+/// that type's own docs — is passed through untouched without even
+/// evaluating consent state: these renders have no real visitor and no
+/// consent cookie, so injecting here would bake a banner (and a
+/// build-time-only CSRF token) directly into the static HTML file written to
+/// `dist/`. Every future visitor, including ones who have already consented,
+/// would then receive that frozen-in-time banner forever, since it becomes
+/// literal page content rather than something this middleware could
+/// conditionally show or hide again at request time.
 ///
 /// Also, while a visitor needs (re-)prompting: strips `If-None-Match` /
 /// `If-Modified-Since` from the request before calling `next`, so an inner
 /// `EtagLayer` can't short-circuit to a bodyless `304` — which would replay a
 /// browser-cached, banner-less page and silently skip the required prompt
-/// after a policy bump or a withdrawn consent. And reads the CSRF form-field
-/// name (`security.csrf.form_field`, via `CsrfFormField` in request
-/// extensions) and the CSP nonce (`security.headers.csp_nonce`, via
-/// `CspNonce` in request extensions, or parsed back out of the response's
-/// `Content-Security-Policy` header if `CspNonce` wasn't already in request
-/// extensions when this ran) so the injected banner and its style stay valid
-/// under those configurations too.
+/// after a policy bump or a withdrawn consent.
 ///
 /// Whenever it actually injects the banner (and therefore a live, per-visitor
 /// CSRF token) into the body, it also stamps the response
@@ -143,22 +136,36 @@ pub fn consent_banner_markup(
 /// the app marked publicly cacheable (e.g. via `cache_for(..).public()`)
 /// could have one visitor's CSRF token served to every other visitor (and
 /// any CDN/proxy in between) until the cache entry expires.
+///
+/// # Known limitation: `#[static_get]` pages and CSRF
+///
+/// A first-time visitor whose very first hit lands on a pre-rendered
+/// `#[static_get]` page is served that page by the static-first middleware
+/// before the dynamic router (and therefore `CsrfLayer`) ever runs, so no
+/// CSRF cookie exists yet. This middleware then has no token to embed in the
+/// banner's hidden field, and the resulting `/consent/accept` /
+/// `/consent/reject` submission is rejected by `CsrfLayer` with a `403`. This
+/// does not affect the default `autumn new` scaffold (which has no
+/// `#[static_get]` routes); an app that adds one should exempt its consent
+/// routes' path prefix, or route visitors through a dynamic page at least
+/// once before relying on the static-served banner's buttons.
 pub async fn inject_consent_banner(
     mut request: Request<Body>,
     next: Next,
     policy_version: u32,
     csrf_cookie_name: &str,
+    csrf_form_field: &str,
 ) -> Response<Body> {
+    if request
+        .extensions()
+        .get::<crate::static_gen::RenderDeadlineExempt>()
+        .is_some()
+    {
+        return next.run(request).await;
+    }
+
     let consent = Consent::from_headers(request.headers());
     let request_csrf_cookie = find_cookie(request.headers(), csrf_cookie_name);
-    let csrf_field_name = request
-        .extensions()
-        .get::<crate::security::CsrfFormField>()
-        .map_or_else(|| "_csrf".to_owned(), |field| field.0.clone());
-    let request_nonce = request
-        .extensions()
-        .get::<crate::security::CspNonce>()
-        .map(|nonce| nonce.value().to_owned());
 
     let needs_prompt = consent.needs_prompt(policy_version);
     if needs_prompt {
@@ -174,26 +181,8 @@ pub async fn inject_consent_banner(
 
     let csrf_token =
         extract_response_csrf_cookie(&response, csrf_cookie_name).or(request_csrf_cookie);
-    let nonce = request_nonce.or_else(|| extract_response_csp_nonce(&response));
-    let banner_html =
-        consent_banner_markup(csrf_token.as_deref(), &csrf_field_name, nonce.as_deref())
-            .into_string();
+    let banner_html = consent_banner_markup(csrf_token.as_deref(), csrf_form_field).into_string();
     splice_into_response(response, &banner_html).await
-}
-
-/// Recover the per-request CSP nonce from the response's
-/// `Content-Security-Policy` header, for when `CspNonce` wasn't yet in
-/// request extensions (i.e. `SecurityHeadersLayer` sits inner to this
-/// middleware rather than outer). Mirrors the same `'nonce-...'` extraction
-/// the framework's own tests use.
-fn extract_response_csp_nonce(response: &Response<Body>) -> Option<String> {
-    response
-        .headers()
-        .get(HeaderName::from_static("content-security-policy"))
-        .and_then(|value| value.to_str().ok())
-        .and_then(|csp| csp.split("'nonce-").nth(1))
-        .and_then(|rest| rest.split('\'').next())
-        .map(str::to_owned)
 }
 
 /// Find a fresh CSRF cookie value the wrapped handler's response is about to
@@ -348,14 +337,14 @@ mod tests {
 
     #[test]
     fn banner_has_accessible_region_and_label() {
-        let html = consent_banner_markup(None, "_csrf", None).into_string();
+        let html = consent_banner_markup(None, "_csrf").into_string();
         assert!(html.contains(r#"role="region""#));
         assert!(html.contains(r#"aria-label="Cookie consent""#));
     }
 
     #[test]
     fn banner_reject_and_accept_share_the_same_base_button_class() {
-        let html = consent_banner_markup(None, "_csrf", None).into_string();
+        let html = consent_banner_markup(None, "_csrf").into_string();
         // Reject-as-easy-as-accept: both are `type="submit"` sharing the base
         // `autumn-consent-banner__button` class — neither gets a differently
         // weighted/emphasized class the other lacks.
@@ -371,26 +360,26 @@ mod tests {
 
     #[test]
     fn banner_omits_csrf_field_when_no_token_given() {
-        let html = consent_banner_markup(None, "_csrf", None).into_string();
+        let html = consent_banner_markup(None, "_csrf").into_string();
         assert!(!html.contains("_csrf"));
     }
 
     #[test]
     fn banner_includes_csrf_hidden_field_when_token_given() {
-        let html = consent_banner_markup(Some("tok-123"), "_csrf", None).into_string();
+        let html = consent_banner_markup(Some("tok-123"), "_csrf").into_string();
         assert!(html.contains(r#"name="_csrf""#));
         assert!(html.contains(r#"value="tok-123""#));
     }
 
     #[test]
     fn banner_needs_no_script_tag() {
-        let html = consent_banner_markup(Some("tok"), "_csrf", None).into_string();
+        let html = consent_banner_markup(Some("tok"), "_csrf").into_string();
         assert!(!html.contains("<script"), "banner must need no JS: {html}");
     }
 
     #[test]
     fn banner_buttons_are_keyboard_reachable_native_submit_buttons() {
-        let html = consent_banner_markup(None, "_csrf", None).into_string();
+        let html = consent_banner_markup(None, "_csrf").into_string();
         assert!(html.contains(r#"type="submit""#));
         assert!(!html.contains("tabindex=\"-1\""));
     }
@@ -499,7 +488,7 @@ mod tests {
         Router::new()
             .route("/", get(|| async { html_page() }))
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, version, "autumn-csrf").await
+                inject_consent_banner(req, next, version, "autumn-csrf", "_csrf").await
             }))
     }
 
@@ -530,7 +519,7 @@ mod tests {
             Router::new()
                 .route("/", get(handler))
                 .layer(axum::middleware::from_fn(move |req, next| async move {
-                    inject_consent_banner(req, next, POLICY_VERSION, "autumn-csrf").await
+                    inject_consent_banner(req, next, POLICY_VERSION, "autumn-csrf", "_csrf").await
                 }))
                 .layer(SessionLayer::new(
                     MemoryStore::new(),
@@ -675,7 +664,7 @@ mod tests {
                 get(|| async { ([(CONTENT_TYPE, "application/json")], r#"{"status":"ok"}"#) }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf").await
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/api").body(Body::empty()).unwrap())
@@ -702,7 +691,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf").await
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -807,7 +796,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf").await
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -843,7 +832,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "my-csrf").await
+                inject_consent_banner(req, next, 1, "my-csrf", "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -859,49 +848,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn banner_reserves_space_for_fixed_positioning_so_it_cannot_permanently_hide_content() {
-        let html = consent_banner_markup(None, "_csrf", None).into_string();
-        assert!(
-            html.contains("padding-bottom"),
-            "banner must reserve viewport space so a fixed-position banner \
-             doesn't permanently cover page content like a footer: {html}"
-        );
-    }
-
     // ── configured CSRF form-field name ──────────────────────────────
 
     #[test]
     fn banner_uses_default_csrf_field_name() {
-        let html = consent_banner_markup(Some("tok"), "_csrf", None).into_string();
+        let html = consent_banner_markup(Some("tok"), "_csrf").into_string();
         assert!(html.contains(r#"name="_csrf""#));
     }
 
     #[test]
     fn banner_honors_custom_csrf_field_name() {
-        let html = consent_banner_markup(Some("tok"), "authenticity_token", None).into_string();
+        let html = consent_banner_markup(Some("tok"), "authenticity_token").into_string();
         assert!(html.contains(r#"name="authenticity_token""#));
         assert!(!html.contains(r#"name="_csrf""#));
     }
 
     #[tokio::test]
-    async fn banner_honors_configured_csrf_form_field_name_from_request_extensions() {
+    async fn banner_honors_configured_csrf_form_field_name_end_to_end() {
+        // The form-field name is config-derived, not request-derived (see
+        // `inject_consent_banner`'s doc: `CsrfLayer` sits inner to user
+        // layers, so a `CsrfFormField` request extension is never visible
+        // here) -- so it must be threaded in as an explicit parameter, not
+        // read back off the request or response.
         let app = Router::new()
             .route("/", get(|| async { html_page() }))
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf").await
+                inject_consent_banner(req, next, 1, "autumn-csrf", "authenticity_token").await
             }));
 
-        let mut request = Request::builder()
+        let request = Request::builder()
             .uri("/")
             .header("cookie", "autumn-csrf=tok-abc")
             .body(Body::empty())
             .unwrap();
-        request
-            .extensions_mut()
-            .insert(crate::security::CsrfFormField(
-                "authenticity_token".to_owned(),
-            ));
 
         let response = app.oneshot(request).await.unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -913,138 +892,6 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains(r#"name="_csrf""#), "{html}");
-    }
-
-    // ── CSP nonce ─────────────────────────────────────────────────────
-
-    #[test]
-    fn extract_response_csp_nonce_parses_nonce_from_header() {
-        let response = Response::builder()
-            .header(
-                "content-security-policy",
-                "script-src 'self' 'nonce-abc123'; style-src 'self' 'nonce-abc123'",
-            )
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            extract_response_csp_nonce(&response),
-            Some("abc123".to_owned())
-        );
-    }
-
-    #[test]
-    fn extract_response_csp_nonce_none_when_header_absent() {
-        let response = Response::builder().body(Body::empty()).unwrap();
-        assert_eq!(extract_response_csp_nonce(&response), None);
-    }
-
-    #[test]
-    fn banner_style_omits_nonce_attribute_when_none() {
-        let html = consent_banner_markup(None, "_csrf", None).into_string();
-        assert!(!html.contains("nonce="), "{html}");
-    }
-
-    #[test]
-    fn banner_style_carries_nonce_when_given() {
-        let html = consent_banner_markup(None, "_csrf", Some("abc123")).into_string();
-        assert!(html.contains(r#"<style nonce="abc123">"#), "{html}");
-    }
-
-    #[tokio::test]
-    async fn banner_nonce_matches_a_real_security_headers_layer_via_request_extensions() {
-        // My middleware runs INNER to `SecurityHeadersLayer` here (it's applied
-        // last, so it wraps outermost), meaning by the time my middleware
-        // reads request extensions, `SecurityHeadersLayer` has already
-        // inserted `CspNonce` on the way in — the primary (request-extension)
-        // resolution path.
-        use crate::security::{CspNonceConfig, HeadersConfig, SecurityHeadersLayer};
-
-        let headers_config = HeadersConfig {
-            csp_nonce: CspNonceConfig { enabled: true },
-            ..HeadersConfig::default()
-        };
-
-        let app = Router::new()
-            .route("/", get(|| async { html_page() }))
-            .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf").await
-            }))
-            .layer(SecurityHeadersLayer::from_config(&headers_config));
-
-        let response = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        let csp = response
-            .headers()
-            .get("content-security-policy")
-            .and_then(|v| v.to_str().ok())
-            .expect("CSP header must be set")
-            .to_owned();
-        let nonce = csp
-            .split("'nonce-")
-            .nth(1)
-            .and_then(|rest| rest.split('\'').next())
-            .expect("CSP header must advertise a nonce")
-            .to_owned();
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            html.contains(&format!(r#"nonce="{nonce}""#)),
-            "banner's <style> must carry the same nonce as the response's CSP header: {html}"
-        );
-    }
-
-    #[tokio::test]
-    async fn banner_nonce_falls_back_to_response_header_when_layer_runs_after() {
-        // Here `SecurityHeadersLayer` is applied FIRST (innermost), so my
-        // middleware — outermost — sees no `CspNonce` in request extensions
-        // yet when it runs; it must fall back to parsing the nonce back out
-        // of the response's `Content-Security-Policy` header.
-        use crate::security::{CspNonceConfig, HeadersConfig, SecurityHeadersLayer};
-
-        let headers_config = HeadersConfig {
-            csp_nonce: CspNonceConfig { enabled: true },
-            ..HeadersConfig::default()
-        };
-
-        let app = Router::new()
-            .route("/", get(|| async { html_page() }))
-            .layer(SecurityHeadersLayer::from_config(&headers_config))
-            .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf").await
-            }));
-
-        let response = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        let csp = response
-            .headers()
-            .get("content-security-policy")
-            .and_then(|v| v.to_str().ok())
-            .expect("CSP header must be set")
-            .to_owned();
-        let nonce = csp
-            .split("'nonce-")
-            .nth(1)
-            .and_then(|rest| rest.split('\'').next())
-            .expect("CSP header must advertise a nonce")
-            .to_owned();
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            html.contains(&format!(r#"nonce="{nonce}""#)),
-            "banner's <style> must carry the nonce recovered from the CSP header: {html}"
-        );
     }
 
     // ── conditional-request headers stripped while prompting ─────────
@@ -1066,7 +913,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf").await
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
             }));
 
         let response = app
@@ -1107,7 +954,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf").await
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
             }));
 
         let cookie = super::super::accept_all_cookie(&["analytics"], 1);
@@ -1135,6 +982,43 @@ mod tests {
         assert!(
             text.contains("inm=true"),
             "no need to force-bust caching when the banner won't show anyway: {text}"
+        );
+    }
+
+    // ── build/ISR internal renders are exempt ─────────────────────────
+
+    #[tokio::test]
+    async fn skips_injection_entirely_for_a_render_deadline_exempt_request() {
+        // `RenderDeadlineExempt` marks an internal `autumn build` / ISR
+        // background-regeneration render, driven directly via `oneshot` with
+        // no real visitor and no consent cookie. Injecting the banner here
+        // would bake it (plus a build-time-only CSRF token) into the static
+        // HTML file written to `dist/`, and every future visitor -- including
+        // ones who have already consented -- would then receive that frozen
+        // banner forever, since it becomes literal page content this
+        // middleware can no longer conditionally hide. A live inbound request
+        // never carries this marker, so this exemption cannot be reached by
+        // an ordinary visitor.
+        let app = Router::new()
+            .route("/", get(|| async { html_page() }))
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+            }));
+
+        let request = Request::builder()
+            .uri("/")
+            .extension(crate::static_gen::RenderDeadlineExempt)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !html.contains("autumn-consent-banner"),
+            "an internal build/ISR render must never have the banner baked in: {html}"
         );
     }
 }

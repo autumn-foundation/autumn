@@ -676,10 +676,16 @@ until a decision is recorded under the current policy version).
 build the `Set-Cookie` value recording categories + policy version +
 timestamp. `inject_consent_banner` (behind the `maud` feature; mirrors the
 dev-mode live-reload injector) auto-splices the banner into every HTML
-response — no change to the shared `layout()` signature is needed. Bump the
-scaffolded `CONSENT_POLICY_VERSION` constant to invalidate prior consent and
-re-show the banner. Strictly-necessary cookies (session, CSRF) are never
-routed through the gate.
+response — no change to the shared `layout()` signature is needed. Takes the
+CSRF cookie name and form-field name as explicit parameters
+(`DEFAULT_CSRF_COOKIE_NAME` / `DEFAULT_CSRF_FORM_FIELD` when unconfigured)
+rather than reading them off request/response state, since `CsrfLayer` always
+sits inner to user layers. Skips injection entirely for an internal `autumn
+build` / ISR render (`static_gen::RenderDeadlineExempt`) rather than baking
+the banner into the static file written to `dist/`. Bump the scaffolded
+`CONSENT_POLICY_VERSION` constant to invalidate prior consent and re-show the
+banner. Strictly-necessary cookies (session, CSRF) are never routed through
+the gate.
 
 ### Audit actor attribution (unreleased — trunk-dev)
 

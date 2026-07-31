@@ -1272,16 +1272,21 @@
 
 /* ── Cookie-consent banner (issue #1214) ──────────────────────────────────── */
 
-/* Fixed to the bottom of the viewport so it doesn't shift page content, but
-   not a full-screen overlay — a persistent bar, not a blocking modal. Its
-   companion inline `<style>` (emitted alongside this markup, see
-   `consent::banner::BANNER_SPACE_RESERVATION_CSS`) reserves matching
-   `padding-bottom` on `<body>` so it never permanently hides page content
-   (e.g. a `<footer>`) underneath it. `--text-muted` (not `--border`, which is
-   only ~1.2:1 against `--surface`) gives the boundary the ~3:1 contrast
-   WCAG 1.4.11 requires for a UI-component edge; `--shadow` reinforces it. */
+/* `position: sticky` (not `fixed`) deliberately: the banner is spliced right
+   before `</body>`, so as the last element in normal document flow it always
+   reserves exactly its own real, responsive height -- however many lines the
+   message/buttons wrap to on a narrow viewport or at increased text zoom --
+   with no separate CSS reservation hack that could fall out of sync and let
+   a `fixed` banner permanently cover page content (e.g. a `<footer>`)
+   underneath it. It still behaves like a persistent bottom bar (not a
+   full-screen overlay, not a blocking modal) on any page taller than the
+   viewport, which is the common case; on a very short page it simply settles
+   in flow just after the content rather than pinned to the visual bottom of
+   the screen. `--text-muted` (not `--border`, which is only ~1.2:1 against
+   `--surface`) gives the boundary the ~3:1 contrast WCAG 1.4.11 requires for
+   a UI-component edge; `--shadow` reinforces it. */
 .autumn-consent-banner {
-    position: fixed;
+    position: sticky;
     left: 0;
     right: 0;
     bottom: 0;
