@@ -8,6 +8,7 @@ mod canary;
 mod check;
 mod cold_start_driver;
 mod config;
+mod console;
 mod credentials;
 mod data;
 mod db;
@@ -39,6 +40,7 @@ mod routes;
 mod routes_audit;
 mod scaling_driver;
 mod schema;
+mod search;
 mod seed;
 mod serve;
 mod setup;
@@ -165,6 +167,58 @@ pub enum LifecycleSubcommands {
         /// Write the diagram(s) to this file instead of stdout.
         #[arg(long, value_name = "FILE")]
         out: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn search`.
+#[derive(Subcommand)]
+pub enum SearchSubcommands {
+    /// Rebuild search indexes from the system of record.
+    ///
+    /// Runs the application binary with `AUTUMN_SEARCH_BACKFILL` set, which
+    /// makes `autumn-search`'s startup hook run a full backfill and exit
+    /// instead of serving traffic. Only the app knows which models are
+    /// searchable and which backend/embedder are installed, so the reindex has
+    /// to run inside it — the same technique `autumn jobs manifest` uses.
+    ///
+    /// # Examples
+    ///
+    ///   autumn search reindex
+    ///   autumn search reindex --index articles
+    ///   autumn search reindex --purge
+    ///   autumn search reindex --profile prod
+    #[command(verbatim_doc_comment)]
+    Reindex {
+        /// Index to rebuild. Omit to rebuild every registered index.
+        #[arg(long)]
+        index: Option<String>,
+
+        /// Profile whose `[search]` configuration to rebuild against
+        /// (`dev`, `prod`, or a custom name).
+        ///
+        /// The reindex runs the application binary, and that binary resolves
+        /// its own `[search]` section — including `[profile.<name>.search]`.
+        /// The CLI builds a DEBUG binary, which core reads as `dev` when no
+        /// selector is set, so rebuilding a production index requires saying
+        /// so. Forwarded as `AUTUMN_ENV`.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Clear each index before rebuilding it.
+        ///
+        /// Use after a schema change, when documents the source no longer
+        /// produces would otherwise survive. Searches return nothing until the
+        /// rebuild finishes.
+        #[arg(long)]
+        purge: bool,
+
+        /// Package to run (for workspaces).
+        #[arg(long)]
+        package: Option<String>,
+
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long)]
+        bin: Option<String>,
     },
 }
 
@@ -453,6 +507,43 @@ enum Commands {
     ///   autumn data import posts --in posts.csv --upsert-by id
     #[command(subcommand, verbatim_doc_comment, name = "data")]
     Data(DataCommands),
+
+    /// Run a pre-wired data playground against the project's database.
+    ///
+    /// Autumn's answer to `rails console` / `manage.py shell`. Rust has no
+    /// stable `eval`, so instead of a line-by-line REPL this scaffolds an
+    /// editable binary — `src/bin/playground.rs` — already wired with the same
+    /// config and database-URL resolution `autumn dev` and `autumn seed` use
+    /// (`AUTUMN_DATABASE__*` → `DATABASE_URL` → `autumn.toml`), a constructed
+    /// async pool, and a checked-out connection. Put a query in the marked
+    /// region, re-run `autumn console`, and it compiles and executes against
+    /// the live database.
+    ///
+    /// An existing playground is never overwritten; pass `--force` to
+    /// regenerate it from the template.
+    ///
+    /// # Examples
+    ///
+    ///   autumn console
+    ///   autumn console --profile demo
+    ///   autumn console --force
+    #[command(visible_alias = "c", verbatim_doc_comment)]
+    Console {
+        /// Profile forwarded to the playground via `AUTUMN_ENV`
+        /// (default: `dev`).
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Overwrite an existing playground with a fresh copy of the template.
+        #[arg(long)]
+        force: bool,
+        /// Scaffold and wire the playground, then stop without building or
+        /// running it.
+        #[arg(long)]
+        scaffold_only: bool,
+    },
 
     /// Run the project's seed binary to populate the database with representative data.
     ///
@@ -754,6 +845,12 @@ enum Commands {
     Jobs {
         #[command(subcommand)]
         action: JobsSubcommands,
+    },
+
+    /// Operate the application's search indexes (`autumn-search`).
+    Search {
+        #[command(subcommand)]
+        action: SearchSubcommands,
     },
 
     /// Run conformance checks against a plugin's route contributions.
@@ -2154,6 +2251,38 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold the in-app notification feed: a `notifications` table
+    /// migration, notify/feed/unread-count/mark-read routes over the built-in
+    /// `Notifications` extractor, `main.rs` route wiring, and an in-process
+    /// smoke test.
+    ///
+    /// Notifications are a fixed, single-instance resource (the framework's
+    /// `Notifications` extractor reads one conventional `notifications`
+    /// table), so this command takes no name argument.
+    ///
+    /// Creates:
+    ///
+    /// - `migrations/<ts>_create_notifications/` — backend-aware table DDL
+    /// - `src/notifications.rs`  — notify / feed / unread-count / mark-read /
+    ///   mark-all-read route handlers
+    /// - `src/main.rs`           — `mod notifications;` + route registration
+    /// - `tests/notifications_feed.rs` — smoke test over the in-process
+    ///   `TestApp` (no database needed: memory-store fallback)
+    /// - `Cargo.toml`            — `serde`/`serde_json` deps and the tokio
+    ///   dev-dependency test features
+    ///
+    /// Example:
+    ///
+    ///   autumn generate notifications
+    #[command(verbatim_doc_comment)]
+    Notifications {
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate a complete browser authentication flow: signup, login, logout,
     /// account/profile, forgot-password, and reset-password.
     ///
@@ -2902,6 +3031,12 @@ fn run_command(command: Commands) {
             payload,
         }) => webhook::run_sim(&provider, &url, &secret, &payload),
         Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
+        Commands::Console {
+            profile,
+            package,
+            force,
+            scaffold_only,
+        } => console::run(&profile, package.as_deref(), force, scaffold_only),
         Commands::Seed {
             profile,
             package,
@@ -3131,6 +3266,23 @@ fn run_command(command: Commands) {
                     package: package.as_deref(),
                     bin: bin.as_deref(),
                     output: &path,
+                });
+            }
+        },
+        Commands::Search { action } => match action {
+            SearchSubcommands::Reindex {
+                index,
+                profile,
+                purge,
+                package,
+                bin,
+            } => {
+                search::run(&search::ReindexOptions {
+                    package: package.as_deref(),
+                    bin: bin.as_deref(),
+                    index: index.as_deref(),
+                    profile: profile.as_deref(),
+                    purge,
                 });
             }
         },
@@ -3708,6 +3860,10 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 generate::channel::Transport::Sse
             };
             let plan = generate::channel::plan_channel(&resolve_cwd(), &name, transport);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Notifications { dry_run, force } => {
+            let plan = generate::notifications::plan_notifications(&resolve_cwd());
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::InboundMail {
@@ -5207,6 +5363,66 @@ mod tests {
         assert_eq!(profile.as_deref(), Some("prod"));
     }
 
+    // ── autumn console tests (issue #1039) ─────────────────────────────────
+
+    #[test]
+    fn parse_console_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "console"]).unwrap();
+        match cli.command {
+            Commands::Console {
+                profile,
+                package,
+                force,
+                scaffold_only,
+            } => {
+                assert_eq!(profile, "dev");
+                assert!(package.is_none());
+                assert!(!force);
+                assert!(!scaffold_only);
+            }
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_short_alias_c() {
+        let cli = Cli::try_parse_from(["autumn", "c"]).unwrap();
+        assert!(matches!(cli.command, Commands::Console { .. }));
+    }
+
+    #[test]
+    fn parse_console_with_force() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--force"]).unwrap();
+        match cli.command {
+            Commands::Console { force, .. } => assert!(force),
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_with_scaffold_only() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--scaffold-only"]).unwrap();
+        match cli.command {
+            Commands::Console { scaffold_only, .. } => assert!(scaffold_only),
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_with_profile_and_package() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--profile", "demo", "-p", "my-app"])
+            .unwrap();
+        match cli.command {
+            Commands::Console {
+                profile, package, ..
+            } => {
+                assert_eq!(profile, "demo");
+                assert_eq!(package.as_deref(), Some("my-app"));
+            }
+            _ => panic!("expected Console command"),
+        }
+    }
+
     // ── autumn seed tests ──────────────────────────────────────────────────
 
     #[test]
@@ -6650,6 +6866,48 @@ mod tests {
     #[test]
     fn parse_generate_channel_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "channel"]).is_err());
+    }
+
+    // ── autumn generate notifications tests ────────────────────────────────
+
+    #[test]
+    fn parse_generate_notifications_takes_no_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "notifications"]).unwrap();
+        let Commands::Generate(GenerateCommands::Notifications { dry_run, force }) = cli.command
+        else {
+            panic!("expected generate notifications");
+        };
+        assert!(!dry_run);
+        assert!(!force);
+        // A fixed resource: a stray name argument must be rejected.
+        assert!(Cli::try_parse_from(["autumn", "generate", "notifications", "Feed"]).is_err());
+    }
+
+    #[test]
+    fn parse_generate_notifications_with_dry_run_and_force() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "notifications",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Notifications { dry_run, force }) = cli.command
+        else {
+            panic!("expected generate notifications");
+        };
+        assert!(dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_destroy_notifications() {
+        let cli = Cli::try_parse_from(["autumn", "destroy", "notifications"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Destroy(GenerateCommands::Notifications { .. })
+        ));
     }
 
     // ── autumn maintenance tests ───────────────────────────────────────────────

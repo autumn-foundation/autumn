@@ -125,6 +125,14 @@ pub mod hooks;
 pub mod i18n;
 pub mod idempotency;
 pub mod range;
+// NOTE: no outer `///` doc here. rustdoc MERGES an outer doc on a `pub mod`
+// declaration with the module's own `//!` header and resolves the combined
+// text in THIS scope (the crate root), where `IndexDefinition` /
+// `SearchDocument` are not in scope — so adding one turns every intra-doc link
+// in `search.rs`'s header into a `broken_intra_doc_links` error. The module's
+// own header is the documentation.
+#[cfg(feature = "db")]
+pub mod search;
 pub mod seo;
 /// Translation lookup macro with compile-time key validation.
 ///
@@ -357,6 +365,7 @@ pub mod middleware;
 /// Content-negotiated success responder (`Negotiate` / `Negotiated` / `Format`).
 #[cfg(feature = "maud")]
 pub mod negotiate;
+pub mod notifications;
 pub mod openapi;
 pub mod pagination;
 pub mod paths;
@@ -382,6 +391,9 @@ pub use presence::presence_stream;
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
 pub use route::{RepositoryApiMeta, Route, RouteIdempotency, RouteTimeout};
+// Re-exported alongside the other `Route` field types so a hand-built
+// `Route { .. }` needs only the `autumn_web::` prefix.
+pub use seo::SeoRouteDefaults;
 /// First-class Markdown rendering with frontmatter parsing and SSG integration.
 ///
 /// Enable with the Cargo feature `markdown`.

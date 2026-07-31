@@ -55,18 +55,12 @@ pub fn plan_mailer(
     plan_mailer_ex(project_root, name, list_unsubscribe, no_layout, false)
 }
 
-/// Shared implementation of [`plan_mailer`]. `for_revert` suppresses the
-/// generate-only `SQLite` rejection so `autumn destroy mailer` (which recomputes
-/// this same plan before [`Plan::revert`]) can remove generated files on a
-/// `SQLite` app — including files scaffolded before the gate landed. `destroy`
-/// only reverts previously written files; it never applies the Postgres-only
-/// unsubscribe migration, so the rejection is generate-path only.
-///
-/// The `SQLite` rejection is scoped to the `--list-unsubscribe` path
-/// (`list_unsubscribe.is_some()`): only that branch adds the Postgres-only
-/// `mail_unsubscribes` migration. A plain `generate mailer` emits only
-/// Rust/template files and enables the `mail` feature, so it is allowed on a
-/// `SQLite` app.
+/// Shared implementation of [`plan_mailer`]. The `_for_revert` flag is retained
+/// for `destroy`-path symmetry with the other generators, but the mailer
+/// generator no longer branches on it: the `--list-unsubscribe` suppression
+/// migration is now backend-aware (SQLite-dialect DDL under a `SQLite` app,
+/// issue #1927), so there is no generate-only rejection left to suppress on the
+/// revert path.
 ///
 /// # Errors
 /// Project layout and name validation errors surface here.
@@ -80,25 +74,9 @@ pub fn plan_mailer_ex(
     name: &str,
     list_unsubscribe: Option<&str>,
     no_layout: bool,
-    for_revert: bool,
+    _for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
-    // SQLite foundation (issue #1614 AC #4): the ONLY Postgres-only output of this
-    // generator is the `--list-unsubscribe` suppression migration
-    // (`mail_unsubscribes`, emitting `BIGSERIAL`/`NOW()`), which is added only
-    // under the `if list_unsubscribe.is_some()` branch below. A plain
-    // `generate mailer` (no `--list-unsubscribe`) emits only Rust/template files
-    // and enables the `mail` feature — nothing SQLite-incompatible — so it must
-    // succeed on a SQLite app. Reject ONLY the unsubscribe-migration path
-    // (follow-up: issue #1927). Generate-time guard only — skip it on the
-    // destroy/revert path so cleanup can still remove generated files (see
-    // `for_revert` above).
-    if !for_revert
-        && list_unsubscribe.is_some()
-        && super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite
-    {
-        return Err(sqlite_unsubscribe_migration_unsupported_error());
-    }
     validate_resource_name(name)?;
     if let Some(scope) = list_unsubscribe {
         validate_list_unsubscribe_scope(scope)?;
@@ -230,30 +208,16 @@ pub fn plan_mailer_ex(
 
     // ── migrations/<ts>_create_mail_unsubscribes (opt-in, idempotent) ──────
     if list_unsubscribe.is_some() {
-        plan_unsubscribe_migration(project_root, &mut plan);
+        // The suppression migration is backend-aware (issue #1927): a SQLite app
+        // gets SQLite-dialect DDL (`INTEGER PRIMARY KEY AUTOINCREMENT`,
+        // `DEFAULT CURRENT_TIMESTAMP`) instead of the Postgres-only
+        // `BIGSERIAL`/`NOW()` form, so the generated migration applies on either
+        // backend.
+        let backend = super::detect_backend(project_root);
+        plan_unsubscribe_migration(project_root, &mut plan, backend);
     }
 
     Ok(plan)
-}
-
-/// Error for `generate mailer --list-unsubscribe` on a `SQLite` app.
-///
-/// Only the `--list-unsubscribe` path adds the `mail_unsubscribes` suppression
-/// migration, which emits Postgres-only DDL (`BIGSERIAL PRIMARY KEY`,
-/// `DEFAULT NOW()`) that `SQLite` rejects. A plain `generate mailer` is unaffected,
-/// so the message points the user at dropping the flag rather than implying
-/// mailers are wholesale unsupported (follow-up: issue #1927).
-fn sqlite_unsubscribe_migration_unsupported_error() -> GenerateError {
-    GenerateError::Config(
-        "`generate mailer --list-unsubscribe` is not yet supported on SQLite apps: the \
-         unsubscribe-tracking `mail_unsubscribes` migration emits Postgres-only DDL \
-         (`BIGSERIAL PRIMARY KEY`, `DEFAULT NOW()`), which SQLite rejects, so the generated \
-         migration would fail to apply. A plain `generate mailer` (without `--list-unsubscribe`) \
-         works on a SQLite app today. A SQLite-compatible unsubscribe migration is tracked in \
-         https://github.com/autumn-foundation/autumn/issues/1927 — omit `--list-unsubscribe`, or target a \
-         Postgres database, to use unsubscribe tracking for now."
-            .to_owned(),
-    )
 }
 
 /// Validate a `--list-unsubscribe` scope. Restricted to a safe identifier-like
@@ -291,13 +255,35 @@ fn validate_list_unsubscribe_scope(scope: &str) -> Result<(), GenerateError> {
 /// still a silent no-op there) and a fresh timestamp only when none exists
 /// yet. Either way the action is present for `autumn destroy`'s
 /// suffix-based migration matching (`resolve_migration_removal`) to find.
-fn plan_unsubscribe_migration(project_root: &Path, plan: &mut Plan) {
+fn plan_unsubscribe_migration(
+    project_root: &Path,
+    plan: &mut Plan,
+    backend: autumn_web::config::DatabaseBackend,
+) {
     let migrations_dir = project_root.join("migrations");
     let dir = existing_mail_unsubscribes_dir(&migrations_dir).unwrap_or_else(|| {
         migrations_dir.join(format!("{}_create_mail_unsubscribes", timestamp_now()))
     });
-    plan.create_if_absent(dir.join("up.sql"), UNSUBSCRIBE_MIGRATION_UP.to_owned());
+    plan.create_if_absent(
+        dir.join("up.sql"),
+        unsubscribe_migration_up(backend).to_owned(),
+    );
     plan.create_if_absent(dir.join("down.sql"), UNSUBSCRIBE_MIGRATION_DOWN.to_owned());
+}
+
+/// The `mail_unsubscribes` `up.sql` for the target `backend` (issue #1927).
+///
+/// Postgres keeps the historical DDL byte-for-byte (`BIGSERIAL PRIMARY KEY`,
+/// `TIMESTAMPTZ NOT NULL DEFAULT NOW()`). `SQLite` — which has neither
+/// `BIGSERIAL` nor `NOW()` nor a dedicated timestamp type — gets the portable
+/// form (`INTEGER PRIMARY KEY AUTOINCREMENT`, ISO-8601 `TEXT ... DEFAULT
+/// CURRENT_TIMESTAMP`), matching the `SQLite` dialect the backend-aware
+/// model/migration generators emit.
+const fn unsubscribe_migration_up(backend: autumn_web::config::DatabaseBackend) -> &'static str {
+    match backend {
+        autumn_web::config::DatabaseBackend::Postgres => UNSUBSCRIBE_MIGRATION_UP,
+        autumn_web::config::DatabaseBackend::Sqlite => UNSUBSCRIBE_MIGRATION_UP_SQLITE,
+    }
 }
 
 /// The real on-disk `*_create_mail_unsubscribes` migration directory, if one
@@ -321,6 +307,24 @@ CREATE TABLE mail_unsubscribes (
     subscriber TEXT NOT NULL,
     list_id TEXT NOT NULL,
     unsubscribed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (subscriber, list_id)
+);
+";
+
+/// SQLite-dialect companion to [`UNSUBSCRIBE_MIGRATION_UP`] (issue #1927):
+/// `INTEGER PRIMARY KEY AUTOINCREMENT` for the id and an ISO-8601 `TEXT` column
+/// defaulted to `CURRENT_TIMESTAMP` (`SQLite` has no `BIGSERIAL`, `TIMESTAMPTZ`,
+/// or `NOW()`). The `UNIQUE` constraint and column names are portable and
+/// unchanged.
+const UNSUBSCRIBE_MIGRATION_UP_SQLITE: &str = "\
+-- Suppression list for RFC 8058 List-Unsubscribe.
+-- Keyed by (subscriber, list_id, unsubscribed_at); send-time checks skip any
+-- recipient with a matching (subscriber, list_id) row.
+CREATE TABLE mail_unsubscribes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscriber TEXT NOT NULL,
+    list_id TEXT NOT NULL,
+    unsubscribed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (subscriber, list_id)
 );
 ";
@@ -608,33 +612,80 @@ async fn main() {
 "#
     }
 
-    /// `SQLite` foundation (issue #1614 AC #4, findings F12/F22): only the
-    /// `--list-unsubscribe` path scaffolds the Postgres-only `mail_unsubscribes`
-    /// migration, so ONLY that path is rejected at generate time on a `SQLite`
-    /// app, citing the backend-aware follow-up (issue #1927) — before any files
-    /// are written. The reject message must name `--list-unsubscribe`
-    /// specifically, not mailers wholesale.
+    /// Backend-aware DDL (issue #1927): `generate mailer --list-unsubscribe` on a
+    /// `SQLite` app now scaffolds the `mail_unsubscribes` suppression migration in
+    /// `SQLite` dialect (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT
+    /// CURRENT_TIMESTAMP`) instead of being rejected — and no Postgres-only
+    /// `BIGSERIAL` / `TIMESTAMPTZ` / `NOW()` leaks into the `SQLite` migration.
     #[test]
-    fn plan_mailer_with_list_unsubscribe_rejected_on_sqlite_app_citing_1927() {
+    fn plan_mailer_with_list_unsubscribe_emits_sqlite_ddl() {
         let tmp = project_with_main(default_main());
         fs::write(
             tmp.path().join("autumn.toml"),
             "[database]\nprimary_url = \"sqlite://app.db\"\n",
         )
         .unwrap();
-        let err = plan_mailer(tmp.path(), "Welcome", Some("newsletter"), false).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("SQLite"), "message must name SQLite: {msg}");
+        let plan = plan_mailer(tmp.path(), "Welcome", Some("newsletter"), false)
+            .expect("a --list-unsubscribe mailer must scaffold on a SQLite app");
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/mailers/welcome.rs").exists());
+
+        let migration_dir = fs::read_dir(tmp.path().join("migrations"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with("_create_mail_unsubscribes"))
+            })
+            .expect("a mail_unsubscribes migration must be generated on SQLite");
+        let up = fs::read_to_string(migration_dir.path().join("up.sql")).unwrap();
         assert!(
-            msg.contains("--list-unsubscribe"),
-            "message must name the --list-unsubscribe path specifically: {msg}"
+            up.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+            "SQLite up.sql must use INTEGER PRIMARY KEY AUTOINCREMENT: {up}"
         );
         assert!(
-            msg.contains("issues/1927"),
-            "message must cite issue #1927: {msg}"
+            up.contains("unsubscribed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            "SQLite up.sql must default the timestamp to CURRENT_TIMESTAMP: {up}"
         );
-        // No files written on rejection.
-        assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+        for leak in ["BIGSERIAL", "TIMESTAMPTZ", "NOW()"] {
+            assert!(
+                !up.contains(leak),
+                "SQLite up.sql leaked Postgres-only `{leak}`: {up}"
+            );
+        }
+    }
+
+    /// Regression guard: on a Postgres app (the default) the suppression
+    /// migration stays byte-for-byte the historical Postgres DDL.
+    #[test]
+    fn plan_mailer_with_list_unsubscribe_emits_postgres_ddl_by_default() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", Some("newsletter"), false).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let migration_dir = fs::read_dir(tmp.path().join("migrations"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with("_create_mail_unsubscribes"))
+            })
+            .expect("a mail_unsubscribes migration must be generated on Postgres");
+        let up = fs::read_to_string(migration_dir.path().join("up.sql")).unwrap();
+        assert!(
+            up.contains("id BIGSERIAL PRIMARY KEY"),
+            "Postgres up.sql must keep BIGSERIAL PRIMARY KEY: {up}"
+        );
+        assert!(
+            up.contains("unsubscribed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
+            "Postgres up.sql must keep TIMESTAMPTZ DEFAULT NOW(): {up}"
+        );
     }
 
     /// Finding F22: a plain `generate mailer` (no `--list-unsubscribe`) emits only
@@ -681,11 +732,10 @@ async fn main() {
         assert!(plan_mailer(tmp.path(), "Welcome", None, false).is_ok());
     }
 
-    /// The `SQLite` rejection is generate-only (findings F17/F22): `autumn destroy
-    /// mailer` recomputes this same plan with `for_revert` before
-    /// [`Plan::revert`], so even a `--list-unsubscribe` mailer (whose generate
-    /// path IS rejected on `SQLite`) must NOT be rejected when reverting — otherwise
-    /// files generated before the gate landed could never be cleaned up.
+    /// `autumn destroy mailer` recomputes this same plan with `for_revert` before
+    /// [`Plan::revert`], so it must build a revert plan on a `SQLite` app even for
+    /// the `--list-unsubscribe` variant (issue #1927 made its generate path
+    /// SQLite-valid too, so this is now symmetric with the generate path).
     #[test]
     fn plan_mailer_ex_for_revert_not_rejected_on_sqlite_app() {
         let tmp = project_with_main(default_main());

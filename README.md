@@ -27,7 +27,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **Transactional email** - optional `mail` feature with Maud templates, log/file/SMTP transports, and a `Mailer` extractor
 - **Security primitives** - session cookies, auth extractor, security headers, CSRF, and `#[secured]`
 - **File storage (optional)** - pluggable `BlobStore` trait with built-in `Local` and S3-compatible backends, HMAC-signed URLs, and `MultipartField::save_to_blob_store` (see [storage guide](docs/guide/storage.md))
-- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, `autumn migrate`, and `autumn task`
+- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, `autumn migrate`, `autumn console`, and `autumn task`
 
 ## Quickstart
 
@@ -53,6 +53,14 @@ autumn dev
 
 # Or run without watch mode
 # cargo run
+```
+
+Need to poke at your data? `autumn console` scaffolds and runs a pre-wired
+playground binary — same config, same database URL resolution, same pool as the
+app (see the [data playground guide](docs/guide/console.md)):
+
+```bash
+autumn console
 ```
 
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
@@ -218,20 +226,24 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
 | [`examples/reddit-clone`](examples/reddit-clone) | Canonical feature showcase: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable config |
 | [`examples/saas`](examples/saas) | Multi-tenant SaaS starter: session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype (see the [starters guide](docs/guide/starters.md)) |
+| [`examples/media-room`](examples/media-room) | Live-media plugin: installs `autumn-media-plugin` with the rooms primitive and creates/lists mesh-call rooms through the mounted `RoomService` (see the [media guide](docs/guide/media.md)) |
 
 ## Documentation
 
 - [Getting Started Guide](docs/guide/getting-started.md)
+- [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
 - [Dev-Loop Latency Budget](docs/guide/dev-loop-latency.md) — p50/p95/max budgets per change class, measurement methodology, and CI gates for `autumn dev`
 - [Signed Webhook Intake](docs/guide/signed-webhooks.md)
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
 - [Release Checklist](docs/release-checklist.md)
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
+- [Data Playground](docs/guide/console.md) — `autumn console`, the pre-wired edit-and-run answer to `rails console`
 - [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
 - [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
 - [Horizontal Sharding](docs/guide/sharding.md) — `[[database.shards]]`, slot-based routing, `ShardedDb`/`Shards` extractors, per-shard health and migrations
 - [Per-Tenant Memory Cells](docs/guide/tenant-cells.md) — `TenantCell` byte accounting with the `tenancy.quota_bytes` soft quota and deterministic per-tenant eviction
 - [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
+- [OpenAPI Spec Generation](docs/guide/openapi.md) — the spec Autumn derives from your handlers, `#[api_doc(...)]`, `#[derive(OpenApiSchema)]`, Swagger UI, and the production profile gate
 - [Exposing Your API as MCP Tools](docs/guide/mcp.md) — project typed endpoints into a Model Context Protocol server with `#[api_doc(mcp)]` + `mount_mcp`
 - [Mail Guide](docs/guide/mail.md)
 - [Widget Stories](docs/guide/stories.md) — the `/_stories` widget gallery and the `story!` macro

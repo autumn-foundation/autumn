@@ -8,7 +8,6 @@
 
 use autumn_admin_plugin::tokens::TokenAdminModel;
 use autumn_admin_plugin::{AdminModel, ListParams, SortDirection};
-use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -30,7 +29,7 @@ const CREATE_TABLE_SQL: &str = "
 ";
 
 async fn setup_pool() -> (
-    Pool<AsyncPgConnection>,
+    Pool<::autumn_web::RuntimeConnection>,
     testcontainers::ContainerAsync<Postgres>,
 ) {
     let container = Postgres::default()
@@ -41,7 +40,7 @@ async fn setup_pool() -> (
     let port = container.get_host_port_ipv4(5432).await.expect("port");
 
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let manager = AsyncDieselConnectionManager::<::autumn_web::RuntimeConnection>::new(&url);
     let pool = Pool::builder(manager).max_size(5).build().expect("pool");
 
     let mut conn = pool.get().await.expect("conn");

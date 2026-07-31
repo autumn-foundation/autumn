@@ -57,7 +57,10 @@ fn seed_binary_exists_at(path: &Path) -> bool {
 ///
 /// Returns the directory containing the package's `Cargo.toml`, or `None` if
 /// the package cannot be found or `cargo metadata` fails.
-fn find_package_dir(package: &str) -> Option<PathBuf> {
+///
+/// Shared with `autumn console` (see `crate::console`) so both `--package`
+/// flags resolve a workspace member the same way.
+pub fn find_package_dir(package: &str) -> Option<PathBuf> {
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .output()

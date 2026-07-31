@@ -93,7 +93,7 @@ pub enum TlsError {
         /// Key path.
         key: PathBuf,
         /// Underlying rustls error.
-        source: rustls::Error,
+        source: Box<rustls::Error>,
     },
     /// The leaf certificate DER could not be parsed for expiry inspection.
     #[error("failed to parse the leaf certificate in `{path}` for expiry inspection: {detail}")]
@@ -362,7 +362,7 @@ pub fn load_certified_key(
         TlsError::InvalidKeyPair {
             cert: cert_path.to_path_buf(),
             key: key_path.to_path_buf(),
-            source,
+            source: Box::new(source),
         }
     })?;
 
@@ -729,7 +729,7 @@ pub fn inspect_leaf(
     CertifiedKey::from_der(chain, key, &provider).map_err(|source| TlsError::InvalidKeyPair {
         cert: cert_path.to_path_buf(),
         key: key_path.to_path_buf(),
-        source,
+        source: Box::new(source),
     })?;
 
     Ok(LeafInspection {

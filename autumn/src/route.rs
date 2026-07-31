@@ -14,6 +14,7 @@ use axum::routing::MethodRouter;
 use http::Method;
 
 use crate::openapi::ApiDoc;
+use crate::seo::SeoRouteDefaults;
 use crate::state::AppState;
 
 /// Metadata attached to routes emitted by the `#[repository(api = ...)]` macro.
@@ -153,7 +154,7 @@ pub struct Route {
     /// `OpenAPI` metadata inferred from the handler's signature and any
     /// [`#[api_doc(...)]`](crate::api_doc) overrides. Consumed by
     /// `AppBuilder::openapi` when
-    /// generating `/v3/api-docs`.
+    /// generating `/openapi.json`.
     pub api_doc: ApiDoc,
 
     /// API version of the route (e.g. "v1")
@@ -172,6 +173,16 @@ pub struct Route {
 
     /// Per-route override for the global inbound request timeout.
     pub timeout: RouteTimeout,
+
+    /// SEO meta tag defaults declared via the route attribute's `seo(...)`
+    /// argument (e.g. `#[get("/about", seo(title = "About"))]`).
+    ///
+    /// [`SeoRouteDefaults::EMPTY`] when the attribute omits `seo(...)`, which
+    /// is also the [`Default`]. Non-empty defaults are attached to matching
+    /// requests as an extension so the
+    /// [`SeoMeta`](crate::seo::SeoMeta) extractor can hand handlers a
+    /// pre-populated builder.
+    pub seo: SeoRouteDefaults,
 }
 
 impl Route {

@@ -57,6 +57,8 @@ The server starts at <http://localhost:3000>.
 |--------|--------------|------------------------------|
 | GET    | `/`          | Redirect to `/bookmarks`     |
 | GET    | `/bookmarks` | List all bookmarks           |
+| GET    | `/bookmarks/export.csv` | Download all bookmarks as CSV (typed `Download`, Range/206) |
+| GET    | `/bookmarks/stats` | Grouped-aggregate roll-ups: top tags + added-per-day series |
 | GET    | `/bookmarks/{id}` | Show one bookmark        |
 | GET    | `/bookmarks/tag/{tag}` | Filter bookmarks by tag |
 | GET    | `/bookmarks/new` | Add bookmark form        |

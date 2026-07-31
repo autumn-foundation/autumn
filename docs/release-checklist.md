@@ -20,6 +20,7 @@ SemVer contract.
 | `autumn-admin-plugin` | `autumn-admin-plugin/` | 4 | Depends on `autumn-web`. |
 | `autumn-storage-s3` | `autumn-storage-s3/` | 4 | Depends on `autumn-web`. |
 | `autumn-cache-redis` | `autumn-cache-redis/` | 4 | Depends on `autumn-web`. |
+| `autumn-search` | `autumn-search/` | 4 | Depends on `autumn-web`. |
 
 All crates share a single workspace version (`[workspace.package].version` in
 `Cargo.toml`). They are always released together at the same version.
@@ -242,6 +243,7 @@ Before pushing the release tag:
    cargo publish -p autumn-admin-plugin
    cargo publish -p autumn-storage-s3
    cargo publish -p autumn-cache-redis
+   cargo publish -p autumn-search
    ```
 7. **Gate the published quickstart** (see
    [Published Quickstart Gate](#7--published-quickstart-gate-quickstart-gate-workflow-post-publish)):

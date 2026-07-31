@@ -1,20 +1,34 @@
 //! Static about page — demonstrates `#[static_get]` for pre-rendered content.
 
 use autumn_web::i18n::Locale;
+use autumn_web::seo::SeoMeta;
 use autumn_web::{Markup, html, static_get};
 
-use super::posts::layout;
+use super::posts::layout_with_seo;
 
 /// A static about page rendered at build time.
 ///
 /// Uses `#[static_get]` instead of `#[get]`, marking it for pre-rendering
 /// by `autumn build`. At runtime, the pre-rendered HTML is served from disk
 /// without touching the application.
-#[static_get("/about")]
-pub async fn about(locale: Locale) -> Markup {
-    layout(
+///
+/// The page's meta tags are declared entirely on the attribute via `seo(...)`
+/// and arrive in the handler through the [`SeoMeta`] extractor, so a fully
+/// static page needs no hand-built builder at all. `#[static_get]` honours the
+/// argument like any other route macro, so the pre-rendered HTML carries the
+/// tags.
+#[static_get(
+    "/about",
+    seo(
+        title = "About \u{2022} Autumn Blog",
+        description = "Why this blog exists and what the Autumn web framework is for.",
+        og_type = "website"
+    )
+)]
+pub async fn about(locale: Locale, seo: SeoMeta) -> Markup {
+    layout_with_seo(
         &locale,
-        "About \u{2022} Autumn Blog",
+        seo,
         html! {
             article {
                 a href="/"

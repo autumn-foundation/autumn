@@ -51,6 +51,8 @@ REQUEST_PATH_MODULES=(
   autumn/src/middleware/maintenance.rs
   autumn/src/middleware/error_page_filter.rs
   autumn/src/middleware/load_shed.rs
+  autumn/src/search.rs
+  autumn-search/src/lib.rs
 )
 
 # Canonical panic-class lints every gated module must deny on the production

@@ -50,10 +50,19 @@ use serde::{Deserialize, Serialize};
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Postgres backend: `Blob` sits on a `JSONB` column.
 #[cfg_attr(
-    feature = "db",
+    all(feature = "db", not(feature = "sqlite")),
     derive(diesel::AsExpression, diesel::FromSqlRow),
     diesel(sql_type = diesel::sql_types::Jsonb)
+)]
+// SQLite backend (issue #1924): SQLite has no `JSONB` type, so `Blob` sits on a
+// `TEXT` column storing the same metadata JSON. `Blob` is a local type, so these
+// conversions are orphan-rule-legal (unlike `uuid::Uuid` / `rust_decimal::Decimal`).
+#[cfg_attr(
+    feature = "sqlite",
+    derive(diesel::AsExpression, diesel::FromSqlRow),
+    diesel(sql_type = diesel::sql_types::Text)
 )]
 pub struct Blob {
     /// Identifier of the [`BlobStore`](super::BlobStore) this blob lives in.
@@ -127,13 +136,13 @@ pub struct BlobMeta {
     pub etag: Option<String>,
 }
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod diesel_impls {
     //! `Blob` ↔ Postgres `JSONB` conversion.
     //!
-    //! The `db` feature always pulls in Postgres support, so these impls
-    //! target `Pg` directly. The wire format is the standard Postgres
-    //! `jsonb` framing: a single 0x01 version byte followed by the
+    //! The default (Postgres) `db` build stores `Blob` in a `JSONB` column, so
+    //! these impls target `Pg` directly. The wire format is the standard
+    //! Postgres `jsonb` framing: a single 0x01 version byte followed by the
     //! UTF-8 JSON body.
     use std::io::Write as _;
 
@@ -158,6 +167,44 @@ mod diesel_impls {
         fn from_sql(bytes: <Pg as Backend>::RawValue<'_>) -> deserialize::Result<Self> {
             let value = <serde_json::Value as FromSql<Jsonb, Pg>>::from_sql(bytes)?;
             serde_json::from_value(value).map_err(Into::into)
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+mod diesel_impls_sqlite {
+    //! `Blob` ↔ SQLite `TEXT` conversion (issue #1924).
+    //!
+    //! SQLite has no `JSONB` storage class, so under the `sqlite` runtime
+    //! backend `Blob` sits on a `TEXT` column and stores the same metadata as
+    //! a UTF-8 JSON string. Because `Blob` is a local type, these `FromSql` /
+    //! `ToSql<Text, Sqlite>` impls are orphan-rule-legal (the reason
+    //! `uuid::Uuid` / `rust_decimal::Decimal` need a wrapper and stay rejected
+    //! at generate time). The JSON body is `serde_json`-serialized/deserialized,
+    //! so a `Blob` round-trips losslessly on SQLite exactly as it does on the
+    //! Postgres `JSONB` path.
+    use diesel::deserialize::{self, FromSql};
+    use diesel::serialize::{self, IsNull, Output, ToSql};
+    use diesel::sql_types::Text;
+    use diesel::sqlite::Sqlite;
+
+    use super::Blob;
+
+    impl ToSql<Text, Sqlite> for Blob {
+        fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Sqlite>) -> serialize::Result {
+            let json = serde_json::to_string(self)
+                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+            out.set_value(json);
+            Ok(IsNull::No)
+        }
+    }
+
+    impl FromSql<Text, Sqlite> for Blob {
+        fn from_sql(
+            bytes: <Sqlite as diesel::backend::Backend>::RawValue<'_>,
+        ) -> deserialize::Result<Self> {
+            let json = <String as FromSql<Text, Sqlite>>::from_sql(bytes)?;
+            serde_json::from_str(&json).map_err(Into::into)
         }
     }
 }

@@ -1,0 +1,45 @@
+[package]
+name = "autumn-search"
+description = "Keyword and vector search plugin for autumn-web applications: mark a model searchable, get an index that stays in sync"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/autumn-foundation/autumn"
+readme = "README.md"
+keywords = ["web", "search", "vector", "embeddings", "axum"]
+categories = ["web-programming", "database"]
+
+[dependencies]
+autumn-web = { version = "0.6.0", path = "../autumn" }
+# Diesel is used ONLY by the Postgres `SearchBackend` and the Postgres
+# `DocumentSource`. Backend selection (postgres / sqlite) is inherited from
+# autumn-web's `db` feature via cargo feature unification — this crate never
+# enables a backend (or the `sqlite` runtime lane) itself, so the
+# FEATURE-UNIFICATION HAZARD in `autumn/src/db.rs` does not apply. Queries are
+# written against autumn-web's `RuntimeConnection` / `RuntimeBackend` aliases
+# so both lanes compile, and the Postgres-only SQL sits behind
+# `autumn_web::backend_select!`.
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Postgres `SearchBackend` / `DocumentSource` integration tests spin a real
+# Postgres via testcontainers, mirroring `autumn-admin-plugin`'s
+# `tests/token_admin_db.rs`. `#[ignore]`d so a default `cargo test` never needs
+# Docker; CI's Docker sweep picks them up.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+# Profile-aware `[search]` resolution reads real files off disk, so the config
+# tests lay out a throwaway project directory rather than mocking the loader.
+tempfile = "3"
+
+[lints]
+workspace = true

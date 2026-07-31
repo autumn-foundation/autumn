@@ -99,6 +99,7 @@ after checking this table and `docs/guide/`.
 | Admin plugin crate | `autumn-admin-plugin` |
 | S3 storage plugin crate | `autumn-storage-s3` |
 | Redis cache plugin crate | `autumn-cache-redis` |
+| Search plugin crate | `autumn-search` |
 | Main entry macro | `#[autumn_web::main]`, not `#[autumn::main]` |
 
 The name `autumn` is the CLI binary, not the framework crate. In code, import
@@ -183,6 +184,7 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 
 For S3 storage add `autumn-storage-s3 = "0.5"`; `storage-s3` is no longer an
 `autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.5"`.
+For keyword + vector search with lifecycle-synced indexes add `autumn-search`.
 
 ## main.rs pattern
 
@@ -283,6 +285,37 @@ async fn ws() -> impl autumn_web::ws::WsHandler {
 
 Route functions are collected with `routes![...]`. Static routes also need
 `static_routes![...]` so `autumn build` can pre-render them.
+
+**Route-level SEO defaults (issue #1182, unreleased — trunk-dev):** declare
+per-page meta tag values once on the route with a `seo(...)` argument instead of
+rebuilding a `SeoMeta` in every handler. `SeoMeta` is an extractor, so a handler
+that takes one receives a builder pre-populated with the declared values:
+
+```rust
+use autumn_web::seo::SeoMeta;
+
+#[get("/about", seo(title = "About • My Blog", description = "Learn about us"))]
+async fn about(seo: SeoMeta) -> Markup { html! { head { (seo.render()) } } }
+
+// Static default on the attribute, dynamic fields filled in by the handler.
+// The builder is consuming, so the handler's value wins for the keys it
+// touches while the untouched attribute keys survive.
+#[get("/posts/{slug}", seo(og_type = "article"))]
+async fn show(Path(slug): Path<String>, seo: SeoMeta, db: Db) -> AutumnResult<Markup> {
+    let post = Post::find_by_slug(&slug, db).await?;
+    let seo = seo.title(format!("{} • Blog", post.title));
+    Ok(layout_with_seo(seo, html! { /* ... */ }))
+}
+```
+
+Keys mirror the `SeoMeta` builder: `title`, `description`, `canonical`,
+`og_title`, `og_description`, `og_image`, `og_type`, `og_url`, `twitter_card`,
+`twitter_title`, `twitter_description`, `twitter_image`, `robots`. Values must
+be string literals; an unknown or repeated key is a compile error. `#[static_get]`
+accepts the same argument, so pre-rendered pages carry the tags. The extractor
+never fails — on a route without `seo(...)` it yields an empty builder. Note the
+attribute supplies *values*, not markup: the handler still emits them, normally
+via `seo.render()` inside the layout's `<head>`.
 
 **Duplicate-route preflight (issue #1012, unreleased — trunk-dev):** two
 handlers that resolve to the same `(method, path)` after `.scoped(...)` prefix
@@ -829,6 +862,48 @@ this is *provider-reported* failure.
   recipient fixed their mailbox); `store.suppress(addr, SuppressionReason::Manual)`
   adds one by hand.
 
+## In-app notifications (unreleased — trunk-dev, issue #1148)
+
+A first-class per-recipient notification store with read/unread state — do not
+hand-roll a notifications table, model, and unread-count queries. Scaffold with
+`autumn generate notifications` (backend-aware migration + feed routes + smoke
+test), then use the `Notifications` extractor (in the prelude, surfaced like
+`Session`):
+
+```rust
+use autumn_web::prelude::*;
+
+#[post("/comments")]
+async fn create_comment(notifications: Notifications) -> AutumnResult<&'static str> {
+    notifications
+        .notify(recipient_id, "comment.created", serde_json::json!({"post": 42}))
+        .await?;
+    Ok("ok")
+}
+```
+
+- **API:** `notify(recipient_id, kind, payload)`; `list(recipient_id, &ListQuery,
+  &PageRequest) -> Page<Notification>` (`?filter[unread]=true`,
+  `?filter[kind]=…`, `?sort=created_at|id`, newest-first default);
+  `unread_count(recipient_id)`; idempotent `mark_read(id)` /
+  `mark_read_for(recipient_id, id)` / `mark_all_read(recipient_id)`. In
+  user-facing handlers use `mark_read_for` — it refuses to touch other
+  recipients' rows.
+- **Storage resolution** (mirrors `SessionStore`): a store registered via
+  `AppBuilder::with_notification_store(...)` → `DbNotificationStore` when a DB
+  pool is configured (needs the generated `notifications` table) →
+  `MemoryNotificationStore` (process-local; what `TestApp` without a DB uses,
+  so generated smoke tests need no database).
+- **Realtime push (`ws` feature):** `notify_with_push(...)` persists then
+  publishes the notification JSON on `Notifications::topic(recipient_id)`
+  (`"notifications:{id}"`) — best-effort, a channel failure never fails the
+  notify. In the subscribing WS/SSE handler, derive the topic from the
+  **authenticated** user (`Auth`/session), never a client-supplied id — topics
+  are guessable and carry the full payload; use `subscribe_authorized` /
+  `sse::stream_authorized` for channel-level enforcement.
+- Guide: `docs/guide/notifications.md`. Out of scope by design: bell widget,
+  email/SMS channels, preferences/digests, cross-recipient fan-out.
+
 ## Background work
 
 Use built-in jobs and tasks before reaching for a workflow engine:
@@ -926,6 +1001,47 @@ let store = autumn_storage_s3::S3BlobStore::from_config(&config.storage.s3)
     .expect("S3 store");
 autumn_web::app().with_blob_store(store).run().await;
 ```
+
+For keyword **and** vector search with an index that stays in sync:
+
+```toml
+autumn-search = "0.6"
+```
+
+```rust
+#[autumn_web::model]
+#[searchable(language = "english")]
+pub struct Article {
+    #[id] pub id: i64,
+    #[searchable(weight = "A")] pub title: String,
+    #[searchable(weight = "B", embed)] pub body: String,   // embed => vector search
+}
+
+// `#[repository(hooks = ...)]` takes a plain type NAME, so alias the generic.
+type ArticleSearchHooks =
+    autumn_search::SearchSyncHooks<Article, NewArticle, UpdateArticle>;
+
+#[autumn_web::repository(Article, hooks = ArticleSearchHooks, commit_hooks = true)]
+pub trait ArticleRepository {}
+
+autumn_web::app()
+    .plugin(
+        autumn_search::SearchPlugin::new()
+            .postgres()
+            .embedder(std::sync::Arc::new(MyEmbedder))
+            .index::<Article>(),
+    )
+    .run()
+    .await;
+
+// In a handler: the plugin installs the client as an AppState extension.
+let search = state.extension::<autumn_search::SearchClient>().expect("SearchPlugin");
+let page = search.search::<Article>("rust web", &page_req).await?;   // ranked Page
+let hits = search.similar::<Article>("how do I add auth?", 5).await?; // k-NN
+```
+
+`autumn search reindex [--index NAME] [--purge]` rebuilds an index. See
+`docs/guide/search.md`.
 
 For shared Redis cache:
 
@@ -1567,7 +1683,30 @@ autumn db backup --keep 7        # dump control DB + shards to ./backups/<profil
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (unreleased — trunk-dev)
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
 autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
+autumn console                   # data playground: scaffolds src/bin/playground.rs (pre-wired config+pool), then builds and runs it; alias `autumn c`
+autumn console --force           # regenerate the playground from the template (never overwritten otherwise)
+autumn console --scaffold-only   # scaffold + wire Cargo.toml, then stop
 ```
+
+`autumn console` is Autumn's `rails console` equivalent. Rust has no stable
+`eval`, so it follows loco.rs's edit-and-run model instead of shipping a REPL:
+the playground is an ordinary Rust file you edit, and the command owns the
+compile-and-run loop. It resolves the database exactly like `autumn seed` and
+`autumn dev` (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` →
+`DATABASE_URL` → profile-aware `autumn.toml`) by bootstrapping through
+`autumn_web::seed::SeedContext`.
+
+Two things to know when advising on it:
+
+- The playground declares the app's `schema` / `models` / `repositories` /
+  `policies` modules with `#[path = "../…"]`, because a Cargo bin target is its
+  own crate and a generated Autumn app has no `src/lib.rs`. Users add their own
+  `use` lines (and can add more `#[path]` lines for other modules).
+- Its `[[bin]]` is gated behind `required-features = ["playground"]`, so
+  `cargo build`, `cargo test`, `autumn dev`, and `autumn build` skip it
+  entirely. Only `autumn console` compiles it. Never suggest removing that
+  gate: without it, a playground that fails to compile would break the app's
+  default build.
 
 `autumn i18n check` scans `**/*.rs` for string-literal keys passed to
 `t!(...)`, `.t(...)`, and `.t_with(...)`, loads every `i18n/<locale>.ftl` via
@@ -1741,7 +1880,7 @@ signing secrets, and other config problems without printing credentials.
 - Release tag for this line is `v0.5.0`.
 - Published crates are released together at the same workspace version:
   `autumn-macros`, `autumn-web`, `autumn-cli`, `autumn-admin-plugin`,
-  `autumn-storage-s3`, and `autumn-cache-redis`.
+  `autumn-storage-s3`, `autumn-cache-redis`, and `autumn-search`.
 - The publish gate checks crate metadata, package dry-runs, full docs,
   semver compatibility, release-note alignment, and downstream smoke tests.
 - Use `docs/release-checklist.md`, `docs/guide/docs-smoke.md`,

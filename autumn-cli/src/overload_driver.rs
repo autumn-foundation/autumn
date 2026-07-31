@@ -238,7 +238,7 @@ fn sample_rss_kb(pid: u32) -> Option<u64> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn sample_rss_kb(_pid: u32) -> Option<u64> {
+const fn sample_rss_kb(_pid: u32) -> Option<u64> {
     None
 }
 

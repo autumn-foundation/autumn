@@ -12637,6 +12637,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                     timeout: ::autumn_web::RouteTimeout::Inherit,
+                    seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -12693,6 +12694,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                     timeout: ::autumn_web::RouteTimeout::Inherit,
+                    seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -12749,6 +12751,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                     timeout: ::autumn_web::RouteTimeout::Inherit,
+                    seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -12807,6 +12810,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                     timeout: ::autumn_web::RouteTimeout::Inherit,
+                    seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -12846,6 +12850,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                     timeout: ::autumn_web::RouteTimeout::Inherit,
+                    seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
