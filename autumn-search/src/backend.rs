@@ -340,7 +340,7 @@ impl SearchHit {
 
 /// What a backend can do, so callers can degrade deliberately.
 ///
-/// Four independent yes/no capabilities. `clippy::struct_excessive_bools`
+/// Five independent yes/no capabilities. `clippy::struct_excessive_bools`
 /// suggests enums, but each of these is genuinely orthogonal — an engine can
 /// support any subset — so a flag set is the honest shape.
 #[allow(clippy::struct_excessive_bools)]
@@ -355,6 +355,9 @@ pub struct BackendCapabilities {
     pub weighted_fields: bool,
     /// Reading a stored embedding back (`similar_to`).
     pub embedding_readback: bool,
+    /// Honouring [`SearchBackend::index_unless_newer`]'s watermark, so a
+    /// backfill cannot overwrite a concurrent per-record reindex.
+    pub conditional_index: bool,
 }
 
 impl Default for BackendCapabilities {
@@ -364,6 +367,7 @@ impl Default for BackendCapabilities {
             vector: false,
             weighted_fields: false,
             embedding_readback: false,
+            conditional_index: false,
         }
     }
 }
@@ -387,6 +391,14 @@ impl BackendCapabilities {
     #[must_use]
     pub const fn with_embedding_readback(mut self, supported: bool) -> Self {
         self.embedding_readback = supported;
+        self
+    }
+
+    /// Declare that [`SearchBackend::index_unless_newer`]'s watermark is
+    /// honoured rather than ignored.
+    #[must_use]
+    pub const fn with_conditional_index(mut self, supported: bool) -> Self {
+        self.conditional_index = supported;
         self
     }
 
@@ -431,6 +443,56 @@ pub trait SearchBackend: Send + Sync + 'static {
         definition: &'a IndexDefinition,
         documents: &'a [IndexedDocument],
     ) -> BoxFuture<'a, SearchResult<()>>;
+
+    /// A marker for "now" on **the backend's own clock**, for
+    /// [`index_unless_newer`](Self::index_unless_newer).
+    ///
+    /// Opaque and backend-defined: the comparison happens inside the backend,
+    /// so the caller never has to reconcile its clock with the store's. The
+    /// default `None` means this backend has no watermark, and
+    /// `index_unless_newer` degrades to an unconditional write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Backend`](crate::SearchError::Backend) if the
+    /// watermark cannot be read.
+    fn write_watermark(&self) -> BoxFuture<'_, SearchResult<Option<String>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Index `documents`, but **do not overwrite** a document that has been
+    /// written since `watermark`.
+    ///
+    /// This is how a backfill avoids clobbering a concurrent per-record
+    /// reindex. A backfill reads a batch, embeds it (a provider round-trip:
+    /// slow), then writes. A mutation in that window enqueues a reindex job
+    /// that reads and writes the *new* state — and the backfill's in-flight
+    /// batch would then overwrite it with what the source said minutes ago.
+    /// Nothing re-runs the reindex, so the index stays stale until the next
+    /// mutation, and the same ordering resurrects a record deleted mid-run.
+    ///
+    /// A backfill takes one watermark up front and passes it to every batch,
+    /// so any document a reindex wrote after the backfill started is left
+    /// alone. Newer always wins, and the two writers converge without needing
+    /// to know about each other.
+    ///
+    /// The default implementation ignores `watermark` and delegates to
+    /// [`index`](Self::index) — correct for a backend with no notion of write
+    /// time, at the cost of last-writer-wins during a backfill. Report
+    /// [`BackendCapabilities::conditional_index`] to say you honour it.
+    ///
+    /// # Errors
+    ///
+    /// As [`index`](Self::index).
+    fn index_unless_newer<'a>(
+        &'a self,
+        definition: &'a IndexDefinition,
+        documents: &'a [IndexedDocument],
+        watermark: Option<&'a str>,
+    ) -> BoxFuture<'a, SearchResult<()>> {
+        let _ = watermark;
+        self.index(definition, documents)
+    }
 
     /// Remove documents by record id. Removing an absent id is a no-op, not an
     /// error — deletes are replayed.

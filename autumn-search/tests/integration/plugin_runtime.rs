@@ -430,3 +430,131 @@ async fn a_matching_width_boots_and_a_declared_width_without_an_embedder_is_allo
     let test = app_with_widths(Some(768), Arc::new(autumn_search::NoEmbedder));
     assert_eq!(installed_client(&test).embedding_dimensions(), 0);
 }
+
+// ── A disabled subsystem initializes nothing ────────────────────────────────
+
+/// A backend whose setup always fails — the shape of a search-specific outage:
+/// an unreachable external engine, a `CREATE EXTENSION` the role may not run,
+/// a revoked DDL grant.
+#[derive(Default)]
+struct BrokenBackend {
+    ensure_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl autumn_search::SearchBackend for BrokenBackend {
+    fn name(&self) -> &'static str {
+        "broken"
+    }
+
+    fn ensure_index<'a>(
+        &'a self,
+        _definition: &'a autumn_search::IndexDefinition,
+    ) -> autumn_search::BoxFuture<'a, autumn_search::SearchResult<()>> {
+        Box::pin(async move {
+            self.ensure_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(autumn_search::SearchError::Backend(
+                "the search cluster is unreachable".to_owned(),
+            ))
+        })
+    }
+
+    fn index<'a>(
+        &'a self,
+        _definition: &'a autumn_search::IndexDefinition,
+        _documents: &'a [autumn_search::IndexedDocument],
+    ) -> autumn_search::BoxFuture<'a, autumn_search::SearchResult<()>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        _definition: &'a autumn_search::IndexDefinition,
+        _ids: &'a [i64],
+    ) -> autumn_search::BoxFuture<'a, autumn_search::SearchResult<()>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn clear<'a>(
+        &'a self,
+        _definition: &'a autumn_search::IndexDefinition,
+    ) -> autumn_search::BoxFuture<'a, autumn_search::SearchResult<()>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn keyword_search<'a>(
+        &'a self,
+        _definition: &'a autumn_search::IndexDefinition,
+        query: &'a autumn_search::KeywordQuery,
+    ) -> autumn_search::BoxFuture<
+        'a,
+        autumn_search::SearchResult<autumn_search::Page<autumn_search::SearchHit>>,
+    > {
+        Box::pin(async move { Ok(autumn_search::Page::new(Vec::new(), 0, &query.page)) })
+    }
+}
+
+fn app_with_backend(
+    config: SearchConfig,
+    backend: Arc<BrokenBackend>,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .plugin(
+            SearchPlugin::new()
+                .config(config)
+                .backend(backend)
+                .index::<Article>(),
+        )
+        .build()
+}
+
+#[tokio::test]
+#[should_panic(expected = "search index setup failed")]
+async fn an_enabled_search_with_a_broken_backend_aborts_boot() {
+    // The control case: while search is ON, a backend that cannot be set up is
+    // a real boot failure. Without this, the test below would pass for the
+    // wrong reason.
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let _ = app_with_backend(SearchConfig::default(), Arc::new(BrokenBackend::default()));
+}
+
+#[tokio::test]
+async fn a_disabled_search_does_not_touch_the_backend_at_boot() {
+    // `enabled = false` exists so that a search outage cannot take the
+    // application down. Running `ensure_index` anyway means the incident the
+    // switch was flipped for still aborts startup — the switch would be
+    // useless in exactly the situation it was written for.
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let backend = Arc::new(BrokenBackend::default());
+    let disabled = SearchConfig::from_toml_str("[search]\nenabled = false\n").expect("parse");
+    let test = app_with_backend(disabled, backend.clone());
+
+    assert_eq!(
+        backend
+            .ensure_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a disabled subsystem must not initialize its backend"
+    );
+
+    // And the client is still installed, so a handler that resolves the
+    // extension finds a working (no-op) one rather than nothing at all.
+    let search = installed_client(&test);
+    assert!(!search.is_enabled());
+    search
+        .index_record(&article(1, "Rust", "a survey"))
+        .await
+        .expect("a disabled index write is a no-op, not an error");
+    assert!(
+        search
+            .search::<Article>("rust", &PageRequest::default())
+            .await
+            .expect("disabled search returns an empty page")
+            .content
+            .is_empty()
+    );
+}

@@ -450,47 +450,69 @@ impl Plugin for SearchPlugin {
                         "autumn-search: {message}"
                     )));
                 }
-                // The declared width and the installed embedder's width must
-                // agree before a single document is written. They are set in
-                // two different places — `[search] embedding_dimensions` in
-                // config, `Embedder::dimensions()` in code — and when they
-                // disagree the failure is silent: every write succeeds, the
-                // vector column rejects the wrong-width value, and semantic
-                // search simply returns nothing. Boot loudly instead.
-                //
-                // `0` means no usable embedder (the default `NoEmbedder`), for
-                // which nothing vector-shaped runs at all — declaring a width
-                // ahead of installing a provider is a legitimate ordering.
-                let embedder_width = client.embedding_dimensions();
-                if let Some(configured) = config.embedding_dimensions
-                    && embedder_width != 0
-                    && embedder_width != configured
-                {
-                    return Err(autumn_web::AutumnError::internal_server_error_msg(format!(
-                        "autumn-search: `search.embedding_dimensions = {configured}` does not \
-                         match the installed embedder, which produces {embedder_width}-dimension \
-                         vectors; set them to the same value (and re-run `autumn search reindex \
-                         --purge` if the width really changed)"
-                    )));
-                }
-
-                if let Some(store) = &postgres {
-                    let pool = state.pool().cloned().ok_or_else(|| {
-                        autumn_web::AutumnError::internal_server_error_msg(
-                            "SearchPlugin::postgres() needs a database pool; configure \
-                             `database.primary_url` or install a different backend",
-                        )
-                    })?;
-                    store.install_pool(pool);
-                }
-
-                client.ensure_indexes().await.map_err(|error| {
-                    autumn_web::AutumnError::internal_server_error_msg(format!(
-                        "search index setup failed: {error}"
-                    ))
-                })?;
-
+                // Install the client FIRST, and unconditionally. A handler
+                // that resolves the extension must find one whether or not
+                // search is enabled — a disabled client answers every call
+                // with an empty page rather than being absent.
                 state.insert_extension(client.clone());
+
+                // Everything below is search-specific setup, and every line of
+                // it can fail for search-specific reasons: an unreachable
+                // external engine, a `CREATE EXTENSION` the role may not run,
+                // a revoked DDL grant, a misconfigured embedder. Running it
+                // while `enabled = false` means a search outage still takes
+                // the whole application down — which is precisely the outcome
+                // the kill switch exists to prevent, and the switch would be
+                // useless in the incident it was written for. A disabled
+                // subsystem initializes nothing.
+                if config.enabled {
+                    // The declared width and the installed embedder's width
+                    // must agree before a single document is written. They are
+                    // set in two different places — `[search]
+                    // embedding_dimensions` in config, `Embedder::dimensions()`
+                    // in code — and when they disagree the failure is silent:
+                    // every write succeeds, the vector column rejects the
+                    // wrong-width value, and semantic search simply returns
+                    // nothing. Boot loudly instead.
+                    //
+                    // `0` means no usable embedder (the default `NoEmbedder`),
+                    // for which nothing vector-shaped runs at all — declaring a
+                    // width ahead of installing a provider is a legitimate
+                    // ordering.
+                    let embedder_width = client.embedding_dimensions();
+                    if let Some(configured) = config.embedding_dimensions
+                        && embedder_width != 0
+                        && embedder_width != configured
+                    {
+                        return Err(autumn_web::AutumnError::internal_server_error_msg(format!(
+                            "autumn-search: `search.embedding_dimensions = {configured}` does not \
+                             match the installed embedder, which produces \
+                             {embedder_width}-dimension vectors; set them to the same value (and \
+                             re-run `autumn search reindex --purge` if the width really changed)"
+                        )));
+                    }
+
+                    if let Some(store) = &postgres {
+                        let pool = state.pool().cloned().ok_or_else(|| {
+                            autumn_web::AutumnError::internal_server_error_msg(
+                                "SearchPlugin::postgres() needs a database pool; configure \
+                                 `database.primary_url` or install a different backend",
+                            )
+                        })?;
+                        store.install_pool(pool);
+                    }
+
+                    client.ensure_indexes().await.map_err(|error| {
+                        autumn_web::AutumnError::internal_server_error_msg(format!(
+                            "search index setup failed: {error}"
+                        ))
+                    })?;
+                } else {
+                    tracing::warn!(
+                        "autumn-search is disabled (`[search] enabled = false`): index writes and \
+                         queries are no-ops, and no backend setup was performed"
+                    );
+                }
 
                 // A one-shot backfill boot (`autumn search reindex`) rebuilds
                 // and exits rather than going on to serve traffic.

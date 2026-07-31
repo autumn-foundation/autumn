@@ -35,6 +35,22 @@ use crate::text::{query_tokens, tokenize};
 #[derive(Debug, Default)]
 pub struct MemorySearchBackend {
     indexes: RwLock<HashMap<String, HashMap<i64, IndexedDocument>>>,
+    /// Per-document write sequence, and the source of the write watermark.
+    ///
+    /// A monotonic counter rather than a clock: the watermark only ever has to
+    /// answer "was this written after that", and a counter answers it exactly,
+    /// with no resolution floor and nothing to skew. It is also what lets the
+    /// backfill-versus-reindex ordering be tested deterministically without a
+    /// database.
+    writes: RwLock<WriteLog>,
+}
+
+/// The monotonic write counter plus, per index, the sequence each document was
+/// last written at.
+#[derive(Debug, Default)]
+struct WriteLog {
+    next: u64,
+    sequences: HashMap<String, HashMap<i64, u64>>,
 }
 
 impl MemorySearchBackend {
@@ -82,6 +98,69 @@ impl MemorySearchBackend {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(guard.entry(definition.name.to_owned()).or_default())
+    }
+
+    /// The current write sequence.
+    fn sequence(&self) -> u64 {
+        self.writes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next
+    }
+
+    /// Upsert `documents`, skipping any whose stored write is newer than
+    /// `watermark`. The single write path behind both `index` and
+    /// `index_unless_newer`, so the two cannot drift apart.
+    fn write(
+        &self,
+        definition: &IndexDefinition,
+        documents: &[IndexedDocument],
+        watermark: Option<u64>,
+    ) -> SearchResult<()> {
+        definition
+            .validate()
+            .map_err(|e| SearchError::InvalidIndex(e.to_string()))?;
+
+        let mut writes = self
+            .writes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut applied: Vec<(i64, u64)> = Vec::with_capacity(documents.len());
+        {
+            let WriteLog { next, sequences } = &mut *writes;
+            let seen = sequences.entry(definition.name.to_owned()).or_default();
+            for document in documents {
+                // A document written after the watermark is left alone: the
+                // writer that produced it read the source more recently than
+                // this batch did, so overwriting it would move the index
+                // backwards.
+                if let (Some(watermark), Some(written)) = (watermark, seen.get(&document.id()))
+                    && *written > watermark
+                {
+                    continue;
+                }
+                *next += 1;
+                applied.push((document.id(), *next));
+            }
+            for (id, sequence) in &applied {
+                seen.insert(*id, *sequence);
+            }
+        }
+        drop(writes);
+
+        let applied_ids: std::collections::HashSet<i64> =
+            applied.iter().map(|(id, _)| *id).collect();
+        self.with_index(definition, |index| {
+            for document in documents {
+                if !applied_ids.contains(&document.id()) {
+                    continue;
+                }
+                // Keyed upsert: re-indexing the same record replaces it, so
+                // at-least-once delivery can never duplicate a document.
+                index.insert(document.id(), document.clone());
+            }
+        });
+        Ok(())
     }
 
     /// Run `f` against a read view of the documents for `definition`.
@@ -178,6 +257,7 @@ impl SearchBackend for MemorySearchBackend {
             .with_vector(true)
             .with_weighted_fields(true)
             .with_embedding_readback(true)
+            .with_conditional_index(true)
     }
 
     fn ensure_index<'a>(
@@ -198,18 +278,25 @@ impl SearchBackend for MemorySearchBackend {
         definition: &'a IndexDefinition,
         documents: &'a [IndexedDocument],
     ) -> BoxFuture<'a, SearchResult<()>> {
+        Box::pin(async move { self.write(definition, documents, None) })
+    }
+
+    fn write_watermark(&self) -> BoxFuture<'_, SearchResult<Option<String>>> {
+        Box::pin(async move { Ok(Some(self.sequence().to_string())) })
+    }
+
+    fn index_unless_newer<'a>(
+        &'a self,
+        definition: &'a IndexDefinition,
+        documents: &'a [IndexedDocument],
+        watermark: Option<&'a str>,
+    ) -> BoxFuture<'a, SearchResult<()>> {
         Box::pin(async move {
-            definition
-                .validate()
-                .map_err(|e| SearchError::InvalidIndex(e.to_string()))?;
-            self.with_index(definition, |index| {
-                for document in documents {
-                    // Keyed upsert: re-indexing the same record replaces it, so
-                    // at-least-once delivery can never duplicate a document.
-                    index.insert(document.id(), document.clone());
-                }
-            });
-            Ok(())
+            self.write(
+                definition,
+                documents,
+                watermark.and_then(|w| w.parse().ok()),
+            )
         })
     }
 

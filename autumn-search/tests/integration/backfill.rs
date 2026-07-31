@@ -263,3 +263,94 @@ async fn a_short_batch_does_not_end_the_backfill() {
         .expect("search");
     assert_eq!(page.total_elements, 15);
 }
+
+// ── Backfill versus a concurrent reindex ────────────────────────────────────
+
+#[tokio::test]
+async fn a_backfill_does_not_overwrite_a_reindex_that_ran_while_it_was_working() {
+    // The window is real and wide: a backfill reads a batch, embeds it (a
+    // provider round-trip), then writes. A mutation in between enqueues a
+    // reindex job that reads and writes the NEW state — and the backfill's
+    // in-flight batch would then put back what the source said minutes ago.
+    // Nothing re-runs the reindex, so the index stays wrong until the next
+    // mutation touches that record.
+    use autumn_search::{IndexedDocument, SearchBackend as _};
+    use autumn_web::search::SearchIndexed as _;
+
+    let backend = Arc::new(MemorySearchBackend::new());
+    let source = Arc::new(MemoryDocumentSource::new());
+    source.upsert(&article(1, "Stale title", "rust web framework"));
+
+    let client = SearchClient::builder()
+        .backend(backend.clone())
+        .source(source.clone())
+        .index::<Article>()
+        .build();
+    client.ensure_indexes().await.expect("ensure");
+
+    let definition = Article::index_definition();
+
+    // Simulate the interleaving directly: take the watermark the backfill
+    // would take, then let a reindex land, then replay the backfill's write.
+    let watermark = backend.write_watermark().await.expect("watermark");
+
+    // …the mutation's reindex job writes the new state.
+    let fresh = article(1, "Fresh title", "rust web framework");
+    client.index_record(&fresh).await.expect("reindex");
+
+    // …and now the backfill's stale batch arrives.
+    let stale =
+        IndexedDocument::new(article(1, "Stale title", "rust web framework").search_document());
+    backend
+        .index_unless_newer(&definition, &[stale], watermark.as_deref())
+        .await
+        .expect("backfill write");
+
+    let page = client
+        .search::<Article>("fresh", &PageRequest::default())
+        .await
+        .expect("search");
+    assert_eq!(
+        page.total_elements, 1,
+        "the reindex's newer document must survive the backfill batch"
+    );
+    assert_eq!(
+        client
+            .search::<Article>("stale", &PageRequest::default())
+            .await
+            .expect("search")
+            .total_elements,
+        0,
+        "the backfill must not have put the stale title back"
+    );
+}
+
+#[tokio::test]
+async fn a_backfill_still_writes_documents_nothing_else_touched() {
+    // The guard must only skip records a newer writer claimed — everything
+    // else still has to be indexed, or the watermark would turn every backfill
+    // after the first into a no-op.
+    let (client, _source) = client_with(5).await;
+    let report = client
+        .backfill("search_articles", &BackfillOptions::default())
+        .await
+        .expect("backfill");
+    assert_eq!(report.indexed, 5);
+
+    let second = client
+        .backfill("search_articles", &BackfillOptions::default())
+        .await
+        .expect("second backfill");
+    assert_eq!(
+        second.indexed, 5,
+        "a later backfill re-reads the source and rewrites every row"
+    );
+    assert_eq!(
+        client
+            .search::<Article>("rust", &PageRequest::default())
+            .await
+            .expect("search")
+            .total_elements,
+        5
+    );
+}

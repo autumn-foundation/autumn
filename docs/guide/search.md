@@ -184,7 +184,10 @@ embedding_dimensions = 768  # declared width; enables the pgvector fast path
 The plugin reads the config itself at boot, so `enabled = false` is the
 incident switch it claims to be: a config change, not a deploy — and it stops
 index writes (including a purging backfill) without failing writes to the
-model. Pass `SearchPlugin::config(...)` to configure in code instead; doing so
+model. A disabled subsystem also **initializes nothing**: no `ensure_index`, no
+DDL, no embedder width check. That is the difference between a kill switch and
+a preference — an unreachable engine or a revoked DDL grant must not still
+abort application startup once you have turned search off. Pass `SearchPlugin::config(...)` to configure in code instead; doing so
 also stops the file being read.
 
 `[search]` is resolved through the **same profile layering the runtime uses**,
@@ -373,6 +376,15 @@ The backfill walks the source with **keyset** pagination
 concurrent writes cannot make it skip or repeat rows. It writes through the
 exact same path as an incremental reindex, so bootstrapping and steady state
 cannot disagree.
+
+A backfill takes a **write watermark** before its first batch and never
+overwrites a document written after that point. Without it, a backfill batch —
+read minutes ago, then delayed by an embedding round-trip — would clobber
+whatever a per-record reindex wrote in the meantime, and nothing re-runs that
+reindex. Newer always wins, so the bulk and per-record writers converge without
+knowing about each other. A backend that does not report
+`BackendCapabilities::conditional_index` ignores the watermark and keeps
+last-writer-wins.
 
 It stops only on an **empty** batch, never on a short one. `DocumentSource::scan`
 returns *up to* `limit` documents, so a source that filters after reading —

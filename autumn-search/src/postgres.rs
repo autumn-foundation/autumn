@@ -130,6 +130,12 @@ struct SourceRow {
 }
 
 #[derive(diesel::QueryableByName)]
+struct WatermarkRow {
+    #[diesel(sql_type = Text)]
+    watermark: String,
+}
+
+#[derive(diesel::QueryableByName)]
 struct WidthRow {
     #[diesel(sql_type = BigInt)]
     width: i64,
@@ -247,6 +253,170 @@ impl PostgresSearchStore {
             .read()
             .ok()
             .and_then(|guard| *guard)
+    }
+
+    /// Upsert `documents`, optionally refusing to clobber rows written since
+    /// `watermark`. The single write path behind both
+    /// [`SearchBackend::index`] and [`SearchBackend::index_unless_newer`], so
+    /// the conditional and unconditional forms cannot drift apart.
+    async fn write_documents(
+        &self,
+        definition: &IndexDefinition,
+        documents: &[IndexedDocument],
+        watermark: Option<&str>,
+    ) -> SearchResult<()> {
+        use std::fmt::Write as _;
+
+        checked(definition)?;
+        if documents.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn().await?;
+        // Keyed on the PHYSICAL column, not on this process's mode. The
+        // column can outlive the mode that created it (dimensions unset, a
+        // width mismatch, a mixed fleet), and skipping it then leaves a
+        // stale `embedding_vec` behind after every upsert — which a
+        // pgvector-mode reader silently ranks on. `None` width means the
+        // column is absent and must stay out of the column list entirely.
+        let vector_width = self.vector_column_width();
+
+        for document in documents {
+            // The weighted tsvector, built exactly as #842 does:
+            // `setweight(to_tsvector(<lang>, <value>), <weight>)` per
+            // field, concatenated.
+            //
+            // The weight letter is interpolated, so it comes from the
+            // VALIDATED definition rather than from the document: a
+            // hand-built document (or a third-party `DocumentSource`) can
+            // carry any `char`. A field the index does not declare is
+            // skipped entirely.
+            //
+            // Bound: $1 index_name, $2 record_id, $3 tenant_id, $4 fields
+            // json, $5 language, $6 content, $7 embedding, ($8 vector),
+            // then one per field value.
+            let mut binds = vec![
+                Bound::Text(definition.name.to_owned()),
+                Bound::BigInt(document.id()),
+                Bound::NullableText(document.document.tenant_id.clone()),
+                Bound::Text(fields_json(document)?),
+                Bound::Text(definition.language.to_owned()),
+                Bound::Text(document.document.text()),
+                Bound::NullableText(document.embedding.as_deref().map(array_literal)),
+            ];
+            if let Some(width) = vector_width {
+                let literal = match document.embedding.as_deref() {
+                    // A width the column cannot hold would fail the insert,
+                    // and leaving the old value in place is exactly the
+                    // staleness this avoids — so it never reaches SQL.
+                    //
+                    // Whether that is an ERROR depends on which column this
+                    // process is actually reading. In pgvector mode k-NN
+                    // runs off `embedding_vec`, so writing NULL would leave
+                    // the row permanently invisible to semantic search
+                    // while every write reported success — a silent hole,
+                    // and the worst outcome available. Say so instead.
+                    Some(embedding) if embedding.len() != width => {
+                        if self.vector_mode().is_some_and(VectorMode::is_pgvector) {
+                            return Err(SearchError::DimensionMismatch {
+                                expected: width,
+                                actual: embedding.len(),
+                            });
+                        }
+                        // Not in pgvector mode: `embedding_vec` is a
+                        // leftover column from a previous width, k-NN runs
+                        // off the portable `embedding` array (bound above,
+                        // at full width), and NULLing the stale copy is the
+                        // correct repair rather than a loss.
+                        None
+                    }
+                    other => other.map(vector_literal),
+                };
+                binds.push(Bound::NullableText(literal));
+            }
+
+            let mut vector_sql = String::new();
+            let mut param = binds.len() + 1;
+            for field in &document.document.fields {
+                let Some(weight) = definition.weight_of(field.name) else {
+                    continue;
+                };
+                if !vector_sql.is_empty() {
+                    vector_sql.push_str(" || ");
+                }
+                // `$5::text::regconfig`, not `$5::regconfig`: the same
+                // parameter is also the `language` column value, and the
+                // untyped form is "inconsistent types deduced for
+                // parameter" under any client that does not declare bind
+                // types.
+                let _ = write!(
+                    vector_sql,
+                    "setweight(to_tsvector($5::text::regconfig, ${param}), '{weight}')"
+                );
+                binds.push(Bound::Text(field.value.clone()));
+                param += 1;
+            }
+            if vector_sql.is_empty() {
+                "to_tsvector($5::text::regconfig, '')".clone_into(&mut vector_sql);
+            }
+
+            let (vec_column, vec_value, vec_update) = if vector_width.is_some() {
+                (
+                    ", embedding_vec",
+                    ", $8::vector",
+                    ", embedding_vec = EXCLUDED.embedding_vec",
+                )
+            } else {
+                ("", "", "")
+            };
+
+            // The watermark guard. Without it a backfill batch — read
+            // minutes ago, then delayed by an embedding round-trip —
+            // overwrites whatever a per-record reindex wrote in the
+            // meantime, and nothing re-runs that reindex. `updated_at` is
+            // server-side `NOW()` and the watermark came from the same
+            // clock, so the comparison is skew-free.
+            //
+            // Only the UPDATE arm is guarded: a row that does not exist
+            // yet cannot have a newer version to protect, and skipping the
+            // insert would leave it unindexed.
+            let guard = if watermark.is_some() {
+                param += 1;
+                format!(
+                    " WHERE {DOCUMENTS_TABLE}.updated_at <= ${}::timestamptz",
+                    param - 1
+                )
+            } else {
+                String::new()
+            };
+            if let Some(watermark) = watermark {
+                binds.push(Bound::Text(watermark.to_owned()));
+            }
+
+            let sql = format!(
+                "INSERT INTO {DOCUMENTS_TABLE} \
+                       (index_name, record_id, tenant_id, language, fields, content, \
+                        search_vector, embedding{vec_column}) \
+                     VALUES ($1, $2, $3, $5, $4::jsonb, $6, {vector_sql}, \
+                             $7::double precision[]{vec_value}) \
+                     ON CONFLICT (index_name, record_id) DO UPDATE SET \
+                       tenant_id = EXCLUDED.tenant_id, \
+                       language = EXCLUDED.language, \
+                       fields = EXCLUDED.fields, \
+                       content = EXCLUDED.content, \
+                       search_vector = EXCLUDED.search_vector, \
+                       embedding = EXCLUDED.embedding{vec_update}, \
+                       updated_at = NOW(){guard}"
+            );
+
+            bind_all(
+                diesel::sql_query(sql).into_boxed::<autumn_web::RuntimeBackend>(),
+                binds,
+            )
+            .execute(&mut conn)
+            .await
+            .map_err(SearchError::backend)?;
+        }
+        Ok(())
     }
 
     fn pool(&self) -> SearchResult<&RuntimePool> {
@@ -472,6 +642,32 @@ impl SearchBackend for PostgresSearchStore {
             .with_vector(true)
             .with_weighted_fields(true)
             .with_embedding_readback(true)
+            .with_conditional_index(true)
+    }
+
+    fn write_watermark(&self) -> BoxFuture<'_, SearchResult<Option<String>>> {
+        Box::pin(async move {
+            // The DATABASE's clock, not the process's. `updated_at` is set by
+            // `NOW()` server-side, so comparing it against an app-side
+            // timestamp would be at the mercy of clock skew between however
+            // many app instances and the database — and the whole point of the
+            // watermark is deciding which of two writes is newer.
+            let mut conn = self.conn().await?;
+            let row = diesel::sql_query("SELECT NOW()::text AS watermark")
+                .get_result::<WatermarkRow>(&mut conn)
+                .await
+                .map_err(SearchError::backend)?;
+            Ok(Some(row.watermark))
+        })
+    }
+
+    fn index_unless_newer<'a>(
+        &'a self,
+        definition: &'a IndexDefinition,
+        documents: &'a [IndexedDocument],
+        watermark: Option<&'a str>,
+    ) -> BoxFuture<'a, SearchResult<()>> {
+        Box::pin(async move { self.write_documents(definition, documents, watermark).await })
     }
 
     fn ensure_index<'a>(
@@ -531,137 +727,7 @@ impl SearchBackend for PostgresSearchStore {
         definition: &'a IndexDefinition,
         documents: &'a [IndexedDocument],
     ) -> BoxFuture<'a, SearchResult<()>> {
-        use std::fmt::Write as _;
-
-        Box::pin(async move {
-            checked(definition)?;
-            if documents.is_empty() {
-                return Ok(());
-            }
-            let mut conn = self.conn().await?;
-            // Keyed on the PHYSICAL column, not on this process's mode. The
-            // column can outlive the mode that created it (dimensions unset, a
-            // width mismatch, a mixed fleet), and skipping it then leaves a
-            // stale `embedding_vec` behind after every upsert — which a
-            // pgvector-mode reader silently ranks on. `None` width means the
-            // column is absent and must stay out of the column list entirely.
-            let vector_width = self.vector_column_width();
-
-            for document in documents {
-                // The weighted tsvector, built exactly as #842 does:
-                // `setweight(to_tsvector(<lang>, <value>), <weight>)` per
-                // field, concatenated.
-                //
-                // The weight letter is interpolated, so it comes from the
-                // VALIDATED definition rather than from the document: a
-                // hand-built document (or a third-party `DocumentSource`) can
-                // carry any `char`. A field the index does not declare is
-                // skipped entirely.
-                //
-                // Bound: $1 index_name, $2 record_id, $3 tenant_id, $4 fields
-                // json, $5 language, $6 content, $7 embedding, ($8 vector),
-                // then one per field value.
-                let mut binds = vec![
-                    Bound::Text(definition.name.to_owned()),
-                    Bound::BigInt(document.id()),
-                    Bound::NullableText(document.document.tenant_id.clone()),
-                    Bound::Text(fields_json(document)?),
-                    Bound::Text(definition.language.to_owned()),
-                    Bound::Text(document.document.text()),
-                    Bound::NullableText(document.embedding.as_deref().map(array_literal)),
-                ];
-                if let Some(width) = vector_width {
-                    let literal = match document.embedding.as_deref() {
-                        // A width the column cannot hold would fail the insert,
-                        // and leaving the old value in place is exactly the
-                        // staleness this avoids — so it never reaches SQL.
-                        //
-                        // Whether that is an ERROR depends on which column this
-                        // process is actually reading. In pgvector mode k-NN
-                        // runs off `embedding_vec`, so writing NULL would leave
-                        // the row permanently invisible to semantic search
-                        // while every write reported success — a silent hole,
-                        // and the worst outcome available. Say so instead.
-                        Some(embedding) if embedding.len() != width => {
-                            if self.vector_mode().is_some_and(VectorMode::is_pgvector) {
-                                return Err(SearchError::DimensionMismatch {
-                                    expected: width,
-                                    actual: embedding.len(),
-                                });
-                            }
-                            // Not in pgvector mode: `embedding_vec` is a
-                            // leftover column from a previous width, k-NN runs
-                            // off the portable `embedding` array (bound above,
-                            // at full width), and NULLing the stale copy is the
-                            // correct repair rather than a loss.
-                            None
-                        }
-                        other => other.map(vector_literal),
-                    };
-                    binds.push(Bound::NullableText(literal));
-                }
-
-                let mut vector_sql = String::new();
-                let mut param = binds.len() + 1;
-                for field in &document.document.fields {
-                    let Some(weight) = definition.weight_of(field.name) else {
-                        continue;
-                    };
-                    if !vector_sql.is_empty() {
-                        vector_sql.push_str(" || ");
-                    }
-                    // `$5::text::regconfig`, not `$5::regconfig`: the same
-                    // parameter is also the `language` column value, and the
-                    // untyped form is "inconsistent types deduced for
-                    // parameter" under any client that does not declare bind
-                    // types.
-                    let _ = write!(
-                        vector_sql,
-                        "setweight(to_tsvector($5::text::regconfig, ${param}), '{weight}')"
-                    );
-                    binds.push(Bound::Text(field.value.clone()));
-                    param += 1;
-                }
-                if vector_sql.is_empty() {
-                    "to_tsvector($5::text::regconfig, '')".clone_into(&mut vector_sql);
-                }
-
-                let (vec_column, vec_value, vec_update) = if vector_width.is_some() {
-                    (
-                        ", embedding_vec",
-                        ", $8::vector",
-                        ", embedding_vec = EXCLUDED.embedding_vec",
-                    )
-                } else {
-                    ("", "", "")
-                };
-
-                let sql = format!(
-                    "INSERT INTO {DOCUMENTS_TABLE} \
-                       (index_name, record_id, tenant_id, language, fields, content, \
-                        search_vector, embedding{vec_column}) \
-                     VALUES ($1, $2, $3, $5, $4::jsonb, $6, {vector_sql}, \
-                             $7::double precision[]{vec_value}) \
-                     ON CONFLICT (index_name, record_id) DO UPDATE SET \
-                       tenant_id = EXCLUDED.tenant_id, \
-                       language = EXCLUDED.language, \
-                       fields = EXCLUDED.fields, \
-                       content = EXCLUDED.content, \
-                       search_vector = EXCLUDED.search_vector, \
-                       embedding = EXCLUDED.embedding{vec_update}, \
-                       updated_at = NOW()"
-                );
-
-                bind_all(
-                    diesel::sql_query(sql).into_boxed::<autumn_web::RuntimeBackend>(),
-                    binds,
-                )
-                .execute(&mut conn)
-                .await
-                .map_err(SearchError::backend)?;
-            }
-            Ok(())
-        })
+        Box::pin(async move { self.write_documents(definition, documents, None).await })
     }
 
     fn delete<'a>(

@@ -98,7 +98,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows stay indexed exactly as the model's finders return them.
   Request-controlled values — pagination, and the k-NN minimum score — are
   bound rather than formatted into the SQL, because diesel's statement cache is
-  keyed on query text and never evicts. The in-core
+  keyed on query text and never evicts. A disabled subsystem initializes
+  nothing — no `ensure_index`, no DDL, no width check — so a search outage
+  cannot abort application startup after the switch has been thrown. A backfill
+  takes a write watermark up front and never overwrites a document a concurrent
+  reindex wrote after it started, so the bulk and per-record writers converge
+  instead of racing. The in-core
   `#[repository(searchable)]` `search()` and its `websearch_to_tsquery`
   semantics are untouched; this subsumes #842 as one backend, it does not
   replace it. See `docs/guide/search.md`.

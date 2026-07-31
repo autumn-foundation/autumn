@@ -861,6 +861,30 @@ impl SearchClient {
         };
         let mut after: Option<i64> = None;
 
+        // Taken ONCE, before the first batch, and passed to every write.
+        //
+        // A backfill reads a batch, embeds it (a provider round-trip — slow),
+        // then writes. A mutation inside that window enqueues a reindex job
+        // that reads and writes the *new* state, and the backfill's in-flight
+        // batch would then overwrite it with what the source said minutes ago.
+        // Nothing re-runs the reindex, so the index stays wrong until the next
+        // mutation, and the same ordering resurrects a record deleted mid-run.
+        //
+        // The watermark makes the rule "a backfill never overwrites a document
+        // written after the backfill began" — newer always wins, and the two
+        // writers converge without knowing about each other. A backend that
+        // does not report `conditional_index` ignores it and keeps
+        // last-writer-wins.
+        let watermark = self.inner.backend.write_watermark().await?;
+        if watermark.is_none() && !self.inner.backend.capabilities().conditional_index {
+            tracing::debug!(
+                backend = self.inner.backend.name(),
+                index = %index,
+                "backend has no write watermark; a concurrent reindex may be overwritten by this \
+                 backfill"
+            );
+        }
+
         loop {
             let documents = source.scan(definition, after, batch_size).await?;
             if documents.is_empty() {
@@ -873,7 +897,10 @@ impl SearchClient {
             let count = documents.len() as u64;
 
             let prepared = self.embed_documents(documents).await?;
-            self.inner.backend.index(definition, &prepared).await?;
+            self.inner
+                .backend
+                .index_unless_newer(definition, &prepared, watermark.as_deref())
+                .await?;
 
             report.indexed += count;
             report.batches += 1;
