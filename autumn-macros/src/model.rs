@@ -2031,36 +2031,92 @@ fn parse_model_shard_key(attrs: &[syn::Attribute]) -> syn::Result<Option<String>
     Ok(None)
 }
 
+#[derive(Debug)]
 enum FieldSearchable {
     NotSearchable,
     SearchableDefault,
     SearchableWithWeight(String),
 }
 
-/// Parse the field-level weight from `#[searchable(weight = "...")]`
-fn parse_field_searchable_weight(field: &syn::Field) -> syn::Result<FieldSearchable> {
+/// Field-level `#[searchable(...)]` configuration.
+///
+/// #842 introduced the weight; #1191 adds `embed`, which nominates the field
+/// whose text is embedded for vector / "find similar" search. The two are
+/// independent: `#[searchable(weight = "B", embed)]` both ranks the field at
+/// weight B for keyword search and embeds it for k-NN search.
+#[derive(Debug)]
+struct FieldSearchableConfig {
+    kind: FieldSearchable,
+    embed: bool,
+}
+
+/// Whether `ty` is `String` or `Option<String>` — the shape the tenancy path
+/// assumes for a `tenant_id` column.
+fn is_string_or_option_string(ty: &syn::Type) -> bool {
+    fn is_string(ty: &syn::Type) -> bool {
+        matches!(ty, syn::Type::Path(tp) if tp.path.segments.last()
+            .is_some_and(|s| s.ident == "String"))
+    }
+    if is_string(ty) {
+        return true;
+    }
+    let syn::Type::Path(tp) = ty else {
+        return false;
+    };
+    let Some(segment) = tp.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Option" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    matches!(args.args.first(), Some(syn::GenericArgument::Type(inner)) if is_string(inner))
+}
+
+/// Parse the full field-level `#[searchable(weight = "...", embed)]` config.
+fn parse_field_searchable(field: &syn::Field) -> syn::Result<FieldSearchableConfig> {
     for attr in &field.attrs {
         if attr.path().is_ident("searchable") {
             if matches!(attr.meta, syn::Meta::Path(_)) {
-                return Ok(FieldSearchable::SearchableDefault);
+                return Ok(FieldSearchableConfig {
+                    kind: FieldSearchable::SearchableDefault,
+                    embed: false,
+                });
             }
             let mut weight = None;
+            let mut embed = false;
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("weight") {
                     let value: syn::LitStr = meta.value()?.parse()?;
                     weight = Some(value.value());
                     Ok(())
+                } else if meta.path.is_ident("embed") {
+                    if embed {
+                        return Err(meta.error("duplicate `embed` in #[searchable(...)]"));
+                    }
+                    embed = true;
+                    Ok(())
                 } else {
-                    Err(meta.error("unsupported field searchable attribute"))
+                    Err(meta.error(
+                        "unsupported field searchable attribute (expected `weight = \"A\"` or `embed`)",
+                    ))
                 }
             })?;
-            return Ok(weight.map_or(
-                FieldSearchable::SearchableDefault,
-                FieldSearchable::SearchableWithWeight,
-            ));
+            return Ok(FieldSearchableConfig {
+                kind: weight.map_or(
+                    FieldSearchable::SearchableDefault,
+                    FieldSearchable::SearchableWithWeight,
+                ),
+                embed,
+            });
         }
     }
-    Ok(FieldSearchable::NotSearchable)
+    Ok(FieldSearchableConfig {
+        kind: FieldSearchable::NotSearchable,
+        embed: false,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -3502,11 +3558,30 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut search_field_names = Vec::new();
     let mut search_field_weights = Vec::new();
+    // #1191: the field idents backing the searchable columns, so the derived
+    // `SearchIndexed::search_document` can extract their values, plus the
+    // single `#[searchable(embed)]` field (if any) that feeds vector search.
+    let mut search_field_idents: Vec<syn::Ident> = Vec::new();
+    let mut search_embed_field: Option<String> = None;
 
     for field in &all_fields {
-        match parse_field_searchable_weight(field) {
-            Ok(FieldSearchable::NotSearchable) => {}
-            Ok(weight_type) => {
+        let cfg = match parse_field_searchable(field) {
+            Ok(cfg) => cfg,
+            Err(err) => return err.to_compile_error(),
+        };
+        match cfg.kind {
+            FieldSearchable::NotSearchable => {
+                if cfg.embed {
+                    // Unreachable through the parser (a bare `embed` still
+                    // yields a searchable kind), but keep the invariant local.
+                    return syn::Error::new_spanned(
+                        field,
+                        "`embed` requires the field to be #[searchable]",
+                    )
+                    .to_compile_error();
+                }
+            }
+            weight_type => {
                 let field_ident = field.ident.as_ref().unwrap();
                 let weight = match weight_type {
                     FieldSearchable::SearchableWithWeight(w) => w,
@@ -3529,11 +3604,34 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                     .to_compile_error();
                 }
+                if cfg.embed {
+                    if let Some(existing) = &search_embed_field {
+                        return syn::Error::new_spanned(
+                            field_ident,
+                            format!(
+                                "only one field may be marked #[searchable(embed)]; `{existing}` \
+                                 already is. A model has a single embedding per record — \
+                                 concatenate the fields you want embedded into one column."
+                            ),
+                        )
+                        .to_compile_error();
+                    }
+                    search_embed_field = Some(field_ident.to_string());
+                }
                 search_field_names.push(field_ident.to_string());
                 search_field_weights.push(weight_char);
+                search_field_idents.push(field_ident.clone());
             }
-            Err(err) => return err.to_compile_error(),
         }
+    }
+
+    if !is_searchable && search_embed_field.is_some() {
+        return syn::Error::new_spanned(
+            name,
+            "#[searchable(embed)] requires the model to be marked #[searchable] \
+             (add `#[searchable]` or `#[searchable(language = \"...\")]` above the struct)",
+        )
+        .to_compile_error();
     }
 
     let id_fields: Vec<&&Field> = all_fields.iter().filter(|f| has_attr(f, "id")).collect();
@@ -3590,6 +3688,173 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(err) => return err.to_compile_error(),
         }
     }
+
+    // ── #1191: the engine-agnostic search index definition + document ───────
+    //
+    // #842 already emits `AutumnSearchableModel` (the metadata the in-core
+    // Postgres/SQLite FTS reads). `SearchIndexed` is the *pluggable* half: it
+    // hands `autumn-search` an `IndexDefinition` and a per-record
+    // `SearchDocument` so any backend (Postgres+pgvector, Meilisearch, a
+    // vector store) can index the model with zero hand-written glue.
+    //
+    // Emitted only for a model that is actually searchable, declares at least
+    // one searchable field, and has an `i64` primary key — the id type every
+    // search index keys on (the in-core FTS `search()` already assumes it).
+    // A `#[searchable]` model with, say, a `Uuid` key keeps its #842 behaviour
+    // and simply has no plugin index.
+    let search_pk_ident: Option<&syn::Ident> = pk_field_for_factory.and_then(|(id, ty)| {
+        matches!(ty, syn::Type::Path(tp) if tp.path.is_ident("i64")).then_some(id)
+    });
+    let search_indexed_impl = match (is_searchable, search_pk_ident) {
+        (true, Some(pk_ident)) if !search_field_idents.is_empty() => {
+            // Diesel maps a struct field to the identically-named column, so
+            // the `#[id]` field's ident IS the key column name.
+            let search_pk_column = pk_ident.to_string();
+            let field_names = search_field_names.clone();
+            let field_weights = search_field_weights.clone();
+            let field_idents = search_field_idents.clone();
+            let embed_const = search_embed_field.as_ref().map_or_else(
+                || quote! { ::core::option::Option::None },
+                |field| quote! { ::core::option::Option::Some(#field) },
+            );
+            let embed_extract = search_embed_field.as_ref().map_or_else(
+                || quote! {},
+                |field| {
+                    let ident = syn::Ident::new(field, name.span());
+                    quote! {
+                        // An empty embed source stays `None`: embedding the
+                        // empty string would cost a provider call and pollute
+                        // k-NN results with a meaningless vector.
+                        let __autumn_embed =
+                            ::autumn_web::search::SearchTextValue::search_text_value(&self.#ident);
+                        if !__autumn_embed.is_empty() {
+                            __autumn_doc.embed_text = ::core::option::Option::Some(__autumn_embed);
+                        }
+                    }
+                },
+            );
+            // A model with a `tenant_id` column carries its tenant into every
+            // document, so any backend can fail closed on a cross-tenant read.
+            //
+            // Keyed on the name AND the type. An unrelated `tenant_id: i64`
+            // would otherwise stamp `tenant_id = "42"` on every document and
+            // make every real-tenant search return nothing; a `tenant_id` of
+            // some other type would fail to compile INSIDE generated code,
+            // pointing at a trait the user never mentioned. The rest of the
+            // macro's tenancy path already assumes `String`/`Option<String>`.
+            //
+            // This is the COLUMN check only. Whether the index is *scoped* to
+            // the tenant is a separate question, resolved at runtime from the
+            // repository — see `#tenant_scoped_expr` below.
+            let has_tenant_column = all_fields.iter().any(|f| {
+                f.ident.as_ref().is_some_and(|i| i == "tenant_id")
+                    && is_string_or_option_string(&f.ty)
+            });
+            // Tenant SCOPING follows `#[repository(tenant_scoped)]`, exactly as
+            // soft-delete follows `#[repository(soft_delete)]` — and for the
+            // same reason. A `tenant_id` column that is denormalized or audit
+            // data, on a repository that does not opt in, has unscoped
+            // finders; marking its index tenant-scoped anyway would make every
+            // search outside a tenant context fail with `TenantContextMissing`
+            // and every search inside one silently filter, neither of which
+            // matches what the app's own reads do.
+            //
+            // Column presence is still required: without a `tenant_id` the
+            // documents carry no tenant to filter on, so scoping would match
+            // nothing.
+            let tenant_scoped_expr = if has_tenant_column {
+                quote! { <Self>::__autumn_repo_tenant_scope() }
+            } else {
+                quote! { false }
+            };
+            let tenant_extract = if has_tenant_column {
+                quote! {
+                    let __autumn_tenant =
+                        ::autumn_web::search::SearchTextValue::search_text_value(&self.tenant_id);
+                    if !__autumn_tenant.is_empty() {
+                        __autumn_doc.tenant_id = ::core::option::Option::Some(__autumn_tenant);
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
+            quote! {
+                impl ::autumn_web::search::SearchIndexed for #name {
+                    const SEARCH_INDEX: &'static str = #table_name;
+                    const SEARCH_EMBED_FIELD: ::core::option::Option<&'static str> = #embed_const;
+
+                    fn index_definition() -> ::autumn_web::search::IndexDefinition {
+                        // In scope so the blanket `false` defaults resolve for
+                        // a model whose repository is not `soft_delete` /
+                        // `tenant_scoped` (or that has no repository at all).
+                        // An inherent override emitted by `#[repository(...)]`
+                        // still wins — see the unqualified `<Self>::` calls.
+                        use ::autumn_web::preload::AutumnPreloadScopeExt as _;
+
+                        const __AUTUMN_SEARCH_INDEX_FIELDS:
+                            &[::autumn_web::search::SearchIndexField] = &[
+                            #(::autumn_web::search::SearchIndexField::new(
+                                #field_names,
+                                #field_weights,
+                            )),*
+                        ];
+                        ::autumn_web::search::IndexDefinition::new(
+                            #table_name,
+                            #search_language,
+                            __AUTUMN_SEARCH_INDEX_FIELDS,
+                            #embed_const,
+                            #tenant_scoped_expr,
+                        )
+                        // The REAL key column, not the conventional `id`: a
+                        // backend that rebuilds documents from the source table
+                        // (backfill, reindex) selects and paginates on it, and
+                        // a model keyed on `article_id` would otherwise fail at
+                        // runtime with an undefined column.
+                        .with_key_column(#search_pk_column)
+                        // Resolved at RUNTIME through the same seam preload
+                        // uses: `#[repository(soft_delete)]` overrides this
+                        // inherently on the model, and `#[model]` cannot see
+                        // the repository attribute. A `deleted_at` column
+                        // alone does NOT mean soft delete — it is often audit
+                        // history, and those rows must stay indexed because
+                        // the model's finders still return them.
+                        //
+                        // UNQUALIFIED `<Self>::`, never `<Self as Trait>::`:
+                        // the override is an *inherent* associated fn, and
+                        // naming the trait would resolve straight past it to
+                        // the blanket `false` default — silently disabling the
+                        // filter for every genuinely soft-deleted model.
+                        .with_soft_delete(<Self>::__autumn_repo_soft_delete_scope())
+                    }
+
+                    fn search_id(&self) -> i64 {
+                        self.#pk_ident
+                    }
+
+                    fn search_document(&self) -> ::autumn_web::search::SearchDocument {
+                        let mut __autumn_doc = ::autumn_web::search::SearchDocument::new(
+                            #table_name,
+                            self.#pk_ident,
+                        );
+                        #(
+                            __autumn_doc = __autumn_doc.with_field(
+                                #field_names,
+                                #field_weights,
+                                ::autumn_web::search::SearchTextValue::search_text_value(
+                                    &self.#field_idents,
+                                ),
+                            );
+                        )*
+                        #embed_extract
+                        #tenant_extract
+                        __autumn_doc
+                    }
+                }
+            }
+        }
+        _ => quote! {},
+    };
 
     // Fields for NewX: exclude #[id], #[default], #[lock_version], and auto-detected ID fields
     let fields_for_new: Vec<&&Field> = all_fields
@@ -5797,6 +6062,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ];
         }
 
+        // ── Pluggable search index definition + document (#1191) ────────────
+        #search_indexed_impl
+
         // ── State machine impls (one per #[state_machine] field) ────────────
         #(#state_machine_impls)*
 
@@ -6711,6 +6979,210 @@ mod tests {
         };
         let err = validate_encrypted_field(&field).unwrap_err();
         assert!(err.to_string().contains("searchable"));
+    }
+
+    // ── #1191: `#[searchable(embed)]` parsing ───────────────────────────────
+
+    #[test]
+    fn tenant_id_detection_requires_a_string_shaped_column() {
+        assert!(is_string_or_option_string(&syn::parse_quote!(String)));
+        assert!(is_string_or_option_string(&syn::parse_quote!(
+            Option<String>
+        )));
+        assert!(is_string_or_option_string(&syn::parse_quote!(
+            ::std::option::Option<::std::string::String>
+        )));
+        // An unrelated `tenant_id: i64` must NOT make the index tenant-scoped.
+        assert!(!is_string_or_option_string(&syn::parse_quote!(i64)));
+        assert!(!is_string_or_option_string(&syn::parse_quote!(Option<i64>)));
+        assert!(!is_string_or_option_string(&syn::parse_quote!(Uuid)));
+    }
+
+    #[test]
+    fn a_non_string_tenant_id_column_does_not_make_the_index_tenant_scoped() {
+        let input: TokenStream = quote! {
+            #[searchable]
+            pub struct Reading {
+                #[id]
+                pub id: i64,
+                #[searchable]
+                pub label: String,
+                // A sensor reading's "tenant_id" that is really a device id.
+                pub tenant_id: i64,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(expanded.contains("SearchIndexed for Reading"), "{expanded}");
+        // The tenant extraction (and the tenant_scoped flag) must be absent.
+        assert!(
+            !expanded.contains("__autumn_tenant"),
+            "a non-String tenant_id must not be extracted: {expanded}"
+        );
+    }
+
+    #[test]
+    fn searchable_embed_flag_is_parsed_alongside_the_weight() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(weight = "B", embed)]
+            pub body: String
+        };
+        let cfg = parse_field_searchable(&field).expect("parses");
+        assert!(cfg.embed);
+        assert!(matches!(
+            cfg.kind,
+            FieldSearchable::SearchableWithWeight(ref w) if w == "B"
+        ));
+    }
+
+    #[test]
+    fn searchable_embed_alone_defaults_the_weight() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(embed)]
+            pub body: String
+        };
+        let cfg = parse_field_searchable(&field).expect("parses");
+        assert!(cfg.embed);
+        assert!(matches!(cfg.kind, FieldSearchable::SearchableDefault));
+    }
+
+    #[test]
+    fn searchable_without_embed_leaves_the_flag_off() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(weight = "A")]
+            pub title: String
+        };
+        assert!(!parse_field_searchable(&field).expect("parses").embed);
+
+        let bare: syn::Field = syn::parse_quote! {
+            #[searchable]
+            pub title: String
+        };
+        assert!(!parse_field_searchable(&bare).expect("parses").embed);
+
+        let none: syn::Field = syn::parse_quote! {
+            pub title: String
+        };
+        let cfg = parse_field_searchable(&none).expect("parses");
+        assert!(!cfg.embed);
+        assert!(matches!(cfg.kind, FieldSearchable::NotSearchable));
+    }
+
+    #[test]
+    fn unknown_searchable_key_names_the_supported_set() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(vectorize)]
+            pub body: String
+        };
+        let err = parse_field_searchable(&field).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("weight"), "{message}");
+        assert!(message.contains("embed"), "{message}");
+    }
+
+    #[test]
+    fn duplicate_embed_is_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(embed, embed)]
+            pub body: String
+        };
+        let err = parse_field_searchable(&field).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn two_embed_fields_are_rejected_by_the_model_macro() {
+        // A record has ONE embedding; two `embed` fields is ambiguous, so it
+        // must be a compile error rather than a silent last-wins.
+        let input: TokenStream = quote! {
+            #[searchable(language = "english")]
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[searchable(weight = "A", embed)]
+                pub title: String,
+                #[searchable(weight = "B", embed)]
+                pub body: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            expanded.contains("only one field may be marked"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn embed_without_a_model_level_searchable_is_rejected() {
+        // `#[searchable(embed)]` on a field of a model that is not itself
+        // `#[searchable]` would produce an index nothing ever queries.
+        let input: TokenStream = quote! {
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[searchable(embed)]
+                pub body: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            expanded.contains("requires the model to be marked"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn searchable_model_emits_the_search_indexed_impl() {
+        let input: TokenStream = quote! {
+            #[searchable(language = "english")]
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[searchable(weight = "A")]
+                pub title: String,
+                #[searchable(weight = "B", embed)]
+                pub body: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(expanded.contains("SearchIndexed for Article"), "{expanded}");
+        assert!(expanded.contains("SEARCH_EMBED_FIELD"), "{expanded}");
+    }
+
+    #[test]
+    fn non_searchable_model_emits_no_search_indexed_impl() {
+        let input: TokenStream = quote! {
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                pub title: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            !expanded.contains("SearchIndexed for Article"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn searchable_model_with_a_non_i64_key_emits_no_search_indexed_impl() {
+        // The plugin index keys on `i64` (as the in-core FTS already does), so
+        // a `Uuid`-keyed model keeps its #842 behaviour and simply has no
+        // pluggable index — rather than emitting an impl that cannot compile.
+        let input: TokenStream = quote! {
+            #[searchable]
+            pub struct Article {
+                #[id]
+                pub id: uuid::Uuid,
+                #[searchable]
+                pub title: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            !expanded.contains("SearchIndexed for Article"),
+            "{expanded}"
+        );
     }
 
     #[test]

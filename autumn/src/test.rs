@@ -917,7 +917,7 @@ impl TestApp {
     /// Enable `OpenAPI` spec generation for the test app.
     ///
     /// Mirrors [`crate::app::AppBuilder::openapi`] so integration tests
-    /// can exercise the `/v3/api-docs` and `/swagger-ui` endpoints.
+    /// can exercise the `/openapi.json` and `/swagger-ui` endpoints.
     ///
     /// Gated behind the `openapi` Cargo feature.
     #[cfg(feature = "openapi")]
@@ -1180,6 +1180,19 @@ impl TestApp {
     {
         use std::sync::Arc;
         let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        self.state_initializers.push(Box::new(move |state| {
+            state.insert_extension(service);
+        }));
+        self
+    }
+
+    /// Mirrors [`crate::app::AppBuilder::with_notification_store`].
+    #[must_use]
+    pub fn with_notification_store<S>(mut self, store: S) -> Self
+    where
+        S: crate::notifications::NotificationStore,
+    {
+        let service = crate::notifications::Notifications::new(store);
         self.state_initializers.push(Box::new(move |state| {
             state.insert_extension(service);
         }));
@@ -4192,6 +4205,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -4210,6 +4224,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -4228,6 +4243,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -4400,6 +4416,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         }];

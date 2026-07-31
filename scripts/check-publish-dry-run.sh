@@ -40,6 +40,7 @@ CRATES=(
   autumn-media-plugin
   autumn-storage-s3
   autumn-cache-redis
+  autumn-search
 )
 
 # Assets that MUST appear in a crate's packaged file list. `--list` does not

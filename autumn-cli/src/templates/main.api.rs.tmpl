@@ -9,7 +9,12 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 // `#[derive(serde::Serialize)]` (via `autumn_web::reexports::serde`) as your
 // API grows.
 
+// `#[public]` marks each handler below deliberately unauthenticated — see
+// `autumn routes audit` / docs/guide/route-auth-coverage.md. Replace it with
+// `#[secured]`/`#[authorize]` on any route that should require a signed-in
+// user or a dynamic policy check.
 #[get("/")]
+#[public]
 async fn index() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "name": "{{project_name}}",
@@ -18,6 +23,7 @@ async fn index() -> Json<serde_json::Value> {
 }
 
 #[get("/hello/{name}")]
+#[public]
 async fn hello_name(name: autumn_web::extract::Path<String>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "message": format!("Hello, {}!", *name),

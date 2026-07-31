@@ -402,6 +402,103 @@ fn ci_workflow_runs_a11y_verify() {
 }
 
 #[test]
+fn ci_workflow_runs_routes_audit() {
+    let temp_dir = scaffold("ci-routes-audit-app");
+    let project_dir = temp_dir.path().join("ci-routes-audit-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        ci.contains("run: autumn routes audit"),
+        "ci.yml must run `autumn routes audit` as a default-on route \
+         auth-coverage gate (#1604)"
+    );
+    // The gate must run after the CLI is installed (the a11y step's `run:`
+    // block), not require a second, separate install.
+    let a11y_pos = ci
+        .find("- name: Accessibility (a11y) verify")
+        .expect("a11y verify step present");
+    let audit_pos = ci
+        .find("run: autumn routes audit")
+        .expect("routes audit step present");
+    assert!(
+        audit_pos > a11y_pos,
+        "routes audit step must come after the CLI install (a11y step)"
+    );
+}
+
+/// Patch a scaffolded project's `Cargo.toml` to build against this workspace's
+/// `autumn-web` instead of a published crates.io version, mirroring
+/// `seed_model_linking::linked_seed_binary_cargo_checks`.
+fn patch_to_local_autumn_web(project: &std::path::Path) {
+    use std::fmt::Write as _;
+
+    let cargo_toml_path = project.join("Cargo.toml");
+    let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let autumn_web = workspace_root.join("autumn");
+    let _ = write!(
+        content,
+        "\n[patch.crates-io]\nautumn-web = {{ path = \"{}\" }}\n",
+        autumn_web.display().to_string().replace('\\', "/")
+    );
+    fs::write(&cargo_toml_path, content).unwrap();
+}
+
+/// Regression guard for the Codex review finding on PR #2154: the audit gate
+/// wired into scaffolded CI (`ci_workflow_runs_routes_audit`) is worthless —
+/// worse, actively hostile to first-run DX — if the scaffold it gates ships
+/// with unclassified starter routes. Every fresh `autumn new` app (and
+/// `autumn new --api`) must pass `autumn routes audit` with no changes,
+/// exactly as the generated CI step will run it.
+#[test]
+#[ignore = "slow: compiles a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn scaffolded_app_passes_routes_audit_gate() {
+    let temp_dir = scaffold("routes-audit-gate-app");
+    let project_dir = temp_dir.path().join("routes-audit-gate-app");
+    patch_to_local_autumn_web(&project_dir);
+
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let audit = Command::new(autumn_bin)
+        .args(["routes", "audit"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("failed to run `autumn routes audit`");
+    assert!(
+        audit.status.success(),
+        "a freshly scaffolded app must pass `autumn routes audit` unmodified \
+         (every starter handler needs #[public]/#[secured]/#[authorize]):\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&audit.stdout),
+        String::from_utf8_lossy(&audit.stderr),
+    );
+}
+
+/// Same guarantee as [`scaffolded_app_passes_routes_audit_gate`], for the
+/// `--api` JSON-first starter (`main.api.rs.tmpl`), which has its own set of
+/// starter handlers.
+#[test]
+#[ignore = "slow: compiles a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn scaffolded_api_app_passes_routes_audit_gate() {
+    let temp_dir = scaffold_with_flags("routes-audit-gate-api-app", &["--api"]);
+    let project_dir = temp_dir.path().join("routes-audit-gate-api-app");
+    patch_to_local_autumn_web(&project_dir);
+
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let audit = Command::new(autumn_bin)
+        .args(["routes", "audit"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("failed to run `autumn routes audit`");
+    assert!(
+        audit.status.success(),
+        "a freshly scaffolded --api app must pass `autumn routes audit` unmodified:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&audit.stdout),
+        String::from_utf8_lossy(&audit.stderr),
+    );
+}
+
+#[test]
 fn ci_workflow_pins_msrv_toolchain() {
     let temp_dir = scaffold("ci-msrv-app");
     let project_dir = temp_dir.path().join("ci-msrv-app");

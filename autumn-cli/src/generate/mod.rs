@@ -24,6 +24,7 @@ pub mod mailer;
 pub mod migration;
 pub mod model;
 pub mod naming;
+pub mod notifications;
 pub mod plugin;
 pub mod policy;
 pub mod pwa;

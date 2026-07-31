@@ -1,0 +1,5 @@
+error: duplicate `seo(...)` key `title`. Declare each key once.
+ --> tests/compile-fail/route_seo_duplicate_key.rs:3:34
+  |
+3 | #[get("/about", seo(title = "A", title = "B"))]
+  |                                  ^^^^^

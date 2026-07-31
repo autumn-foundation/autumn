@@ -664,6 +664,15 @@ spins up an isolated test DB and runs the suite like `rails test` /
 `rails destroy` for reverting a generator, and `autumn i18n check` gives you
 an i18n-tasks-style health report on missing and unused translation keys.
 
+`autumn console` is the closest thing to `rails console` (and Django's
+`manage.py shell`, Phoenix's `iex -S mix`) that Rust can honestly offer. There
+is no stable `eval` in the language, so instead of a line-by-line REPL it
+scaffolds `src/bin/playground.rs` — pre-wired with the same config, database
+URL, and pool your app resolves — and compiles and runs it on every
+invocation. You edit a real Rust file with real types and real autocompletion;
+the command owns the compile-and-run loop. See the
+[data playground guide](console.md).
+
 ---
 
 ## Recently Added: Cross-Framework Feature Map

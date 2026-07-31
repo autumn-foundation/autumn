@@ -63,10 +63,18 @@ pub(crate) const CHAOS_STREAM_SALT: u64 = 0xC7A0_5EED_C7A0_5EED;
 /// schedule.
 const CHAOS_SKEW_SALT: u64 = 0x5C0F_F5E7_5C0F_F5E7;
 
+/// Salt `XOR`ed into the sim seed to derive the **SMTP transport** decision
+/// sub-stream (W5.a, item 5). Kept independent of the DB/job stream so enabling
+/// the optional probabilistic mail lane never shifts their schedule; the
+/// explicit per-send schedule draws nothing at all and so is independent by
+/// construction.
+#[cfg(feature = "mail")]
+const CHAOS_MAIL_SALT: u64 = 0x3A11_FA17_3A11_FA17;
+
 /// Which chaos hook produced a [`ChaosEvent`].
 ///
-/// `#[non_exhaustive]` so later waves can add hooks (e.g. a mail-transport or
-/// channel-publish fault) without a breaking change.
+/// `#[non_exhaustive]` so later waves can add hooks (e.g. a channel-publish
+/// fault) without a breaking change.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChaosHook {
@@ -74,6 +82,41 @@ pub enum ChaosHook {
     DbCheckout,
     /// A job delivery decision made at enqueue time.
     JobDelivery,
+    /// An SMTP transport send decision (W5.a, item 5), made per outbound mail as
+    /// it passes through the fault-injecting mail interceptor. `fired` is `true`
+    /// when a scheduled (or probabilistic) [`MailFault`] was applied instead of
+    /// delegating to the real transport.
+    MailSend,
+}
+
+/// A transport fault injected on a specific SMTP send (W5.a, item 5, issue
+/// #1797).
+///
+/// Lets a test adversarially exercise its throttled-resume / retry path against
+/// a deterministic "send #7 fails, #8 times out" schedule.
+///
+/// `#[non_exhaustive]` so later waves can add fault shapes (a connection reset,
+/// a greylist deferral, …) without a breaking change.
+#[cfg(feature = "mail")]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailFault {
+    /// The send returns a permanent-ish delivery failure
+    /// ([`MailError::RuntimeUnavailable`](crate::mail::MailError::RuntimeUnavailable)),
+    /// modelling a transport that rejected the message outright.
+    Fail,
+    /// The send returns a timeout-shaped error
+    /// ([`MailError::Io`](crate::mail::MailError::Io) with
+    /// [`std::io::ErrorKind::TimedOut`]).
+    ///
+    /// Under the paused sim runtime this is a **deterministic, timeout-shaped
+    /// error returned immediately** — never a real hang. A genuine wall-clock
+    /// stall would either block the single-threaded paused runtime or require an
+    /// [`advance`](crate::sim::Sim::advance) to release it, both of which would
+    /// add timing nondeterminism; returning the timeout-shaped error at the send
+    /// seam keeps the fault schedule reproducible byte-for-byte while still
+    /// surfacing the exact error kind a real SMTP read-timeout produces.
+    Timeout,
 }
 
 /// One recorded fault decision.
@@ -126,6 +169,18 @@ pub struct Chaos {
     /// When set, install a wrapping clock offset by a deterministic amount in
     /// `[0, dur]`.
     clock_skew: Option<std::time::Duration>,
+    /// Explicit, deterministic per-send SMTP fault schedule (W5.a, item 5),
+    /// keyed by **1-based** send index (send #1 is the first send). An entry
+    /// draws no entropy at all, so the schedule is reproducible by construction.
+    #[cfg(feature = "mail")]
+    mail_fault_schedule: std::collections::BTreeMap<usize, MailFault>,
+    /// Probability an unscheduled SMTP send fails transiently
+    /// ([`MailFault::Fail`]), for parity with
+    /// [`db_transient_errors`](Chaos::db_transient_errors). Clamped to
+    /// `[0.0, 1.0]`; drawn from a dedicated mail sub-stream so it never shifts
+    /// the DB/job schedule.
+    #[cfg(feature = "mail")]
+    mail_transient_error_prob: f64,
 }
 
 impl Chaos {
@@ -169,19 +224,84 @@ impl Chaos {
         self
     }
 
+    /// Install a **deterministic SMTP transport fault schedule** (W5.a, item 5):
+    /// a map from a **1-based send index** to the [`MailFault`] to inject on that
+    /// send. `smtp_faults([(7, MailFault::Fail), (8, MailFault::Timeout)])` is
+    /// exactly the ratified "send #7 fails, #8 times out" example.
+    ///
+    /// The schedule is deterministic *by construction* — a scheduled send draws
+    /// no entropy, so a given schedule always injects the same faults on the same
+    /// sends, independent of seed, and never perturbs the DB/job decision stream.
+    /// Sends not named in the schedule delegate to the real transport (unless a
+    /// probabilistic [`smtp_transient_errors`](Chaos::smtp_transient_errors) rate
+    /// is also set). Each send is recorded as a [`ChaosHook::MailSend`] event.
+    ///
+    /// Later calls merge into the existing schedule (a duplicate index overwrites
+    /// its prior entry). An empty schedule installs nothing.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn smtp_faults(mut self, schedule: impl IntoIterator<Item = (usize, MailFault)>) -> Self {
+        for (index, fault) in schedule {
+            // A 0 index is meaningless for a 1-based send counter; ignore it so a
+            // caller typo never silently faults "send #1".
+            if index >= 1 {
+                self.mail_fault_schedule.insert(index, fault);
+            }
+        }
+        self
+    }
+
+    /// Set the probability that an SMTP send not named in the explicit
+    /// [`smtp_faults`](Chaos::smtp_faults) schedule fails transiently
+    /// ([`MailFault::Fail`]), for parity with
+    /// [`db_transient_errors`](Chaos::db_transient_errors).
+    ///
+    /// `p` is clamped to `[0.0, 1.0]`. The decision is drawn from a dedicated
+    /// seed-derived mail sub-stream (`seed ^ CHAOS_MAIL_SALT`), so it is
+    /// reproducible for a given seed and never shifts the DB/job schedule. An
+    /// explicit schedule entry always wins over the probabilistic draw.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn smtp_transient_errors(mut self, p: f64) -> Self {
+        self.mail_transient_error_prob = clamp_prob(p);
+        self
+    }
+
+    /// Whether any SMTP-transport fault (explicit schedule or probabilistic
+    /// rate) is configured.
+    #[cfg(feature = "mail")]
+    fn mail_chaos_active(&self) -> bool {
+        !self.mail_fault_schedule.is_empty() || self.mail_transient_error_prob > 0.0
+    }
+
     /// Whether this configuration installs any hook. A default `Chaos` is
     /// inactive, so [`Sim::build`](crate::sim::Sim::build) stays byte-for-byte
     /// unchanged when chaos is unused.
     pub(crate) fn is_active(&self) -> bool {
-        self.db_transient_error_prob > 0.0
+        if self.db_transient_error_prob > 0.0
             || self.job_duplicate_prob > 0.0
             || self.clock_skew.is_some()
+        {
+            return true;
+        }
+        #[cfg(feature = "mail")]
+        if self.mail_chaos_active() {
+            return true;
+        }
+        false
     }
 }
 
 /// Clamp a probability into `[0.0, 1.0]`, mapping `NaN` to `0.0`.
 fn clamp_prob(p: f64) -> f64 {
     if p.is_nan() { 0.0 } else { p.clamp(0.0, 1.0) }
+}
+
+/// Map a raw `u64` draw to a uniform value in `[0, 1)`: take the top 53 bits and
+/// divide by 2^53 (the f64 mantissa width, so the quotient is exact).
+#[allow(clippy::cast_precision_loss)] // 53-bit mantissa: the shifted value fits f64 exactly
+fn unit_from_draw(draw: u64) -> f64 {
+    (draw >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Shared runtime state backing every chaos hook for one simulation.
@@ -200,6 +320,18 @@ pub(crate) struct ChaosState {
     /// Set while an injected duplicate enqueue is in flight so its re-entrant
     /// pass through the interceptor makes no new decision (and cannot recurse).
     suppress_next_duplicate: AtomicBool,
+    /// Dedicated SMTP decision sub-stream (`seed ^ CHAOS_MAIL_SALT`), used only
+    /// by the probabilistic mail lane so it never shifts the DB/job schedule.
+    #[cfg(feature = "mail")]
+    mail_stream: Arc<dyn Entropy>,
+    /// The explicit 1-based per-send fault schedule.
+    #[cfg(feature = "mail")]
+    mail_fault_schedule: std::collections::BTreeMap<usize, MailFault>,
+    #[cfg(feature = "mail")]
+    mail_transient_error_prob: f64,
+    /// Per-send counter; the 1-based send index is `fetch_add(..) + 1`.
+    #[cfg(feature = "mail")]
+    mail_seq: AtomicU64,
     events: Mutex<Vec<ChaosEvent>>,
 }
 
@@ -213,19 +345,41 @@ impl ChaosState {
             checkout_seq: AtomicU64::new(0),
             job_seq: AtomicU64::new(0),
             suppress_next_duplicate: AtomicBool::new(false),
+            #[cfg(feature = "mail")]
+            mail_stream: SeededEntropy::shared(seed ^ CHAOS_MAIL_SALT),
+            #[cfg(feature = "mail")]
+            mail_fault_schedule: chaos.mail_fault_schedule.clone(),
+            #[cfg(feature = "mail")]
+            mail_transient_error_prob: chaos.mail_transient_error_prob,
+            #[cfg(feature = "mail")]
+            mail_seq: AtomicU64::new(0),
             events: Mutex::new(Vec::new()),
         })
     }
 
-    /// Draw one `u64` from the decision stream and decide whether a fault of
-    /// probability `prob` fires. Always consumes exactly one draw so the hook
+    /// Draw one `u64` from the DB/job decision stream and decide whether a fault
+    /// of probability `prob` fires. Always consumes exactly one draw so the hook
     /// order maps one-to-one onto the stream.
-    #[allow(clippy::cast_precision_loss)] // 53-bit mantissa: the shifted value fits f64 exactly
     fn decide(&self, prob: f64) -> bool {
-        let draw = self.stream.next_u64();
-        // Uniform in [0, 1): take the top 53 bits and divide by 2^53.
-        let unit = (draw >> 11) as f64 / (1u64 << 53) as f64;
-        unit < prob
+        unit_from_draw(self.stream.next_u64()) < prob
+    }
+
+    /// Resolve the SMTP fault (if any) for the 1-based `send_index`: an explicit
+    /// schedule entry always wins; otherwise draw the probabilistic transient
+    /// decision from the dedicated mail sub-stream. The draw happens **only**
+    /// when a rate is configured and the send is unscheduled, so an explicit-only
+    /// schedule consumes no mail entropy and stays independent by construction.
+    #[cfg(feature = "mail")]
+    fn resolve_mail_fault(&self, send_index: usize) -> Option<MailFault> {
+        if let Some(&fault) = self.mail_fault_schedule.get(&send_index) {
+            return Some(fault);
+        }
+        if self.mail_transient_error_prob > 0.0
+            && unit_from_draw(self.mail_stream.next_u64()) < self.mail_transient_error_prob
+        {
+            return Some(MailFault::Fail);
+        }
+        None
     }
 
     fn record(&self, hook: ChaosHook, seq: u64, fired: bool) {
@@ -303,6 +457,13 @@ pub(crate) fn install(
     #[cfg(feature = "db")]
     {
         app = app.with_db_interceptor(ChaosDbInterceptor {
+            state: Arc::clone(&state),
+        });
+    }
+
+    #[cfg(feature = "mail")]
+    if !state.mail_fault_schedule.is_empty() || state.mail_transient_error_prob > 0.0 {
+        app = app.with_mail_interceptor(ChaosMailInterceptor {
             state: Arc::clone(&state),
         });
     }
@@ -429,6 +590,56 @@ impl crate::interceptor::DbConnectionInterceptor for ChaosDbInterceptor {
     }
 }
 
+/// Fault-injecting [`crate::interceptor::MailInterceptor`] for the SMTP
+/// transport fault schedule (W5.a, item 5).
+///
+/// Maintains a **1-based** per-send counter. On each send it resolves the
+/// scheduled (or probabilistic) [`MailFault`] via
+/// [`ChaosState::resolve_mail_fault`], records a [`ChaosHook::MailSend`] event,
+/// and either returns the corresponding fault-shaped
+/// [`MailError`](crate::mail::MailError) **without touching the real transport**
+/// or delegates to `next`. Because the fault is keyed on send sequence, a
+/// retry/resume path that re-sends is exercised deterministically ("send #7
+/// fails, #8 times out" happens on exactly the 7th and 8th sends of the run).
+#[cfg(feature = "mail")]
+struct ChaosMailInterceptor {
+    state: Arc<ChaosState>,
+}
+
+#[cfg(feature = "mail")]
+impl crate::interceptor::MailInterceptor for ChaosMailInterceptor {
+    fn intercept<'a>(
+        &'a self,
+        _mail: &'a crate::mail::Mail,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            // 1-based send index so `smtp_faults([(7, …)])` faults the 7th send.
+            let send_index = self.state.mail_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let fault = self
+                .state
+                .resolve_mail_fault(usize::try_from(send_index).unwrap_or(usize::MAX));
+            // Record with the 0-based `seq`, consistent with the other hooks.
+            self.state
+                .record(ChaosHook::MailSend, send_index - 1, fault.is_some());
+            match fault {
+                Some(MailFault::Fail) => Err(crate::mail::MailError::RuntimeUnavailable(
+                    "chaos: injected SMTP send failure".to_owned(),
+                )),
+                Some(MailFault::Timeout) => Err(crate::mail::MailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "chaos: injected SMTP send timeout",
+                ))),
+                None => next.await,
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Chaos, ChaosHook, ChaosState, clamp_prob, deterministic_skew};
@@ -518,5 +729,88 @@ mod tests {
             deterministic_skew(99, std::time::Duration::ZERO),
             chrono::Duration::zero()
         );
+    }
+
+    // ---- W5.a (item 5): SMTP transport fault schedule ----
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn mail_faults_activate_chaos() {
+        use super::MailFault;
+        assert!(
+            Chaos::default()
+                .smtp_faults([(7, MailFault::Fail), (8, MailFault::Timeout)])
+                .is_active(),
+            "an explicit schedule activates chaos"
+        );
+        assert!(
+            Chaos::default().smtp_transient_errors(0.01).is_active(),
+            "a probabilistic rate activates chaos"
+        );
+        // An empty schedule / zero rate leaves the config inactive (default
+        // `Sim::build` unchanged).
+        assert!(!Chaos::default().smtp_faults([]).is_active());
+        assert!(!Chaos::default().smtp_transient_errors(0.0).is_active());
+    }
+
+    // The explicit schedule maps a 1-based send index to its fault and draws no
+    // entropy, so it is deterministic by construction — independent of seed.
+    #[cfg(feature = "mail")]
+    #[test]
+    fn explicit_schedule_is_1_based_and_seed_independent() {
+        use super::MailFault;
+        let chaos = Chaos::default().smtp_faults([(7, MailFault::Fail), (8, MailFault::Timeout)]);
+        for seed in [1u64, 42, 0x5EED] {
+            let state = ChaosState::new(seed, &chaos);
+            assert_eq!(state.resolve_mail_fault(6), None, "send #6 is unscheduled");
+            assert_eq!(state.resolve_mail_fault(7), Some(MailFault::Fail));
+            assert_eq!(state.resolve_mail_fault(8), Some(MailFault::Timeout));
+            assert_eq!(state.resolve_mail_fault(9), None, "send #9 is unscheduled");
+        }
+        // A 0 index is rejected by the builder (the counter is 1-based).
+        let zeroed = Chaos::default().smtp_faults([(0, MailFault::Fail)]);
+        assert!(!zeroed.is_active());
+    }
+
+    // An explicit schedule entry always wins over the probabilistic rate, and the
+    // probabilistic lane is drawn from the dedicated, seed-deterministic mail
+    // sub-stream.
+    #[cfg(feature = "mail")]
+    #[test]
+    fn schedule_wins_over_probabilistic_and_prob_is_seed_deterministic() {
+        use super::MailFault;
+        // p=1.0 everywhere, but the scheduled Timeout on #8 still wins.
+        let chaos = Chaos::default()
+            .smtp_faults([(8, MailFault::Timeout)])
+            .smtp_transient_errors(1.0);
+        let state = ChaosState::new(3, &chaos);
+        assert_eq!(
+            state.resolve_mail_fault(1),
+            Some(MailFault::Fail),
+            "p=1.0 faults an unscheduled send transiently"
+        );
+        // (send #8 would be next, but assert the precedence on a fresh state so
+        // the draw sequence does not matter.)
+        let state2 = ChaosState::new(3, &chaos);
+        assert_eq!(
+            state2.resolve_mail_fault(8),
+            Some(MailFault::Timeout),
+            "an explicit entry wins over the probabilistic rate"
+        );
+
+        // Same seed ⇒ identical probabilistic decisions on the mail sub-stream.
+        let prob_only = Chaos::default().smtp_transient_errors(0.5);
+        let draw = |seed: u64| {
+            let state = ChaosState::new(seed, &prob_only);
+            (1..=32)
+                .map(|i| state.resolve_mail_fault(i).is_some())
+                .collect::<Vec<bool>>()
+        };
+        assert_eq!(
+            draw(77),
+            draw(77),
+            "same seed replays the same mail schedule"
+        );
+        assert_ne!(draw(77), draw(78), "different seeds diverge");
     }
 }

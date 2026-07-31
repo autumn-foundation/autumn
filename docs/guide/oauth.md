@@ -2,6 +2,11 @@
 
 Autumn supports first-class OAuth2 and OpenID Connect (OIDC) login via the `--oauth` flag on `autumn generate auth`.
 
+OAuth is one identity source among several. For the session, password, and
+route-guard machinery every sign-in path shares — including what a successful
+OAuth callback ultimately writes into the session — start from the
+[authentication guide](./authentication.md).
+
 ## Quick start
 
 ```sh

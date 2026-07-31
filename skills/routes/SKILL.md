@@ -86,11 +86,21 @@ On trunk-dev, `autumn routes audit` audits every route's authentication
 exposure. It prints each route's classification — `gated`, `public`,
 `framework`, or `unclassified` — and emits a stable-ordered (by path, then
 method) JSON security manifest. It exits non-zero on any `unclassified` (or
-omitted) route, so it can gate CI.
+omitted) route, so it can gate CI. `autumn new` now wires this into every
+scaffolded app's `.github/workflows/ci.yml` by default (right after the
+a11y-verify step, reusing its installed CLI), so a fresh app fails CI on day
+one if a route is left unclassified.
 
 Mark a deliberately-unauthenticated handler with the new `#[public]` attribute
 (mirrors `#[secured]`) to classify it as `public` and clear it from the
 `unclassified` set.
+
+An unclassified-route diagnostic now names the offending handler's `file:line`
+(from `file!()`/`line!()`) alongside its module, e.g. `POST /widgets (handler
+`create_widget` [myapp::widgets] at src/routes/widgets.rs:12)`, so it can be
+jumped to directly. See `docs/guide/route-auth-coverage.md` for the full
+default-deny posture model and how to classify `gated`/`public`/`framework`
+routes.
 
 ## Comparing expected vs actual routes
 

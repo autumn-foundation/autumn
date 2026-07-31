@@ -296,6 +296,7 @@ mod tests {
             name,
             revalidate: None,
             params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         }
     }
 
@@ -309,6 +310,7 @@ mod tests {
             name,
             revalidate: Some(revalidate),
             params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         }
     }
 
@@ -475,6 +477,7 @@ mod tests {
             name: "show_post",
             revalidate: None,
             params_fn: Some(slug_params_hello_world),
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
 
         let result = render_static_routes(echo_router(), &[meta], &dist).await;
@@ -504,6 +507,7 @@ mod tests {
             name: "blog_post",
             revalidate: None,
             params_fn: Some(multi_params),
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
 
         let result = render_static_routes(echo_router(), &[meta], &dist).await;
@@ -531,6 +535,7 @@ mod tests {
                 name: "show_post",
                 revalidate: None,
                 params_fn: Some(slug_params_alpha_beta),
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
             },
         ];
 
@@ -556,6 +561,7 @@ mod tests {
             name: "show_post",
             revalidate: Some(3600),
             params_fn: Some(slug_params_hello),
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
 
         let result = render_static_routes(echo_router(), &[meta], &dist).await;

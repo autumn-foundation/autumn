@@ -3,7 +3,7 @@
 //! Covers:
 //! * Route macros emit the expected `ApiDoc` metadata.
 //! * `#[api_doc(...)]` overrides flow through to the generated spec.
-//! * `AppBuilder::openapi(...)` mounts `/v3/api-docs` and `/swagger-ui`.
+//! * `AppBuilder::openapi(...)` mounts `/openapi.json` and `/swagger-ui`.
 
 #![cfg(feature = "openapi")]
 

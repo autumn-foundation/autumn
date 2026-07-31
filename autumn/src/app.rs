@@ -402,7 +402,7 @@ pub struct AppBuilder {
     /// destinations are used. See [`crate::alerts`].
     pub(crate) alert_channels: Vec<Arc<dyn crate::alerts::AlertChannel>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
-    /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
+    /// `/openapi.json` (serving the generated spec) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
     ///
     /// Gated behind the `openapi` feature: apps that don't need a
@@ -736,12 +736,14 @@ impl AppBuilder {
     /// [`ApiDoc`](crate::openapi::ApiDoc) metadata — inferred at compile
     /// time from the route path, HTTP method, extractor types, and any
     /// [`#[api_doc(...)]`](crate::api_doc) overrides — and serves an
-    /// `OpenAPI` 3.0 JSON document at `OpenApiConfig::openapi_json_path`
-    /// (default `/v3/api-docs`). If
+    /// `OpenAPI` 3.1 JSON document at `OpenApiConfig::openapi_json_path`
+    /// (default `/openapi.json`). If
     /// `OpenApiConfig::swagger_ui_path` is set (default `/swagger-ui`),
     /// a Swagger UI HTML page is served there too.
     ///
     /// Routes marked `#[api_doc(hidden)]` are excluded.
+    ///
+    /// Narrative guide: `docs/guide/openapi.md`.
     ///
     /// **Gated behind the `openapi` Cargo feature.** Add
     /// `features = ["openapi"]` to your `autumn-web` dependency to
@@ -2118,6 +2120,40 @@ impl AppBuilder {
         })
     }
 
+    /// Register a notification store, overriding the default resolution used
+    /// by the [`Notifications`] extractor.
+    ///
+    /// Without this call the extractor resolves its store automatically: the
+    /// database-backed [`DbNotificationStore`] when a pool is configured (the
+    /// `notifications` table is scaffolded by `autumn generate
+    /// notifications`), the process-local
+    /// [`MemoryNotificationStore`](crate::notifications::MemoryNotificationStore)
+    /// otherwise. Register a store explicitly to plug in a custom backend.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::notifications::MemoryNotificationStore;
+    ///
+    /// autumn_web::app()
+    ///     .with_notification_store(MemoryNotificationStore::new())
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// [`Notifications`]: crate::notifications::Notifications
+    /// [`DbNotificationStore`]: crate::notifications::DbNotificationStore
+    #[must_use]
+    pub fn with_notification_store<S>(self, store: S) -> Self
+    where
+        S: crate::notifications::NotificationStore,
+    {
+        let service = crate::notifications::Notifications::new(store);
+        self.state_initializer(move |state| {
+            state.insert_extension(service);
+        })
+    }
+
     /// Register an experiment store with a custom [`ExposureSink`].
     ///
     /// Use when you want to forward exposure events to an analytics pipeline
@@ -3320,7 +3356,14 @@ impl AppBuilder {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
             let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
-            let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
+            // A static route that declared `seo(robots = "noindex")` must not
+            // be advertised in sitemap.xml — otherwise the app tells crawlers
+            // "here is this URL" and "do not index it" at the same time (#1182).
+            let static_paths: Vec<&str> = static_metas
+                .iter()
+                .filter(|m| !crate::seo::defaults_exclude_from_sitemap(m.seo))
+                .map(|m| m.path)
+                .collect();
             let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
                 profile,
                 seo_cfg.base_url.as_deref(),
@@ -4729,7 +4772,14 @@ impl AppBuilder {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
             let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
-            let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
+            // A static route that declared `seo(robots = "noindex")` must not
+            // be advertised in sitemap.xml — otherwise the app tells crawlers
+            // "here is this URL" and "do not index it" at the same time (#1182).
+            let static_paths: Vec<&str> = static_metas
+                .iter()
+                .filter(|m| !crate::seo::defaults_exclude_from_sitemap(m.seo))
+                .map(|m| m.path)
+                .collect();
             let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
                 profile,
                 seo_cfg.base_url.as_deref(),
@@ -8651,6 +8701,7 @@ mod validate_repository_api_policies_tests {
             repository: meta,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         }
@@ -10669,6 +10720,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         }
@@ -10793,6 +10845,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             }],
@@ -10825,6 +10878,7 @@ mod tests {
                 name: "localized",
                 revalidate: None,
                 params_fn: None,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
             }],
             &dist,
         )
@@ -11248,6 +11302,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         }];
@@ -11322,6 +11377,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -11340,6 +11396,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -11697,6 +11754,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
                 }],
@@ -11713,6 +11771,7 @@ mod tests {
                     name: "about",
                     revalidate: None,
                     params_fn: None,
+                    seo: crate::seo::SeoRouteDefaults::EMPTY,
                 }],
                 &dist,
             )
@@ -11755,6 +11814,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
                 }]);
@@ -11911,6 +11971,7 @@ mod tests {
             name: "about",
             revalidate: None,
             params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         }];
         let builder = app().static_routes(metas);
         assert_eq!(builder.static_metas.len(), 1);
