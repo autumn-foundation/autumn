@@ -1508,3 +1508,87 @@ pub(crate) fn install_registry_from_config(
     state.insert_extension(registry);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn should_extract_slack_delivery_id_from_event_id() {
+        let payload = json!({
+            "event_id": "Ev12345",
+            "type": "event_callback"
+        });
+        assert_eq!(
+            slack_delivery_id(Some(&payload)),
+            Some("Ev12345".to_owned())
+        );
+    }
+
+    #[test]
+    fn should_extract_slack_delivery_id_from_url_verification_challenge() {
+        let payload = json!({
+            "type": "url_verification",
+            "challenge": "Ch9876"
+        });
+        assert_eq!(slack_delivery_id(Some(&payload)), Some("Ch9876".to_owned()));
+    }
+
+    #[test]
+    fn should_return_none_when_slack_payload_missing_identifiers() {
+        let payload = json!({
+            "type": "event_callback",
+            "text": "hello"
+        });
+        assert_eq!(slack_delivery_id(Some(&payload)), None);
+    }
+
+    #[test]
+    fn should_return_none_when_slack_payload_is_none() {
+        assert_eq!(slack_delivery_id(None), None);
+    }
+
+    #[test]
+    fn should_extract_json_string_field() {
+        let payload = json!({
+            "id": "123",
+            "count": 45
+        });
+        assert_eq!(
+            json_string_field(Some(&payload), "id"),
+            Some("123".to_owned())
+        );
+        assert_eq!(json_string_field(Some(&payload), "count"), None); // Not a string
+        assert_eq!(json_string_field(Some(&payload), "missing"), None);
+        assert_eq!(json_string_field(None, "id"), None);
+    }
+
+    #[test]
+    fn should_extract_nested_json_string_field() {
+        let payload = json!({
+            "event": {
+                "type": "message",
+                "count": 1
+            },
+            "other": "value"
+        });
+        assert_eq!(
+            nested_json_string_field(Some(&payload), "event", "type"),
+            Some("message".to_owned())
+        );
+        assert_eq!(
+            nested_json_string_field(Some(&payload), "event", "count"),
+            None
+        ); // Not a string
+        assert_eq!(
+            nested_json_string_field(Some(&payload), "event", "missing"),
+            None
+        );
+        assert_eq!(
+            nested_json_string_field(Some(&payload), "missing", "type"),
+            None
+        );
+        assert_eq!(nested_json_string_field(None, "event", "type"), None);
+    }
+}
