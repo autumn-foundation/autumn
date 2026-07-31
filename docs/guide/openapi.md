@@ -454,6 +454,15 @@ status codes the operation does not already document, so an operation whose
 success status is one of them (`#[api_doc(status = 409)]`, say) keeps your
 declaration.
 
+> **The contract covers framework errors, and the document does not say so.**
+> `AutumnError` is what produces a `problem+json` body. A handler returning
+> `Result<Json<T>, E>` for its own `E: IntoResponse` emits whatever `E` emits —
+> plain text, a bespoke JSON shape, any media type — and nothing normalizes it
+> on the way out. The route macro reads only the `Ok` side, so those ten
+> responses are still advertised on that operation, and a generated client will
+> try to parse your custom error as `ProblemDetails`. Return `AutumnError`
+> (or convert into it) on any endpoint whose spec a client consumes.
+
 ---
 
 ## 6. Security schemes
