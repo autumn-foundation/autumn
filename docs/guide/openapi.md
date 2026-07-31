@@ -117,19 +117,36 @@ alone rather than guessed at, because a wrong schema is worse than an absent
 one. A handler returning `impl IntoResponse`, `Markup`, `Sse`, or a redirect
 contributes an operation with no response body schema.
 
+Three places where the generated document can describe a request the handler
+will not accept. None of them fails the build:
+
 > **`Query<T>` must be flat — scalars only.** The `style: form, explode: true`
 > mapping is accurate only while every field of `T` is a scalar. `Query<T>`
 > decodes with `serde_urlencoded`, which handles neither nested objects nor
 > **sequences**: a `Vec<String>` field advertised as an array is sent by a
 > conforming client as `?tags=a&tags=b` and fails to deserialize with
-> `invalid type: string "a", expected a sequence`. The generator advertises
-> both shapes anyway, so the spec can describe a query the handler cannot
-> accept. Take anything but scalars as a JSON body.
+> `invalid type: string "a", expected a sequence`. Take anything but scalars as
+> a JSON body.
 >
 > The MCP projection notices the nested-object case and logs a build-time
 > `tracing::warn`, but it still publishes the tool — so it appears in
 > `tools/list` and fails when an agent calls it. Neither output refuses to
 > generate; both only warn at best.
+
+> **The query parameter is always `required: false`.** That flag is emitted
+> unconditionally, whatever `T` looks like. If `T` has a non-`Option` field, a
+> client that follows the spec and omits the query string entirely gets a
+> deserialization failure. Make genuinely-optional query fields `Option<T>`,
+> and say so in the operation's `description` when the query is in fact
+> mandatory.
+
+> **Catch-all routes do not survive the translation.** Axum's
+> `#[get("/files/{*rest}")]` reaches the document with its path template
+> unchanged and a path parameter literally named `*rest`. OpenAPI has no
+> slash-spanning parameter, so a generated client cannot reliably call
+> `/files/a/b`. (The MCP projection strips the `*`; the OpenAPI side does not.)
+> Treat catch-all routes as undocumentable — `#[api_doc(hidden)]` if the noise
+> matters.
 
 ### A worked example
 
