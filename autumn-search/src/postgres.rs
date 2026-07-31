@@ -825,35 +825,39 @@ impl SearchBackend for PostgresSearchStore {
                 return Ok(());
             }
             let mut conn = self.conn().await?;
-            let binds = [
-                Bound::Text(definition.name.to_owned()),
-                Bound::Ids(ids.to_vec()),
-            ];
+            // ONE statement, via a data-modifying CTE.
+            //
+            // Removing the document and recording the delete are two halves of
+            // a single fact, and a concurrent backfill must never observe the
+            // gap between them: after the DELETE commits but before the ledger
+            // row exists, a watermarked insert sees no document to conflict
+            // with AND no delete to be blocked by, so it re-creates the record
+            // — and writing the tombstone afterwards does not take it back
+            // out. Two autocommitted statements have exactly that window.
+            //
+            // A CTE rather than an explicit transaction because a single
+            // statement is atomic under autocommit with nothing to roll back,
+            // and it keeps this off diesel-async's transaction API. Postgres
+            // runs a data-modifying CTE to completion whether or not the outer
+            // query reads it, so the DELETE needs no RETURNING.
+            //
+            // `deleted_at` is refreshed on a replayed delete so a retry cannot
+            // age out earlier than the delete it repeats.
             bind_all(
                 diesel::sql_query(format!(
-                    "DELETE FROM {DOCUMENTS_TABLE} \
-                     WHERE index_name = $1 AND record_id = ANY($2)"
-                ))
-                .into_boxed::<autumn_web::RuntimeBackend>(),
-                binds.clone(),
-            )
-            .execute(&mut conn)
-            .await
-            .map_err(SearchError::backend)?;
-
-            // Record the delete so it OUTLIVES the document. Without this a
-            // backfill batch scanned before the delete finds no row to
-            // conflict with, inserts unconditionally, and resurrects a record
-            // someone deleted. `deleted_at` is refreshed on re-delete so a
-            // replayed delete cannot age out early.
-            bind_all(
-                diesel::sql_query(format!(
-                    "INSERT INTO {DELETES_TABLE} (index_name, record_id) \
+                    "WITH removed AS ( \
+                       DELETE FROM {DOCUMENTS_TABLE} \
+                        WHERE index_name = $1 AND record_id = ANY($2) \
+                     ) \
+                     INSERT INTO {DELETES_TABLE} (index_name, record_id) \
                      SELECT $1, unnest($2::bigint[]) \
                      ON CONFLICT (index_name, record_id) DO UPDATE SET deleted_at = NOW()"
                 ))
                 .into_boxed::<autumn_web::RuntimeBackend>(),
-                binds,
+                [
+                    Bound::Text(definition.name.to_owned()),
+                    Bound::Ids(ids.to_vec()),
+                ],
             )
             .execute(&mut conn)
             .await
@@ -866,21 +870,21 @@ impl SearchBackend for PostgresSearchStore {
         Box::pin(async move {
             checked(definition)?;
             let mut conn = self.conn().await?;
+            // Documents and ledger in ONE statement, for the same reason
+            // `delete` uses a CTE: a purge is a deliberate reset, and a
+            // concurrent write must not be able to observe half of it. The
+            // ledger has to go too, or the rebuild that follows would silently
+            // skip everything previously deleted.
             diesel::sql_query(format!(
-                "DELETE FROM {DOCUMENTS_TABLE} WHERE index_name = $1"
+                "WITH removed AS ( \
+                   DELETE FROM {DOCUMENTS_TABLE} WHERE index_name = $1 \
+                 ) \
+                 DELETE FROM {DELETES_TABLE} WHERE index_name = $1"
             ))
             .bind::<Text, _>(definition.name.to_owned())
             .execute(&mut conn)
             .await
             .map_err(SearchError::backend)?;
-            // The ledger goes with it: a purge is a deliberate reset, and the
-            // backfill that follows is *supposed* to rewrite everything.
-            // Leaving tombstones behind would make it silently skip records.
-            diesel::sql_query(format!("DELETE FROM {DELETES_TABLE} WHERE index_name = $1"))
-                .bind::<Text, _>(definition.name.to_owned())
-                .execute(&mut conn)
-                .await
-                .map_err(SearchError::backend)?;
             Ok(())
         })
     }

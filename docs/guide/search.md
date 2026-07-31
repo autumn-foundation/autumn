@@ -384,7 +384,10 @@ A backfill takes a **write watermark** before its first batch and never
 overwrites — or re-creates — a record touched after that point. Deletes are
 recorded in a ledger that outlives the document, because once the row is gone
 there is nothing left for a conditional write to compare against, and an
-unguarded insert would resurrect something a user deleted. Without it, a backfill batch —
+unguarded insert would resurrect something a user deleted. Removing the
+document and recording the delete happen in **one statement** — they are two
+halves of a single fact, and a backfill that observed the gap between them
+would see neither the document nor the tombstone. Without it, a backfill batch —
 read minutes ago, then delayed by an embedding round-trip — would clobber
 whatever a per-record reindex wrote in the meantime, and nothing re-runs that
 reindex. Newer always wins, so the bulk and per-record writers converge without
