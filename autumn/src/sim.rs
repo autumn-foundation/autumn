@@ -87,6 +87,15 @@ pub mod chaos;
 pub use chaos::MailFault;
 pub use chaos::{Chaos, ChaosEvent, ChaosHook};
 
+// The seeded LLM stub (W5.b, item 6, issue #1797): a deterministic fake
+// completion client — canned responses + a seeded fault/latency schedule — for
+// exercising agent retry/fallback paths under the virtual clock. Standalone and
+// additive; it does not route through the `Chaos` builder. See the module docs
+// for the determinism contract.
+pub mod llm;
+
+pub use llm::{LlmCall, LlmClient, LlmError, LlmRequest, LlmResponse, SeededLlm, SeededLlmBuilder};
+
 // The W6 semantic core (issue #1797): the `always!` / `sometimes!` assertion
 // macros and the thread-local non-vacuity registry. Public (documented) module —
 // the macros are `#[macro_export]`ed at the crate root (`autumn_web::always` /

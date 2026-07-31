@@ -511,6 +511,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (empty) `Chaos` leaves the build byte-for-byte unchanged. Probabilities are
   clamped to `[0.0, 1.0]`. This is W5.0 (chaos scaffolding + chaos-v1 base); the
   richer per-fault surfaces build additively on it. [no-plugin]
+- **sim-testing:** a **seeded LLM stub** (`sim::llm`, W5.b, item 6, #1797) — a
+  deterministic fake completion client for exercising an agent's retry/fallback
+  paths under the paused virtual clock, with **no network and no real model**.
+  `SeededLlm::builder(seed)` (or `::from_entropy`) configures canned
+  `canned_response(prompt_match, response)` pairs (a seed-derived deterministic
+  fallback answers unmatched prompts), an explicit per-call
+  `fault_at(call_index, LlmError)` schedule plus an optional probabilistic
+  `fault_probability(p, error)` lane, and a `latency_up_to(max)` window; the
+  built `SeededLlm` implements the `LlmClient` trait (`LlmRequest` →
+  `LlmResponse`/`LlmError`). Every decision is drawn from a **dedicated seeded
+  stream**, so the **same seed replays the identical `(response, fault, latency)`
+  sequence byte-for-byte** while a different seed diverges; injected latency is
+  only observable after `Sim::advance`, keeping it integrated with virtual time.
+  Recorded calls are readable via `SeededLlm::calls()`. Standalone and additive
+  — it does not route through the `Chaos` builder and touches no default build.
+  This is W5.b; it stacks on W5.0 and is a sibling of W5.a (item 5). [no-plugin]
 - **sim-testing:** the chaos lane gained a **deterministic SMTP transport fault
   schedule** (W5.a, item 5, #1797), gated on the `mail` feature. `Chaos::smtp_faults([(7, MailFault::Fail), (8, MailFault::Timeout)])`
   maps a **1-based send index** to a `MailFault` (`#[non_exhaustive]`; `Fail`
