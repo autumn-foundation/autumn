@@ -368,6 +368,13 @@ jobs:
             --test sqlite_jobs_scheduler_e2e \
             --test sim_sqlite_substrate \
             --test sim_sqlite_integration
+      - name: Run the sqlite mail-chaos suite (W5.a, issue #1797)
+        # `sim_chaos_mail` needs the `mail` feature for the mail
+        # interceptor/transport surface, so it runs as its own invocation to
+        # avoid widening the feature set of the other sqlite tests above.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support,mail" \
+            --test sim_chaos_mail
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings

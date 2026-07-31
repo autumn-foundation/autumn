@@ -83,6 +83,8 @@ pub mod substrate;
 // nothing. See the module docs for the determinism contract.
 pub mod chaos;
 
+#[cfg(feature = "mail")]
+pub use chaos::MailFault;
 pub use chaos::{Chaos, ChaosEvent, ChaosHook};
 
 // The W6 semantic core (issue #1797): the `always!` / `sometimes!` assertion

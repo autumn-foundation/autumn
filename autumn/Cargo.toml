@@ -655,6 +655,18 @@ path = "tests/sim_sqlite_substrate.rs"
 name = "sim_chaos"
 path = "tests/sim_chaos.rs"
 
+# W5.a (item 5, issue #1797): deterministic per-send SMTP transport fault
+# schedule ("send #7 fails, #8 times out") over the in-memory SQLite sim
+# substrate. Same isolated-binary rationale as `sim_chaos` above, but it needs
+# the `mail` feature for the mail interceptor/transport surface, so the file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support", feature = "mail"))]`
+# and a default `cargo test` compiles it to an empty (passing) binary. Runs
+# without Docker (Log mail transport). Run:
+# `cargo test -p autumn-web --features "sqlite,test-support,mail" --test sim_chaos_mail`.
+[[test]]
+name = "sim_chaos_mail"
+path = "tests/sim_chaos_mail.rs"
+
 # Sim-testing W4 ↔ W2 integration (issue #1797): wires the merged W4
 # `sim::substrate::SqliteSubstrate` (#2106) through the merged W2 public `Sim` API
 # (#2104). Drives a 24h-backoff `#[job]` to completion via `sim.build` +
