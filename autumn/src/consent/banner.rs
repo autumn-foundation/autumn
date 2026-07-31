@@ -137,6 +137,11 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 /// could have one visitor's CSRF token served to every other visitor (and
 /// any CDN/proxy in between) until the cache entry expires.
 ///
+/// If the response already contains the banner's own marker class (e.g. a
+/// "manage cookie preferences" handler rendered [`consent_banner_markup`]
+/// itself so an already-decided visitor can change their choice), this
+/// middleware skips injection rather than adding a second, identical copy.
+///
 /// # Known limitation: `#[static_get]` pages and CSRF
 ///
 /// A first-time visitor whose very first hit lands on a pre-rendered
@@ -231,9 +236,12 @@ enum CollectedBody {
     /// body (finding `</body>` would require buffering arbitrarily more), so
     /// unlike the CSRF version there is no separate scan-prefix to return.
     Oversized(Body),
-    /// The body stream errored before EOF. The bytes read so far are
-    /// discarded.
-    Errored,
+    /// The body stream errored before EOF. Carries the bytes read so far and
+    /// the underlying error, so the caller can replay the prefix and then
+    /// end the reconstructed body with the same error — an honest abnormal
+    /// close — rather than silently discarding everything and returning a
+    /// well-formed, misleadingly-complete-looking empty response.
+    Errored { prefix: Bytes, error: axum::Error },
 }
 
 /// Buffer `body` up to `limit` bytes without failing when the body is larger,
@@ -246,7 +254,12 @@ async fn collect_body_prefix(body: Body, limit: usize) -> CollectedBody {
     loop {
         match stream.next().await {
             None => break,
-            Some(Err(_)) => return CollectedBody::Errored,
+            Some(Err(error)) => {
+                return CollectedBody::Errored {
+                    prefix: Bytes::from(buf),
+                    error,
+                };
+            }
             Some(Ok(chunk)) => {
                 let remaining = limit.saturating_sub(buf.len());
                 if chunk.len() > remaining {
@@ -269,6 +282,16 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
     let (mut parts, body) = response.into_parts();
     match collect_body_prefix(body, MAX_SPLICE_BODY_BYTES).await {
         CollectedBody::Full(bytes) => {
+            // A handler (e.g. a "manage cookie preferences" page) may have
+            // already rendered the banner widget itself to let an
+            // already-decided visitor change their choice. Splicing another
+            // copy in here would give that response two identical forms —
+            // check for the marker class this middleware's own markup always
+            // carries rather than assuming any particular route.
+            if contains_ascii_case_insensitive(&bytes, b"autumn-consent-banner") {
+                return Response::from_parts(parts, Body::from(bytes));
+            }
+
             let updated = splice_before_body_close(&bytes, snippet);
             if updated == bytes.as_ref() {
                 return Response::from_parts(parts, Body::from(bytes));
@@ -295,10 +318,23 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
         // Content-Length stays correct and no cache-control change is needed
         // (nothing per-visitor was embedded).
         CollectedBody::Oversized(body) => Response::from_parts(parts, body),
-        // The body stream errored before EOF; nothing to reconstruct.
-        CollectedBody::Errored => {
+        // The body stream errored before EOF. Rather than silently discarding
+        // everything and returning a well-formed, misleadingly-complete
+        // empty `200` — the page did not actually load successfully —
+        // replay whatever bytes were already read and then end the
+        // reconstructed stream with the same error, mirroring
+        // `crate::etag::apply_etag`'s identical handling of a body read
+        // failure: the connection aborts abnormally, an honest signal (to
+        // the client and any caching proxy) that the transfer failed rather
+        // than completed.
+        CollectedBody::Errored { prefix, error } => {
             parts.headers.remove(CONTENT_LENGTH);
-            Response::from_parts(parts, Body::empty())
+            let frames: Vec<Result<Bytes, axum::Error>> = if prefix.is_empty() {
+                vec![Err(error)]
+            } else {
+                vec![Ok(prefix), Err(error)]
+            };
+            Response::from_parts(parts, Body::from_stream(futures::stream::iter(frames)))
         }
     }
 }
@@ -885,6 +921,86 @@ mod tests {
             !String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
             "an oversized body is served as-is without the banner spliced in \
              (splicing would require buffering arbitrarily more)"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_splice_a_second_banner_when_the_handler_already_rendered_one() {
+        // A "manage cookie preferences" handler may render the banner widget
+        // itself so an already-decided visitor can change their choice. If
+        // that visitor is undecided (or on a stale policy version),
+        // `needs_prompt` is still true and this middleware must not splice a
+        // second, identical copy into the same response.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from(
+                            "<html><body><section class=\"autumn-consent-banner\">already \
+                             here</section></body></html>"
+                                .to_owned(),
+                        ))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+            }));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            html.matches("autumn-consent-banner").count(),
+            1,
+            "must not splice a second banner when the response already contains one: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_stream_error_replays_buffered_prefix_then_ends_with_the_same_error() {
+        // The bytes read so far must not be silently discarded in favor of a
+        // clean-looking empty `200` — that would misrepresent a genuine
+        // transport/body failure as a successful (if blank) page. Instead
+        // the reconstructed body must replay the prefix and then end
+        // abnormally with the same error, mirroring
+        // `crate::etag::apply_etag`'s identical handling.
+        let prefix = Bytes::from_static(b"<html><body>partial");
+        let error = axum::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "simulated upstream body error",
+        ));
+        let frames: Vec<Result<Bytes, axum::Error>> = vec![Ok(prefix.clone()), Err(error)];
+        let body = Body::from_stream(futures::stream::iter(frames));
+        let response = Response::builder()
+            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(body)
+            .unwrap();
+
+        let spliced = splice_into_response(response, "<snip>").await;
+        let mut stream = spliced.into_body().into_data_stream();
+        let first = stream
+            .next()
+            .await
+            .expect("the buffered prefix must be replayed")
+            .expect("the prefix chunk must be Ok");
+        assert_eq!(
+            first, prefix,
+            "bytes read before the error must be replayed, not discarded"
+        );
+        let second = stream
+            .next()
+            .await
+            .expect("the reconstructed body must end with an error frame, not silently end");
+        assert!(
+            second.is_err(),
+            "the reconstructed body must end abnormally with the original error"
         );
     }
 
