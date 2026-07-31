@@ -560,8 +560,17 @@ tests](../../autumn/tests/integration/openapi.rs) work.
 The `mcp` feature implies `openapi` and derives its tool catalog from the very
 same `ApiDoc` values, through the same schema-resolution rules and the same
 component keys. Tag a handler `#[api_doc(mcp)]`, call `mount_mcp("/mcp")`, and
-an agent gets a typed tool whose `inputSchema` cannot drift from the OpenAPI
-document or from the handler. See [Exposing your API as MCP tools](./mcp.md).
+an agent gets a typed tool whose `inputSchema` is derived from the same typed
+contract the OpenAPI operation is. See
+[Exposing your API as MCP tools](./mcp.md).
+
+> **One shape doesn't survive the projection.** A tool's arguments are a single
+> flat object: path parameters by name, plus the reserved keys `query` and
+> `body` for the `Query<T>` extractor and the JSON body. A route whose *path
+> parameter* is itself named `query` or `body` — `/items/{body}` with a
+> `Json<T>` — loses that property to the reserved key, and the tool cannot
+> rebuild the URL. The OpenAPI operation is still correct; only the MCP tool is
+> unusable. Rename the path parameter if you expose such a route as a tool.
 
 ---
 
