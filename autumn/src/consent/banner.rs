@@ -305,24 +305,60 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
 
 /// Insert `snippet` just before the last `</body>` tag, or append it if the
 /// document has an `<html>`/`</html>` shell but no `</body>`. Leaves `body`
-/// unchanged if neither is present (mirrors
-/// `crate::middleware::dev::inject_snippet`).
+/// unchanged if neither is present.
+///
+/// Operates directly on the raw bytes rather than decoding through
+/// `String::from_utf8_lossy`: an HTML page using a legacy single-byte charset
+/// (e.g. ISO-8859-1) is not valid UTF-8, and lossy-decoding it would silently
+/// replace those bytes with U+FFFD, corrupting page content while its
+/// `<meta charset>` declaration kept claiming the original encoding. Tag
+/// matching is ASCII case-insensitive (`<HTML><BODY>...` is exactly as valid
+/// HTML as lowercase), which a byte-for-byte comparison must do explicitly.
+/// `snippet` is always plain ASCII-safe markup, so splicing it in at an
+/// ASCII tag's byte offset can never straddle a multi-byte UTF-8 sequence.
 fn splice_before_body_close(body: &[u8], snippet: &str) -> Vec<u8> {
-    let html = String::from_utf8_lossy(body);
-
-    if let Some(index) = html.rfind("</body>") {
-        let mut html = html.into_owned();
-        html.insert_str(index, snippet);
-        return html.into_bytes();
+    if let Some(index) = rfind_ascii_case_insensitive(body, b"</body>") {
+        let mut out = Vec::with_capacity(body.len() + snippet.len());
+        out.extend_from_slice(&body[..index]);
+        out.extend_from_slice(snippet.as_bytes());
+        out.extend_from_slice(&body[index..]);
+        return out;
     }
 
-    if html.contains("<html") || html.contains("</html>") {
-        let mut html = html.into_owned();
-        html.push_str(snippet);
-        return html.into_bytes();
+    if contains_ascii_case_insensitive(body, b"<html")
+        || contains_ascii_case_insensitive(body, b"</html>")
+    {
+        let mut out = body.to_vec();
+        out.extend_from_slice(snippet.as_bytes());
+        return out;
     }
 
     body.to_vec()
+}
+
+/// Byte offset of the last case-insensitive (ASCII-only) match of `needle`
+/// in `haystack`. See [`splice_before_body_close`] for why this operates on
+/// raw bytes instead of a decoded `&str`.
+fn rfind_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .rev()
+        .find(|&i| haystack[i..i + needle.len()].eq_ignore_ascii_case(needle))
+}
+
+/// Whether `haystack` contains a case-insensitive (ASCII-only) match of
+/// `needle` anywhere.
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    (0..=haystack.len() - needle.len())
+        .any(|i| haystack[i..i + needle.len()].eq_ignore_ascii_case(needle))
 }
 
 #[cfg(test)]
@@ -404,6 +440,41 @@ mod tests {
     fn splice_leaves_non_html_untouched() {
         let out = splice_before_body_close(b"not html at all", "<snip>");
         assert_eq!(out, b"not html at all");
+    }
+
+    #[test]
+    fn splice_matches_uppercase_and_mixed_case_tags() {
+        let out = splice_before_body_close(b"<HTML><BODY><main>ok</main></BODY></HTML>", "<snip>");
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains("<snip></BODY>"),
+            "an uppercase `</BODY>` is exactly as valid HTML as lowercase: {s}"
+        );
+    }
+
+    #[test]
+    fn splice_appends_when_only_uppercase_html_shell_present() {
+        let out = splice_before_body_close(b"<HTML><main>ok</main></HTML>", "<snip>");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.ends_with("<snip>"), "{s}");
+    }
+
+    #[test]
+    fn splice_preserves_non_utf8_bytes_in_a_legacy_charset_document() {
+        // A byte sequence that is not valid UTF-8 (0xE9 alone is an ISO-8859-1
+        // 'é', but an invalid/incomplete UTF-8 sequence on its own).
+        // `String::from_utf8_lossy` would replace it with U+FFFD; this must
+        // pass it through byte-for-byte instead, since the raw bytes are
+        // spliced around, never decoded.
+        let mut body = b"<html><body>caf\xE9".to_vec();
+        body.extend_from_slice(b"</body></html>");
+        let out = splice_before_body_close(&body, "<snip>");
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(
+            out.windows(4).any(|w| w == b"caf\xE9"),
+            "non-UTF-8 bytes must survive splicing untouched, not become U+FFFD: {out_str}"
+        );
+        assert!(out_str.contains("<snip></body>"));
     }
 
     // ── is_html_response ────────────────────────────────────────────

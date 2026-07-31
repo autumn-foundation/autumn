@@ -1249,9 +1249,9 @@ mod tests {
         );
         assert!(
             main_rs.contains("\"/consent/manage\"")
-                && main_rs.contains("autumn_web::consent::expire_consent_cookie"),
-            "generated main.rs must scaffold a withdrawal route (GDPR Art. 7(3): \
-             withdrawing consent must be as easy as giving it): {main_rs}"
+                && main_rs.contains("autumn_web::consent::consent_banner_markup"),
+            "generated main.rs must scaffold a preferences route reusing the consent-banner \
+             widget (GDPR Art. 7(3): withdrawing consent must be as easy as giving it): {main_rs}"
         );
         assert!(
             main_rs.contains("href=\"/consent/manage\""),
@@ -1261,6 +1261,39 @@ mod tests {
         assert!(
             main_rs.contains("autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME"),
             "the middleware wiring must pass the CSRF cookie name explicitly: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("autumn_web::consent::DEFAULT_CSRF_FORM_FIELD"),
+            "the middleware wiring must pass the CSRF form-field name explicitly: {main_rs}"
+        );
+    }
+
+    // `/consent/manage` must stay a side-effect-free `GET`: it renders the
+    // consent-banner widget so the visitor can make a new choice, but the
+    // actual state change goes through the existing CSRF-protected
+    // `POST /consent/accept` / `POST /consent/reject` handlers. If the GET
+    // handler itself mutated the consent cookie (e.g. by calling
+    // `expire_consent_cookie` directly), a same-origin prefetcher, browser
+    // extension, or cross-site top-level navigation following the footer
+    // link could silently reset a visitor's consent, since `GET` is
+    // CSRF-exempt by definition.
+    #[test]
+    fn consent_manage_route_does_not_mutate_state_on_get() {
+        let tmp = TempDir::new().unwrap();
+        generate("consent-manage-app", tmp.path()).unwrap();
+        let main_rs =
+            fs::read_to_string(tmp.path().join("consent-manage-app/src/main.rs")).unwrap();
+        let start = main_rs
+            .find("async fn consent_manage")
+            .expect("consent_manage handler must exist");
+        let body = &main_rs[start..];
+        let end = body[1..]
+            .find("\n#[")
+            .map_or(body.len(), |offset| offset + 1);
+        let handler_body = &body[..end];
+        assert!(
+            !handler_body.contains("expire_consent_cookie") && !handler_body.contains("SET_COOKIE"),
+            "the GET /consent/manage handler must not itself set or expire any cookie: {handler_body}"
         );
     }
 
