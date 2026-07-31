@@ -67,7 +67,12 @@ let config = OpenApiConfig::new("My API", "1.0.0")
     .swagger_ui_path(Some("/docs".to_owned()));
 ```
 
-Both paths must start with `/`, and they must differ from each other and from
+Both paths must be **static**: non-empty, starting with `/`, with no `//`, no
+`*` wildcard, and no `{…}` capture (balanced or not). `/tenants/{id}/docs` is
+rejected with `InvalidOpenApiPath` at boot even though it looks like an
+ordinary route path — the docs endpoints mount at one fixed location.
+
+They must also differ from each other and from
 any `GET` route Autumn already owns. A conflict is a `RouterBuildError`
 (`OpenApiPathCollision` / a duplicate-path error) raised **before** any router
 is mounted, naming both sides — not a mid-boot panic. The check covers your
@@ -339,9 +344,19 @@ A schema's component key is its short type name (`Article`). When two
 *different* types share that last segment — the classic `create::Args` versus
 `update::Args` — Autumn qualifies each with the fewest trailing module segments
 that disambiguate them (`create.Args`, `update.Args`), deterministically and
-independently of link order. Nested `$ref`s inside a schema body are rewritten
-to the same keys, so a reference can never resolve to the wrong type. In the
-common no-collision case the key stays the plain short name.
+independently of link order. In the common no-collision case the key stays the
+plain short name.
+
+Nested `$ref`s inside a schema body are rewritten to those same keys — but only
+where the `$ref` target is a **type identity** (the full `type_name`), which is
+what `#[derive(OpenApiSchema)]` emits. A body you hand to `register_schema`
+yourself is copied verbatim: its `$ref`s are matched against the identity graph,
+find nothing, and stay as written. That is fine while a short key is
+unambiguous, and wrong the moment it isn't — if `create::Args` and
+`update::Args` collide, the real components become `create.Args` / `update.Args`
+while your hand-written `#/components/schemas/Args` keeps pointing at a key
+nothing defines. **In a manually registered schema, write the
+collision-resolved key you actually want.**
 
 ---
 
@@ -366,15 +381,16 @@ declaration.
 
 ## 6. Security schemes
 
-`#[secured]` is what puts security requirements in the spec — the generator
-never guesses from a path prefix.
+An auth guard on the handler is what puts security requirements in the spec —
+the generator never guesses from a path prefix.
 
 | Handler | Documented as |
 |---------|---------------|
 | `#[secured]` or `#[secured("admin")]` | `SessionAuth` — an `apiKey` scheme in the session cookie |
 | `#[secured(scopes = ["reports:read"])]` | `BearerAuth` — HTTP bearer, plus `x-required-scopes` |
 | `#[secured("admin", scopes = ["reports:read"])]` | Both, in one requirement object (an AND) |
-| Unsecured | No `security` entry; if no route is secured, no `securitySchemes` block at all |
+| `#[authorize(...)]` with no `#[secured]` | `SessionAuth`, with no roles or scopes — a policy check implies an authenticated caller |
+| No guard at all | No `security` entry; if no route in the app is guarded, no `securitySchemes` block at all |
 
 The `SessionAuth` cookie name is taken from your app's live
 `session.cookie_name` config, so a renamed cookie is reflected in the document
