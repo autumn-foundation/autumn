@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **consent:** `autumn new` now scaffolds a cookie-consent banner and a real
+  consent gate, so a fresh app is cookie-compliant by default (#1214). The new
+  `autumn_web::consent` module provides a `Consent` extractor
+  (`consent.allows("analytics", POLICY_VERSION)`) plus `accept_all_cookie` /
+  `reject_non_essential_cookie` builders for a first-party cookie that records
+  the chosen categories, a policy version, and a timestamp; bumping the app's
+  policy version constant invalidates prior consent and re-shows the banner.
+  The scaffolded banner (offering "Accept all" and "Reject non-essential" with
+  equal visual weight) is injected automatically into every HTML page via
+  `inject_consent_banner`, needs no JavaScript, and is wired into the base
+  `autumn new` template alongside `POST /consent/accept` /
+  `POST /consent/reject` routes (redirecting back to the referring page, not
+  always the homepage) and a `GET /consent/manage` withdrawal route linked
+  from the footer (GDPR Art. 7(3): withdrawing consent must be as easy as
+  giving it). Strictly-necessary cookies (session, CSRF) are never routed
+  through the gate — they keep being set unconditionally. The consent cookie
+  reader defends against cookie tossing the same way the session cookie
+  reader does, and injecting the banner (which embeds a live per-visitor CSRF
+  token) marks the response `Cache-Control: private, no-store` /
+  `Vary: Cookie` so it's never shared across visitors by a cache. Additive;
+  the `--api` JSON-first scaffold is unaffected (no HTML layout to show a
+  banner in).
 - **search:** a new optional plugin crate, `autumn-search`, turning the in-core
   full-text primitives (#842) into a **search subsystem**: mark a model
   searchable and get an index that stays in sync with the record lifecycle,
