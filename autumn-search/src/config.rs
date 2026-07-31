@@ -141,7 +141,23 @@ impl SearchConfig {
     /// be read or parsed, when the merged `[search]` table has an unknown or
     /// ill-typed key, or when a value is out of range.
     pub fn resolve() -> Result<Self, SearchConfigError> {
-        Self::resolve_with_env(&autumn_web::config::OsEnv)
+        // The OS environment **overlaid with `.env`**, not `OsEnv` alone.
+        //
+        // Core's loader reads `.env`, `.env.local`, `.env.<profile>` into an
+        // overlay `Env` and deliberately does NOT export them into the process
+        // environment. A resolver built on `OsEnv` therefore cannot see them
+        // at all — so `AUTUMN_SEARCH__ENABLED=false` in a project `.env`, the
+        // most ordinary way to set it in development, would leave search on
+        // while every other framework setting in the same file took effect.
+        //
+        // A `.env` that exists but cannot be read or parsed falls back to the
+        // real environment rather than failing the whole resolution: core
+        // surfaces that error on its own path, and search refusing to boot
+        // over it would be a second, more confusing report of one problem.
+        autumn_web::dotenv::os_env_with_dotenv().map_or_else(
+            |_| Self::resolve_with_env(&autumn_web::config::OsEnv),
+            |env| Self::resolve_with_env(&env),
+        )
     }
 
     /// Pure core of [`resolve`](Self::resolve): build the effective `[search]`
@@ -155,7 +171,9 @@ impl SearchConfig {
     ///    canonical spelling wins),
     /// 3. `autumn-<profile>.toml` `[search]` (first existing file in the
     ///    shared [`profile_override_file_lookup_names`] order wins),
-    /// 4. `AUTUMN_SEARCH__*` environment overrides.
+    /// 4. `AUTUMN_SEARCH__*` environment overrides — including values from the
+    ///    project's `.env` files, which core overlays onto the environment
+    ///    without exporting them into the process.
     ///
     /// Reading only layer 1 — which is what a naive plugin loader does — means
     /// `enabled = false` set under `[profile.prod.search]` is silently ignored

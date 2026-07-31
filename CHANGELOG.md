@@ -99,9 +99,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same profile core does. A `deleted_at` column is not by itself a tombstone:
   the source follows the repository's `soft_delete` opt-in, so audit-history
   rows stay indexed exactly as the model's finders return them.
-  Request-controlled values — pagination, and the k-NN minimum score — are
-  bound rather than formatted into the SQL, because diesel's statement cache is
-  keyed on query text and never evicts. A disabled subsystem initializes
+  Request-controlled values — pagination, the k-NN minimum score, the query
+  vector's width — are bound rather than formatted into the SQL, because
+  diesel's statement cache is keyed on query text and never evicts. `[search]`
+  is resolved through core's `.env` overlay too, so a kill switch set there
+  takes effect. A *filtered* k-NN query skips the ivfflat index deliberately:
+  it probes candidate lists before the `WHERE` runs, so a selective
+  authorization filter could otherwise return short or empty while qualifying
+  neighbours sat in unprobed lists. A disabled subsystem initializes
   nothing — no `ensure_index`, no DDL, no width check — so a search outage
   cannot abort application startup after the switch has been thrown. A backfill
   takes a write watermark up front and never overwrites — or re-creates — a

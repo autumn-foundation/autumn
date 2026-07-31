@@ -580,6 +580,28 @@ fn score_threshold_sql(score_expr: &str, min_score: Option<f32>, next_param: &mu
     sql
 }
 
+/// The pgvector `ORDER BY`, which decides whether the ivfflat index may serve
+/// the query — and for a **filtered** query it must not.
+///
+/// ivfflat picks its candidate lists by distance BEFORE the `WHERE` clause
+/// runs, so a selective tenant or visibility predicate can leave the probed
+/// lists holding few or none of the rows the caller is allowed to see. The
+/// query then returns short, or empty, while qualifying neighbours sit in
+/// unprobed lists. That is a wrong answer to an authorization-scoped query
+/// rather than an approximate one, and it would diverge from the array
+/// backend, which the two suites assert implements the same contract.
+///
+/// Ordering by the derived similarity is opaque to the planner, so it forces
+/// an exact scan: slower, and right. An unfiltered query keeps the
+/// index-friendly `<=>` form, which is where the fast path actually pays.
+fn pgvector_order_by(filtered: bool) -> String {
+    if filtered {
+        "ORDER BY (1 - (embedding_vec <=> $2::vector)) DESC, record_id ASC".to_owned()
+    } else {
+        "ORDER BY (embedding_vec <=> $2::vector) ASC, record_id ASC".to_owned()
+    }
+}
+
 /// The document upsert, optionally guarded by a watermark in parameter slot
 /// `watermark_param`.
 ///
@@ -1003,7 +1025,9 @@ impl SearchBackend for PostgresSearchStore {
             let predicate = filter_sql(definition, &query.filter, &mut param, &mut binds);
 
             let pgvector = self.vector_mode().is_some_and(VectorMode::is_pgvector);
-            let width = query.vector.len();
+            // A filter here is an AUTHORIZATION boundary as often as not — a
+            // tenant, a visibility allowlist, a `similar_to` self-exclusion.
+            let filtered = query.filter != SearchFilter::default();
             // Both modes score cosine SIMILARITY so the two orderings agree
             // (pgvector's `<=>` is cosine distance, hence `1 - d`).
             //
@@ -1018,7 +1042,24 @@ impl SearchBackend for PostgresSearchStore {
                     vector_literal(&query.vector),
                     "(embedding_vec <=> $2::vector)".to_owned(),
                     "(1 - (embedding_vec <=> $2::vector))::double precision".to_owned(),
-                    "ORDER BY (embedding_vec <=> $2::vector) ASC, record_id ASC".to_owned(),
+                    // The ordering decides whether the ivfflat index can serve
+                    // this query, and for a FILTERED query it must not.
+                    //
+                    // ivfflat picks its candidate lists by distance BEFORE the
+                    // `WHERE` clause runs, so a selective tenant or visibility
+                    // predicate can leave the probed lists holding few or none
+                    // of the rows the caller is allowed to see — returning
+                    // short, or empty, while qualifying neighbours sit in
+                    // unprobed lists. That is a wrong answer to an
+                    // authorization-scoped query, not merely an approximate
+                    // one, and it would differ from the array backend, which
+                    // the two suites assert implements the same contract.
+                    //
+                    // Ordering by the derived similarity is opaque to the
+                    // planner, so it forces an exact scan: slower, and right.
+                    // An unfiltered query keeps the index-friendly form, which
+                    // is where the fast path actually pays.
+                    pgvector_order_by(filtered),
                     "embedding_vec IS NOT NULL".to_owned(),
                 )
             } else {
@@ -1032,7 +1073,23 @@ impl SearchBackend for PostgresSearchStore {
                     // silently mis-scores, so a width mismatch is excluded
                     // rather than ranked. (pgvector's `<=>` errors instead —
                     // documented divergence.)
-                    format!("embedding IS NOT NULL AND array_length(embedding, 1) = {width}"),
+                    //
+                    // The width is BOUND, not interpolated. It is the length of
+                    // a caller-supplied vector, so formatting it mints a
+                    // permanent prepared statement per distinct length in a
+                    // cache that never evicts — the same unbounded growth the
+                    // ids, limits, offsets and score threshold are all bound to
+                    // avoid. `array_length` returns `integer`, hence the cast.
+                    {
+                        let slot = param;
+                        param += 1;
+                        binds.push(Bound::BigInt(
+                            i64::try_from(query.vector.len()).unwrap_or(i64::MAX),
+                        ));
+                        format!(
+                            "embedding IS NOT NULL AND array_length(embedding, 1) = ${slot}::integer"
+                        )
+                    },
                 )
             };
             let _ = distance;
@@ -1572,6 +1629,27 @@ mod tests {
 
     fn definition() -> IndexDefinition {
         IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
+    }
+
+    #[test]
+    fn a_filtered_vector_query_does_not_let_ivfflat_decide_what_is_visible() {
+        // Unfiltered: order by DISTANCE so ivfflat can serve it. That form is
+        // the whole reason the fast path is worth having.
+        let open = pgvector_order_by(false);
+        assert!(open.contains("<=>"), "{open}");
+        assert!(open.contains("ASC, record_id ASC"), "{open}");
+
+        // Filtered: order by the DERIVED similarity, which the planner cannot
+        // serve from ivfflat, so the scan is exact. ivfflat probes lists
+        // before the WHERE clause runs, so a selective authorization filter
+        // can otherwise return short or empty while authorized neighbours sit
+        // in unprobed lists.
+        let scoped = pgvector_order_by(true);
+        assert!(
+            scoped.starts_with("ORDER BY (1 - "),
+            "a filtered query must not be served by the approximate index: {scoped}"
+        );
+        assert_ne!(open, scoped);
     }
 
     #[test]

@@ -459,6 +459,14 @@ Same API, same ordering, different speed — so the plugin is deployable on a
 managed Postgres without `pgvector`, and gets the fast path for free where it
 exists. A failed `CREATE EXTENSION` degrades; it never aborts boot.
 
+A **filtered** k-NN query deliberately does not use the ivfflat index. ivfflat
+picks its candidate lists by distance before the `WHERE` clause runs, so a
+selective tenant or visibility predicate can leave the probed lists holding
+few or none of the rows the caller may see — returning short, or empty, while
+qualifying neighbours sit in unprobed lists. Since those filters are usually an
+authorization boundary, a filtered query orders by the derived similarity
+instead, which forces an exact scan. Unfiltered queries keep the fast path.
+
 ---
 
 ## 8. Embeddings
