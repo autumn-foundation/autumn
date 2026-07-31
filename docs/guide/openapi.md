@@ -2,9 +2,11 @@
 
 Autumn derives an OpenAPI 3.1 document from the routes you already wrote. There
 is no second source of truth: paths, path parameters, query structs, request
-bodies, response bodies, status codes, tags, and security requirements all come
-from each handler's signature and its route macro. Change a handler's types and
-the spec changes with it, in the same compile.
+bodies, response bodies, tags, and security requirements all come from each
+handler's signature and its route macro, so changing a handler's types changes
+the spec in the same compile. What a signature *cannot* express — summaries,
+the success status code, custom tags — you add with
+[`#[api_doc(...)]`](#3-enriching-operations-with-api_doc).
 
 You add one builder call. Autumn mounts `GET /openapi.json` and a Swagger UI at
 `/swagger-ui`, and regenerates the document on every request so
