@@ -37,9 +37,9 @@
 //! ## Strictly-necessary cookies are exempt
 //!
 //! The session cookie ([`crate::session`], default name `autumn.sid`) and the
-//! CSRF cookie ([`crate::security::csrf`], default name `autumn-csrf`) are
+//! CSRF cookie (`security::csrf`, default name `autumn-csrf`) are
 //! never routed through this module's gate at all — [`crate::session::SessionLayer`]
-//! and [`crate::security::csrf::CsrfLayer`] set them unconditionally,
+//! and [`crate::security::CsrfLayer`] set them unconditionally,
 //! regardless of the visitor's consent choice. Consent is not required for
 //! them (ePrivacy's "strictly necessary" exemption), and gating them would
 //! break login. `Consent::allows("necessary", _)` always returns `true` so an

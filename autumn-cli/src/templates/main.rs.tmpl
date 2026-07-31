@@ -89,29 +89,29 @@ async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
 // same-origin by `redirect_target_from_referer`) rather than always bouncing
 // to the homepage.
 #[post("/consent/accept")]
-async fn consent_accept(headers: axum::http::HeaderMap) -> impl IntoResponse {
+async fn consent_accept(headers: autumn_web::reexports::http::HeaderMap) -> impl IntoResponse {
     let cookie = autumn_web::consent::accept_all_cookie(&["analytics"], CONSENT_POLICY_VERSION);
     let target = autumn_web::consent::redirect_target_from_referer(
         headers
-            .get(axum::http::header::REFERER)
+            .get(autumn_web::reexports::http::header::REFERER)
             .and_then(|v| v.to_str().ok()),
     );
     (
-        [(axum::http::header::SET_COOKIE, cookie)],
+        [(autumn_web::reexports::http::header::SET_COOKIE, cookie)],
         Redirect::to(&target),
     )
 }
 
 #[post("/consent/reject")]
-async fn consent_reject(headers: axum::http::HeaderMap) -> impl IntoResponse {
+async fn consent_reject(headers: autumn_web::reexports::http::HeaderMap) -> impl IntoResponse {
     let cookie = autumn_web::consent::reject_non_essential_cookie(CONSENT_POLICY_VERSION);
     let target = autumn_web::consent::redirect_target_from_referer(
         headers
-            .get(axum::http::header::REFERER)
+            .get(autumn_web::reexports::http::header::REFERER)
             .and_then(|v| v.to_str().ok()),
     );
     (
-        [(axum::http::header::SET_COOKIE, cookie)],
+        [(autumn_web::reexports::http::header::SET_COOKIE, cookie)],
         Redirect::to(&target),
     )
 }
@@ -120,15 +120,15 @@ async fn consent_reject(headers: axum::http::HeaderMap) -> impl IntoResponse {
 // footer link on every page) that withdraws any recorded consent and
 // re-opens the banner so the visitor can choose again.
 #[get("/consent/manage")]
-async fn consent_manage(headers: axum::http::HeaderMap) -> impl IntoResponse {
+async fn consent_manage(headers: autumn_web::reexports::http::HeaderMap) -> impl IntoResponse {
     let target = autumn_web::consent::redirect_target_from_referer(
         headers
-            .get(axum::http::header::REFERER)
+            .get(autumn_web::reexports::http::header::REFERER)
             .and_then(|v| v.to_str().ok()),
     );
     (
         [(
-            axum::http::header::SET_COOKIE,
+            autumn_web::reexports::http::header::SET_COOKIE,
             autumn_web::consent::expire_consent_cookie(),
         )],
         Redirect::to(&target),
@@ -142,7 +142,7 @@ async fn main() {
         .migrations(MIGRATIONS)
         // Strictly-necessary cookies (session, CSRF) are never gated — only
         // this banner/non-essential-category flow depends on consent.
-        .layer(axum::middleware::from_fn(move |req, next| async move {
+        .layer(autumn_web::reexports::axum::middleware::from_fn(move |req, next| async move {
             autumn_web::consent::inject_consent_banner(
                 req,
                 next,
