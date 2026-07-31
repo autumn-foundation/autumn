@@ -4,8 +4,10 @@ Autumn derives an OpenAPI 3.1 document from the routes you already wrote. There
 is no second source of truth: paths, path parameters, query structs, request
 bodies, response bodies, tags, and security requirements all come from each
 handler's signature and its route macro, so changing a handler's types changes
-the spec in the same compile. What a signature *cannot* express — summaries,
-the success status code, custom tags — you add with
+the spec in the same compile — provided the route macro sits outermost, since a
+guard that expands first erases the type the generator would have read
+([§3](#attribute-ordering-rules)). What a signature *cannot* express —
+summaries, the success status code, custom tags — you add with
 [`#[api_doc(...)]`](#3-enriching-operations-with-api_doc).
 
 You add one builder call. Autumn mounts `GET /openapi.json` and a Swagger UI at
@@ -454,7 +456,9 @@ pre-rendered page out of the document.
 Three ways to shape what remains:
 
 - `#[api_doc(hidden)]` on routes that are not part of the API contract
-  (internal endpoints, HTML pages you would rather not advertise).
+  (internal endpoints, ordinary `#[get]` HTML pages you would rather not
+  advertise). As above, this does not work on a `#[static_get]` page — that
+  attribute is ignored there.
 - Tags: give your JSON endpoints an explicit `tag`, so the UI groups them apart
   from page routes that inherit a path-segment tag.
 - Path layout: keeping the API under `/api/...` gives every endpoint the same
