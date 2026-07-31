@@ -117,6 +117,15 @@ alone rather than guessed at, because a wrong schema is worse than an absent
 one. A handler returning `impl IntoResponse`, `Markup`, `Sse`, or a redirect
 contributes an operation with no response body schema.
 
+> **`Query<T>` must be flat.** The `style: form, explode: true` mapping is
+> accurate only while `T`'s fields are scalars (or arrays of scalars).
+> `Query<T>` decodes with `serde_urlencoded`, which cannot parse a nested
+> object or an array of objects — but the generator will still happily
+> advertise that nested shape, so a client following the spec sends a request
+> the handler rejects. Autumn's MCP projection detects this case and refuses to
+> build a tool for it; the OpenAPI document has no such guard. Take structured
+> input as a JSON body instead.
+
 ### A worked example
 
 ```rust
@@ -320,10 +329,19 @@ struct ReportQuery {
 
 The derive mirrors the schema `#[model]` builds: each named field becomes a
 property, every non-`Option` field is `required`, `Vec<T>` becomes an array,
-`Option<T>` becomes nullable, and a container `#[serde(rename_all = "…")]` is
-honored so property names match the wire format. It rejects generic types and
-non-struct / tuple-struct inputs with a clear compile error — use a manual
-`impl OpenApiSchema` plus `register_schema` for those.
+`Option<T>` becomes nullable, and a container `#[serde(rename_all = "…")]` or
+field-level `#[serde(rename = "…")]` is honored so property names match the
+wire format. It rejects generic types and non-struct / tuple-struct inputs with
+a clear compile error — use a manual `impl OpenApiSchema` plus
+`register_schema` for those.
+
+The rename handling is exact for the ordinary symmetric attributes. The **split
+form** — `#[serde(rename_all(serialize = "kebab-case", deserialize =
+"camelCase"))]`, and its field-level equivalent — is the exception: the schema
+takes the *serialize* side, while `Query<T>` and `Json<T>` accept the
+*deserialize* side. On a request type that would advertise a key the handler
+will not accept, so name request fields with a symmetric `rename` /
+`rename_all`, or register the schema by hand.
 
 For a type you cannot annotate (a foreign type, or a payload whose JSON shape
 differs from its Rust shape):
