@@ -439,10 +439,17 @@ actually calls.
 
 Every route in `routes![]` (and in a scoped group) lands in the spec —
 including HTML page handlers, which show up as operations with no JSON body.
-Two kinds of route never appear: `#[ws]` handlers, which are hidden
-automatically, and `#[static_get]` pages registered only through
-`.static_routes(static_routes![…])`, which carry no `ApiDoc` into the route
-list the generator walks.
+`#[ws]` handlers are the exception: they set `hidden` themselves and never
+appear.
+
+That includes **pre-rendered pages**. A `#[static_get]` handler belongs in
+`routes![]` *and* in `static_routes![]` — the pre-renderer drives the real
+router, so a page listed only in `static_routes![]` is never mounted and
+cannot be rendered — and being in `routes![]` is what puts it in the spec.
+`examples/blog` registers its about page both ways for exactly this reason.
+Note that `#[static_get]` builds its metadata directly and ignores
+`#[api_doc(...)]` entirely, so `#[api_doc(hidden)]` will **not** take a
+pre-rendered page out of the document.
 
 Three ways to shape what remains:
 
