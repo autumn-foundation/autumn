@@ -379,9 +379,20 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
         // Serve the page unmodified — no banner this one time — rather than
         // dropping it: a large report/streamed page without the banner is far
         // better than an empty page. The bytes are unchanged, so any existing
-        // Content-Length stays correct and no cache-control change is needed
-        // (nothing per-visitor was embedded).
-        CollectedBody::Oversized(body) => Response::from_parts(parts, body),
+        // Content-Length stays correct and no Cache-Control change is needed
+        // (nothing per-visitor was embedded). This path is only reached for a
+        // visitor who still needs prompting, and the app's own handler can
+        // still gate markup on the same Consent cookie regardless of whether
+        // the banner itself got spliced in, so — exactly like the
+        // decided-but-not-injected case above — a shared cache must still
+        // vary on it rather than conflate this undecided visitor's oversized
+        // representation with a decided visitor's.
+        CollectedBody::Oversized(body) => {
+            parts
+                .headers
+                .append(VARY, HeaderValue::from_static("Cookie"));
+            Response::from_parts(parts, body)
+        }
         // The body stream errored before EOF. Rather than silently discarding
         // everything and returning a well-formed, misleadingly-complete
         // empty `200` — the page did not actually load successfully —
@@ -1029,6 +1040,43 @@ mod tests {
             !String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
             "an oversized body is served as-is without the banner spliced in \
              (splicing would require buffering arbitrarily more)"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_body_still_varies_on_cookie() {
+        // This path is only reached for a visitor who still needs
+        // prompting. Even though the banner itself isn't spliced in (the
+        // body is too large), the app's own handler can still gate markup
+        // on the same Consent cookie, so a shared cache must not conflate
+        // this undecided visitor's oversized representation with a decided
+        // visitor's.
+        let oversized =
+            "<html><body>".to_owned() + &"x".repeat(MAX_SPLICE_BODY_BYTES + 1) + "</body></html>";
+        let app = Router::new()
+            .route(
+                "/",
+                get(move || {
+                    let oversized = oversized.clone();
+                    async move {
+                        Response::builder()
+                            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                            .body(Body::from(oversized))
+                            .unwrap()
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+            }));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get(VARY).and_then(|v| v.to_str().ok()),
+            Some("Cookie"),
+            "an oversized undecided-visitor response must still vary on Cookie"
         );
     }
 

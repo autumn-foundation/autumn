@@ -386,19 +386,25 @@ pub fn expire_consent_cookie() -> String {
 /// path — starts with exactly one `/` (not `//`, which browsers treat as
 /// scheme-relative and will happily follow off-site), contains no `://`
 /// (defense in depth against a scheme smuggled in past the leading slash),
-/// carries no `\r`/`\n` (header-injection guard, though
-/// `HeaderValue`/`Redirect` already reject control bytes on their own), and
 /// carries no `\` — browsers using the WHATWG URL parser treat a backslash
 /// exactly like a forward slash when resolving an HTTP(S) URL, so
 /// `/\evil.example` would otherwise slip past the `//` check above and still
-/// resolve to `https://evil.example/` once a browser follows the `Location`.
+/// resolve to `https://evil.example/` once a browser follows the `Location`
+/// — and carries no ASCII control byte (`\0`-`\x1F`, `\x7F`) at all, not
+/// just `\r`/`\n`: the WHATWG URL parser strips ASCII tab and newline bytes
+/// from the whole URL before parsing continues, so `/\t/evil.example`
+/// resolves to `//evil.example` (scheme-relative) once a browser strips the
+/// embedded tab, exactly as if the tab had never been checked for at all.
+/// Rejecting the full control-byte range closes that entire class rather
+/// than reacting to each individually-discovered stripped byte in turn.
 /// Otherwise returns `"/"`.
 #[must_use]
 pub fn safe_redirect_target(path: &str) -> &str {
     let is_safe = path.starts_with('/')
         && !path.starts_with("//")
         && !path.contains("://")
-        && !path.contains(['\r', '\n', '\\']);
+        && !path.contains('\\')
+        && path.bytes().all(|b| !b.is_ascii_control());
     if is_safe { path } else { "/" }
 }
 
@@ -728,6 +734,24 @@ mod tests {
     #[test]
     fn safe_redirect_target_rejects_embedded_crlf() {
         assert_eq!(safe_redirect_target("/x\r\nSet-Cookie: pwned=1"), "/");
+    }
+
+    #[test]
+    fn safe_redirect_target_rejects_tab_based_scheme_relative_bypass() {
+        // The WHATWG URL parser strips ASCII tab/newline bytes from the
+        // whole URL before parsing continues, so `/\t/evil.example` becomes
+        // `//evil.example` (scheme-relative) once a browser strips the tab.
+        assert_eq!(safe_redirect_target("/\t/evil.example"), "/");
+    }
+
+    #[test]
+    fn safe_redirect_target_rejects_any_ascii_control_byte() {
+        // Rejecting the whole control-byte range (not just the specific
+        // bytes browsers are known to strip today) closes this class of
+        // bypass at once rather than reacting to each one individually.
+        assert_eq!(safe_redirect_target("/x\0evil"), "/");
+        assert_eq!(safe_redirect_target("/x\x0Bevil"), "/");
+        assert_eq!(safe_redirect_target("/x\x7Fevil"), "/");
     }
 
     #[test]
