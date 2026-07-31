@@ -137,7 +137,6 @@ impl std::fmt::Debug for SearchClient {
 }
 
 /// Builder for [`SearchClient`].
-#[derive(Default)]
 pub struct SearchClientBuilder {
     backend: Option<Arc<dyn SearchBackend>>,
     embedder: Option<Arc<dyn Embedder>>,
@@ -148,15 +147,30 @@ pub struct SearchClientBuilder {
     batch_size: usize,
 }
 
+/// Hand-written rather than derived: a derived `Default` would give
+/// `enabled: false` and `batch_size: 0`, so the public
+/// `SearchClientBuilder::default()` would build a client that silently
+/// indexes nothing and backfills in batches of zero. `default()` and
+/// [`SearchClientBuilder::new`] must agree.
+impl Default for SearchClientBuilder {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            embedder: None,
+            source: None,
+            visibility: None,
+            indexes: BTreeMap::new(),
+            enabled: true,
+            batch_size: DEFAULT_BACKFILL_BATCH,
+        }
+    }
+}
+
 impl SearchClientBuilder {
     /// Start a builder with no backend (defaults to in-memory) and no indexes.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            enabled: true,
-            batch_size: DEFAULT_BACKFILL_BATCH,
-            ..Self::default()
-        }
+        Self::default()
     }
 
     /// Install the engine.
@@ -999,6 +1013,20 @@ mod tests {
         let list = ListQuery::new(None, SortDir::Asc, &[("nope", "x")]);
         let filter = filter_from_list_query(&definition(), &list);
         assert_eq!(filter, SearchFilter::default());
+    }
+
+    #[test]
+    fn a_default_builder_matches_a_new_one() {
+        // `SearchClientBuilder` is public API, so `default()` is a reachable
+        // entry point. A derived `Default` would hand back `enabled: false`
+        // and `batch_size: 0` — a silently dead client whose backfills all
+        // request zero rows.
+        let client = SearchClientBuilder::default().build();
+        assert!(
+            client.is_enabled(),
+            "a default builder must not be disabled"
+        );
+        assert_eq!(client.default_batch_size(), DEFAULT_BACKFILL_BATCH);
     }
 
     #[test]

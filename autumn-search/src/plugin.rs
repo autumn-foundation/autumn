@@ -146,16 +146,19 @@ impl SearchPlugin {
 
     /// Install the search engine.
     ///
-    /// Overrides a previous [`Self::postgres`], **including** the document
-    /// source it installed: leaving that behind would ship a
-    /// [`PostgresSearchStore`] whose pool the startup hook no longer installs,
-    /// so every reindex and backfill would fail at runtime with "the search
-    /// store has no database pool".
+    /// Overrides a previous [`Self::postgres`], dropping the
+    /// [`PostgresSearchStore`] it would have installed as both backend and
+    /// document source — that store's pool comes from the startup hook, which
+    /// no longer runs for it, so keeping it would fail every reindex at
+    /// runtime with "the search store has no database pool".
+    ///
+    /// A source the app installed with [`Self::source`] is **kept**:
+    /// [`Self::postgres`] only records intent and never writes that field, so
+    /// clearing it here could only ever discard the app's own choice.
     #[must_use]
     pub fn backend(mut self, backend: Arc<dyn SearchBackend>) -> Self {
         self.backend = Some(backend);
         if std::mem::take(&mut self.use_postgres) {
-            self.source = None;
             self.postgres_store = OnceLock::new();
         }
         self
@@ -244,7 +247,14 @@ impl SearchPlugin {
     fn resolved_config(&self) -> &Result<SearchConfig, String> {
         self.resolved_config.get_or_init(|| {
             if self.config_explicit {
-                return Ok(self.search_config());
+                // Validated on the same terms as a config read from a file: a
+                // zero batch size or a blank queue is just as wrong when it
+                // arrives from code, and boot is where it should be caught.
+                let config = self.search_config();
+                return config
+                    .validate()
+                    .map(|()| config)
+                    .map_err(|error| error.to_string());
             }
             SearchConfig::resolve()
                 .map(|mut config| {
@@ -644,6 +654,41 @@ mod tests {
             .postgres()
             .backend(Arc::new(crate::memory::MemorySearchBackend::new()));
         assert!(!plugin.uses_postgres());
+    }
+
+    #[test]
+    fn an_explicit_backend_keeps_an_explicit_document_source() {
+        // `postgres()` records intent only — it never writes `self.source`, so
+        // the source a later `backend(...)` used to clear could only ever be
+        // one the app installed itself.
+        let source = Arc::new(crate::source::MemoryDocumentSource::new());
+        let plugin = SearchPlugin::new()
+            .postgres()
+            .source(Arc::clone(&source) as Arc<dyn DocumentSource>)
+            .backend(Arc::new(crate::memory::MemorySearchBackend::new()));
+        assert!(
+            plugin.source.is_some(),
+            "overriding the backend must not discard the app's own source"
+        );
+    }
+
+    #[test]
+    fn an_explicit_config_is_validated_like_a_resolved_one() {
+        // A config read from `autumn.toml` is validated; one passed in code
+        // took a shortcut past `validate()`, so `batch_size = 0` reached the
+        // backfill loop instead of aborting boot.
+        // Built by hand, not parsed: `from_toml_str` validates on the way in,
+        // which is exactly the check the in-code path was skipping.
+        let config = SearchConfig {
+            batch_size: 0,
+            ..SearchConfig::default()
+        };
+        let plugin = SearchPlugin::new().config(config);
+        let error = plugin
+            .resolved_config()
+            .as_ref()
+            .expect_err("a zero batch size must not resolve");
+        assert!(error.contains("batch_size"), "unexpected error: {error}");
     }
 
     #[test]
