@@ -343,6 +343,22 @@ takes the *serialize* side, while `Query<T>` and `Json<T>` accept the
 will not accept, so name request fields with a symmetric `rename` /
 `rename_all`, or register the schema by hand.
 
+> **"Field-accurate" means the fields, not every serde attribute.** Renaming is
+> the only serde behavior the derive interprets. It emits *every* named field
+> and marks *every* non-`Option` field `required`, so these diverge from the
+> real wire shape:
+>
+> | Attribute | What the schema says | What actually happens |
+> |---|---|---|
+> | `#[serde(default)]` | `required` | The field may be omitted |
+> | `#[serde(skip)]` / `skip_deserializing` | Present as a property | Never read from the wire |
+> | `#[serde(skip_serializing_if = "…")]` | Always present | May be absent from the response |
+> | `#[serde(flatten)]` | A nested object property | The inner fields are inlined |
+>
+> Reach for `register_schema` when a type uses these — and note that a manual
+> registration is only as accurate as the JSON you hand it; nothing checks it
+> against the type.
+
 For a type you cannot annotate (a foreign type, or a payload whose JSON shape
 differs from its Rust shape):
 
@@ -411,8 +427,17 @@ the generator never guesses from a path prefix.
 | `#[secured]` or `#[secured("admin")]` | `SessionAuth` — an `apiKey` scheme in the session cookie |
 | `#[secured(scopes = ["reports:read"])]` | `BearerAuth` — HTTP bearer, plus `x-required-scopes` |
 | `#[secured("admin", scopes = ["reports:read"])]` | Both, in one requirement object (an AND) |
-| `#[authorize(...)]` with no `#[secured]` | `SessionAuth`, with no roles or scopes — a policy check implies an authenticated caller |
+| `#[authorize(...)]` with no `#[secured]` | `SessionAuth`, with no roles or scopes — but see the warning below |
 | No guard at all | No `security` entry; if no route in the app is guarded, no `securitySchemes` block at all |
+
+> **`#[authorize]` alone does not require authentication.** The generator
+> records `SessionAuth` for a policy-guarded route, but that is *documentation,
+> not enforcement*. `PolicyContext` carries an **optional** `user_id`, and the
+> authorize path simply asks `policy.can(...)` — so a policy that returns
+> `true` admits an anonymous caller, and a service principal authorizes on its
+> token scopes with no session user at all. If the endpoint must have an
+> authenticated caller, say so with `#[secured]`; do not read the spec's
+> `SessionAuth` entry as proof that it does.
 
 The `SessionAuth` cookie name is taken from your app's live
 `session.cookie_name` config, so a renamed cookie is reflected in the document
