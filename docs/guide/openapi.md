@@ -76,6 +76,12 @@ Both paths must be **static**: non-empty, starting with `/`, with no `//`, no
 rejected with `InvalidOpenApiPath` at boot even though it looks like an
 ordinary route path — the docs endpoints mount at one fixed location.
 
+Also avoid a **colon-prefixed segment** (`/:spec`, axum 0.7's old capture
+syntax). `validate_route_path` does not screen for it, but axum 0.8's
+`Router::route` panics on it during assembly, so you get a startup crash rather
+than a named error. The MCP mount-path validator *does* reject colon segments
+for this exact reason; the OpenAPI one has not caught up.
+
 They must also differ from each other and from
 any `GET` route Autumn already owns. A conflict is a `RouterBuildError`
 (`OpenApiPathCollision` / a duplicate-path error) raised **before** any router
@@ -109,7 +115,7 @@ an `ApiDoc` at compile time from the path and the handler signature:
 | `Json<T>` return, including `Result<Json<T>, _>` / `AutumnResult<Json<T>>` and tuples like `(StatusCode, Json<T>)` | The success response body |
 | `Vec<T>` in either position | `type: array` with `items` from `T` |
 | `Option<T>` in either position | Nullable — `type: ["string", "null"]` for primitives, `oneOf: [{$ref}, {type: "null"}]` for refs |
-| `String`, `bool`, `i*`/`u*`, `f32`/`f64` | Inline primitive schemas, never a `$ref` |
+| `String`/`str`, `bool`, `i8`–`i64`, `u8`–`u64`, `isize`/`usize`, `f32`/`f64` | Inline primitive schemas, never a `$ref`. **`i128`/`u128` are not in the list** — they fall through to a named `$ref` and land on the object placeholder |
 | Anything else named | A `$ref` into `#/components/schemas/…` (see [§4](#4-component-schemas)) |
 
 Only these shapes are recognized deliberately: an unknown wrapper type is left
@@ -117,7 +123,7 @@ alone rather than guessed at, because a wrong schema is worse than an absent
 one. A handler returning `impl IntoResponse`, `Markup`, `Sse`, or a redirect
 contributes an operation with no response body schema.
 
-Three places where the generated document can describe a request the handler
+Several places where the generated document can describe a request the handler
 will not accept. None of them fails the build:
 
 > **`Query<T>` must be flat — scalars only.** The `style: form, explode: true`
@@ -139,6 +145,17 @@ will not accept. None of them fails the build:
 > deserialization failure. Make genuinely-optional query fields `Option<T>`,
 > and say so in the operation's `description` when the query is in fact
 > mandatory.
+
+> **Path parameters are always untyped strings.** Every `{…}` segment is
+> emitted as `type: string`; the generator never looks at the `Path<T>` in the
+> signature. So `#[get("/users/{id}")]` with `Path<i64>` advertises a parameter
+> that accepts `abc`, and extraction rejects it at request time. Note the
+> constraint in the operation's `description` when it matters to callers.
+
+> **Only the first `Query<T>` is documented.** `infer_query_params` stops at
+> the first one it finds, so a handler taking `(Query<A>, Query<B>)` documents
+> only `A` — fields that `B` requires are absent from the contract while
+> extraction still demands them.
 
 > **Catch-all routes do not survive the translation.** Axum's
 > `#[get("/files/{*rest}")]` reaches the document with its path template
