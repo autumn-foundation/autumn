@@ -34,22 +34,32 @@ use crate::text::{query_tokens, tokenize};
 /// maps.
 #[derive(Debug, Default)]
 pub struct MemorySearchBackend {
-    indexes: RwLock<HashMap<String, HashMap<i64, IndexedDocument>>>,
-    /// Per-document write sequence, and the source of the write watermark.
+    /// Documents AND their write sequences under **one** lock.
     ///
-    /// A monotonic counter rather than a clock: the watermark only ever has to
-    /// answer "was this written after that", and a counter answers it exactly,
-    /// with no resolution floor and nothing to skew. It is also what lets the
-    /// backfill-versus-reindex ordering be tested deterministically without a
-    /// database.
-    writes: RwLock<WriteLog>,
+    /// Deliberately not two: a conditional write has to compare a sequence and
+    /// replace a document as a single step. With separate locks a backfill can
+    /// read an old sequence, a reindex can then claim a newer one and store
+    /// fresh content, and the backfill still overwrites it — the exact race
+    /// the watermark exists to prevent, reintroduced by the bookkeeping meant
+    /// to close it.
+    store: RwLock<Store>,
 }
 
-/// The monotonic write counter plus, per index, the sequence each document was
-/// last written at.
+/// Documents plus the write bookkeeping that decides which write wins.
 #[derive(Debug, Default)]
-struct WriteLog {
-    next: u64,
+struct Store {
+    documents: HashMap<String, HashMap<i64, IndexedDocument>>,
+    /// Monotonic counter behind the write watermark. A counter rather than a
+    /// clock: the watermark only ever answers "was this written after that",
+    /// which a counter answers exactly, with no resolution floor and nothing
+    /// to skew — and it makes the interleaving deterministically testable.
+    next_sequence: u64,
+    /// Per index, the sequence each record was last **written or deleted** at.
+    ///
+    /// Deletes are recorded too, and outlive the document. A delete that only
+    /// removed the value would leave no evidence it happened, so a stale
+    /// backfill batch would see no newer sequence and reinsert the record —
+    /// resurrecting something a user deleted.
     sequences: HashMap<String, HashMap<i64, u64>>,
 }
 
@@ -63,9 +73,10 @@ impl MemorySearchBackend {
     /// Number of documents currently held in `index`. Test/inspection helper.
     #[must_use]
     pub fn document_count(&self, index: &str) -> usize {
-        self.indexes
+        self.store
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .documents
             .get(index)
             .map_or(0, HashMap::len)
     }
@@ -74,9 +85,10 @@ impl MemorySearchBackend {
     #[must_use]
     pub fn index_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
-            .indexes
+            .store
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .documents
             .keys()
             .cloned()
             .collect();
@@ -84,28 +96,60 @@ impl MemorySearchBackend {
         names
     }
 
+    /// Run `f` against the whole store. Recovers from a poisoned lock rather
+    /// than propagating, per CONTRIBUTING.md's contract: the guarded data is a
+    /// plain map with no invariant a panicking writer could have left
+    /// half-applied.
+    fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
+        let mut guard = self
+            .store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut guard)
+    }
+
     /// Run `f` against the (created-on-demand) document map for `definition`.
-    /// Recovers from a poisoned lock rather than propagating, per
-    /// CONTRIBUTING.md's contract: the guarded data is a plain document map
-    /// with no invariant a panicking writer could have left half-applied.
     fn with_index<T>(
         &self,
         definition: &IndexDefinition,
         f: impl FnOnce(&mut HashMap<i64, IndexedDocument>) -> T,
     ) -> T {
-        let mut guard = self
-            .indexes
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(guard.entry(definition.name.to_owned()).or_default())
+        self.with_store(|store| {
+            f(store
+                .documents
+                .entry(definition.name.to_owned())
+                .or_default())
+        })
     }
 
     /// The current write sequence.
     fn sequence(&self) -> u64 {
-        self.writes
+        self.store
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next
+            .next_sequence
+    }
+
+    /// Record that `ids` were deleted, so a later conditional write can see
+    /// that something newer happened to them.
+    fn record_deletes(&self, definition: &IndexDefinition, ids: &[i64]) {
+        self.with_store(|store| {
+            let index = definition.name.to_owned();
+            store.documents.entry(index.clone()).or_default();
+            let sequences = store.sequences.entry(index.clone()).or_default();
+            let mut next = store.next_sequence;
+            for id in ids {
+                next += 1;
+                sequences.insert(*id, next);
+            }
+            store.next_sequence = next;
+            if let Some(documents) = store.documents.get_mut(&index) {
+                for id in ids {
+                    // Absent ids are a no-op: deletes are replayed.
+                    documents.remove(id);
+                }
+            }
+        });
     }
 
     /// Upsert `documents`, skipping any whose stored write is newer than
@@ -121,43 +165,49 @@ impl MemorySearchBackend {
             .validate()
             .map_err(|e| SearchError::InvalidIndex(e.to_string()))?;
 
-        let mut writes = self
-            .writes
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut applied: Vec<(i64, u64)> = Vec::with_capacity(documents.len());
-        {
-            let WriteLog { next, sequences } = &mut *writes;
-            let seen = sequences.entry(definition.name.to_owned()).or_default();
-            for document in documents {
-                // A document written after the watermark is left alone: the
-                // writer that produced it read the source more recently than
-                // this batch did, so overwriting it would move the index
-                // backwards.
-                if let (Some(watermark), Some(written)) = (watermark, seen.get(&document.id()))
-                    && *written > watermark
-                {
-                    continue;
+        // ONE critical section for the whole compare-and-set. Checking the
+        // sequence under one lock and replacing the document under another
+        // would let a newer write slot in between the two, and the stale
+        // batch would overwrite it while the bookkeeping claimed the newer
+        // write had won.
+        self.with_store(|store| {
+            let index = definition.name.to_owned();
+            store.documents.entry(index.clone()).or_default();
+            let mut next = store.next_sequence;
+            let mut applied: Vec<(i64, u64)> = Vec::with_capacity(documents.len());
+            {
+                let sequences = store.sequences.entry(index.clone()).or_default();
+                for document in documents {
+                    // A record touched after the watermark — written OR
+                    // deleted — is left alone: that writer read the source
+                    // more recently than this batch did, so applying this one
+                    // would move the index backwards.
+                    if let (Some(watermark), Some(touched)) =
+                        (watermark, sequences.get(&document.id()))
+                        && *touched > watermark
+                    {
+                        continue;
+                    }
+                    next += 1;
+                    applied.push((document.id(), next));
                 }
-                *next += 1;
-                applied.push((document.id(), *next));
+                for (id, sequence) in &applied {
+                    sequences.insert(*id, *sequence);
+                }
             }
-            for (id, sequence) in &applied {
-                seen.insert(*id, *sequence);
-            }
-        }
-        drop(writes);
+            store.next_sequence = next;
 
-        let applied_ids: std::collections::HashSet<i64> =
-            applied.iter().map(|(id, _)| *id).collect();
-        self.with_index(definition, |index| {
-            for document in documents {
-                if !applied_ids.contains(&document.id()) {
-                    continue;
+            let applied_ids: std::collections::HashSet<i64> =
+                applied.iter().map(|(id, _)| *id).collect();
+            if let Some(map) = store.documents.get_mut(&index) {
+                for document in documents {
+                    if !applied_ids.contains(&document.id()) {
+                        continue;
+                    }
+                    // Keyed upsert: re-indexing the same record replaces it, so
+                    // at-least-once delivery can never duplicate a document.
+                    map.insert(document.id(), document.clone());
                 }
-                // Keyed upsert: re-indexing the same record replaces it, so
-                // at-least-once delivery can never duplicate a document.
-                index.insert(document.id(), document.clone());
             }
         });
         Ok(())
@@ -170,10 +220,10 @@ impl MemorySearchBackend {
         f: impl FnOnce(Option<&HashMap<i64, IndexedDocument>>) -> T,
     ) -> T {
         let guard = self
-            .indexes
+            .store
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(guard.get(definition.name))
+        f(guard.documents.get(definition.name))
     }
 }
 
@@ -306,19 +356,28 @@ impl SearchBackend for MemorySearchBackend {
         ids: &'a [i64],
     ) -> BoxFuture<'a, SearchResult<()>> {
         Box::pin(async move {
-            self.with_index(definition, |index| {
-                for id in ids {
-                    // Absent ids are a no-op: deletes are replayed.
-                    index.remove(id);
-                }
-            });
+            // Recorded in the sequence log, not just removed: the delete has
+            // to outlive the document, or a backfill batch that scanned this
+            // record before the delete would find no newer sequence and put it
+            // straight back.
+            self.record_deletes(definition, ids);
             Ok(())
         })
     }
 
     fn clear<'a>(&'a self, definition: &'a IndexDefinition) -> BoxFuture<'a, SearchResult<()>> {
         Box::pin(async move {
-            self.with_index(definition, HashMap::clear);
+            // A purge is a deliberate reset of the whole index, so the
+            // sequence log goes with it — the backfill that follows is
+            // *supposed* to rewrite everything.
+            self.with_store(|store| {
+                store
+                    .documents
+                    .entry(definition.name.to_owned())
+                    .or_default()
+                    .clear();
+                store.sequences.remove(definition.name);
+            });
             Ok(())
         })
     }

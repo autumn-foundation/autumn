@@ -71,8 +71,11 @@ that still has an unrelated `id` column backfills correctly rather than keying
 half its documents off the wrong value.
 
 A `tenant_id` column of type `String` / `Option<String>` is picked up
-automatically: its value is carried into every document, and the index is
-marked **tenant-scoped**. Querying a tenant-scoped index with no tenant in
+automatically: its value is carried into every document. Whether the index is
+**tenant-scoped** follows `#[repository(..., tenant_scoped)]`, not the column —
+same rule as `soft_delete`, because a denormalized or audit `tenant_id` on an
+unscoped repository has unscoped finders, and the index must not be more
+restrictive than the reads it mirrors. Querying a tenant-scoped index with no tenant in
 scope is then `SearchError::TenantContextMissing`, not a search across every
 tenant — the same posture `#[repository(tenant_scoped)]` takes, and it is what
 protects the paths that are easy to forget (a route mounted outside the tenancy
@@ -378,7 +381,10 @@ exact same path as an incremental reindex, so bootstrapping and steady state
 cannot disagree.
 
 A backfill takes a **write watermark** before its first batch and never
-overwrites a document written after that point. Without it, a backfill batch —
+overwrites — or re-creates — a record touched after that point. Deletes are
+recorded in a ledger that outlives the document, because once the row is gone
+there is nothing left for a conditional write to compare against, and an
+unguarded insert would resurrect something a user deleted. Without it, a backfill batch —
 read minutes ago, then delayed by an embedding round-trip — would clobber
 whatever a per-record reindex wrote in the meantime, and nothing re-runs that
 reindex. Newer always wins, so the bulk and per-record writers converge without

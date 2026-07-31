@@ -46,6 +46,53 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    search_def_denorm (id) {
+        id -> Int8,
+        body -> Text,
+        tenant_id -> Text,
+    }
+}
+
+/// A searchable model whose `tenant_id` is **denormalized data**, not a scope:
+/// the repository does not opt into `tenant_scoped`, so its finders return
+/// rows across tenants — and the index must not be more restrictive than the
+/// finders it mirrors.
+#[autumn_web::model(table = "search_def_denorm")]
+#[searchable]
+pub struct DenormDoc {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub body: String,
+    pub tenant_id: String,
+}
+
+#[autumn_web::repository(DenormDoc, table = "search_def_denorm")]
+pub trait DenormDocRepository {}
+
+diesel::table! {
+    search_def_scoped (id) {
+        id -> Int8,
+        body -> Text,
+        tenant_id -> Text,
+    }
+}
+
+/// The same shape with a genuinely tenant-scoped repository.
+#[autumn_web::model(table = "search_def_scoped")]
+#[searchable]
+pub struct ScopedDoc {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub body: String,
+    pub tenant_id: String,
+}
+
+#[autumn_web::repository(ScopedDoc, table = "search_def_scoped", tenant_scoped)]
+pub trait ScopedDocRepository {}
+
 /// A `#[searchable]` model with **no** `embed` field: vector search is opt-in,
 /// keyword search still works.
 #[autumn_web::model(table = "search_def_notes")]
@@ -221,6 +268,37 @@ fn index_definition_carries_the_repositorys_soft_delete_semantics() {
     );
     // A model with no `deleted_at` at all is trivially not soft-deleting.
     assert!(!Article::index_definition().soft_delete);
+}
+
+#[test]
+fn index_definition_carries_the_repositorys_tenant_scoping() {
+    // Same rule as soft-delete, and for the same reason: a `tenant_id` COLUMN
+    // is not the question, the repository's opt-in is. A denormalized or audit
+    // `tenant_id` on an unscoped repository has unscoped finders, so marking
+    // its index tenant-scoped would make every search outside a tenant context
+    // fail with `TenantContextMissing` and every search inside one silently
+    // filter — neither of which matches what the app's own reads do.
+    assert!(
+        !DenormDoc::index_definition().tenant_scoped,
+        "a `tenant_id` column without `#[repository(tenant_scoped)]` is not a scope"
+    );
+    assert!(
+        ScopedDoc::index_definition().tenant_scoped,
+        "`#[repository(tenant_scoped)]` must reach the index definition"
+    );
+    // A model with no `tenant_id` at all is trivially unscoped.
+    assert!(!Note::index_definition().tenant_scoped);
+
+    // The tenant is still carried into the document either way — it is what a
+    // caller-supplied filter matches on, and dropping it would make an
+    // explicit tenant filter silently match nothing.
+    let doc = DenormDoc {
+        id: 1,
+        body: "x".to_owned(),
+        tenant_id: "acme".to_owned(),
+    }
+    .search_document();
+    assert_eq!(doc.tenant_id.as_deref(), Some("acme"));
 }
 
 #[test]

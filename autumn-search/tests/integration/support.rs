@@ -58,10 +58,16 @@ pub struct TenantArticle {
     pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
 }
 
-/// `TenantArticle`'s repository genuinely opts into `soft_delete`, so its
-/// finders hide deleted rows — and the search index must agree. That opt-in,
-/// not the mere presence of the column, is what reaches `IndexDefinition`.
-#[autumn_web::repository(TenantArticle, table = "search_tenant_articles", soft_delete)]
+/// `TenantArticle`'s repository genuinely opts into **both** scopes, so its
+/// finders hide deleted rows and restrict to the ambient tenant — and the
+/// search index must agree. Those opt-ins, not the mere presence of the
+/// columns, are what reach `IndexDefinition`.
+#[autumn_web::repository(
+    TenantArticle,
+    table = "search_tenant_articles",
+    soft_delete,
+    tenant_scoped
+)]
 pub trait TenantArticleRepository {}
 
 diesel::table! {

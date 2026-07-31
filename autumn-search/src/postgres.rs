@@ -61,6 +61,16 @@ type BoxedQuery<'a> = diesel::query_builder::BoxedSqlQuery<
 /// Physical table every index's documents live in.
 pub const DOCUMENTS_TABLE: &str = "autumn_search_documents";
 
+/// Ledger of deleted records, consulted by a watermarked (backfill) insert.
+pub const DELETES_TABLE: &str = "autumn_search_deletes";
+
+/// How long a delete stays in [`DELETES_TABLE`].
+///
+/// It only has to outlive the longest backfill that could still be holding a
+/// stale batch. Seven days is far beyond that and keeps the table small on a
+/// delete-heavy index; pruning runs once per process, at `ensure_index`.
+const DELETE_RETENTION: &str = "7 days";
+
 /// `ts_rank_cd`'s `{D, C, B, A}` weight array, matching
 /// [`weight_factor`](autumn_web::search::weight_factor).
 ///
@@ -369,48 +379,43 @@ impl PostgresSearchStore {
                 ("", "", "")
             };
 
-            // The watermark guard. Without it a backfill batch — read
-            // minutes ago, then delayed by an embedding round-trip —
-            // overwrites whatever a per-record reindex wrote in the
-            // meantime, and nothing re-runs that reindex. `updated_at` is
-            // server-side `NOW()` and the watermark came from the same
-            // clock, so the comparison is skew-free.
-            //
-            // Only the UPDATE arm is guarded: a row that does not exist
-            // yet cannot have a newer version to protect, and skipping the
-            // insert would leave it unindexed.
-            let guard = if watermark.is_some() {
-                param += 1;
-                format!(
-                    " WHERE {DOCUMENTS_TABLE}.updated_at <= ${}::timestamptz",
-                    param - 1
-                )
-            } else {
-                String::new()
-            };
+            let sql = upsert_sql(
+                &vector_sql,
+                vec_column,
+                vec_value,
+                vec_update,
+                watermark.map(|_| param),
+            );
             if let Some(watermark) = watermark {
                 binds.push(Bound::Text(watermark.to_owned()));
             }
 
-            let sql = format!(
-                "INSERT INTO {DOCUMENTS_TABLE} \
-                       (index_name, record_id, tenant_id, language, fields, content, \
-                        search_vector, embedding{vec_column}) \
-                     VALUES ($1, $2, $3, $5, $4::jsonb, $6, {vector_sql}, \
-                             $7::double precision[]{vec_value}) \
-                     ON CONFLICT (index_name, record_id) DO UPDATE SET \
-                       tenant_id = EXCLUDED.tenant_id, \
-                       language = EXCLUDED.language, \
-                       fields = EXCLUDED.fields, \
-                       content = EXCLUDED.content, \
-                       search_vector = EXCLUDED.search_vector, \
-                       embedding = EXCLUDED.embedding{vec_update}, \
-                       updated_at = NOW(){guard}"
-            );
-
             bind_all(
                 diesel::sql_query(sql).into_boxed::<autumn_web::RuntimeBackend>(),
                 binds,
+            )
+            .execute(&mut conn)
+            .await
+            .map_err(SearchError::backend)?;
+        }
+
+        // An UNCONDITIONAL write is the record coming back: a reindex read the
+        // row and found it present, which supersedes any earlier delete. Clear
+        // the ledger so a later backfill is not blocked by a tombstone for a
+        // record that exists again.
+        //
+        // Deliberately not done for a watermarked (backfill) write: that batch
+        // is older than the ledger entry by construction, so it has nothing to
+        // say about whether the delete still stands.
+        if watermark.is_none() {
+            let ids: Vec<i64> = documents.iter().map(IndexedDocument::id).collect();
+            bind_all(
+                diesel::sql_query(format!(
+                    "DELETE FROM {DELETES_TABLE} \
+                     WHERE index_name = $1 AND record_id = ANY($2)"
+                ))
+                .into_boxed::<autumn_web::RuntimeBackend>(),
+                [Bound::Text(definition.name.to_owned()), Bound::Ids(ids)],
             )
             .execute(&mut conn)
             .await
@@ -594,6 +599,71 @@ fn score_threshold_sql(score_expr: &str, min_score: Option<f32>, next_param: &mu
     sql
 }
 
+/// The document upsert, optionally guarded by a watermark in parameter slot
+/// `watermark_param`.
+///
+/// The guard goes on **both** arms, and the two failures are different:
+///
+/// - the `DO UPDATE` arm covers a record a concurrent reindex REWROTE — a
+///   stale backfill batch would otherwise put the old text back;
+/// - the insert arm covers one it DELETED. With the row gone there is no
+///   conflict, so an unguarded insert re-creates the record and resurrects
+///   something a user deleted. `autumn_search_deletes` exists precisely
+///   because, once the document is gone, it is the only evidence the insert
+///   path has that anything happened.
+///
+/// `INSERT ... SELECT ... WHERE` rather than `VALUES` when guarding, because
+/// `VALUES` admits no predicate and the delete guard would have nowhere to
+/// attach. `ON CONFLICT` applies to the `SELECT` form just the same.
+///
+/// Both guards reference the SAME parameter slot rather than binding the
+/// watermark twice.
+fn upsert_sql(
+    vector_sql: &str,
+    vec_column: &str,
+    vec_value: &str,
+    vec_update: &str,
+    watermark_param: Option<usize>,
+) -> String {
+    let (guard, values_source) = watermark_param.map_or_else(
+        || {
+            (
+                String::new(),
+                format!(
+                    "VALUES ($1, $2, $3, $5, $4::jsonb, $6, {vector_sql}, \
+                         $7::double precision[]{vec_value})"
+                ),
+            )
+        },
+        |slot| {
+            (
+                format!(" WHERE {DOCUMENTS_TABLE}.updated_at <= ${slot}::timestamptz"),
+                format!(
+                    "SELECT $1, $2, $3, $5, $4::jsonb, $6, {vector_sql}, \
+                            $7::double precision[]{vec_value} \
+                     WHERE NOT EXISTS (SELECT 1 FROM {DELETES_TABLE} d \
+                       WHERE d.index_name = $1 AND d.record_id = $2 \
+                         AND d.deleted_at > ${slot}::timestamptz)"
+                ),
+            )
+        },
+    );
+    format!(
+        "INSERT INTO {DOCUMENTS_TABLE} \
+           (index_name, record_id, tenant_id, language, fields, content, \
+            search_vector, embedding{vec_column}) \
+         {values_source} \
+         ON CONFLICT (index_name, record_id) DO UPDATE SET \
+           tenant_id = EXCLUDED.tenant_id, \
+           language = EXCLUDED.language, \
+           fields = EXCLUDED.fields, \
+           content = EXCLUDED.content, \
+           search_vector = EXCLUDED.search_vector, \
+           embedding = EXCLUDED.embedding{vec_update}, \
+           updated_at = NOW(){guard}"
+    )
+}
+
 /// The bound value for [`score_threshold_sql`], if it emitted a fragment.
 ///
 /// Kept next to it so the two cannot disagree about whether a parameter was
@@ -717,6 +787,19 @@ impl SearchBackend for PostgresSearchStore {
                     vector_column_width = ?width,
                     "autumn-search postgres vector storage resolved"
                 );
+
+                // Prune the delete ledger once per process. An entry only has
+                // to outlive the longest backfill that could still hold a
+                // stale batch; past that it is dead weight on a delete-heavy
+                // index. Best-effort — a failure here must not abort boot.
+                if let Err(error) = diesel::sql_query(format!(
+                    "DELETE FROM {DELETES_TABLE} WHERE deleted_at < NOW() - INTERVAL '{DELETE_RETENTION}'"
+                ))
+                .execute(&mut conn)
+                .await
+                {
+                    tracing::warn!(%error, "autumn-search could not prune the delete ledger");
+                }
             }
             Ok(())
         })
@@ -742,16 +825,35 @@ impl SearchBackend for PostgresSearchStore {
                 return Ok(());
             }
             let mut conn = self.conn().await?;
+            let binds = [
+                Bound::Text(definition.name.to_owned()),
+                Bound::Ids(ids.to_vec()),
+            ];
             bind_all(
                 diesel::sql_query(format!(
                     "DELETE FROM {DOCUMENTS_TABLE} \
                      WHERE index_name = $1 AND record_id = ANY($2)"
                 ))
                 .into_boxed::<autumn_web::RuntimeBackend>(),
-                [
-                    Bound::Text(definition.name.to_owned()),
-                    Bound::Ids(ids.to_vec()),
-                ],
+                binds.clone(),
+            )
+            .execute(&mut conn)
+            .await
+            .map_err(SearchError::backend)?;
+
+            // Record the delete so it OUTLIVES the document. Without this a
+            // backfill batch scanned before the delete finds no row to
+            // conflict with, inserts unconditionally, and resurrects a record
+            // someone deleted. `deleted_at` is refreshed on re-delete so a
+            // replayed delete cannot age out early.
+            bind_all(
+                diesel::sql_query(format!(
+                    "INSERT INTO {DELETES_TABLE} (index_name, record_id) \
+                     SELECT $1, unnest($2::bigint[]) \
+                     ON CONFLICT (index_name, record_id) DO UPDATE SET deleted_at = NOW()"
+                ))
+                .into_boxed::<autumn_web::RuntimeBackend>(),
+                binds,
             )
             .execute(&mut conn)
             .await
@@ -771,6 +873,14 @@ impl SearchBackend for PostgresSearchStore {
             .execute(&mut conn)
             .await
             .map_err(SearchError::backend)?;
+            // The ledger goes with it: a purge is a deliberate reset, and the
+            // backfill that follows is *supposed* to rewrite everything.
+            // Leaving tombstones behind would make it silently skip records.
+            diesel::sql_query(format!("DELETE FROM {DELETES_TABLE} WHERE index_name = $1"))
+                .bind::<Text, _>(definition.name.to_owned())
+                .execute(&mut conn)
+                .await
+                .map_err(SearchError::backend)?;
             Ok(())
         })
     }
@@ -1393,6 +1503,21 @@ fn fields_json(document: &IndexedDocument) -> SearchResult<String> {
 /// not application schema, and every statement is `IF NOT EXISTS`, so running
 /// it on each boot is both safe and self-repairing.
 const SCHEMA_STATEMENTS: &[&str] = &[
+    // Durable evidence that a record was deleted, and WHEN.
+    //
+    // A hard delete leaves no trace, so a backfill batch scanned before the
+    // delete would insert the record straight back — the `ON CONFLICT` guard
+    // cannot help, because with the row gone there is no conflict to guard.
+    // The ledger is what a conditional insert consults instead. Rows are
+    // pruned once they are older than any backfill could plausibly be.
+    "CREATE TABLE IF NOT EXISTS autumn_search_deletes (
+        index_name TEXT        NOT NULL,
+        record_id  BIGINT      NOT NULL,
+        deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (index_name, record_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS autumn_search_deletes_pruning_idx
+        ON autumn_search_deletes (deleted_at)",
     "CREATE TABLE IF NOT EXISTS autumn_search_documents (
         index_name    TEXT        NOT NULL,
         record_id     BIGINT      NOT NULL,

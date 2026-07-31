@@ -354,3 +354,94 @@ async fn a_backfill_still_writes_documents_nothing_else_touched() {
         5
     );
 }
+
+#[tokio::test]
+async fn a_backfill_does_not_resurrect_a_record_deleted_while_it_was_working() {
+    // The other half of the race, and the worse half. The watermark's UPDATE
+    // guard only protects a document that still exists — if the reindex
+    // DELETED it, the backfill's write finds nothing to conflict with and
+    // inserts unconditionally. A record someone deleted becomes searchable
+    // again, and stays that way until another mutation touches it.
+    use autumn_search::{IndexedDocument, SearchBackend as _};
+    use autumn_web::search::SearchIndexed as _;
+
+    let backend = Arc::new(MemorySearchBackend::new());
+    let client = SearchClient::builder()
+        .backend(backend.clone())
+        .index::<Article>()
+        .build();
+    client.ensure_indexes().await.expect("ensure");
+
+    let definition = Article::index_definition();
+    let record = article(1, "Secret", "rust web framework");
+    client.index_record(&record).await.expect("index");
+
+    // The backfill scans and takes its watermark…
+    let watermark = backend.write_watermark().await.expect("watermark");
+
+    // …the record is deleted, and the reindex removes its document…
+    client.remove::<Article>(1).await.expect("remove");
+    assert_eq!(
+        client
+            .search::<Article>("rust", &PageRequest::default())
+            .await
+            .expect("search")
+            .total_elements,
+        0
+    );
+
+    // …and now the backfill's stale batch arrives.
+    let stale = IndexedDocument::new(record.search_document());
+    backend
+        .index_unless_newer(&definition, &[stale], watermark.as_deref())
+        .await
+        .expect("backfill write");
+
+    assert_eq!(
+        client
+            .search::<Article>("rust", &PageRequest::default())
+            .await
+            .expect("search")
+            .total_elements,
+        0,
+        "a deleted record must not come back because a backfill was mid-flight"
+    );
+}
+
+#[tokio::test]
+async fn a_purge_clears_the_delete_record_so_the_rebuild_is_not_blocked() {
+    // The tombstone must not outlive a deliberate reset: a purging backfill is
+    // *supposed* to rewrite everything, so leaving delete records behind would
+    // make it silently skip whatever had been deleted before.
+    let backend = Arc::new(MemorySearchBackend::new());
+    let source = Arc::new(MemoryDocumentSource::new());
+    source.upsert(&article(1, "Rust", "rust web framework"));
+
+    let client = SearchClient::builder()
+        .backend(backend.clone())
+        .source(source.clone())
+        .index::<Article>()
+        .build();
+    client.ensure_indexes().await.expect("ensure");
+
+    client
+        .index_record(&article(1, "Rust", "x"))
+        .await
+        .expect("index");
+    client.remove::<Article>(1).await.expect("remove");
+
+    let report = client
+        .backfill("search_articles", &BackfillOptions::default().purge(true))
+        .await
+        .expect("backfill");
+    assert_eq!(report.indexed, 1);
+    assert_eq!(
+        client
+            .search::<Article>("rust", &PageRequest::default())
+            .await
+            .expect("search")
+            .total_elements,
+        1,
+        "the source still has the row, so a purging rebuild must index it"
+    );
+}

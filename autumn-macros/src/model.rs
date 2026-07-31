@@ -3733,22 +3733,41 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 },
             );
-            // A model with a `tenant_id` column carries its tenant into the
-            // document so every backend can fail closed on cross-tenant reads,
-            // and marks the index tenant-scoped so a query with no tenant
-            // context is refused rather than silently run across tenants
-            // (matching `#[repository(tenant_scoped)]`, which errors).
+            // A model with a `tenant_id` column carries its tenant into every
+            // document, so any backend can fail closed on a cross-tenant read.
+            //
             // Keyed on the name AND the type. An unrelated `tenant_id: i64`
             // would otherwise stamp `tenant_id = "42"` on every document and
             // make every real-tenant search return nothing; a `tenant_id` of
             // some other type would fail to compile INSIDE generated code,
             // pointing at a trait the user never mentioned. The rest of the
             // macro's tenancy path already assumes `String`/`Option<String>`.
-            let is_tenant_scoped = all_fields.iter().any(|f| {
+            //
+            // This is the COLUMN check only. Whether the index is *scoped* to
+            // the tenant is a separate question, resolved at runtime from the
+            // repository — see `#tenant_scoped_expr` below.
+            let has_tenant_column = all_fields.iter().any(|f| {
                 f.ident.as_ref().is_some_and(|i| i == "tenant_id")
                     && is_string_or_option_string(&f.ty)
             });
-            let tenant_extract = if is_tenant_scoped {
+            // Tenant SCOPING follows `#[repository(tenant_scoped)]`, exactly as
+            // soft-delete follows `#[repository(soft_delete)]` — and for the
+            // same reason. A `tenant_id` column that is denormalized or audit
+            // data, on a repository that does not opt in, has unscoped
+            // finders; marking its index tenant-scoped anyway would make every
+            // search outside a tenant context fail with `TenantContextMissing`
+            // and every search inside one silently filter, neither of which
+            // matches what the app's own reads do.
+            //
+            // Column presence is still required: without a `tenant_id` the
+            // documents carry no tenant to filter on, so scoping would match
+            // nothing.
+            let tenant_scoped_expr = if has_tenant_column {
+                quote! { <Self>::__autumn_repo_tenant_scope() }
+            } else {
+                quote! { false }
+            };
+            let tenant_extract = if has_tenant_column {
                 quote! {
                     let __autumn_tenant =
                         ::autumn_web::search::SearchTextValue::search_text_value(&self.tenant_id);
@@ -3766,10 +3785,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     const SEARCH_EMBED_FIELD: ::core::option::Option<&'static str> = #embed_const;
 
                     fn index_definition() -> ::autumn_web::search::IndexDefinition {
-                        // In scope so the blanket `false` default resolves for
-                        // a model whose repository is not `soft_delete` (or
-                        // that has no repository at all). An inherent override
-                        // emitted by `#[repository(soft_delete)]` still wins.
+                        // In scope so the blanket `false` defaults resolve for
+                        // a model whose repository is not `soft_delete` /
+                        // `tenant_scoped` (or that has no repository at all).
+                        // An inherent override emitted by `#[repository(...)]`
+                        // still wins — see the unqualified `<Self>::` calls.
                         use ::autumn_web::preload::AutumnPreloadScopeExt as _;
 
                         const __AUTUMN_SEARCH_INDEX_FIELDS:
@@ -3784,7 +3804,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #search_language,
                             __AUTUMN_SEARCH_INDEX_FIELDS,
                             #embed_const,
-                            #is_tenant_scoped,
+                            #tenant_scoped_expr,
                         )
                         // The REAL key column, not the conventional `id`: a
                         // backend that rebuilds documents from the source table
