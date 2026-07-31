@@ -129,8 +129,8 @@ async fn consent_manage(
     flash: Flash,
     path: CurrentPath,
     csrf: Option<autumn_web::security::CsrfToken>,
-) -> maud::Markup {
-    layout(
+) -> impl IntoResponse {
+    let markup = layout(
         "Manage cookie preferences",
         path.as_str(),
         flash_messages(&flash.consume().await),
@@ -138,6 +138,22 @@ async fn consent_manage(
             csrf.as_ref().map(autumn_web::security::CsrfToken::token),
             autumn_web::consent::DEFAULT_CSRF_FORM_FIELD,
         ),
+    );
+    // This page embeds the visitor's own live CSRF token, so — like
+    // `inject_consent_banner`'s own injected banner — it must never be
+    // shared across visitors by a cache: a shared/public cache serving this
+    // response to someone else would leak one visitor's token to another
+    // and make every other visitor's own consent forms fail CSRF
+    // validation.
+    (
+        [
+            (
+                autumn_web::reexports::http::header::CACHE_CONTROL,
+                "private, no-store",
+            ),
+            (autumn_web::reexports::http::header::VARY, "Cookie"),
+        ],
+        markup,
     )
 }
 

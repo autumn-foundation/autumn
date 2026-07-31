@@ -386,15 +386,19 @@ pub fn expire_consent_cookie() -> String {
 /// path — starts with exactly one `/` (not `//`, which browsers treat as
 /// scheme-relative and will happily follow off-site), contains no `://`
 /// (defense in depth against a scheme smuggled in past the leading slash),
-/// and carries no `\r`/`\n` (header-injection guard, though
-/// `HeaderValue`/`Redirect` already reject control bytes on their own).
+/// carries no `\r`/`\n` (header-injection guard, though
+/// `HeaderValue`/`Redirect` already reject control bytes on their own), and
+/// carries no `\` — browsers using the WHATWG URL parser treat a backslash
+/// exactly like a forward slash when resolving an HTTP(S) URL, so
+/// `/\evil.example` would otherwise slip past the `//` check above and still
+/// resolve to `https://evil.example/` once a browser follows the `Location`.
 /// Otherwise returns `"/"`.
 #[must_use]
 pub fn safe_redirect_target(path: &str) -> &str {
     let is_safe = path.starts_with('/')
         && !path.starts_with("//")
         && !path.contains("://")
-        && !path.contains(['\r', '\n']);
+        && !path.contains(['\r', '\n', '\\']);
     if is_safe { path } else { "/" }
 }
 
@@ -724,6 +728,16 @@ mod tests {
     #[test]
     fn safe_redirect_target_rejects_embedded_crlf() {
         assert_eq!(safe_redirect_target("/x\r\nSet-Cookie: pwned=1"), "/");
+    }
+
+    #[test]
+    fn safe_redirect_target_rejects_backslash_based_scheme_relative_bypass() {
+        // Browsers using the WHATWG URL parser treat `\` exactly like `/`
+        // when resolving an HTTP(S) URL, so `/\evil.example` would otherwise
+        // slip past the plain `//` check and still resolve off-site.
+        assert_eq!(safe_redirect_target("/\\evil.example"), "/");
+        assert_eq!(safe_redirect_target("/\\\\evil.example"), "/");
+        assert_eq!(safe_redirect_target("/ok/path\\evil.example"), "/");
     }
 
     #[test]

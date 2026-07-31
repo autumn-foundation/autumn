@@ -32,6 +32,25 @@ use super::{Consent, find_cookie};
 /// rather than dropped — a large page without the banner beats an empty one.
 const MAX_SPLICE_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// The literal opening tag [`consent_banner_markup`] always renders for its
+/// outermost `<section>`, used by [`inject_consent_banner`] to detect
+/// whether a handler already rendered the banner itself before splicing in
+/// another copy.
+///
+/// Deliberately the *entire* opening tag rather than just the
+/// `autumn-consent-banner` class name: ordinary page content (documentation
+/// mentioning the class, or user-authored text containing that identifier)
+/// could plausibly contain the bare class name, which would wrongly be
+/// treated as an already-rendered banner and silently skip a required
+/// prompt. Reproducing this whole tag verbatim, byte-for-byte, is not
+/// something incidental prose does.
+///
+/// Must be kept in sync with `consent_banner_markup`'s `section` line — a
+/// test (`rendered_banner_carries_the_detection_marker_verbatim`) asserts
+/// this rather than relying on the two staying in sync by hand.
+const RENDERED_BANNER_MARKER: &str =
+    r#"<section class="autumn-consent-banner" role="region" aria-label="Cookie consent">"#;
+
 /// Render the consent-banner markup.
 ///
 /// Offers "Reject non-essential" and "Accept all" as two `type="submit"`
@@ -286,9 +305,11 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
             // already rendered the banner widget itself to let an
             // already-decided visitor change their choice. Splicing another
             // copy in here would give that response two identical forms —
-            // check for the marker class this middleware's own markup always
-            // carries rather than assuming any particular route.
-            if contains_ascii_case_insensitive(&bytes, b"autumn-consent-banner") {
+            // check for the literal rendered marker (see
+            // `RENDERED_BANNER_MARKER`'s doc for why the whole opening tag,
+            // not just the bare class name) rather than assuming any
+            // particular route.
+            if contains_ascii_case_insensitive(&bytes, RENDERED_BANNER_MARKER.as_bytes()) {
                 return Response::from_parts(parts, Body::from(bytes));
             }
 
@@ -935,11 +956,47 @@ mod tests {
             .route(
                 "/",
                 get(|| async {
+                    let banner = consent_banner_markup(None, "_csrf").into_string();
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from(format!("<html><body>{banner}</body></html>")))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+            }));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            html.matches(RENDERED_BANNER_MARKER).count(),
+            1,
+            "must not splice a second banner when the response already contains one: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn still_injects_when_page_merely_mentions_the_banner_class_in_prose() {
+        // Documentation or user-authored content mentioning the
+        // `autumn-consent-banner` class name in passing (without actually
+        // rendering the widget's specific opening tag) must NOT be mistaken
+        // for an already-rendered banner — that would silently withhold the
+        // required prompt from an undecided visitor.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
                     Response::builder()
                         .header(CONTENT_TYPE, "text/html; charset=utf-8")
                         .body(Body::from(
-                            "<html><body><section class=\"autumn-consent-banner\">already \
-                             here</section></body></html>"
+                            "<html><body><p>Style the banner via the \
+                             <code>autumn-consent-banner</code> class.</p></body></html>"
                                 .to_owned(),
                         ))
                         .unwrap()
@@ -956,10 +1013,19 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(
-            html.matches("autumn-consent-banner").count(),
-            1,
-            "must not splice a second banner when the response already contains one: {html}"
+        assert!(
+            html.contains(RENDERED_BANNER_MARKER),
+            "an undecided visitor must still get a real, rendered prompt: {html}"
+        );
+    }
+
+    #[test]
+    fn rendered_banner_carries_the_detection_marker_verbatim() {
+        let html = consent_banner_markup(None, "_csrf").into_string();
+        assert!(
+            html.contains(RENDERED_BANNER_MARKER),
+            "RENDERED_BANNER_MARKER must be kept in sync with consent_banner_markup's \
+             actual rendered output: {html}"
         );
     }
 
