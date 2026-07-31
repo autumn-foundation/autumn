@@ -59,6 +59,10 @@ use crate::repository::AutumnSearchableModel;
 /// `setweight` classes. `D` is the default for a bare `#[searchable]` field.
 pub const SEARCH_WEIGHTS: [char; 4] = ['A', 'B', 'C', 'D'];
 
+/// The conventional primary-key column, used when a model does not say
+/// otherwise. See [`IndexDefinition::key_column`].
+pub const DEFAULT_KEY_COLUMN: &str = "id";
+
 /// Relative multiplier for a weight class, used by backends that rank in Rust
 /// (and as the basis for the Postgres `ts_rank_cd` weight array).
 ///
@@ -167,10 +171,23 @@ pub struct IndexDefinition {
     /// the same posture `#[repository(tenant_scoped)]` takes, where a missing
     /// tenant is an error rather than an unscoped read.
     pub tenant_scoped: bool,
+    /// Primary-key column of the model's table, defaulting to `"id"`.
+    ///
+    /// A backend that reads the source table to rebuild documents — a backfill
+    /// or a reindex — needs the real key column: `#[id] pub article_id: i64`
+    /// is a perfectly ordinary model, and a hardcoded `id` would turn every
+    /// backfill on it into an undefined-column error at runtime. Set by
+    /// `#[model]` from the `#[id]` field, and validated as a bare identifier
+    /// by [`IndexDefinition::validate`] because it is interpolated into SQL.
+    pub key_column: &'static str,
 }
 
 impl IndexDefinition {
-    /// Construct a definition. Prefer [`SearchIndexed::index_definition`].
+    /// Construct a definition keyed on the conventional `id` column. Prefer
+    /// [`SearchIndexed::index_definition`].
+    ///
+    /// A model whose primary key is named otherwise adds
+    /// [`with_key_column`](Self::with_key_column).
     #[must_use]
     pub const fn new(
         name: &'static str,
@@ -185,7 +202,15 @@ impl IndexDefinition {
             fields: Cow::Borrowed(fields),
             embed_field,
             tenant_scoped,
+            key_column: DEFAULT_KEY_COLUMN,
         }
+    }
+
+    /// Point the definition at a primary-key column other than `id`.
+    #[must_use]
+    pub const fn with_key_column(mut self, key_column: &'static str) -> Self {
+        self.key_column = key_column;
+        self
     }
 
     /// Whether this index can answer vector / "find similar" queries.
@@ -231,9 +256,9 @@ impl IndexDefinition {
     /// # Errors
     ///
     /// Returns [`InvalidIndexDefinition`] when the index name, a field name,
-    /// or the language is not a bare identifier, when a weight is outside
-    /// [`SEARCH_WEIGHTS`], when there are no fields, or when `embed_field`
-    /// names a field that is not indexed.
+    /// the key column, or the language is not a bare identifier, when a weight
+    /// is outside [`SEARCH_WEIGHTS`], when there are no fields, or when
+    /// `embed_field` names a field that is not indexed.
     pub fn validate(&self) -> Result<(), InvalidIndexDefinition> {
         let invalid = |message: String| Err(InvalidIndexDefinition { message });
 
@@ -247,6 +272,12 @@ impl IndexDefinition {
             return invalid(format!(
                 "search language {:?} on index {:?} is not an identifier",
                 self.language, self.name
+            ));
+        }
+        if !is_valid_index_identifier(self.key_column) {
+            return invalid(format!(
+                "search key column {:?} on index {:?} is not an identifier",
+                self.key_column, self.name
             ));
         }
         if self.fields.is_empty() {

@@ -522,17 +522,34 @@ impl SearchBackend for PostgresSearchStore {
                     Bound::NullableText(document.embedding.as_deref().map(array_literal)),
                 ];
                 if let Some(width) = vector_width {
-                    // Write the real vector when it fits the declared width,
-                    // and NULL when it does not — a width the column cannot
-                    // hold would fail the insert, and leaving the old value in
-                    // place is exactly the staleness this avoids.
-                    binds.push(Bound::NullableText(
-                        document
-                            .embedding
-                            .as_deref()
-                            .filter(|embedding| embedding.len() == width)
-                            .map(vector_literal),
-                    ));
+                    let literal = match document.embedding.as_deref() {
+                        // A width the column cannot hold would fail the insert,
+                        // and leaving the old value in place is exactly the
+                        // staleness this avoids — so it never reaches SQL.
+                        //
+                        // Whether that is an ERROR depends on which column this
+                        // process is actually reading. In pgvector mode k-NN
+                        // runs off `embedding_vec`, so writing NULL would leave
+                        // the row permanently invisible to semantic search
+                        // while every write reported success — a silent hole,
+                        // and the worst outcome available. Say so instead.
+                        Some(embedding) if embedding.len() != width => {
+                            if self.vector_mode().is_some_and(VectorMode::is_pgvector) {
+                                return Err(SearchError::DimensionMismatch {
+                                    expected: width,
+                                    actual: embedding.len(),
+                                });
+                            }
+                            // Not in pgvector mode: `embedding_vec` is a
+                            // leftover column from a previous width, k-NN runs
+                            // off the portable `embedding` array (bound above,
+                            // at full width), and NULLing the stale copy is the
+                            // correct repair rather than a loss.
+                            None
+                        }
+                        other => other.map(vector_literal),
+                    };
+                    binds.push(Bound::NullableText(literal));
                 }
 
                 let mut vector_sql = String::new();
@@ -1111,9 +1128,11 @@ impl PostgresSearchStore {
     /// values are returned as one JSON object rather than N columns, which is
     /// what lets a single `QueryableByName` struct serve every model.
     ///
-    /// **The source table's primary key must be the `id` column** — the same
-    /// assumption the in-core FTS `search()` makes. A `#[searchable]` model
-    /// whose key column is named otherwise needs its own `DocumentSource`.
+    /// The key column comes from [`IndexDefinition::key_column`], which
+    /// `#[model]` fills in from the `#[id]` field — so a model keyed on
+    /// `article_id` backfills as readily as one keyed on `id`. `validate()`
+    /// has already checked it is a bare identifier; it is quoted here anyway,
+    /// so a column named after a reserved word still works.
     async fn load_documents(
         &self,
         definition: &IndexDefinition,
@@ -1123,6 +1142,7 @@ impl PostgresSearchStore {
         // the first deadlocks a small pool.
         let mut conn = self.conn().await?;
         let columns = self.optional_columns(definition, &mut conn).await?;
+        let key = format!("\"{}\"", definition.key_column);
 
         let mut binds: Vec<Bound> = Vec::new();
         let mut param = 1_usize;
@@ -1131,12 +1151,12 @@ impl PostgresSearchStore {
 
         match selection {
             Selection::Ids(ids) => {
-                predicates.push(format!("id = ANY(${param})"));
+                predicates.push(format!("{key} = ANY(${param})"));
                 binds.push(Bound::Ids(ids.to_vec()));
             }
             Selection::After { after, limit } => {
                 if let Some(after) = after {
-                    predicates.push(format!("id > ${param}"));
+                    predicates.push(format!("{key} > ${param}"));
                     binds.push(Bound::BigInt(after));
                     param += 1;
                 }
@@ -1162,13 +1182,13 @@ impl PostgresSearchStore {
             "NULL::text"
         };
 
-        // `id::bigint`: the row is decoded as `BigInt`, so an `integer`/
-        // `serial` key column would be a runtime deserialization error the
-        // compiler cannot see.
+        // `::bigint`: the row is decoded as `BigInt`, so an `integer`/`serial`
+        // key column would be a runtime deserialization error the compiler
+        // cannot see. Aliased to `id` because that is what `SourceRow` names.
         let rows = bind_all(
             diesel::sql_query(format!(
-                "SELECT id::bigint AS id, {} AS fields, {tenant} AS tenant_id \
-                 FROM \"{}\" {where_clause} ORDER BY id ASC{limit_clause}",
+                "SELECT {key}::bigint AS id, {} AS fields, {tenant} AS tenant_id \
+                 FROM \"{}\" {where_clause} ORDER BY {key} ASC{limit_clause}",
                 fields_projection(definition),
                 definition.name,
             ))

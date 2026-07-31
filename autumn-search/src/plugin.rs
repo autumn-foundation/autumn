@@ -76,7 +76,7 @@ pub struct SearchPlugin {
     /// one would be permanently pool-less.
     postgres_store: OnceLock<Arc<PostgresSearchStore>>,
     /// Set once the app supplies configuration explicitly, so `build` does not
-    /// then overwrite it from `autumn.toml`.
+    /// then overwrite it from the app's config files.
     config_explicit: bool,
 }
 
@@ -106,8 +106,8 @@ impl SearchPlugin {
 
     /// Replace the whole `[search]` configuration.
     ///
-    /// Setting it explicitly also stops [`Plugin::build`] from loading
-    /// `[search]` out of `autumn.toml`.
+    /// Setting it explicitly also stops [`Plugin::build`] from resolving
+    /// `[search]` out of the app's config files and environment.
     #[must_use]
     pub fn config(mut self, config: SearchConfig) -> Self {
         self.config = config;
@@ -118,7 +118,7 @@ impl SearchPlugin {
     /// Route the reindex/backfill jobs to a named queue.
     ///
     /// Overrides **only** `[search] queue`; every other key still comes from
-    /// `autumn.toml`. Suppressing the whole file here would mean an app that
+    /// the resolved config. Suppressing the whole file here would mean an app that
     /// picks a queue in code silently loses `enabled = false` — i.e. the
     /// documented incident kill switch would stop working because of an
     /// unrelated builder call.
@@ -205,9 +205,9 @@ impl SearchPlugin {
 
     /// The configuration as it stands, with any builder overrides applied.
     ///
-    /// Before [`Plugin::build`] this does **not** include `autumn.toml` — the
-    /// file is read at build time so a test or a caller can inspect the
-    /// builder's own intent without touching the filesystem.
+    /// Before [`Plugin::build`] this does **not** include the app's config
+    /// files — they are resolved at build time, so a test or a caller can
+    /// inspect the builder's own intent without touching the filesystem.
     #[must_use]
     pub fn search_config(&self) -> SearchConfig {
         let mut config = self.config.clone();
@@ -329,47 +329,6 @@ fn parse_purge_flag(raw: Option<&str>) -> bool {
     raw.is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
 }
 
-/// Read `[search]` from the application's `autumn.toml`.
-///
-/// Resolution mirrors core's own config loader (`find_config_file_named` in
-/// `autumn/src/config.rs`): the app's crate directory via
-/// `AUTUMN_MANIFEST_DIR` first, then the process working directory. The two
-/// differ whenever the binary is launched from somewhere other than the crate
-/// root — `autumn search reindex --package app` from a workspace root, for
-/// instance — and reading the wrong file (or none) would silently ignore
-/// `enabled = false` or pick the wrong embedding mode.
-///
-/// `Ok(None)` means no file was found — an app with no `autumn.toml` is a
-/// supported zero-config setup, so that is not an error. A file that exists
-/// but has a malformed `[search]` **is**.
-fn load_config_file() -> Result<Option<SearchConfig>, crate::config::SearchConfigError> {
-    for path in config_file_candidates() {
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => return SearchConfig::from_toml_str(&contents).map(Some),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            // A file that exists but cannot be read is a real problem — a
-            // permissions mistake must not read as "zero-config".
-            Err(error) => {
-                return Err(crate::config::SearchConfigError::Invalid(format!(
-                    "cannot read {}: {error}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Candidate `autumn.toml` paths, in core's precedence order.
-fn config_file_candidates() -> Vec<std::path::PathBuf> {
-    let mut candidates = Vec::with_capacity(2);
-    if let Ok(manifest_dir) = std::env::var("AUTUMN_MANIFEST_DIR") {
-        candidates.push(std::path::PathBuf::from(manifest_dir).join("autumn.toml"));
-    }
-    candidates.push(std::path::PathBuf::from("autumn.toml"));
-    candidates
-}
-
 impl Plugin for SearchPlugin {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("autumn-search")
@@ -381,15 +340,19 @@ impl Plugin for SearchPlugin {
         // "unknown key" — and so every return path below carries it.
         let app = app.config_section("search");
 
-        // Pick up `[search]` from `autumn.toml` unless the app configured the
-        // plugin explicitly. Without this, `enabled = false` — documented as
-        // the incident kill switch — would need a code change and a deploy,
-        // which is exactly what a kill switch must not need.
+        // Pick up `[search]` from the app's config unless the plugin was
+        // configured explicitly in code. Without this, `enabled = false` —
+        // documented as the incident kill switch — would need a code change
+        // and a deploy, which is exactly what a kill switch must not need.
+        //
+        // `resolve()`, not a single-file read: the section is resolved through
+        // the same profile layering core applies, so `[profile.prod.search]`
+        // and `autumn-prod.toml` are honoured. A kill switch that works in dev
+        // and is ignored in prod is worse than no kill switch.
         let mut config_error = None;
         if !self.config_explicit {
-            match load_config_file() {
-                Ok(Some(config)) => self.config = config,
-                Ok(None) => {}
+            match SearchConfig::resolve() {
+                Ok(config) => self.config = config,
                 // A malformed `[search]` must not silently fall back to
                 // defaults: an unknown key there is how a typo'd kill switch
                 // would go unnoticed. `Plugin::build` cannot return an error,
@@ -428,6 +391,30 @@ impl Plugin for SearchPlugin {
                         "autumn-search: {message}"
                     )));
                 }
+                // The declared width and the installed embedder's width must
+                // agree before a single document is written. They are set in
+                // two different places — `[search] embedding_dimensions` in
+                // config, `Embedder::dimensions()` in code — and when they
+                // disagree the failure is silent: every write succeeds, the
+                // vector column rejects the wrong-width value, and semantic
+                // search simply returns nothing. Boot loudly instead.
+                //
+                // `0` means no usable embedder (the default `NoEmbedder`), for
+                // which nothing vector-shaped runs at all — declaring a width
+                // ahead of installing a provider is a legitimate ordering.
+                let embedder_width = client.embedding_dimensions();
+                if let Some(configured) = config.embedding_dimensions
+                    && embedder_width != 0
+                    && embedder_width != configured
+                {
+                    return Err(autumn_web::AutumnError::internal_server_error_msg(format!(
+                        "autumn-search: `search.embedding_dimensions = {configured}` does not \
+                         match the installed embedder, which produces {embedder_width}-dimension \
+                         vectors; set them to the same value (and re-run `autumn search reindex \
+                         --purge` if the width really changed)"
+                    )));
+                }
+
                 if let Some(store) = &postgres {
                     let pool = state.pool().cloned().ok_or_else(|| {
                         autumn_web::AutumnError::internal_server_error_msg(
@@ -527,7 +514,7 @@ mod tests {
     fn a_queue_override_does_not_suppress_the_rest_of_the_file_config() {
         // The trap: if `queue(...)` marked the whole config explicit, an app
         // that picks a queue in code would silently lose `enabled = false`
-        // from `autumn.toml` — the incident kill switch defeated by an
+        // from the resolved config — the incident kill switch defeated by an
         // unrelated builder call.
         let plugin = SearchPlugin::new().queue("indexing");
         assert!(
@@ -585,30 +572,6 @@ mod tests {
             BackfillTarget::Index("articles".to_owned()).name(),
             Some("articles")
         );
-    }
-
-    #[test]
-    fn config_resolution_prefers_the_manifest_directory_over_the_cwd() {
-        // `autumn search reindex --package app` runs the binary from the
-        // workspace root, where the CWD holds a different `autumn.toml` (or
-        // none). Core resolves through `AUTUMN_MANIFEST_DIR` first; the
-        // plugin-owned section must resolve the same way or it reads a
-        // different file than the rest of the config.
-        let candidates = config_file_candidates();
-        assert_eq!(
-            candidates.last().map(|p| p.to_string_lossy().into_owned()),
-            Some("autumn.toml".to_owned()),
-            "the CWD is always the last resort"
-        );
-        // The manifest-dir candidate is present only when the env var is set,
-        // and when present it must come FIRST.
-        match std::env::var("AUTUMN_MANIFEST_DIR") {
-            Ok(dir) => {
-                assert_eq!(candidates.len(), 2);
-                assert!(candidates[0].starts_with(&dir), "{candidates:?}");
-            }
-            Err(_) => assert_eq!(candidates.len(), 1),
-        }
     }
 
     #[test]

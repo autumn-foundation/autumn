@@ -71,9 +71,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returns an empty page having issued no query, and a filter key that is not a
   declared field never reaches SQL — which keeps results consistent between
   engines and makes a hostile query string structurally incapable of widening
-  the result set. `[search]` is read from `autumn.toml`, so `enabled = false`
-  is a working incident switch: it stops index writes (including a purging
-  backfill) without failing writes to the model. The in-core
+  the result set. `[search]` is resolved through the same profile layering the
+  runtime uses — base `autumn.toml`, then `[profile.<name>.search]`, then
+  `autumn-<profile>.toml`, then `AUTUMN_SEARCH__*` env vars — so
+  `enabled = false` is a working incident switch *per environment*: it stops
+  index writes (including a purging backfill) without failing writes to the
+  model, and cannot be set in prod only to be ignored there. The declared
+  `embedding_dimensions` is checked against the installed `Embedder` at
+  startup and a disagreement refuses the boot, because the alternative is a
+  silent one: writes keep succeeding while the vector column rejects every
+  value and semantic search returns nothing. The index definition also carries
+  the model's real key column, so a `#[id] pub note_id: i64` over a legacy
+  table that still has an unrelated `id` backfills off the right one. The
+  in-core
   `#[repository(searchable)]` `search()` and its `websearch_to_tsquery`
   semantics are untouched; this subsumes #842 as one backend, it does not
   replace it. See `docs/guide/search.md`.

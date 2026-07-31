@@ -49,8 +49,10 @@
 //! let similar = search.similar::<Article>("how do I add auth?", 5).await?;
 //! ```
 //!
-//! Configuration comes from `[search]` in `autumn.toml`, which the plugin
-//! loads itself unless the app passes `SearchPlugin::config(...)`.
+//! Configuration comes from `[search]`, which the plugin resolves itself
+//! (base `autumn.toml` → `[profile.<name>.search]` → `autumn-<profile>.toml`
+//! → `AUTUMN_SEARCH__*`, the same layering core applies) unless the app passes
+//! `SearchPlugin::config(...)`.
 //!
 //! # How the pieces fit
 //!

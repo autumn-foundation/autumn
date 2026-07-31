@@ -58,6 +58,12 @@ Rules the macro enforces at compile time:
 A `#[searchable]` model whose primary key is not `i64` keeps its #842 behaviour
 and simply has no plugin index — search indexes key on `i64`.
 
+The key **column** does not have to be called `id`. `#[id] pub note_id: i64` is
+carried into the index definition as `key_column`, and the Postgres document
+source selects, filters, and paginates on it — so a model over a legacy table
+that still has an unrelated `id` column backfills correctly rather than keying
+half its documents off the wrong value.
+
 A `tenant_id` column of type `String` / `Option<String>` is picked up
 automatically: its value is carried into every document, and the index is
 marked **tenant-scoped**. Querying a tenant-scoped index with no tenant in
@@ -158,15 +164,44 @@ enabled = true              # false ⇒ index writes are no-ops, queries empty
 embedding_dimensions = 768  # declared width; enables the pgvector fast path
 ```
 
-The plugin reads `autumn.toml` itself at boot, so `enabled = false` is the
+The plugin reads the config itself at boot, so `enabled = false` is the
 incident switch it claims to be: a config change, not a deploy — and it stops
 index writes (including a purging backfill) without failing writes to the
 model. Pass `SearchPlugin::config(...)` to configure in code instead; doing so
 also stops the file being read.
 
+`[search]` is resolved through the **same profile layering the runtime uses**,
+so a per-environment switch works the way you would expect:
+
+| Layer | Wins over |
+|---|---|
+| `autumn.toml` `[search]` | — |
+| `[profile.<name>.search]` in `autumn.toml` | the base section |
+| `autumn-<profile>.toml` `[search]` | the inline profile section |
+| `AUTUMN_SEARCH__QUEUE` / `__BATCH_SIZE` / `__ENABLED` / `__EMBEDDING_DIMENSIONS` | every file |
+
+```toml
+# Search off in production, on everywhere else.
+[profile.prod.search]
+enabled = false
+```
+
+The active profile comes from `AUTUMN_ENV` → `AUTUMN_PROFILE` → `--profile` →
+`AUTUMN_IS_DEBUG=0` ⇒ `prod` → `dev`, exactly as core resolves it, and each
+filename is looked up through `AUTUMN_MANIFEST_DIR` before the working
+directory. A plugin that read only the base `autumn.toml` would silently ignore
+the kill switch in the one environment you reach for it.
+
 An unknown key under `[search]` is an **error**, not a warning — a typo'd
 `queu = "indexing"` would otherwise silently leave indexing on the default
-queue with no signal at all.
+queue with no signal at all. A malformed value in an `AUTUMN_SEARCH__*` var is
+ignored instead: a bad env var must not take down a process that would boot
+fine on its file config.
+
+`embedding_dimensions` is checked against the installed `Embedder` at startup.
+If they disagree the app **refuses to boot**, because the alternative is
+silent: every index write succeeds, the vector column rejects the wrong-width
+value, and semantic search returns nothing forever.
 
 ---
 

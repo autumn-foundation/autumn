@@ -274,6 +274,18 @@ impl SearchClient {
         self.inner.batch_size
     }
 
+    /// Width of the vectors the installed [`Embedder`] produces.
+    ///
+    /// `0` means no usable embedder is installed (the default
+    /// [`NoEmbedder`](crate::NoEmbedder)), so nothing vector-shaped will run.
+    /// Exposed so a host can check it against the width its backend was
+    /// configured for **before** serving traffic, rather than discovering the
+    /// disagreement as an empty result page.
+    #[must_use]
+    pub fn embedding_dimensions(&self) -> usize {
+        self.inner.embedder.dimensions()
+    }
+
     /// Registered index names, sorted.
     #[must_use]
     pub fn index_names(&self) -> Vec<String> {

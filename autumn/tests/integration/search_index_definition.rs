@@ -57,6 +57,35 @@ pub struct Note {
     pub memo: String,
 }
 
+diesel::table! {
+    search_def_memos (memo_id) {
+        memo_id -> Int8,
+        // A leftover column that is not the key (see `Memo`).
+        id -> Int8,
+        memo -> Text,
+    }
+}
+
+/// A `#[searchable]` model whose primary key is **not** named `id`.
+///
+/// Nothing about `#[searchable]` requires the conventional name, so the index
+/// definition has to carry the real one: a backend that rebuilds documents by
+/// reading the source table selects, filters, and paginates on that column,
+/// and against a table that still has an unrelated `id` column that reads the
+/// wrong values with no error at all.
+#[autumn_web::model(table = "search_def_memos")]
+#[searchable]
+// `memo_id` is the point of the fixture — the column name has to stay.
+#[allow(clippy::struct_field_names)]
+pub struct Memo {
+    #[id]
+    pub memo_id: i64,
+    /// The leftover column. Ordinary data, not a key.
+    pub id: i64,
+    #[searchable]
+    pub memo: String,
+}
+
 fn article() -> Article {
     Article {
         id: 7,
@@ -105,6 +134,28 @@ fn index_definition_without_embed_field_disables_vector_search() {
 }
 
 #[test]
+fn index_definition_carries_the_models_real_key_column() {
+    // The conventional case still reads `id`, so nothing that assumed it
+    // changes behaviour…
+    assert_eq!(Article::index_definition().key_column, "id");
+    assert_eq!(Note::index_definition().key_column, "id");
+    // …and a model keyed elsewhere says so, rather than leaving a backend to
+    // guess wrong at runtime.
+    assert_eq!(Memo::index_definition().key_column, "memo_id");
+    let memo = Memo {
+        memo_id: 9,
+        id: 109,
+        memo: "x".to_owned(),
+    };
+    assert_eq!(
+        memo.search_id(),
+        9,
+        "the document keys off `#[id]`, not `id`"
+    );
+    assert_eq!(memo.search_document().id, 9);
+}
+
+#[test]
 fn index_definition_validates_its_own_identifiers() {
     // Every identifier the backend interpolates into SQL comes from here, so
     // the definition validates itself rather than trusting the caller.
@@ -112,6 +163,11 @@ fn index_definition_validates_its_own_identifiers() {
 
     let mut bad = Article::index_definition();
     bad.name = "articles\"; DROP TABLE users; --";
+    assert!(bad.validate().is_err());
+
+    // The key column is interpolated into the source query too, so it is held
+    // to the same standard as the index and field names.
+    let bad = Article::index_definition().with_key_column("id\"; DROP TABLE users; --");
     assert!(bad.validate().is_err());
 }
 

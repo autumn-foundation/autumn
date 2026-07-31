@@ -3707,6 +3707,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     });
     let search_indexed_impl = match (is_searchable, search_pk_ident) {
         (true, Some(pk_ident)) if !search_field_idents.is_empty() => {
+            // Diesel maps a struct field to the identically-named column, so
+            // the `#[id]` field's ident IS the key column name.
+            let search_pk_column = pk_ident.to_string();
             let field_names = search_field_names.clone();
             let field_weights = search_field_weights.clone();
             let field_idents = search_field_idents.clone();
@@ -3777,6 +3780,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #embed_const,
                             #is_tenant_scoped,
                         )
+                        // The REAL key column, not the conventional `id`: a
+                        // backend that rebuilds documents from the source table
+                        // (backfill, reindex) selects and paginates on it, and
+                        // a model keyed on `article_id` would otherwise fail at
+                        // runtime with an undefined column.
+                        .with_key_column(#search_pk_column)
                     }
 
                     fn search_id(&self) -> i64 {

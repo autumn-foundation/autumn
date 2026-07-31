@@ -376,3 +376,53 @@ async fn disabled_search_returns_an_empty_page_even_with_no_visibility_hook() {
             .is_empty()
     );
 }
+
+// ── Declared width vs installed embedder ────────────────────────────────────
+
+/// Build an app whose declared `embedding_dimensions` may disagree with the
+/// installed embedder.
+fn app_with_widths(
+    declared: Option<usize>,
+    embedder: Arc<dyn autumn_search::Embedder>,
+) -> autumn_web::test::TestClient {
+    let mut config = SearchConfig::default();
+    config.embedding_dimensions = declared;
+    TestApp::new()
+        .plugin(
+            SearchPlugin::new()
+                .config(config)
+                .backend(Arc::new(MemorySearchBackend::new()))
+                .embedder(embedder)
+                .index::<Article>(),
+        )
+        .build()
+}
+
+#[tokio::test]
+#[should_panic(expected = "does not match the installed embedder")]
+async fn a_declared_width_that_disagrees_with_the_embedder_fails_at_boot() {
+    // The two are set in different places — `[search] embedding_dimensions` in
+    // config, `Embedder::dimensions()` in code — and the failure mode is
+    // silent: every index write reports success, the vector column rejects the
+    // wrong-width value, and semantic search just returns nothing forever. A
+    // refused boot is the only version of this an operator can act on.
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let _ = app_with_widths(Some(128), Arc::new(autumn_search::HashingEmbedder::new(64)));
+}
+
+#[tokio::test]
+async fn a_matching_width_boots_and_a_declared_width_without_an_embedder_is_allowed() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let test = app_with_widths(Some(64), Arc::new(autumn_search::HashingEmbedder::new(64)));
+    assert_eq!(installed_client(&test).embedding_dimensions(), 64);
+
+    // Declaring a width before installing a provider is a legitimate ordering:
+    // `NoEmbedder` reports `0`, nothing vector-shaped runs, and the declared
+    // width is simply what the backend will use once a provider arrives.
+    let test = app_with_widths(Some(768), Arc::new(autumn_search::NoEmbedder));
+    assert_eq!(installed_client(&test).embedding_dimensions(), 0);
+}

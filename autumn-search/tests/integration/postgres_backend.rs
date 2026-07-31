@@ -30,7 +30,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 use super::support::{
-    Article, TenantArticle, article, tenant_article, untenanted_article, with_tenant,
+    Article, Note, TenantArticle, article, note, tenant_article, untenanted_article, with_tenant,
 };
 
 const CREATE_TABLES_SQL: &[&str] = &[
@@ -47,6 +47,15 @@ const CREATE_TABLES_SQL: &[&str] = &[
         body       TEXT NOT NULL,
         tenant_id  TEXT,
         deleted_at TIMESTAMPTZ
+    )",
+    // Keyed on `note_id`, with a leftover `id` column whose values disagree.
+    // A source reader that assumes `id` returns rows here without error — it
+    // just keys every document off the wrong column.
+    "CREATE TABLE IF NOT EXISTS search_notes (
+        note_id BIGSERIAL PRIMARY KEY,
+        id      BIGINT NOT NULL,
+        title   TEXT NOT NULL,
+        body    TEXT NOT NULL
     )",
 ];
 
@@ -93,6 +102,10 @@ impl Fixture {
             .ensure_index(&TenantArticle::index_definition())
             .await
             .expect("ensure_index (tenant)");
+        store
+            .ensure_index(&Note::index_definition())
+            .await
+            .expect("ensure_index (note)");
 
         Self {
             store,
@@ -176,6 +189,22 @@ impl Fixture {
         )
     }
 
+    /// Insert a row into the `note_id`-keyed source table.
+    async fn insert_note(&self, record: &Note) {
+        let mut conn = self.pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO search_notes (note_id, id, title, body) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (note_id) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(record.note_id)
+        .bind::<diesel::sql_types::BigInt, _>(record.id)
+        .bind::<diesel::sql_types::Text, _>(record.title.clone())
+        .bind::<diesel::sql_types::Text, _>(record.body.clone())
+        .execute(&mut conn)
+        .await
+        .expect("insert note row");
+    }
+
     async fn delete_source(&self, id: i64) {
         let mut conn = self.pool.get().await.expect("conn");
         diesel::sql_query("DELETE FROM search_articles WHERE id = $1")
@@ -220,6 +249,7 @@ impl Fixture {
             .embedder(Arc::new(HashingEmbedder::new(64)))
             .index::<Article>()
             .index::<TenantArticle>()
+            .index::<Note>()
             .build()
     }
 }
@@ -697,6 +727,66 @@ async fn scanning_walks_the_table_by_keyset() {
             .expect("scan")
             .is_empty()
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_model_keyed_on_something_other_than_id_backfills_and_searches() {
+    // `Note` is keyed on `note_id`, over a table that also has a leftover `id`
+    // whose values are offset by 100. Every source query — the keyset scan,
+    // the id-list fetch, the ordering, the projected key — has to come from
+    // the index definition. A hardcoded `id` does not error here; it returns
+    // documents keyed 101/102/103, which no longer match the ids the sync
+    // hooks write, so the index silently ends up holding two of everything.
+    let fixture = Fixture::start().await;
+    let client = fixture.client();
+    let definition = Note::index_definition();
+
+    for id in 1..=3 {
+        fixture
+            .insert_note(&note(id, &format!("Rust {id}"), "notes about rust"))
+            .await;
+    }
+
+    // Keyset scan, in key order, paginated on the real key column.
+    let first = fixture
+        .store
+        .scan(&definition, None, 2)
+        .await
+        .expect("scan");
+    assert_eq!(first.iter().map(|d| d.id).collect::<Vec<_>>(), vec![1, 2]);
+    let second = fixture
+        .store
+        .scan(&definition, Some(2), 2)
+        .await
+        .expect("scan");
+    assert_eq!(second.iter().map(|d| d.id).collect::<Vec<_>>(), vec![3]);
+
+    // Id-list fetch, the path a per-record reindex job takes.
+    let fetched = fixture.store.fetch(&definition, &[2]).await.expect("fetch");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].id, 2);
+    assert_eq!(
+        fetched[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "title")
+            .map(|f| f.value.as_str()),
+        Some("Rust 2")
+    );
+
+    // And the whole thing end to end: backfill, then query.
+    let report = client
+        .backfill("search_notes", &BackfillOptions::default().batch_size(2))
+        .await
+        .expect("backfill");
+    assert_eq!(report.indexed, 3);
+
+    let page = client
+        .search::<Note>("rust", &PageRequest::default())
+        .await
+        .expect("search");
+    assert_eq!(page.total_elements, 3);
 }
 
 // ── End to end: the issue's success metric ──────────────────────────────────

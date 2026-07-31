@@ -104,8 +104,22 @@ embedding_dimensions = 768  # enables the pgvector fast path
 ```
 
 The plugin reads this itself at boot, so `enabled = false` is a config change
-rather than a deploy. Pass `SearchPlugin::config(...)` (or any of the builder
-overrides) to configure it in code instead.
+rather than a deploy. Resolution goes through the same profile layering the
+runtime uses — base `autumn.toml`, then `[profile.<name>.search]`, then
+`autumn-<profile>.toml`, then `AUTUMN_SEARCH__*` env vars — so the kill switch
+works per environment:
+
+```toml
+[profile.prod.search]
+enabled = false
+```
+
+```bash
+AUTUMN_SEARCH__ENABLED=false ./my-app   # or without touching a file at all
+```
+
+Pass `SearchPlugin::config(...)` (or any of the builder overrides) to configure
+it in code instead.
 
 ## Documentation
 

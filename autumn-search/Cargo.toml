@@ -37,6 +37,9 @@ tracing = { workspace = true }
 # Docker; CI's Docker sweep picks them up.
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+# Profile-aware `[search]` resolution reads real files off disk, so the config
+# tests lay out a throwaway project directory rather than mocking the loader.
+tempfile = "3"
 
 [lints]
 workspace = true

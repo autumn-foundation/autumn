@@ -55,6 +55,56 @@ pub struct TenantArticle {
     pub tenant_id: Option<String>,
 }
 
+diesel::table! {
+    search_notes (note_id) {
+        note_id -> Int8,
+        // A legacy column that is NOT the key and is not part of the model.
+        // Its values deliberately disagree with `note_id` below, so a source
+        // reader that assumes `id` produces wrong answers rather than an
+        // error — see `Note`.
+        id -> Int8,
+        title -> Text,
+        body -> Text,
+    }
+}
+
+/// A searchable model whose primary key is **not** called `id`, on a table
+/// that happens to have an `id` column anyway.
+///
+/// The combination is what makes this dangerous rather than merely broken.
+/// `#[model]`'s bulk-upsert path names `<table>::id`, so a table with no `id`
+/// column at all fails to compile — loud, and nobody ships it. A table that
+/// *does* have a leftover `id` compiles fine, and then a source reader that
+/// assumes `id` silently keys every backfilled document off the wrong column:
+/// the sync hooks write documents keyed on `note_id`, the backfill writes
+/// documents keyed on `id`, and the index quietly holds two of everything with
+/// no error anywhere. The key column has to come from the model.
+#[autumn_web::model(table = "search_notes")]
+#[searchable(language = "english")]
+// `note_id` is the point of the fixture — the column name has to stay.
+#[allow(clippy::struct_field_names)]
+pub struct Note {
+    #[id]
+    pub note_id: i64,
+    /// The leftover column. Ordinary data, not a key, and not searchable.
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+    #[searchable(weight = "B", embed)]
+    pub body: String,
+}
+
+/// Build a note keyed on `note_id`, with the decoy `id` offset by 100 so
+/// reading the wrong column is unmistakable.
+pub fn note(note_id: i64, title: &str, body: &str) -> Note {
+    Note {
+        note_id,
+        id: note_id + 100,
+        title: title.to_owned(),
+        body: body.to_owned(),
+    }
+}
+
 /// Build an article without touching a database.
 pub fn article(id: i64, title: &str, body: &str) -> Article {
     Article {

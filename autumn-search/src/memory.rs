@@ -98,13 +98,26 @@ impl MemorySearchBackend {
     }
 }
 
-/// Score `document` against `tokens`.
+/// Score `document` against `tokens`, ranking with `definition`'s weights.
 ///
 /// Returns `None` unless **every** query token appears somewhere in the
 /// document (the AND contract documented on [`KeywordQuery`]). The score sums
 /// `weight_factor(field) × occurrences`, so a match in a weight-`A` field
 /// outranks the same match in a weight-`B` field.
-fn score(document: &IndexedDocument, tokens: &[String]) -> Option<f32> {
+///
+/// The weight comes from [`IndexDefinition::weight_of`], never from the
+/// document — the same rule the Postgres backend follows when it interpolates
+/// a `setweight(...)` letter. A document is data: it can arrive from a
+/// third-party [`DocumentSource`](crate::DocumentSource), a hand-built
+/// [`SearchDocument`], or a stale row written before the model's weights
+/// changed, and any of those could otherwise promote a `D` field to `A` and
+/// reorder someone else's results. A field the index does not declare is
+/// skipped entirely, so it contributes neither score nor a token match.
+fn score(
+    definition: &IndexDefinition,
+    document: &IndexedDocument,
+    tokens: &[String],
+) -> Option<f32> {
     let mut total = 0.0_f32;
     let mut matched = vec![false; tokens.len()];
 
@@ -112,7 +125,10 @@ fn score(document: &IndexedDocument, tokens: &[String]) -> Option<f32> {
         if field.value.is_empty() {
             continue;
         }
-        let factor = weight_factor(field.weight);
+        let Some(weight) = definition.weight_of(field.name) else {
+            continue;
+        };
+        let factor = weight_factor(weight);
         for field_token in tokenize(&field.value) {
             for (index, query_token) in tokens.iter().enumerate() {
                 if field_token == *query_token {
@@ -241,7 +257,7 @@ impl SearchBackend for MemorySearchBackend {
                     if !query.filter.permits(&document.document) {
                         continue;
                     }
-                    if let Some(score) = score(document, &tokens) {
+                    if let Some(score) = score(definition, document, &tokens) {
                         hits.push(SearchHit::new(definition.name, document.id(), score));
                     }
                 }
@@ -355,26 +371,92 @@ mod tests {
     #[test]
     fn scoring_requires_every_query_token() {
         let document = doc(1, "Rust web", "frameworks");
-        assert!(score(&document, &["rust".to_owned()]).is_some());
-        assert!(score(&document, &["rust".to_owned(), "web".to_owned()]).is_some());
+        assert!(score(&definition(), &document, &["rust".to_owned()]).is_some());
         assert!(
-            score(&document, &["rust".to_owned(), "gardening".to_owned()]).is_none(),
+            score(
+                &definition(),
+                &document,
+                &["rust".to_owned(), "web".to_owned()]
+            )
+            .is_some()
+        );
+        assert!(
+            score(
+                &definition(),
+                &document,
+                &["rust".to_owned(), "gardening".to_owned()]
+            )
+            .is_none(),
             "a missing token must veto the match"
         );
     }
 
     #[test]
     fn scoring_weights_a_title_hit_above_a_body_hit() {
-        let title_hit = score(&doc(1, "rust", "nothing"), &["rust".to_owned()]).expect("match");
-        let body_hit = score(&doc(2, "nothing", "rust"), &["rust".to_owned()]).expect("match");
+        let title_hit = score(
+            &definition(),
+            &doc(1, "rust", "nothing"),
+            &["rust".to_owned()],
+        )
+        .expect("match");
+        let body_hit = score(
+            &definition(),
+            &doc(2, "nothing", "rust"),
+            &["rust".to_owned()],
+        )
+        .expect("match");
         assert!(title_hit > body_hit, "{title_hit} !> {body_hit}");
     }
 
     #[test]
     fn scoring_accumulates_repeated_occurrences() {
-        let once = score(&doc(1, "rust", ""), &["rust".to_owned()]).expect("match");
-        let twice = score(&doc(1, "rust rust", ""), &["rust".to_owned()]).expect("match");
+        let once = score(&definition(), &doc(1, "rust", ""), &["rust".to_owned()]).expect("match");
+        let twice = score(
+            &definition(),
+            &doc(1, "rust rust", ""),
+            &["rust".to_owned()],
+        )
+        .expect("match");
         assert!(twice > once);
+    }
+
+    #[test]
+    fn scoring_uses_the_definitions_weight_not_the_documents() {
+        // A document that claims weight `A` for the index's weight-`B` `body`
+        // field must not outrank a real `A` hit. The stored weight is data —
+        // it can come from a third-party source or a row written before the
+        // model changed — so ranking reads the definition instead.
+        let honest = doc(1, "rust", "");
+        let inflated = IndexedDocument::new(
+            SearchDocument::new("articles", 2)
+                .with_field("title", 'A', "")
+                .with_field("body", 'A', "rust"),
+        );
+        let honest_score =
+            score(&definition(), &honest, &["rust".to_owned()]).expect("title match");
+        let inflated_score =
+            score(&definition(), &inflated, &["rust".to_owned()]).expect("body match");
+        assert!(
+            honest_score > inflated_score,
+            "a document-declared weight must not promote a body hit: \
+             {honest_score} !> {inflated_score}"
+        );
+    }
+
+    #[test]
+    fn scoring_ignores_fields_the_index_does_not_declare() {
+        // An undeclared field contributes neither score nor a token match, so
+        // it cannot satisfy the AND contract on its own.
+        let smuggled = IndexedDocument::new(
+            SearchDocument::new("articles", 1)
+                .with_field("title", 'A', "")
+                .with_field("body", 'B', "")
+                .with_field("internal_notes", 'A', "rust"),
+        );
+        assert!(
+            score(&definition(), &smuggled, &["rust".to_owned()]).is_none(),
+            "a field outside the index definition must not be searchable"
+        );
     }
 
     #[test]
