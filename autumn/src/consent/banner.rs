@@ -414,9 +414,15 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
     }
 }
 
-/// Insert `snippet` just before the last `</body>` tag, or append it if the
-/// document has an `<html>`/`</html>` shell but no `</body>`. Leaves `body`
-/// unchanged if neither is present.
+/// Insert `snippet` just before the last `</body>` tag, or append it at the
+/// very end otherwise. The caller ([`splice_into_response`], via
+/// [`is_html_response`]) only ever invokes this on a response whose
+/// `Content-Type` is already validated as `text/html`, so a document that
+/// omits its `<html>`/`<body>` wrapper tags entirely — valid HTML5 tag
+/// omission, e.g. `<!doctype html><main>...</main>` — is still a real page a
+/// browser parses and implicitly wraps in `<body>`; appending at the end
+/// still lands the banner where a browser renders it, rather than silently
+/// sending no banner just because no explicit wrapper tag was present.
 ///
 /// Operates directly on the raw bytes rather than decoding through
 /// `String::from_utf8_lossy`: an HTML page using a legacy single-byte charset
@@ -436,15 +442,9 @@ fn splice_before_body_close(body: &[u8], snippet: &str) -> Vec<u8> {
         return out;
     }
 
-    if contains_ascii_case_insensitive(body, b"<html")
-        || contains_ascii_case_insensitive(body, b"</html>")
-    {
-        let mut out = body.to_vec();
-        out.extend_from_slice(snippet.as_bytes());
-        return out;
-    }
-
-    body.to_vec()
+    let mut out = body.to_vec();
+    out.extend_from_slice(snippet.as_bytes());
+    out
 }
 
 /// Byte offset of the last case-insensitive (ASCII-only) match of `needle`
@@ -548,9 +548,16 @@ mod tests {
     }
 
     #[test]
-    fn splice_leaves_non_html_untouched() {
-        let out = splice_before_body_close(b"not html at all", "<snip>");
-        assert_eq!(out, b"not html at all");
+    fn splice_appends_when_no_recognizable_html_wrapper_tag_is_present() {
+        // The caller only ever invokes this on a response whose Content-Type
+        // is already validated as text/html (is_html_response), so a
+        // document that omits its <html>/<body> wrapper tags entirely --
+        // valid HTML5 tag omission, e.g. `<!doctype html><main>...</main>`
+        // -- is still a real page a browser renders; it must still get the
+        // banner appended rather than being silently skipped.
+        let out = splice_before_body_close(b"<!doctype html><main>ok</main>", "<snip>");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.ends_with("<snip>"), "{s}");
     }
 
     #[test]

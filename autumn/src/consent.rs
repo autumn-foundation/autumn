@@ -423,7 +423,15 @@ pub fn redirect_target_from_referer(referer: Option<&str>) -> String {
     let Some(value) = referer else {
         return "/".to_owned();
     };
-    let after_scheme = value.split("://").nth(1).unwrap_or(value);
+    // `split_once` (not `split(...).nth(1)`): a `split` iterates every
+    // occurrence of the delimiter, so a Referer whose path/query legitimately
+    // contains a second `://` (e.g. `?source=https://vendor.example/x`) would
+    // have `.nth(1)` land on the fragment between the FIRST and SECOND
+    // delimiter instead of everything after the first — truncating the
+    // target partway through an embedded URL. `split_once` only ever
+    // recognizes the first `://`, so the rest of the string (including any
+    // further `://` occurrences) survives intact as ordinary path content.
+    let after_scheme = value.split_once("://").map_or(value, |(_, rest)| rest);
     let path = after_scheme.find('/').map_or("/", |i| &after_scheme[i..]);
     safe_redirect_target(path).to_owned()
 }
@@ -794,5 +802,27 @@ mod tests {
             redirect_target_from_referer(Some("https://example.com")),
             "/"
         );
+    }
+
+    #[test]
+    fn redirect_target_from_referer_does_not_silently_accept_a_scheme_truncated_target() {
+        // A naive `split("://").nth(1)` would stop at the SECOND `://`
+        // occurrence (the one inside the query value) rather than only the
+        // first, silently truncating the target to `/docs?source=https` —
+        // which, having lost its own embedded `://`, would then sail right
+        // past `safe_redirect_target`'s unrelated "no `://` anywhere" guard
+        // and get silently accepted as a corrupted redirect target.
+        // `split_once` preserves the whole thing instead, so the candidate
+        // downstream still legitimately contains `://` and is correctly
+        // rejected by that guard, falling back to the safe "/" rather than
+        // redirecting to a mangled URL.
+        let result = redirect_target_from_referer(Some(
+            "https://app.example.com/docs?source=https://vendor.example.com/x",
+        ));
+        assert_ne!(
+            result, "/docs?source=https",
+            "must not silently truncate to (and accept) a corrupted target: {result}"
+        );
+        assert_eq!(result, "/");
     }
 }
