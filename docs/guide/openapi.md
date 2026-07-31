@@ -419,8 +419,14 @@ actually calls.
 
 ## 9. Choosing what appears
 
-Every registered route lands in the spec — including HTML pages, which show up
-as operations with no JSON body. Three ways to shape that:
+Every route in `routes![]` (and in a scoped group) lands in the spec —
+including HTML page handlers, which show up as operations with no JSON body.
+Two kinds of route never appear: `#[ws]` handlers, which are hidden
+automatically, and `#[static_get]` pages registered only through
+`.static_routes(static_routes![…])`, which carry no `ApiDoc` into the route
+list the generator walks.
+
+Three ways to shape what remains:
 
 - `#[api_doc(hidden)]` on routes that are not part of the API contract
   (internal endpoints, HTML pages you would rather not advertise).
@@ -428,8 +434,6 @@ as operations with no JSON body. Three ways to shape that:
   from page routes that inherit a path-segment tag.
 - Path layout: keeping the API under `/api/...` gives every endpoint the same
   default tag for free.
-
-`#[ws]` routes are hidden automatically.
 
 ---
 
