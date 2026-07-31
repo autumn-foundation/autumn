@@ -115,5 +115,8 @@ follow-up.
 
 ## See also
 
+- [Route Auth Coverage — the Default-Deny Posture Model](route-auth-coverage.md)
+  — the default-deny classification model behind the `routes` dimension, and
+  how to classify the three route kinds (`gated`, `public`, `framework`).
 - [`autumn routes` — Route Inspection CLI](routes-cli.md) — the `audit`
   subcommand that emits this manifest.

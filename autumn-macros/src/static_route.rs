@@ -224,6 +224,8 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     api_version: ::core::option::Option::None,
                     public: #is_public,
                     module_path: ::core::module_path!(),
+                    source_file: ::core::file!(),
+                    source_line: ::core::line!(),
                     ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::None,

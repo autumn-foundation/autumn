@@ -293,6 +293,11 @@ pub struct RouteInfo {
     /// route in audit diagnostics. `None` for routes without a known module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
+    /// `file:line` source location of the handler (from `file!()`/`line!()`),
+    /// used to point an audit diagnostic straight at the offending handler.
+    /// `None` for routes without a known location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 /// `skip_serializing_if` helper: elide `false` booleans from JSON output.
@@ -395,6 +400,16 @@ fn module_of(api_doc: &crate::openapi::ApiDoc) -> Option<String> {
     (!api_doc.module_path.is_empty()).then(|| api_doc.module_path.to_owned())
 }
 
+/// The handler's `file:line` source location, when the route macros captured
+/// one (`ApiDoc::source_file`/`ApiDoc::source_line`, from `file!()`/`line!()`
+/// at the handler's definition site). `None` for routes constructed without
+/// the route macros, so an audit diagnostic can point straight at the
+/// offending handler instead of only naming its module.
+fn source_location_of(api_doc: &crate::openapi::ApiDoc) -> Option<String> {
+    (!api_doc.source_file.is_empty())
+        .then(|| format!("{}:{}", api_doc.source_file, api_doc.source_line))
+}
+
 /// Helper type alias representing version name, status string, and sunset opt-out flag.
 type RouteVersionInfo = (Option<String>, Option<String>, Option<bool>);
 
@@ -475,6 +490,7 @@ pub fn collect_route_infos(
             scopes,
             policy,
             module: module_of(&route.api_doc),
+            location: source_location_of(&route.api_doc),
         });
     }
 
@@ -499,6 +515,7 @@ pub fn collect_route_infos(
                 scopes,
                 policy,
                 module: module_of(&route.api_doc),
+                location: source_location_of(&route.api_doc),
             });
         }
     }

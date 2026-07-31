@@ -51,7 +51,12 @@ pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: mau
     }
 }
 
+// `#[public]` marks each handler below deliberately unauthenticated — see
+// `autumn routes audit` / docs/guide/route-auth-coverage.md. Replace it with
+// `#[secured]`/`#[authorize]` on any route that should require a signed-in
+// user or a dynamic policy check.
 #[get("/")]
+#[public]
 async fn index(flash: Flash, path: CurrentPath) -> maud::Markup {
     layout("Welcome", path.as_str(), flash_messages(&flash.consume().await), maud::html! {
         h1 { "Welcome to {{project_name}}!" }
@@ -60,11 +65,13 @@ async fn index(flash: Flash, path: CurrentPath) -> maud::Markup {
 }
 
 #[get("/hello")]
+#[public]
 async fn hello() -> &'static str {
     "Hello, Autumn!"
 }
 
 #[get("/hello/{name}")]
+#[public]
 async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
     format!("Hello, {}!", *name)
 }
