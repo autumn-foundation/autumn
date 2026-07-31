@@ -58,6 +58,12 @@ Rules the macro enforces at compile time:
 A `#[searchable]` model whose primary key is not `i64` keeps its #842 behaviour
 and simply has no plugin index — search indexes key on `i64`.
 
+A `deleted_at` column is **not** by itself treated as a tombstone. The index
+follows the repository: `#[repository(..., soft_delete)]` makes the source
+exclude deleted rows, matching the finders, while a `deleted_at` kept as audit
+history leaves them indexed — also matching the finders. Inferring from the
+column alone would hide records the app still displays.
+
 The key **column** does not have to be called `id`. `#[id] pub note_id: i64` is
 carried into the index definition as `key_column`, and the Postgres document
 source selects, filters, and paginates on it — so a model over a legacy table
@@ -202,6 +208,13 @@ The active profile comes from `AUTUMN_ENV` → `AUTUMN_PROFILE` → `--profile` 
 filename is looked up through `AUTUMN_MANIFEST_DIR` before the working
 directory. A plugin that read only the base `autumn.toml` would silently ignore
 the kill switch in the one environment you reach for it.
+
+Both of those last two values are read through core's `Env` abstraction rather
+than the raw process environment, because neither is necessarily a real
+variable: `#[autumn_web::main]` supplies the crate directory and the build mode
+at compile time. Reading `std::env` directly would see a release binary as
+`dev` — skipping `[profile.prod]` — and would miss the app's own config
+whenever the binary runs from anywhere but its crate root.
 
 An unknown key under `[search]` is an **error**, not a warning — a typo'd
 `queu = "indexing"` would otherwise silently leave indexing on the default

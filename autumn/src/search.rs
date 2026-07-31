@@ -171,6 +171,20 @@ pub struct IndexDefinition {
     /// the same posture `#[repository(tenant_scoped)]` takes, where a missing
     /// tenant is an error rather than an unscoped read.
     pub tenant_scoped: bool,
+    /// Whether the model's **repository** opts into `soft_delete`.
+    ///
+    /// Not "does the table have a `deleted_at` column" — the two are different
+    /// questions, and the framework supports a model that carries `deleted_at`
+    /// purely as audit history while its finders return those rows. A source
+    /// that inferred soft-delete semantics from column presence alone would
+    /// hide every such row from reindex and drop it from a purging backfill,
+    /// disagreeing with the very finders the index is supposed to mirror.
+    ///
+    /// Filled by `#[model]` from
+    /// `AutumnPreloadScopeExt::__autumn_repo_soft_delete_scope`, the same seam
+    /// `preload`'s in-memory retain uses, which `#[repository(soft_delete)]`
+    /// overrides inherently on the model.
+    pub soft_delete: bool,
     /// Primary-key column of the model's table, defaulting to `"id"`.
     ///
     /// A backend that reads the source table to rebuild documents — a backfill
@@ -202,6 +216,7 @@ impl IndexDefinition {
             fields: Cow::Borrowed(fields),
             embed_field,
             tenant_scoped,
+            soft_delete: false,
             key_column: DEFAULT_KEY_COLUMN,
         }
     }
@@ -210,6 +225,15 @@ impl IndexDefinition {
     #[must_use]
     pub const fn with_key_column(mut self, key_column: &'static str) -> Self {
         self.key_column = key_column;
+        self
+    }
+
+    /// Declare that the model's repository is `soft_delete`, so a source
+    /// excludes `deleted_at IS NOT NULL` rows. See
+    /// [`soft_delete`](Self::soft_delete).
+    #[must_use]
+    pub const fn with_soft_delete(mut self, soft_delete: bool) -> Self {
+        self.soft_delete = soft_delete;
         self
     }
 

@@ -400,6 +400,40 @@ fn filter_sql(
     sql
 }
 
+/// The ` AND <score> >= $n` fragment for a minimum-score bound, advancing
+/// `next_param` when one is emitted.
+///
+/// The threshold is **bound, never interpolated**. `min_score` can come
+/// straight off a request, and diesel's prepared-statement cache is keyed on
+/// SQL text and never evicts — so a formatted value mints a permanent
+/// statement per distinct threshold, and a caller sweeping values grows the
+/// cache without bound until the server dies. That is the same failure the
+/// LIMIT/OFFSET binds exist to prevent, and the same one that made
+/// interpolated ids an OOM on every backfill.
+///
+/// Emitted only when a bound was asked for, because it repeats the
+/// (non-trivial) score expression. A non-finite bound is dropped rather than
+/// bound: "no threshold" is the safe reading of "not a number", and `>= NaN`
+/// would silently match nothing.
+fn score_threshold_sql(score_expr: &str, min_score: Option<f32>, next_param: &mut usize) -> String {
+    if !min_score.is_some_and(f32::is_finite) {
+        return String::new();
+    }
+    let sql = format!(" AND {score_expr} >= ${next_param}::double precision");
+    *next_param += 1;
+    sql
+}
+
+/// The bound value for [`score_threshold_sql`], if it emitted a fragment.
+///
+/// Kept next to it so the two cannot disagree about whether a parameter was
+/// consumed — a mismatch would shift every later parameter by one.
+fn score_threshold_bind(min_score: Option<f32>) -> Option<Bound> {
+    min_score
+        .filter(|min| min.is_finite())
+        .map(|min| Bound::Double(f64::from(min)))
+}
+
 /// One bound parameter.
 ///
 /// Exists so a query can be assembled as `(sql, Vec<Bound>)` and bound in one
@@ -410,6 +444,7 @@ enum Bound {
     Text(String),
     NullableText(Option<String>),
     BigInt(i64),
+    Double(f64),
     Ids(Vec<i64>),
 }
 
@@ -420,6 +455,7 @@ fn bind_all(mut query: BoxedQuery<'_>, binds: impl IntoIterator<Item = Bound>) -
             Bound::Text(value) => query.bind::<Text, _>(value),
             Bound::NullableText(value) => query.bind::<Nullable<Text>, _>(value),
             Bound::BigInt(value) => query.bind::<BigInt, _>(value),
+            Bound::Double(value) => query.bind::<Double, _>(value),
             Bound::Ids(values) => query.bind::<Array<BigInt>, _>(values),
         };
     }
@@ -813,15 +849,7 @@ impl SearchBackend for PostgresSearchStore {
             };
             let _ = distance;
 
-            // Only emit the threshold when one was asked for: it repeats the
-            // (non-trivial) score expression. A non-finite bound would render
-            // as a bare `NaN`/`inf` identifier and turn the query into a
-            // syntax error, so drop it — no threshold is the safe reading of
-            // "not a number".
-            let threshold = query
-                .min_score
-                .filter(|min| min.is_finite())
-                .map_or_else(String::new, |min| format!(" AND {score_expr} >= {min:?}"));
+            let threshold = score_threshold_sql(&score_expr, query.min_score, &mut param);
 
             let limit_param = param;
             let limit = i64::try_from(query.limit).unwrap_or(i64::MAX);
@@ -838,6 +866,10 @@ impl SearchBackend for PostgresSearchStore {
                 ]
                 .into_iter()
                 .chain(binds)
+                // The threshold parameter, when one was emitted, sits between
+                // the filter binds and the limit — matching the order `param`
+                // handed the numbers out above.
+                .chain(score_threshold_bind(query.min_score))
                 .chain([Bound::BigInt(limit)]),
             )
             .load::<HitRow>(&mut conn)
@@ -1177,10 +1209,20 @@ impl PostgresSearchStore {
                 binds.push(Bound::BigInt(i64::try_from(limit).unwrap_or(i64::MAX)));
             }
         }
-        if columns.deleted_at {
-            // A soft-deleted row must not be re-indexed: `after_delete_commit`
-            // removes its document, and a later backfill would otherwise put
-            // it straight back — searchable while `find` hides it.
+        // BOTH conditions: the column has to exist, and the model's repository
+        // has to actually be `soft_delete`.
+        //
+        // Column presence alone is not the question. A `deleted_at` that is
+        // audit history — a supported shape, whose finders return those rows —
+        // would otherwise be read as a tombstone here: reindex would see the
+        // row as absent and delete its document, and a purging backfill would
+        // drop it entirely. The index would hide records the app still shows.
+        //
+        // When the repository IS `soft_delete`, the filter is required for the
+        // mirror-image reason: `after_delete_commit` removes the document, and
+        // a later backfill would put it straight back — searchable while
+        // `find` hides it.
+        if columns.deleted_at && definition.soft_delete {
             predicates.push("deleted_at IS NULL".to_owned());
         }
         let where_clause = if predicates.is_empty() {
@@ -1327,6 +1369,54 @@ mod tests {
 
     fn definition() -> IndexDefinition {
         IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
+    }
+
+    #[test]
+    fn a_min_score_is_bound_so_the_statement_cache_stays_bounded() {
+        // The property that matters is not "the value is correct" but "the SQL
+        // TEXT does not vary with the value" — diesel's statement cache is
+        // keyed on that text and never evicts, so a request-controlled
+        // threshold would otherwise leak one permanent prepared statement per
+        // distinct value.
+        let expr = "(1 - (embedding_vec <=> $2::vector))::double precision";
+        let mut a = 5;
+        let mut b = 5;
+        let first = score_threshold_sql(expr, Some(0.25), &mut a);
+        let second = score_threshold_sql(expr, Some(0.999_999), &mut b);
+        assert_eq!(
+            first, second,
+            "two thresholds must produce ONE statement, not two"
+        );
+        assert_eq!(a, b, "and consume the same parameter slot");
+        assert!(first.contains("$5"), "{first}");
+        assert!(
+            !first.contains("0.25"),
+            "the value must not reach the SQL text: {first}"
+        );
+
+        // No bound: no fragment, no parameter consumed.
+        let mut param = 5;
+        assert!(score_threshold_sql(expr, None, &mut param).is_empty());
+        assert_eq!(param, 5);
+
+        // Non-finite: dropped rather than bound. `>= NaN` matches nothing.
+        let mut param = 5;
+        assert!(score_threshold_sql(expr, Some(f32::NAN), &mut param).is_empty());
+        assert!(score_threshold_sql(expr, Some(f32::INFINITY), &mut param).is_empty());
+        assert_eq!(param, 5);
+
+        // The fragment and its bind must agree on whether a slot was used —
+        // a disagreement would shift every later parameter by one.
+        for candidate in [None, Some(0.5), Some(f32::NAN), Some(f32::INFINITY)] {
+            let mut param = 5;
+            let emitted = !score_threshold_sql(expr, candidate, &mut param).is_empty();
+            assert_eq!(
+                emitted,
+                score_threshold_bind(candidate).is_some(),
+                "fragment/bind disagreement for {candidate:?}"
+            );
+            assert_eq!(param, if emitted { 6 } else { 5 });
+        }
     }
 
     #[test]

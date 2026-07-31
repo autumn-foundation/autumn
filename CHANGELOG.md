@@ -91,7 +91,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value and semantic search returns nothing. The index definition also carries
   the model's real key column, so a `#[id] pub note_id: i64` over a legacy
   table that still has an unrelated `id` backfills off the right one. The
-  in-core
+  section is read through core's own `Env` abstraction, so the macro-supplied
+  crate directory and build mode are visible and a release binary resolves the
+  same profile core does. A `deleted_at` column is not by itself a tombstone:
+  the source follows the repository's `soft_delete` opt-in, so audit-history
+  rows stay indexed exactly as the model's finders return them.
+  Request-controlled values — pagination, and the k-NN minimum score — are
+  bound rather than formatted into the SQL, because diesel's statement cache is
+  keyed on query text and never evicts. The in-core
   `#[repository(searchable)]` `search()` and its `websearch_to_tsquery`
   semantics are untouched; this subsumes #842 as one backend, it does not
   replace it. See `docs/guide/search.md`.

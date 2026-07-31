@@ -36,6 +36,7 @@ diesel::table! {
         title -> Text,
         body -> Text,
         tenant_id -> Nullable<Text>,
+        deleted_at -> Nullable<Timestamp>,
     }
 }
 
@@ -53,6 +54,56 @@ pub struct TenantArticle {
     #[searchable(weight = "B", embed)]
     pub body: String,
     pub tenant_id: Option<String>,
+    #[default]
+    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+}
+
+/// `TenantArticle`'s repository genuinely opts into `soft_delete`, so its
+/// finders hide deleted rows — and the search index must agree. That opt-in,
+/// not the mere presence of the column, is what reaches `IndexDefinition`.
+#[autumn_web::repository(TenantArticle, table = "search_tenant_articles", soft_delete)]
+pub trait TenantArticleRepository {}
+
+diesel::table! {
+    search_audit_articles (id) {
+        id -> Int8,
+        title -> Text,
+        body -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+/// The mirror image: a `deleted_at` column that is **audit history**, with a
+/// repository that does *not* opt into `soft_delete`.
+///
+/// The framework supports this shape and its finders still return those rows
+/// (`autumn/tests/integration/preload_scoping.rs`'s `AuditItem`). A source
+/// that read the column as a tombstone would hide them from reindex and drop
+/// them from a purging backfill, so the index would disagree with the app.
+#[autumn_web::model(table = "search_audit_articles")]
+#[searchable(language = "english")]
+pub struct AuditArticle {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+    #[searchable(weight = "B", embed)]
+    pub body: String,
+    #[default]
+    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(AuditArticle, table = "search_audit_articles")]
+pub trait AuditArticleRepository {}
+
+/// Build an audit-history article.
+pub fn audit_article(id: i64, title: &str, body: &str) -> AuditArticle {
+    AuditArticle {
+        id,
+        title: title.to_owned(),
+        body: body.to_owned(),
+        deleted_at: None,
+    }
 }
 
 diesel::table! {
@@ -121,6 +172,7 @@ pub fn tenant_article(id: i64, title: &str, body: &str, tenant: &str) -> TenantA
         title: title.to_owned(),
         body: body.to_owned(),
         tenant_id: Some(tenant.to_owned()),
+        deleted_at: None,
     }
 }
 
@@ -131,6 +183,7 @@ pub fn untenanted_article(id: i64, title: &str, body: &str) -> TenantArticle {
         title: title.to_owned(),
         body: body.to_owned(),
         tenant_id: None,
+        deleted_at: None,
     }
 }
 

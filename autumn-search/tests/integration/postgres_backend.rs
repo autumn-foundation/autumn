@@ -30,7 +30,8 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 use super::support::{
-    Article, Note, TenantArticle, article, note, tenant_article, untenanted_article, with_tenant,
+    Article, AuditArticle, Note, TenantArticle, article, audit_article, note, tenant_article,
+    untenanted_article, with_tenant,
 };
 
 const CREATE_TABLES_SQL: &[&str] = &[
@@ -47,6 +48,14 @@ const CREATE_TABLES_SQL: &[&str] = &[
         body       TEXT NOT NULL,
         tenant_id  TEXT,
         deleted_at TIMESTAMPTZ
+    )",
+    // `deleted_at` here is AUDIT HISTORY: the repository does not opt into
+    // `soft_delete`, so finders return these rows and the index must too.
+    "CREATE TABLE IF NOT EXISTS search_audit_articles (
+        id         BIGSERIAL PRIMARY KEY,
+        title      TEXT NOT NULL,
+        body       TEXT NOT NULL,
+        deleted_at TIMESTAMP
     )",
     // Keyed on `note_id`, with a leftover `id` column whose values disagree.
     // A source reader that assumes `id` returns rows here without error — it
@@ -106,6 +115,10 @@ impl Fixture {
             .ensure_index(&Note::index_definition())
             .await
             .expect("ensure_index (note)");
+        store
+            .ensure_index(&AuditArticle::index_definition())
+            .await
+            .expect("ensure_index (audit)");
 
         Self {
             store,
@@ -189,6 +202,24 @@ impl Fixture {
         )
     }
 
+    /// Insert an audit-history row, optionally already "deleted".
+    async fn insert_audit(&self, record: &AuditArticle, deleted: bool) {
+        let mut conn = self.pool.get().await.expect("conn");
+        let deleted_at = if deleted { "NOW()" } else { "NULL" };
+        diesel::sql_query(format!(
+            "INSERT INTO search_audit_articles (id, title, body, deleted_at) \
+             VALUES ($1, $2, $3, {deleted_at}) \
+             ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, \
+             deleted_at = EXCLUDED.deleted_at"
+        ))
+        .bind::<diesel::sql_types::BigInt, _>(record.id)
+        .bind::<diesel::sql_types::Text, _>(record.title.clone())
+        .bind::<diesel::sql_types::Text, _>(record.body.clone())
+        .execute(&mut conn)
+        .await
+        .expect("insert audit row");
+    }
+
     /// Insert a row into the `note_id`-keyed source table.
     async fn insert_note(&self, record: &Note) {
         let mut conn = self.pool.get().await.expect("conn");
@@ -250,6 +281,7 @@ impl Fixture {
             .index::<Article>()
             .index::<TenantArticle>()
             .index::<Note>()
+            .index::<AuditArticle>()
             .build()
     }
 }
@@ -1083,4 +1115,61 @@ async fn an_undeclared_filter_key_cannot_widen_the_query() {
         .tenant_search("rust", SearchFilter::default().tenant("acme"))
         .await;
     assert_eq!(ids, vec![1]);
+}
+
+// ── `deleted_at` is not automatically a tombstone ───────────────────────────
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_audit_deleted_at_column_does_not_hide_rows_from_the_index() {
+    // `AuditArticle` carries `deleted_at` as history and its repository does
+    // NOT opt into `soft_delete`, so its finders return those rows. Inferring
+    // a tombstone from column presence would hide them here: reindex would
+    // read the row as absent and delete its document, and a purging backfill
+    // would drop it entirely — an index that hides records the app displays.
+    let fixture = Fixture::start().await;
+    let client = fixture.client();
+
+    fixture
+        .insert_audit(&audit_article(1, "Rust one", "a rust framework"), false)
+        .await;
+    fixture
+        .insert_audit(&audit_article(2, "Rust two", "a rust framework"), true)
+        .await;
+
+    let report = client
+        .backfill(
+            "search_audit_articles",
+            &BackfillOptions::default().purge(true),
+        )
+        .await
+        .expect("backfill");
+    assert_eq!(
+        report.indexed, 2,
+        "an audit timestamp is not a delete: both rows belong in the index"
+    );
+
+    let page = client
+        .search::<AuditArticle>("rust", &PageRequest::default())
+        .await
+        .expect("search");
+    assert_eq!(
+        page.content.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+
+    // And a targeted reindex of the "deleted" row keeps it, rather than
+    // converging to absent.
+    client
+        .reindex(&ReindexArgs::upsert("search_audit_articles", 2))
+        .await
+        .expect("reindex");
+    assert_eq!(
+        client
+            .search::<AuditArticle>("rust", &PageRequest::default())
+            .await
+            .expect("search")
+            .total_elements,
+        2
+    );
 }

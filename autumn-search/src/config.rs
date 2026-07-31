@@ -1,8 +1,8 @@
 //! The plugin-owned `[search]` section of `autumn.toml`.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use autumn_web::config::Env;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the search subsystem.
@@ -141,7 +141,7 @@ impl SearchConfig {
     /// be read or parsed, when the merged `[search]` table has an unknown or
     /// ill-typed key, or when a value is out of range.
     pub fn resolve() -> Result<Self, SearchConfigError> {
-        Self::resolve_with_env(&std::env::vars().collect())
+        Self::resolve_with_env(&autumn_web::config::OsEnv)
     }
 
     /// Pure core of [`resolve`](Self::resolve): build the effective `[search]`
@@ -167,6 +167,16 @@ impl SearchConfig {
     /// then the working directory, exactly as core's `find_config_file_named`
     /// does — so the plugin reads the same files the host runtime does.
     ///
+    /// `env` is core's [`Env`](autumn_web::config::Env) abstraction, **not** a
+    /// snapshot of `std::env::vars()`. That distinction is load-bearing:
+    /// [`OsEnv`](autumn_web::config::OsEnv) synthesizes `AUTUMN_MANIFEST_DIR`
+    /// and `AUTUMN_IS_DEBUG` from the `#[autumn_web::main]` macro context, and
+    /// neither is a real process variable. Reading the raw process environment
+    /// instead means a release binary launched with no explicit selector is
+    /// seen as `dev` here while core resolves `prod` — so `[profile.prod]`
+    /// would be skipped — and the app's crate directory is invisible, so a
+    /// binary run from anywhere but the crate root misses its own config.
+    ///
     /// [`profile_override_file_lookup_names`]: autumn_web::config::profile_override_file_lookup_names
     ///
     /// # Errors
@@ -174,7 +184,7 @@ impl SearchConfig {
     /// Returns [`SearchConfigError::Invalid`] when a contributing file cannot
     /// be read or parsed, when the merged `[search]` table has an unknown or
     /// ill-typed key, or when a value is out of range.
-    pub fn resolve_with_env(env: &HashMap<String, String>) -> Result<Self, SearchConfigError> {
+    pub fn resolve_with_env(env: &dyn Env) -> Result<Self, SearchConfigError> {
         let (selected_input, canonical) = resolve_active_profile(env);
         let mut merged = toml::Value::Table(toml::map::Map::new());
 
@@ -218,7 +228,7 @@ impl SearchConfig {
     /// An unparseable value is **ignored** rather than fatal, matching core's
     /// own `apply_env_overrides`: a malformed env var must not take down a
     /// process that would otherwise boot on its file config.
-    fn apply_env_overrides(&mut self, env: &HashMap<String, String>) {
+    fn apply_env_overrides(&mut self, env: &dyn Env) {
         if let Some(queue) = env_trimmed(env, "AUTUMN_SEARCH__QUEUE") {
             self.queue = queue;
         }
@@ -273,11 +283,11 @@ fn toml_from_str<T: serde::de::DeserializeOwned>(contents: &str) -> Result<T, to
 }
 
 /// Non-blank env value (a blank value reads as unset, as core treats it).
-fn env_trimmed(env: &HashMap<String, String>, key: &str) -> Option<String> {
-    env.get(key)
-        .map(|value| value.trim())
+fn env_trimmed(env: &dyn Env, key: &str) -> Option<String> {
+    env.var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 /// The `(selected spelling, canonical name)` of the active profile.
@@ -286,7 +296,7 @@ fn env_trimmed(env: &HashMap<String, String>, key: &str) -> Option<String> {
 /// `--profile` → `AUTUMN_IS_DEBUG=0` ⇒ `prod` → `dev`. Both halves are needed
 /// because the override-file lookup prefers the spelling that was actually
 /// selected (`autumn-production.toml` vs `autumn-prod.toml`).
-fn resolve_active_profile(env: &HashMap<String, String>) -> (String, String) {
+fn resolve_active_profile(env: &dyn Env) -> (String, String) {
     let selected = resolve_profile_input(env);
     let canonical =
         autumn_web::config::normalize_profile_name(&selected).unwrap_or_else(|| "dev".to_owned());
@@ -294,7 +304,7 @@ fn resolve_active_profile(env: &HashMap<String, String>) -> (String, String) {
 }
 
 /// The raw profile selector, before normalization.
-fn resolve_profile_input(env: &HashMap<String, String>) -> String {
+fn resolve_profile_input(env: &dyn Env) -> String {
     if let Some(value) = env_trimmed(env, "AUTUMN_ENV") {
         return value;
     }
@@ -318,7 +328,7 @@ fn resolve_profile_input(env: &HashMap<String, String>) -> String {
             return profile.trim().to_owned();
         }
     }
-    if env.get("AUTUMN_IS_DEBUG").map(String::as_str) == Some("0") {
+    if env_trimmed(env, "AUTUMN_IS_DEBUG").as_deref() == Some("0") {
         return "prod".to_owned();
     }
     "dev".to_owned()
@@ -328,7 +338,7 @@ fn resolve_profile_input(env: &HashMap<String, String>) -> String {
 /// `AUTUMN_MANIFEST_DIR` when the file is actually there, else relative to the
 /// working directory. Per-file, not per-directory — a base `autumn.toml` in the
 /// crate root and an `autumn-prod.toml` in the working directory both count.
-fn find_config_file(filename: &str, env: &HashMap<String, String>) -> PathBuf {
+fn find_config_file(filename: &str, env: &dyn Env) -> PathBuf {
     if let Some(dir) = env_trimmed(env, "AUTUMN_MANIFEST_DIR") {
         let candidate = PathBuf::from(dir).join(filename);
         if candidate.exists() {
@@ -412,6 +422,8 @@ fn deep_merge_at(base: &mut toml::Value, overlay: toml::Value, depth: usize) {
 
 #[cfg(test)]
 mod tests {
+    use autumn_web::config::MockEnv;
+
     use super::*;
 
     #[test]
@@ -463,17 +475,17 @@ mod tests {
 
     // ── Profile-aware resolution ────────────────────────────────────────────
 
-    /// A project directory plus the env map that points the resolver at it.
-    fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, HashMap<String, String>) {
+    /// A project directory plus the `Env` that points the resolver at it.
+    ///
+    /// `MockEnv` is core's own test double for the same abstraction the
+    /// runtime uses, so these exercise the real resolution path rather than a
+    /// parallel one built on `std::env::vars()`.
+    fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, MockEnv) {
         let dir = tempfile::tempdir().expect("tempdir");
         for (name, contents) in files {
             std::fs::write(dir.path().join(name), contents).expect("write");
         }
-        let mut env = HashMap::new();
-        env.insert(
-            "AUTUMN_MANIFEST_DIR".to_owned(),
-            dir.path().display().to_string(),
-        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", &dir.path().display().to_string());
         (dir, env)
     }
 
@@ -509,7 +521,7 @@ mod tests {
         let dev = SearchConfig::resolve_with_env(&env).expect("dev");
         assert!(dev.enabled, "the base section governs the dev profile");
 
-        env.insert("AUTUMN_ENV".to_owned(), "prod".to_owned());
+        env = env.with("AUTUMN_ENV", "prod");
         let prod = SearchConfig::resolve_with_env(&env).expect("prod");
         assert!(!prod.enabled, "[profile.prod.search] must win in prod");
         assert_eq!(
@@ -527,7 +539,7 @@ mod tests {
             ),
             ("autumn-prod.toml", "[search]\nbatch_size = 300\n"),
         ]);
-        env.insert("AUTUMN_ENV".to_owned(), "prod".to_owned());
+        env = env.with("AUTUMN_ENV", "prod");
         assert_eq!(
             SearchConfig::resolve_with_env(&env)
                 .expect("resolve")
@@ -544,7 +556,7 @@ mod tests {
             ("autumn.toml", "[server]\nport = 3000\n"),
             ("autumn-prod.toml", "[search]\nenabled = false\n"),
         ]);
-        env.insert("AUTUMN_ENV".to_owned(), "prod".to_owned());
+        env = env.with("AUTUMN_ENV", "prod");
         assert!(
             !SearchConfig::resolve_with_env(&env)
                 .expect("resolve")
@@ -558,7 +570,7 @@ mod tests {
             "autumn.toml",
             "[search]\nenabled = true\n\n[profile.production.search]\nenabled = false\n",
         )]);
-        env.insert("AUTUMN_ENV".to_owned(), "production".to_owned());
+        env = env.with("AUTUMN_ENV", "production");
         assert!(
             !SearchConfig::resolve_with_env(&env)
                 .expect("resolve")
@@ -572,17 +584,14 @@ mod tests {
             "autumn.toml",
             "[search]\nenabled = true\n\n[profile.prod.search]\nenabled = true\n",
         )]);
-        env.insert("AUTUMN_ENV".to_owned(), "prod".to_owned());
-        env.insert("AUTUMN_SEARCH__ENABLED".to_owned(), "false".to_owned());
+        env = env.with("AUTUMN_ENV", "prod");
+        env = env.with("AUTUMN_SEARCH__ENABLED", "false");
         let config = SearchConfig::resolve_with_env(&env).expect("resolve");
         assert!(!config.enabled, "AUTUMN_SEARCH__ENABLED is the last word");
 
-        env.insert("AUTUMN_SEARCH__QUEUE".to_owned(), "urgent".to_owned());
-        env.insert("AUTUMN_SEARCH__BATCH_SIZE".to_owned(), "7".to_owned());
-        env.insert(
-            "AUTUMN_SEARCH__EMBEDDING_DIMENSIONS".to_owned(),
-            "384".to_owned(),
-        );
+        env = env.with("AUTUMN_SEARCH__QUEUE", "urgent");
+        env = env.with("AUTUMN_SEARCH__BATCH_SIZE", "7");
+        env = env.with("AUTUMN_SEARCH__EMBEDDING_DIMENSIONS", "384");
         let config = SearchConfig::resolve_with_env(&env).expect("resolve");
         assert_eq!(config.queue, "urgent");
         assert_eq!(config.batch_size, 7);
@@ -595,14 +604,14 @@ mod tests {
             "autumn.toml",
             "[search]\nenabled = true\n\n[profile.prod.search]\nenabld = false\n",
         )]);
-        env.insert("AUTUMN_ENV".to_owned(), "prod".to_owned());
+        env = env.with("AUTUMN_ENV", "prod");
         assert!(SearchConfig::resolve_with_env(&env).is_err());
     }
 
     #[test]
     fn an_out_of_range_env_override_is_still_rejected() {
         let (_dir, mut env) = project(&[("autumn.toml", "[search]\nbatch_size = 100\n")]);
-        env.insert("AUTUMN_SEARCH__BATCH_SIZE".to_owned(), "0".to_owned());
+        env = env.with("AUTUMN_SEARCH__BATCH_SIZE", "0");
         assert!(SearchConfig::resolve_with_env(&env).is_err());
     }
 
@@ -611,12 +620,76 @@ mod tests {
         // Core's own overrides ignore a malformed value rather than refusing
         // to boot; a process that would run on its file config should.
         let (_dir, mut env) = project(&[("autumn.toml", "[search]\nbatch_size = 100\n")]);
-        env.insert("AUTUMN_SEARCH__BATCH_SIZE".to_owned(), "lots".to_owned());
+        env = env.with("AUTUMN_SEARCH__BATCH_SIZE", "lots");
         assert_eq!(
             SearchConfig::resolve_with_env(&env)
                 .expect("resolve")
                 .batch_size,
             100
+        );
+    }
+
+    #[test]
+    fn a_release_binary_with_no_selector_resolves_prod_not_dev() {
+        // `AUTUMN_IS_DEBUG` is NOT a real process variable — core's `OsEnv`
+        // synthesizes it from the `#[autumn_web::main]` macro context. A
+        // resolver reading `std::env::vars()` never sees it, so a release
+        // binary launched with no explicit selector reads as `dev` while core
+        // reads `prod`, and `[profile.prod.search] enabled = false` is skipped
+        // in exactly the environment it was written for.
+        let (_dir, env) = project(&[(
+            "autumn.toml",
+            "[search]\nenabled = true\n\n[profile.prod.search]\nenabled = false\n",
+        )]);
+
+        let debug_build = env.clone().with("AUTUMN_IS_DEBUG", "1");
+        assert!(
+            SearchConfig::resolve_with_env(&debug_build)
+                .expect("resolve")
+                .enabled,
+            "a debug build is `dev`"
+        );
+
+        let release_build = env.with("AUTUMN_IS_DEBUG", "0");
+        assert!(
+            !SearchConfig::resolve_with_env(&release_build)
+                .expect("resolve")
+                .enabled,
+            "a release build with no selector must resolve `prod`, as core does"
+        );
+    }
+
+    #[test]
+    fn an_explicit_selector_still_beats_the_build_mode() {
+        let (_dir, env) = project(&[(
+            "autumn.toml",
+            "[search]\nqueue = \"base\"\n\n[profile.prod.search]\nqueue = \"prod\"\n\n\
+             [profile.staging.search]\nqueue = \"staging\"\n",
+        )]);
+        let env = env
+            .with("AUTUMN_IS_DEBUG", "0")
+            .with("AUTUMN_ENV", "staging");
+        assert_eq!(
+            SearchConfig::resolve_with_env(&env).expect("resolve").queue,
+            "staging",
+            "AUTUMN_ENV outranks the build-mode fallback"
+        );
+    }
+
+    #[test]
+    fn the_manifest_directory_need_not_be_a_process_variable() {
+        // Same point for the other synthesized value: `OsEnv` falls back to
+        // the macro-supplied crate directory when `AUTUMN_MANIFEST_DIR` is not
+        // in the process environment. Going through `Env` is what lets the
+        // plugin find the app's config from any working directory.
+        let (dir, env) = project(&[("autumn.toml", "[search]\nqueue = \"from-manifest\"\n")]);
+        assert_eq!(
+            find_config_file("autumn.toml", &env),
+            dir.path().join("autumn.toml")
+        );
+        assert_eq!(
+            SearchConfig::resolve_with_env(&env).expect("resolve").queue,
+            "from-manifest"
         );
     }
 
@@ -630,7 +703,7 @@ mod tests {
             ),
             ("autumn-prod.toml", "[search]\nqueue = \"prod-file\"\n"),
         ]);
-        env.insert("AUTUMN_ENV".to_owned(), "staging".to_owned());
+        env = env.with("AUTUMN_ENV", "staging");
         assert_eq!(
             SearchConfig::resolve_with_env(&env).expect("resolve").queue,
             "staging",
@@ -657,7 +730,7 @@ mod tests {
             PathBuf::from("autumn-prod.toml")
         );
         assert_eq!(
-            find_config_file("autumn.toml", &HashMap::new()),
+            find_config_file("autumn.toml", &MockEnv::new()),
             PathBuf::from("autumn.toml"),
             "with no manifest dir the CWD is the only candidate"
         );

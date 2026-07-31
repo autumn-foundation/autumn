@@ -58,6 +58,55 @@ pub struct Note {
 }
 
 diesel::table! {
+    search_def_audited (id) {
+        id -> Int8,
+        body -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+diesel::table! {
+    search_def_archived (id) {
+        id -> Int8,
+        body -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+/// A searchable model whose `deleted_at` is **audit history**, not a
+/// tombstone: the repository does not opt into `soft_delete`, so its finders
+/// return those rows — and so must the search index.
+#[autumn_web::model(table = "search_def_audited")]
+#[searchable]
+pub struct AuditedDoc {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub body: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(AuditedDoc, table = "search_def_audited")]
+pub trait AuditedDocRepository {}
+
+/// The same shape, but genuinely soft-deleted. Its finders hide the rows, so
+/// the index must too.
+#[autumn_web::model(table = "search_def_archived")]
+#[searchable]
+pub struct ArchivedDoc {
+    #[id]
+    pub id: i64,
+    #[searchable]
+    pub body: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(ArchivedDoc, table = "search_def_archived", soft_delete)]
+pub trait ArchivedDocRepository {}
+
+diesel::table! {
     search_def_memos (memo_id) {
         memo_id -> Int8,
         // A leftover column that is not the key (see `Memo`).
@@ -153,6 +202,25 @@ fn index_definition_carries_the_models_real_key_column() {
         "the document keys off `#[id]`, not `id`"
     );
     assert_eq!(memo.search_document().id, 9);
+}
+
+#[test]
+fn index_definition_carries_the_repositorys_soft_delete_semantics() {
+    // A `deleted_at` COLUMN is not the question — the repository's opt-in is.
+    // The framework explicitly supports `deleted_at` as audit history, and
+    // those rows are still returned by finders. A source that inferred a
+    // tombstone from the column would hide them from reindex and drop them
+    // from a purging backfill, so the index would disagree with the app.
+    assert!(
+        !AuditedDoc::index_definition().soft_delete,
+        "an audit `deleted_at` without `#[repository(soft_delete)]` is not a tombstone"
+    );
+    assert!(
+        ArchivedDoc::index_definition().soft_delete,
+        "`#[repository(soft_delete)]` must reach the index definition"
+    );
+    // A model with no `deleted_at` at all is trivially not soft-deleting.
+    assert!(!Article::index_definition().soft_delete);
 }
 
 #[test]

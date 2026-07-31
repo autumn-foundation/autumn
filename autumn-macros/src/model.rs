@@ -3766,6 +3766,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     const SEARCH_EMBED_FIELD: ::core::option::Option<&'static str> = #embed_const;
 
                     fn index_definition() -> ::autumn_web::search::IndexDefinition {
+                        // In scope so the blanket `false` default resolves for
+                        // a model whose repository is not `soft_delete` (or
+                        // that has no repository at all). An inherent override
+                        // emitted by `#[repository(soft_delete)]` still wins.
+                        use ::autumn_web::preload::AutumnPreloadScopeExt as _;
+
                         const __AUTUMN_SEARCH_INDEX_FIELDS:
                             &[::autumn_web::search::SearchIndexField] = &[
                             #(::autumn_web::search::SearchIndexField::new(
@@ -3786,6 +3792,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // a model keyed on `article_id` would otherwise fail at
                         // runtime with an undefined column.
                         .with_key_column(#search_pk_column)
+                        // Resolved at RUNTIME through the same seam preload
+                        // uses: `#[repository(soft_delete)]` overrides this
+                        // inherently on the model, and `#[model]` cannot see
+                        // the repository attribute. A `deleted_at` column
+                        // alone does NOT mean soft delete — it is often audit
+                        // history, and those rows must stay indexed because
+                        // the model's finders still return them.
+                        //
+                        // UNQUALIFIED `<Self>::`, never `<Self as Trait>::`:
+                        // the override is an *inherent* associated fn, and
+                        // naming the trait would resolve straight past it to
+                        // the blanket `false` default — silently disabling the
+                        // filter for every genuinely soft-deleted model.
+                        .with_soft_delete(<Self>::__autumn_repo_soft_delete_scope())
                     }
 
                     fn search_id(&self) -> i64 {
