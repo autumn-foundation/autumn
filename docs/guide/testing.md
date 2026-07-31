@@ -257,6 +257,12 @@ These mirror Laravel's `actingAs`, Rails' `sign_in`, Django's `force_login`, and
 Phoenix's `log_in_user`. `acting_as` requires a client built via `TestApp::build()`
 with the default in-memory session backend; it panics for `from_router` clients.
 
+`acting_as` sets identity only — authorization still runs, so a user who lacks
+the required role or scope is still denied. Keep at least one test that drives
+the real login handler: see the [authentication guide](./authentication.md) for
+what that test should assert (session-id rotation, non-enumeration, and an
+unusable post-logout cookie).
+
 ---
 
 ## Structural HTML assertions

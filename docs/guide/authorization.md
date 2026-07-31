@@ -306,6 +306,8 @@ empty.
 
 ## See also
 
+- [Authentication](./authentication.md) — how a request acquires the identity
+  these policies are evaluated against: sessions, login, and `#[secured]`.
 - [Macro transparency: `#[authorize]`](./macro-transparency.md#authorize)
 - [Coming from other frameworks](./coming-from-other-frameworks.md) — maps
   Pundit, Bodyguard, `@PreAuthorize`, and `before_action` onto autumn's
