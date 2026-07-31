@@ -522,8 +522,17 @@ npx @openapitools/openapi-generator-cli generate \
 **In CI**, the cheapest useful gate is a breaking-change diff: regenerate the
 spec on the PR branch, compare it against the committed copy with an
 OpenAPI-diff tool, and fail on removals. Because the spec is derived from
-handler types, that diff catches contract breaks — a dropped field, a renamed
-route, a body that changed shape — as part of the normal build.
+handler types, that diff catches contract breaks — a removed route, a changed
+method or status, a parameter that vanished — as part of the normal build.
+
+A diff can only see what the document describes, so **field-level** breaks are
+caught exactly for the types that carry a field-accurate schema: anything with
+`#[derive(OpenApiSchema)]` or an explicit `register_schema`. A type resolving
+to the `{"type": "object", "title": "…"}` placeholder of
+[§4](#4-component-schemas) — including a `#[model]` you have not registered —
+has no fields in the spec at all, so renaming or dropping one changes nothing
+for the diff to fail on. If you intend to lean on this gate, make sure the
+types on your API boundary are not placeholders first.
 
 ---
 
