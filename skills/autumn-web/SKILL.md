@@ -664,6 +664,29 @@ export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 For rotation, set `[security.signing_secret].previous_secrets` until old
 cookies, CSRF tokens, flash state, and signed storage URLs expire.
 
+### Cookie consent (unreleased — trunk-dev, issue #1214)
+
+`autumn new` scaffolds a cookie-consent banner and a real consent gate by
+default — no third-party tracker, no JS. `autumn_web::consent::Consent` is an
+extractor read straight off the request's `Cookie` header (no middleware
+dependency); `consent.allows("analytics", POLICY_VERSION)` is the actual
+enforcement gate (returns `false` for every category except `"necessary"`
+until a decision is recorded under the current policy version).
+`accept_all_cookie` / `reject_non_essential_cookie` / `expire_consent_cookie`
+build the `Set-Cookie` value recording categories + policy version +
+timestamp. `inject_consent_banner` (behind the `maud` feature; mirrors the
+dev-mode live-reload injector) auto-splices the banner into every HTML
+response — no change to the shared `layout()` signature is needed. Takes the
+CSRF cookie name and form-field name as explicit parameters
+(`DEFAULT_CSRF_COOKIE_NAME` / `DEFAULT_CSRF_FORM_FIELD` when unconfigured)
+rather than reading them off request/response state, since `CsrfLayer` always
+sits inner to user layers. Skips injection entirely for an internal `autumn
+build` / ISR render (`static_gen::RenderDeadlineExempt`) rather than baking
+the banner into the static file written to `dist/`. Bump the scaffolded
+`CONSENT_POLICY_VERSION` constant to invalidate prior consent and re-show the
+banner. Strictly-necessary cookies (session, CSRF) are never routed through
+the gate.
+
 ### Audit actor attribution (unreleased — trunk-dev)
 
 Version/audit writes are auto-attributed to the current actor — no per-call

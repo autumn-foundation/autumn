@@ -416,6 +416,32 @@ Per-primitive setters (in addition to the shared set):
   `cursor_pagination_nav(&CursorPage, &PagerOptions)`, `PagerOptions::new(base)
   .query(qs).hx_target(sel).hx_push_url()` (prelude re-exports).
 - `autumn_web::ui::{WIDGETS_CSS, WIDGETS_CSS_PATH}` widget stylesheet.
+- `autumn_web::consent` (issue #1214, `maud`-gated parts noted below) —
+  cookie-consent banner + gate scaffolded by `autumn new` by default.
+  `Consent` extractor (reads the `Cookie` header directly, no middleware
+  needed) with `consent.allows(category, current_policy_version) -> bool`
+  (always `true` for `"necessary"`) and `consent.needs_prompt(current_policy_version)
+  -> bool`. `accept_all_cookie(&[categories], policy_version)` /
+  `reject_non_essential_cookie(policy_version)` / `expire_consent_cookie()`
+  build the `Set-Cookie` value (categories + policy version + RFC 3339
+  timestamp). `consent_banner_markup(csrf_token, csrf_field_name)` (feature
+  `maud`) and `inject_consent_banner(request, next, policy_version,
+  csrf_cookie_name, csrf_form_field)` (feature `maud`, `DEFAULT_CSRF_COOKIE_NAME`
+  / `DEFAULT_CSRF_FORM_FIELD` constants for the unconfigured defaults) — a
+  response-body-splice middleware, registered via
+  `.layer(axum::middleware::from_fn(...))`, that auto-injects the banner into
+  every HTML response without changing the shared `layout()` signature.
+  `csrf_form_field` is a plain parameter (not read from a `CsrfFormField`
+  request extension) because `CsrfLayer` always sits inner to user layers in
+  the documented stack. An internal `autumn build` / ISR render (tagged
+  `static_gen::RenderDeadlineExempt`) is passed through untouched rather than
+  having the banner baked into the static file on disk. `safe_redirect_target`
+  / `redirect_target_from_referer` are open-redirect-safe helpers for routing
+  a visitor back to the page they were on after they record a choice. Session
+  and CSRF cookies are never routed through the gate. Known limitation: a
+  first-time visitor whose first hit lands on a `#[static_get]` page is served
+  before `CsrfLayer` runs, so the banner has no CSRF token to embed and its
+  forms 403 until the visitor reaches a dynamic page at least once.
 
 (Typed accessible primitives — `Img` / `Button` / `Link` / `MenuItem` /
 `TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` — are documented
