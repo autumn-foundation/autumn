@@ -154,7 +154,14 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 /// `Cache-Control: private, no-store` and `Vary: Cookie` — otherwise a page
 /// the app marked publicly cacheable (e.g. via `cache_for(..).public()`)
 /// could have one visitor's CSRF token served to every other visitor (and
-/// any CDN/proxy in between) until the cache entry expires.
+/// any CDN/proxy in between) until the cache entry expires. For an HTML
+/// response where the visitor has already decided (so nothing is injected),
+/// `Vary: Cookie` is still appended — the app's own handler can render
+/// differently based on the same Consent cookie (e.g.
+/// `consent.allows("analytics", ...)`-gated markup), so a shared cache must
+/// never serve that decided visitor's exact representation to a different
+/// one. `Cache-Control` is left alone in that case, since nothing per-visitor
+/// was freshly embedded and the app's own caching choice should stand.
 ///
 /// If the response already contains the banner's own marker class (e.g. a
 /// "manage cookie preferences" handler rendered [`consent_banner_markup`]
@@ -214,9 +221,26 @@ pub async fn inject_consent_banner(
         request.headers_mut().remove(IF_MODIFIED_SINCE);
     }
 
-    let response = next.run(request).await;
+    let mut response = next.run(request).await;
 
-    if !needs_prompt || !is_html_response(&response) {
+    if !is_html_response(&response) {
+        return response;
+    }
+
+    if !needs_prompt {
+        // A handler can still render differently based on the visitor's
+        // Consent cookie even when this middleware injects nothing (e.g.
+        // `consent.allows("analytics", ...)`-gated markup) — this visitor
+        // simply happens to have already decided. If the app marked the
+        // page publicly cacheable, a shared cache must never serve this
+        // visitor's exact representation to a different visitor (one who's
+        // undecided, or decided under different categories), so it has to
+        // vary on the same header this middleware itself reads consent
+        // from. `append` (not `insert`) preserves any `Vary` the app's own
+        // handler already set (e.g. `Accept-Language`).
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Cookie"));
         return response;
     }
 
@@ -902,7 +926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_cache_headers_added_when_consent_already_decided() {
+    async fn no_cache_control_added_when_consent_already_decided() {
         let app = app_with_policy_version(1);
         let cookie = super::super::accept_all_cookie(&["analytics"], 1);
         let raw_value = cookie
@@ -923,7 +947,41 @@ mod tests {
             .unwrap();
         assert!(
             response.headers().get(CACHE_CONTROL).is_none(),
-            "no banner injected, so this middleware must not touch caching headers"
+            "no banner injected, so this middleware must leave the app's own Cache-Control alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn varies_on_cookie_even_when_consent_already_decided_and_nothing_is_injected() {
+        // The app's own handler can render differently based on the same
+        // Consent cookie (e.g. `consent.allows("analytics", ...)`-gated
+        // markup) even when this middleware itself injects nothing for an
+        // already-decided visitor. A shared cache that stored this
+        // visitor's exact representation must never replay it to a
+        // different visitor (undecided, or decided under different
+        // categories), so the response must still vary on `Cookie`.
+        let app = app_with_policy_version(1);
+        let cookie = super::super::accept_all_cookie(&["analytics"], 1);
+        let raw_value = cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("autumn.consent=")
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("cookie", format!("autumn.consent={raw_value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get(VARY).and_then(|v| v.to_str().ok()),
+            Some("Cookie"),
+            "a decided-but-not-injected HTML response must still vary on Cookie"
         );
     }
 
