@@ -638,6 +638,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was shipped non-blocking in #2018 only until a pinned autumn release published
   prebuilt CLI binaries; with v0.6.0 now published with prebuilt binaries, the
   step runs against the release binary and blocks. Checklist item #7 of #2040.
+### Added
+
+- **security:** `autumn routes audit` (#1604) is now wired into every
+  scaffolded app's CI by default — `autumn new` adds a "Route auth coverage
+  (security manifest)" step to `.github/workflows/ci.yml`, right after the
+  a11y-verify step whose prebuilt CLI it reuses, so a route someone forgot to
+  classify fails CI on day one instead of waiting for an app to opt in.
+  Unclassified-route diagnostics now also name the offending handler's
+  `file:line` (from `file!()`/`line!()`, captured by the `#[get]`/`#[post]`/…,
+  `#[ws]`, and static-route macros alongside the existing module path), so a
+  failing gate points straight at the line to fix. A new [Route Auth
+  Coverage](docs/guide/route-auth-coverage.md) guide documents the
+  default-deny posture model and how to classify the three route kinds
+  (`gated`, `public`, `framework`), completing the deferred items from #1604's
+  first slice (#1850).
 
 ## [0.6.0] - 2026-07-18
 

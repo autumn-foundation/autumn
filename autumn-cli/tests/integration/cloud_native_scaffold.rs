@@ -402,6 +402,31 @@ fn ci_workflow_runs_a11y_verify() {
 }
 
 #[test]
+fn ci_workflow_runs_routes_audit() {
+    let temp_dir = scaffold("ci-routes-audit-app");
+    let project_dir = temp_dir.path().join("ci-routes-audit-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        ci.contains("run: autumn routes audit"),
+        "ci.yml must run `autumn routes audit` as a default-on route \
+         auth-coverage gate (#1604)"
+    );
+    // The gate must run after the CLI is installed (the a11y step's `run:`
+    // block), not require a second, separate install.
+    let a11y_pos = ci
+        .find("- name: Accessibility (a11y) verify")
+        .expect("a11y verify step present");
+    let audit_pos = ci
+        .find("run: autumn routes audit")
+        .expect("routes audit step present");
+    assert!(
+        audit_pos > a11y_pos,
+        "routes audit step must come after the CLI install (a11y step)"
+    );
+}
+
+#[test]
 fn ci_workflow_pins_msrv_toolchain() {
     let temp_dir = scaffold("ci-msrv-app");
     let project_dir = temp_dir.path().join("ci-msrv-app");

@@ -139,6 +139,14 @@ pub struct ApiDoc {
     /// definition site), used to name a route in security-audit diagnostics.
     /// Empty for routes constructed without the route macros.
     pub module_path: &'static str,
+    /// Source file of the handler (`file!()` captured at the handler's
+    /// definition site), used alongside [`Self::source_line`] to point a
+    /// security-audit diagnostic straight at the offending handler. Empty for
+    /// routes constructed without the route macros.
+    pub source_file: &'static str,
+    /// Source line of the handler (`line!()` captured at the handler's
+    /// definition site). `0` when [`Self::source_file`] is empty.
+    pub source_line: u32,
     /// True when the endpoint opts in to MCP tool exposure via
     /// `#[api_doc(mcp)]`. Opt-in is per-endpoint and never implicit.
     pub mcp_tool: bool,

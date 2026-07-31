@@ -226,6 +226,8 @@ pub fn route_macro(
                     has_policy: #has_policy_val,
                     public: #is_public,
                     module_path: ::core::module_path!(),
+                    source_file: ::core::file!(),
+                    source_line: ::core::line!(),
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
