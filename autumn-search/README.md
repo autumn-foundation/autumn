@@ -68,6 +68,7 @@ There is no hand-written index-sync code anywhere.
 autumn search reindex                     # every registered index
 autumn search reindex --index articles    # one index
 autumn search reindex --purge             # clear first (after a schema change)
+autumn search reindex --profile prod      # rebuild the prod profile's index
 ```
 
 ## Backends

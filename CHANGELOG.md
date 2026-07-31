@@ -32,10 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concurrency cap of one **per record** keeps the two jobs that implies from
   interleaving a stale read over a newer write. Queries reuse `Page`/`ListQuery`
   (`search`, `search_list`, `search_hydrated`, `similar`, `similar_to`), and
-  `autumn search reindex [--index NAME] [--purge]` rebuilds an index by running
-  the application binary — the same technique `autumn jobs manifest` uses,
+  `autumn search reindex [--index NAME] [--purge] [--profile NAME]` rebuilds an
+  index by running the application binary — the same technique `autumn jobs manifest` uses,
   because only the app knows which models, backend, and embedder are
-  registered. Backfill walks the source by keyset (`WHERE <key> > $after`),
+  registered. `--profile` matters there: that binary resolves its own
+  `[search]` section, and the CLI builds a debug binary, which core reads as
+  `dev` — so a production rebuild must say so or it rebuilds the development
+  index and reports success. Backfill walks the source by keyset (`WHERE <key> > $after`),
   never `OFFSET`, so a live table cannot skip or repeat rows, and it stops only
   on an empty batch — `scan` returns *up to* `limit`, so a source that filters
   after reading yields short batches with rows still behind them. Backends are pluggable
@@ -104,9 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes a write watermark up front and never overwrites — or re-creates — a
   record a concurrent reindex touched after it started, so the bulk and
   per-record writers converge instead of racing; deletes are recorded in a
-  ledger that outlives the document — in the same statement that removes it, so
-  no concurrent write can observe the gap — and a mid-backfill delete cannot be
-  undone by a stale batch. Tenant scoping, like soft delete, follows the repository's
+  ledger that outlives the document — written in the same statement that removes
+  it and cleared in the same statement that re-creates the record, so no
+  concurrent write can observe half of either — and a mid-backfill delete
+  cannot be undone by a stale batch. Tenant scoping, like soft delete, follows the repository's
   opt-in rather than the mere presence of a column. The in-core
   `#[repository(searchable)]` `search()` and its `websearch_to_tsquery`
   semantics are untouched; this subsumes #842 as one backend, it does not

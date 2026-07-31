@@ -359,6 +359,7 @@ For bootstrapping and after a schema change:
 autumn search reindex                     # every registered index
 autumn search reindex --index articles    # one index
 autumn search reindex --purge             # clear each index first
+autumn search reindex --profile prod      # rebuild prod's index
 ```
 
 The CLI compiles the application binary and runs it with
@@ -400,6 +401,14 @@ returns *up to* `limit` documents, so a source that filters after reading —
 soft-deleted rows, a tenant check, an empty embed field — legitimately returns
 a short batch with rows still behind it. Stopping there would truncate the
 rebuild and report success.
+
+`--profile` matters more than it looks. The reindex works by running your
+application binary — only the app knows which indexes, backend, and embedder
+are registered — and that binary resolves its own `[search]` section. The CLI
+builds a **debug** binary, which core reads as the `dev` profile when no
+selector is set, so a production rebuild has to say `--profile prod` or it will
+rebuild (or purge) the development index and report success. The CLI prints the
+profile it is using for exactly that reason.
 
 `purge` is off by default: emptying the index is the wrong trade for a routine
 repair run. Turn it on when documents the source no longer produces would

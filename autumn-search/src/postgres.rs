@@ -399,28 +399,9 @@ impl PostgresSearchStore {
             .map_err(SearchError::backend)?;
         }
 
-        // An UNCONDITIONAL write is the record coming back: a reindex read the
-        // row and found it present, which supersedes any earlier delete. Clear
-        // the ledger so a later backfill is not blocked by a tombstone for a
-        // record that exists again.
-        //
-        // Deliberately not done for a watermarked (backfill) write: that batch
-        // is older than the ledger entry by construction, so it has nothing to
-        // say about whether the delete still stands.
-        if watermark.is_none() {
-            let ids: Vec<i64> = documents.iter().map(IndexedDocument::id).collect();
-            bind_all(
-                diesel::sql_query(format!(
-                    "DELETE FROM {DELETES_TABLE} \
-                     WHERE index_name = $1 AND record_id = ANY($2)"
-                ))
-                .into_boxed::<autumn_web::RuntimeBackend>(),
-                [Bound::Text(definition.name.to_owned()), Bound::Ids(ids)],
-            )
-            .execute(&mut conn)
-            .await
-            .map_err(SearchError::backend)?;
-        }
+        // The ledger clear is NOT a trailing statement: `upsert_sql` folds it
+        // into each document's own statement, so the write and the tombstone
+        // removal cannot be split by a concurrent delete.
         Ok(())
     }
 
@@ -648,7 +629,7 @@ fn upsert_sql(
             )
         },
     );
-    format!(
+    let upsert = format!(
         "INSERT INTO {DOCUMENTS_TABLE} \
            (index_name, record_id, tenant_id, language, fields, content, \
             search_vector, embedding{vec_column}) \
@@ -661,6 +642,33 @@ fn upsert_sql(
            search_vector = EXCLUDED.search_vector, \
            embedding = EXCLUDED.embedding{vec_update}, \
            updated_at = NOW(){guard}"
+    );
+
+    if watermark_param.is_some() {
+        // A watermarked (backfill) write leaves the ledger alone: its batch is
+        // older than any tombstone by construction, so it has nothing to say
+        // about whether the delete still stands.
+        return upsert;
+    }
+
+    // An UNCONDITIONAL write is the record coming back — a reindex read the row
+    // and found it present, which supersedes any earlier delete — so the
+    // tombstone is cleared or a later backfill would skip a record that exists.
+    //
+    // In the SAME statement, for the reason the round before learned the hard
+    // way. As two statements a delete can interleave between them: the upsert
+    // commits, the delete commits (document removed, tombstone written), and
+    // then the trailing clear erases that NEWER tombstone while the document
+    // stays absent — leaving a backfill able to see neither and resurrect the
+    // record. One statement means the two possible serializations are
+    // "upsert+clear, then delete" (document absent, tombstone present) and
+    // "delete, then upsert+clear" (document present, no tombstone). Both are
+    // consistent; the interleaving that is not, cannot happen.
+    format!(
+        "WITH upserted AS ( \
+           {upsert} \
+         ) \
+         DELETE FROM {DELETES_TABLE} WHERE index_name = $1 AND record_id = $2"
     )
 }
 
@@ -1564,6 +1572,38 @@ mod tests {
 
     fn definition() -> IndexDefinition {
         IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
+    }
+
+    #[test]
+    fn an_unconditional_upsert_clears_the_tombstone_in_the_same_statement() {
+        // Two statements let a delete interleave: the upsert commits, the
+        // delete commits (document removed, tombstone written), and the
+        // trailing clear then erases that NEWER tombstone while the document
+        // stays absent — leaving a backfill able to see neither and resurrect
+        // the record. One statement admits only the two consistent
+        // serializations.
+        let sql = upsert_sql("to_tsvector('simple', '')", "", "", "", None);
+        assert!(
+            sql.starts_with("WITH upserted AS ("),
+            "the upsert and the tombstone clear must be one statement: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("DELETE FROM {DELETES_TABLE}")),
+            "{sql}"
+        );
+
+        // A watermarked (backfill) write leaves the ledger alone — its batch is
+        // older than any tombstone by construction. Clearing it there would
+        // undo the very delete the guard is protecting.
+        let guarded = upsert_sql("to_tsvector('simple', '')", "", "", "", Some(9));
+        assert!(
+            !guarded.contains(&format!("DELETE FROM {DELETES_TABLE}")),
+            "a backfill write must never clear a tombstone: {guarded}"
+        );
+        assert!(
+            guarded.contains(&format!("SELECT 1 FROM {DELETES_TABLE}")),
+            "but it must still be blocked by one: {guarded}"
+        );
     }
 
     #[test]

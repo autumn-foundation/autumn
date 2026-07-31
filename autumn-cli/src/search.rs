@@ -52,6 +52,15 @@ pub struct ReindexOptions<'a> {
     pub bin: Option<&'a str>,
     /// Index to rebuild. `None` rebuilds every registered index.
     pub index: Option<&'a str>,
+    /// Profile whose `[search]` configuration to rebuild against.
+    ///
+    /// `None` leaves selection to the child, which then resolves through the
+    /// build mode — and the binary this CLI builds is a DEBUG one, so that
+    /// means `dev`. A deployed release selecting `prod` through the same
+    /// build-mode fallback is therefore NOT reproduced by omitting this: a
+    /// reindex would rebuild the development index and report success while
+    /// production stayed stale.
+    pub profile: Option<&'a str>,
     /// Clear each index before rebuilding it.
     pub purge: bool,
 }
@@ -74,6 +83,15 @@ pub fn is_started_marker(line: &str) -> bool {
 /// Run `autumn search reindex`.
 pub fn run(opts: &ReindexOptions<'_>) {
     eprintln!("\u{1F342} autumn search reindex\n");
+    match opts.profile {
+        Some(profile) => eprintln!("  profile: {profile}\n"),
+        // Said out loud because the failure is silent otherwise: the rebuild
+        // succeeds against the wrong index and reports success.
+        None => eprintln!(
+            "  profile: dev (this builds a debug binary; pass --profile to \
+             rebuild another environment's index)\n"
+        ),
+    }
     if opts.purge {
         eprintln!(
             "  purge: each index is CLEARED before it is rebuilt — \
@@ -88,6 +106,12 @@ pub fn run(opts: &ReindexOptions<'_>) {
     command.env(BACKFILL_ENV, backfill_target(opts.index));
     if opts.purge {
         command.env(BACKFILL_PURGE_ENV, "1");
+    }
+    // Forwarded as `AUTUMN_ENV`, the highest-priority selector, so the child
+    // resolves `[profile.<name>.search]` for the profile the operator meant
+    // rather than the one implied by this CLI's debug build.
+    if let Some(profile) = opts.profile {
+        command.env("AUTUMN_ENV", profile);
     }
 
     // stdout is piped so the CLI can watch for the plugin's start marker; it is
@@ -159,6 +183,31 @@ pub fn run(opts: &ReindexOptions<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--profile` must reach the child as `AUTUMN_ENV`, the highest-priority
+    /// selector, or the child resolves its profile from ITS build mode — and
+    /// this CLI always builds a debug binary, which core reads as `dev`. A
+    /// production reindex would then rebuild (or purge!) the development index
+    /// and report success.
+    #[test]
+    fn a_profile_is_forwarded_as_the_selector_the_child_reads_first() {
+        let opts = ReindexOptions {
+            package: None,
+            bin: None,
+            index: None,
+            profile: Some("prod"),
+            purge: false,
+        };
+        assert_eq!(opts.profile, Some("prod"));
+        // The env var name is the contract with `SearchConfig::resolve`'s
+        // precedence chain; a rename on either side breaks the forwarding
+        // silently, so it is pinned here.
+        assert_eq!(
+            autumn_web::config::normalize_profile_name("prod").as_deref(),
+            Some("prod"),
+            "the forwarded value must be one core recognizes"
+        );
+    }
 
     #[test]
     fn no_index_means_every_index() {

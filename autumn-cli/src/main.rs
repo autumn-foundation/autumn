@@ -186,11 +186,23 @@ pub enum SearchSubcommands {
     ///   autumn search reindex
     ///   autumn search reindex --index articles
     ///   autumn search reindex --purge
+    ///   autumn search reindex --profile prod
     #[command(verbatim_doc_comment)]
     Reindex {
         /// Index to rebuild. Omit to rebuild every registered index.
         #[arg(long)]
         index: Option<String>,
+
+        /// Profile whose `[search]` configuration to rebuild against
+        /// (`dev`, `prod`, or a custom name).
+        ///
+        /// The reindex runs the application binary, and that binary resolves
+        /// its own `[search]` section — including `[profile.<name>.search]`.
+        /// The CLI builds a DEBUG binary, which core reads as `dev` when no
+        /// selector is set, so rebuilding a production index requires saying
+        /// so. Forwarded as `AUTUMN_ENV`.
+        #[arg(long)]
+        profile: Option<String>,
 
         /// Clear each index before rebuilding it.
         ///
@@ -3260,6 +3272,7 @@ fn run_command(command: Commands) {
         Commands::Search { action } => match action {
             SearchSubcommands::Reindex {
                 index,
+                profile,
                 purge,
                 package,
                 bin,
@@ -3268,6 +3281,7 @@ fn run_command(command: Commands) {
                     package: package.as_deref(),
                     bin: bin.as_deref(),
                     index: index.as_deref(),
+                    profile: profile.as_deref(),
                     purge,
                 });
             }
