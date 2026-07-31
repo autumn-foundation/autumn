@@ -49,6 +49,9 @@ async fn main() {
             wizards::add_bookmark::cancel,
         ])
         .tasks(tasks![tasks::check_links])
+        // Serves the derived spec at `/openapi.json` and a Swagger UI at
+        // `/swagger-ui`, covering the `#[repository]`-generated JSON handlers
+        // registered above. See `docs/guide/openapi.md`.
         .openapi(OpenApiConfig::new("Bookmarks API", "1.0.0"))
         .run()
         .await;

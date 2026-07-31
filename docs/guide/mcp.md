@@ -654,6 +654,7 @@ scope** and are tracked as follow-ups:
 - **LLM-assisted tool descriptions** — descriptions come from `#[api_doc]`;
   garbage-in/garbage-out is the author's call.
 
-For the typed JSON-Schema derivation this builds on, see the OpenAPI support
-in [`openapi.rs`](../../autumn/src/openapi.rs); for the in-process dispatch
+For the typed JSON-Schema derivation this builds on, see the
+[OpenAPI guide](openapi.md) (and
+[`openapi.rs`](../../autumn/src/openapi.rs)); for the in-process dispatch
 path, see the [Testing guide](testing.md).

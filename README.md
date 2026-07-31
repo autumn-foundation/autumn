@@ -243,6 +243,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Horizontal Sharding](docs/guide/sharding.md) — `[[database.shards]]`, slot-based routing, `ShardedDb`/`Shards` extractors, per-shard health and migrations
 - [Per-Tenant Memory Cells](docs/guide/tenant-cells.md) — `TenantCell` byte accounting with the `tenancy.quota_bytes` soft quota and deterministic per-tenant eviction
 - [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
+- [OpenAPI Spec Generation](docs/guide/openapi.md) — the spec Autumn derives from your handlers, `#[api_doc(...)]`, `#[derive(OpenApiSchema)]`, Swagger UI, and the production profile gate
 - [Exposing Your API as MCP Tools](docs/guide/mcp.md) — project typed endpoints into a Model Context Protocol server with `#[api_doc(mcp)]` + `mount_mcp`
 - [Mail Guide](docs/guide/mail.md)
 - [Widget Stories](docs/guide/stories.md) — the `/_stories` widget gallery and the `story!` macro
