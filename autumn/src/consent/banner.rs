@@ -9,12 +9,14 @@
 //! wiring, and no change to the app's shared `layout()` function signature
 //! (which `autumn generate scaffold` depends on staying a stable 4-arg call).
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, SET_COOKIE, VARY,
+    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, IF_MODIFIED_SINCE,
+    IF_NONE_MATCH, SET_COOKIE, VARY,
 };
-use axum::http::{HeaderValue, Request, Response};
+use axum::http::{HeaderName, HeaderValue, Request, Response};
 use axum::middleware::Next;
+use futures::StreamExt as _;
 use maud::PreEscaped;
 
 use super::{Consent, find_cookie};
@@ -27,15 +29,20 @@ use super::{Consent, find_cookie};
 /// undecided visitor — an attacker-triggerable, unauthenticated request path
 /// — so buffering must be bounded rather than `usize::MAX`. Matches the CSRF
 /// body-scan cap precedent (`security.csrf.token_scan_bytes`, 2 MiB default).
+/// A body over this cap is served **unmodified** (see [`collect_body_prefix`])
+/// rather than dropped — a large page without the banner beats an empty one.
 const MAX_SPLICE_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-/// Inline style reserving room at the bottom of the viewport so the
-/// fixed-position banner never permanently hides page content (e.g. a
-/// `<footer>`) underneath it. Emitted only alongside the banner itself, so it
-/// never affects layout once consent has been decided. Uses an inline
-/// `<style>` tag rather than a JS height measurement, matching
-/// `crate::error_pages::dev_badge`'s own inline-CSS-only convention.
-const BANNER_SPACE_RESERVATION_CSS: &str = "<style>body{padding-bottom:6.5rem}</style>";
+/// Bare CSS for [`BANNER_SPACE_RESERVATION_CSS`]'s `<style>` element — reserves
+/// room at the bottom of the viewport so the fixed-position banner never
+/// permanently hides page content (e.g. a `<footer>`) underneath it. Emitted
+/// only alongside the banner itself, so it never affects layout once consent
+/// has been decided. Uses an inline `<style>` tag rather than a JS height
+/// measurement, matching `crate::error_pages::dev_badge`'s own
+/// inline-CSS-only convention; carries the request's CSP nonce (see
+/// [`inject_consent_banner`]) so it isn't dropped under
+/// `security.headers.csp_nonce.enabled = true`.
+const BANNER_SPACE_RESERVATION_CSS: &str = "body{padding-bottom:6.5rem}";
 
 /// Render the consent-banner markup.
 ///
@@ -50,11 +57,19 @@ const BANNER_SPACE_RESERVATION_CSS: &str = "<style>body{padding-bottom:6.5rem}</
 ///
 /// `csrf_token` should be the value of the app's CSRF cookie (whatever name
 /// it's configured under — see `security.csrf.cookie_name`); pass `None`
-/// only when CSRF protection is disabled entirely.
+/// only when CSRF protection is disabled entirely. `csrf_field_name` is the
+/// form field the token is submitted under — `"_csrf"` unless the app
+/// customized `security.csrf.form_field`. `nonce` is the request's CSP nonce
+/// (see `security.headers.csp_nonce`) applied to the reservation `<style>`;
+/// pass `None` when CSP nonces are disabled (the default).
 #[must_use]
-pub fn consent_banner_markup(csrf_token: Option<&str>) -> maud::Markup {
+pub fn consent_banner_markup(
+    csrf_token: Option<&str>,
+    csrf_field_name: &str,
+    nonce: Option<&str>,
+) -> maud::Markup {
     maud::html! {
-        (PreEscaped(BANNER_SPACE_RESERVATION_CSS))
+        style nonce=[nonce] { (PreEscaped(BANNER_SPACE_RESERVATION_CSS)) }
         section class="autumn-consent-banner" role="region" aria-label="Cookie consent" {
             p class="autumn-consent-banner__message" {
                 "This site uses cookies. Strictly-necessary cookies (login, security) are always on. "
@@ -62,7 +77,7 @@ pub fn consent_banner_markup(csrf_token: Option<&str>) -> maud::Markup {
             }
             form method="post" action="/consent/accept" class="autumn-consent-banner__actions" {
                 @if let Some(token) = csrf_token {
-                    input type="hidden" name="_csrf" value=(token);
+                    input type="hidden" name=(csrf_field_name) value=(token);
                 }
                 button
                     type="submit"
@@ -110,6 +125,18 @@ pub fn consent_banner_markup(csrf_token: Option<&str>) -> maud::Markup {
 /// `Content-Encoding`-bearing responses (compressed bodies) pass through
 /// untouched, exactly like the dev-mode live-reload injector.
 ///
+/// Also, while a visitor needs (re-)prompting: strips `If-None-Match` /
+/// `If-Modified-Since` from the request before calling `next`, so an inner
+/// `EtagLayer` can't short-circuit to a bodyless `304` — which would replay a
+/// browser-cached, banner-less page and silently skip the required prompt
+/// after a policy bump or a withdrawn consent. And reads the CSRF form-field
+/// name (`security.csrf.form_field`, via `CsrfFormField` in request
+/// extensions) and the CSP nonce (`security.headers.csp_nonce`, via
+/// `CspNonce` in request extensions, or parsed back out of the response's
+/// `Content-Security-Policy` header if `CspNonce` wasn't already in request
+/// extensions when this ran) so the injected banner and its style stay valid
+/// under those configurations too.
+///
 /// Whenever it actually injects the banner (and therefore a live, per-visitor
 /// CSRF token) into the body, it also stamps the response
 /// `Cache-Control: private, no-store` and `Vary: Cookie` — otherwise a page
@@ -117,24 +144,56 @@ pub fn consent_banner_markup(csrf_token: Option<&str>) -> maud::Markup {
 /// could have one visitor's CSRF token served to every other visitor (and
 /// any CDN/proxy in between) until the cache entry expires.
 pub async fn inject_consent_banner(
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
     policy_version: u32,
     csrf_cookie_name: &str,
 ) -> Response<Body> {
     let consent = Consent::from_headers(request.headers());
     let request_csrf_cookie = find_cookie(request.headers(), csrf_cookie_name);
+    let csrf_field_name = request
+        .extensions()
+        .get::<crate::security::CsrfFormField>()
+        .map_or_else(|| "_csrf".to_owned(), |field| field.0.clone());
+    let request_nonce = request
+        .extensions()
+        .get::<crate::security::CspNonce>()
+        .map(|nonce| nonce.value().to_owned());
+
+    let needs_prompt = consent.needs_prompt(policy_version);
+    if needs_prompt {
+        request.headers_mut().remove(IF_NONE_MATCH);
+        request.headers_mut().remove(IF_MODIFIED_SINCE);
+    }
 
     let response = next.run(request).await;
 
-    if !consent.needs_prompt(policy_version) || !is_html_response(&response) {
+    if !needs_prompt || !is_html_response(&response) {
         return response;
     }
 
     let csrf_token =
         extract_response_csrf_cookie(&response, csrf_cookie_name).or(request_csrf_cookie);
-    let banner_html = consent_banner_markup(csrf_token.as_deref()).into_string();
+    let nonce = request_nonce.or_else(|| extract_response_csp_nonce(&response));
+    let banner_html =
+        consent_banner_markup(csrf_token.as_deref(), &csrf_field_name, nonce.as_deref())
+            .into_string();
     splice_into_response(response, &banner_html).await
+}
+
+/// Recover the per-request CSP nonce from the response's
+/// `Content-Security-Policy` header, for when `CspNonce` wasn't yet in
+/// request extensions (i.e. `SecurityHeadersLayer` sits inner to this
+/// middleware rather than outer). Mirrors the same `'nonce-...'` extraction
+/// the framework's own tests use.
+fn extract_response_csp_nonce(response: &Response<Body>) -> Option<String> {
+    response
+        .headers()
+        .get(HeaderName::from_static("content-security-policy"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|csp| csp.split("'nonce-").nth(1))
+        .and_then(|rest| rest.split('\'').next())
+        .map(str::to_owned)
 }
 
 /// Find a fresh CSRF cookie value the wrapped handler's response is about to
@@ -169,39 +228,90 @@ fn is_html_response(response: &Response<Body>) -> bool {
         .is_some_and(|content_type| content_type.contains("text/html"))
 }
 
+/// Outcome of bounding how much of a body [`collect_body_prefix`] buffers.
+/// Mirrors `security::csrf`'s own `CollectedBody` shape (the same problem —
+/// bound memory use without dropping an oversized body — solved once there
+/// for a request body, adapted here for a response body).
+enum CollectedBody {
+    /// The whole body fit within the cap and is fully buffered.
+    Full(Bytes),
+    /// The body exceeded the cap. Replays the complete, unmodified body — the
+    /// buffered prefix plus the over-limit chunk and the remaining stream —
+    /// so the client receives every byte with the tail streamed rather than
+    /// buffered. This middleware does not attempt to splice into an oversized
+    /// body (finding `</body>` would require buffering arbitrarily more), so
+    /// unlike the CSRF version there is no separate scan-prefix to return.
+    Oversized(Body),
+    /// The body stream errored before EOF. The bytes read so far are
+    /// discarded.
+    Errored,
+}
+
+/// Buffer `body` up to `limit` bytes without failing when the body is larger,
+/// reconstructing the full body for pass-through in that case. See
+/// `security::csrf::collect_body_prefix` for the request-body sibling this
+/// mirrors.
+async fn collect_body_prefix(body: Body, limit: usize) -> CollectedBody {
+    let mut buf = Vec::<u8>::new();
+    let mut stream = body.into_data_stream();
+    loop {
+        match stream.next().await {
+            None => break,
+            Some(Err(_)) => return CollectedBody::Errored,
+            Some(Ok(chunk)) => {
+                let remaining = limit.saturating_sub(buf.len());
+                if chunk.len() > remaining {
+                    let mut leading = Vec::with_capacity(2);
+                    if !buf.is_empty() {
+                        leading.push(Ok::<Bytes, axum::Error>(Bytes::from(buf)));
+                    }
+                    leading.push(Ok::<Bytes, axum::Error>(chunk));
+                    let body = Body::from_stream(futures::stream::iter(leading).chain(stream));
+                    return CollectedBody::Oversized(body);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+        }
+    }
+    CollectedBody::Full(Bytes::from(buf))
+}
+
 async fn splice_into_response(response: Response<Body>, snippet: &str) -> Response<Body> {
     let (mut parts, body) = response.into_parts();
-    let Ok(body) = axum::body::to_bytes(body, MAX_SPLICE_BODY_BYTES).await else {
-        // Body exceeds MAX_SPLICE_BODY_BYTES (or failed to buffer). Bounding
-        // memory use here matters: unlike the dev-only live-reload injector
-        // this mirrors, this middleware runs unconditionally in production
-        // for every undecided visitor, so an unbounded `usize::MAX` buffer
-        // would be a per-request memory-exhaustion vector. The bytes read so
-        // far are already discarded by this point, so the visitor gets an
-        // empty body this one time (an exceedingly rare combination: a
-        // multi-megabyte uncompressed HTML page from a visitor who hasn't
-        // yet decided on consent) rather than an unbounded buffer.
-        parts.headers.remove(CONTENT_LENGTH);
-        return Response::from_parts(parts, Body::empty());
-    };
-    let updated = splice_before_body_close(&body, snippet);
+    match collect_body_prefix(body, MAX_SPLICE_BODY_BYTES).await {
+        CollectedBody::Full(bytes) => {
+            let updated = splice_before_body_close(&bytes, snippet);
+            if updated == bytes.as_ref() {
+                return Response::from_parts(parts, Body::from(bytes));
+            }
 
-    if updated == body {
-        return Response::from_parts(parts, Body::from(body));
+            parts
+                .headers
+                .insert(CONTENT_LENGTH, HeaderValue::from(updated.len()));
+            // A live, per-visitor CSRF token was just embedded in this body —
+            // never let a CDN/proxy (or the browser) cache and replay it to
+            // someone else.
+            parts
+                .headers
+                .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+            parts
+                .headers
+                .append(VARY, HeaderValue::from_static("Cookie"));
+            Response::from_parts(parts, Body::from(updated))
+        }
+        // Too large to safely buffer and splice into (MAX_SPLICE_BODY_BYTES).
+        // Serve the page unmodified — no banner this one time — rather than
+        // dropping it: a large report/streamed page without the banner is far
+        // better than an empty page. The bytes are unchanged, so any existing
+        // Content-Length stays correct and no cache-control change is needed
+        // (nothing per-visitor was embedded).
+        CollectedBody::Oversized(body) => Response::from_parts(parts, body),
+        // The body stream errored before EOF; nothing to reconstruct.
+        CollectedBody::Errored => {
+            parts.headers.remove(CONTENT_LENGTH);
+            Response::from_parts(parts, Body::empty())
+        }
     }
-
-    parts
-        .headers
-        .insert(CONTENT_LENGTH, HeaderValue::from(updated.len()));
-    // A live, per-visitor CSRF token was just embedded in this body — never
-    // let a CDN/proxy (or the browser) cache and replay it to someone else.
-    parts
-        .headers
-        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
-    parts
-        .headers
-        .append(VARY, HeaderValue::from_static("Cookie"));
-    Response::from_parts(parts, Body::from(updated))
 }
 
 /// Insert `snippet` just before the last `</body>` tag, or append it if the
@@ -238,14 +348,14 @@ mod tests {
 
     #[test]
     fn banner_has_accessible_region_and_label() {
-        let html = consent_banner_markup(None).into_string();
+        let html = consent_banner_markup(None, "_csrf", None).into_string();
         assert!(html.contains(r#"role="region""#));
         assert!(html.contains(r#"aria-label="Cookie consent""#));
     }
 
     #[test]
     fn banner_reject_and_accept_share_the_same_base_button_class() {
-        let html = consent_banner_markup(None).into_string();
+        let html = consent_banner_markup(None, "_csrf", None).into_string();
         // Reject-as-easy-as-accept: both are `type="submit"` sharing the base
         // `autumn-consent-banner__button` class — neither gets a differently
         // weighted/emphasized class the other lacks.
@@ -261,26 +371,26 @@ mod tests {
 
     #[test]
     fn banner_omits_csrf_field_when_no_token_given() {
-        let html = consent_banner_markup(None).into_string();
+        let html = consent_banner_markup(None, "_csrf", None).into_string();
         assert!(!html.contains("_csrf"));
     }
 
     #[test]
     fn banner_includes_csrf_hidden_field_when_token_given() {
-        let html = consent_banner_markup(Some("tok-123")).into_string();
+        let html = consent_banner_markup(Some("tok-123"), "_csrf", None).into_string();
         assert!(html.contains(r#"name="_csrf""#));
         assert!(html.contains(r#"value="tok-123""#));
     }
 
     #[test]
     fn banner_needs_no_script_tag() {
-        let html = consent_banner_markup(Some("tok")).into_string();
+        let html = consent_banner_markup(Some("tok"), "_csrf", None).into_string();
         assert!(!html.contains("<script"), "banner must need no JS: {html}");
     }
 
     #[test]
     fn banner_buttons_are_keyboard_reachable_native_submit_buttons() {
-        let html = consent_banner_markup(None).into_string();
+        let html = consent_banner_markup(None, "_csrf", None).into_string();
         assert!(html.contains(r#"type="submit""#));
         assert!(!html.contains("tabindex=\"-1\""));
     }
@@ -672,12 +782,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_body_is_bounded_not_buffered_without_limit() {
-        // A body far larger than MAX_SPLICE_BODY_BYTES must not be fully
-        // buffered into memory; the middleware falls back to an empty body
-        // rather than holding an unbounded allocation.
+    async fn oversized_body_is_bounded_in_memory_but_served_intact_unmodified() {
+        // A body far larger than MAX_SPLICE_BODY_BYTES must never be fully
+        // buffered into memory (bounding the splice buffer matters: this
+        // middleware runs unconditionally in production for every undecided,
+        // unauthenticated visitor). But the visitor must still receive the
+        // real, complete page — a large report/streamed page without the
+        // banner is far better than an empty one — so the response body must
+        // come through byte-for-byte intact, not truncated or dropped.
         let oversized =
             "<html><body>".to_owned() + &"x".repeat(MAX_SPLICE_BODY_BYTES + 1) + "</body></html>";
+        let expected_len = oversized.len();
         let app = Router::new()
             .route(
                 "/",
@@ -701,10 +816,15 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
+        assert_eq!(
+            body.len(),
+            expected_len,
+            "an oversized body must be served intact, not truncated or emptied"
+        );
         assert!(
-            body.len() < MAX_SPLICE_BODY_BYTES,
-            "oversized body must not pass through fully buffered/spliced: got {} bytes",
-            body.len()
+            !String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
+            "an oversized body is served as-is without the banner spliced in \
+             (splicing would require buffering arbitrarily more)"
         );
     }
 
@@ -741,11 +861,280 @@ mod tests {
 
     #[test]
     fn banner_reserves_space_for_fixed_positioning_so_it_cannot_permanently_hide_content() {
-        let html = consent_banner_markup(None).into_string();
+        let html = consent_banner_markup(None, "_csrf", None).into_string();
         assert!(
             html.contains("padding-bottom"),
             "banner must reserve viewport space so a fixed-position banner \
              doesn't permanently cover page content like a footer: {html}"
+        );
+    }
+
+    // ── configured CSRF form-field name ──────────────────────────────
+
+    #[test]
+    fn banner_uses_default_csrf_field_name() {
+        let html = consent_banner_markup(Some("tok"), "_csrf", None).into_string();
+        assert!(html.contains(r#"name="_csrf""#));
+    }
+
+    #[test]
+    fn banner_honors_custom_csrf_field_name() {
+        let html = consent_banner_markup(Some("tok"), "authenticity_token", None).into_string();
+        assert!(html.contains(r#"name="authenticity_token""#));
+        assert!(!html.contains(r#"name="_csrf""#));
+    }
+
+    #[tokio::test]
+    async fn banner_honors_configured_csrf_form_field_name_from_request_extensions() {
+        let app = Router::new()
+            .route("/", get(|| async { html_page() }))
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf").await
+            }));
+
+        let mut request = Request::builder()
+            .uri("/")
+            .header("cookie", "autumn-csrf=tok-abc")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(crate::security::CsrfFormField(
+                "authenticity_token".to_owned(),
+            ));
+
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains(r#"name="authenticity_token" value="tok-abc""#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    // ── CSP nonce ─────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_response_csp_nonce_parses_nonce_from_header() {
+        let response = Response::builder()
+            .header(
+                "content-security-policy",
+                "script-src 'self' 'nonce-abc123'; style-src 'self' 'nonce-abc123'",
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            extract_response_csp_nonce(&response),
+            Some("abc123".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_response_csp_nonce_none_when_header_absent() {
+        let response = Response::builder().body(Body::empty()).unwrap();
+        assert_eq!(extract_response_csp_nonce(&response), None);
+    }
+
+    #[test]
+    fn banner_style_omits_nonce_attribute_when_none() {
+        let html = consent_banner_markup(None, "_csrf", None).into_string();
+        assert!(!html.contains("nonce="), "{html}");
+    }
+
+    #[test]
+    fn banner_style_carries_nonce_when_given() {
+        let html = consent_banner_markup(None, "_csrf", Some("abc123")).into_string();
+        assert!(html.contains(r#"<style nonce="abc123">"#), "{html}");
+    }
+
+    #[tokio::test]
+    async fn banner_nonce_matches_a_real_security_headers_layer_via_request_extensions() {
+        // My middleware runs INNER to `SecurityHeadersLayer` here (it's applied
+        // last, so it wraps outermost), meaning by the time my middleware
+        // reads request extensions, `SecurityHeadersLayer` has already
+        // inserted `CspNonce` on the way in — the primary (request-extension)
+        // resolution path.
+        use crate::security::{CspNonceConfig, HeadersConfig, SecurityHeadersLayer};
+
+        let headers_config = HeadersConfig {
+            csp_nonce: CspNonceConfig { enabled: true },
+            ..HeadersConfig::default()
+        };
+
+        let app = Router::new()
+            .route("/", get(|| async { html_page() }))
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf").await
+            }))
+            .layer(SecurityHeadersLayer::from_config(&headers_config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .expect("CSP header must be set")
+            .to_owned();
+        let nonce = csp
+            .split("'nonce-")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("CSP header must advertise a nonce")
+            .to_owned();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains(&format!(r#"nonce="{nonce}""#)),
+            "banner's <style> must carry the same nonce as the response's CSP header: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn banner_nonce_falls_back_to_response_header_when_layer_runs_after() {
+        // Here `SecurityHeadersLayer` is applied FIRST (innermost), so my
+        // middleware — outermost — sees no `CspNonce` in request extensions
+        // yet when it runs; it must fall back to parsing the nonce back out
+        // of the response's `Content-Security-Policy` header.
+        use crate::security::{CspNonceConfig, HeadersConfig, SecurityHeadersLayer};
+
+        let headers_config = HeadersConfig {
+            csp_nonce: CspNonceConfig { enabled: true },
+            ..HeadersConfig::default()
+        };
+
+        let app = Router::new()
+            .route("/", get(|| async { html_page() }))
+            .layer(SecurityHeadersLayer::from_config(&headers_config))
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf").await
+            }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .expect("CSP header must be set")
+            .to_owned();
+        let nonce = csp
+            .split("'nonce-")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("CSP header must advertise a nonce")
+            .to_owned();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains(&format!(r#"nonce="{nonce}""#)),
+            "banner's <style> must carry the nonce recovered from the CSP header: {html}"
+        );
+    }
+
+    // ── conditional-request headers stripped while prompting ─────────
+
+    #[tokio::test]
+    async fn strips_conditional_request_headers_while_prompting_so_etag_cannot_shortcut_to_304() {
+        let app = Router::new()
+            .route(
+                "/",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let has_inm = headers.contains_key(axum::http::header::IF_NONE_MATCH);
+                    let has_ims = headers.contains_key(axum::http::header::IF_MODIFIED_SINCE);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from(format!(
+                            "<html><body>inm={has_inm} ims={has_ims}</body></html>"
+                        )))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(axum::http::header::IF_NONE_MATCH, "\"abc\"")
+                    .header(
+                        axum::http::header::IF_MODIFIED_SINCE,
+                        "Wed, 21 Oct 2015 07:28:00 GMT",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("inm=false"), "{text}");
+        assert!(text.contains("ims=false"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn preserves_conditional_request_headers_when_consent_already_decided() {
+        let app = Router::new()
+            .route(
+                "/",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let has_inm = headers.contains_key(axum::http::header::IF_NONE_MATCH);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from(format!(
+                            "<html><body>inm={has_inm}</body></html>"
+                        )))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf").await
+            }));
+
+        let cookie = super::super::accept_all_cookie(&["analytics"], 1);
+        let raw_value = cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("autumn.consent=")
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("cookie", format!("autumn.consent={raw_value}"))
+                    .header(axum::http::header::IF_NONE_MATCH, "\"abc\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("inm=true"),
+            "no need to force-bust caching when the banner won't show anyway: {text}"
         );
     }
 }
