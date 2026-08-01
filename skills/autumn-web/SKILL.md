@@ -173,7 +173,7 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `oauth2` | OAuth2/OIDC helpers and `autumn generate auth --oauth` scaffolding |
 | `openapi` | OpenAPI route metadata and spec generation |
 | `mcp` | Project typed JSON endpoints as MCP tools; implies `openapi` |
-| `markdown` | Markdown rendering with frontmatter and static-site support |
+| `markdown` | Markdown rendering with frontmatter and static-site support, plus the safe user-submitted rich-text path (`render_user_content`, `rich_text_area`) — see [rich text](../../docs/guide/rich-text.md) |
 | `telemetry-otlp` | OpenTelemetry OTLP export |
 | `test-support` | Testcontainers-backed `TestApp`, `TestClient`, and `TestDb` |
 | `i18n` | Locale extractor and compile-time checked translations |

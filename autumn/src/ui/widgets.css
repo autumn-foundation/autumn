@@ -157,6 +157,103 @@
     margin: 0;
 }
 
+/* ── Rich text (autumn-rich-text) — issue #1255 ───────────────────────────── */
+
+.autumn-rich-text {
+    gap: 0.375rem;
+}
+
+.autumn-rich-text__toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0.375rem 0.5rem;
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: var(--radius) var(--radius) 0 0;
+    background-color: var(--surface);
+}
+
+.autumn-rich-text__toolbar-item {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+}
+
+.autumn-rich-text__toolbar-label {
+    color: var(--text-muted);
+}
+
+.autumn-rich-text__toolbar-syntax {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--text);
+}
+
+/* The toolbar sits directly on top of the editor, so they read as one control. */
+.autumn-rich-text__toolbar + .autumn-rich-text__editor {
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}
+
+.autumn-rich-text__editor {
+    min-height: 12rem;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    resize: vertical;
+}
+
+.autumn-rich-text__hint {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+    margin: 0;
+}
+
+.autumn-rich-text__preview-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-top: 0.5rem;
+}
+
+.autumn-rich-text__preview-label {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text);
+}
+
+.autumn-rich-text__preview {
+    padding: 0.75rem;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+    background-color: var(--surface);
+    color: var(--text);
+    font-size: 0.875rem;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+}
+
+.autumn-rich-text__preview > :first-child {
+    margin-top: 0;
+}
+
+.autumn-rich-text__preview > :last-child {
+    margin-bottom: 0;
+}
+
+.autumn-rich-text__preview pre {
+    overflow-x: auto;
+}
+
+.autumn-rich-text__preview table {
+    border-collapse: collapse;
+}
+
+.autumn-rich-text__preview th,
+.autumn-rich-text__preview td {
+    border: 1px solid var(--border);
+    padding: 0.25rem 0.5rem;
+}
+
 /* ── Submit button (autumn-submit) ────────────────────────────────────────── */
 
 .autumn-submit {

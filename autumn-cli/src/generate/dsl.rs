@@ -217,7 +217,10 @@ impl Field {
         let c = &self.constraints;
         let mut out = Vec::new();
         match self.kind {
-            FieldKind::String | FieldKind::Text => {
+            // `RichText` shares `Text`'s length rules; its `email`/`url`
+            // constraints are rejected at parse time, so the flags below are
+            // always false for it.
+            FieldKind::String | FieldKind::Text | FieldKind::RichText => {
                 if c.min.is_some() || c.max.is_some() {
                     out.push(format!(
                         "length({})",
@@ -268,6 +271,30 @@ pub enum FieldKind {
     String,
     /// `Text` (alias for `String`) — `TEXT`.
     Text,
+    /// `richtext` — user-submitted Markdown, stored as `TEXT` (issue #1255).
+    ///
+    /// Storage-identical to [`FieldKind::Text`]: the column holds the Markdown
+    /// **source**, never rendered HTML, so the Rust type is `String`, the
+    /// diesel token is `Text`, and the SQL column type is `TEXT` on both
+    /// backends. The distinction is entirely in the generated UI:
+    ///
+    /// - the form renders `autumn_web::form::rich_text_area_htmx_with_token_field`
+    ///   — a Markdown editor with a no-JavaScript syntax toolbar and an htmx
+    ///   live preview — instead of a bare `<textarea>`;
+    /// - the `show` view renders the value through
+    ///   `autumn_web::markdown::render_user_content`, which disables raw-HTML
+    ///   passthrough and applies an allowlist sanitizer, instead of emitting
+    ///   the source as escaped text;
+    /// - the scaffold enables `autumn-web`'s `markdown` feature so both of
+    ///   those resolve.
+    ///
+    /// The `{email}`/`{url}` format constraints are rejected on this kind
+    /// (a Markdown body cannot satisfy a single-line format validator). The
+    /// `{min}`/`{max}` length bounds are accepted and emit the same server-side
+    /// `#[validate(length(…))]` rule as `Text`; unlike `Text` they emit no
+    /// client-side `minlength`/`maxlength`, because the editor is rendered by
+    /// `rich_text_area`, which takes no HTML5 constraint attributes.
+    RichText,
     /// `i32` — `INTEGER`.
     I32,
     /// `i64` — `BIGINT`.
@@ -337,7 +364,7 @@ impl FieldKind {
             // `Enum`'s "String" here is a storage-representation fallback
             // only — `Field::rust_type()` overrides it with the generated
             // enum's real type name.
-            Self::String | Self::Text | Self::Enum => "String",
+            Self::String | Self::Text | Self::RichText | Self::Enum => "String",
             Self::I32 => "i32",
             // `References` is always `i64`, matching the default `i64` PK convention.
             Self::I64 | Self::References => "i64",
@@ -357,7 +384,7 @@ impl FieldKind {
     #[must_use]
     pub const fn schema_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text | Self::Enum => "Text",
+            Self::String | Self::Text | Self::RichText | Self::Enum => "Text",
             Self::I32 => "Int4",
             Self::I64 | Self::References => "Int8",
             Self::Bool => "Bool",
@@ -376,7 +403,7 @@ impl FieldKind {
     #[must_use]
     pub const fn sql_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text | Self::Enum => "TEXT",
+            Self::String | Self::Text | Self::RichText | Self::Enum => "TEXT",
             Self::I32 => "INTEGER",
             Self::I64 | Self::References => "BIGINT",
             Self::Bool => "BOOLEAN",
@@ -417,7 +444,7 @@ impl FieldKind {
     )]
     pub const fn sqlite_sql_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text | Self::Enum => "TEXT",
+            Self::String | Self::Text | Self::RichText | Self::Enum => "TEXT",
             Self::I32 | Self::I64 | Self::References | Self::Bool => "INTEGER",
             Self::F32 | Self::F64 => "REAL",
             Self::Uuid => "TEXT",
@@ -481,7 +508,7 @@ impl FieldKind {
     )]
     pub const fn sqlite_schema_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text | Self::Enum => "Text",
+            Self::String | Self::Text | Self::RichText | Self::Enum => "Text",
             Self::I32 => "Int4",
             Self::I64 | Self::References => "Int8",
             Self::Bool => "Bool",
@@ -562,6 +589,17 @@ impl FieldKind {
     #[must_use]
     pub const fn is_enum(self) -> bool {
         matches!(self, Self::Enum)
+    }
+
+    /// Returns `true` for a `richtext` field (issue #1255).
+    ///
+    /// Used by the scaffold generator to pick the Markdown editor control and
+    /// the sanitizing `show`-view render, and to enable `autumn-web`'s
+    /// `markdown` feature on the project. Storage-wise the column is
+    /// indistinguishable from [`FieldKind::Text`].
+    #[must_use]
+    pub const fn is_rich_text(self) -> bool {
+        matches!(self, Self::RichText)
     }
 
     /// Returns `true` for an exact-precision `decimal` field.
@@ -693,7 +731,7 @@ impl IdType {
 }
 
 /// Comma-separated list of supported types, for error messages and `--help`.
-pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
+pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, \
     enum{a,b,…}, decimal{precision,scale}, Option<…>, :unique";
 
@@ -702,7 +740,7 @@ pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
 /// [`FieldKind::sqlite_has_diesel_conversion`] rejects (`Uuid`, `Decimal`,
 /// `Enum`). Used in the generate-time rejection message so the user knows which
 /// field kinds a `SQLite` app supports today.
-pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, i32, i64, bool, f32, f64, \
+pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, Option<…>, :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
@@ -1115,6 +1153,14 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
         );
     }
 
+    // `min`/`max` length bounds apply to every text-shaped column, `richtext`
+    // included. The `email`/`url` *format* validators do not: a Markdown body
+    // can never satisfy a single-line format rule, so accepting them would emit
+    // a field no submission could ever fill (issue #1255).
+    let length_bounded = matches!(
+        kind,
+        FieldKind::String | FieldKind::Text | FieldKind::RichText
+    );
     let string_like = matches!(kind, FieldKind::String | FieldKind::Text);
     let numeric = matches!(
         kind,
@@ -1171,7 +1217,7 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
 
     // Cross-check the combination against the kind: length/range bounds need a
     // string or numeric field, and require min <= max when both are present.
-    if (c.min.is_some() || c.max.is_some()) && !string_like && !numeric {
+    if (c.min.is_some() || c.max.is_some()) && !length_bounded && !numeric {
         return Err(format!(
             "min/max constraints are not supported for {} fields",
             kind.rust_type()
@@ -1185,7 +1231,7 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
         // instead of failing generation here. Each bound already passed
         // `parse_bound` for `kind`, so these re-parses succeed exactly.
         let inverted = match kind {
-            FieldKind::String | FieldKind::Text => {
+            FieldKind::String | FieldKind::Text | FieldKind::RichText => {
                 matches!((min.parse::<u64>(), max.parse::<u64>()), (Ok(lo), Ok(hi)) if lo > hi)
             }
             FieldKind::I32 | FieldKind::I64 => {
@@ -1237,7 +1283,7 @@ fn parse_bound(value: &str, kind: FieldKind) -> Result<String, String> {
     // concrete type and re-`to_string()`-ing yields a literal that is always
     // valid and value-preserving (issue #1388 follow-up).
     match kind {
-        FieldKind::String | FieldKind::Text => {
+        FieldKind::String | FieldKind::Text | FieldKind::RichText => {
             let n = value
                 .parse::<u64>()
                 .map_err(|_| format!("length bound '{value}' must be a non-negative integer"))?;
@@ -1329,7 +1375,12 @@ fn set_label_constraint(
 fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
     let accepted = match kind {
         FieldKind::String | FieldKind::Text => "min=N, max=N, email, url",
-        FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => "min=N, max=N",
+        // `RichText` shares the numeric arm's accepted set, not `String`'s: it
+        // takes the `min`/`max` length bounds but NOT the `email`/`url` format
+        // validators, which a Markdown body could never satisfy (issue #1255).
+        FieldKind::RichText | FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => {
+            "min=N, max=N"
+        }
         FieldKind::References => "label:col",
         _ => "(none — this field type takes no constraint modifiers)",
     };
@@ -1601,6 +1652,11 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         // References / references: foreign-key column, resolved to `_id` and
         // `BIGINT REFERENCES <table>(id)` by the callers that emit SQL.
         "References" | "references" => Some(FieldKind::References),
+        // richtext (issue #1255): a TEXT column holding user-submitted Markdown
+        // that the generated views render through the sanitizing
+        // `markdown::render_user_content`. All three spellings are accepted so
+        // the token reads naturally however the author types it.
+        "richtext" | "RichText" | "rich_text" => Some(FieldKind::RichText),
         _ => {
             // Allow `Vec<u8>` as a synonym for `Bytea`.
             strip_wrapper(ty, "Vec").and_then(|inner| {
@@ -2025,6 +2081,106 @@ mod tests {
     fn parse_attachment_lowercase() {
         let f = parse_field("cover_image:attachment").unwrap();
         assert_eq!(f.kind, FieldKind::Attachment);
+    }
+
+    // ── richtext (issue #1255) ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_richtext_token() {
+        let f = parse_field("body:richtext").unwrap();
+        assert_eq!(f.kind, FieldKind::RichText);
+        assert!(!f.nullable);
+        assert_eq!(f.name, "body");
+    }
+
+    #[test]
+    fn parse_richtext_accepts_documented_spellings() {
+        for token in ["body:richtext", "body:RichText", "body:rich_text"] {
+            assert_eq!(
+                parse_field(token).unwrap().kind,
+                FieldKind::RichText,
+                "{token} should parse as RichText"
+            );
+        }
+    }
+
+    #[test]
+    fn richtext_stores_markdown_source_in_a_text_column() {
+        // The column holds the Markdown *source*, not rendered HTML — so it is
+        // an ordinary TEXT/String column everywhere in the storage stack.
+        let f = parse_field("body:richtext").unwrap();
+        assert_eq!(f.rust_type(), "String");
+        assert_eq!(f.sql_type(), "TEXT");
+        assert_eq!(f.schema_type(), "Text");
+        assert_eq!(
+            f.sql_column_type_for(DatabaseBackend::Sqlite),
+            "TEXT",
+            "richtext must work on the SQLite backend too"
+        );
+        assert_eq!(f.schema_type_for(DatabaseBackend::Sqlite), "Text");
+        assert!(FieldKind::RichText.sqlite_has_diesel_conversion());
+    }
+
+    #[test]
+    fn optional_richtext_parses() {
+        let f = parse_field("body:Option<richtext>").unwrap();
+        assert_eq!(f.kind, FieldKind::RichText);
+        assert!(f.nullable);
+        assert_eq!(f.rust_type(), "Option<String>");
+        assert_eq!(f.schema_type(), "Nullable<Text>");
+    }
+
+    #[test]
+    fn richtext_is_rich_text_predicate() {
+        assert!(FieldKind::RichText.is_rich_text());
+        assert!(!FieldKind::Text.is_rich_text());
+        assert!(!FieldKind::String.is_rich_text());
+    }
+
+    #[test]
+    fn richtext_accepts_length_constraints() {
+        let f = parse_field("body:richtext{min=10,max=50000}").unwrap();
+        assert_eq!(f.validation_attrs(), vec!["length(min = 10, max = 50000)"]);
+    }
+
+    #[test]
+    fn richtext_rejects_format_constraints() {
+        // `email`/`url` are single-line format validators; a Markdown body can
+        // never satisfy them, so accepting them would emit an unwritable field.
+        for token in ["body:richtext{email}", "body:richtext{url}"] {
+            let err = parse_field(token).unwrap_err().to_string();
+            assert!(
+                err.contains("email") || err.contains("url"),
+                "{token} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn richtext_rejects_state_machine_modifier() {
+        let err = parse_field("body:richtext:states(draft -> live)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("state machine"), "{err}");
+    }
+
+    #[test]
+    fn richtext_supports_unique_modifier_like_other_text_columns() {
+        let f = parse_field("body:richtext:unique").unwrap();
+        assert_eq!(f.kind, FieldKind::RichText);
+        assert!(f.unique);
+    }
+
+    #[test]
+    fn richtext_appears_in_supported_types_constants() {
+        assert!(
+            SUPPORTED_TYPES.contains("richtext"),
+            "SUPPORTED_TYPES must list richtext"
+        );
+        assert!(
+            SQLITE_SUPPORTED_KINDS.contains("richtext"),
+            "SQLITE_SUPPORTED_KINDS must list richtext — it is a plain TEXT column"
+        );
     }
 
     #[test]
@@ -3206,6 +3362,9 @@ mod schema_core_parity {
         let cases: Vec<(FieldKind, ColumnType, Vec<String>)> = vec![
             (FieldKind::String, ColumnType::Text, vec![]),
             (FieldKind::Text, ColumnType::Text, vec![]),
+            // `RichText` is a presentation/UX distinction only — it stores the
+            // Markdown *source*, so every storage mapping is `Text`'s.
+            (FieldKind::RichText, ColumnType::Text, vec![]),
             (FieldKind::I32, ColumnType::Int32, vec![]),
             (FieldKind::I64, ColumnType::Int64, vec![]),
             (FieldKind::References, ColumnType::Int64, vec![]),

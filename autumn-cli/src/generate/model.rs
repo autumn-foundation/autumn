@@ -516,6 +516,38 @@ fn type_is_uuid(ty: &syn::Type) -> bool {
 /// Parses with `syn` (like [`model_struct_has_uuid_pk`]) so grouped
 /// attributes, doc comments, and a multi-model `src/models.rs` layout don't
 /// defeat it.
+/// The doc comment the model generator puts on a `richtext` column (issue
+/// #1255), and the marker [`model_string_columns`] matches to exclude it from
+/// `references` display-label candidates.
+///
+/// A `richtext` column's Rust type is a bare `String`, identical to
+/// `String`/`Text`, so the rendered source carries no other signal. Editing or
+/// removing this line only downgrades label selection to the pre-#1255
+/// behaviour (a Markdown body may be chosen as a `<select>` label) — nothing
+/// breaks.
+pub(super) const RICH_TEXT_MARKER_DOC: &str =
+    "Markdown source (rich text) — render with `autumn_web::markdown::render_user_content`.";
+
+/// Whether `field`'s attributes carry the [`RICH_TEXT_MARKER_DOC`] marker.
+fn has_rich_text_marker(field: &syn::Field) -> bool {
+    field.attrs.iter().any(|attr| {
+        let syn::Meta::NameValue(nv) = &attr.meta else {
+            return false;
+        };
+        if !nv.path.is_ident("doc") {
+            return false;
+        }
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) = &nv.value
+        else {
+            return false;
+        };
+        s.value().trim() == RICH_TEXT_MARKER_DOC
+    })
+}
+
 pub(super) fn model_string_columns(project_root: &Path, base: &str) -> Vec<(String, bool)> {
     let pascal_name = pascal(base);
     let per_resource = project_root
@@ -550,6 +582,14 @@ pub(super) fn model_string_columns(project_root: &Path, base: &str) -> Vec<(Stri
         let Some(ident) = field.ident.as_ref() else {
             continue;
         };
+        // A `richtext` column is a `String` in Rust but must not be offered as
+        // a `references` display label (issue #1255) — see
+        // [`RICH_TEXT_MARKER_DOC`]. This mirrors the self-reference path in
+        // `scaffold::target_string_columns`, which filters on the `FieldKind`
+        // directly because the in-flight columns are still typed there.
+        if has_rich_text_marker(field) {
+            continue;
+        }
         if let Some(nullable) = string_like_nullability(&field.ty) {
             out.push((ident.to_string(), nullable));
         }
@@ -1717,7 +1757,13 @@ fn validate_known_field(
 
 fn render_validation_attr(field: &Field, rule: &str) -> Result<String, String> {
     if rule == "url" || rule == "email" {
-        if !is_string_like(field) {
+        // `richtext` is deliberately excluded even though `is_string_like`
+        // accepts it for LENGTH rules: a Markdown body can never satisfy a
+        // single-line format validator, so `#[validate(email)]` on one makes the
+        // field unwritable. The DSL rejects `body:richtext{email}` for the same
+        // reason (issue #1255) — this is the `--validate` flag's matching guard,
+        // so the two spellings agree.
+        if !is_string_like(field) || field.kind.is_rich_text() {
             return Err(format!("{rule} validation requires String or Text fields"));
         }
         return Ok(rule.to_owned());
@@ -1771,7 +1817,10 @@ fn render_validation_attr(field: &Field, rule: &str) -> Result<String, String> {
 }
 
 const fn is_string_like(field: &Field) -> bool {
-    matches!(field.kind, FieldKind::String | FieldKind::Text)
+    matches!(
+        field.kind,
+        FieldKind::String | FieldKind::Text | FieldKind::RichText
+    )
 }
 
 /// Strip a single layer of matching double or single quotes from a
@@ -1832,7 +1881,7 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             "false" => Ok("FALSE".to_owned()),
             _ => Err("bool defaults must be true or false".to_owned()),
         },
-        FieldKind::String | FieldKind::Text => {
+        FieldKind::String | FieldKind::Text | FieldKind::RichText => {
             let unquoted = unquote_default_value(value);
             Ok(format!("'{}'", unquoted.replace('\'', "''")))
         }
@@ -2126,6 +2175,17 @@ fn render_model_file(
                 }
             }
             let _ = writeln!(out, "    #[state_machine(transitions({inner}))]");
+        }
+        // Issue #1255: a `richtext` column renders as a bare `String`, exactly
+        // like `String`/`Text`, so nothing in the emitted source would otherwise
+        // distinguish it. Emit a marker doc comment that (a) tells a human
+        // reading the model that the column holds Markdown source to be rendered
+        // through `render_user_content`, and (b) lets
+        // [`model_string_columns`] skip it when picking a `references` display
+        // label — a whole Markdown body is the worst possible `<select>` option
+        // text. See [`RICH_TEXT_MARKER_DOC`].
+        if f.kind.is_rich_text() {
+            let _ = writeln!(out, "    /// {RICH_TEXT_MARKER_DOC}");
         }
         let _ = writeln!(out, "    pub {}: {},", f.name, f.rust_type());
     }

@@ -380,7 +380,11 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         FieldKind::String | FieldKind::Uuid | FieldKind::Enum | FieldKind::Decimal { .. } => {
             "AdminFieldKind::Text"
         }
-        FieldKind::Text => "AdminFieldKind::TextArea",
+        // `RichText` (issue #1255) edits as a plain multi-line textarea in the
+        // admin panel: the column holds Markdown source, and the admin's
+        // record editor is a raw-value editor, not the app-facing form that
+        // renders `rich_text_area`'s hint and preview.
+        FieldKind::Text | FieldKind::RichText => "AdminFieldKind::TextArea",
         // A foreign-key id renders the same as any other integer column.
         FieldKind::I32 | FieldKind::I64 | FieldKind::References => "AdminFieldKind::Integer",
         FieldKind::Bool => "AdminFieldKind::Boolean",
@@ -400,7 +404,10 @@ fn admin_field_is_encrypted(options: &AdminOptions, name: &str) -> bool {
 }
 
 const fn is_default_searchable(field: &Field) -> bool {
-    matches!(field.kind, FieldKind::String | FieldKind::Text)
+    matches!(
+        field.kind,
+        FieldKind::String | FieldKind::Text | FieldKind::RichText
+    )
 }
 
 const fn is_default_filterable(field: &Field) -> bool {
@@ -417,7 +424,12 @@ const fn is_default_optional(field: &Field) -> bool {
 
 fn is_default_hide_from_list(field: &Field) -> bool {
     // TextArea bodies and binary blobs clutter the table; updated_at is redundant noise.
-    matches!(field.kind, FieldKind::Text | FieldKind::Bytea) || field.name == "updated_at"
+    // `RichText` renders as a TextArea too (see `admin_field_kind`), and a
+    // Markdown body is the single worst column to inline in a list view.
+    matches!(
+        field.kind,
+        FieldKind::Text | FieldKind::RichText | FieldKind::Bytea
+    ) || field.name == "updated_at"
 }
 
 fn is_lock_version_field(field: &Field, lock_version_field: Option<&str>) -> bool {
@@ -1161,6 +1173,35 @@ mod tests {
     /// Create a minimal project root: Cargo.toml + src/models/<snake>.rs.
     fn project_with_model(snake: &str) -> TempDir {
         project_with_model_source(snake, "// stub\n")
+    }
+
+    #[test]
+    fn richtext_column_is_a_textarea_hidden_from_the_list() {
+        // A `richtext` column edits as a plain textarea in the admin's
+        // raw-value editor (issue #1255) — and a Markdown body is the single
+        // worst column to inline in a list table, exactly like a `Text` body.
+        let field = |kind: crate::generate::dsl::FieldKind| Field {
+            name: "body".to_owned(),
+            kind,
+            nullable: false,
+            variants: Vec::new(),
+            unique: false,
+            constraints: crate::generate::dsl::FieldConstraints::default(),
+            state_machine: None,
+        };
+        let rich = field(FieldKind::RichText);
+        let text = field(FieldKind::Text);
+        assert_eq!(admin_field_kind(&rich), "AdminFieldKind::TextArea");
+        assert!(
+            is_default_hide_from_list(&rich),
+            "a Markdown body must not clutter the admin list table"
+        );
+        // It behaves identically to the `Text` column it mirrors.
+        assert_eq!(admin_field_kind(&rich), admin_field_kind(&text));
+        assert_eq!(
+            is_default_hide_from_list(&rich),
+            is_default_hide_from_list(&text)
+        );
     }
 
     fn project_with_model_source(snake: &str, model_source: &str) -> TempDir {

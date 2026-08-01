@@ -18,6 +18,7 @@ mod offsite_backup;
 mod repo_hygiene;
 mod scaffold_belongs_to;
 mod scaffold_form_for;
+mod scaffold_rich_text;
 mod scaffold_search;
 mod scaffold_sort_filter;
 mod scaffold_validation;

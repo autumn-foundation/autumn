@@ -33,8 +33,11 @@ openapi = ["dep:serde_yaml"]
 # agents can call the real, authenticated handler pipeline. Builds on the
 # same `ApiDoc` registry that drives `openapi`, so it implies that feature.
 mcp = ["openapi"]
-# Optional Markdown rendering with frontmatter parsing and SSG integration.
-markdown = ["dep:pulldown-cmark"]
+# Optional Markdown rendering with frontmatter parsing and SSG integration,
+# plus the safe *user-submitted* rich-text path (issue #1255): `ammonia` is the
+# allowlist HTML sanitizer `markdown::render_user_content` runs its output
+# through, so a content app can accept user Markdown without stored XSS.
+markdown = ["dep:pulldown-cmark", "dep:ammonia"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -292,6 +295,7 @@ serde_urlencoded = "0.7"
 serde_path_to_error = "0.1"
 serde_yaml = { version = "0.9", optional = true }
 pulldown-cmark = { workspace = true, optional = true }
+ammonia = { workspace = true, optional = true }
 subtle = "2.6.1"
 base64 = "0.22"
 url = "2.5.8"

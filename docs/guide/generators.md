@@ -67,6 +67,7 @@ set.
 | ----------------- | ------------------------------- | ------------------ | ------------------- |
 | `title:String`    | `String`                        | `Text`             | `TEXT`              |
 | `body:Text`       | `String` (alias for `String`)   | `Text`             | `TEXT`              |
+| `body:richtext`   | `String` (Markdown source)      | `Text`             | `TEXT`              |
 | `count:i32`       | `i32`                           | `Int4`             | `INTEGER`           |
 | `count:i64`       | `i64`                           | `Int8`             | `BIGINT`            |
 | `score:f32`       | `f32`                           | `Float4`           | `REAL`              |
@@ -81,6 +82,38 @@ set.
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
 emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
+
+### `richtext` — safe user-submitted Markdown
+
+`body:richtext` is storage-identical to `body:Text` (a plain `TEXT` column
+holding the Markdown **source**, never rendered HTML). What it changes is the
+generated UI:
+
+- the form renders a Markdown editor with a no-JavaScript syntax toolbar and an
+  htmx live preview instead of a bare `<textarea>`;
+- a `POST /{plural}/preview/{field}` endpoint drives that preview;
+- the show view renders the column through
+  `autumn_web::markdown::render_user_content`, which disables raw-HTML
+  passthrough and runs the output through an allowlist sanitizer;
+- `autumn-web`'s `markdown` feature is enabled on your project.
+
+```bash
+autumn generate scaffold Post title:String body:richtext
+```
+
+That is the whole setup — the resulting app accepts formatted user content
+without stored XSS. See the [rich text guide](rich-text.md) for the exact
+sanitization guarantee, the tag/URL-scheme allowlist, and what it deliberately
+excludes.
+
+`{min=N,max=N}` length bounds are accepted on a `richtext` column and emit the
+same server-side `#[validate(length(…))]` rule as `Text` — but no client-side
+`minlength`/`maxlength`, since the editor is rendered by `rich_text_area`, which
+takes no HTML5 constraint attributes. `{email}` and `{url}` are rejected: a
+Markdown body cannot satisfy a single-line format validator, so accepting them
+would emit a field no submission could fill. `--api` scaffolds ignore the rich-text wiring entirely —
+they render no form or show view, so the column is just `TEXT` carried out over
+JSON.
 
 ### Validation and HTML5 constraints (`{…}` modifiers)
 
@@ -99,6 +132,7 @@ autumn generate scaffold Post \
 | Modifier                        | Applies to        | `#[validate(…)]`        | HTML5 attribute(s)        |
 | ------------------------------- | ----------------- | ----------------------- | ------------------------- |
 | `{min=N,max=N}` (String/Text)   | `String`/`Text`   | `length(min, max)`      | `minlength` / `maxlength` |
+| `{min=N,max=N}` (richtext)      | `richtext`        | `length(min, max)`      | *(none — server-side only)* |
 | `{min=N,max=N}` (numeric)       | `i32`/`i64`/`f32`/`f64` | `range(min, max)` | `min` / `max` (`type="number"`) |
 | `{email}`                       | `String`/`Text`   | `email`                 | `type="email"`            |
 | `{url}`                         | `String`/`Text`   | `url`                   | `type="url"`              |
