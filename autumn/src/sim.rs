@@ -83,7 +83,23 @@ pub mod substrate;
 // nothing. See the module docs for the determinism contract.
 pub mod chaos;
 
+#[cfg(feature = "mail")]
+pub use chaos::MailFault;
 pub use chaos::{Chaos, ChaosEvent, ChaosHook};
+
+// The seeded LLM stub (W5.b, item 6, issue #1797): a deterministic fake
+// completion client — canned responses + a seeded fault/latency schedule — for
+// exercising agent retry/fallback paths under the virtual clock. Standalone and
+// additive; it does not route through the `Chaos` builder. See the module docs
+// for the determinism contract.
+pub mod llm;
+
+pub use llm::{LlmCall, LlmClient, LlmError, LlmRequest, LlmResponse, SeededLlm, SeededLlmBuilder};
+
+// The crash lane (W5.c item 7, issue #1797): a seed-derived crash schedule plus
+// the `Sim` kill/restart primitive for durable crash-recovery tests. Additive —
+// the schedule is a pure function of the seed and installs nothing at build.
+pub mod crash;
 
 // The W6 semantic core (issue #1797): the `always!` / `sometimes!` assertion
 // macros and the thread-local non-vacuity registry. Public (documented) module —
@@ -96,6 +112,7 @@ pub use assert::{
     SometimesRegistry, assert_all_sometimes_satisfied, reset_sometimes_registry,
     sometimes_snapshot, sometimes_unsatisfied,
 };
+pub use crash::{CrashPoint, CrashSchedule};
 
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.
@@ -264,6 +281,17 @@ impl Sim {
     /// client.get("/hello").send().await.assert_ok();
     /// ```
     pub fn build(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        self.mount(app)
+    }
+
+    /// Mount `app` on the paused runtime with the simulation's virtual clock (and
+    /// active chaos hooks) installed, replacing any previously-mounted client.
+    ///
+    /// Shared by [`build`](Self::build) and [`restart`](Self::restart) so the
+    /// initial mount and a post-crash restart go through byte-for-byte the same
+    /// path. When chaos is active this re-derives the chaos decision state from
+    /// the seed, so a restart's fault schedule replays deterministically.
+    fn mount(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
         // When chaos is active, install its deterministic hooks (which also own
         // the clock so a skew wrapper can be applied); otherwise the build is
         // byte-for-byte the pre-W5 path — just the virtual clock.
@@ -277,6 +305,85 @@ impl Sim {
         let client = app.build();
         self.app.client = Some(client);
         self.app.client()
+    }
+
+    /// Simulate a process crash: drop the mounted app so the in-process job
+    /// runtime's in-flight work is **cancelled without completing** (its
+    /// [`Drop`] cancels the runtime's shutdown token and clears the global job
+    /// client), ready for durable recovery on [`restart`](Self::restart).
+    ///
+    /// This is the kill half of the W5.c crash-recovery primitive (item 7). It
+    /// deliberately drops **only** the app/runtime, never the durable database:
+    /// the caller holds the sim's DB substrate (e.g. an
+    /// `SqliteSubstrate`) and its `pool()`, so every committed row — crucially
+    /// the durable `autumn_repository_commit_hooks` queue — survives the crash
+    /// and is still there when a fresh app is mounted on the same pool.
+    ///
+    /// A crash after [`build`](Self::build) has not run is a no-op.
+    ///
+    /// # Durability boundary (stated plainly)
+    ///
+    /// Under the `sqlite` sim substrate the app runs the **in-memory `local`
+    /// job backend**, which is **not durable** — a kill drops its mid-flight and
+    /// still-queued jobs by design, exactly as a real process crash would drop an
+    /// in-memory queue. Item 7's durable guarantee is therefore asserted against
+    /// the DB-backed repository commit-hook queue, **not** the local job queue;
+    /// the in-memory job queue's by-design loss is documented, never pretended
+    /// durable. See the [`crash`] module docs.
+    pub fn kill(&mut self) {
+        // Dropping the client runs `TestJobRuntime::drop` (shutdown.cancel() +
+        // clear_global_job_client()), modelling the process dying mid-flight.
+        self.app.client = None;
+        // A fresh process has no in-memory chaos decision log; a restart
+        // re-derives it deterministically from the seed.
+        self.chaos_state = None;
+    }
+
+    /// Restart after a [`kill`](Self::kill): mount a fresh `app` on the paused
+    /// runtime, modelling a process restart on the **same durable database**.
+    ///
+    /// The caller rebuilds the `TestApp` against the *same* substrate pool
+    /// (`TestApp::new()…with_db(substrate.pool())`), so the restarted app sees
+    /// every row the crashed process committed. Following the restart with
+    /// [`run_to_idle`](Self::run_to_idle) drains the durable repository
+    /// commit-hook queue, recovering and running any hook the crash left
+    /// un-drained (at-least-once / idempotent). Registering the app's hook
+    /// runners on the fresh app models a real app re-registering them on boot.
+    pub fn restart(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        self.mount(app)
+    }
+
+    /// Kill the running app and immediately [`restart`](Self::restart) it on a
+    /// fresh `app` — the kill-then-restart convenience over
+    /// [`kill`](Self::kill) + [`restart`](Self::restart).
+    ///
+    /// The `app` must be rebuilt against the same durable substrate pool so the
+    /// restarted process recovers the crashed one's committed rows.
+    pub fn crash_and_restart(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        self.kill();
+        self.restart(app)
+    }
+
+    /// The seed-derived [`CrashSchedule`] for this simulation.
+    ///
+    /// A pure function of the [`seed`](Self::seed): two same-seed sims return an
+    /// equal schedule (the W5.c determinism Definition-of-Done), while different
+    /// seeds overwhelmingly diverge. The representative realized crash point is
+    /// its [`CrashSchedule::first`]; see the [`crash`] module docs for the
+    /// representative-vs-general scope.
+    #[must_use]
+    pub fn crash_schedule(&self) -> CrashSchedule {
+        CrashSchedule::derive(self.seed, crash::DEFAULT_CRASH_SCHEDULE_LEN)
+    }
+
+    /// The representative, realized crash point for this simulation — the first
+    /// entry of the seed-derived [`crash_schedule`](Self::crash_schedule).
+    ///
+    /// `None` only if the schedule is empty (it never is under the default
+    /// length). Deterministic for a given seed.
+    #[must_use]
+    pub fn crash_point(&self) -> Option<CrashPoint> {
+        self.crash_schedule().first().cloned()
     }
 
     /// The recorded chaos fault schedule for this simulation.

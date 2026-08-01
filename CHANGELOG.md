@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **consent:** `autumn new` now scaffolds a cookie-consent banner and a real
+  consent gate, so a fresh app is cookie-compliant by default (#1214). The new
+  `autumn_web::consent` module provides a `Consent` extractor
+  (`consent.allows("analytics", POLICY_VERSION)`) plus `accept_all_cookie` /
+  `reject_non_essential_cookie` builders for a first-party cookie that records
+  the chosen categories, a policy version, and a timestamp; bumping the app's
+  policy version constant invalidates prior consent and re-shows the banner.
+  The scaffolded banner (offering "Accept all" and "Reject non-essential" with
+  equal visual weight) is injected automatically into every HTML page via
+  `inject_consent_banner`, needs no JavaScript, and is wired into the base
+  `autumn new` template alongside `POST /consent/accept` /
+  `POST /consent/reject` routes (redirecting back to the referring page, not
+  always the homepage) and a `GET /consent/manage` withdrawal route linked
+  from the footer (GDPR Art. 7(3): withdrawing consent must be as easy as
+  giving it). Strictly-necessary cookies (session, CSRF) are never routed
+  through the gate — they keep being set unconditionally. The consent cookie
+  reader defends against cookie tossing the same way the session cookie
+  reader does, and injecting the banner (which embeds a live per-visitor CSRF
+  token) marks the response `Cache-Control: private, no-store` /
+  `Vary: Cookie` so it's never shared across visitors by a cache. An oversized
+  HTML response is served intact rather than emptied, conditional-request
+  headers are stripped while a prompt is pending so an `EtagLayer` can't
+  short-circuit to a banner-less cached `304`, the CSRF cookie/form-field
+  names are explicit parameters (`DEFAULT_CSRF_COOKIE_NAME` /
+  `DEFAULT_CSRF_FORM_FIELD`) rather than read off request state, an internal
+  `autumn build` / ISR render is passed through untouched instead of baking
+  the banner into the static file on disk, and the banner uses
+  `position: sticky` so it always reserves its own real, responsive height
+  instead of a fixed CSS estimate. Additive; the `--api` JSON-first scaffold
+  is unaffected (no HTML layout to show a banner in).
 - **rich text:** a safe first-class path for **user-submitted** formatted text,
   so a content app built on Autumn cannot ship stored XSS by using the shipped
   helpers (#1255). `autumn generate scaffold post title:String body:richtext`
@@ -359,6 +389,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `Idempotency-Key`, and the `[security.submit_token]` config knobs. The
   `saas` example now guards its signup POST with a one-time submit token so a
   double-clicked signup cannot create a duplicate account. [no-plugin]
+- **sim-testing:** the `Sim` chaos harness gained a **crash / restart** primitive
+  and a seed-derived crash schedule for durable crash-recovery tests (#1797, W5.c
+  item 7). `Sim::kill()` drops the mounted app so the in-process job runtime's
+  in-flight work is cancelled **without** completing (modelling a process crash),
+  `Sim::restart(TestApp)` mounts a fresh app on the **same durable database**, and
+  `Sim::crash_and_restart(TestApp)` is the kill-then-restart convenience. A new
+  `sim::crash` module derives a reproducible `CrashSchedule` / `CrashPoint` from a
+  dedicated `seed ^ CRASH_STREAM_SALT` stream (independent of the app-facing
+  entropy and the chaos decision stream), read through `Sim::crash_schedule()` /
+  `Sim::crash_point()`, so two same-seed runs replay an identical crash schedule.
+  The Definition-of-Done (`sim_chaos_crash`) commits a **real durable repository
+  commit hook** to the DB-backed `autumn_repository_commit_hooks` queue on the
+  in-memory `SQLite` substrate, kills the sim before it drains, restarts on the
+  same `substrate.pool()`, and proves `run_to_idle()` recovers and runs the hook
+  exactly-once/idempotently. This wave injects a **single representative
+  deterministic crash point** (after a repository write has enqueued its durable
+  hook but before it drains) with the schedule API shaped generally — documented
+  representativeness, not faked generality. The `sqlite` substrate runs the
+  in-memory `local` job backend, which is **not durable**: a kill drops its
+  mid-flight jobs by design, so the durable guarantee is asserted against the
+  commit-hook queue, not the local job queue. Additive: no existing signature
+  changes; a default/no-crash `build` + `run_to_idle` is byte-for-byte unchanged.
+  [no-plugin]
 - **test-support:** `autumn_web::test::drain_ready_repository_commit_hooks(pool, max_rows)`
   deterministically claims and runs ready durable repository commit hooks in
   integration tests — driving the real worker→drain wiring without starting the
@@ -550,6 +603,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (empty) `Chaos` leaves the build byte-for-byte unchanged. Probabilities are
   clamped to `[0.0, 1.0]`. This is W5.0 (chaos scaffolding + chaos-v1 base); the
   richer per-fault surfaces build additively on it. [no-plugin]
+- **sim-testing:** a **seeded LLM stub** (`sim::llm`, W5.b, item 6, #1797) — a
+  deterministic fake completion client for exercising an agent's retry/fallback
+  paths under the paused virtual clock, with **no network and no real model**.
+  `SeededLlm::builder(seed)` (or `::from_entropy`) configures canned
+  `canned_response(prompt_match, response)` pairs (a seed-derived deterministic
+  fallback answers unmatched prompts), an explicit per-call
+  `fault_at(call_index, LlmError)` schedule plus an optional probabilistic
+  `fault_probability(p, error)` lane, and a `latency_up_to(max)` window; the
+  built `SeededLlm` implements the `LlmClient` trait (`LlmRequest` →
+  `LlmResponse`/`LlmError`). Every decision is drawn from a **dedicated seeded
+  stream**, so the **same seed replays the identical `(response, fault, latency)`
+  sequence byte-for-byte** while a different seed diverges; injected latency is
+  only observable after `Sim::advance`, keeping it integrated with virtual time.
+  Recorded calls are readable via `SeededLlm::calls()`. Standalone and additive
+  — it does not route through the `Chaos` builder and touches no default build.
+  This is W5.b; it stacks on W5.0 and is a sibling of W5.a (item 5). [no-plugin]
+- **sim-testing:** the chaos lane gained a **deterministic SMTP transport fault
+  schedule** (W5.a, item 5, #1797), gated on the `mail` feature. `Chaos::smtp_faults([(7, MailFault::Fail), (8, MailFault::Timeout)])`
+  maps a **1-based send index** to a `MailFault` (`#[non_exhaustive]`; `Fail`
+  returns a permanent-ish `MailError::RuntimeUnavailable`, `Timeout` a
+  timeout-shaped `MailError::Io`/`TimedOut`) — the ratified "send #7 fails, #8
+  times out" example — so a test can adversarially exercise a throttled-resume /
+  retry path against faults that are **deterministic by construction** (a
+  scheduled send draws no entropy and never perturbs the DB/job stream).
+  Installed at `Sim::build` as a fault-injecting `MailInterceptor`, each send is
+  recorded as a new `ChaosHook::MailSend` event on the same
+  `Sim::__chaos_events()` log. Under the paused sim runtime a `Timeout` is a
+  timeout-shaped error returned immediately (never a real hang), keeping the
+  schedule byte-for-byte reproducible. An optional `Chaos::smtp_transient_errors(p)`
+  adds a probabilistic lane (drawn from a dedicated mail sub-stream) for parity
+  with `db_transient_errors`; an explicit schedule entry always wins. An empty
+  schedule / zero rate installs nothing, so a default `Chaos` is unchanged. This
+  is W5.a; it stacks on W5.0 and is a sibling of W5.b (item 6). [no-plugin]
 ### Fixed
 
 - **mail:** the prod `deliver_later` durability guard no longer aborts app
@@ -677,6 +763,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was shipped non-blocking in #2018 only until a pinned autumn release published
   prebuilt CLI binaries; with v0.6.0 now published with prebuilt binaries, the
   step runs against the release binary and blocks. Checklist item #7 of #2040.
+### Added
+
+- **security:** `autumn routes audit` (#1604) is now wired into every
+  scaffolded app's CI by default — `autumn new` adds a "Route auth coverage
+  (security manifest)" step to `.github/workflows/ci.yml`, right after the
+  a11y-verify step whose prebuilt CLI it reuses, so a route someone forgot to
+  classify fails CI on day one instead of waiting for an app to opt in.
+  Unclassified-route diagnostics now also name the offending handler's
+  `file:line` (from `file!()`/`line!()`, captured by the `#[get]`/`#[post]`/…,
+  `#[ws]`, and static-route macros alongside the existing module path), so a
+  failing gate points straight at the line to fix. A new [Route Auth
+  Coverage](docs/guide/route-auth-coverage.md) guide documents the
+  default-deny posture model and how to classify the three route kinds
+  (`gated`, `public`, `framework`), completing the deferred items from #1604's
+  first slice (#1850).
 
 ## [0.6.0] - 2026-07-18
 

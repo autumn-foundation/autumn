@@ -70,6 +70,10 @@ pub struct AuditRoute {
     pub policy: bool,
     #[serde(default)]
     pub module: Option<String>,
+    /// `file:line` source location of the handler, when known (serialized as
+    /// `location` in the dump).
+    #[serde(default)]
+    pub location: Option<String>,
 }
 
 impl AuditRoute {
@@ -143,6 +147,9 @@ pub struct ManifestRoute {
     pub scopes: Vec<String>,
     pub policy: bool,
     pub source: String,
+    /// `file:line` source location of the handler, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
     /// How the classification was established. `"provable"` means it was
     /// derived from macro-expanded code (route + auth posture).
     pub provenance: &'static str,
@@ -253,6 +260,7 @@ fn build_routes_dimension(routes: &[AuditRoute]) -> RoutesDimension {
             scopes: r.scopes.clone(),
             policy: r.policy,
             source: r.source.clone(),
+            location: r.location.clone(),
             provenance: "provable",
         })
         .collect();
@@ -546,9 +554,14 @@ pub fn format_diagnostic(unresolved: &[&AuditRoute]) -> String {
             .as_deref()
             .map(|m| format!(" [{m}]"))
             .unwrap_or_default();
+        let location = r
+            .location
+            .as_deref()
+            .map(|l| format!(" at {l}"))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "  {method:<6} {path}  (handler `{handler}`{module})",
+            "  {method:<6} {path}  (handler `{handler}`{module}{location})",
             method = r.method,
             path = r.path,
             handler = r.handler,
@@ -686,6 +699,7 @@ mod tests {
             scopes: vec![],
             policy: false,
             module: None,
+            location: None,
         }
     }
 
@@ -745,6 +759,28 @@ mod tests {
         assert!(msg.contains("create_widget"), "{msg}");
         assert!(msg.contains("myapp::widgets"), "{msg}");
         assert!(msg.contains("#[public]"), "{msg}");
+    }
+
+    /// (#1604 deferred item) when the dump carries a `file!()`/`line!()`
+    /// source location, the diagnostic names it so an offending handler can
+    /// be jumped to directly instead of only naming its module.
+    #[test]
+    fn diagnostic_includes_source_location_when_known() {
+        let mut r = route("POST", "/widgets", "create_widget", "unclassified");
+        r.location = Some("src/routes/widgets.rs:42".to_owned());
+        let unresolved = vec![&r];
+        let msg = format_diagnostic(&unresolved);
+        assert!(msg.contains("src/routes/widgets.rs:42"), "{msg}");
+    }
+
+    /// A route dumped without a location (older binary, or a route built
+    /// without the route macros) must not print a stray `at ` fragment.
+    #[test]
+    fn diagnostic_omits_location_when_unknown() {
+        let r = route("POST", "/widgets", "create_widget", "unclassified");
+        let unresolved = vec![&r];
+        let msg = format_diagnostic(&unresolved);
+        assert!(!msg.contains(" at "), "{msg}");
     }
 
     // ── manifest shape / stability ───────────────────────────────────────────

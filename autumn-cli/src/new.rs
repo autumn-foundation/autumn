@@ -537,8 +537,8 @@ fn replace_anchor(src: &str, from: &str, to: &str) -> String {
 fn inject_i18n(main_rs: &str) -> String {
     let with_locale = replace_anchor(
         main_rs,
-        "        .routes(routes![index, hello, hello_name])",
-        "        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
+        "        .routes(routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage])",
+        "        .i18n_auto()\n        .routes(routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage])",
     );
     let with_static = replace_anchor(
         &with_locale,
@@ -1214,6 +1214,133 @@ mod tests {
             p.join("tests/integration_test.rs").is_file(),
             "`autumn new` should generate tests/integration_test.rs"
         );
+    }
+
+    // `autumn new` must scaffold a working cookie-consent banner (issue
+    // #1214): a policy-version constant the app owner can bump to re-prompt,
+    // the auto-injecting middleware wired into the app, and the accept/reject
+    // routes it posts to.
+    #[test]
+    fn generates_consent_banner_wiring_in_main_rs() {
+        let tmp = TempDir::new().unwrap();
+        generate("consent-app", tmp.path()).unwrap();
+        let main_rs = fs::read_to_string(tmp.path().join("consent-app/src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains("CONSENT_POLICY_VERSION"),
+            "generated main.rs must declare a bump-to-reprompt policy version constant: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("autumn_web::consent::inject_consent_banner"),
+            "generated main.rs must wire the consent-banner middleware: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("consent_accept") && main_rs.contains("consent_reject"),
+            "generated main.rs must define consent_accept/consent_reject routes: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("\"/consent/accept\"") && main_rs.contains("\"/consent/reject\""),
+            "generated main.rs must mount the accept/reject routes at their documented paths: {main_rs}"
+        );
+        assert!(
+            main_rs.contains(
+                "routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage]"
+            ),
+            "the new consent routes must be registered alongside the existing routes: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("\"/consent/manage\"")
+                && main_rs.contains("autumn_web::consent::consent_banner_markup"),
+            "generated main.rs must scaffold a preferences route reusing the consent-banner \
+             widget (GDPR Art. 7(3): withdrawing consent must be as easy as giving it): {main_rs}"
+        );
+        assert!(
+            main_rs.contains("href=\"/consent/manage\""),
+            "the shared layout's footer must link to the withdrawal route so it's \
+             reachable from every page: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME"),
+            "the middleware wiring must pass the CSRF cookie name explicitly: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("autumn_web::consent::DEFAULT_CSRF_FORM_FIELD"),
+            "the middleware wiring must pass the CSRF form-field name explicitly: {main_rs}"
+        );
+    }
+
+    // `/consent/manage` must stay a side-effect-free `GET`: it renders the
+    // consent-banner widget so the visitor can make a new choice, but the
+    // actual state change goes through the existing CSRF-protected
+    // `POST /consent/accept` / `POST /consent/reject` handlers. If the GET
+    // handler itself mutated the consent cookie (e.g. by calling
+    // `expire_consent_cookie` directly), a same-origin prefetcher, browser
+    // extension, or cross-site top-level navigation following the footer
+    // link could silently reset a visitor's consent, since `GET` is
+    // CSRF-exempt by definition.
+    #[test]
+    fn consent_manage_route_does_not_mutate_state_on_get() {
+        let tmp = TempDir::new().unwrap();
+        generate("consent-manage-app", tmp.path()).unwrap();
+        let main_rs =
+            fs::read_to_string(tmp.path().join("consent-manage-app/src/main.rs")).unwrap();
+        let start = main_rs
+            .find("async fn consent_manage")
+            .expect("consent_manage handler must exist");
+        let body = &main_rs[start..];
+        let end = body[1..]
+            .find("\n#[")
+            .map_or(body.len(), |offset| offset + 1);
+        let handler_body = &body[..end];
+        assert!(
+            !handler_body.contains("expire_consent_cookie") && !handler_body.contains("SET_COOKIE"),
+            "the GET /consent/manage handler must not itself set or expire any cookie: {handler_body}"
+        );
+    }
+
+    // The JSON-first `--api` flavor has no HTML/layout to show a banner in —
+    // it must not scaffold the consent-banner wiring at all.
+    #[test]
+    fn api_flavor_does_not_scaffold_consent_banner() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "consent-api-app",
+            tmp.path(),
+            GenerateOptions {
+                with_api: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let main_rs = fs::read_to_string(tmp.path().join("consent-api-app/src/main.rs")).unwrap();
+        assert!(
+            !main_rs.contains("inject_consent_banner"),
+            "the --api flavor ships no HTML layout, so it must not scaffold the banner: {main_rs}"
+        );
+    }
+
+    // The generated `--with-i18n` main.rs must still compile-shape correctly:
+    // the i18n injection anchors must stay in sync with the new routes! list
+    // (see `inject_i18n`'s anchor constant).
+    #[test]
+    fn with_i18n_still_wires_consent_routes() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "consent-i18n-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let main_rs = fs::read_to_string(tmp.path().join("consent-i18n-app/src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains(
+                "routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage]"
+            ),
+            "i18n injection must not drop the consent routes from the routes! list: {main_rs}"
+        );
+        assert!(main_rs.contains("i18n_auto"));
     }
 
     // The generated Cargo.toml must have [dev-dependencies] with tokio
