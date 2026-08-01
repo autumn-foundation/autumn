@@ -100,6 +100,9 @@ time = { version = ">=0.3, <0.3.55" }
 csv = "1.3"
 rust_decimal = "1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# HTML allowlist sanitizer for user-submitted rich text (issue #1255). Pulled in
+# by autumn-web's `markdown` feature; see `autumn/src/markdown/user_content.rs`.
+ammonia = "4.1"
 chromiumoxide = { version = "0.9", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 

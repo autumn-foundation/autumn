@@ -475,6 +475,42 @@ impl<T: Serialize> ChangesetForm<T> {
         text_input_htmx_with_token_field(&self.changeset, field, label, validate_url, token_field)
     }
 
+    /// Render a labeled Markdown editor for a rich-text `field` (issue #1255).
+    ///
+    /// Delegates to [`rich_text_area`]; see that function for the full contract,
+    /// including how to render the stored value back out safely.
+    pub fn rich_text_area(&self, field: &str, label: &str) -> maud::Markup {
+        rich_text_area(&self.changeset, field, label)
+    }
+
+    /// Render a Markdown editor with an htmx-driven live preview pane.
+    ///
+    /// Delegates to [`rich_text_area_htmx`]; see that function for full docs.
+    pub fn rich_text_area_htmx(&self, field: &str, label: &str, preview_url: &str) -> maud::Markup {
+        rich_text_area_htmx(&self.changeset, field, label, preview_url)
+    }
+
+    /// Render a Markdown editor with an htmx live preview, excluding the
+    /// configured submit-token field `token_field` from the preview POST.
+    ///
+    /// Delegates to [`rich_text_area_htmx_with_token_field`]; use this when the
+    /// app customizes `[security.submit_token].field_name` (issue #1843).
+    pub fn rich_text_area_htmx_with_token_field(
+        &self,
+        field: &str,
+        label: &str,
+        preview_url: &str,
+        token_field: &str,
+    ) -> maud::Markup {
+        rich_text_area_htmx_with_token_field(
+            &self.changeset,
+            field,
+            label,
+            preview_url,
+            token_field,
+        )
+    }
+
     /// Render a `<button type="submit">` with `label`.
     pub fn submit_button(&self, label: &str) -> maud::Markup {
         submit_button(label)
@@ -1242,6 +1278,189 @@ pub fn textarea_input<T: Serialize>(
             }
         }
     }
+}
+
+/// The hint shown under a [`rich_text_area`] editor, telling the author which
+/// Markdown the field accepts. Kept in one place so the widget, its htmx
+/// variant, and the generated scaffold all say the same thing.
+#[cfg(feature = "maud")]
+const RICH_TEXT_HINT: &str = "Markdown supported: **bold**, _italic_, [links](https://example.com), \
+     lists, `code`, and tables. HTML is not allowed and is shown as plain text.";
+
+/// Render a labeled Markdown editor for a rich-text field (issue #1255).
+///
+/// The control is a plain `<textarea>` carrying the Markdown **source** — the
+/// column stores the source, never rendered HTML — plus a hint naming the
+/// supported syntax. It needs no JavaScript and degrades to an ordinary
+/// textarea everywhere.
+///
+/// Render the stored value back out with
+/// [`markdown::render_user_content`](crate::markdown::render_user_content),
+/// which disables raw-HTML passthrough and applies an allowlist sanitizer.
+/// Rendering it any other way — `PreEscaped(&post.body)`, or the trusted-content
+/// [`markdown::render`](crate::markdown::render) — reintroduces stored XSS.
+///
+/// Use [`rich_text_area_htmx`] to add a live preview pane.
+///
+/// - Sets `name` and `id` to `field`
+/// - Wraps in a `<div id="{field}-field">` for stable htmx targeting
+/// - Populates the textarea body from the changeset's serialized data
+/// - Points `aria-describedby` at the hint, plus the error region when errors exist
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    rich_text_area_inner(changeset, field, label, None)
+}
+
+/// Render a [`rich_text_area`] with an htmx-driven live preview pane.
+///
+/// The textarea POSTs the form to `preview_url` a short moment after typing
+/// stops and swaps the response into `#{field}-preview` — **no JavaScript of
+/// your own**, just htmx attributes. Without htmx (or with scripting off) the
+/// control still works: it is the same textarea, and the pane simply shows the
+/// server-rendered preview of the value the page was rendered with.
+///
+/// As with [`text_input_htmx`], `hx-params` excludes the default one-time
+/// submit-token field so a preview request cannot spend the token the real
+/// submit needs; use [`rich_text_area_htmx_with_token_field`] when the app
+/// customizes `[security.submit_token].field_name`.
+///
+/// The preview handler should extract [`ChangesetForm<T>`] and return
+/// [`markdown::render_user_content`](crate::markdown::render_user_content) of
+/// the submitted field:
+///
+/// ```rust,ignore
+/// #[post("/posts/preview/body")]
+/// async fn preview_body(form: ChangesetForm<PostForm>) -> Markup {
+///     autumn_web::markdown::render_user_content(
+///         &form.field_value("body").unwrap_or_default(),
+///     )
+/// }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area_htmx<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+) -> maud::Markup {
+    rich_text_area_htmx_with_token_field(
+        changeset,
+        field,
+        label,
+        preview_url,
+        DEFAULT_SUBMIT_TOKEN_FIELD,
+    )
+}
+
+/// Like [`rich_text_area_htmx`] but excludes the caller-supplied submit-token
+/// field name from the preview POST instead of the hardcoded default
+/// `_submit_token`.
+///
+/// Use this when the app customizes `[security.submit_token].field_name`
+/// (issue #1843) — source the configured name at request time from the
+/// [`SubmitFormField`](crate::security::SubmitFormField) extractor. Passing
+/// `"_submit_token"` here is equivalent to calling [`rich_text_area_htmx`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area_htmx_with_token_field<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    token_field: &str,
+) -> maud::Markup {
+    rich_text_area_inner(changeset, field, label, Some((preview_url, token_field)))
+}
+
+/// Shared body of [`rich_text_area`] and its htmx variant. `preview` is
+/// `Some((preview_url, token_field))` for the live-preview flavour.
+#[cfg(feature = "maud")]
+fn rich_text_area_inner<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview: Option<(&str, &str)>,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let hint_id = format!("{field}-hint");
+    let wrapper_id = format!("{field}-field");
+    let preview_id = format!("{field}-preview");
+    // The hint is always present, so `aria-describedby` is never empty and
+    // never names an element that isn't in the DOM.
+    let described_by = if has_errors {
+        format!("{hint_id} {error_id}")
+    } else {
+        hint_id.clone()
+    };
+    let preview_target = format!("#{preview_id}");
+    let hx_params = preview.map(|(_, token_field)| format!("not {token_field}"));
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field autumn-rich-text" data-autumn-field-wrapper=(field) {
+            label for=(field) class="autumn-field__label" { (label) }
+            textarea
+                id=(field)
+                name=(field)
+                rows="12"
+                class=(if has_errors { "autumn-field__input autumn-rich-text__editor autumn-field__input--invalid" } else { "autumn-field__input autumn-rich-text__editor" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(described_by)
+                hx-post=[preview.map(|(url, _)| url)]
+                hx-trigger=[preview.map(|_| "keyup changed delay:400ms, change")]
+                hx-target=[preview.map(|_| preview_target.as_str())]
+                hx-swap=[preview.map(|_| "innerHTML")]
+                hx-include=[preview.map(|_| "closest form")]
+                hx-params=[hx_params.as_deref()]
+                { (value) }
+            p id=(hint_id) class="autumn-rich-text__hint" { (RICH_TEXT_HINT) }
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+            @if preview.is_some() {
+                div class="autumn-rich-text__preview-wrapper" {
+                    span class="autumn-rich-text__preview-label" id=(format!("{field}-preview-label")) { "Preview" }
+                    div
+                        id=(preview_id)
+                        class="autumn-rich-text__preview"
+                        role="region"
+                        aria-live="polite"
+                        aria-labelledby=(format!("{field}-preview-label"))
+                        { (rich_text_preview(&value)) }
+                }
+            }
+        }
+    }
+}
+
+/// Server-side pre-render of the preview pane's initial contents.
+///
+/// With the `markdown` feature on, the current value is rendered through the
+/// same sanitizer the live preview and the show page use, so a 422 re-render
+/// displays the preview immediately instead of waiting for the first keystroke.
+/// Without it, the pane starts empty and fills in on the first htmx response.
+#[cfg(all(feature = "maud", feature = "markdown"))]
+fn rich_text_preview(value: &str) -> maud::Markup {
+    crate::markdown::render_user_content(value)
+}
+
+/// Fallback for builds without the `markdown` feature — see the documented
+/// sibling above.
+#[cfg(all(feature = "maud", not(feature = "markdown")))]
+fn rich_text_preview(_value: &str) -> maud::Markup {
+    maud::html! {}
 }
 
 /// Render a labeled `<input type="text">` for a required field.
@@ -3378,6 +3597,178 @@ mod tests {
         assert!(html.contains(r#"aria-invalid="true""#), "{html}");
         assert!(html.contains(r#"role="alert""#), "{html}");
         assert!(html.contains("required"), "{html}");
+    }
+
+    // ── Rich text (issue #1255) ────────────────────────────────────────────
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_renders_a_labeled_markdown_editor() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: "Hello **world**".into(),
+        });
+        let html = rich_text_area(&cs, "body", "Body").into_string();
+        assert!(html.contains("<textarea"), "{html}");
+        assert!(html.contains(r#"name="body""#), "{html}");
+        assert!(html.contains(r#"id="body""#), "{html}");
+        assert!(html.contains(r#"<label for="body""#), "{html}");
+        assert!(html.contains("Body"), "{html}");
+        // The submitted Markdown source round-trips into the editor.
+        assert!(html.contains("Hello **world**"), "{html}");
+        // A hint tells the author the field takes Markdown — the whole point of
+        // the control over a bare textarea.
+        assert!(html.to_lowercase().contains("markdown"), "{html}");
+        assert!(html.contains("autumn-rich-text"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_escapes_the_editor_value() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: "</textarea><script>alert(1)</script>".into(),
+        });
+        let html = rich_text_area(&cs, "body", "Body").into_string();
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("</textarea><script"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_describes_itself_with_hint_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let ok = rich_text_area(&cs, "body", "Body").into_string();
+        // Error-free: described by the hint alone, never a dangling error id.
+        assert!(ok.contains(r#"aria-describedby="body-hint""#), "{ok}");
+        assert!(ok.contains(r#"aria-invalid="false""#), "{ok}");
+
+        let mut errors = HashMap::new();
+        errors.insert("body".to_string(), vec!["must not be blank".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                body: String::new(),
+            },
+            errors,
+        );
+        let bad = rich_text_area(&cs, "body", "Body").into_string();
+        assert!(
+            bad.contains(r#"aria-describedby="body-hint body-error""#),
+            "{bad}"
+        );
+        assert!(bad.contains(r#"aria-invalid="true""#), "{bad}");
+        assert!(bad.contains(r#"role="alert""#), "{bad}");
+        assert!(bad.contains("must not be blank"), "{bad}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_htmx_wires_a_live_preview_with_no_javascript() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F { body: "hi".into() });
+        let html = rich_text_area_htmx(&cs, "body", "Body", "/posts/preview/body").into_string();
+        assert!(html.contains(r#"hx-post="/posts/preview/body""#), "{html}");
+        assert!(html.contains(r##"hx-target="#body-preview""##), "{html}");
+        assert!(html.contains(r#"hx-swap="innerHTML""#), "{html}");
+        assert!(html.contains("hx-trigger="), "{html}");
+        // The one-time submit token must not be spent by preview requests.
+        assert!(html.contains(r#"hx-params="not _submit_token""#), "{html}");
+        // The pane htmx swaps into, announced politely for AT users.
+        assert!(html.contains(r#"id="body-preview""#), "{html}");
+        assert!(html.contains(r#"aria-live="polite""#), "{html}");
+        // No inline JavaScript anywhere — htmx attributes only.
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("onkeyup"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_htmx_with_token_field_filters_the_configured_field() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let html = rich_text_area_htmx_with_token_field(
+            &cs,
+            "body",
+            "Body",
+            "/posts/preview/body",
+            "_one_time",
+        )
+        .into_string();
+        assert!(html.contains(r#"hx-params="not _one_time""#), "{html}");
+        assert!(!html.contains("_submit_token"), "{html}");
+    }
+
+    #[cfg(all(feature = "maud", feature = "markdown"))]
+    #[test]
+    fn rich_text_area_htmx_preview_pane_is_prerendered_and_sanitized() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: "**bold** [x](javascript:alert(1))".into(),
+        });
+        let html = rich_text_area_htmx(&cs, "body", "Body", "/posts/preview/body").into_string();
+        // A 422 re-render shows the preview immediately, without waiting for
+        // the first keystroke to fire the htmx request…
+        assert!(html.contains("<strong>bold</strong>"), "{html}");
+        // …and that server-side pre-render goes through the same sanitizer.
+        // Scoped to the preview pane: the textarea legitimately still holds the
+        // raw Markdown source, escaped as text content, because the column
+        // stores the source and the author must be able to edit it back.
+        let pane = html
+            .split_once(r#"id="body-preview""#)
+            .expect("preview pane present")
+            .1;
+        assert!(!pane.to_ascii_lowercase().contains("javascript:"), "{pane}");
+        assert!(!pane.contains("href="), "{pane}");
+        // The editor keeps the source verbatim (escaped), not the render.
+        assert!(
+            html.contains("[x](javascript:alert(1))</textarea>"),
+            "{html}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn changeset_form_exposes_the_rich_text_helpers() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let form = ChangesetForm {
+            changeset: Changeset::new(F { body: "hi".into() }),
+            csrf_token: None,
+            csrf_field: "_csrf".to_owned(),
+        };
+        assert_eq!(
+            form.rich_text_area("body", "Body").into_string(),
+            rich_text_area(&form.changeset, "body", "Body").into_string()
+        );
+        assert_eq!(
+            form.rich_text_area_htmx("body", "Body", "/p").into_string(),
+            rich_text_area_htmx(&form.changeset, "body", "Body", "/p").into_string()
+        );
     }
 
     #[cfg(feature = "maud")]

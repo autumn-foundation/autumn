@@ -186,6 +186,8 @@ mod repository_scope_meta;
 #[cfg(feature = "db")]
 mod repository_search;
 mod request_timeout;
+#[cfg(all(feature = "markdown", feature = "maud"))]
+mod rich_text;
 mod route_macro;
 mod routes_macro;
 mod scheduled_coordination;

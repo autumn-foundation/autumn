@@ -11,6 +11,18 @@ use crate::markdown::types::{RenderOptions, RenderedMarkdown, TocItem};
 /// CSS class. The output HTML is safe: it is produced by pulldown-cmark's
 /// built-in HTML writer, which escapes raw HTML by default.
 ///
+/// # Not for user-submitted text
+///
+/// This helper targets *trusted, build-time* content — pages you authored and
+/// committed. It applies **no** URL-scheme allowlist (a `[x](javascript:…)`
+/// link renders as written) and injects heading `id` anchors from the document
+/// text, which user-controlled headings could use for DOM clobbering.
+///
+/// For anything a request body carried in — posts, comments, wiki bodies —
+/// use [`render_user_content_html`](crate::markdown::render_user_content_html)
+/// (or `render_user_content` for `maud::Markup`) instead, which disables
+/// raw-HTML passthrough and runs the output through an allowlist sanitizer.
+///
 /// # Example
 ///
 /// ```
