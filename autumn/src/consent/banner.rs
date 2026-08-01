@@ -168,6 +168,16 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 /// itself so an already-decided visitor can change their choice), this
 /// middleware skips injection rather than adding a second, identical copy.
 ///
+/// A `HEAD` request needs no special-casing here: this middleware always
+/// runs *inside* the Axum `Route` wrapper that actually turns a `GET`
+/// handler's response into a `HEAD` one, so `response` still carries the
+/// real, full body (and no `Content-Length` yet) when this function inspects
+/// or splices into it, regardless of the request's method. Whatever this
+/// middleware returns — banner spliced in, `Content-Length` updated, or left
+/// untouched — is exactly what that outer wrapper uses to compute the final
+/// `Content-Length` before emptying the body for `HEAD`, so the `HEAD`
+/// response's metadata always matches the equivalent `GET`'s.
+///
 /// # Known limitation: `#[static_get]` pages and CSRF
 ///
 /// A first-time visitor whose very first hit lands on a pre-rendered
@@ -227,6 +237,17 @@ pub async fn inject_consent_banner(
         return response;
     }
 
+    // No `HEAD`-specific handling is needed here, even though this can
+    // splice a banner into the body below: Axum's own per-route wrapper
+    // (added by `.layer()`, wrapping this entire middleware) is what
+    // actually converts a `GET` handler's response into a `HEAD` one — it
+    // computes `Content-Length` from *this* middleware's returned body and
+    // *then* empties it for `HEAD`, strictly after this function returns.
+    // So by the time this code runs, `response` still carries the real,
+    // full body (and no `Content-Length` yet) regardless of request method;
+    // splicing into it here and letting `Content-Length` reflect the
+    // spliced body is exactly the metadata Axum will carry through to the
+    // final `HEAD` response once it empties the body.
     if !needs_prompt {
         // A handler can still render differently based on the visitor's
         // Consent cookie even when this middleware injects nothing (e.g.
@@ -279,9 +300,23 @@ fn is_html_response(response: &Response<Body>) -> bool {
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        // HTTP media-type tokens are case-insensitive (RFC 9110 8.3.1) — a
-        // handler returning `Text/HTML` is exactly as valid as `text/html`.
-        .is_some_and(|content_type| content_type.to_ascii_lowercase().contains("text/html"))
+        .is_some_and(|content_type| {
+            // The media-type *essence* is only the part before the first
+            // `;` (parameters like `charset=utf-8` follow) — matching
+            // against the whole header value would also match an unrelated
+            // type that merely contains this substring, e.g.
+            // `text/html-patch+json` or `application/json;
+            // profile="text/html"`, and wrongly splice banner markup into a
+            // non-HTML payload. HTTP media-type tokens are case-insensitive
+            // (RFC 9110 8.3.1) — a handler returning `Text/HTML` is exactly
+            // as valid as `text/html`.
+            let essence = content_type
+                .split(';')
+                .next()
+                .unwrap_or(content_type)
+                .trim();
+            essence.eq_ignore_ascii_case("text/html")
+        })
 }
 
 /// Outcome of bounding how much of a body [`collect_body_prefix`] buffers.
@@ -476,7 +511,7 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
 mod tests {
     use super::*;
     use axum::Router;
-    use axum::http::StatusCode;
+    use axum::http::{Method, StatusCode};
     use axum::routing::get;
     use tower::ServiceExt;
 
@@ -620,6 +655,26 @@ mod tests {
     fn json_response_is_not_html() {
         let response = Response::builder()
             .header(CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_html_response(&response));
+    }
+
+    #[test]
+    fn media_type_that_merely_contains_text_html_as_a_substring_is_not_html() {
+        // `text/html-patch+json` and `application/json; profile="text/html"`
+        // both contain the substring "text/html" but are not the `text/html`
+        // media type — matching on the whole header value would wrongly
+        // treat either as HTML and splice banner markup into a non-HTML
+        // payload, corrupting it for its actual consumer.
+        let response = Response::builder()
+            .header(CONTENT_TYPE, "text/html-patch+json")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_html_response(&response));
+
+        let response = Response::builder()
+            .header(CONTENT_TYPE, r#"application/json; profile="text/html""#)
             .body(Body::empty())
             .unwrap();
         assert!(!is_html_response(&response));
@@ -1000,6 +1055,108 @@ mod tests {
             response.headers().get(VARY).and_then(|v| v.to_str().ok()),
             Some("Cookie"),
             "a decided-but-not-injected HTML response must still vary on Cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn undecided_visitors_head_request_matches_the_spliced_gets_content_length_and_cache_control()
+     {
+        // This middleware runs inside the Axum `Route` wrapper that turns a
+        // `GET` handler's response into a `HEAD` one, so it still sees (and
+        // splices into) the real, full body here regardless of request
+        // method — the outer wrapper computes `Content-Length` from
+        // whatever this middleware returns and only empties the body
+        // afterward. So an undecided visitor's `HEAD` response must carry
+        // the same post-splice `Content-Length` and `Cache-Control` its
+        // `GET` counterpart would.
+        let unspliced_get_len = axum::body::to_bytes(html_page().into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .len();
+        let banner_len = consent_banner_markup(None, "_csrf").into_string().len();
+
+        let app = app_with_policy_version(1);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get(VARY).and_then(|v| v.to_str().ok()),
+            Some("Cookie"),
+            "an undecided visitor's HEAD response must still vary on Cookie"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private, no-store"),
+            "an undecided visitor's HEAD response must match the GET path's uncacheable directive"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some((unspliced_get_len + banner_len).to_string().as_str()),
+            "an undecided visitor's HEAD response must report the post-splice Content-Length, \
+             not the pre-splice one"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.is_empty(),
+            "a HEAD response must never carry a spliced-in body"
+        );
+    }
+
+    #[tokio::test]
+    async fn decided_visitors_head_request_leaves_representation_metadata_untouched() {
+        // Once a visitor has already decided, the GET path injects nothing
+        // and leaves Content-Length/Cache-Control alone — so the equivalent
+        // HEAD response has no reason to touch them either, beyond adding
+        // Vary: Cookie like every other HTML response here.
+        let unspliced_get_len = axum::body::to_bytes(html_page().into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .len();
+        let app = app_with_policy_version(1);
+        let cookie = super::super::accept_all_cookie(&["analytics"], 1);
+        let raw_value = cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("autumn.consent=")
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/")
+                    .header("cookie", format!("autumn.consent={raw_value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get(VARY).and_then(|v| v.to_str().ok()),
+            Some("Cookie")
+        );
+        assert!(response.headers().get(CACHE_CONTROL).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(unspliced_get_len.to_string().as_str())
         );
     }
 
