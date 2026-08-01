@@ -440,113 +440,83 @@ fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<t
 /// (staging, test, etc.) get no smart defaults — they rely on
 /// their profile TOML file and env overrides.
 fn profile_defaults_as_toml(profile: &str) -> toml::Value {
-    let mut table = toml::map::Map::new();
-
     match profile {
-        "dev" => {
-            let mut log = toml::map::Map::new();
-            log.insert("level".into(), "debug".into());
-            log.insert("format".into(), "Pretty".into());
-            table.insert("log".into(), toml::Value::Table(log));
+        "dev" => toml::from_str(
+            r#"
+[log]
+level = "debug"
+format = "Pretty"
 
-            let mut telemetry = toml::map::Map::new();
-            telemetry.insert("environment".into(), "development".into());
-            table.insert("telemetry".into(), toml::Value::Table(telemetry));
+[telemetry]
+environment = "development"
 
-            let mut server = toml::map::Map::new();
-            server.insert("host".into(), "127.0.0.1".into());
-            server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(1));
-            // Zero-out the prestop grace in dev: there is no load balancer to
-            // deregister, so the 5-second default would add unnecessary latency
-            // on every Ctrl-C.
-            server.insert("prestop_grace_secs".into(), toml::Value::Integer(0));
-            table.insert("server".into(), toml::Value::Table(server));
+[server]
+host = "127.0.0.1"
+shutdown_timeout_secs = 1
+# Zero-out the prestop grace in dev: there is no load balancer to
+# deregister, so the 5-second default would add unnecessary latency
+# on every Ctrl-C.
+prestop_grace_secs = 0
 
-            let mut health = toml::map::Map::new();
-            health.insert("detailed".into(), toml::Value::Boolean(true));
-            table.insert("health".into(), toml::Value::Table(health));
+[health]
+detailed = true
 
-            let mut actuator = toml::map::Map::new();
-            actuator.insert("sensitive".into(), toml::Value::Boolean(true));
-            table.insert("actuator".into(), toml::Value::Table(actuator));
+[actuator]
+sensitive = true
 
-            let mut cors = toml::map::Map::new();
-            cors.insert(
-                "allowed_origins".into(),
-                toml::Value::Array(vec![toml::Value::String("*".to_owned())]),
-            );
-            table.insert("cors".into(), toml::Value::Table(cors));
+[cors]
+allowed_origins = ["*"]
 
-            // Dev: enable the local-disk blob store rooted at
-            // `target/blobs/` automatically when the `storage` feature
-            // is on. `prod` deliberately leaves `backend = "disabled"`
-            // so the operator has to opt into either `local` (with
-            // `allow_local_in_production = true`) or `s3`.
-            let mut storage = toml::map::Map::new();
-            storage.insert("backend".into(), "local".into());
-            table.insert("storage".into(), toml::Value::Table(storage));
-            // Dev: trust X-Forwarded-* from loopback only so local reverse
-            // proxies (nginx, caddy, etc. on 127.0.0.1/::1) work out of the box.
-            let mut trusted_proxies = toml::map::Map::new();
-            trusted_proxies.insert("trust_forwarded_headers".into(), toml::Value::Boolean(true));
-            trusted_proxies.insert(
-                "ranges".into(),
-                toml::Value::Array(vec![
-                    toml::Value::String("127.0.0.0/8".to_owned()),
-                    toml::Value::String("::1/128".to_owned()),
-                ]),
-            );
-            let mut security = toml::map::Map::new();
-            security.insert(
-                "trusted_proxies".into(),
-                toml::Value::Table(trusted_proxies),
-            );
-            table.insert("security".into(), toml::Value::Table(security));
-            // Dev: CSRF disabled (default), HSTS off (default)
-        }
-        "prod" => {
-            let mut log = toml::map::Map::new();
-            log.insert("level".into(), "info".into());
-            log.insert("format".into(), "Json".into());
-            table.insert("log".into(), toml::Value::Table(log));
+# Dev: enable the local-disk blob store rooted at
+# `target/blobs/` automatically when the `storage` feature
+# is on. `prod` deliberately leaves `backend = "disabled"`
+# so the operator has to opt into either `local` (with
+# `allow_local_in_production = true`) or `s3`.
+[storage]
+backend = "local"
 
-            let mut telemetry = toml::map::Map::new();
-            telemetry.insert("environment".into(), "production".into());
-            table.insert("telemetry".into(), toml::Value::Table(telemetry));
+[security.trusted_proxies]
+# Dev: trust X-Forwarded-* from loopback only so local reverse
+# proxies (nginx, caddy, etc. on 127.0.0.1/::1) work out of the box.
+trust_forwarded_headers = true
+ranges = ["127.0.0.0/8", "::1/128"]
+# Dev: CSRF disabled (default), HSTS off (default)
+"#,
+        )
+        .expect("valid dev toml"),
+        "prod" => toml::from_str(
+            r#"
+[log]
+level = "info"
+format = "Json"
 
-            let mut server = toml::map::Map::new();
-            server.insert("host".into(), "0.0.0.0".into());
-            server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(30));
-            let mut timeouts = toml::map::Map::new();
-            timeouts.insert("request_timeout_ms".into(), toml::Value::Integer(30_000));
-            server.insert("timeouts".into(), toml::Value::Table(timeouts));
-            table.insert("server".into(), toml::Value::Table(server));
+[telemetry]
+environment = "production"
 
-            let mut health = toml::map::Map::new();
-            health.insert("detailed".into(), toml::Value::Boolean(false));
-            table.insert("health".into(), toml::Value::Table(health));
+[server]
+host = "0.0.0.0"
+shutdown_timeout_secs = 30
 
-            // Prod: strict security -- HSTS on, CSRF enabled, secure cookies
-            let mut security = toml::map::Map::new();
-            let mut headers = toml::map::Map::new();
-            headers.insert(
-                "strict_transport_security".into(),
-                toml::Value::Boolean(true),
-            );
-            security.insert("headers".into(), toml::Value::Table(headers));
-            let mut csrf = toml::map::Map::new();
-            csrf.insert("enabled".into(), toml::Value::Boolean(true));
-            security.insert("csrf".into(), toml::Value::Table(csrf));
-            table.insert("security".into(), toml::Value::Table(security));
+[server.timeouts]
+request_timeout_ms = 30_000
 
-            let mut session = toml::map::Map::new();
-            session.insert("secure".into(), toml::Value::Boolean(true));
-            table.insert("session".into(), toml::Value::Table(session));
-        }
-        _ => {} // Custom profiles get no smart defaults
+[health]
+detailed = false
+
+# Prod: strict security -- HSTS on, CSRF enabled, secure cookies
+[security.headers]
+strict_transport_security = true
+
+[security.csrf]
+enabled = true
+
+[session]
+secure = true
+"#,
+        )
+        .expect("valid prod toml"),
+        _ => toml::Value::Table(toml::map::Map::new()), // Custom profiles get no smart defaults
     }
-
-    toml::Value::Table(table)
 }
 
 #[cfg(feature = "mail")]
