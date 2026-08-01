@@ -450,6 +450,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shlex",
  "syn 2.0.118",
  "temp-env",
  "tempfile",
