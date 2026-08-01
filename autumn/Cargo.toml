@@ -790,3 +790,7 @@ path = "tests/loom_models.rs"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "chaos_tracking_store_loom"
+path = "tests/chaos_tracking_store_loom.rs"

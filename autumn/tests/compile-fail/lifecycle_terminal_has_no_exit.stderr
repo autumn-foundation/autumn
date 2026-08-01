@@ -12,4 +12,5 @@ error[E0599]: no method named `to_paid` found for struct `Machine<Delivered>` in
 34 |       let _ = machine.to_paid();
    |                       ^^^^^^^ method not found in `Machine<Delivered>`
    |
-   = note: the method was found for `Machine<order_state::Pending>`
+   = note: the method was found for
+           - `Machine<order_state::Pending>`
