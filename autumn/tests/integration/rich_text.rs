@@ -309,6 +309,43 @@ fn xss_corpus_is_inert_through_the_html_sanitizer_too() {
 }
 
 #[test]
+fn ac_named_combined_payload_emits_no_script_and_no_javascript_href() {
+    // The acceptance criterion names this exact input: the rendered output must
+    // contain no `<script>` and no `javascript:` href.
+    let payload = "<script>alert(1)</script>[x](javascript:alert(1))";
+    let html = render_user_content_html(payload);
+    let lowered = html.to_ascii_lowercase();
+
+    // No script element.
+    assert!(!lowered.contains("<script"), "{html}");
+    assert!(!lowered.contains("</script"), "{html}");
+    // No `javascript:` href — the criterion is about the *href*, and
+    // `assert_inert` proves it structurally by parsing every surviving tag.
+    assert!(
+        !lowered.contains("href="),
+        "no anchor survives here:\n{html}"
+    );
+    assert_inert(payload, &html);
+
+    // Everything survives only as inert, escaped text. Note the link is not
+    // even parsed as a link here: `<script>` opens a CommonMark *HTML block*,
+    // which swallows the rest of the line — so `javascript:` appears in the
+    // output as literal characters. That is why this asserts on `href` rather
+    // than on the bare substring.
+    assert!(html.contains("&lt;script&gt;"), "{html}");
+
+    // Split across lines the link IS parsed as a link — and is still defused.
+    let split = render_user_content_html("<script>alert(1)</script>\n\n[x](javascript:alert(1))");
+    let split_lower = split.to_ascii_lowercase();
+    assert!(!split_lower.contains("<script"), "{split}");
+    assert!(
+        !split_lower.contains("javascript:"),
+        "a genuinely parsed javascript: link must leave no trace:\n{split}"
+    );
+    assert!(split.contains('x'), "the link text survives:\n{split}");
+}
+
+#[test]
 fn ac_named_javascript_link_payload_emits_no_href() {
     // The acceptance criterion names this payload explicitly: the rendered
     // output must carry no `javascript:` URL at all.
