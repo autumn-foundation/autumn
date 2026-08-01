@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **rich text:** a safe first-class path for **user-submitted** formatted text,
+  so a content app built on Autumn cannot ship stored XSS by using the shipped
+  helpers (#1255). `autumn generate scaffold post title:String body:richtext`
+  is the whole setup: a `TEXT` column holding the Markdown **source**, a form
+  with a Markdown editor and an htmx live preview, and a show view that renders
+  through a sanitizer — no JavaScript of your own and no sanitizer to
+  configure. The renderer is `autumn_web::markdown::render_user_content`, and
+  it applies two independent controls: raw-HTML passthrough is disabled at the
+  parser (raw markup becomes escaped text, and link/image destinations are
+  checked against a URL-scheme allowlist before the HTML writer runs), and the
+  resulting HTML is then run through an `ammonia` allowlist built from the
+  curated `RICH_TEXT_ALLOWED_TAGS` / `RICH_TEXT_ALLOWED_URL_SCHEMES` public
+  constants. Either control alone blocks the canonical payloads; both are
+  applied so a bypass of one is not a bypass of the feature. The allowlist is
+  deliberately tight — no `<img>` (a Markdown image degrades to its alt text,
+  so a post cannot beacon a reader's IP to a third-party host), no `id`/`name`
+  (DOM clobbering), `style` narrowed to table alignment, `class` narrowed to
+  the code-fence language hint, and `rel="noopener noreferrer nofollow"` forced
+  onto every surviving link. This is the counterpart to the existing
+  `markdown::render`, which stays what it always was — a *trusted*,
+  build-time renderer that injects heading anchors and applies no allowlist;
+  its docs now say so and point here. `form::rich_text_area` renders the
+  editor, `form::rich_text_area_htmx` adds the preview pane (filtering the
+  one-time submit token out of the preview POST), and `sanitize_user_html`
+  applies the same allowlist when the untrusted rich text arrives as HTML
+  rather than Markdown. A 40-payload adversarial corpus locks the guarantee
+  down structurally — it parses the rendered output and asserts that no
+  non-allowlisted element, no event-handler attribute, and no URL outside the
+  scheme allowlist survives. See the [rich text
+  guide](docs/guide/rich-text.md).
 - **search:** a new optional plugin crate, `autumn-search`, turning the in-core
   full-text primitives (#842) into a **search subsystem**: mark a model
   searchable and get an index that stays in sync with the record lifecycle,
