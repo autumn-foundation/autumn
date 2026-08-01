@@ -424,7 +424,12 @@ const fn is_default_optional(field: &Field) -> bool {
 
 fn is_default_hide_from_list(field: &Field) -> bool {
     // TextArea bodies and binary blobs clutter the table; updated_at is redundant noise.
-    matches!(field.kind, FieldKind::Text | FieldKind::Bytea) || field.name == "updated_at"
+    // `RichText` renders as a TextArea too (see `admin_field_kind`), and a
+    // Markdown body is the single worst column to inline in a list view.
+    matches!(
+        field.kind,
+        FieldKind::Text | FieldKind::RichText | FieldKind::Bytea
+    ) || field.name == "updated_at"
 }
 
 fn is_lock_version_field(field: &Field, lock_version_field: Option<&str>) -> bool {
@@ -1168,6 +1173,35 @@ mod tests {
     /// Create a minimal project root: Cargo.toml + src/models/<snake>.rs.
     fn project_with_model(snake: &str) -> TempDir {
         project_with_model_source(snake, "// stub\n")
+    }
+
+    #[test]
+    fn richtext_column_is_a_textarea_hidden_from_the_list() {
+        // A `richtext` column edits as a plain textarea in the admin's
+        // raw-value editor (issue #1255) — and a Markdown body is the single
+        // worst column to inline in a list table, exactly like a `Text` body.
+        let field = |kind: crate::generate::dsl::FieldKind| Field {
+            name: "body".to_owned(),
+            kind,
+            nullable: false,
+            variants: Vec::new(),
+            unique: false,
+            constraints: crate::generate::dsl::FieldConstraints::default(),
+            state_machine: None,
+        };
+        let rich = field(FieldKind::RichText);
+        let text = field(FieldKind::Text);
+        assert_eq!(admin_field_kind(&rich), "AdminFieldKind::TextArea");
+        assert!(
+            is_default_hide_from_list(&rich),
+            "a Markdown body must not clutter the admin list table"
+        );
+        // It behaves identically to the `Text` column it mirrors.
+        assert_eq!(admin_field_kind(&rich), admin_field_kind(&text));
+        assert_eq!(
+            is_default_hide_from_list(&rich),
+            is_default_hide_from_list(&text)
+        );
     }
 
     fn project_with_model_source(snake: &str, model_source: &str) -> TempDir {

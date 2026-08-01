@@ -163,6 +163,39 @@
     gap: 0.375rem;
 }
 
+.autumn-rich-text__toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0.375rem 0.5rem;
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: var(--radius) var(--radius) 0 0;
+    background-color: var(--surface);
+}
+
+.autumn-rich-text__toolbar-item {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+}
+
+.autumn-rich-text__toolbar-label {
+    color: var(--text-muted);
+}
+
+.autumn-rich-text__toolbar-syntax {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--text);
+}
+
+/* The toolbar sits directly on top of the editor, so they read as one control. */
+.autumn-rich-text__toolbar + .autumn-rich-text__editor {
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}
+
 .autumn-rich-text__editor {
     min-height: 12rem;
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;

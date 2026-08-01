@@ -1280,12 +1280,36 @@ pub fn textarea_input<T: Serialize>(
     }
 }
 
-/// The hint shown under a [`rich_text_area`] editor, telling the author which
-/// Markdown the field accepts. Kept in one place so the widget, its htmx
-/// variant, and the generated scaffold all say the same thing.
+/// The hint shown under a [`rich_text_area`] editor. Deliberately short: the
+/// syntax itself lives in the toolbar ([`RICH_TEXT_TOOLBAR`]), so this sentence
+/// only carries the part the toolbar can't — that HTML is *not* accepted.
 #[cfg(feature = "maud")]
-const RICH_TEXT_HINT: &str = "Markdown supported: **bold**, _italic_, [links](https://example.com), \
-     lists, `code`, and tables. HTML is not allowed and is shown as plain text.";
+const RICH_TEXT_HINT: &str = "Markdown supported. HTML is not allowed and is shown as plain text.";
+
+/// The minimal Markdown toolbar rendered above a [`rich_text_area`] editor, as
+/// `(label, syntax)` pairs.
+///
+/// This is a **no-JavaScript** toolbar: it shows the syntax for each supported
+/// construct at the point of use rather than inserting it on click. That is a
+/// deliberate trade-off. Inserting text into a `<textarea>` is impossible in
+/// HTML alone, so a click-to-insert toolbar would mean shipping a script — and a
+/// scripted control that silently does nothing when scripting is off is worse
+/// than no control at all. The editor's contract is that it works with no
+/// JavaScript (issue #1255), so the toolbar holds to the same bar.
+///
+/// Every entry corresponds to something the renderer actually emits (see
+/// [`RICH_TEXT_ALLOWED_TAGS`](crate::markdown::RICH_TEXT_ALLOWED_TAGS)) — there
+/// is no affordance here for syntax the sanitizer would strip.
+#[cfg(feature = "maud")]
+const RICH_TEXT_TOOLBAR: &[(&str, &str)] = &[
+    ("Bold", "**bold**"),
+    ("Italic", "_italic_"),
+    ("Link", "[text](url)"),
+    ("Code", "`code`"),
+    ("List", "- item"),
+    ("Heading", "# Heading"),
+    ("Quote", "> quote"),
+];
 
 /// Render a labeled Markdown editor for a rich-text field (issue #1255).
 ///
@@ -1329,18 +1353,29 @@ pub fn rich_text_area<T: Serialize>(
 /// submit needs; use [`rich_text_area_htmx_with_token_field`] when the app
 /// customizes `[security.submit_token].field_name`.
 ///
-/// The preview handler should extract [`ChangesetForm<T>`] and return
+/// The preview handler should decode the body **leniently** and return
 /// [`markdown::render_user_content`](crate::markdown::render_user_content) of
-/// the submitted field:
+/// the submitted field — this is exactly what `autumn generate scaffold
+/// … body:richtext` emits:
 ///
 /// ```rust,ignore
 /// #[post("/posts/preview/body")]
-/// async fn preview_body(form: ChangesetForm<PostForm>) -> Markup {
+/// pub async fn preview_body(body: Bytes) -> Markup {
+///     let Ok(form) = decode_form(body) else {
+///         return html! {};
+///     };
+///     let changeset = form.into_changeset();
 ///     autumn_web::markdown::render_user_content(
-///         &form.field_value("body").unwrap_or_default(),
+///         &changeset.field_value("body").unwrap_or_default(),
 ///     )
 /// }
 /// ```
+///
+/// Do **not** use the [`ChangesetForm<T>`] extractor here. It rejects a body it
+/// cannot deserialize with a 4xx response, and a half-filled form legitimately
+/// posts an empty string for a numeric column — htmx does not swap a 4xx, so
+/// the preview would silently stop updating mid-edit. Failing closed to empty
+/// markup keeps the editor usable.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn rich_text_area_htmx<T: Serialize>(
@@ -1407,6 +1442,14 @@ fn rich_text_area_inner<T: Serialize>(
     maud::html! {
         div id=(wrapper_id) class="autumn-field autumn-rich-text" data-autumn-field-wrapper=(field) {
             label for=(field) class="autumn-field__label" { (label) }
+            div class="autumn-rich-text__toolbar" role="group" aria-label="Markdown formatting" {
+                @for (control, syntax) in RICH_TEXT_TOOLBAR {
+                    span class="autumn-rich-text__toolbar-item" {
+                        span class="autumn-rich-text__toolbar-label" { (control) }
+                        code class="autumn-rich-text__toolbar-syntax" { (syntax) }
+                    }
+                }
+            }
             textarea
                 id=(field)
                 name=(field)
@@ -1432,11 +1475,17 @@ fn rich_text_area_inner<T: Serialize>(
             @if preview.is_some() {
                 div class="autumn-rich-text__preview-wrapper" {
                     span class="autumn-rich-text__preview-label" id=(format!("{field}-preview-label")) { "Preview" }
+                    // Deliberately NOT an `aria-live` region: this element is
+                    // the htmx swap target and re-renders on every pause in
+                    // typing, so announcing it would read the entire post back
+                    // to the author mid-sentence. `docs/guide/accessibility.md`
+                    // reserves live regions for short, deliberate status
+                    // messages delivered out-of-band. It stays a labeled
+                    // landmark the author can navigate to on demand.
                     div
                         id=(preview_id)
                         class="autumn-rich-text__preview"
                         role="region"
-                        aria-live="polite"
                         aria-labelledby=(format!("{field}-preview-label"))
                         { (rich_text_preview(&value)) }
                 }
@@ -3627,6 +3676,50 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[test]
+    fn rich_text_area_renders_a_minimal_markdown_toolbar() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let html = rich_text_area(&cs, "body", "Body").into_string();
+
+        // A grouped, labeled toolbar — announced as one unit rather than as
+        // loose text between the label and the editor.
+        assert!(html.contains(r#"role="group""#), "{html}");
+        assert!(html.contains("autumn-rich-text__toolbar"), "{html}");
+        assert!(
+            html.to_lowercase()
+                .contains(r#"aria-label="markdown formatting"#),
+            "{html}"
+        );
+
+        // Every syntax the allowlist actually renders is represented.
+        for token in [
+            "**bold**",
+            "_italic_",
+            "[text](url)",
+            "- item",
+            "# Heading",
+            "> quote",
+        ] {
+            assert!(
+                html.contains(&maud::html! { (token) }.into_string()),
+                "toolbar is missing the {token:?} affordance:\n{html}"
+            );
+        }
+
+        // The graceful base case: the toolbar must not depend on JavaScript,
+        // and must not render a control that silently does nothing without it.
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("<button"), "{html}");
+        assert!(!html.contains("onclick"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
     fn rich_text_area_escapes_the_editor_value() {
         #[derive(serde::Serialize)]
         struct F {
@@ -3688,9 +3781,13 @@ mod tests {
         assert!(html.contains("hx-trigger="), "{html}");
         // The one-time submit token must not be spent by preview requests.
         assert!(html.contains(r#"hx-params="not _submit_token""#), "{html}");
-        // The pane htmx swaps into, announced politely for AT users.
+        // The pane htmx swaps into. Deliberately not an `aria-live` region —
+        // it re-renders on every pause in typing, and announcing the whole
+        // rendered body back to its author is noise, not help.
         assert!(html.contains(r#"id="body-preview""#), "{html}");
-        assert!(html.contains(r#"aria-live="polite""#), "{html}");
+        assert!(!html.contains("aria-live"), "{html}");
+        assert!(html.contains(r#"role="region""#), "{html}");
+        assert!(html.contains("aria-labelledby="), "{html}");
         // No inline JavaScript anywhere — htmx attributes only.
         assert!(!html.contains("<script"), "{html}");
         assert!(!html.contains("onkeyup"), "{html}");

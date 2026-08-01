@@ -278,9 +278,9 @@ pub enum FieldKind {
     /// diesel token is `Text`, and the SQL column type is `TEXT` on both
     /// backends. The distinction is entirely in the generated UI:
     ///
-    /// - the form renders `autumn_web::form::rich_text_area` — a Markdown
-    ///   editor with a hint and (with `--live-validation`) an htmx live preview
-    ///   — instead of a bare `<textarea>`;
+    /// - the form renders `autumn_web::form::rich_text_area_htmx_with_token_field`
+    ///   — a Markdown editor with a no-JavaScript syntax toolbar and an htmx
+    ///   live preview — instead of a bare `<textarea>`;
     /// - the `show` view renders the value through
     ///   `autumn_web::markdown::render_user_content`, which disables raw-HTML
     ///   passthrough and applies an allowlist sanitizer, instead of emitting
@@ -289,8 +289,11 @@ pub enum FieldKind {
     ///   those resolve.
     ///
     /// The `{email}`/`{url}` format constraints are rejected on this kind
-    /// (a Markdown body cannot satisfy a single-line format validator), but the
-    /// `{min}`/`{max}` length bounds apply exactly as they do for `Text`.
+    /// (a Markdown body cannot satisfy a single-line format validator). The
+    /// `{min}`/`{max}` length bounds are accepted and emit the same server-side
+    /// `#[validate(length(…))]` rule as `Text`; unlike `Text` they emit no
+    /// client-side `minlength`/`maxlength`, because the editor is rendered by
+    /// `rich_text_area`, which takes no HTML5 constraint attributes.
     RichText,
     /// `i32` — `INTEGER`.
     I32,
@@ -1372,8 +1375,12 @@ fn set_label_constraint(
 fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
     let accepted = match kind {
         FieldKind::String | FieldKind::Text => "min=N, max=N, email, url",
-        FieldKind::RichText => "min=N, max=N",
-        FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => "min=N, max=N",
+        // `RichText` shares the numeric arm's accepted set, not `String`'s: it
+        // takes the `min`/`max` length bounds but NOT the `email`/`url` format
+        // validators, which a Markdown body could never satisfy (issue #1255).
+        FieldKind::RichText | FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => {
+            "min=N, max=N"
+        }
         FieldKind::References => "label:col",
         _ => "(none — this field type takes no constraint modifiers)",
     };

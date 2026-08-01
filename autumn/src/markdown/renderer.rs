@@ -8,8 +8,12 @@ use crate::markdown::types::{RenderOptions, RenderedMarkdown, TocItem};
 /// every heading and returning an ordered table of contents.
 ///
 /// Fenced code blocks preserve their language hint as a `language-{lang}`
-/// CSS class. The output HTML is safe: it is produced by pulldown-cmark's
-/// built-in HTML writer, which escapes raw HTML by default.
+/// CSS class. Raw HTML in the source is escaped rather than emitted — this
+/// function rewrites pulldown-cmark's `Html`/`InlineHtml` events to text before
+/// the writer runs (pulldown's own writer would pass them through verbatim).
+///
+/// That is **not** the same as sanitizing, and this renderer is not a
+/// sanitizer — see below.
 ///
 /// # Not for user-submitted text
 ///

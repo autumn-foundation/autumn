@@ -27,7 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a post cannot beacon a reader's IP to a third-party host), no `id`/`name`
   (DOM clobbering), `style` narrowed to table alignment, `class` narrowed to
   the code-fence language hint, and `rel="noopener noreferrer nofollow"` forced
-  onto every surviving link. This is the counterpart to the existing
+  onto every surviving link. Block nesting is capped at 100 levels: the HTML
+  sanitizer walks its open-elements stack once per block start tag, so
+  uncapped nesting would be quadratic — and `"> "` is two source bytes per
+  level, which would let one request body (or one stored post, re-rendered on
+  every view) burn minutes of CPU. This is the counterpart to the existing
   `markdown::render`, which stays what it always was — a *trusted*,
   build-time renderer that injects heading anchors and applies no allowlist;
   its docs now say so and point here. `form::rich_text_area` renders the
@@ -38,7 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   down structurally — it parses the rendered output and asserts that no
   non-allowlisted element, no event-handler attribute, and no URL outside the
   scheme allowlist survives. See the [rich text
-  guide](docs/guide/rich-text.md).
+  guide](docs/guide/rich-text.md). `form::rich_text_area` renders a labeled
+  textarea, a minimal Markdown formatting toolbar, and the current value; the
+  toolbar shows each construct's syntax rather than inserting it on click,
+  because inserting into a `<textarea>` needs JavaScript and a control that
+  silently does nothing without scripting is worse than none — the editor's
+  contract is that it works with no JavaScript at all.
 - **search:** a new optional plugin crate, `autumn-search`, turning the in-core
   full-text primitives (#842) into a **search subsystem**: mark a model
   searchable and get an index that stays in sync with the record lifecycle,

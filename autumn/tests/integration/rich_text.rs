@@ -38,18 +38,35 @@ const FORBIDDEN_TAGS: &[&str] = &[
     "<textarea",
 ];
 
-/// Attribute names that must never survive on any element. Checked against
-/// parsed attribute *names* (see [`parse_tag`]), never raw substrings, so an
-/// escaped `&quot; onmouseover=&quot;` sitting inertly inside a `title` value
-/// is correctly treated as harmless text.
-const FORBIDDEN_ATTRS: &[&str] = &[
-    "srcdoc",
-    "formaction",
-    // User-controlled ids/names enable DOM clobbering.
-    "id",
-    "name",
-    "http-equiv",
+/// The complete per-tag attribute allowlist, mirroring `build_sanitizer`'s
+/// `tag_attributes` map in `autumn/src/markdown/user_content.rs`.
+///
+/// This is an **allowlist**, not a denylist, and that distinction is the whole
+/// point: a denylist of scary-looking names (`onerror`, `srcdoc`, …) silently
+/// tolerates anything nobody thought to enumerate — `style` (a full-viewport
+/// clickjacking overlay), `ping` and `target` (which together defeat the forced
+/// `rel` hardening), `data-*` hooks into the host page's own scripts. Asserting
+/// the exact surviving set means widening the sanitizer without widening this
+/// table fails the corpus.
+///
+/// `rel` appears on `a` because ammonia *adds* it (`link_rel`); it is not
+/// accepted from input.
+const ALLOWED_TAG_ATTRIBUTES: &[(&str, &[&str])] = &[
+    ("a", &["href", "title", "rel"]),
+    ("code", &["class"]),
+    ("pre", &["class"]),
+    ("th", &["style"]),
+    ("td", &["style"]),
+    ("ol", &["start"]),
 ];
+
+/// The attributes permitted on `tag`, or an empty slice when the tag takes none.
+fn allowed_attributes_for(tag: &str) -> &'static [&'static str] {
+    ALLOWED_TAG_ATTRIBUTES
+        .iter()
+        .find(|(name, _)| *name == tag)
+        .map_or(&[], |(_, attrs)| *attrs)
+}
 
 /// Adversarial Markdown/HTML payloads a hostile user could submit.
 const XSS_CORPUS: &[&str] = &[
@@ -111,6 +128,20 @@ const XSS_CORPUS: &[&str] = &[
     "| a |\n|---|\n| [x](javascript:alert(1)) |",
     // Title attribute injection attempt.
     "[x](https://ok.example \"a\\\" onmouseover=\\\"alert(1)\")",
+    // Non-scripting attributes that are just as dangerous as an `on*` handler:
+    // a full-viewport `style` overlay is clickjacking/UI-redress, a remote
+    // `background: url(…)` is the same reader-IP beacon the `<img>` exclusion
+    // exists to prevent, and `ping`/`target` together defeat the forced
+    // `rel="noopener noreferrer"` hardening.
+    "<p style=\"position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:9999\">x</p>",
+    "<p style=\"background:url(https://evil.example/beacon.png)\">x</p>",
+    "<a href=\"https://ok.example\" ping=\"https://evil.example/track\" target=\"_blank\">x</a>",
+    "<a href=\"https://ok.example\" rel=\"\">x</a>",
+    // A `data-*` hook into the host page's own scripts.
+    "<p data-controller=\"admin\" data-action=\"delete\">x</p>",
+    // Attribute smuggling through the two value-narrowed attributes.
+    "<pre><code class=\"language-rust evil-hook\">x</code></pre>",
+    "<table><tr><td style=\"text-align:left;position:fixed\">x</td></tr></table>",
 ];
 
 /// Split `html` into its live tag regions (`<…>`).
@@ -222,13 +253,15 @@ fn assert_inert(payload: &str, html: &str) {
             "payload {payload:?} emitted non-allowlisted tag {name:?}:\n{html}"
         );
         for (attr, value) in attrs {
+            // The allowlist assertion subsumes every denylist we could write —
+            // event handlers, `id`/`name`, `srcdoc`, `formaction`, `style`,
+            // `ping`, `target`, `data-*` — because anything not named for this
+            // tag fails here.
             assert!(
-                !attr.starts_with("on"),
-                "payload {payload:?} kept event handler {attr:?} on <{name}>:\n{html}"
-            );
-            assert!(
-                !FORBIDDEN_ATTRS.contains(&attr.as_str()),
-                "payload {payload:?} kept attribute {attr:?} on <{name}>:\n{html}"
+                allowed_attributes_for(&name).contains(&attr.as_str()),
+                "payload {payload:?} kept non-allowlisted attribute {attr:?} on \
+                 <{name}> (allowed: {:?}):\n{html}",
+                allowed_attributes_for(&name)
             );
             if !matches!(attr.as_str(), "href" | "src") {
                 continue;
@@ -409,6 +442,66 @@ fn markup_helper_matches_string_helper() {
 #[test]
 fn empty_input_renders_empty_output() {
     assert_eq!(render_user_content_html("").trim(), "");
+}
+
+#[test]
+fn deeply_nested_blocks_render_in_linear_time() {
+    // A rich-text column is rendered on every show-page view and on every
+    // keystroke-debounced preview POST, so the renderer must not be
+    // super-linear in any attacker-controlled dimension. `"> "` is the maximal
+    // amplifier: two source bytes per nesting level.
+    //
+    // Before the nesting cap this was O(depth²) inside the HTML sanitizer's
+    // open-elements scope walk — 80 KB of input took ~111s. The assertion is a
+    // generous ceiling (a linear render of this input is milliseconds); it is
+    // sized to catch a return of quadratic behaviour, not to benchmark.
+    use std::time::Instant;
+
+    let source = "> ".repeat(40_000);
+    let started = Instant::now();
+    let html = render_user_content_html(&source);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed.as_secs() < 5,
+        "rendering {} bytes of nested blockquotes took {elapsed:?} — the renderer \
+         has regressed to super-linear behaviour",
+        source.len()
+    );
+    // Output stays bounded too: past the cap the nesting is flattened rather
+    // than emitted, so a 80 KB input cannot inflate into megabytes of markup.
+    assert!(
+        html.len() < 10_000,
+        "output inflated to {} bytes from a capped-depth input",
+        html.len()
+    );
+}
+
+#[test]
+fn nesting_below_the_cap_is_preserved_exactly() {
+    // The cap must not disturb documents anyone would actually write.
+    let source = "> ".repeat(20) + "quoted";
+    let html = render_user_content_html(&source);
+    assert_eq!(
+        html.matches("<blockquote>").count(),
+        20,
+        "ordinary nesting must survive untouched:\n{html}"
+    );
+    assert!(html.contains("quoted"), "{html}");
+}
+
+#[test]
+fn rejected_autolink_keeps_its_text_exactly_once() {
+    // Dropping the anchor must not duplicate the destination: the parser
+    // already emits the autolink's text as its own event.
+    let html = render_user_content_html("<javascript:alert(1)>");
+    assert_eq!(html.trim(), "<p>javascript:alert(1)</p>", "{html}");
+    let html = render_user_content_html("<ftp://example.com/f>");
+    assert_eq!(html.trim(), "<p>ftp://example.com/f</p>", "{html}");
+    // An allowed autolink still becomes a real link, exactly once.
+    let html = render_user_content_html("<https://example.com/>");
+    assert_eq!(html.matches("<a ").count(), 1, "{html}");
+    assert_eq!(html.matches("https://example.com/").count(), 2, "{html}");
 }
 
 #[test]

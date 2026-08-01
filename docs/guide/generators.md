@@ -89,8 +89,8 @@ emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
 holding the Markdown **source**, never rendered HTML). What it changes is the
 generated UI:
 
-- the form renders a Markdown editor with a syntax hint and an htmx live
-  preview instead of a bare `<textarea>`;
+- the form renders a Markdown editor with a no-JavaScript syntax toolbar and an
+  htmx live preview instead of a bare `<textarea>`;
 - a `POST /{plural}/preview/{field}` endpoint drives that preview;
 - the show view renders the column through
   `autumn_web::markdown::render_user_content`, which disables raw-HTML
@@ -106,10 +106,12 @@ without stored XSS. See the [rich text guide](rich-text.md) for the exact
 sanitization guarantee, the tag/URL-scheme allowlist, and what it deliberately
 excludes.
 
-`{min=N,max=N}` length bounds work on a `richtext` column exactly as they do on
-`Text`. `{email}` and `{url}` are rejected: a Markdown body cannot satisfy a
-single-line format validator, so accepting them would emit a field no
-submission could fill. `--api` scaffolds ignore the rich-text wiring entirely —
+`{min=N,max=N}` length bounds are accepted on a `richtext` column and emit the
+same server-side `#[validate(length(…))]` rule as `Text` — but no client-side
+`minlength`/`maxlength`, since the editor is rendered by `rich_text_area`, which
+takes no HTML5 constraint attributes. `{email}` and `{url}` are rejected: a
+Markdown body cannot satisfy a single-line format validator, so accepting them
+would emit a field no submission could fill. `--api` scaffolds ignore the rich-text wiring entirely —
 they render no form or show view, so the column is just `TEXT` carried out over
 JSON.
 
@@ -129,7 +131,8 @@ autumn generate scaffold Post \
 
 | Modifier                        | Applies to        | `#[validate(…)]`        | HTML5 attribute(s)        |
 | ------------------------------- | ----------------- | ----------------------- | ------------------------- |
-| `{min=N,max=N}` (String/Text)   | `String`/`Text`/`richtext` | `length(min, max)` | `minlength` / `maxlength` |
+| `{min=N,max=N}` (String/Text)   | `String`/`Text`   | `length(min, max)`      | `minlength` / `maxlength` |
+| `{min=N,max=N}` (richtext)      | `richtext`        | `length(min, max)`      | *(none — server-side only)* |
 | `{min=N,max=N}` (numeric)       | `i32`/`i64`/`f32`/`f64` | `range(min, max)` | `min` / `max` (`type="number"`) |
 | `{email}`                       | `String`/`Text`   | `email`                 | `type="email"`            |
 | `{url}`                         | `String`/`Text`   | `url`                   | `type="url"`              |

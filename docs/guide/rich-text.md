@@ -25,9 +25,10 @@ controls**:
 1. **Raw-HTML passthrough is disabled.** Every raw-HTML event the Markdown
    parser produces is rewritten into a text event, so `<script>alert(1)</script>`
    in the source renders as the visible characters `<script>alert(1)</script>`,
-   not as a script tag. Link and image destinations are checked against the URL
-   scheme allowlist *before* the HTML writer runs; a link with a rejected scheme
-   is degraded to its own text.
+   not as a script tag. Link destinations are checked against the URL scheme
+   allowlist *before* the HTML writer runs; a link with a rejected scheme is
+   degraded to its own text. Image destinations are never rendered at all, so
+   they are dropped rather than scheme-checked.
 2. **The output is run through an allowlist sanitizer.** The resulting HTML
    string is passed through [`ammonia`](https://crates.io/crates/ammonia),
    configured with the curated tag set, a per-tag attribute allowlist, and the
@@ -59,6 +60,10 @@ folklore:
 | --- | --- |
 | `markdown::RICH_TEXT_ALLOWED_TAGS` | `p` `br` `hr` `blockquote` `h1`–`h6` `em` `strong` `del` `sub` `sup` `a` `ul` `ol` `li` `code` `pre` `table` `thead` `tbody` `tr` `th` `td` |
 | `markdown::RICH_TEXT_ALLOWED_URL_SCHEMES` | `http` `https` `mailto` `tel` |
+
+`sub` and `sup` have no CommonMark syntax, so they are unreachable from
+`render_user_content` — they are allowlisted for `sanitize_user_html` callers
+whose source is already HTML.
 
 Attributes are allowlisted per tag and narrowed further by value:
 
@@ -112,8 +117,16 @@ the same allowlist to an HTML string.
 ## The editor widget
 
 `autumn_web::form::rich_text_area` renders a labeled `<textarea>` carrying the
-Markdown source, plus a hint naming the supported syntax. It needs no
+Markdown source, a minimal formatting toolbar, and a hint. It needs no
 JavaScript and degrades to an ordinary textarea everywhere.
+
+The toolbar shows the syntax for each supported construct (`**bold**`,
+`[text](url)`, `- item`, …) rather than inserting it on click. That is
+deliberate: inserting text into a `<textarea>` is impossible in HTML alone, so a
+click-to-insert toolbar would require a script — and a control that silently
+does nothing when scripting is off is worse than no control. The editor's
+contract is that it works with no JavaScript, so the toolbar holds to the same
+bar.
 
 ```rust
 form.rich_text_area("body", "Body")
@@ -188,3 +201,17 @@ Block/WYSIWYG editors, collaborative editing, image upload and embedding,
 @-mentions, slash commands, emoji pickers, storing pre-rendered HTML, and
 per-field allowlist configuration are all deliberately out of scope. The goal
 is one token to safe formatted text — not an editor product.
+
+A **click-to-insert** toolbar is also out of scope for the same reason: it
+cannot be built without JavaScript, and the widget's contract is that it works
+without any. If you want one, `rich_text_area`'s markup is stable enough to
+enhance from your own script — the editor is `#{field}` and the toolbar is
+`.autumn-rich-text__toolbar`.
+
+### Known limitation: field order
+
+A `richtext` column is rendered through `form_for`'s `.exclude()` + `.append()`
+escape hatch, and appended markup lands just before the submit button. So in a
+generated form a rich-text column always appears **last**, regardless of where
+it sits in the field list. The attachment and DSL-constrained columns share this
+limitation. Reorder by editing the generated `{resource}_form_for` helper.

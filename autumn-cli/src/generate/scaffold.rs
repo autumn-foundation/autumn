@@ -773,8 +773,23 @@ fn plan_scaffold_with_options_impl(
             format!("missing {}", main_path.display()),
         ))
     })?;
+    // Issue #1255: a `richtext` column never takes the htmx inline-validation
+    // path — its wrapper already owns an `hx-post` for the live preview, so
+    // `render_changeset_form_inputs` renders the editor instead of
+    // `text_input_htmx`. Emitting (and mounting, and submit-token-exempting) a
+    // `validate_{field}` route nothing links to would be dead surface, so filter
+    // those columns out here and at the emission site in `render_routes_file`.
     let validated_field_names: Vec<String> = if options_with_key.live_validation {
-        metadata.validations().keys().cloned().collect()
+        metadata
+            .validations()
+            .keys()
+            .filter(|name| {
+                !fields
+                    .iter()
+                    .any(|f| &&f.name == name && f.kind.is_rich_text())
+            })
+            .cloned()
+            .collect()
     } else {
         Vec::new()
     };
@@ -798,10 +813,15 @@ fn plan_scaffold_with_options_impl(
     // Issue #1255: the `POST /{plural}/preview/{field}` fragment handlers the
     // routes module emits for each `richtext` column. HTML surface only — an
     // `--api` scaffold renders no form, so it emits no preview endpoint.
+    //
+    // Derived from `form_fields`, NOT `fields`: a `--default`ed column is
+    // dropped from the form (and therefore from the rendered routes module), so
+    // deriving from `fields` would mount a `preview_{field}` handler the module
+    // never emitted and fail the generated app to compile.
     let rich_text_field_names: Vec<String> = if options_with_key.api {
         Vec::new()
     } else {
-        rich_text_fields(&fields)
+        rich_text_fields(&form_fields)
             .iter()
             .map(|f| f.name.clone())
             .collect()
@@ -1008,6 +1028,10 @@ fn plan_scaffold_with_options_impl(
     // `--api` renders no form and no show view, so it needs neither the
     // feature nor the preview route — the column is just TEXT carrying Markdown
     // source out over JSON, and the client renders it.
+    // The show view renders EVERY richtext column (including a `--default`ed
+    // one, which the form drops but the detail page still displays), so the
+    // feature gate reads `fields`. The preview *routes* below are emitted only
+    // for form columns, so their exemption reads `rich_text_field_names`.
     let rich_text_views = has_rich_text_fields(&fields) && !options_with_key.api;
     if rich_text_views {
         let cargo_path = project_root.join("Cargo.toml");
@@ -1152,7 +1176,7 @@ fn plan_scaffold_with_options_impl(
     if options_with_key.live_validation {
         exempt_segments.push("validate");
     }
-    if rich_text_views {
+    if !rich_text_field_names.is_empty() {
         exempt_segments.push("preview");
     }
     if !exempt_segments.is_empty() {
@@ -3290,12 +3314,23 @@ pub async fn index(
     // one place the validation rules live, and the returned markup matches
     // `text_input_htmx`'s `hx-swap="outerHTML"` contract — swapping in a bare
     // `<span>` would delete the input it's supposed to replace.
+    // Issue #1255: rich-text columns are excluded — see the matching filter on
+    // `validated_field_names` in `plan_scaffold`. Both sides must agree or the
+    // mounted route set and the emitted handler set drift apart.
+    let htmx_validated: Vec<(&String, &Vec<String>)> = validations
+        .iter()
+        .filter(|(name, _)| {
+            !fields
+                .iter()
+                .any(|f| &&f.name == name && f.kind.is_rich_text())
+        })
+        .collect();
     let validate_handlers = if live_validation {
         let mut vh = String::new();
-        for (field_name, rules) in validations {
+        for (field_name, rules) in &htmx_validated {
             let rule_comment = rules.join(", ");
             let label = humanize_label(field_name);
-            let field = fields.iter().find(|f| f.name == *field_name);
+            let field = fields.iter().find(|f| f.name == **field_name);
             // Issue #1750: a DSL-constrained `String`/`Text` field renders in
             // the form through the raw-markup constrained control (carrying the
             // #1388 HTML5 attributes `minlength`/`maxlength`/`type="email"`), so
@@ -3371,11 +3406,10 @@ pub async fn index(
         let mut ph = String::new();
         for f in rich_text_fields(fields) {
             let field_name = &f.name;
-            let value_expr = if f.nullable {
-                format!("changeset.field_value(\"{field_name}\").unwrap_or_default()")
-            } else {
-                format!("changeset.field_value(\"{field_name}\").unwrap_or_default()")
-            };
+            // `field_value` already flattens a nullable column to `None`, and the
+            // preview of an empty body is legitimately empty markup — so the
+            // nullable and non-nullable cases read identically here.
+            let value_expr = format!("changeset.field_value(\"{field_name}\").unwrap_or_default()");
             let _ = write!(
                 ph,
                 "\n\n/// `POST /{plural}/preview/{field_name}` — sanitized Markdown preview fragment.\n"
@@ -3430,7 +3464,7 @@ pub async fn index(
         // One inline-validation endpoint per validated field (live-validation
         // only), each linked from the form's `.hx("post", paths::validate_{f}())`.
         if live_validation {
-            for field_name in validations.keys() {
+            for (field_name, _) in &htmx_validated {
                 names.push(format!("validate_{field_name}"));
             }
         }
@@ -7027,6 +7061,13 @@ fn render_unique_violation_smoke_test(
     out
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per optional route family the scaffold can emit \
+              (live SSE, search, inline validation, state transitions, rich-text \
+              preview); grouping them into a struct would only move the same \
+              list one level out"
+)]
 fn main_route_entries(
     plural: &str,
     snake_name: &str,
@@ -13233,6 +13274,42 @@ exempt_paths = [
                 Revert::SubmitTokenValidateExempt { segment, .. } if segment == "preview"
             )),
             "the inserted preview exemption must be reverted on destroy"
+        );
+    }
+
+    #[test]
+    fn defaulted_richtext_column_mounts_no_preview_route() {
+        // A `--default`ed column is dropped from the form, so the routes module
+        // emits no `preview_{field}` handler for it. Mounting one anyway in
+        // `main.rs` fails the generated app to compile with `cannot find value
+        // preview_body in module routes::posts`.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:richtext".into()],
+            "20260731000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["body=hi".to_owned()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let main_rs = action_contents(&plan, "src/main.rs");
+        assert_eq!(
+            routes.contains("pub async fn preview_body("),
+            main_rs.contains("routes::posts::preview_body"),
+            "the mounted route set must match the handlers actually emitted\n\
+             routes:\n{routes}\nmain:\n{main_rs}"
+        );
+        // The show view still displays the column, so the feature is still needed.
+        assert!(
+            routes.contains("render_user_content(&row.body)"),
+            "a defaulted richtext column still renders on the detail page:\n{routes}"
         );
     }
 

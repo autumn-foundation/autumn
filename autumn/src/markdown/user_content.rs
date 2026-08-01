@@ -12,10 +12,11 @@
 //!
 //! 1. **Raw-HTML passthrough is disabled.** Every `Html`/`InlineHtml` event
 //!    pulldown-cmark produces is rewritten to a `Text` event, so raw markup in
-//!    the source is HTML-escaped rather than emitted. Link and image
-//!    destinations are additionally checked against
-//!    [`RICH_TEXT_ALLOWED_URL_SCHEMES`] *before* the HTML writer sees them, and
-//!    a link with a rejected scheme is degraded to its own text.
+//!    the source is HTML-escaped rather than emitted. Link destinations are
+//!    additionally checked against [`RICH_TEXT_ALLOWED_URL_SCHEMES`] *before*
+//!    the HTML writer sees them, and a link with a rejected scheme is degraded
+//!    to its own text. Image destinations are never rendered at all (see
+//!    below), so they are dropped rather than scheme-checked.
 //! 2. **The result is run through an allowlist sanitizer.** The HTML string is
 //!    then passed through [`ammonia`], configured with the curated
 //!    [`RICH_TEXT_ALLOWED_TAGS`] tag set, a per-tag attribute allowlist, and the
@@ -42,7 +43,7 @@
 
 use std::sync::LazyLock;
 
-use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 /// The HTML tags [`render_user_content`] may emit — formatting, links, lists,
 /// code, and tables, per issue #1255. Anything else in the rendered output is
@@ -57,7 +58,9 @@ pub const RICH_TEXT_ALLOWED_TAGS: &[&str] = &[
     "p", "br", "hr", "blockquote",
     // Headings
     "h1", "h2", "h3", "h4", "h5", "h6",
-    // Inline formatting
+    // Inline formatting. `sub`/`sup` have no CommonMark syntax and so are
+    // unreachable from `render_user_content_html`; they are allowlisted for
+    // `sanitize_user_html` callers whose source is already HTML.
     "em", "strong", "del", "sub", "sup",
     // Links
     "a",
@@ -90,7 +93,8 @@ const ALLOWED_TEXT_ALIGN: &[&str] = &["left", "right", "center"];
 /// Render user-submitted Markdown to sanitized HTML.
 ///
 /// See the [module documentation](self) for the exact guarantee and allowlist.
-/// Prefer [`render_user_content`] when you are emitting into a Maud template.
+/// Prefer `render_user_content` (the `maud` feature) when you are emitting into
+/// a Maud template.
 ///
 /// # Example
 ///
@@ -141,11 +145,12 @@ pub fn render_user_content(source: &str) -> maud::Markup {
     maud::PreEscaped(render_user_content_html(source))
 }
 
-/// Run an HTML string through the same allowlist [`render_user_content`] uses.
+/// Run an HTML string through the same allowlist [`render_user_content_html`]
+/// uses.
 ///
 /// Use this when the untrusted rich text reaches you as HTML rather than
 /// Markdown (a legacy column, an imported feed). Markdown input should go
-/// through [`render_user_content`] instead, which additionally disables
+/// through [`render_user_content_html`] instead, which additionally disables
 /// raw-HTML passthrough at the parser.
 ///
 /// # Example
@@ -227,6 +232,18 @@ fn build_sanitizer() -> ammonia::Builder<'static> {
     builder
 }
 
+/// The deepest block nesting (blockquotes, lists, tables) [`render_user_content`]
+/// will emit. Anything past this is flattened: the container tags are dropped
+/// and their content kept.
+///
+/// This is a **denial-of-service bound**, not a style rule. The HTML sanitizer
+/// walks its open-elements stack once per block start tag, so emitting `n`
+/// nested containers costs O(n²) — and `"> "` is two source bytes per level, so
+/// a single request body can ask for millions of levels. Capping the depth makes
+/// the whole render linear in input size. Real prose never approaches 100 levels
+/// of nesting; documents below the cap render byte-identically.
+const MAX_BLOCK_NESTING_DEPTH: usize = 100;
+
 /// Streaming adapter over pulldown-cmark events that removes every avenue for
 /// attacker-controlled markup *before* the HTML writer runs:
 ///
@@ -235,6 +252,8 @@ fn build_sanitizer() -> ammonia::Builder<'static> {
 ///   has its anchor dropped; the link text survives as plain text.
 /// - Images are always dropped in favour of their alt text (image embedding is
 ///   out of scope for this field).
+/// - Block nesting past [`MAX_BLOCK_NESTING_DEPTH`] is flattened, bounding the
+///   sanitizer's per-start-tag stack walk (see that constant).
 struct SafeEvents<'a, I: Iterator<Item = Event<'a>>> {
     inner: I,
     /// Depth of image tags currently open. Non-zero means we are inside an
@@ -243,6 +262,9 @@ struct SafeEvents<'a, I: Iterator<Item = Event<'a>>> {
     /// Stack of open links, `true` when that link's anchor was dropped and its
     /// matching `End` must be dropped too.
     dropped_links: Vec<bool>,
+    /// Stack of open block containers, `true` when that container was dropped
+    /// for exceeding the depth cap and its matching `End` must be dropped too.
+    dropped_blocks: Vec<bool>,
 }
 
 impl<'a, I: Iterator<Item = Event<'a>>> SafeEvents<'a, I> {
@@ -251,8 +273,42 @@ impl<'a, I: Iterator<Item = Event<'a>>> SafeEvents<'a, I> {
             inner,
             image_depth: 0,
             dropped_links: Vec::new(),
+            dropped_blocks: Vec::new(),
         }
     }
+}
+
+/// Whether `tag` opens a block container that nests — i.e. one that grows the
+/// HTML sanitizer's open-elements stack and so counts against
+/// [`MAX_BLOCK_NESTING_DEPTH`].
+const fn is_nesting_block(tag: &Tag<'_>) -> bool {
+    matches!(
+        tag,
+        Tag::BlockQuote(_)
+            | Tag::List(_)
+            | Tag::Item
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::FootnoteDefinition(_)
+    )
+}
+
+/// The [`TagEnd`] counterpart of [`is_nesting_block`]. Kept adjacent so the two
+/// can never drift — a mismatch would desynchronize the `dropped_blocks` stack.
+const fn is_nesting_block_end(tag: TagEnd) -> bool {
+    matches!(
+        tag,
+        TagEnd::BlockQuote(_)
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::FootnoteDefinition
+    )
 }
 
 impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SafeEvents<'a, I> {
@@ -285,13 +341,12 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SafeEvents<'a, I> {
                             id,
                         }));
                     }
-                    // Rejected scheme: drop the anchor, keep the text. An
-                    // autolink carries no separate text event, so re-emit the
-                    // destination as inert text instead of losing it silently.
+                    // Rejected scheme: drop the anchor and keep the text. The
+                    // parser emits the link's visible text as its own `Text`
+                    // event — including for an autolink, whose text is the
+                    // destination — so suppressing just the `Start`/`End` pair
+                    // preserves it exactly once.
                     self.dropped_links.push(true);
-                    if matches!(link_type, LinkType::Autolink | LinkType::Email) {
-                        return Some(Event::Text(dest_url));
-                    }
                 }
                 Event::End(TagEnd::Link) => {
                     if !self.dropped_links.pop().unwrap_or(false) {
@@ -301,6 +356,20 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SafeEvents<'a, I> {
                 // Inside an image, code spans are alt text — flatten to text so
                 // the alt survives without markup.
                 Event::Code(s) if self.image_depth > 0 => return Some(Event::Text(s)),
+                Event::Start(tag) if is_nesting_block(&tag) => {
+                    // Past the cap, drop the container but keep descending —
+                    // the content inside it still renders, just unwrapped.
+                    let over_cap = self.dropped_blocks.len() >= MAX_BLOCK_NESTING_DEPTH;
+                    self.dropped_blocks.push(over_cap);
+                    if !over_cap {
+                        return Some(Event::Start(tag));
+                    }
+                }
+                Event::End(tag) if is_nesting_block_end(tag) => {
+                    if !self.dropped_blocks.pop().unwrap_or(false) {
+                        return Some(Event::End(tag));
+                    }
+                }
                 other => return Some(other),
             }
         }
