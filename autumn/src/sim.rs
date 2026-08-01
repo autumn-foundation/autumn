@@ -45,7 +45,7 @@
 //!   ([`Sim::chaos`]), installed at [`Sim::build`] and recorded into the
 //!   schedule read by [`Sim::__chaos_events`].
 //! - **W6** adds the [`always!`](crate::always) / [`sometimes!`](crate::sometimes)
-//!   assertion macros ([`assert`]) and, behind the `sim-testing` feature, a
+//!   assertion macros ([`mod@assert`]) and, behind the `sim-testing` feature, a
 //!   property-based op-driver (`sim::op`) — `Sim::gen_ops`/`Sim::gen_ops_with` for
 //!   deterministic generation and `Sim::run_proptest` for shrink-capable runs.
 //!
