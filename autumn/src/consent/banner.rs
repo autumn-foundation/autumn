@@ -14,7 +14,7 @@ use axum::http::header::{
     CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, IF_MODIFIED_SINCE,
     IF_NONE_MATCH, SET_COOKIE, VARY,
 };
-use axum::http::{HeaderValue, Method, Request, Response};
+use axum::http::{HeaderValue, Request, Response};
 use axum::middleware::Next;
 use futures::StreamExt as _;
 
@@ -511,7 +511,7 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
 mod tests {
     use super::*;
     use axum::Router;
-    use axum::http::StatusCode;
+    use axum::http::{Method, StatusCode};
     use axum::routing::get;
     use tower::ServiceExt;
 
