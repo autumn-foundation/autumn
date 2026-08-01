@@ -795,6 +795,17 @@ fn plan_scaffold_with_options_impl(
             .map(|f| f.name.clone())
             .collect()
     };
+    // Issue #1255: the `POST /{plural}/preview/{field}` fragment handlers the
+    // routes module emits for each `richtext` column. HTML surface only — an
+    // `--api` scaffold renders no form, so it emits no preview endpoint.
+    let rich_text_field_names: Vec<String> = if options_with_key.api {
+        Vec::new()
+    } else {
+        rich_text_fields(&fields)
+            .iter()
+            .map(|f| f.name.clone())
+            .collect()
+    };
     let route_entries = main_route_entries(
         &plural,
         &snake_name,
@@ -803,6 +814,7 @@ fn plan_scaffold_with_options_impl(
         search_enabled && !options_with_key.api,
         &validated_field_names,
         &sm_field_names,
+        &rich_text_field_names,
     );
     let mut mods = vec!["models", "schema", "repositories"];
     if !options_with_key.api {
@@ -988,6 +1000,41 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
+    // Issue #1255: a scaffold with `richtext` columns needs autumn-web's
+    // `markdown` feature. The generated show view, preview route, and form
+    // control all call into `autumn_web::markdown::render_user_content` (via
+    // `form::rich_text_area_htmx`'s pre-rendered preview pane), which is gated
+    // on that feature — without it the scaffold would not compile.
+    // `--api` renders no form and no show view, so it needs neither the
+    // feature nor the preview route — the column is just TEXT carrying Markdown
+    // source out over JSON, and the client renders it.
+    let rich_text_views = has_rich_text_fields(&fields) && !options_with_key.api;
+    if rich_text_views {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "markdown");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // Pushed unconditionally for the same reason as the attachment block
+        // above: at `destroy` time the plan is recomputed against the already-
+        // generated Cargo.toml, where the feature is by definition present.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: "markdown".to_owned(),
+            owner_dir: Some(project_root.join("src").join("routes")),
+        });
+    }
+
     // --live requires `ws` (sse::stream), `maud` (LiveFragment/Markup), and `htmx`.
     // --live-validation alone also emits Markup-returning validate handlers and
     // references HTMX_JS_PATH, so it requires `htmx` + `maud` even without `ws`.
@@ -1083,35 +1130,65 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // ── autumn.toml: exempt the live-validation routes from the submit-token
-    // guard (issue #1360). The generated `POST /{plural}/validate/{field}`
-    // inline-validation routes `hx-include` the whole form, so without this the
-    // one-time `_submit_token` is consumed by a validation POST and the real
-    // create/update submit replays a validation fragment instead of mutating.
+    // ── autumn.toml: exempt this resource's form-echoing POST routes from the
+    // submit-token guard.
+    //
+    // Both families `hx-include` the whole form, so without an exemption the
+    // one-time `_submit_token` is consumed by a helper request and the real
+    // create/update submit replays a fragment instead of mutating:
+    //
+    // - `POST /{plural}/validate/{field}` — `--live-validation` inline
+    //   validation (issue #1360).
+    // - `POST /{plural}/preview/{field}` — a `richtext` column's live Markdown
+    //   preview (issue #1255).
+    //
     // The `hx-params="not _submit_token"` markup filter mitigates this only for
     // the DEFAULT field name; exempting the route by prefix makes it robust for
-    // ANY configured `security.submit_token.field_name`. Only meaningful for
-    // `--live-validation`, and only when the project actually has an
-    // `autumn.toml` to edit (a bare/hand-rolled project keeps the markup
-    // filter as its sole, still-effective default-field-name guard).
+    // ANY configured `security.submit_token.field_name`. Only applied when the
+    // project actually has an `autumn.toml` to edit (a bare/hand-rolled project
+    // keeps the markup filter as its sole, still-effective default-field-name
+    // guard).
+    let mut exempt_segments: Vec<&str> = Vec::new();
     if options_with_key.live_validation {
+        exempt_segments.push("validate");
+    }
+    if rich_text_views {
+        exempt_segments.push("preview");
+    }
+    if !exempt_segments.is_empty() {
         let autumn_toml_path = project_root.join("autumn.toml");
         if autumn_toml_path.exists() {
-            let toml_existing = read_or_empty(&autumn_toml_path);
-            // Only record the modify *and* the destroy-time revert when this
-            // scaffold actually inserts the exemption. If `/{plural}/validate`
-            // is already present (a preexisting, user-owned entry), the append
-            // is a no-op and returns `None`; recording a revert then would let a
-            // later `autumn destroy` delete an exemption we never added,
-            // re-enabling submit-token guarding on live-validation routes.
-            if let Some(updated_toml) =
-                append_submit_token_validate_exempt_to_toml(&toml_existing, &plural)
-            {
-                plan.modify(autumn_toml_path.clone(), updated_toml);
-                plan.push_revert(Revert::SubmitTokenValidateExempt {
-                    path: autumn_toml_path,
-                    plural,
-                });
+            for segment in exempt_segments {
+                // Re-read the *planned* content each round so a second segment
+                // merges into the first's edit instead of overwriting it.
+                let toml_existing = plan
+                    .actions
+                    .iter()
+                    .rev()
+                    .find_map(|a| match a {
+                        Action::Modify { path, contents } if path == &autumn_toml_path => {
+                            Some(contents.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| read_or_empty(&autumn_toml_path));
+                // Only record the modify *and* the destroy-time revert when this
+                // scaffold actually inserts the exemption. If the prefix is
+                // already present (a preexisting, user-owned entry), the append
+                // is a no-op and returns `None`; recording a revert then would
+                // let a later `autumn destroy` delete an exemption we never
+                // added, re-enabling submit-token guarding on those routes.
+                if let Some(updated_toml) =
+                    append_submit_token_exempt_to_toml(&toml_existing, &plural, segment)
+                {
+                    plan.actions.retain(|a| a.path() != autumn_toml_path);
+                    plan.modify(autumn_toml_path.clone(), updated_toml);
+                    plan.push_revert(Revert::SubmitTokenValidateExempt {
+                        path: autumn_toml_path.clone(),
+                        plural: plural.clone(),
+                        segment: segment.to_owned(),
+                    });
+                }
             }
         }
     }
@@ -3281,6 +3358,54 @@ pub async fn index(
         String::new()
     };
 
+    // Issue #1255: one `POST /{plural}/preview/{field}` fragment endpoint per
+    // `richtext` column, driving that column's htmx live preview.
+    //
+    // The handler decodes the same submitted form the create/update handlers
+    // do (so the endpoint needs no bespoke request type) and returns the
+    // field's Markdown rendered through `markdown::render_user_content` — the
+    // sanitizing helper, identical to the show view. That equality is the whole
+    // point: what the author sees in the preview is byte-for-byte what a reader
+    // will see, including anything the allowlist strips.
+    let preview_handlers = {
+        let mut ph = String::new();
+        for f in rich_text_fields(fields) {
+            let field_name = &f.name;
+            let value_expr = if f.nullable {
+                format!("changeset.field_value(\"{field_name}\").unwrap_or_default()")
+            } else {
+                format!("changeset.field_value(\"{field_name}\").unwrap_or_default()")
+            };
+            let _ = write!(
+                ph,
+                "\n\n/// `POST /{plural}/preview/{field_name}` — sanitized Markdown preview fragment.\n"
+            );
+            let _ = writeln!(
+                ph,
+                "///\n/// Decodes the submitted form and returns `{field_name}` rendered through\n\
+                 /// `autumn_web::markdown::render_user_content`, which disables raw-HTML\n\
+                 /// passthrough and runs the output through an allowlist sanitizer. htmx swaps\n\
+                 /// the fragment into `#{field_name}-preview` (`hx-swap=\"innerHTML\"`), so the\n\
+                 /// author previews exactly the markup a reader will get."
+            );
+            let _ = writeln!(ph, "#[post(\"/{plural}/preview/{field_name}\")]");
+            let _ = writeln!(
+                ph,
+                "pub async fn preview_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{"
+            );
+            ph.push_str("    let Ok(form) = decode_form(body) else {\n");
+            ph.push_str("        return autumn_web::html! {};\n");
+            ph.push_str("    };\n");
+            ph.push_str("    let changeset = form.into_changeset();\n");
+            let _ = writeln!(
+                ph,
+                "    autumn_web::markdown::render_user_content(&{value_expr})"
+            );
+            ph.push_str("}\n");
+        }
+        ph
+    };
+
     // Issue #1133: emit an `autumn_web::paths![…]` invocation so the routes
     // module gains a `pub mod paths` re-exporting each handler's typed
     // `__autumn_path_*` companion under a clean short name. Every view href,
@@ -3308,6 +3433,11 @@ pub async fn index(
             for field_name in validations.keys() {
                 names.push(format!("validate_{field_name}"));
             }
+        }
+        // Issue #1255: one preview endpoint per `richtext` column, linked from
+        // the form's `rich_text_area_htmx(&…, paths::preview_{field}())`.
+        for f in rich_text_fields(fields) {
+            names.push(format!("preview_{}", f.name));
         }
         // Issue #1326: one transition endpoint per state-machine field, linked
         // from the show page's `transition_controls` form actions
@@ -3878,6 +4008,7 @@ pub async fn events(
     } else {
         String::new()
     } + &validate_handlers
+        + &preview_handlers
         + &paths_macro
         + &search_handler
 }
@@ -3924,6 +4055,20 @@ fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
 /// Whether any field in `fields` is a file attachment.
 fn has_attachment_fields(fields: &[Field]) -> bool {
     fields.iter().any(|f| f.kind.is_attachment())
+}
+
+/// Whether the scaffold declares any `richtext` column (issue #1255).
+///
+/// Gates the `markdown` feature on the project's `autumn-web` dependency, the
+/// generated `POST /{plural}/preview/{field}` routes, and their submit-token
+/// exemption.
+fn has_rich_text_fields(fields: &[Field]) -> bool {
+    fields.iter().any(|f| f.kind.is_rich_text())
+}
+
+/// The `richtext` columns of a scaffold, in declaration order (issue #1255).
+fn rich_text_fields(fields: &[Field]) -> Vec<&Field> {
+    fields.iter().filter(|f| f.kind.is_rich_text()).collect()
 }
 
 /// Emit the `FormModel` delegation impl for the generated `{Pascal}Form`
@@ -4025,6 +4170,30 @@ fn render_form_for_helper(
                 let _ = write!(
                     builder_calls,
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: vec![{options}] }})"
+                );
+            }
+            FieldKind::RichText => {
+                // Issue #1255: the derive sees a plain `String` column and
+                // emits a single-line text input. A rich-text column instead
+                // renders `form::rich_text_area_htmx` — a Markdown editor with
+                // a syntax hint and an htmx live-preview pane wired to the
+                // generated `POST /{plural}/preview/{field}` endpoint. That is
+                // a whole labeled control, not a `FieldControl` variant, so it
+                // takes the same `.exclude()` + `.append()` escape hatch the
+                // constrained-field arm below uses.
+                //
+                // The token-field-aware variant is used so the preview POST's
+                // `hx-params` filter names the app's ACTUAL configured
+                // `[security.submit_token].field_name` (issue #1843), not just
+                // the default — the helper already has the `SubmitFormField`
+                // extractor in scope for `submit_token_input`.
+                let label = humanize_label(name);
+                let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
+                let _ = write!(
+                    appends,
+                    "\n        .append(autumn_web::form::rich_text_area_htmx_with_token_field(\
+                     changeset, \"{name}\", \"{label}\", &paths::preview_{name}(), \
+                     submit_field.map_or(\"_submit_token\", |f| f.0.as_str())))"
                 );
             }
             FieldKind::Decimal { scale, .. } => {
@@ -4452,7 +4621,22 @@ fn render_changeset_form_inputs(
         // shipped `autumn_web::form` helpers can't express; render it as raw
         // markup instead so the live path matches the standard path (#1750).
         let constraint = html5_constraint_spec(f);
-        let line = if f.kind.is_reference() && reference_select_names.contains(name.as_str()) {
+        let line = if f.kind.is_rich_text() {
+            // Issue #1255: identical control to the standard `form_for` path —
+            // the Markdown editor with its htmx live preview. A rich-text
+            // column never takes the inline-*validation* htmx path: its wrapper
+            // already owns an `hx-post` (the preview), and a second one would
+            // fight it for the same element.
+            //
+            // `.as_ref()` because the handler owns an `Option<SubmitFormField>`
+            // here (the `form_for` helper takes an `Option<&…>` instead) — two
+            // rich-text columns in one form would otherwise use a moved value.
+            format!(
+                "(autumn_web::form::rich_text_area_htmx_with_token_field(&{cv}, \"{name}\", \
+                 \"{label}\", &paths::preview_{name}(), \
+                 submit_field.as_ref().map_or(\"_submit_token\", |f| f.0.as_str())))"
+            )
+        } else if f.kind.is_reference() && reference_select_names.contains(name.as_str()) {
             // belongs_to parent dropdown (issue #1146), restored in the
             // `--live-validation` per-field path (issue #1750).
             render_live_reference_select(f, cv)
@@ -4941,15 +5125,22 @@ fn cell_value_expr(field: &Field) -> String {
             )
         }
         // Nullable String/Text: use as_deref to avoid heap allocation.
-        (true, FieldKind::String | FieldKind::Text) => {
+        // `RichText` joins them: an index cell renders the Markdown SOURCE as
+        // escaped text (maud's `Render` impl escapes it), never rendered
+        // markup — a table cell has no business carrying block-level HTML, and
+        // escaped source is inherently safe. The rendered form lives on the
+        // show page (see `render_show_property_rows`).
+        (true, FieldKind::String | FieldKind::Text | FieldKind::RichText) => {
             format!("row.{name}.as_deref().unwrap_or_default()")
         }
         // Nullable: Option<T> — no Render impl; unwrap to String.
         (true, _) => format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
         // Non-nullable Bytea: Cow<str> does implement Render.
         (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&row.{name})"),
-        // String/Text: &String implements Render via deref coercion.
-        (false, FieldKind::String | FieldKind::Text) => format!("&row.{name}"),
+        // String/Text/RichText: &String implements Render via deref coercion.
+        (false, FieldKind::String | FieldKind::Text | FieldKind::RichText) => {
+            format!("&row.{name}")
+        }
         // Numerics (i32, i64, f32, f64): implement Render directly.
         (false, FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64) => {
             format!("row.{name}")
@@ -5059,6 +5250,20 @@ fn render_show_property_rows(
         let label = humanize(&f.name);
         let cell_expr = if f.kind.is_reference() && reference_displays.contains_key(&f.name) {
             format!("{}_label", f.name)
+        } else if f.kind.is_rich_text() {
+            // Issue #1255: the column stores user-submitted Markdown SOURCE, so
+            // the show page renders it through `render_user_content` — raw-HTML
+            // passthrough disabled, output run through an allowlist sanitizer.
+            // This is the one place the scaffold emits pre-escaped markup from a
+            // user-controlled column, and it is exactly why that helper exists.
+            let name = &f.name;
+            if f.nullable {
+                format!(
+                    "autumn_web::markdown::render_user_content(row.{name}.as_deref().unwrap_or_default())"
+                )
+            } else {
+                format!("autumn_web::markdown::render_user_content(&row.{name})")
+            }
         } else {
             cell_value_expr(f)
         };
@@ -6310,7 +6515,9 @@ fn sql_sample_literal(kind: FieldKind) -> String {
         // special-cases every enum column (the field under test gets the
         // deliberately out-of-set literal; any *other* required enum column
         // gets one of its own real variants instead — see that function).
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'sample'".to_owned(),
+        FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Enum => {
+            "'sample'".to_owned()
+        }
         FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1".to_owned(),
         FieldKind::Bool => "TRUE".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "1.0".to_owned(),
@@ -6349,7 +6556,7 @@ const API_SMOKE_TEST_SEED_ROWS: usize = 25;
 /// per row.
 fn sql_seed_value_expr(f: &Field) -> String {
     match f.kind {
-        FieldKind::String | FieldKind::Text => "'sample-' || g".to_owned(),
+        FieldKind::String | FieldKind::Text | FieldKind::RichText => "'sample-' || g".to_owned(),
         FieldKind::I32 | FieldKind::I64 => "g".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "g::double precision".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime => {
@@ -6562,7 +6769,9 @@ fn render_enum_rejection_smoke_test(
 /// the duplicate-insert assertion would never trip.
 fn unique_sample_literal(kind: FieldKind) -> String {
     match kind {
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value'".to_owned(),
+        FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Enum => {
+            "'dup_value'".to_owned()
+        }
         FieldKind::I32 | FieldKind::I64 => "424242".to_owned(),
         // Must be a real seeded row's id, not an arbitrary literal — a
         // `references` target column is FK-constrained against the stub
@@ -6595,7 +6804,9 @@ fn unique_sample_literal(kind: FieldKind) -> String {
 /// to decide which violation Postgres actually reports.
 fn unique_sample_literal_variant(kind: FieldKind) -> String {
     match kind {
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value_2'".to_owned(),
+        FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Enum => {
+            "'dup_value_2'".to_owned()
+        }
         FieldKind::I32 | FieldKind::I64 => "424243".to_owned(),
         // The second stub row `render_reference_stub_tables_sql` seeds —
         // distinct from `unique_sample_literal`'s "1" for the same reason
@@ -6824,6 +7035,7 @@ fn main_route_entries(
     search: bool,
     validated_field_names: &[String],
     sm_field_names: &[String],
+    rich_text_field_names: &[String],
 ) -> Vec<String> {
     if api {
         let mut entries = vec![
@@ -6866,22 +7078,33 @@ fn main_route_entries(
         for field_name in sm_field_names {
             entries.push(format!("routes::{plural}::transition_{field_name}"));
         }
+        // Issue #1255: mount the `POST /{plural}/preview/{field}` fragment
+        // handler emitted for each `richtext` column, so the editor's htmx live
+        // preview resolves to a real route rather than 404ing. A scaffold with
+        // no rich-text column pushes nothing here and keeps the mounted route
+        // set byte-identical.
+        for field_name in rich_text_field_names {
+            entries.push(format!("routes::{plural}::preview_{field_name}"));
+        }
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_list"));
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_get"));
         entries
     }
 }
 
-/// The submit-token exempt-path prefix for a `--live-validation` resource.
+/// The submit-token exempt-path prefix for one family of a resource's
+/// form-echoing POST routes.
 ///
-/// The generated inline-validation routes are `POST /{plural}/validate/{field}`;
-/// this prefix exempts every one of them from the submit-token guard at once
-/// (the guard matches `exempt_paths` by prefix — an exact match, a prefix ending
-/// in `/`, or a prefix whose remainder begins with `/`, so `/{plural}/validate`
+/// `segment` is `"validate"` for the `--live-validation` inline-validation
+/// routes (`POST /{plural}/validate/{field}`, issue #1360) or `"preview"` for a
+/// `richtext` column's live Markdown preview (`POST /{plural}/preview/{field}`,
+/// issue #1255). Either prefix exempts every route in its family at once (the
+/// guard matches `exempt_paths` by prefix — an exact match, a prefix ending in
+/// `/`, or a prefix whose remainder begins with `/`, so `/{plural}/validate`
 /// covers `/{plural}/validate/title`, `/{plural}/validate/body`, … without
 /// touching the guarded `POST /{plural}` create route).
-fn submit_token_validate_exempt_prefix(plural: &str) -> String {
-    format!("/{plural}/validate")
+fn submit_token_exempt_prefix(plural: &str, segment: &str) -> String {
+    format!("/{plural}/{segment}")
 }
 
 /// The `(start, end)` line span of a top-level `[header]` TOML table — the
@@ -6898,9 +7121,10 @@ fn toml_table_block_range(lines: &[&str], header: &str) -> Option<(usize, usize)
     Some((start, end))
 }
 
-/// Ensure `/{plural}/validate` is listed under `[security.submit_token]
-/// exempt_paths` so a `--live-validation` scaffold's inline-validation POSTs
-/// never consume the one-time submit token (issue #1360).
+/// Ensure `/{plural}/{segment}` is listed under `[security.submit_token]
+/// exempt_paths` so a scaffold's form-echoing POSTs (inline validation,
+/// issue #1360; richtext preview, issue #1255) never consume the one-time
+/// submit token.
 ///
 /// This is the route-based, field-name-agnostic half of the fix: the
 /// `hx-params="not _submit_token"` markup filter only strips the DEFAULT field
@@ -6919,10 +7143,14 @@ fn toml_table_block_range(lines: &[&str], header: &str) -> Option<(usize, usize)
 /// Handles three shapes — no `[security.submit_token]` table (append a fresh
 /// one), a table without an `exempt_paths` key (insert the key after the
 /// header), and a table whose `exempt_paths` array is merged in place.
-fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> Option<String> {
+fn append_submit_token_exempt_to_toml(
+    existing: &str,
+    plural: &str,
+    segment: &str,
+) -> Option<String> {
     use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
-    let exempt = submit_token_validate_exempt_prefix(plural);
+    let exempt = submit_token_exempt_prefix(plural, segment);
 
     // Parse format-preservingly so comments, ordering, and hand-crafted array
     // layout survive the edit. A config we can't parse is left untouched (and we
@@ -6965,19 +7193,20 @@ fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> 
     Some(doc.to_string())
 }
 
-/// Inverse of [`append_submit_token_validate_exempt_to_toml`] (`autumn
-/// destroy`, issue #1048): remove `/{plural}/validate` from
+/// Inverse of [`append_submit_token_exempt_to_toml`] (`autumn
+/// destroy`, issue #1048): remove `/{plural}/{segment}` from
 /// `[security.submit_token] exempt_paths`, dropping the whole block if that
 /// leaves an empty freshly-generated `exempt_paths = [...]` as its only key.
 ///
 /// Conservative: only touches an `exempt_paths` array that still contains the
 /// exact prefix this generator inserts, never a hand-edited value.
-pub(super) fn remove_submit_token_validate_exempt_from_toml(
+pub(super) fn remove_submit_token_exempt_from_toml(
     existing: &str,
     plural: &str,
+    segment: &str,
 ) -> String {
     const HEADER: &str = "[security.submit_token]";
-    let exempt = submit_token_validate_exempt_prefix(plural);
+    let exempt = submit_token_exempt_prefix(plural, segment);
     let quoted = format!("\"{exempt}\"");
 
     let lines: Vec<&str> = existing.lines().collect();
@@ -12682,7 +12911,7 @@ async fn main() {
     #[test]
     fn submit_token_exempt_appends_fresh_block_when_absent() {
         let existing = "[server]\nport = 3000\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+        let out = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("absent exemption must be inserted");
         assert!(out.contains("[security.submit_token]"), "{out}");
         assert!(
@@ -12696,7 +12925,7 @@ async fn main() {
     #[test]
     fn submit_token_exempt_is_idempotent() {
         let existing = "[security.submit_token]\nexempt_paths = [\"/posts/validate\"]\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        let out = append_submit_token_exempt_to_toml(existing, "posts", "validate");
         assert_eq!(
             out, None,
             "re-adding the same prefix must be a no-op returning None"
@@ -12707,7 +12936,7 @@ async fn main() {
     fn submit_token_exempt_merges_into_existing_array() {
         let existing =
             "[security.submit_token]\nttl_secs = 900\nexempt_paths = [\"/webhooks/x\"]\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+        let out = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("a new prefix must be merged into the existing array");
         assert!(out.contains("\"/webhooks/x\""), "{out}");
         assert!(out.contains("\"/posts/validate\""), "{out}");
@@ -12731,7 +12960,7 @@ exempt_paths = [
     \"/webhooks/x\",
 ]
 ";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+        let out = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("a new prefix must be merged into the commented array");
         // The merged output is valid TOML.
         let parsed: toml::Value =
@@ -12753,7 +12982,7 @@ exempt_paths = [
     #[test]
     fn submit_token_exempt_inserts_key_when_block_lacks_it() {
         let existing = "[security.submit_token]\nttl_secs = 900\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+        let out = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("a block lacking the key must gain one");
         assert!(
             out.contains("exempt_paths = [\"/posts/validate\"]"),
@@ -12768,7 +12997,7 @@ exempt_paths = [
         // `security.submit_token.field_name`. It must cover the per-field
         // validation routes but never the guarded create route.
         assert_eq!(
-            submit_token_validate_exempt_prefix("posts"),
+            submit_token_exempt_prefix("posts", "validate"),
             "/posts/validate"
         );
     }
@@ -12776,9 +13005,9 @@ exempt_paths = [
     #[test]
     fn remove_submit_token_exempt_drops_fresh_block() {
         let existing = "[server]\nport = 3000\n";
-        let added = append_submit_token_validate_exempt_to_toml(existing, "posts")
+        let added = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("fresh block must be added");
-        let removed = remove_submit_token_validate_exempt_from_toml(&added, "posts");
+        let removed = remove_submit_token_exempt_from_toml(&added, "posts", "validate");
         assert!(!removed.contains("/posts/validate"), "{removed}");
         assert!(!removed.contains("[security.submit_token]"), "{removed}");
         assert!(removed.contains("[server]"), "{removed}");
@@ -12788,7 +13017,7 @@ exempt_paths = [
     fn remove_submit_token_exempt_keeps_other_entries() {
         let existing =
             "[security.submit_token]\nexempt_paths = [\"/webhooks/x\", \"/posts/validate\"]\n";
-        let removed = remove_submit_token_validate_exempt_from_toml(existing, "posts");
+        let removed = remove_submit_token_exempt_from_toml(existing, "posts", "validate");
         assert!(removed.contains("\"/webhooks/x\""), "{removed}");
         assert!(!removed.contains("/posts/validate"), "{removed}");
         assert!(removed.contains("[security.submit_token]"), "{removed}");
@@ -12798,7 +13027,7 @@ exempt_paths = [
     fn remove_submit_token_exempt_ignores_hand_edited_value() {
         // Never touch an array that no longer carries our exact prefix.
         let existing = "[security.submit_token]\nexempt_paths = [\"/custom/only\"]\n";
-        let removed = remove_submit_token_validate_exempt_from_toml(existing, "posts");
+        let removed = remove_submit_token_exempt_from_toml(existing, "posts", "validate");
         assert_eq!(removed, existing);
     }
 
@@ -12869,6 +13098,208 @@ exempt_paths = [
         assert!(
             !touches_toml,
             "a plain scaffold (no --live-validation) must not add submit-token exemptions"
+        );
+    }
+
+    // ── richtext scaffolding (issue #1255) ─────────────────────────────────
+
+    /// Plan `autumn generate scaffold Post title:String body:richtext` against
+    /// a fresh project — the exact command the issue's success metric names.
+    fn richtext_scaffold_plan(tmp: &TempDir) -> Plan {
+        plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:richtext".into()],
+            "20260731000000",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn richtext_scaffold_form_uses_the_markdown_editor_widget() {
+        let tmp = project_with_main(default_main());
+        let plan = richtext_scaffold_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            routes.contains("rich_text_area"),
+            "the form must render the Markdown editor, not a bare textarea:\n{routes}"
+        );
+        // The non-richtext column keeps its ordinary control.
+        assert!(routes.contains("\"title\""), "{routes}");
+    }
+
+    #[test]
+    fn richtext_scaffold_show_view_renders_through_the_sanitizer() {
+        let tmp = project_with_main(default_main());
+        let plan = richtext_scaffold_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            routes.contains("autumn_web::markdown::render_user_content(&row.body)"),
+            "the show view must render the stored Markdown through the sanitizing \
+             helper:\n{routes}"
+        );
+        // …and never through the trusted-content renderer or a raw passthrough.
+        assert!(
+            !routes.contains("markdown::render(&row.body)"),
+            "the trusted-content renderer must never see user input:\n{routes}"
+        );
+        assert!(
+            !routes.contains("PreEscaped(&row.body)"),
+            "the raw source must never be emitted pre-escaped:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn richtext_scaffold_index_view_shows_escaped_source_not_markup() {
+        let tmp = project_with_main(default_main());
+        let plan = richtext_scaffold_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        // The index column renders the raw source through maud's escaping
+        // `Render` impl — a table cell must not carry block-level markup, and
+        // escaped text is inherently safe.
+        let columns = routes
+            .split_once("let columns:")
+            .expect("index columns block")
+            .1;
+        let columns = columns.split_once("];").unwrap().0;
+        assert!(
+            !columns.contains("render_user_content"),
+            "index cells render the source as escaped text, not HTML:\n{columns}"
+        );
+    }
+
+    #[test]
+    fn richtext_scaffold_generates_a_preview_route() {
+        let tmp = project_with_main(default_main());
+        let plan = richtext_scaffold_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            routes.contains("#[post(\"/posts/preview/body\")]"),
+            "a richtext column needs a preview endpoint for the htmx live \
+             preview:\n{routes}"
+        );
+        assert!(routes.contains("pub async fn preview_body("), "{routes}");
+        // The preview handler renders through the same sanitizer.
+        let handler = routes
+            .split_once("pub async fn preview_body(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            handler.contains("render_user_content"),
+            "the preview must be sanitized exactly like the show view:\n{handler}"
+        );
+        // The typed path helper is exported so the form can link to it.
+        assert!(routes.contains("preview_body"), "{routes}");
+    }
+
+    #[test]
+    fn richtext_scaffold_enables_the_markdown_feature() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
+        )
+        .unwrap();
+        let plan = richtext_scaffold_plan(&tmp);
+        let cargo = action_contents(&plan, "Cargo.toml");
+        assert!(
+            cargo.contains("markdown"),
+            "a richtext scaffold must enable autumn-web's `markdown` feature so \
+             `render_user_content` resolves:\n{cargo}"
+        );
+    }
+
+    #[test]
+    fn richtext_scaffold_exempts_the_preview_route_from_the_submit_token() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[security.submit_token]\nfield_name = \"_confirm\"\n",
+        )
+        .unwrap();
+        let plan = richtext_scaffold_plan(&tmp);
+        let toml = action_contents(&plan, "autumn.toml");
+        assert!(
+            toml.contains("/posts/preview"),
+            "the preview POST hx-includes the whole form, so it must not spend \
+             the one-time submit token under a custom field name:\n{toml}"
+        );
+        assert!(
+            plan.reverts.iter().any(|r| matches!(
+                r,
+                Revert::SubmitTokenValidateExempt { segment, .. } if segment == "preview"
+            )),
+            "the inserted preview exemption must be reverted on destroy"
+        );
+    }
+
+    #[test]
+    fn api_richtext_scaffold_skips_the_html_only_wiring() {
+        // `--api` renders no form and no show view, so a richtext column is
+        // just a TEXT column carrying Markdown source out over JSON. Pulling in
+        // the `markdown` feature (and exempting a preview route that is never
+        // generated) would be dead weight.
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[security.submit_token]\nfield_name = \"_confirm\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:richtext".into()],
+            "20260731000000",
+            &ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cargo = action_contents(&plan, "Cargo.toml");
+        assert!(
+            !cargo.contains("\"markdown\""),
+            "--api has no view that renders Markdown:\n{cargo}"
+        );
+        let toml = action_contents(&plan, "autumn.toml");
+        assert!(
+            !toml.contains("/posts/preview"),
+            "--api generates no preview route to exempt:\n{toml}"
+        );
+    }
+
+    #[test]
+    fn non_richtext_scaffold_stays_untouched_by_the_richtext_wiring() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260731000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(!routes.contains("rich_text_area"), "{routes}");
+        assert!(!routes.contains("render_user_content"), "{routes}");
+        assert!(!routes.contains("/posts/preview"), "{routes}");
+        let cargo = action_contents(&plan, "Cargo.toml");
+        assert!(
+            !cargo.contains("markdown"),
+            "a scaffold with no richtext column must not pull in the markdown \
+             feature:\n{cargo}"
         );
     }
 

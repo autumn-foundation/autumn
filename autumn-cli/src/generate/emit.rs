@@ -153,11 +153,20 @@ pub enum Revert {
     /// Remove the `[auth.webauthn]` stub block `autumn generate auth
     /// --passkeys` appended to `path` (`autumn.toml`).
     AuthWebauthnStub { path: PathBuf },
-    /// Remove `/{plural}/validate` from `[security.submit_token] exempt_paths`
-    /// in `path` (`autumn.toml`) — the submit-token exemption `autumn generate
-    /// scaffold --live-validation` appended for issue #1360 — dropping the
-    /// block if that empties a freshly-generated `exempt_paths` key.
-    SubmitTokenValidateExempt { path: PathBuf, plural: String },
+    /// Remove `/{plural}/{segment}` from `[security.submit_token]
+    /// exempt_paths` in `path` (`autumn.toml`) — a submit-token exemption
+    /// `autumn generate scaffold` appended — dropping the block if that empties
+    /// a freshly-generated `exempt_paths` key.
+    ///
+    /// `segment` is `"validate"` for the `--live-validation` inline-validation
+    /// routes (issue #1360) or `"preview"` for a `richtext` column's live
+    /// Markdown preview routes (issue #1255). Both hx-include the whole form,
+    /// so both must be exempt from the one-time submit-token guard.
+    SubmitTokenValidateExempt {
+        path: PathBuf,
+        plural: String,
+        segment: String,
+    },
     /// Remove the remember-me middleware layer + startup-hook calls
     /// `autumn generate auth` injected into the `AppBuilder` chain in `path`
     /// (`src/main.rs`) (issue #1397).
@@ -340,9 +349,9 @@ impl Revert {
                 super::auth::remove_oauth_provider_stubs(content, providers)
             }
             Self::AuthWebauthnStub { .. } => super::auth::remove_webauthn_stub(content),
-            Self::SubmitTokenValidateExempt { plural, .. } => {
-                super::scaffold::remove_submit_token_validate_exempt_from_toml(content, plural)
-            }
+            Self::SubmitTokenValidateExempt {
+                plural, segment, ..
+            } => super::scaffold::remove_submit_token_exempt_from_toml(content, plural, segment),
             Self::SeedBinLinks { .. } => super::schema_edit::unlink_models_from_seed_bin(content),
         }
     }
@@ -1091,6 +1100,14 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // import line — both of which this marker already catches. There is no
         // prelude-unqualified spelling to miss, so no extra marker is needed.
         "storage" => &["autumn_web::storage::"],
+        // A `richtext` scaffold (issue #1255) enables `markdown` for the
+        // sanitizing `render_user_content` its show/preview paths call, but a
+        // hand-written route can render trusted Markdown through the same
+        // feature's `render`/`MarkdownRegistry`. `autumn_web::markdown::`
+        // catches every spelling: the prelude re-exports none of these types,
+        // so any user must reach them through that path — fully qualified or
+        // via a `use autumn_web::markdown::{…};` import line.
+        "markdown" => &["autumn_web::markdown::"],
         _ => &[],
     }
 }

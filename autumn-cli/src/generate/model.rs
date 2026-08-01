@@ -1771,7 +1771,10 @@ fn render_validation_attr(field: &Field, rule: &str) -> Result<String, String> {
 }
 
 const fn is_string_like(field: &Field) -> bool {
-    matches!(field.kind, FieldKind::String | FieldKind::Text)
+    matches!(
+        field.kind,
+        FieldKind::String | FieldKind::Text | FieldKind::RichText
+    )
 }
 
 /// Strip a single layer of matching double or single quotes from a
@@ -1832,7 +1835,7 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             "false" => Ok("FALSE".to_owned()),
             _ => Err("bool defaults must be true or false".to_owned()),
         },
-        FieldKind::String | FieldKind::Text => {
+        FieldKind::String | FieldKind::Text | FieldKind::RichText => {
             let unquoted = unquote_default_value(value);
             Ok(format!("'{}'", unquoted.replace('\'', "''")))
         }

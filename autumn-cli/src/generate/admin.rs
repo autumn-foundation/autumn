@@ -380,7 +380,11 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         FieldKind::String | FieldKind::Uuid | FieldKind::Enum | FieldKind::Decimal { .. } => {
             "AdminFieldKind::Text"
         }
-        FieldKind::Text => "AdminFieldKind::TextArea",
+        // `RichText` (issue #1255) edits as a plain multi-line textarea in the
+        // admin panel: the column holds Markdown source, and the admin's
+        // record editor is a raw-value editor, not the app-facing form that
+        // renders `rich_text_area`'s hint and preview.
+        FieldKind::Text | FieldKind::RichText => "AdminFieldKind::TextArea",
         // A foreign-key id renders the same as any other integer column.
         FieldKind::I32 | FieldKind::I64 | FieldKind::References => "AdminFieldKind::Integer",
         FieldKind::Bool => "AdminFieldKind::Boolean",
@@ -400,7 +404,10 @@ fn admin_field_is_encrypted(options: &AdminOptions, name: &str) -> bool {
 }
 
 const fn is_default_searchable(field: &Field) -> bool {
-    matches!(field.kind, FieldKind::String | FieldKind::Text)
+    matches!(
+        field.kind,
+        FieldKind::String | FieldKind::Text | FieldKind::RichText
+    )
 }
 
 const fn is_default_filterable(field: &Field) -> bool {
