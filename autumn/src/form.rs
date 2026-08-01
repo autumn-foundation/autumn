@@ -1378,7 +1378,7 @@ pub fn rich_text_area<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    rich_text_area_inner(changeset, field, label, None)
+    rich_text_area_inner(changeset, field, label, None, false)
 }
 
 /// Render a [`rich_text_area`] with an htmx-driven live preview pane.
@@ -1402,21 +1402,23 @@ pub fn rich_text_area<T: Serialize>(
 /// ```rust,ignore
 /// #[post("/posts/preview/body")]
 /// pub async fn preview_body(body: Bytes) -> Markup {
-///     let Ok(form) = decode_form(body) else {
-///         return html! {};
-///     };
-///     let changeset = form.into_changeset();
-///     autumn_web::markdown::render_user_content(
-///         &changeset.field_value("body").unwrap_or_default(),
-///     )
+///     let source = autumn_web::form::field_from_urlencoded(&body, "body")
+///         .unwrap_or_default();
+///     autumn_web::markdown::render_user_content(&source)
 /// }
 /// ```
 ///
-/// Do **not** use the [`ChangesetForm<T>`] extractor here. It rejects a body it
-/// cannot deserialize with a 4xx response, and a half-filled form legitimately
-/// posts an empty string for a numeric column — htmx does not swap a 4xx, so
-/// the preview would silently stop updating mid-edit. Failing closed to empty
-/// markup keeps the editor usable.
+/// Note it reads the one field it needs with [`field_from_urlencoded`] rather
+/// than deserializing the whole form: `hx-include` posts **every** field, so on
+/// a freshly-opened "new" page an unrelated required `i64` column arrives as
+/// `count=`, and a whole-form decode would fail on that empty string and blank
+/// the preview until the author had filled in every other column.
+///
+/// For the same reason, do **not** use the [`ChangesetForm<T>`] extractor here:
+/// it rejects a body it cannot deserialize with a 4xx, htmx does not swap a
+/// 4xx, and the preview would silently stop updating mid-edit. Reading the one
+/// field has no failure mode — an absent or empty field previews as empty,
+/// which is exactly right for a cleared editor.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn rich_text_area_htmx<T: Serialize>(
@@ -1451,7 +1453,81 @@ pub fn rich_text_area_htmx_with_token_field<T: Serialize>(
     preview_url: &str,
     token_field: &str,
 ) -> maud::Markup {
-    rich_text_area_inner(changeset, field, label, Some((preview_url, token_field)))
+    rich_text_area_inner(
+        changeset,
+        field,
+        label,
+        Some((preview_url, token_field)),
+        false,
+    )
+}
+
+/// Render a labeled Markdown editor for a **required** rich-text field.
+///
+/// Identical to [`rich_text_area`] but adds the HTML `required` attribute and
+/// `aria-required="true"`, giving both AT users and browser-native validation
+/// the required-field signal — matching the `required_*` siblings for every
+/// other control.
+///
+/// This matters more here than it looks: both `String` deserialization and a
+/// `TEXT NOT NULL` column accept the empty string, so without a client-side
+/// signal a non-nullable rich-text column would silently persist a blank body
+/// unless the field also declared a `{min=N}` length constraint (PR #2157
+/// review). The generator picks this variant for a non-nullable `richtext`
+/// column and [`rich_text_area`] for an `Option<richtext>` one.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_rich_text_area<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    rich_text_area_inner(changeset, field, label, None, true)
+}
+
+/// Render a **required** Markdown editor with an htmx-driven live preview.
+///
+/// The required-field counterpart of [`rich_text_area_htmx`]; see
+/// [`required_rich_text_area`] for why the signal matters and
+/// [`rich_text_area_htmx`] for the preview wiring.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_rich_text_area_htmx<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+) -> maud::Markup {
+    required_rich_text_area_htmx_with_token_field(
+        changeset,
+        field,
+        label,
+        preview_url,
+        DEFAULT_SUBMIT_TOKEN_FIELD,
+    )
+}
+
+/// Like [`required_rich_text_area_htmx`] but excludes the caller-supplied
+/// submit-token field name from the preview POST instead of the hardcoded
+/// default `_submit_token`.
+///
+/// The required-field counterpart of [`rich_text_area_htmx_with_token_field`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_rich_text_area_htmx_with_token_field<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    token_field: &str,
+) -> maud::Markup {
+    rich_text_area_inner(
+        changeset,
+        field,
+        label,
+        Some((preview_url, token_field)),
+        true,
+    )
 }
 
 /// Shared body of [`rich_text_area`] and its htmx variant. `preview` is
@@ -1462,6 +1538,7 @@ fn rich_text_area_inner<T: Serialize>(
     field: &str,
     label: &str,
     preview: Option<(&str, &str)>,
+    required: bool,
 ) -> maud::Markup {
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
@@ -1498,6 +1575,8 @@ fn rich_text_area_inner<T: Serialize>(
                 class=(if has_errors { "autumn-field__input autumn-rich-text__editor autumn-field__input--invalid" } else { "autumn-field__input autumn-rich-text__editor" })
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(described_by)
+                required[required]
+                aria-required=[required.then_some("true")]
                 hx-post=[preview.map(|(url, _)| url)]
                 hx-trigger=[preview.map(|_| "keyup changed delay:400ms, change")]
                 hx-target=[preview.map(|_| preview_target.as_str())]
@@ -3745,6 +3824,50 @@ mod tests {
         assert_eq!(field_from_urlencoded(b"", "body"), None);
         // A key that merely *contains* the name must not match.
         assert_eq!(field_from_urlencoded(b"body_extra=no", "body"), None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_rich_text_area_signals_a_required_field() {
+        // PR #2157 review: a non-nullable `body:richtext` column had no
+        // required signal at all, unlike every other non-nullable generated
+        // control. Both `String` deserialization and a `TEXT NOT NULL` column
+        // accept `""`, so an empty editor persisted a blank body silently.
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let html = required_rich_text_area(&cs, "body", "Body").into_string();
+        assert!(html.contains("required"), "{html}");
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        // Still the same editor otherwise.
+        assert!(html.contains("<textarea"), "{html}");
+        assert!(html.contains("autumn-rich-text"), "{html}");
+
+        // The optional variant keeps its previous behaviour: leaving a nullable
+        // column blank is valid, so no browser-native "please fill this out".
+        let optional = rich_text_area(&cs, "body", "Body").into_string();
+        assert!(!optional.contains(r#"aria-required="true""#), "{optional}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_rich_text_area_htmx_keeps_both_the_preview_and_the_signal() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let html =
+            required_rich_text_area_htmx(&cs, "body", "Body", "/posts/preview/body").into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains(r#"hx-post="/posts/preview/body""#), "{html}");
+        assert!(html.contains(r##"hx-target="#body-preview""##), "{html}");
     }
 
     #[cfg(feature = "maud")]

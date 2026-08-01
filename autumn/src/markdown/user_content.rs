@@ -92,7 +92,8 @@ const ALLOWED_TEXT_ALIGN: &[&str] = &["left", "right", "center"];
 
 /// Render user-submitted Markdown to sanitized HTML.
 ///
-/// See the [module documentation](self) for the exact guarantee and allowlist.
+/// See the [`markdown` module documentation](crate::markdown) for the exact
+/// guarantee and allowlist.
 /// Prefer `render_user_content` (the `maud` feature) when you are emitting into
 /// a Maud template.
 ///

@@ -4225,10 +4225,19 @@ fn render_form_for_helper(
                 // the default — the helper already has the `SubmitFormField`
                 // extractor in scope for `submit_token_input`.
                 let label = humanize_label(name);
+                // A non-nullable column takes the `required_*` variant, exactly
+                // like every other generated control — `String` and `TEXT NOT
+                // NULL` both accept `""`, so without it an empty editor would
+                // silently persist a blank body (PR #2157 review).
+                let helper = if f.nullable {
+                    "rich_text_area_htmx_with_token_field"
+                } else {
+                    "required_rich_text_area_htmx_with_token_field"
+                };
                 let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
                 let _ = write!(
                     appends,
-                    "\n        .append(autumn_web::form::rich_text_area_htmx_with_token_field(\
+                    "\n        .append(autumn_web::form::{helper}(\
                      changeset, \"{name}\", \"{label}\", &paths::preview_{name}(), \
                      submit_field.map_or(\"_submit_token\", |f| f.0.as_str())))"
                 );
@@ -4668,8 +4677,13 @@ fn render_changeset_form_inputs(
             // `.as_ref()` because the handler owns an `Option<SubmitFormField>`
             // here (the `form_for` helper takes an `Option<&…>` instead) — two
             // rich-text columns in one form would otherwise use a moved value.
+            let helper = if f.nullable {
+                "rich_text_area_htmx_with_token_field"
+            } else {
+                "required_rich_text_area_htmx_with_token_field"
+            };
             format!(
-                "(autumn_web::form::rich_text_area_htmx_with_token_field(&{cv}, \"{name}\", \
+                "(autumn_web::form::{helper}(&{cv}, \"{name}\", \
                  \"{label}\", &paths::preview_{name}(), \
                  submit_field.as_ref().map_or(\"_submit_token\", |f| f.0.as_str())))"
             )
@@ -13237,6 +13251,35 @@ exempt_paths = [
         );
         // The typed path helper is exported so the form can link to it.
         assert!(routes.contains("preview_body"), "{routes}");
+    }
+
+    #[test]
+    fn non_nullable_richtext_gets_a_required_signal() {
+        // PR #2157 review: every other non-nullable generated control carries
+        // `required`/`aria-required`. A `body:richtext` column had neither, and
+        // since `String` and `TEXT NOT NULL` both accept `""`, an empty editor
+        // persisted a blank body.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["body:richtext".into(), "note:Option<richtext>".into()],
+            "20260731000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            routes.contains("required_rich_text_area_htmx_with_token_field(changeset, \"body\""),
+            "a non-nullable richtext column needs the required variant:\n{routes}"
+        );
+        assert!(
+            routes.contains("rich_text_area_htmx_with_token_field(changeset, \"note\""),
+            "a nullable richtext column keeps the optional variant:\n{routes}"
+        );
+        assert!(
+            !routes.contains("required_rich_text_area_htmx_with_token_field(changeset, \"note\""),
+            "leaving a nullable column blank is valid — no required signal:\n{routes}"
+        );
     }
 
     #[test]

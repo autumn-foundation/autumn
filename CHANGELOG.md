@@ -75,8 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field it renders, via the new `form::field_from_urlencoded` — the editor
   `hx-include`s the whole form, so decoding the form struct would fail on the
   first strictly-typed empty column of a freshly-opened `new` page and leave the
-  preview blank until every unrelated field was filled in. See the [rich text
-  guide](docs/guide/rich-text.md). `form::rich_text_area` renders a labeled
+  preview blank until every unrelated field was filled in. A non-nullable
+  `richtext` column renders through `required_rich_text_area*`, matching every
+  other non-nullable generated control — `String` and `TEXT NOT NULL` both
+  accept `""`, so without that signal an empty editor persisted a blank body.
+  See the [rich text guide](docs/guide/rich-text.md). `form::rich_text_area` renders a labeled
   textarea, a minimal Markdown formatting toolbar, and the current value; the
   toolbar shows each construct's syntax rather than inserting it on click,
   because inserting into a `<textarea>` needs JavaScript and a control that

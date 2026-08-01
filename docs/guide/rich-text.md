@@ -132,6 +132,14 @@ bar.
 form.rich_text_area("body", "Body")
 ```
 
+For a **non-nullable** column use `required_rich_text_area` (and
+`required_rich_text_area_htmx` for the preview variant), which adds the HTML
+`required` attribute and `aria-required="true"`. This matters more than it
+looks: both `String` deserialization and a `TEXT NOT NULL` column accept the
+empty string, so without that signal an empty editor would silently persist a
+blank body unless the field also declared a `{min=N}` constraint. The scaffold
+picks the right variant from the column's nullability.
+
 `rich_text_area_htmx` adds a live preview pane:
 
 ```rust

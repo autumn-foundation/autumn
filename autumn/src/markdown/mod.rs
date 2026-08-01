@@ -9,13 +9,13 @@
 //!
 //! | Source of the Markdown | Use |
 //! |---|---|
-//! | Files you authored and committed (docs, marketing pages, a `content/` tree) | [`render`] / [`MarkdownRegistry`] |
+//! | Files you authored and committed (docs, marketing pages, a `content/` tree) | [`render`](crate::markdown::render) / [`MarkdownRegistry`](crate::markdown::MarkdownRegistry) |
 //! | Anything a request body carried in (posts, comments, wiki bodies, bios) | `render_user_content` |
 //!
-//! [`render`] is built for *trusted, build-time* content: it injects heading
+//! [`render`](crate::markdown::render) is built for *trusted, build-time* content: it injects heading
 //! anchors and applies no allowlist. `render_user_content` disables raw-HTML
 //! passthrough, restricts link schemes, and runs the output through an
-//! allowlist sanitizer — see [`render_user_content_html`] and
+//! allowlist sanitizer — see [`render_user_content_html`](crate::markdown::render_user_content_html) and
 //! [`docs/guide/rich-text.md`] for the exact guarantee.
 //!
 //! [`docs/guide/rich-text.md`]: https://github.com/autumn-foundation/autumn/blob/main/docs/guide/rich-text.md
