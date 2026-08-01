@@ -1280,6 +1280,47 @@ pub fn textarea_input<T: Serialize>(
     }
 }
 
+/// Extract one field's value from a URL-encoded form body, without
+/// deserializing the whole form.
+///
+/// # Why this exists
+///
+/// A fragment endpoint that only needs *one* field — a rich-text live preview,
+/// say — is usually reached from an htmx `hx-include="closest form"`, which
+/// posts **every** field on the page. Deserializing that into the form struct
+/// to read one value couples the fragment to the validity of every *other*
+/// field: on a freshly-opened "new" form, a required `i64` column arrives as
+/// `count=`, `serde_urlencoded` fails on the empty string, and the fragment
+/// renders nothing. The author would have to fill in every unrelated column
+/// before the preview started working (PR #2157 review).
+///
+/// Reading the one field leniently avoids that entirely. It is the right tool
+/// *only* when the endpoint genuinely needs a single raw value and performs no
+/// validation — inline **validation** fragments still decode the whole form,
+/// because checking a field against its `#[validate]` rules is exactly what
+/// they are for.
+///
+/// Percent-escapes and `+`-as-space are decoded. The first occurrence of a
+/// repeated key wins, matching `serde_urlencoded`. A present-but-empty field
+/// returns `Some("")`, not `None`, so a cleared editor previews as empty
+/// rather than falling back to a stale value.
+///
+/// # Example
+///
+/// ```
+/// use autumn_web::form::field_from_urlencoded;
+///
+/// let body = b"title=Hi&body=a+%2B+b&count=";
+/// assert_eq!(field_from_urlencoded(body, "body").as_deref(), Some("a + b"));
+/// assert_eq!(field_from_urlencoded(body, "missing"), None);
+/// ```
+#[must_use]
+pub fn field_from_urlencoded(body: &[u8], field: &str) -> Option<String> {
+    url::form_urlencoded::parse(body)
+        .find(|(key, _)| key.as_ref() == field)
+        .map(|(_, value)| value.into_owned())
+}
+
 /// The hint shown under a [`rich_text_area`] editor. Deliberately short: the
 /// syntax itself lives in the toolbar ([`RICH_TEXT_TOOLBAR`]), so this sentence
 /// only carries the part the toolbar can't — that HTML is *not* accepted.
@@ -3649,6 +3690,62 @@ mod tests {
     }
 
     // ── Rich text (issue #1255) ────────────────────────────────────────────
+
+    #[test]
+    fn strict_form_decode_fails_on_a_partially_filled_form() {
+        // The premise of `field_from_urlencoded` (PR #2157 review): a live
+        // preview `hx-include`s the WHOLE form, so on a fresh "new" page every
+        // other field is still empty. Deserializing the whole form struct to
+        // reach one field therefore fails on the first strictly-typed empty
+        // field — and the preview would go blank until the author filled in
+        // every unrelated required column.
+        #[derive(serde::Deserialize)]
+        struct PostForm {
+            #[allow(dead_code)]
+            body: String,
+            #[allow(dead_code)]
+            count: i64,
+        }
+        let partial = b"body=hello+%2A%2Aworld%2A%2A&count=";
+        assert!(
+            serde_urlencoded::from_bytes::<PostForm>(partial).is_err(),
+            "whole-form decode must fail here — that is the bug being fixed"
+        );
+        // The lenient single-field extractor reaches the field regardless.
+        assert_eq!(
+            field_from_urlencoded(partial, "body").as_deref(),
+            Some("hello **world**")
+        );
+    }
+
+    #[test]
+    fn field_from_urlencoded_decodes_percent_and_plus_escapes() {
+        let body = b"title=hi&body=a+%2B+b+%26+%3Cc%3E&other=x";
+        assert_eq!(
+            field_from_urlencoded(body, "body").as_deref(),
+            Some("a + b & <c>")
+        );
+        assert_eq!(field_from_urlencoded(body, "title").as_deref(), Some("hi"));
+        assert_eq!(field_from_urlencoded(body, "absent"), None);
+    }
+
+    #[test]
+    fn field_from_urlencoded_handles_empty_and_repeated_keys() {
+        // An empty value is present-but-blank, not absent — a cleared editor
+        // must preview as empty, not fall back to a stale value.
+        assert_eq!(
+            field_from_urlencoded(b"body=&x=1", "body").as_deref(),
+            Some("")
+        );
+        // First occurrence wins, matching serde_urlencoded's own behaviour.
+        assert_eq!(
+            field_from_urlencoded(b"body=first&body=second", "body").as_deref(),
+            Some("first")
+        );
+        assert_eq!(field_from_urlencoded(b"", "body"), None);
+        // A key that merely *contains* the name must not match.
+        assert_eq!(field_from_urlencoded(b"body_extra=no", "body"), None);
+    }
 
     #[cfg(feature = "maud")]
     #[test]

@@ -147,17 +147,23 @@ including anything the allowlist strips:
 ```rust
 #[post("/posts/preview/body")]
 pub async fn preview_body(body: Bytes) -> Markup {
-    let Ok(form) = decode_form(body) else {
-        return html! {};
-    };
-    let changeset = form.into_changeset();
-    autumn_web::markdown::render_user_content(
-        &changeset.field_value("body").unwrap_or_default(),
-    )
+    let source = autumn_web::form::field_from_urlencoded(&body, "body")
+        .unwrap_or_default();
+    autumn_web::markdown::render_user_content(&source)
 }
 ```
 
 The scaffold generates exactly this handler for you.
+
+Note that it reads the one field it needs with
+`form::field_from_urlencoded` rather than deserializing the whole form.
+`hx-include="closest form"` posts **every** field, so on a freshly-opened "new"
+page a required `i64` column arrives as `count=`. Decoding the form struct would
+fail on that empty string and the preview would stay blank until the author had
+filled in every unrelated column. A preview validates nothing, so it has no
+reason to depend on the rest of the form being valid — unlike an inline
+*validation* fragment, which decodes the whole form precisely because checking
+`#[validate]` rules is its job.
 
 ### Submit tokens
 

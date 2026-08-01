@@ -71,7 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than Markdown. A 40-payload adversarial corpus locks the guarantee
   down structurally — it parses the rendered output and asserts that no
   non-allowlisted element, no event-handler attribute, and no URL outside the
-  scheme allowlist survives. See the [rich text
+  scheme allowlist survives. The generated preview endpoint reads only the
+  field it renders, via the new `form::field_from_urlencoded` — the editor
+  `hx-include`s the whole form, so decoding the form struct would fail on the
+  first strictly-typed empty column of a freshly-opened `new` page and leave the
+  preview blank until every unrelated field was filled in. See the [rich text
   guide](docs/guide/rich-text.md). `form::rich_text_area` renders a labeled
   textarea, a minimal Markdown formatting toolbar, and the current value; the
   toolbar shows each construct's syntax rather than inserting it on click,

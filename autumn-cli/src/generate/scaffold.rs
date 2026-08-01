@@ -3406,10 +3406,6 @@ pub async fn index(
         let mut ph = String::new();
         for f in rich_text_fields(fields) {
             let field_name = &f.name;
-            // `field_value` already flattens a nullable column to `None`, and the
-            // preview of an empty body is legitimately empty markup — so the
-            // nullable and non-nullable cases read identically here.
-            let value_expr = format!("changeset.field_value(\"{field_name}\").unwrap_or_default()");
             let _ = write!(
                 ph,
                 "\n\n/// `POST /{plural}/preview/{field_name}` — sanitized Markdown preview fragment.\n"
@@ -3427,14 +3423,21 @@ pub async fn index(
                 ph,
                 "pub async fn preview_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{"
             );
-            ph.push_str("    let Ok(form) = decode_form(body) else {\n");
-            ph.push_str("        return autumn_web::html! {};\n");
-            ph.push_str("    };\n");
-            ph.push_str("    let changeset = form.into_changeset();\n");
+            // Read ONLY the previewed field, leniently — never `decode_form`.
+            // The editor `hx-include`s the whole form, so on a fresh `new` page
+            // every other column arrives blank; deserializing the form struct
+            // would fail on the first strictly-typed empty field (`count=` into
+            // an `i64`) and blank the preview until the author had filled in
+            // every unrelated column (PR #2157 review). A preview performs no
+            // validation, so it has no reason to need the rest of the form —
+            // unlike the inline-validation fragments above, which decode the
+            // whole form precisely because checking `#[validate]` rules is
+            // their job.
             let _ = writeln!(
                 ph,
-                "    autumn_web::markdown::render_user_content(&{value_expr})"
+                "    let source = autumn_web::form::field_from_urlencoded(&body, \"{field_name}\")\n        .unwrap_or_default();"
             );
+            let _ = writeln!(ph, "    autumn_web::markdown::render_user_content(&source)");
             ph.push_str("}\n");
         }
         ph
@@ -13234,6 +13237,44 @@ exempt_paths = [
         );
         // The typed path helper is exported so the form can link to it.
         assert!(routes.contains("preview_body"), "{routes}");
+    }
+
+    #[test]
+    fn richtext_preview_does_not_depend_on_the_rest_of_the_form_decoding() {
+        // PR #2157 review: the preview `hx-include`s the whole form, so on a
+        // fresh "new" page every other field is still blank. Decoding the whole
+        // form struct to reach the one previewed field would fail on the first
+        // strictly-typed empty column (`count=` into an `i64`) and blank the
+        // preview until every unrelated field was filled in.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["body:richtext".into(), "count:i64".into()],
+            "20260731000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let handler = routes
+            .split_once("pub async fn preview_body(")
+            .expect("preview handler")
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            handler.contains("field_from_urlencoded"),
+            "the preview must read its one field leniently:\n{handler}"
+        );
+        assert!(
+            !handler.contains("decode_form"),
+            "whole-form decode couples the preview to every other field's \
+             validity:\n{handler}"
+        );
+        assert!(
+            handler.contains("render_user_content"),
+            "the preview must still be sanitized:\n{handler}"
+        );
     }
 
     #[test]
