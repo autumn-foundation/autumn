@@ -350,6 +350,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `Idempotency-Key`, and the `[security.submit_token]` config knobs. The
   `saas` example now guards its signup POST with a one-time submit token so a
   double-clicked signup cannot create a duplicate account. [no-plugin]
+- **sim-testing:** the `Sim` chaos harness gained a **crash / restart** primitive
+  and a seed-derived crash schedule for durable crash-recovery tests (#1797, W5.c
+  item 7). `Sim::kill()` drops the mounted app so the in-process job runtime's
+  in-flight work is cancelled **without** completing (modelling a process crash),
+  `Sim::restart(TestApp)` mounts a fresh app on the **same durable database**, and
+  `Sim::crash_and_restart(TestApp)` is the kill-then-restart convenience. A new
+  `sim::crash` module derives a reproducible `CrashSchedule` / `CrashPoint` from a
+  dedicated `seed ^ CRASH_STREAM_SALT` stream (independent of the app-facing
+  entropy and the chaos decision stream), read through `Sim::crash_schedule()` /
+  `Sim::crash_point()`, so two same-seed runs replay an identical crash schedule.
+  The Definition-of-Done (`sim_chaos_crash`) commits a **real durable repository
+  commit hook** to the DB-backed `autumn_repository_commit_hooks` queue on the
+  in-memory `SQLite` substrate, kills the sim before it drains, restarts on the
+  same `substrate.pool()`, and proves `run_to_idle()` recovers and runs the hook
+  exactly-once/idempotently. This wave injects a **single representative
+  deterministic crash point** (after a repository write has enqueued its durable
+  hook but before it drains) with the schedule API shaped generally — documented
+  representativeness, not faked generality. The `sqlite` substrate runs the
+  in-memory `local` job backend, which is **not durable**: a kill drops its
+  mid-flight jobs by design, so the durable guarantee is asserted against the
+  commit-hook queue, not the local job queue. Additive: no existing signature
+  changes; a default/no-crash `build` + `run_to_idle` is byte-for-byte unchanged.
+  [no-plugin]
 - **test-support:** `autumn_web::test::drain_ready_repository_commit_hooks(pool, max_rows)`
   deterministically claims and runs ready durable repository commit hooks in
   integration tests — driving the real worker→drain wiring without starting the
