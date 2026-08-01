@@ -44,6 +44,10 @@
 //! - **W5** turns [`Chaos`] into a public, seed-driven fault-injection builder
 //!   ([`Sim::chaos`]), installed at [`Sim::build`] and recorded into the
 //!   schedule read by [`Sim::__chaos_events`].
+//! - **W6** adds the [`always!`](crate::always) / [`sometimes!`](crate::sometimes)
+//!   assertion macros ([`assert`]) and, behind the `sim-testing` feature, a
+//!   property-based op-driver (`sim::op`) — `Sim::gen_ops`/`Sim::gen_ops_with` for
+//!   deterministic generation and `Sim::run_proptest` for shrink-capable runs.
 //!
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
@@ -113,6 +117,13 @@ pub use assert::{
     sometimes_snapshot, sometimes_unsatisfied,
 };
 pub use crash::{CrashPoint, CrashSchedule};
+
+// The W6 op-driver (PR2, issue #1797): `Sim::gen_ops`/`Sim::gen_ops_with` (deterministic,
+// non-shrinking generation) and `Sim::run_proptest` (the shrink-capable
+// runner-owning entrypoint). Behind the `sim-testing` feature because it needs
+// `proptest` as a library (not just dev) dependency — see `autumn/Cargo.toml`.
+#[cfg(feature = "sim-testing")]
+pub mod op;
 
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.
