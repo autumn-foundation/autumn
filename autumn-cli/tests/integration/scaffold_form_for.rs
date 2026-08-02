@@ -398,6 +398,10 @@ fn scaffold_attachment_emits_zero_js_multipart_handlers() {
         routes.contains(".save_to_blob_store(&*store, key).await?;"),
         "{routes}"
     );
+    assert!(
+        routes.contains("duplicate attachment field: image"),
+        "duplicate file parts must be rejected before a staged blob is overwritten: {routes}"
+    );
     assert!(routes.contains("multipart.next_field().await?"), "{routes}");
     // The parse span is wrapped in a single fallible block funneling every `?`
     // (next_field, save, bytes_limited, utf8, decode_form) to one cleanup path.
@@ -415,6 +419,19 @@ fn scaffold_attachment_emits_zero_js_multipart_handlers() {
         "{routes}"
     );
     assert!(routes.contains("new.image = image_blob;"), "{routes}");
+
+    // Reloaded index/show views render non-sensitive stored metadata rather
+    // than reducing every persisted attachment to the same generic label or
+    // exposing the backend object key (AC3).
+    assert!(
+        routes.contains("blob.content_type, blob.byte_size"),
+        "{routes}"
+    );
+    assert!(
+        routes.contains("CSRF scans only a bounded prefix")
+            && routes.contains("oversized files retain their 413"),
+        "the generated note must describe the streaming CSRF/upload-limit behavior: {routes}"
+    );
 
     // storage + multipart auto-enabled on autumn-web (AC7).
     let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
@@ -635,6 +652,16 @@ fn scaffold_attachment_cleans_up_saved_blob_on_early_return() {
     );
 
     let update = handler_body(&routes, "pub async fn update(", "pub async fn destroy(");
+    let authorize_at = update
+        .find("autumn_web::authorization::authorize::<Photo>")
+        .unwrap_or_else(|| panic!("missing update authorization:\n{update}"));
+    let save_at = update
+        .find("save_to_blob_store")
+        .unwrap_or_else(|| panic!("missing multipart save:\n{update}"));
+    assert!(
+        authorize_at < save_at,
+        "record authorization must run before an attachment update stores attacker-controlled bytes:\n{update}"
+    );
     let update_success_at = update
         .find("flash.success(\"Photo updated\")")
         .unwrap_or_else(|| panic!("missing update success in:\n{update}"));
@@ -642,17 +669,18 @@ fn scaffold_attachment_cleans_up_saved_blob_on_early_return() {
     // Cleanup guards every update early return that can occur after the first
     // blob is saved. Codex P2 centralized the parse span: the mid-loop save
     // failure, `next_field`, `bytes_limited`, the UTF-8 conversion, and
-    // `decode_form` collapse to ONE cleanup inside the parse block. The six
-    // post-parse returns keep their own cleanup: validation 422, the current-row
-    // load, `into_new`, the unique-violation 422, the generic DB `Err`, and the
-    // not-found (`updated == 0`) guard.
+    // `decode_form` collapse to ONE cleanup inside the parse block. The five
+    // post-parse returns keep their own cleanup: validation 422,
+    // `into_new`, the unique-violation 422, the generic DB `Err`, and the
+    // not-found (`updated == 0`) guard. Current-row load and authorization now
+    // happen before parsing, when there is no staged blob to clean up.
     assert_eq!(
         update_early
             .matches("let _ = store.delete(key).await;")
             .count(),
-        7,
-        "update must clean up the saved blob on all seven early-return sites \
-         (one central parse-span cleanup, plus validation, current-row load, into_new, \
+        6,
+        "update must clean up the saved blob on all six early-return sites \
+         (one central parse-span cleanup, plus validation, into_new, \
          unique-violation, DB error, not-found):\n{update}"
     );
     assert!(
