@@ -351,6 +351,11 @@ jobs:
         run: cargo build -p autumn-web --features sqlite
       - name: Clippy (autumn-web lib, sqlite backend)
         run: cargo clippy -p autumn-web --features sqlite --lib -- -D warnings
+      - name: Clippy (autumn-web lib, sim-testing op-driver)
+        # `sim-testing` (W6 PR2, issue #1797) promotes `proptest` to a library
+        # dependency for `sim::op` — lint it here (alongside the sqlite lib
+        # lint above) since it's not part of any other feature combo above.
+        run: cargo clippy -p autumn-web --features "sqlite,sim-testing" --lib -- -D warnings
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
@@ -387,6 +392,16 @@ jobs:
         run: |
           cargo test -p autumn-web --features "sqlite,test-support,mail" \
             --test sim_chaos_mail
+      - name: Run the sim op-driver DoD suite (W6 PR2, issue #1797)
+        # `sim_op_driver` needs the `sim-testing` feature (`proptest` as a
+        # library dependency) — runs as its own invocation to avoid widening
+        # the feature set of the other sqlite tests above. It doesn't actually
+        # need `sqlite`/`test-support` (it never calls `Sim::build`), but lives
+        # in this job to keep sim-testing CI coverage co-located with the rest
+        # of the sim DoD suites.
+        run: |
+          cargo test -p autumn-web --features sim-testing \
+            --test sim_op_driver
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings

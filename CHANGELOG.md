@@ -350,6 +350,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guides (#2099). Also corrects stale rustdoc that advertised a `/v3/api-docs`
   default (the served default is `/openapi.json`) and an "OpenAPI 3.0" document
   (the generator emits 3.1.0). [no-plugin]
+- **sim-testing:** add a property-based **op-driver** (`sim::op`, W6 PR2,
+  #1797) behind the new `sim-testing` feature: `Sim::gen_ops::<T>()` /
+  `Sim::gen_ops_with(strategy)` deterministically draw an arbitrary `Vec<T>`
+  of app-defined operations from a seed, and `Sim::run_proptest(seed,
+  strategy, body)` is the shrink-capable entrypoint — it owns a proptest
+  `TestRunner` and rebuilds a fresh `Sim::from_seed(seed)` for every case
+  (including every shrink attempt), so an `always!` violation shrinks to a
+  minimal, byte-for-byte-reproducible counterexample. The op-generation RNG
+  stream is salted independently of the app-facing entropy, chaos, and crash
+  streams, and proptest's own file-based failure persistence is disabled in
+  favor of the `AUTUMN_SIM_SEED=…` replay line. `proptest` is now also an
+  optional **library** dependency (not just dev-only), so this can live in
+  `src/` and the forthcoming `sim-sweep` binary (W6 PR3) can depend on it
+  too. [no-plugin]
 - **sim-testing:** add the `always!` / `sometimes!` simulation assertion macros
   (W6 op-driver assertion core, #1797) — hard-invariant + reachability assertions
   for `#[sim_test]`, with a non-vacuity registry the forthcoming sim-sweep

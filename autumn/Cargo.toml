@@ -115,6 +115,12 @@ telemetry-otlp = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
+# W6 PR2 op-driver (issue #1797): promotes `proptest` from a dev-only dependency
+# to an optional **library** dependency so `sim::Op`-style generation/shrinking
+# code can live in `src/` (not just `tests/`), and so the forthcoming `sim-sweep`
+# `[[bin]]` (W6 PR3), which is a binary and therefore cannot use dev-deps, can
+# depend on it too. `proptest` itself stays out of default builds.
+sim-testing = ["dep:proptest"]
 redis = ["dep:redis"]
 i18n = []
 # Embed the app's `static/` tree (incl. the fingerprint manifest) and i18n
@@ -291,6 +297,7 @@ rust_decimal.workspace = true
 croner = "3.0.1"
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
+proptest = { version = "1.4", optional = true }
 serde_urlencoded = "0.7"
 serde_path_to_error = "0.1"
 serde_yaml = { version = "0.9", optional = true }
@@ -709,6 +716,21 @@ path = "tests/sim_sqlite_integration.rs"
 [[test]]
 name = "sim_assert"
 path = "tests/sim_assert.rs"
+
+# W6 PR2 op-driver DoD (issue #1797): `Sim::gen_ops`/`Sim::gen_ops_with`
+# (deterministic generation) and `Sim::run_proptest` (the shrink-capable
+# runner-owning entrypoint) against a small, self-contained, deliberately buggy
+# account model — proves an injected invariant break is found, shrunk to a
+# minimal counterexample, and replays deterministically. Isolated `[[test]]`
+# binary because it needs `proptest` as a library dependency behind the new
+# `sim-testing` feature, which the default-feature consolidated
+# `integration_tests` binary does not enable, so the file is
+# `#![cfg(feature = "sim-testing")]` and a default `cargo test` compiles it to
+# an empty (passing) binary. Runs without Docker. Run:
+# `cargo test -p autumn-web --features sim-testing --test sim_op_driver`.
+[[test]]
+name = "sim_op_driver"
+path = "tests/sim_op_driver.rs"
 
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
