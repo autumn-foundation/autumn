@@ -78,6 +78,7 @@ set.
 | `at:DateTime`     | `chrono::DateTime<chrono::Utc>` | `Timestamptz`      | `TIMESTAMPTZ`       |
 | `data:Bytea` *(or `Vec<u8>`)* | `Vec<u8>`           | `Bytea`            | `BYTEA`             |
 | `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
+| `slug:slug{from:title}` | `String`                  | `Text`              | `TEXT`              |
 
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
@@ -212,6 +213,63 @@ the migration for a UUID foreign key instead.
 Composite foreign keys, cascade policy (`ON DELETE`/`ON UPDATE`), and runtime
 association traversal (`belongs_to`/`has_many`) are not in scope for this
 token — see issue #835 for the latter.
+
+### Human-readable URLs with `slug:slug{from:...}`
+
+`slug:slug{from:title}` gives a model a clean, shareable URL
+(`/posts/why-rust-wins`) instead of the default `/posts/42` — a single DSL
+token, zero hand-edits, composing with the existing `unique` (issue #1032)
+and `references` (issue #1026) machinery rather than introducing a parallel
+system:
+
+```bash
+autumn generate scaffold Post title:String body:Text slug:slug{from:title}
+```
+
+This wires up, end to end:
+
+- **A public `autumn_web::slugify(&str) -> String` helper.** Lowercases,
+  best-effort ASCII-folds accented Latin characters (`"café"` ->
+  `"cafe"`), and treats everything else (punctuation, whitespace, un-folded
+  non-Latin script) as a separator, collapsing runs to a single `-` and
+  trimming leading/trailing `-`. An input that slugifies to nothing (empty,
+  or entirely punctuation/non-Latin) falls back to a stable, deterministic
+  non-empty token rather than ever returning `""`.
+- **A `NOT NULL` column with its own `UNIQUE INDEX`** in the migration — a
+  `slug` field is implicitly `unique`, so it reuses the exact `CREATE UNIQUE
+  INDEX` codegen a `:unique` modifier produces on any other field.
+- **A `find_by_slug(&str)` repository lookup** — again for free, from the
+  same "every `unique` field gets a `find_by_<field>`" machinery `:unique`
+  already triggers.
+- **Auto-derivation on create.** When the submitted slug is blank, the
+  `create` handler derives it from the `from` field via `slugify`, then
+  probes for a collision and appends a deterministic `-2`, `-3`, ... suffix
+  until it finds a free value — so two posts titled "Hello" get distinct
+  slugs (`hello`, `hello-2`) instead of a 422 on the unique index. The
+  generated form exposes the slug as a plain, optional text input (no
+  live-preview JS); a non-blank submission is used as-is and still goes
+  through the normal unique-violation handling on conflict.
+- **Slug-keyed `show`/`edit`/`update`/`delete` routes.** `GET /posts/{slug}`
+  (and its edit/update/delete siblings) resolve the record by slug instead of
+  `id`, 404ing through the same `AutumnResult`/`AutumnError::not_found` path
+  every other lookup uses. Every generated view, redirect, and `paths::`
+  helper for the resource links through the slug, never the numeric id — an
+  `rg "/\{id\}"` over a slug-bearing scaffold's HTML routes returns zero
+  hits. (The auto-generated JSON REST API under `/api/...` stays id-keyed;
+  rekeying it is out of scope for this token.)
+- **A model has at most one `slug` field** (it's the resource's routing key)
+  and it always needs the `{from:<field>}` modifier, naming a declared
+  `String`/`Text`/`richtext` field to derive from — either error is caught
+  at generate time with a message naming the problem.
+- A slug field is not yet supported together with `--live`/
+  `--live-validation`, `--sharded`, an `Attachment` field, or a field
+  carrying a `:states(...)` state machine — each of those combinations is
+  rejected at generate time rather than silently emitting routes that still
+  key off `id`. A non-slug scaffold (the overwhelming common case) is
+  completely unaffected: output stays byte-for-byte identical.
+- Renaming the source field after the fact does not retroactively rename
+  existing slugs, and there is no `slug_history`/301-redirect for a stale
+  slug after a manual edit — both are follow-up work, not this slice.
 
 ## `autumn generate model`
 

@@ -2,7 +2,7 @@ use autumn_web::AutumnResult;
 use autumn_web::hooks::{MutationContext, MutationHooks, UpdateDraft};
 
 use crate::models::{NewPost, Post, UpdatePost};
-use crate::slugify::slugify;
+use autumn_web::slugify;
 
 /// Mutation hooks for posts — auto-generate slug from title on
 /// create and re-slug on title change during update.

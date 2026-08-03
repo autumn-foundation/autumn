@@ -650,6 +650,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "trybuild",
+ "unicode-normalization",
  "url",
  "uuid",
  "validator",
