@@ -1754,6 +1754,19 @@ fn validate_slug_fields(tokens: &[String], fields: &[Field]) -> Result<(), Gener
                 ),
             });
         }
+        // A nullable source renders as `Option<String>` on the generated
+        // `New*` insert struct, but `autumn_web::slugify` takes `&str` — the
+        // create handler's `slugify(&new.{from})` would not compile.
+        if source.nullable {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "slug field '{}' derives `from:{from}`, but '{from}' is nullable \
+                     (`Option<…>`) — slug can only derive from a non-nullable field",
+                    slug_field.name
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -2252,6 +2265,24 @@ mod tests {
         let err = parse_fields(&tokens).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("count"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_rejects_slug_from_nullable_source_field() {
+        // `new.{from}` would be `Option<String>` on the generated `New*`
+        // insert struct — `autumn_web::slugify(&new.{from})` doesn't compile
+        // against that type, so this must be rejected at generate time
+        // rather than emit uncompilable code.
+        let tokens = vec![
+            "title:Option<String>".into(),
+            "slug:slug{from:title}".into(),
+        ];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title") && msg.contains("nullable"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
