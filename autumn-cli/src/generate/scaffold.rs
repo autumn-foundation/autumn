@@ -2012,6 +2012,17 @@ fn render_model_form(
     }
 }
 
+/// The extractor's LOCAL BINDING name for a slug-keyed route (issue #1260) —
+/// deliberately fixed and `__`-prefixed (matching this file's other
+/// internal-only identifiers, e.g. `__parse_result`), NOT the DSL field name.
+/// A field literally named `db`/`flash`/`body`/`csrf`/`session`/etc. is a
+/// valid declaration (`db:slug{from:title}`), and destructuring straight to
+/// that name would collide with the handler's own same-named extractor
+/// parameter — a real "duplicate binding" compile error a review caught. The
+/// actual field name is still used for the schema column and the URL
+/// placeholder segment — only the Rust-local binding is renamed.
+const ROUTE_KEY_BINDING: &str = "__route_key";
+
 #[allow(
     clippy::too_many_lines,
     reason = "This is a single template — splitting it produces less readable output, \
@@ -2054,7 +2065,7 @@ fn render_routes_file(
     // literal `id: Path<{id_rust}>` text.
     let id_param_decl: String = route_key_field.map_or_else(
         || format!("id: Path<{id_rust}>"),
-        |f| format!("Path({f}): Path<String>"),
+        |_| format!("Path({ROUTE_KEY_BINDING}): Path<String>"),
     );
     // The URL path segment name for those same four routes.
     let id_url_segment: &str = route_key_field.unwrap_or("id");
@@ -2062,13 +2073,13 @@ fn render_routes_file(
     // pre-#1260 literal `.find(*id)` (dot kept in the surrounding template).
     let find_expr: String = route_key_field.map_or_else(
         || "find(*id)".to_owned(),
-        |f| format!("filter({plural}::{f}.eq(&{f}))"),
+        |f| format!("filter({plural}::{f}.eq(&{ROUTE_KEY_BINDING}))"),
     );
     // The value expression used everywhere a route handler builds a
     // `paths::*`/error-message argument identifying the row it just loaded —
     // substitutes in place of the pre-#1260 literal `*id`.
     let id_value_expr: String =
-        route_key_field.map_or_else(|| "*id".to_owned(), |f| format!("&{f}"));
+        route_key_field.map_or_else(|| "*id".to_owned(), |_| format!("&{ROUTE_KEY_BINDING}"));
     // Same, but for a loaded `row: {pascal_name}` value rather than the path
     // extractor local — substitutes in place of the pre-#1260 literal `row.id`
     // wherever a view displays or links the record it just rendered. Borrows
@@ -13250,9 +13261,12 @@ async fn main() {
             routes.contains(r#"#[post("/posts/{slug}/delete", name = "delete")]"#),
             "{routes}"
         );
-        assert!(routes.contains("Path(slug): Path<String>"), "{routes}");
         assert!(
-            routes.contains("posts::table\n        .filter(posts::slug.eq(&slug))"),
+            routes.contains("Path(__route_key): Path<String>"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("posts::table\n        .filter(posts::slug.eq(&__route_key))"),
             "{routes}"
         );
         // AC6, falsifiable check: zero `/{id}`-keyed HTML route ATTRIBUTES remain
@@ -13348,7 +13362,7 @@ async fn main() {
         assert!(
             routes.contains(
                 "posts::table\n                .filter(posts::slug.eq(&candidate))\n                \
-                 .filter(posts::slug.ne(&slug))"
+                 .filter(posts::slug.ne(&__route_key))"
             ),
             "{routes}"
         );
@@ -13378,6 +13392,59 @@ async fn main() {
             ),
             "{routes}"
         );
+    }
+
+    #[test]
+    fn scaffold_slug_field_named_like_an_extractor_param_does_not_collide() {
+        // Review finding: a slug field literally named `db` (a valid
+        // `snake_case` declaration, `db:slug{from:title}`) previously
+        // destructured straight to `Path(db): Path<String>`, colliding with
+        // the SAME handler's own `mut db: Db` extractor parameter — a
+        // duplicate-binding compile error. `flash`/`body`/`csrf`/`session`
+        // are the same class of bug. The extractor must bind to a fixed
+        // internal name regardless of the field's actual name.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "db:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // The extractor's local binding is the fixed internal name, not `db`.
+        assert!(
+            routes.contains("Path(__route_key): Path<String>"),
+            "{routes}"
+        );
+        assert!(!routes.contains("Path(db): Path<String>"), "{routes}");
+        // The URL placeholder and schema column still use the real field name.
+        assert!(routes.contains(r#"#[get("/posts/{db}")]"#), "{routes}");
+        assert!(
+            routes.contains("posts::table\n        .filter(posts::db.eq(&__route_key))"),
+            "{routes}"
+        );
+        // No handler signature now declares `db` twice (once as the route-key
+        // extractor, once as `mut db: Db`) — every `show`/`edit`/`update`/
+        // `destroy` still gets exactly one `db: Db`/`mut db: Db` parameter.
+        // Scan the parameter list between `fn <handler>(` and the matching
+        // `{` that opens the function body.
+        for handler in ["fn show(", "fn edit_form(", "fn update(", "fn destroy("] {
+            let start = routes.find(handler).unwrap_or_else(|| {
+                panic!("missing handler {handler} in generated routes: {routes}")
+            });
+            let body_start = routes[start..]
+                .find(" -> AutumnResult")
+                .unwrap_or_else(|| routes[start..].find('{').unwrap());
+            let sig = &routes[start..start + body_start];
+            assert_eq!(
+                sig.matches("db: ").count(),
+                1,
+                "handler signature declares `db` more than once: {sig}"
+            );
+        }
     }
 
     #[test]
