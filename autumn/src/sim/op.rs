@@ -47,11 +47,15 @@
 //! separately, so none of these streams perturb each other). Same seed ⇒ same
 //! generated op sequence ⇒ same shrink path, byte-for-byte.
 //!
-//! [`Sim::run_proptest`] additionally disables proptest's own file-based
-//! failure persistence (`proptest-regressions/*.txt`): the sim harness's
-//! `AUTUMN_SIM_SEED=…` replay line is the single source of truth for
-//! reproducing a failure, so a second, proptest-owned persistence file would
-//! just be a redundant (and potentially stale) source of truth.
+//! Both also disable proptest's own file-based failure persistence
+//! (`proptest-regressions/*.txt`) — the sim harness's `AUTUMN_SIM_SEED=…`
+//! replay line is the single source of truth for reproducing a failure, so a
+//! second, proptest-owned persistence file would just be a redundant (and
+//! potentially stale) source of truth — and force off proptest's fork mode
+//! and fork timeout regardless of any ambient `PROPTEST_FORK` /
+//! `PROPTEST_TIMEOUT` env vars: both runners are owned in-process (there's no
+//! `test_name` to hand proptest's forking machinery), so inheriting fork mode
+//! would panic instead of generating ops.
 //!
 //! # Example
 //!
@@ -106,11 +110,23 @@ fn stream_rng(seed: u64, salt: u64) -> TestRng {
     TestRng::from_seed(RngAlgorithm::ChaCha, &bytes)
 }
 
-/// A [`Config`] with proptest's own file-based failure persistence disabled
-/// (see the module docs' "Determinism" section for why).
-fn config_without_persistence() -> Config {
+/// A [`Config`] for the embedded, in-process runners [`Sim::gen_ops_with`] and
+/// [`Sim::run_proptest`] own directly (as opposed to a runner `#[test]`-owned
+/// proptest picks up via `proptest!`/`#[proptest_derive]`).
+///
+/// Disables proptest's own file-based failure persistence (see the module
+/// docs' "Determinism" section for why) and, since [`Config::default`] also
+/// pulls in whatever `PROPTEST_FORK` / `PROPTEST_TIMEOUT` env vars happen to
+/// be set process-wide, forces fork mode and the fork timeout off — this
+/// runner has no `test_name` to give proptest's forking machinery, so
+/// inheriting fork mode from the environment would panic
+/// (`Must supply test_name when forking enabled`) before a single op could be
+/// generated.
+fn embedded_config() -> Config {
     Config {
         failure_persistence: None,
+        fork: false,
+        timeout: 0,
         ..Config::default()
     }
 }
@@ -146,7 +162,7 @@ impl Sim {
         T: fmt::Debug,
     {
         let mut runner =
-            TestRunner::new_with_rng(Config::default(), stream_rng(self.seed, OP_GEN_STREAM_SALT));
+            TestRunner::new_with_rng(embedded_config(), stream_rng(self.seed, OP_GEN_STREAM_SALT));
         strategy
             .new_tree(&mut runner)
             .expect("op strategy generation should not fail")
@@ -180,10 +196,8 @@ impl Sim {
         S: Strategy<Value = Vec<T>>,
         F: Fn(&mut Self, &[T]),
     {
-        let mut runner = TestRunner::new_with_rng(
-            config_without_persistence(),
-            stream_rng(seed, OP_GEN_STREAM_SALT),
-        );
+        let mut runner =
+            TestRunner::new_with_rng(embedded_config(), stream_rng(seed, OP_GEN_STREAM_SALT));
         let result = runner.run(&strategy, |ops| {
             let mut sim = Self::from_seed(seed);
             body(&mut sim, &ops);
@@ -250,6 +264,26 @@ mod tests {
         let after_rng_use = sim2.gen_ops_with(tiny_op_strategy());
 
         assert_eq!(baseline, after_rng_use);
+    }
+
+    #[test]
+    fn embedded_config_forces_fork_and_timeout_off() {
+        // `Config::default()` folds in whatever `PROPTEST_FORK`/`PROPTEST_TIMEOUT`
+        // env vars happen to be set process-wide (proptest's `contextualize_config`,
+        // cached process-lifetime via a `LazyLock` — not something a per-test env var
+        // override could exercise reliably here). Both embedded runners have no
+        // `test_name` to hand proptest's forking machinery, so inheriting fork mode
+        // would panic with "Must supply test_name when forking enabled" before a
+        // single op could be generated. Assert the override directly instead.
+        let config = embedded_config();
+        assert!(
+            !config.fork,
+            "the embedded op-driver runner must never fork — it has no test_name"
+        );
+        assert_eq!(
+            config.timeout, 0,
+            "the embedded op-driver runner has no fork timeout to honor"
+        );
     }
 
     #[test]
