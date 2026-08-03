@@ -571,11 +571,12 @@ fn build_router_pre_state(
     // the same path instead of panicking on an overlapping `GET` (issue #1971).
     let user_get_paths = collect_user_get_paths(&route_list, &ctx.scoped_groups);
 
-    let mut router = group_and_mount_routes(
+    let mut router = mount_user_routes(
         route_list,
         idempotency_layers.as_ref(),
         opaque_app_layers_present,
         state,
+        config,
     );
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
@@ -1782,6 +1783,161 @@ fn group_and_mount_routes(
         router = router.route(path, method_router);
     }
     router
+}
+
+/// Mount the user route table, applying locale-prefixed routing (issue
+/// #1251) when [`I18nConfig::locale_prefix_routes`](crate::i18n::I18nConfig::locale_prefix_routes)
+/// is enabled. Delegates straight to [`group_and_mount_routes`] otherwise, so
+/// apps that don't opt in see no behavior change.
+#[cfg(feature = "i18n")]
+fn mount_user_routes(
+    route_list: Vec<Route>,
+    idempotency_layers: Option<&BuiltIdempotencyLayers>,
+    opaque_app_layers_present: bool,
+    state: &AppState,
+    config: &AutumnConfig,
+) -> axum::Router<AppState> {
+    if !config.i18n.locale_prefix_routes {
+        return group_and_mount_routes(
+            route_list,
+            idempotency_layers,
+            opaque_app_layers_present,
+            state,
+        );
+    }
+
+    let (included, excluded) =
+        partition_routes_for_locale_prefix(route_list, &config.i18n.locale_prefix_exclude);
+    let mut included_paths: Vec<&'static str> = included.iter().map(|route| route.path).collect();
+    included_paths.sort_unstable();
+    included_paths.dedup();
+
+    let content_router = group_and_mount_routes(
+        included,
+        idempotency_layers,
+        opaque_app_layers_present,
+        state,
+    );
+    let excluded_router = group_and_mount_routes(
+        excluded,
+        idempotency_layers,
+        opaque_app_layers_present,
+        state,
+    );
+    apply_locale_prefix_routing(
+        excluded_router,
+        &content_router,
+        &included_paths,
+        &config.i18n,
+    )
+}
+
+#[cfg(not(feature = "i18n"))]
+fn mount_user_routes(
+    route_list: Vec<Route>,
+    idempotency_layers: Option<&BuiltIdempotencyLayers>,
+    opaque_app_layers_present: bool,
+    state: &AppState,
+    _config: &AutumnConfig,
+) -> axum::Router<AppState> {
+    group_and_mount_routes(
+        route_list,
+        idempotency_layers,
+        opaque_app_layers_present,
+        state,
+    )
+}
+
+/// Splits `route_list` into `(included, excluded)` for locale-prefix
+/// mounting: `excluded` routes match a configured
+/// [`I18nConfig::locale_prefix_exclude`](crate::i18n::I18nConfig::locale_prefix_exclude)
+/// prefix (e.g. hand-written `/api/*` routes) and mount unprefixed, exactly
+/// as they would with locale-prefix routing off. `included` routes get
+/// nested under every supported locale plus a bare-path redirect.
+#[cfg(feature = "i18n")]
+fn partition_routes_for_locale_prefix(
+    route_list: Vec<Route>,
+    exclude_prefixes: &[String],
+) -> (Vec<Route>, Vec<Route>) {
+    let mut included = Vec::new();
+    let mut excluded = Vec::new();
+    for route in route_list {
+        if matches_locale_exclude_prefix(route.path, exclude_prefixes) {
+            excluded.push(route);
+        } else {
+            included.push(route);
+        }
+    }
+    (included, excluded)
+}
+
+/// `true` when `path` equals one of `prefixes` or starts with `{prefix}/`.
+/// A trailing `/*` (or `/`) on a configured prefix is stripped before
+/// comparing, so `"/api"` and `"/api/*"` are equivalent.
+#[cfg(feature = "i18n")]
+fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|raw| {
+        let prefix = raw.strip_suffix("/*").unwrap_or(raw.as_str());
+        let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+        !prefix.is_empty() && (path == prefix || path.starts_with(&format!("{prefix}/")))
+    })
+}
+
+/// Builds the locale-prefixed router: `excluded_router` (and a bare-path
+/// redirect for every `included_paths` entry) mount at the top level;
+/// `content_router` is cloned and nested once per supported locale.
+///
+/// Cloning `content_router` — a cheap, `Arc`-backed `axum::Router` — rather
+/// than the underlying [`Route`] list is what lets every locale share one
+/// router build: no route definition is duplicated by hand or in code.
+#[cfg(feature = "i18n")]
+fn apply_locale_prefix_routing(
+    excluded_router: axum::Router<AppState>,
+    content_router: &axum::Router<AppState>,
+    included_paths: &[&'static str],
+    i18n: &crate::i18n::I18nConfig,
+) -> axum::Router<AppState> {
+    let mut router = excluded_router;
+
+    if !included_paths.is_empty() {
+        let mut redirect_router = axum::Router::<AppState>::new();
+        for path in included_paths {
+            redirect_router =
+                redirect_router.route(path, axum::routing::any(locale_prefix_redirect_handler));
+        }
+        router = router.merge(redirect_router);
+    }
+
+    for locale in &i18n.supported_locales {
+        let nested = content_router
+            .clone()
+            .fallback(crate::middleware::error_page_filter::fallback_404_handler)
+            .layer(axum::Extension(crate::i18n::UrlPrefixedLocale(
+                locale.clone(),
+            )));
+        router = router.nest(&format!("/{locale}"), nested);
+    }
+
+    router
+}
+
+/// Fallback handler mounted at every locale-prefix-eligible bare path:
+/// 308-redirects to the negotiated locale's prefixed path, preserving the
+/// query string. Reuses the unmodified [`Locale`](crate::i18n::Locale)
+/// extractor (no [`UrlPrefixedLocale`](crate::i18n::UrlPrefixedLocale) is set
+/// this far outside any locale nest) so the redirect target matches exactly
+/// what the request would have resolved to anyway.
+#[cfg(feature = "i18n")]
+async fn locale_prefix_redirect_handler(
+    locale: crate::i18n::Locale,
+    uri: axum::http::Uri,
+) -> axum::response::Redirect {
+    let mut target = format!("/{}{}", locale.tag(), uri.path());
+    if let Some(query) = uri.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    axum::response::Redirect::permanent(&target)
 }
 
 const fn idempotency_layer_for_route<'a>(
@@ -5731,6 +5887,229 @@ mod tests {
         let router = build_router(Vec::new(), &config, stories_state_with_builtin());
         let response = get_with_host(router, "/_stories").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Locale-prefixed routing (issue #1251) ───────────────────────────────
+
+    #[cfg(feature = "i18n")]
+    mod locale_prefix_routing {
+        use super::*;
+        use crate::i18n::{Bundle, I18nConfig, Locale};
+
+        async fn locale_probe(locale: Locale) -> String {
+            locale.tag().to_owned()
+        }
+
+        async fn plain_ok() -> &'static str {
+            "ok"
+        }
+
+        fn simple_route(path: &'static str, name: &'static str, probe: bool) -> Route {
+            Route {
+                method: http::Method::GET,
+                path,
+                handler: if probe {
+                    axum::routing::get(locale_probe)
+                } else {
+                    axum::routing::get(plain_ok)
+                },
+                name,
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path,
+                    operation_id: name,
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }
+        }
+
+        fn config(supported: &[&str], exclude: &[&str]) -> AutumnConfig {
+            let mut config = AutumnConfig::default();
+            config.i18n.locale_prefix_routes = true;
+            config.i18n.default_locale = supported.first().copied().unwrap_or("en").to_owned();
+            config.i18n.supported_locales = supported.iter().map(|s| (*s).to_owned()).collect();
+            config.i18n.locale_prefix_exclude = exclude.iter().map(|s| (*s).to_owned()).collect();
+            config
+        }
+
+        fn bundle(supported: &[&str]) -> Arc<Bundle> {
+            let cfg = I18nConfig {
+                default_locale: supported.first().copied().unwrap_or("en").to_owned(),
+                supported_locales: supported.iter().map(|s| (*s).to_owned()).collect(),
+                fallback_chain: vec![],
+                dir: "i18n".to_owned(),
+                locale_prefix_routes: false,
+                locale_prefix_exclude: vec![],
+            };
+            Arc::new(Bundle::from_messages(
+                std::collections::HashMap::new(),
+                &cfg,
+            ))
+        }
+
+        async fn request(
+            router: &axum::Router,
+            uri: &str,
+            headers: &[(&str, &str)],
+        ) -> axum::response::Response {
+            let mut req = Request::builder().uri(uri);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            router
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+
+        async fn body_string(resp: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        /// AC: default off — no behavior change for existing apps. The bare
+        /// route serves directly; no locale nest exists.
+        #[tokio::test]
+        async fn locale_prefix_routing_off_by_default() {
+            let mut config = AutumnConfig::default();
+            assert!(!config.i18n.locale_prefix_routes);
+            config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+
+            let route = simple_route("/posts", "posts", false);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let bare = request(&app, "/posts", &[]).await;
+            assert_eq!(bare.status(), StatusCode::OK);
+
+            let prefixed = request(&app, "/en/posts", &[]).await;
+            assert_eq!(
+                prefixed.status(),
+                StatusCode::NOT_FOUND,
+                "no locale nest should exist when the flag is off"
+            );
+        }
+
+        /// AC: every route is reachable under `/{locale}` for each supported
+        /// locale, with zero hand-duplicated route definitions — one `Route`
+        /// serves both `/en/posts` and `/es/posts`.
+        #[tokio::test]
+        async fn route_reachable_under_every_supported_locale() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let en = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en.status(), StatusCode::OK);
+            assert_eq!(body_string(en).await, "en");
+
+            let es = request(&app, "/es/posts", &[]).await;
+            assert_eq!(es.status(), StatusCode::OK);
+            assert_eq!(body_string(es).await, "es");
+        }
+
+        /// AC: an unknown `{locale}` prefix 404s — no panic.
+        #[tokio::test]
+        async fn unknown_locale_prefix_is_404_not_panic() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(&app, "/zz/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// AC: a bare (non-prefixed) path 308-redirects to the negotiated
+        /// locale's prefixed path, preserving the query string.
+        #[tokio::test]
+        async fn bare_path_redirects_preserving_query() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(&app, "/posts?sort=asc", &[]).await;
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en/posts?sort=asc")
+            );
+
+            let response = request(
+                &app,
+                "/posts?sort=asc",
+                &[(axum::http::header::ACCEPT_LANGUAGE.as_str(), "es")],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/es/posts?sort=asc")
+            );
+        }
+
+        /// AC: the URL prefix takes precedence over cookie/session/
+        /// `Accept-Language`, with zero handler changes (the handler above
+        /// takes a plain `Locale` parameter).
+        #[tokio::test]
+        async fn url_prefix_locale_wins_over_cookie_and_accept_language() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(
+                &app,
+                "/es/posts",
+                &[
+                    (axum::http::header::COOKIE.as_str(), "autumn_locale=en"),
+                    (axum::http::header::ACCEPT_LANGUAGE.as_str(), "en"),
+                ],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_string(response).await, "es");
+        }
+
+        /// AC: configured prefixes are excluded from localization and from
+        /// the bare-path redirect, so machine endpoints stay unprefixed.
+        #[tokio::test]
+        async fn excluded_prefix_stays_unprefixed_and_unredirected() {
+            let config = config(&["en", "es"], &["/api"]);
+            let route = simple_route("/api/status", "api_status", false);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let direct = request(&app, "/api/status", &[]).await;
+            assert_eq!(
+                direct.status(),
+                StatusCode::OK,
+                "excluded route must serve directly, not redirect"
+            );
+
+            let nested = request(&app, "/en/api/status", &[]).await;
+            assert_eq!(
+                nested.status(),
+                StatusCode::NOT_FOUND,
+                "excluded route must not be nested under a locale prefix"
+            );
+        }
     }
 
     /// Loads a layered `autumn.toml` for `profile` via `MockEnv` (no process

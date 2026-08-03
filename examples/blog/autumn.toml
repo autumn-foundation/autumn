@@ -18,6 +18,17 @@ hosts = ["localhost", "127.0.0.1", "::1"]
 [i18n]
 default_locale = "en"
 supported_locales = ["en", "es"]
+# Locale-prefixed routing (issue #1251): every content route above is also
+# reachable under `/en/...` and `/es/...` with zero duplicated route
+# definitions. `/posts` (bare) 308-redirects to the negotiated locale's
+# prefixed path. Machine/internal routes stay unprefixed.
+locale_prefix_routes = true
+locale_prefix_exclude = ["/api", "/auth", "/admin", "/feed.xml"]
+
+[seo]
+# Enables canonical/hreflang URL injection and locale-prefixed sitemap.xml
+# entries (issue #1251) — see routes::about and main.rs's BlogSitemapSource.
+base_url = "https://autumn-demo.example.com"
 
 # ── OAuth2 / OIDC providers ──────────────────────────────────────────────────
 # Set client_secret via environment variable in production:

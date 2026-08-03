@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **i18n:** locale-prefixed routing and a path-preserving locale switcher
+  (#1251). A new `[i18n] locale_prefix_routes` flag (default `false` — no
+  behavior change for existing apps) makes every route registered via
+  `AppBuilder::routes` also reachable under `/{locale}/...` for each
+  configured `supported_locales`, with zero hand-duplicated route
+  definitions: the router builds the content router once and nests a cheap
+  clone under each locale prefix. An unknown `{locale}` segment (e.g.
+  `/zz/posts`) 404s rather than panicking, and a request to the bare,
+  non-prefixed path 308-redirects to the negotiated locale's prefixed path,
+  preserving the query string. Within a locale-prefixed request, the URL
+  segment now takes precedence over cookie/session/`Accept-Language` for the
+  existing `Locale` extractor — with no handler changes required. New
+  `[i18n] locale_prefix_exclude` config exempts route prefixes (e.g. `/api`,
+  `/actuator`) from both localization and the bare-path redirect, so machine
+  endpoints stay unprefixed. Two new view helpers,
+  `autumn_web::widgets::{localized_path, locale_switcher}`, render
+  path-and-query-preserving links to the current page in every supported
+  locale. The SEO toolkit gained `SeoMeta::hreflang_alternates` plus a
+  `seo::locale_alternates` helper that builds `<link rel="alternate"
+  hreflang="…">` tags (including `x-default`) for a page's localized
+  variants, and `sitemap.xml` now lists one entry per supported locale for
+  each eligible static route when locale-prefix routing is enabled. The
+  `examples/blog` i18n demo (`/greet`, plus the site-wide nav) was extended to
+  exercise all of the above end-to-end.
 - **consent:** `autumn new` now scaffolds a cookie-consent banner and a real
   consent gate, so a fresh app is cookie-compliant by default (#1214). The new
   `autumn_web::consent` module provides a `Consent` extractor

@@ -92,6 +92,27 @@ pub struct I18nConfig {
     /// Filesystem directory containing `<locale>.ftl` files, relative to
     /// the application's manifest directory. Defaults to `"i18n"`.
     pub dir: String,
+
+    /// Enable locale-prefixed routing (issue #1251). Default `false` — no
+    /// behavior change for existing apps.
+    ///
+    /// When `true`, every route registered via [`AppBuilder::routes`](crate::app::AppBuilder::routes)
+    /// (except those matching [`Self::locale_prefix_exclude`]) is also
+    /// reachable under `/{locale}/...` for each of [`Self::supported_locales`],
+    /// with zero hand-duplicated route definitions. A request to the bare,
+    /// non-prefixed path 308-redirects to the negotiated locale's prefixed
+    /// path, preserving the query string. The locale segment takes
+    /// precedence over cookie/session/`Accept-Language` for the [`Locale`]
+    /// extractor on requests within a prefixed path.
+    pub locale_prefix_routes: bool,
+
+    /// Route path prefixes exempt from locale-prefixing and from the
+    /// bare-path redirect, even when [`Self::locale_prefix_routes`] is
+    /// enabled (e.g. `["/api", "/actuator"]` for machine endpoints defined
+    /// as normal routes). A trailing `/*` is accepted and ignored (`"/api"`
+    /// and `"/api/*"` are equivalent). A route matches when its path equals
+    /// the prefix or starts with `{prefix}/`.
+    pub locale_prefix_exclude: Vec<String>,
 }
 
 impl Default for I18nConfig {
@@ -101,6 +122,8 @@ impl Default for I18nConfig {
             supported_locales: vec!["en".to_owned()],
             fallback_chain: Vec::new(),
             dir: "i18n".to_owned(),
+            locale_prefix_routes: false,
+            locale_prefix_exclude: Vec::new(),
         }
     }
 }
@@ -166,15 +189,17 @@ pub enum LoadError {
 ///
 /// # Resolution order
 ///
-/// 1. `?locale=xx` query parameter (explicit override, useful for testing)
-/// 2. `autumn_locale` cookie (set by application code, e.g. on a switcher
+/// 1. URL locale prefix (issue #1251 — set when [`I18nConfig::locale_prefix_routes`]
+///    is enabled and the request matched a `/{locale}/...` nest)
+/// 2. `?locale=xx` query parameter (explicit override, useful for testing)
+/// 3. `autumn_locale` cookie (set by application code, e.g. on a switcher
 ///    form submit)
-/// 3. `Accept-Language` header, negotiated against the configured
+/// 4. `Accept-Language` header, negotiated against the configured
 ///    [`I18nConfig::supported_locales`]
-/// 4. [`I18nConfig::default_locale`]
+/// 5. [`I18nConfig::default_locale`]
 ///
 /// This is stable and documented: applications can rely on the order. If
-/// step 1–3 produce a locale that is **not** in the supported list, the
+/// step 1–4 produce a locale that is **not** in the supported list, the
 /// extractor falls through to the next step rather than serving an
 /// unsupported locale.
 #[derive(Debug, Clone)]
@@ -708,9 +733,17 @@ where
             .as_ref()
             .map_or_else(|| "en".to_owned(), |b| b.default_locale.clone());
 
-        // Resolution order: query → session (signed cookie) → plain cookie
-        // (legacy / sessions-off) → Accept-Language → default.
-        let mut resolved = resolve_query_override(parts, &supported);
+        // Resolution order: URL locale prefix (issue #1251, when the router's
+        // locale-prefix nesting matched) → query → session (signed cookie) →
+        // plain cookie (legacy / sessions-off) → Accept-Language → default.
+        let mut resolved = parts
+            .extensions
+            .get::<UrlPrefixedLocale>()
+            .and_then(|url_locale| negotiate(&url_locale.0, &supported))
+            .map(str::to_owned);
+        if resolved.is_none() {
+            resolved = resolve_query_override(parts, &supported);
+        }
         if resolved.is_none() {
             resolved = resolve_from_session(parts, &supported).await;
         }
@@ -729,6 +762,17 @@ where
         Ok(locale)
     }
 }
+
+/// Request extension inserted by the router's locale-prefix nesting (issue
+/// #1251) — one instance per `/{locale}` nest, carrying that nest's literal
+/// locale segment.
+///
+/// The [`Locale`] extractor checks this before query/cookie/session/
+/// `Accept-Language`, so a URL like `/es/posts` resolves to `es` regardless
+/// of any cookie or header — with zero changes to handlers, which keep
+/// taking a plain [`Locale`] parameter.
+#[derive(Debug, Clone)]
+pub struct UrlPrefixedLocale(pub String);
 
 /// Session key used for the persisted locale.
 ///
@@ -888,6 +932,8 @@ mod tests {
             supported_locales: supported.iter().map(|s| (*s).to_owned()).collect(),
             fallback_chain: vec![],
             dir: "i18n".to_owned(),
+            locale_prefix_routes: false,
+            locale_prefix_exclude: vec![],
         }
     }
 
@@ -1216,6 +1262,42 @@ mod tests {
             &[(header::COOKIE.as_str(), "autumn_locale=en")],
         );
         parts.extensions.insert(bundle.clone());
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(locale.tag(), "es");
+    }
+
+    // ── URL locale prefix precedence (issue #1251) ───────────────
+
+    #[tokio::test]
+    async fn url_prefixed_locale_wins_over_query_cookie_and_accept_language() {
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
+        let mut parts = build_parts(
+            "/?locale=en",
+            &[
+                (header::COOKIE.as_str(), "autumn_locale=en"),
+                (header::ACCEPT_LANGUAGE.as_str(), "en"),
+            ],
+        );
+        parts.extensions.insert(bundle.clone());
+        parts.extensions.insert(UrlPrefixedLocale("es".to_owned()));
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(
+            locale.tag(),
+            "es",
+            "URL locale prefix must outrank query, cookie, and Accept-Language"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_url_prefixed_locale_falls_through_to_next_step() {
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
+        let mut parts = build_parts("/?locale=es", &[]);
+        parts.extensions.insert(bundle.clone());
+        // Defensive: a bogus/unsupported injected value must not be trusted
+        // blindly — it should fall through to the next resolution step.
+        parts.extensions.insert(UrlPrefixedLocale("zz".to_owned()));
         let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(locale.tag(), "es");
     }

@@ -32,6 +32,8 @@ fn config() -> I18nConfig {
         supported_locales: vec!["en".to_owned(), "es".to_owned()],
         fallback_chain: vec![],
         dir: "i18n".to_owned(),
+        locale_prefix_routes: false,
+        locale_prefix_exclude: vec![],
     }
 }
 

@@ -8,13 +8,25 @@ use autumn_web::cache::cache_fragment_global;
 use autumn_web::extract::{Form, Path};
 use autumn_web::i18n::Locale;
 use autumn_web::seo::SeoMeta;
-use autumn_web::widgets::{Crumb, HeroConfig, breadcrumb, hero};
+use autumn_web::widgets::{Crumb, HeroConfig, breadcrumb, hero, locale_switcher};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, t};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::models::{NewPost, Post, UpdatePost};
 use crate::schema::posts;
+
+/// The current request's locale-stripped path plus any query string (issue
+/// #1251) — what [`locale_switcher`] needs to link to *this* page in every
+/// other supported locale. Inside a `/{locale}/...` nest, axum's `Uri`
+/// extractor already returns the prefix-stripped path, so this is a plain
+/// passthrough with the query string reattached.
+fn path_and_query(uri: &autumn_web::reexports::http::Uri) -> String {
+    match uri.query() {
+        Some(query) => format!("{}?{query}", uri.path()),
+        None => uri.path().to_owned(),
+    }
+}
 
 // ── Layout ──────────────────────────────────────────────────────
 
@@ -25,11 +37,25 @@ use crate::schema::posts;
 /// `#[static_get]` (e.g. `about.rs`) use the same extractor during static
 /// rendering, so pre-rendered HTML receives the configured bundle too.
 ///
+/// `path_and_query` is the current page's locale-stripped path (plus any
+/// query string) — see [`locale_switcher`] — used to render the site-wide
+/// language switcher so it always links to *this* page in each other
+/// supported locale (issue #1251), not just the home page. Pass `None` for
+/// pages excluded from locale-prefixing (`/admin/*`, per
+/// `[i18n] locale_prefix_exclude` in `autumn.toml`) — the switcher would
+/// otherwise link to a `/{locale}/admin/...` URL that 404s.
+///
 /// Accepts an optional [`SeoMeta`] to inject per-page meta tags. Falls back
 /// to a sensible site-wide description when omitted.
-pub fn layout(locale: &Locale, title: &str, content: Markup) -> Markup {
+pub fn layout(
+    locale: &Locale,
+    path_and_query: Option<&str>,
+    title: &str,
+    content: Markup,
+) -> Markup {
     layout_with_seo(
         locale,
+        path_and_query,
         SeoMeta::new()
             .title(title)
             .description("A blog built with the Autumn web framework for Rust."),
@@ -38,7 +64,12 @@ pub fn layout(locale: &Locale, title: &str, content: Markup) -> Markup {
 }
 
 /// Layout variant accepting an explicit [`SeoMeta`] builder.
-pub fn layout_with_seo(locale: &Locale, seo: SeoMeta, content: Markup) -> Markup {
+pub fn layout_with_seo(
+    locale: &Locale,
+    path_and_query: Option<&str>,
+    seo: SeoMeta,
+    content: Markup,
+) -> Markup {
     html! {
         (autumn_web::PreEscaped("<!DOCTYPE html>"))
         html lang=(locale.tag()) {
@@ -64,12 +95,19 @@ pub fn layout_with_seo(locale: &Locale, seo: SeoMeta, content: Markup) -> Markup
                             a href=(paths::admin_list()) class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.admin")) }
                             a href="/backoffice/posts" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { "Plugin Admin" }
                             a href=(paths::new_form()) class="text-sm px-3 py-1.5 bg-amber-700 text-white rounded-lg hover:bg-amber-800 transition-colors" { (t!(locale, "nav.new_post")) }
-                            // Lightweight locale switcher — `?locale=` query
-                            // overrides the resolved locale per the documented
-                            // resolution order.
-                            span class="text-xs text-stone-400 ml-2" { (t!(locale, "nav.locale.label")) ":" }
-                            a href="?locale=en" class="text-xs text-stone-600 hover:text-amber-700" { (t!(locale, "nav.locale.en")) }
-                            a href="?locale=es" class="text-xs text-stone-600 hover:text-amber-700" { (t!(locale, "nav.locale.es")) }
+                            // Locale switcher (issue #1251) — one call,
+                            // preserves this exact page's path and query;
+                            // only the locale segment changes. Omitted on
+                            // pages excluded from locale-prefixing (e.g.
+                            // `/admin/*`), which have no `/{locale}/...` URL.
+                            @if let Some(path_and_query) = path_and_query {
+                                span class="text-xs text-stone-400 ml-2" { (t!(locale, "nav.locale.label")) ":" }
+                                (locale_switcher(
+                                    path_and_query,
+                                    locale.tag(),
+                                    locale.bundle().map_or(&[], |b| b.supported_locales()),
+                                ))
+                            }
                         }
                     }
                 }
@@ -240,11 +278,16 @@ fn post_form(action: &str, post: Option<&Post>) -> Markup {
 
 /// Home page — list published posts.
 #[get("/")]
-pub async fn index(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
+pub async fn index(
+    locale: Locale,
+    uri: autumn_web::reexports::http::Uri,
+    mut db: Db,
+) -> AutumnResult<Markup> {
     let published_posts = Post::published(&mut db).await?;
 
     Ok(layout(
         &locale,
+        Some(&path_and_query(&uri)),
         "Autumn Blog",
         html! {
             (hero(
@@ -277,6 +320,7 @@ pub async fn index(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
 #[get("/posts/{slug}", seo(og_type = "article"))]
 pub async fn show(
     locale: Locale,
+    uri: autumn_web::reexports::http::Uri,
     slug: Path<String>,
     seo: SeoMeta,
     mut db: Db,
@@ -299,6 +343,7 @@ pub async fn show(
 
     Ok(layout_with_seo(
         &locale,
+        Some(&path_and_query(&uri)),
         seo,
         html! {
             (breadcrumb(&[
@@ -341,6 +386,7 @@ pub async fn admin_list(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
 
     Ok(layout(
         &locale,
+        None, // `/admin` is excluded from locale-prefixing.
         "Admin \u{2022} Autumn Blog",
         html! {
             header class="mb-8" {
@@ -428,6 +474,7 @@ pub async fn admin_list(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
 pub async fn new_form(locale: Locale) -> Markup {
     layout(
         &locale,
+        None, // `/admin` is excluded from locale-prefixing.
         "New Post \u{2022} Autumn Blog",
         html! {
             (breadcrumb(&[
@@ -462,6 +509,7 @@ pub async fn edit_form(locale: Locale, id: Path<i64>, mut db: Db) -> AutumnResul
 
     Ok(layout(
         &locale,
+        None, // `/admin` is excluded from locale-prefixing.
         &format!("Edit: {} \u{2022} Autumn Blog", p.title),
         html! {
             (breadcrumb(&[

@@ -3371,6 +3371,7 @@ impl AppBuilder {
                 &seo_cfg.robots.additional_rules,
                 &seo_sources,
                 &static_paths,
+                sitemap_locale_config(&config),
             )
             .await;
             let seo_router = crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
@@ -4787,6 +4788,7 @@ impl AppBuilder {
                 &seo_cfg.robots.additional_rules,
                 &seo_sources,
                 &static_paths,
+                sitemap_locale_config(&config),
             )
             .await;
             // Write each file only if it wasn't already produced by a
@@ -7196,6 +7198,26 @@ fn embedded_i18n_bundle(
             )
         })
     })
+}
+
+/// Derives the sitemap's locale-prefix config (issue #1251) from
+/// `[i18n] locale_prefix_routes`. `None` when the feature is off, disabled,
+/// or the `i18n` cargo feature isn't compiled in — the sitemap then lists a
+/// single unprefixed URL per static path, exactly as before this feature.
+#[cfg(feature = "i18n")]
+fn sitemap_locale_config(config: &AutumnConfig) -> Option<crate::seo::SitemapLocaleConfig<'_>> {
+    config
+        .i18n
+        .locale_prefix_routes
+        .then_some(crate::seo::SitemapLocaleConfig {
+            supported_locales: &config.i18n.supported_locales,
+            exclude_prefixes: &config.i18n.locale_prefix_exclude,
+        })
+}
+
+#[cfg(not(feature = "i18n"))]
+fn sitemap_locale_config(_config: &AutumnConfig) -> Option<crate::seo::SitemapLocaleConfig<'_>> {
+    None
 }
 
 #[cfg(feature = "i18n")]

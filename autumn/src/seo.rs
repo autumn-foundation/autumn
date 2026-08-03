@@ -399,6 +399,7 @@ pub struct SeoMeta {
     twitter_description: Option<String>,
     twitter_image: Option<String>,
     robots_directive: Option<String>,
+    hreflang_alternates: Vec<(String, String)>,
 }
 
 impl SeoMeta {
@@ -503,6 +504,18 @@ impl SeoMeta {
         self
     }
 
+    /// Add `<link rel="alternate" hreflang="…">` tags for the current page's
+    /// localized variants (issue #1251).
+    ///
+    /// Pairs are `(hreflang value, absolute URL)` — use [`locale_alternates`]
+    /// to build the list (including the `x-default` entry) from the
+    /// current path, base URL, default locale, and supported locales.
+    #[must_use]
+    pub fn hreflang_alternates(mut self, alternates: Vec<(String, String)>) -> Self {
+        self.hreflang_alternates = alternates;
+        self
+    }
+
     /// Render all configured meta tags as Maud [`Markup`].
     ///
     /// Emits only the tags that have been configured. Empty builders produce
@@ -562,8 +575,59 @@ impl SeoMeta {
             @if let Some(img) = &self.twitter_image {
                 meta name="twitter:image" content=(img);
             }
+            @for (lang, href) in &self.hreflang_alternates {
+                link rel="alternate" hreflang=(lang) href=(href);
+            }
         }
     }
+}
+
+/// Build `(hreflang, absolute URL)` pairs for [`SeoMeta::hreflang_alternates`]:
+/// one entry per supported locale plus an `x-default` entry pointing at the
+/// default locale (issue #1251).
+///
+/// `path` is the current page's locale-stripped path (e.g. `"/posts"`, as
+/// returned by axum's `Uri` extractor inside a locale-prefixed nest — nesting
+/// strips the matched prefix for downstream extraction). `base_url` is
+/// trimmed of any trailing slash.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_web::seo::locale_alternates;
+///
+/// let alternates = locale_alternates(
+///     "https://example.com",
+///     "/posts",
+///     "en",
+///     &["en".to_owned(), "es".to_owned()],
+/// );
+/// assert_eq!(
+///     alternates,
+///     vec![
+///         ("en".to_owned(), "https://example.com/en/posts".to_owned()),
+///         ("es".to_owned(), "https://example.com/es/posts".to_owned()),
+///         ("x-default".to_owned(), "https://example.com/en/posts".to_owned()),
+///     ]
+/// );
+/// ```
+#[must_use]
+pub fn locale_alternates(
+    base_url: &str,
+    path: &str,
+    default_locale: &str,
+    supported_locales: &[String],
+) -> Vec<(String, String)> {
+    let base_url = base_url.trim_end_matches('/');
+    let mut alternates: Vec<(String, String)> = supported_locales
+        .iter()
+        .map(|locale| (locale.clone(), format!("{base_url}/{locale}{path}")))
+        .collect();
+    alternates.push((
+        "x-default".to_owned(),
+        format!("{base_url}/{default_locale}{path}"),
+    ));
+    alternates
 }
 
 // ── SeoRouteDefaults (route-level defaults) ───────────────────────────────────
@@ -1018,6 +1082,13 @@ pub(crate) fn defaults_exclude_from_sitemap(defaults: SeoRouteDefaults) -> bool 
 ///
 /// Called by both `AppBuilder::run` (server mode) and
 /// `AppBuilder::run_build_mode` (static build mode).
+///
+/// `locale` carries the locale-prefix routing config (issue #1251) when
+/// `[i18n] locale_prefix_routes = true`: each eligible static path expands to
+/// one sitemap entry per supported locale (`{base_url}/{locale}{path}`)
+/// instead of a single unprefixed entry, since only the prefixed URLs are
+/// actually reachable. Paths matching `locale.exclude_prefixes` are listed
+/// unprefixed, same as when `locale` is `None`.
 pub(crate) async fn assemble_seo_bodies(
     profile: &str,
     base_url: Option<&str>,
@@ -1025,6 +1096,7 @@ pub(crate) async fn assemble_seo_bodies(
     additional_rules: &[String],
     sources: &[Arc<dyn SitemapSource>],
     static_paths: &[&str],
+    locale: Option<SitemapLocaleConfig<'_>>,
 ) -> (String, String) {
     let base_url = base_url.map(|u| u.trim_end_matches('/'));
 
@@ -1036,8 +1108,20 @@ pub(crate) async fn assemble_seo_bodies(
 
     if let Some(bu) = base_url {
         for path in static_paths {
-            if !path.contains('{') {
-                sitemap_entries.push(SitemapEntry::new(format!("{bu}{path}")));
+            if path.contains('{') {
+                continue;
+            }
+            match &locale {
+                Some(loc)
+                    if !loc.supported_locales.is_empty()
+                        && !matches_locale_exclude_prefix(path, loc.exclude_prefixes) =>
+                {
+                    for locale_code in loc.supported_locales {
+                        sitemap_entries
+                            .push(SitemapEntry::new(format!("{bu}/{locale_code}{path}")));
+                    }
+                }
+                _ => sitemap_entries.push(SitemapEntry::new(format!("{bu}{path}"))),
             }
         }
     }
@@ -1047,6 +1131,29 @@ pub(crate) async fn assemble_seo_bodies(
     let robots_body = robots_txt(profile, sitemap_url, additional_rules);
     let sitemap_body = sitemap_xml(&sitemap_entries, base_url);
     (robots_body, sitemap_body)
+}
+
+/// Locale-prefix routing config passed to [`assemble_seo_bodies`] so the
+/// sitemap lists each localized URL instead of a single unprefixed one
+/// (issue #1251's sitemap acceptance criterion).
+pub(crate) struct SitemapLocaleConfig<'a> {
+    pub supported_locales: &'a [String],
+    pub exclude_prefixes: &'a [String],
+}
+
+/// `true` when `path` equals one of `prefixes` or starts with `{prefix}/`.
+/// A trailing `/*` (or `/`) on a configured prefix is stripped before
+/// comparing, so `"/api"` and `"/api/*"` are equivalent.
+///
+/// Mirrors `router::matches_locale_exclude_prefix` — kept as a separate copy
+/// so this module doesn't need a hard dependency on the `i18n`-feature-gated
+/// router internals for what is a few lines of string matching.
+fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|raw| {
+        let prefix = raw.strip_suffix("/*").unwrap_or(raw.as_str());
+        let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+        !prefix.is_empty() && (path == prefix || path.starts_with(&format!("{prefix}/")))
+    })
 }
 
 // ── Static build helpers ──────────────────────────────────────────────────────
@@ -1209,7 +1316,7 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_seo_bodies_empty() {
-        let (robots, sitemap) = assemble_seo_bodies("prod", None, None, &[], &[], &[]).await;
+        let (robots, sitemap) = assemble_seo_bodies("prod", None, None, &[], &[], &[], None).await;
         assert!(robots.contains("Allow: /"));
         assert!(sitemap.contains("<urlset"));
     }
@@ -1226,6 +1333,7 @@ mod tests {
             &[],
             &[source],
             &[],
+            None,
         )
         .await;
         assert!(
@@ -1243,6 +1351,7 @@ mod tests {
             &[],
             &[],
             &["/about", "/contact"],
+            None,
         )
         .await;
         assert!(sitemap.contains("https://example.com/about"));
@@ -1258,6 +1367,7 @@ mod tests {
             &[],
             &[],
             &["/posts/{slug}"],
+            None,
         )
         .await;
         assert!(
@@ -1275,6 +1385,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         )
         .await;
         assert!(
@@ -1332,6 +1443,7 @@ mod tests {
             // The caller already dropped any noindex static route, and a
             // parameterized template would be skipped for containing `{`.
             &[],
+            None,
         )
         .await;
 
@@ -1353,6 +1465,7 @@ mod tests {
             &[],
             &[],
             &["/posts/{slug}"],
+            None,
         )
         .await;
 
@@ -1495,11 +1608,127 @@ mod tests {
             &[],
             &[],
             &["/about"],
+            None,
         )
         .await;
         assert!(
             sitemap.contains("https://example.com/about"),
             "base_url trailing slash should be trimmed; got:\n{sitemap}"
         );
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_lists_each_localized_url_when_locale_prefix_enabled() {
+        let supported = vec!["en".to_owned(), "es".to_owned()];
+        let (_, sitemap) = assemble_seo_bodies(
+            "prod",
+            Some("https://example.com"),
+            None,
+            &[],
+            &[],
+            &["/about"],
+            Some(SitemapLocaleConfig {
+                supported_locales: &supported,
+                exclude_prefixes: &[],
+            }),
+        )
+        .await;
+        assert!(
+            sitemap.contains("https://example.com/en/about"),
+            "should list the en-prefixed URL; got:\n{sitemap}"
+        );
+        assert!(
+            sitemap.contains("https://example.com/es/about"),
+            "should list the es-prefixed URL; got:\n{sitemap}"
+        );
+        assert!(
+            !sitemap.contains(">https://example.com/about<"),
+            "unprefixed URL should not also be listed; got:\n{sitemap}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_leaves_excluded_prefixes_unlocalized_in_sitemap() {
+        let supported = vec!["en".to_owned(), "es".to_owned()];
+        let exclude = vec!["/api".to_owned()];
+        let (_, sitemap) = assemble_seo_bodies(
+            "prod",
+            Some("https://example.com"),
+            None,
+            &[],
+            &[],
+            &["/about", "/api/status"],
+            Some(SitemapLocaleConfig {
+                supported_locales: &supported,
+                exclude_prefixes: &exclude,
+            }),
+        )
+        .await;
+        assert!(sitemap.contains("https://example.com/en/about"));
+        assert!(
+            sitemap.contains("https://example.com/api/status"),
+            "excluded prefix should list its unprefixed URL; got:\n{sitemap}"
+        );
+        assert!(!sitemap.contains("https://example.com/en/api/status"));
+    }
+
+    // ── hreflang alternates (issue #1251) ────────────────────────────────────
+
+    #[test]
+    fn locale_alternates_includes_every_supported_locale_and_x_default() {
+        let supported = vec!["en".to_owned(), "es".to_owned()];
+        let alternates = locale_alternates("https://example.com", "/posts", "en", &supported);
+        assert_eq!(
+            alternates,
+            vec![
+                ("en".to_owned(), "https://example.com/en/posts".to_owned()),
+                ("es".to_owned(), "https://example.com/es/posts".to_owned()),
+                (
+                    "x-default".to_owned(),
+                    "https://example.com/en/posts".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn locale_alternates_trims_base_url_trailing_slash() {
+        let supported = vec!["en".to_owned()];
+        let alternates = locale_alternates("https://example.com/", "/", "en", &supported);
+        assert_eq!(
+            alternates,
+            vec![
+                ("en".to_owned(), "https://example.com/en/".to_owned()),
+                ("x-default".to_owned(), "https://example.com/en/".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn seo_meta_renders_hreflang_alternate_links() {
+        let meta = SeoMeta::new().hreflang_alternates(locale_alternates(
+            "https://example.com",
+            "/posts",
+            "en",
+            &["en".to_owned(), "es".to_owned()],
+        ));
+        let rendered = meta.render().into_string();
+        assert!(rendered.contains(
+            r#"<link rel="alternate" hreflang="en" href="https://example.com/en/posts">"#
+        ));
+        assert!(rendered.contains(
+            r#"<link rel="alternate" hreflang="es" href="https://example.com/es/posts">"#
+        ));
+        assert!(rendered.contains(
+            r#"<link rel="alternate" hreflang="x-default" href="https://example.com/en/posts">"#
+        ));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn seo_meta_without_alternates_renders_no_hreflang_links() {
+        let meta = SeoMeta::new().title("Home");
+        assert!(!meta.render().into_string().contains("hreflang"));
     }
 }

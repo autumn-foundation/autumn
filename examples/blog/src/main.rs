@@ -18,15 +18,24 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 /// In a real app this would query the database; here we return a
 /// representative static list so `autumn build` and the running server
 /// produce a valid `/sitemap.xml` without requiring a live database.
+///
+/// Only `/` is listed here — `/about` is a `#[static_get]` route, so it's
+/// already covered (and, with `[i18n] locale_prefix_routes = true`, already
+/// listed once per supported locale) automatically from the static-route
+/// table (issue #1251). A `SitemapSource`'s entries are explicit,
+/// app-authored URLs — the framework never rewrites them — so `/`, a
+/// dynamic (`#[get]`) route with no static-route metadata to derive locale
+/// alternates from, is localized by hand here.
 struct BlogSitemapSource;
 
 impl SitemapSource for BlogSitemapSource {
     fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send + '_>> {
         Box::pin(async {
             vec![
-                SitemapEntry::new("https://autumn-demo.example.com/")
+                SitemapEntry::new("https://autumn-demo.example.com/en/")
                     .changefreq(autumn_web::seo::SitemapChangefreq::Weekly),
-                SitemapEntry::new("https://autumn-demo.example.com/about"),
+                SitemapEntry::new("https://autumn-demo.example.com/es/")
+                    .changefreq(autumn_web::seo::SitemapChangefreq::Weekly),
             ]
         })
     }
@@ -53,7 +62,8 @@ async fn main() {
                 .register(admin::PostAdmin),
         )
         // Register the sitemap source: mounts /robots.txt and /sitemap.xml.
-        // Configure [seo] base_url in autumn.toml for canonical URL injection.
+        // `[seo] base_url` in autumn.toml drives canonical URL injection and,
+        // with locale-prefixed routing on, locale-prefixed sitemap entries.
         .seo_source(BlogSitemapSource)
         .routes(routes![
             // Public routes
@@ -167,7 +177,10 @@ mod tests {
             .title("About \u{2022} Autumn Blog")
             .description("Why this blog exists and what the Autumn web framework is for.")
             .og_type("website");
-        let html = super::routes::about::about(locale, seo).await.into_string();
+        let html =
+            super::routes::about::about(locale, autumn_web::config::AutumnConfig::default(), seo)
+                .await
+                .into_string();
 
         assert!(html.contains("Autumn Blog"), "html: {html}");
         assert!(!html.contains("nav.brand"), "html: {html}");
