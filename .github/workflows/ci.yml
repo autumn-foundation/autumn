@@ -417,14 +417,14 @@ jobs:
           cargo test -p autumn-web --features sim-testing \
             --test sim_sweep_driver
 
-  # Sim seed sweep (W6 PR3, issue #1797): sweeps `AUTUMN_SIM_SEEDS` seeds
-  # sequentially (see `sim::sweep`'s module docs for why sequential, not
-  # parallel) through the `sim-sweep` `[[bin]]`'s built-in, deliberately
-  # CORRECT account demo scenario — this job proves the seed-sweep mechanism
-  # itself scales to many seeds without a false positive. A genuine invariant
-  # break IS caught and shrunk: that's the `sim_sweep_driver` DoD suite in the
-  # sqlite-runtime job above, not this job (which must always stay green).
-  # Structured like the `loom` job below: its own bounded, standalone step.
+  # Sim seed sweep (W6 PR3, issue #1797): sweeps `AUTUMN_SIM_SEEDS` seeds in
+  # parallel (see `sim::sweep`'s module docs) through the `sim-sweep` `[[bin]]`'s
+  # built-in, deliberately CORRECT account demo scenario — this job proves the
+  # seed-sweep mechanism itself scales to many seeds without a false positive.
+  # A genuine invariant break IS caught and shrunk: that's the
+  # `sim_sweep_driver` DoD suite in the sqlite-runtime job above, not this job
+  # (which must always stay green). Structured like the `loom` job below: its
+  # own bounded, standalone step.
   sim-sweep:
     name: Sim sweep (sim-testing)
     runs-on: ubuntu-latest

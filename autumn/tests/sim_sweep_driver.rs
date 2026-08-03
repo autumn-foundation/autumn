@@ -8,9 +8,10 @@
 //! Reuses `tests/sim_op_driver.rs`'s worked example (an account balance with
 //! an intentionally unfloored `Withdraw`) rather than inventing a new bug —
 //! this file's only job is the *sweep* mechanism (`sweep_proptest` batching
-//! `Sim::run_proptest` across seeds, fail-fast, plus cross-seed
-//! `sometimes!` aggregation), not re-proving the op-driver shrink mechanism
-//! itself (that's `sim_op_driver`'s job).
+//! `Sim::run_proptest` across a parallel worker pool, reporting the
+//! lowest-index failing seed, plus cross-seed `sometimes!` aggregation), not
+//! re-proving the op-driver shrink mechanism itself (that's `sim_op_driver`'s
+//! job).
 //!
 //! Isolated `[[test]]` binary for the same reason as `sim_op_driver`: needs
 //! the `sim-testing` feature (`proptest` as a library dependency), which the
@@ -35,14 +36,18 @@ enum Op {
 
 impl Arbitrary for Op {
     type Parameters = ();
-    type Strategy = BoxedStrategy<Self>;
+    // `SBoxedStrategy` (not `BoxedStrategy`): `sweep_proptest` shares the
+    // strategy across a worker-thread pool via `&S`, which needs `S: Send +
+    // Sync` — plain `BoxedStrategy` erases to `Arc<dyn Strategy>` with no
+    // `Send`/`Sync` bound on the trait object.
+    type Strategy = SBoxedStrategy<Self>;
 
     fn arbitrary_with((): ()) -> Self::Strategy {
         prop_oneof![
             (1u32..100).prop_map(Op::Deposit),
             (1u32..100).prop_map(Op::Withdraw),
         ]
-        .boxed()
+        .sboxed()
     }
 }
 
@@ -70,9 +75,9 @@ fn sweep_finds_and_shrinks_the_injected_invariant_break() {
 
     match outcome {
         SweepOutcome::Failed { seeds_run, failure } => {
-            assert!(
-                seeds_run >= 1,
-                "the sweep must have attempted at least one seed"
+            assert_eq!(
+                seeds_run, 16,
+                "the full batch runs regardless of where the failure is"
             );
             assert_eq!(
                 failure.shrunk_ops,

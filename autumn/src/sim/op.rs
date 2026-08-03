@@ -229,11 +229,49 @@ impl Sim {
         S: Strategy<Value = Vec<T>>,
         F: Fn(&mut Self, &[T]),
     {
+        Self::run_proptest_with_case_hook(seed, strategy, body, || {})
+    }
+
+    /// As [`Sim::run_proptest_with_ref`], but additionally invokes `on_case`
+    /// immediately after every case's `body` returns *successfully* — before
+    /// proptest's runner tries the next case, which calls [`Sim::from_seed`]
+    /// again and so resets the [`sometimes!`](crate::sometimes) registry.
+    ///
+    /// [`sim::sweep`](super::sweep) is the only caller: a single seed's
+    /// `run_proptest` drives up to [`Config::default`]'s `cases` (256)
+    /// candidate op-sequences internally, each starting with a fresh registry
+    /// — reading [`sometimes_snapshot`](super::assert::sometimes_snapshot)
+    /// only once, *after* the whole seed finishes, would see just the last
+    /// case tried and silently drop every earlier case's observations. The
+    /// hook lets the sweep fold each case's snapshot before it's overwritten.
+    ///
+    /// Not invoked for a case whose `body` panics — the panic unwinds past
+    /// the hook call. That's fine here: a failing case stops the whole seed
+    /// (and the sweep reports the failure itself), so that case's
+    /// `sometimes!` observations never needed to feed into the non-vacuity
+    /// aggregate in the first place.
+    pub(crate) fn run_proptest_with_case_hook<T, S, F, H>(
+        seed: u64,
+        strategy: &S,
+        body: F,
+        on_case: H,
+    ) -> Result<(), TestError<Vec<T>>>
+    where
+        T: fmt::Debug,
+        S: Strategy<Value = Vec<T>>,
+        F: Fn(&mut Self, &[T]),
+        H: FnMut(),
+    {
+        // `TestRunner::run` requires the test closure to be `Fn`, but the hook
+        // is `FnMut` (it accumulates into a caller-owned set across calls) —
+        // a `RefCell` lets a single `Fn` closure call it repeatedly.
+        let on_case = std::cell::RefCell::new(on_case);
         let mut runner =
             TestRunner::new_with_rng(embedded_config(), stream_rng(seed, OP_GEN_STREAM_SALT));
         runner.run(strategy, |ops| {
             let mut sim = Self::from_seed(seed);
             body(&mut sim, &ops);
+            (on_case.borrow_mut())();
             Ok(())
         })
     }

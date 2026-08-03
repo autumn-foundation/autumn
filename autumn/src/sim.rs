@@ -49,8 +49,9 @@
 //!   property-based op-driver (`sim::op`) — `Sim::gen_ops`/`Sim::gen_ops_with` for
 //!   deterministic generation and `Sim::run_proptest` for shrink-capable runs —
 //!   plus a seed-sweep runner (`sim::sweep`): `sweep_proptest` runs
-//!   `Sim::run_proptest` across a batch of seeds, stopping and reporting at the
-//!   first failure, driven in CI by the `sim-sweep` `[[bin]]`.
+//!   `Sim::run_proptest` across a batch of seeds on a worker-thread pool,
+//!   reporting the lowest-index failing seed, driven in CI by the
+//!   `sim-sweep` `[[bin]]`.
 //!
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
@@ -129,12 +130,13 @@ pub use crash::{CrashPoint, CrashSchedule};
 pub mod op;
 
 // The W6 seed-sweep runner (PR3, issue #1797): `sweep_proptest` runs
-// `Sim::run_proptest` sequentially across a batch of seeds, stopping (and
-// reporting) at the first failing seed, and folds `sometimes!` reachability
-// across the whole swept range so a green sweep is provably non-vacuous. The
-// `sim-sweep` `[[bin]]` (`autumn/src/bin/sim_sweep.rs`) is its CI-facing
-// driver. Same `sim-testing` feature gate as `op` — it builds directly on
-// `Sim::run_proptest_with_ref`.
+// `Sim::run_proptest` across a batch of seeds on a worker-thread pool,
+// reporting the lowest-index failing seed (if any), and folds `sometimes!`
+// reachability — across every proptest case in every seed — across the whole
+// swept range so a green sweep is provably non-vacuous. The `sim-sweep`
+// `[[bin]]` (`autumn/src/bin/sim_sweep.rs`) is its CI-facing driver. Same
+// `sim-testing` feature gate as `op` — it builds directly on
+// `Sim::run_proptest_with_case_hook`.
 #[cfg(feature = "sim-testing")]
 pub mod sweep;
 

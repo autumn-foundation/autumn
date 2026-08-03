@@ -1,7 +1,7 @@
 //! `sim-sweep`: the CI-facing driver for [`autumn_web::sim::sweep::sweep_proptest`]
 //! (sim-testing W6 PR3, issue #1797).
 //!
-//! Sweeps a batch of seeds, sequentially, against a small, self-contained,
+//! Sweeps a batch of seeds, in parallel, against a small, self-contained,
 //! deliberately **correct** account demo scenario (mirroring
 //! `tests/sim_op_driver.rs`'s worked example, but with the `Withdraw`
 //! floor-check bug fixed) — proving the seed-sweep mechanism itself scales to
@@ -42,14 +42,17 @@ enum Op {
 
 impl Arbitrary for Op {
     type Parameters = ();
-    type Strategy = BoxedStrategy<Self>;
+    // `SBoxedStrategy` (not `BoxedStrategy`), same reason as
+    // `sim_sweep_driver.rs`: `sweep_proptest` shares the strategy across a
+    // worker-thread pool via `&S`, which needs `S: Send + Sync`.
+    type Strategy = SBoxedStrategy<Self>;
 
     fn arbitrary_with((): ()) -> Self::Strategy {
         prop_oneof![
             (1u32..100).prop_map(Op::Deposit),
             (1u32..100).prop_map(Op::Withdraw),
         ]
-        .boxed()
+        .sboxed()
     }
 }
 
