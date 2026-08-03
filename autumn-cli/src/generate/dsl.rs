@@ -1703,27 +1703,25 @@ pub fn parse_fields(tokens: &[String]) -> Result<Vec<Field>, GenerateError> {
 /// individually, since `from`'s target may be declared earlier OR later in
 /// the token list.
 fn validate_slug_fields(tokens: &[String], fields: &[Field]) -> Result<(), GenerateError> {
-    let slug_fields: Vec<&Field> = fields.iter().filter(|f| f.kind.is_slug()).collect();
-    if slug_fields.len() > 1 {
-        let second = slug_fields[1];
+    // `parse_fields` builds `fields` from `tokens` one-to-one with no skips,
+    // so `tokens[i]` is always the token that produced `fields[i]` — no need
+    // to rediscover the index via a linear name search below.
+    let slug_fields: Vec<(usize, &Field)> = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.kind.is_slug())
+        .collect();
+    if let [(_, first), (second_idx, second), ..] = slug_fields[..] {
         return Err(GenerateError::InvalidField {
-            token: tokens
-                .get(
-                    fields
-                        .iter()
-                        .position(|f| f.name == second.name)
-                        .unwrap_or(0),
-                )
-                .cloned()
-                .unwrap_or_default(),
+            token: tokens[second_idx].clone(),
             reason: format!(
                 "only one `slug` field is supported per model (it's the routing key) — \
                  found both '{}' and '{}'",
-                slug_fields[0].name, second.name
+                first.name, second.name
             ),
         });
     }
-    for slug_field in &slug_fields {
+    for (idx, slug_field) in &slug_fields {
         // Presence of `constraints.from` is already enforced per-token in
         // `parse_field`; this is the cross-field half of that check.
         let from = slug_field
@@ -1731,15 +1729,7 @@ fn validate_slug_fields(tokens: &[String], fields: &[Field]) -> Result<(), Gener
             .from
             .as_deref()
             .expect("parse_field rejects a slug field with no `from` constraint");
-        let token = tokens
-            .get(
-                fields
-                    .iter()
-                    .position(|f| f.name == slug_field.name)
-                    .unwrap_or(0),
-            )
-            .cloned()
-            .unwrap_or_default();
+        let token = tokens[*idx].clone();
         let Some(source) = fields.iter().find(|f| f.name == from) else {
             return Err(GenerateError::InvalidField {
                 token,

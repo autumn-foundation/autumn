@@ -2026,9 +2026,14 @@ fn render_routes_file(
         route_key_field.map_or_else(|| "*id".to_owned(), |f| format!("&{f}"));
     // Same, but for a loaded `row: {pascal_name}` value rather than the path
     // extractor local — substitutes in place of the pre-#1260 literal `row.id`
-    // wherever a view displays or links the record it just rendered.
+    // wherever a view displays or links the record it just rendered. Borrows
+    // (`&row.{f}`) rather than reading `row.{f}` by value: unlike `row.id`
+    // (`i64`, `Copy`), a slug is a non-`Copy` `String` field, and every
+    // substitution site below already accepts `impl Display`/`Render` on a
+    // reference, so borrowing here avoids depending on happening to be the
+    // last use of `row` in the surrounding handler.
     let route_key_display_expr: String =
-        route_key_field.map_or_else(|| "row.id".to_owned(), |f| format!("row.{f}"));
+        route_key_field.map_or_else(|| "row.id".to_owned(), |f| format!("&row.{f}"));
     // Issue #1319: the full-text search box + results handler apply only to the
     // standard (non-live) HTML index. The `--live`/`--live-validation` list is a
     // `<ul>` with an SSE out-of-band swap contract that a `data_table` search
@@ -2545,6 +2550,15 @@ fn render_routes_file(
     // a plain text input) passes through untouched here; its own uniqueness
     // is still enforced by the existing `unique`-field violation handling
     // below, exactly like any other `unique` column.
+    //
+    // A derived value equal to "new" is treated as taken even though it
+    // isn't in the table yet: axum's router (matchit) always prefers the
+    // static `GET /{plural}/new` route over the `GET /{plural}/{slug}`
+    // capture, so a record whose slug were literally "new" would never be
+    // reachable at its own show page. This only guards the DERIVED path —
+    // an explicitly *submitted* slug of "new" isn't rejected here, matching
+    // this AC's blank-only scope (out of scope: general reserved-word
+    // validation on a hand-typed slug).
     #[allow(clippy::option_if_let_else)] // nested map_or_else closures read worse here
     let slug_derive_block = if let Some(slug) = slug_field {
         let field = &slug.name;
@@ -2564,7 +2578,7 @@ fn render_routes_file(
              .count()\n                \
              .get_result(&mut *db)\n                \
              .await?;\n            \
-             if count == 0 {{\n                \
+             if count == 0 && candidate != \"new\" {{\n                \
              break;\n            \
              }}\n            \
              candidate = format!(\"{{base}}-{{suffix}}\");\n            \
@@ -4374,6 +4388,41 @@ fn render_form_for_helper(
                 let _ = write!(
                     builder_calls,
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Number {{ step: Some(\"{step}\".into()) }})"
+                );
+            }
+            // Issue #1260 AC4: a blank submission auto-derives the slug on
+            // create (see `create_new_block`'s `slug_derive_block`), so the
+            // control must NOT carry `required`/`aria-required` even though
+            // the column itself is `NOT NULL` — otherwise the browser blocks
+            // submission before that derivation logic ever runs. The derive's
+            // default `FormField.required` is driven by Rust-level
+            // nullability (always `true` here, since a slug field is never
+            // `Option<String>`), so this needs the same `.exclude()` +
+            // `.append()` escape hatch the other schema-specific overrides
+            // use, minus the `required_builders` those emit.
+            FieldKind::Slug => {
+                let label = humanize_label(name);
+                let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
+                let _ = write!(
+                    appends,
+                    "\n        .append(html! {{\n            \
+                     @let errors = changeset.errors_for(\"{name}\");\n            \
+                     div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+                     (autumn_web::a11y::TextField::new(\"{name}\")\n                    \
+                     .label(\"{label}\")\n                    \
+                     .label_class(\"autumn-field__label\")\n                    \
+                     .input_type(\"text\")\n                    \
+                     .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
+                     .class(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                     .aria_invalid(!errors.is_empty())\n                    \
+                     .described_by(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}))\n                \
+                     @if !errors.is_empty() {{\n                    \
+                     div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+                     @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+                     }}\n                \
+                     }}\n            \
+                     }}\n        \
+                     }})"
                 );
             }
             FieldKind::References => {
@@ -12528,6 +12577,73 @@ async fn main() {
     }
 
     #[test]
+    fn scaffold_slug_field_collision_loop_never_settles_on_the_reserved_new_segment() {
+        // `GET /{plural}/new` is a static route; axum's router always prefers
+        // it over the `GET /{plural}/{slug}` capture, so a record whose slug
+        // were literally "new" would be permanently unreachable at its own
+        // show page. The derive loop must keep probing past it.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("if count == 0 && candidate != \"new\" {"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_form_input_is_not_required() {
+        // AC4's auto-derive-on-blank only ever runs if a blank submission can
+        // reach the server: a plain HTML5 `required` attribute on the slug
+        // input would have the browser block submission first. The DB column
+        // stays `NOT NULL` (AC3); only the form control must render as
+        // optional (the issue's own words: "the generated form may expose it
+        // as a plain optional text input").
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(".exclude(\"slug\")"),
+            "the slug field must be excluded from the derived (required-by-default) \
+             control so it can be re-appended as optional: {routes}"
+        );
+        assert!(
+            routes.contains("autumn_web::a11y::TextField::new(\"slug\")"),
+            "{routes}"
+        );
+        // The appended slug control must never carry `.required()` — grab the
+        // slice from its `TextField::new` call up to the next field's block
+        // (or the appends' end) and check `.required()` doesn't appear in it.
+        let start = routes
+            .find("autumn_web::a11y::TextField::new(\"slug\")")
+            .expect("slug TextField control");
+        let end = routes[start..]
+            .find("}})")
+            .map_or(routes.len(), |i| start + i);
+        let slug_control = &routes[start..end];
+        assert!(
+            !slug_control.contains(".required()"),
+            "slug control must not be required: {slug_control}"
+        );
+    }
+
+    #[test]
     fn scaffold_slug_field_index_and_show_links_use_slug_not_id() {
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
@@ -12541,7 +12657,7 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(routes.contains("paths::show(&row.slug)"), "{routes}");
-        assert!(routes.contains("paths::edit(row.slug)"), "{routes}");
+        assert!(routes.contains("paths::edit(&row.slug)"), "{routes}");
         assert!(!routes.contains("paths::show(row.id)"), "{routes}");
         assert!(!routes.contains("paths::edit(row.id)"), "{routes}");
     }
