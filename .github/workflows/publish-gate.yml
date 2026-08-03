@@ -188,7 +188,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-semver-checks tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-semver-checks
       - name: Check public API SemVer compatibility
@@ -294,7 +294,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @git-cliff tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.5
         with:
           tool: git-cliff
       - name: Generate release notes artifact
