@@ -9058,7 +9058,11 @@ mod tests {
         let delays_b: Vec<u64> = (0..8).map(|_| jittered_retry_delay_ms(&b, 1_000)).collect();
         assert_eq!(delays_a, delays_b);
         assert!(
-            delays_a.iter().collect::<std::collections::BTreeSet<_>>().len() > 1,
+            delays_a
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 1,
             "a real spread of draws should not collapse to a single delay value: {delays_a:?}"
         );
     }

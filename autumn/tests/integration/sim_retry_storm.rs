@@ -180,7 +180,9 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
     );
 
     let first = retry_checkpoints[0];
-    let spread = retry_checkpoints.iter().any(|checkpoint| *checkpoint != first);
+    let spread = retry_checkpoints
+        .iter()
+        .any(|checkpoint| *checkpoint != first);
     sometimes!(
         spread,
         "retries observed spread across more than one checkpoint of the backoff window"
