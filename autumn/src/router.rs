@@ -1873,12 +1873,21 @@ fn partition_routes_for_locale_prefix(
 
 /// `true` when `path` equals one of `prefixes` or starts with `{prefix}/`.
 /// A trailing `/*` (or `/`) on a configured prefix is stripped before
-/// comparing, so `"/api"` and `"/api/*"` are equivalent.
+/// comparing, so `"/api"` and `"/api/*"` are equivalent — except a bare `"/"`
+/// (e.g. a `#[static_get("/")]` route added via
+/// `exclude_static_routes_from_locale_prefix`), which is kept as-is and
+/// matched exactly: stripping its trailing slash would normalize it to an
+/// empty prefix, which the empty-prefix guard below then silently rejects,
+/// so `"/"` would never actually get excluded (Codex review).
 #[cfg(feature = "i18n")]
 fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|raw| {
         let prefix = raw.strip_suffix("/*").unwrap_or(raw.as_str());
-        let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+        let prefix = if prefix == "/" {
+            prefix
+        } else {
+            prefix.strip_suffix('/').unwrap_or(prefix)
+        };
         !prefix.is_empty() && (path == prefix || path.starts_with(&format!("{prefix}/")))
     })
 }
@@ -6323,6 +6332,42 @@ mod tests {
 
             let nested = request(&app, "/en/api/status", &[]).await;
             assert_eq!(nested.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// Codex review (P1): a bare `"/"` exclude entry (as
+        /// `exclude_static_routes_from_locale_prefix` adds for a
+        /// `#[static_get("/")]` route) must exclude exactly the root path,
+        /// not be normalized away to an empty, always-non-matching prefix.
+        #[tokio::test]
+        async fn root_path_exclude_prefix_excludes_exactly_the_root() {
+            let config = config(&["en", "es"], &["/"]);
+            let root = simple_route("/", "root", false);
+            let posts = simple_route("/posts", "posts", true);
+            let app = build_router(vec![root, posts], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let bare_root = request(&app, "/", &[]).await;
+            assert_eq!(
+                bare_root.status(),
+                StatusCode::OK,
+                "excluded root route must serve directly, not redirect"
+            );
+
+            let nested_root = request(&app, "/en", &[]).await;
+            assert_eq!(
+                nested_root.status(),
+                StatusCode::NOT_FOUND,
+                "excluded root route must not be nested under a locale prefix"
+            );
+
+            // A "/" exclude entry must not swallow every other path — only
+            // the exact root.
+            let bare_posts = request(&app, "/posts", &[]).await;
+            assert_eq!(
+                bare_posts.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "\"/\" in the exclude list must not exclude unrelated routes"
+            );
         }
 
         /// A path that merely starts with an exclude prefix's characters

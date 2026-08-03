@@ -1197,7 +1197,11 @@ pub(crate) struct SitemapLocaleConfig<'a> {
 
 /// `true` when `path` equals one of `prefixes` or starts with `{prefix}/`.
 /// A trailing `/*` (or `/`) on a configured prefix is stripped before
-/// comparing, so `"/api"` and `"/api/*"` are equivalent.
+/// comparing, so `"/api"` and `"/api/*"` are equivalent — except a bare `"/"`
+/// (e.g. a `#[static_get("/")]` route), which is kept as-is and matched
+/// exactly: stripping its trailing slash would normalize it to an empty
+/// prefix, which the empty-prefix guard below then silently rejects, so
+/// `"/"` would never actually get excluded (Codex review).
 ///
 /// Mirrors `router::matches_locale_exclude_prefix` — kept as a separate copy
 /// so this module doesn't need a hard dependency on the `i18n`-feature-gated
@@ -1205,7 +1209,11 @@ pub(crate) struct SitemapLocaleConfig<'a> {
 fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|raw| {
         let prefix = raw.strip_suffix("/*").unwrap_or(raw.as_str());
-        let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+        let prefix = if prefix == "/" {
+            prefix
+        } else {
+            prefix.strip_suffix('/').unwrap_or(prefix)
+        };
         !prefix.is_empty() && (path == prefix || path.starts_with(&format!("{prefix}/")))
     })
 }
@@ -1753,6 +1761,36 @@ mod tests {
             "excluded prefix should list its unprefixed URL; got:\n{sitemap}"
         );
         assert!(!sitemap.contains("https://example.com/en/api/status"));
+    }
+
+    #[tokio::test]
+    async fn assemble_seo_bodies_root_exclude_prefix_excludes_exactly_the_root() {
+        // Codex review (P1): a bare "/" exclude entry (as
+        // exclude_static_routes_from_locale_prefix adds for a
+        // #[static_get("/")] route) must exclude exactly the root path, not
+        // be normalized away to an empty, always-non-matching prefix.
+        let supported = vec!["en".to_owned(), "es".to_owned()];
+        let exclude = vec!["/".to_owned()];
+        let (_, sitemap) = assemble_seo_bodies(
+            "prod",
+            Some("https://example.com"),
+            None,
+            &[],
+            &[],
+            &["/", "/about"],
+            Some(SitemapLocaleConfig {
+                supported_locales: &supported,
+                exclude_prefixes: &exclude,
+            }),
+        )
+        .await;
+        assert!(
+            sitemap.contains(">https://example.com/<"),
+            "excluded root should list its unprefixed URL; got:\n{sitemap}"
+        );
+        assert!(!sitemap.contains(">https://example.com/en<"));
+        // "/" in the exclude list must not exclude unrelated paths.
+        assert!(sitemap.contains("https://example.com/en/about"));
     }
 
     #[tokio::test]

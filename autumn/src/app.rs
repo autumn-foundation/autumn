@@ -10884,6 +10884,22 @@ mod tests {
     }
 
     #[cfg(feature = "i18n")]
+    #[test]
+    fn static_route_exclusion_preserves_a_root_static_route_path_verbatim() {
+        // Codex review (P1): a `#[static_get("/")]` route must be excluded
+        // via the exact string "/" — router::matches_locale_exclude_prefix
+        // treats a bare "/" as an exact-match root exclusion rather than
+        // normalizing it away to an empty (non-matching) prefix.
+        let mut config = AutumnConfig::default();
+        config.i18n.locale_prefix_enabled = true;
+        let metas = vec![static_meta("/")];
+
+        exclude_static_routes_from_locale_prefix(&mut config, &metas);
+
+        assert_eq!(config.i18n.locale_prefix_exclude, vec!["/".to_owned()]);
+    }
+
+    #[cfg(feature = "i18n")]
     #[derive(Clone)]
     struct StaticConfigLoader {
         config: AutumnConfig,
