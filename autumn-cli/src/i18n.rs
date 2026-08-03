@@ -1194,6 +1194,7 @@ mod tests {
             dir: "i18n".to_owned(),
             locale_prefix_enabled: false,
             locale_prefix_exclude: vec![],
+            locale_prefix_exclude_exact: vec![],
         }
     }
 
@@ -2135,6 +2136,7 @@ mod tests {
             dir: "i18n".to_owned(),
             locale_prefix_enabled: false,
             locale_prefix_exclude: vec![],
+            locale_prefix_exclude_exact: vec![],
         };
         let report = build_report(&scan, &config, &per_locale);
 

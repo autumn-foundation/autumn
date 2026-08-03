@@ -113,6 +113,17 @@ pub struct I18nConfig {
     /// and `"/api/*"` are equivalent). A route matches when its path equals
     /// the prefix or starts with `{prefix}/`.
     pub locale_prefix_exclude: Vec<String>,
+
+    /// Exact route paths exempt from locale-prefixing (issue #1251). Unlike
+    /// [`Self::locale_prefix_exclude`], entries here match only the literal
+    /// path itself, never a `{path}/...` child — this is what
+    /// `#[static_get]` routes need, since excluding e.g. `/posts` as a
+    /// *prefix* would also swallow an unrelated dynamic sibling like
+    /// `/posts/{slug}` (Codex review). Not user-configurable — `#[serde(skip)]`
+    /// keeps it out of `autumn.toml`; it's populated internally, from static
+    /// route paths, before router construction.
+    #[serde(skip)]
+    pub locale_prefix_exclude_exact: Vec<String>,
 }
 
 impl Default for I18nConfig {
@@ -124,6 +135,7 @@ impl Default for I18nConfig {
             dir: "i18n".to_owned(),
             locale_prefix_enabled: false,
             locale_prefix_exclude: Vec::new(),
+            locale_prefix_exclude_exact: Vec::new(),
         }
     }
 }
@@ -972,6 +984,7 @@ mod tests {
             dir: "i18n".to_owned(),
             locale_prefix_enabled: false,
             locale_prefix_exclude: vec![],
+            locale_prefix_exclude_exact: vec![],
         }
     }
 

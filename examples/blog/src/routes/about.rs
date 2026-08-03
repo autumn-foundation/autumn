@@ -35,9 +35,11 @@ use super::posts::layout_with_seo;
 pub async fn about(locale: Locale, seo: SeoMeta) -> Markup {
     layout_with_seo(
         &locale,
-        // Fixed path — no per-request `Uri` at pre-render time, and `/about`
-        // takes no query parameters.
-        Some("/about"),
+        // `/about` is excluded from locale-prefix routing (see the doc
+        // comment above), so the switcher must not link to a nonexistent
+        // `/{locale}/about` — pass `None`, per `layout_with_seo`'s contract
+        // for excluded pages (Codex review).
+        None,
         seo,
         html! {
             article {

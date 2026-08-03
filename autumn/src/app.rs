@@ -7228,6 +7228,13 @@ fn embedded_i18n_bundle(
 /// (matching pre-#1251 behavior) even when locale-prefix routing is on for
 /// the rest of the app. Full per-locale static generation is a natural
 /// follow-up, not attempted here.
+///
+/// Populates [`I18nConfig::locale_prefix_exclude_exact`](crate::i18n::I18nConfig::locale_prefix_exclude_exact),
+/// not [`I18nConfig::locale_prefix_exclude`](crate::i18n::I18nConfig::locale_prefix_exclude):
+/// a static route is a single literal path, not a namespace, so it must be
+/// excluded by exact match — otherwise a static `/posts` would, as a
+/// *prefix*, also swallow an unrelated dynamic sibling like `/posts/{slug}`
+/// (Codex review).
 #[cfg(feature = "i18n")]
 fn exclude_static_routes_from_locale_prefix(
     config: &mut AutumnConfig,
@@ -7236,7 +7243,7 @@ fn exclude_static_routes_from_locale_prefix(
     if config.i18n.locale_prefix_enabled {
         config
             .i18n
-            .locale_prefix_exclude
+            .locale_prefix_exclude_exact
             .extend(static_metas.iter().map(|meta| meta.path.to_owned()));
     }
 }
@@ -7260,6 +7267,7 @@ fn sitemap_locale_config(config: &AutumnConfig) -> Option<crate::seo::SitemapLoc
         .then_some(crate::seo::SitemapLocaleConfig {
             supported_locales: &config.i18n.supported_locales,
             exclude_prefixes: &config.i18n.locale_prefix_exclude,
+            exclude_exact: &config.i18n.locale_prefix_exclude_exact,
         })
 }
 
@@ -10847,8 +10855,14 @@ mod tests {
         exclude_static_routes_from_locale_prefix(&mut config, &metas);
 
         assert_eq!(
-            config.i18n.locale_prefix_exclude,
-            vec!["/about".to_owned(), "/pricing".to_owned()]
+            config.i18n.locale_prefix_exclude_exact,
+            vec!["/about".to_owned(), "/pricing".to_owned()],
+            "static routes must be tracked as EXACT exclusions, not prefix \
+             exclusions — see the sibling `static_route_exclusion_does_not_leak_into_a_dynamic_sibling` test"
+        );
+        assert!(
+            config.i18n.locale_prefix_exclude.is_empty(),
+            "must not write static route paths into the prefix-matched exclude list"
         );
     }
 
@@ -10862,8 +10876,8 @@ mod tests {
         exclude_static_routes_from_locale_prefix(&mut config, &metas);
 
         assert!(
-            config.i18n.locale_prefix_exclude.is_empty(),
-            "must not touch the exclude list when the feature is off"
+            config.i18n.locale_prefix_exclude_exact.is_empty(),
+            "must not touch the exact-exclude list when the feature is off"
         );
     }
 
@@ -10873,30 +10887,35 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.i18n.locale_prefix_enabled = true;
         config.i18n.locale_prefix_exclude = vec!["/api".to_owned()];
+        config.i18n.locale_prefix_exclude_exact = vec!["/contact".to_owned()];
         let metas = vec![static_meta("/about")];
 
         exclude_static_routes_from_locale_prefix(&mut config, &metas);
 
         assert_eq!(
             config.i18n.locale_prefix_exclude,
-            vec!["/api".to_owned(), "/about".to_owned()]
+            vec!["/api".to_owned()],
+            "must not touch the user-configured prefix-exclude list"
+        );
+        assert_eq!(
+            config.i18n.locale_prefix_exclude_exact,
+            vec!["/contact".to_owned(), "/about".to_owned()]
         );
     }
 
     #[cfg(feature = "i18n")]
     #[test]
     fn static_route_exclusion_preserves_a_root_static_route_path_verbatim() {
-        // Codex review (P1): a `#[static_get("/")]` route must be excluded
-        // via the exact string "/" — router::matches_locale_exclude_prefix
-        // treats a bare "/" as an exact-match root exclusion rather than
-        // normalizing it away to an empty (non-matching) prefix.
         let mut config = AutumnConfig::default();
         config.i18n.locale_prefix_enabled = true;
         let metas = vec![static_meta("/")];
 
         exclude_static_routes_from_locale_prefix(&mut config, &metas);
 
-        assert_eq!(config.i18n.locale_prefix_exclude, vec!["/".to_owned()]);
+        assert_eq!(
+            config.i18n.locale_prefix_exclude_exact,
+            vec!["/".to_owned()]
+        );
     }
 
     #[cfg(feature = "i18n")]

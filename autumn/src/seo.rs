@@ -1160,6 +1160,7 @@ pub(crate) async fn assemble_seo_bodies(
             match &locale {
                 Some(loc)
                     if !loc.supported_locales.is_empty()
+                        && !loc.exclude_exact.iter().any(|p| p == path)
                         && !matches_locale_exclude_prefix(path, loc.exclude_prefixes) =>
                 {
                     // Root-path special case: axum's `nest("/{locale}",
@@ -1193,6 +1194,11 @@ pub(crate) async fn assemble_seo_bodies(
 pub(crate) struct SitemapLocaleConfig<'a> {
     pub supported_locales: &'a [String],
     pub exclude_prefixes: &'a [String],
+    /// Literal paths excluded by exact match rather than as a prefix —
+    /// auto-populated from `#[static_get]` routes, since excluding a static
+    /// route like `/posts` as a *prefix* would also swallow an unrelated
+    /// dynamic sibling like `/posts/{slug}` (Codex review).
+    pub exclude_exact: &'a [String],
 }
 
 /// `true` when `path` equals one of `prefixes` or starts with `{prefix}/`.
@@ -1692,6 +1698,7 @@ mod tests {
             Some(SitemapLocaleConfig {
                 supported_locales: &supported,
                 exclude_prefixes: &[],
+                exclude_exact: &[],
             }),
         )
         .await;
@@ -1725,6 +1732,7 @@ mod tests {
             Some(SitemapLocaleConfig {
                 supported_locales: &supported,
                 exclude_prefixes: &[],
+                exclude_exact: &[],
             }),
         )
         .await;
@@ -1752,6 +1760,7 @@ mod tests {
             Some(SitemapLocaleConfig {
                 supported_locales: &supported,
                 exclude_prefixes: &exclude,
+                exclude_exact: &[],
             }),
         )
         .await;
@@ -1781,6 +1790,7 @@ mod tests {
             Some(SitemapLocaleConfig {
                 supported_locales: &supported,
                 exclude_prefixes: &exclude,
+                exclude_exact: &[],
             }),
         )
         .await;
@@ -1810,6 +1820,7 @@ mod tests {
             Some(SitemapLocaleConfig {
                 supported_locales: &supported,
                 exclude_prefixes: &exclude,
+                exclude_exact: &[],
             }),
         )
         .await;

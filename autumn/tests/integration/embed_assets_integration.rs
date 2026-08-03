@@ -34,6 +34,7 @@ fn config() -> I18nConfig {
         dir: "i18n".to_owned(),
         locale_prefix_enabled: false,
         locale_prefix_exclude: vec![],
+        locale_prefix_exclude_exact: vec![],
     }
 }
 

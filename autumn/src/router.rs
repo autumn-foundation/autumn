@@ -1806,8 +1806,11 @@ fn mount_user_routes(
         );
     }
 
-    let (included, excluded) =
-        partition_routes_for_locale_prefix(route_list, &config.i18n.locale_prefix_exclude);
+    let (included, excluded) = partition_routes_for_locale_prefix(
+        route_list,
+        &config.i18n.locale_prefix_exclude,
+        &config.i18n.locale_prefix_exclude_exact,
+    );
     let mut included_paths: Vec<&'static str> = included.iter().map(|route| route.path).collect();
     included_paths.sort_unstable();
     included_paths.dedup();
@@ -1849,20 +1852,31 @@ fn mount_user_routes(
 }
 
 /// Splits `route_list` into `(included, excluded)` for locale-prefix
-/// mounting: `excluded` routes match a configured
+/// mounting: `excluded` routes either match a configured
 /// [`I18nConfig::locale_prefix_exclude`](crate::i18n::I18nConfig::locale_prefix_exclude)
-/// prefix (e.g. hand-written `/api/*` routes) and mount unprefixed, exactly
-/// as they would with locale-prefix routing off. `included` routes get
-/// nested under every supported locale plus a bare-path redirect.
+/// prefix (e.g. hand-written `/api/*` routes) or a literal
+/// [`I18nConfig::locale_prefix_exclude_exact`](crate::i18n::I18nConfig::locale_prefix_exclude_exact)
+/// path (auto-populated from `#[static_get]` routes), and mount unprefixed,
+/// exactly as they would with locale-prefix routing off. `included` routes
+/// get nested under every supported locale plus a bare-path redirect.
+///
+/// The two lists are matched differently on purpose: a prefix exclusion like
+/// `/api` also swallows `/api/users`, which is the point for a hand-excluded
+/// namespace, but the exact list must NOT do that — excluding a static route
+/// like `/posts` must not also swallow an unrelated dynamic sibling route
+/// like `/posts/{slug}` (Codex review).
 #[cfg(feature = "i18n")]
 fn partition_routes_for_locale_prefix(
     route_list: Vec<Route>,
     exclude_prefixes: &[String],
+    exclude_exact: &[String],
 ) -> (Vec<Route>, Vec<Route>) {
     let mut included = Vec::new();
     let mut excluded = Vec::new();
     for route in route_list {
-        if matches_locale_exclude_prefix(route.path, exclude_prefixes) {
+        if exclude_exact.iter().any(|p| p == route.path)
+            || matches_locale_exclude_prefix(route.path, exclude_prefixes)
+        {
             excluded.push(route);
         } else {
             included.push(route);
@@ -5992,6 +6006,7 @@ mod tests {
                 dir: "i18n".to_owned(),
                 locale_prefix_enabled: false,
                 locale_prefix_exclude: vec![],
+                locale_prefix_exclude_exact: vec![],
             };
             Arc::new(Bundle::from_messages(
                 std::collections::HashMap::new(),
@@ -6441,6 +6456,54 @@ mod tests {
             let response = request(&app, "/es/posts/hello-world", &[]).await;
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(body_string(response).await, "es:hello-world");
+        }
+
+        /// Codex review (P1): an exact-match exclusion (as populated by
+        /// `exclude_static_routes_from_locale_prefix` for a `#[static_get]`
+        /// route) must not behave like a *prefix* exclusion — excluding the
+        /// literal static route `/posts` must not also swallow an unrelated
+        /// dynamic sibling like `/posts/{slug}`, which shares only a string
+        /// prefix, not a namespace.
+        #[tokio::test]
+        async fn exact_exclude_does_not_swallow_a_dynamic_sibling_route() {
+            let mut config = config(&["en", "es"], &[]);
+            config.i18n.locale_prefix_exclude_exact = vec!["/posts".to_owned()];
+            let static_index = simple_route("/posts", "posts_index", false);
+            let dynamic_child = slug_route("/posts/{slug}", "posts_show");
+            let app = build_router(vec![static_index, dynamic_child], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let excluded = request(&app, "/posts", &[]).await;
+            assert_eq!(
+                excluded.status(),
+                StatusCode::OK,
+                "the exactly-excluded static route must stay unprefixed and unredirected"
+            );
+
+            let excluded_prefixed = request(&app, "/en/posts", &[]).await;
+            assert_eq!(
+                excluded_prefixed.status(),
+                StatusCode::NOT_FOUND,
+                "the exactly-excluded static route must not be nested under a locale prefix"
+            );
+
+            let sibling_prefixed = request(&app, "/en/posts/hello-world", &[]).await;
+            assert_eq!(
+                sibling_prefixed.status(),
+                StatusCode::OK,
+                "a dynamic sibling sharing the excluded path as a string prefix must \
+                 still be locale-prefixed normally — an exact exclusion must not act \
+                 like a prefix exclusion"
+            );
+            assert_eq!(body_string(sibling_prefixed).await, "en:hello-world");
+
+            let sibling_bare = request(&app, "/posts/hello-world", &[]).await;
+            assert_eq!(
+                sibling_bare.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "the dynamic sibling's bare path must still redirect, since only the \
+                 exact literal `/posts` is excluded"
+            );
         }
 
         /// Core assumption underpinning `locale_switcher`/hreflang
