@@ -108,10 +108,10 @@ fn reset_probe_state() {
 /// Fails its first attempt unconditionally, then succeeds — the minimal shape
 /// that puts every enqueued job's retry through the backoff path being tested.
 #[job(name = "storm_probe", max_attempts = 2, backoff_ms = 1000)]
+// The mutex guard necessarily spans the read-modify-write on the `entry` API
+// below; there's no meaningful way to tighten it further.
+#[allow(clippy::significant_drop_tightening)]
 async fn storm_probe(_state: AppState, args: StormArgs) -> AutumnResult<()> {
-    // The guard necessarily spans the read-modify-write on the `entry` API
-    // below; there's no meaningful way to tighten it further.
-    #[allow(clippy::significant_drop_tightening)]
     let attempt = {
         let mut guard = ATTEMPTS.lock().unwrap();
         let attempts = guard.as_mut().expect("reset_probe_state must run first");
