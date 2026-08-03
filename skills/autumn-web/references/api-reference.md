@@ -139,6 +139,24 @@ builder), then refine them with per-request data before calling
 `seo.render()`. `#[static_get]` honours the argument too. The declared values
 are also recorded on `Route::seo` as a `SeoRouteDefaults`.
 
+**Locale-prefixed routing** (**unreleased** — trunk-dev, #1251): `[i18n]
+locale_prefix_routes = true` in `autumn.toml` (default `false`, no behavior
+change) makes every route registered via `routes(...)` also reachable under
+`/{locale}/...` for each `supported_locales` entry — no route definitions are
+duplicated. An unknown `{locale}` prefix 404s (never panics); a bare,
+non-prefixed request 308-redirects to the negotiated locale's prefixed path,
+preserving the query string. Inside a prefixed request the URL segment
+outranks cookie/session/`Accept-Language` for the `Locale` extractor — no
+handler changes needed. `[i18n] locale_prefix_exclude = ["/api", "/actuator"]`
+keeps machine routes unprefixed. View helpers
+`autumn_web::widgets::{localized_path(path, locale), locale_switcher(path,
+current_locale, supported_locales)}` render path-and-query-preserving links
+to the current page in each locale. `SeoMeta::hreflang_alternates(...)` +
+`autumn_web::seo::locale_alternates(base_url, path, default_locale,
+supported_locales)` emit `<link rel="alternate" hreflang="…">` tags (plus
+`x-default`); `sitemap.xml` lists one entry per supported locale per eligible
+static route when the flag is on.
+
 `#[model]` also recognizes `#[belongs_to]` / `#[has_many]` / `#[has_one]`
 struct-level attributes (**unreleased** — trunk-dev, not in published 0.5.0)
 for declarative associations with batched eager
