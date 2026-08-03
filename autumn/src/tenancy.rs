@@ -424,6 +424,21 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
 /// `/login`: `/en/login` is a real, still-tenant-scoped route (excluded from
 /// locale-prefixing), not the locale-prefixed `/login` — stripping it would
 /// wrongly exempt it from tenant resolution (Codex review).
+///
+/// **Known limitation** (Codex review): this heuristic can't see the actual
+/// route table — only `AutumnConfig` — so a raw/opaque route registered via
+/// `AppBuilder::scoped()`/`merge()`/`nest()` at a literal path that happens
+/// to start with a supported locale segment (e.g. a scoped `/en/login`, not
+/// tracked in either exclusion list because it was never part of the
+/// locale-prefix-eligible `routes![...]` table to begin with) is
+/// indistinguishable here from a genuinely locale-prefixed `/login`. Closing
+/// this gap for real would require tenancy to run *after* axum has already
+/// resolved routing (so it could see the nest-specific `UriPrefixedLocale`
+/// extension) rather than as an outer layer ahead of dispatch — a larger
+/// layering change out of scope for issue #1251. An app with this exact
+/// combination (tenancy + locale-prefix routing + an opaque route whose
+/// literal path shadows a locale segment) should rename the route or list
+/// it in `tenancy.public_paths`/handle tenancy explicitly for that path.
 #[cfg(feature = "i18n")]
 fn strip_locale_prefix_for_tenancy<'a>(
     path: &'a str,
@@ -444,10 +459,9 @@ fn strip_locale_prefix_for_tenancy<'a>(
     let Some(rest) = path.strip_prefix('/') else {
         return path;
     };
-    let (segment, remainder) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, ""),
-    };
+    let (segment, remainder) = rest
+        .find('/')
+        .map_or((rest, ""), |idx| (&rest[..idx], &rest[idx..]));
     if config.i18n.supported_locales.iter().any(|l| l == segment) {
         if remainder.is_empty() { "/" } else { remainder }
     } else {

@@ -1849,6 +1849,8 @@ fn mount_user_routes(
         return Err(err);
     }
 
+    let path_method_filters = included_path_method_filters(&included);
+
     let content_router = group_and_mount_routes(
         included,
         idempotency_layers,
@@ -1864,7 +1866,7 @@ fn mount_user_routes(
     Ok(apply_locale_prefix_routing(
         excluded_router,
         &content_router,
-        &included_paths,
+        &path_method_filters,
         &config.i18n,
         &valid_locales,
     ))
@@ -1929,13 +1931,14 @@ fn partition_routes_for_locale_prefix(
 /// empty prefix, which the empty-prefix guard below then silently rejects,
 /// so `"/"` would never actually get excluded (Codex review).
 ///
-/// `pub(crate)` so `tenancy::strip_locale_prefix_for_tenancy` can reuse the
+/// `pub` (the `router` module itself is `pub(crate)`, so this is already
+/// crate-private) so `tenancy::strip_locale_prefix_for_tenancy` can reuse the
 /// same exclusion semantics rather than a third divergent copy (`seo.rs`
 /// keeps its own, feature-independent copy to avoid a hard dependency on
 /// `i18n`-gated router internals; `tenancy.rs`'s caller is already
 /// `i18n`-gated, so reuse here doesn't add one).
 #[cfg(feature = "i18n")]
-pub(crate) fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
+pub fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|raw| {
         let prefix = raw.strip_suffix("/*").unwrap_or(raw.as_str());
         let prefix = if prefix == "/" {
@@ -1952,10 +1955,13 @@ pub(crate) fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> 
 /// panics on — nesting at the root isn't supported) and free of characters
 /// axum's route syntax interprets specially — `/` (would silently nest an
 /// extra sub-path instead of one opaque segment), `{`/`}` (path-parameter
-/// capture syntax), and `*` (wildcard capture) (Codex review).
+/// capture syntax), `*` (wildcard capture), and a leading `:` (axum 0.7
+/// capture syntax — axum 0.8's `Router::route` panics on it during
+/// assembly via `validate_v07_paths`, the same restriction `InvalidMcpPath`
+/// above already guards against) (Codex review).
 #[cfg(feature = "i18n")]
 fn is_valid_locale_segment(locale: &str) -> bool {
-    !locale.is_empty() && !locale.contains(['/', '{', '}', '*'])
+    !locale.is_empty() && !locale.starts_with(':') && !locale.contains(['/', '{', '}', '*'])
 }
 
 /// The subset of `i18n.supported_locales` that's actually valid and unique —
@@ -1976,6 +1982,60 @@ fn validated_locale_prefix_locales(i18n: &crate::i18n::I18nConfig) -> Vec<String
         .collect()
 }
 
+/// Maps an HTTP method to the [`axum::routing::MethodFilter`] bit it
+/// corresponds to. Falls back to `GET` for anything unrecognized — in
+/// practice only the synthetic `WS` method, which callers must run through
+/// [`effective_mount_method`] first (converting it to `GET`) anyway; this
+/// catch-all just avoids ever silently dropping a method were that
+/// invariant somehow violated.
+#[cfg(feature = "i18n")]
+fn method_filter_for(method: &http::Method) -> axum::routing::MethodFilter {
+    use axum::routing::MethodFilter;
+    match method.as_str() {
+        "POST" => MethodFilter::POST,
+        "PUT" => MethodFilter::PUT,
+        "DELETE" => MethodFilter::DELETE,
+        "PATCH" => MethodFilter::PATCH,
+        "HEAD" => MethodFilter::HEAD,
+        "OPTIONS" => MethodFilter::OPTIONS,
+        "TRACE" => MethodFilter::TRACE,
+        _ => MethodFilter::GET,
+    }
+}
+
+/// For each locale-prefix-included path, the exact HTTP methods actually
+/// registered there — after the same `WS`→`GET` and `GET`→`+HEAD` aliasing
+/// [`build_route_timeout_table`] applies, so the bare-path redirect claims
+/// precisely what the nested content will serve.
+///
+/// Claiming every method via `axum::routing::any` (the prior behavior)
+/// would otherwise reserve, say, GET at `/health` for the redirect even
+/// when only `POST /health` is a real included route — colliding with the
+/// framework's own auto-mounted `GET /health` probe, which mounts later
+/// (`mount_probe_endpoints`, well after this function returns) and has no
+/// visibility into methods the redirect already claimed (Codex review).
+#[cfg(feature = "i18n")]
+fn included_path_method_filters(
+    included: &[Route],
+) -> Vec<(&'static str, axum::routing::MethodFilter)> {
+    let mut filters: std::collections::HashMap<&'static str, axum::routing::MethodFilter> =
+        std::collections::HashMap::new();
+    for route in included {
+        let effective = effective_mount_method(&route.method);
+        let mut filter = method_filter_for(&effective);
+        if effective == http::Method::GET {
+            filter = filter.or(axum::routing::MethodFilter::HEAD);
+        }
+        filters
+            .entry(route.path)
+            .and_modify(|existing| *existing = existing.or(filter))
+            .or_insert(filter);
+    }
+    let mut result: Vec<_> = filters.into_iter().collect();
+    result.sort_unstable_by_key(|(path, _)| *path);
+    result
+}
+
 /// Detects a route path that collides with a path locale-prefix nesting will
 /// itself generate — e.g. an app defines both `/foo` and `/en/foo` while
 /// `en` is a supported locale: the bare-path redirect (mounted at every
@@ -1986,6 +2046,14 @@ fn validated_locale_prefix_locales(i18n: &crate::i18n::I18nConfig) -> Vec<String
 /// all get that bare-path redirect) and `excluded_paths` (mounted verbatim
 /// at the top level) so either kind of pre-existing route is caught
 /// (Codex review).
+///
+/// Uses [`paths_conflict_under_matchit`] rather than exact string equality:
+/// two templates with different capture *names* at the same position (e.g.
+/// `/en/users/{id}` generated from `/users/{id}`, vs. an existing
+/// `/en/users/{slug}`) are a DIFFERENT string but the SAME matchit shape,
+/// which axum's `Router::route` rejects as a conflict regardless — the
+/// exact-duplicate-path preflight elsewhere in this file already delegates
+/// to the same matchit oracle for this reason (Codex review).
 #[cfg(feature = "i18n")]
 fn detect_locale_prefix_path_collision(
     included_paths: &[&'static str],
@@ -1999,8 +2067,12 @@ fn detect_locale_prefix_path_collision(
             } else {
                 format!("/{locale}{path}")
             };
-            let collides = included_paths.iter().any(|p| *p == generated)
-                || excluded_paths.iter().any(|p| *p == generated);
+            let collides = included_paths
+                .iter()
+                .any(|p| paths_conflict_under_matchit(p, &generated))
+                || excluded_paths
+                    .iter()
+                    .any(|p| paths_conflict_under_matchit(p, &generated));
             if collides {
                 return Some(RouterBuildError::LocalePrefixPathCollision {
                     locale: locale.clone(),
@@ -2014,10 +2086,11 @@ fn detect_locale_prefix_path_collision(
 }
 
 /// Builds the locale-prefixed router: `excluded_router` (and a bare-path
-/// redirect for every `included_paths` entry) mount at the top level;
-/// `content_router` is cloned and nested once per entry in `valid_locales`
-/// (see [`validated_locale_prefix_locales`] — already deduped and filtered
-/// to safe `Router::nest` segments).
+/// redirect for every `path_method_filters` entry, claiming only the exact
+/// methods registered there — see [`included_path_method_filters`]) mount at
+/// the top level; `content_router` is cloned and nested once per entry in
+/// `valid_locales` (see [`validated_locale_prefix_locales`] — already
+/// deduped and filtered to safe `Router::nest` segments).
 ///
 /// Cloning `content_router` — a cheap, `Arc`-backed `axum::Router` — rather
 /// than the underlying [`Route`] list is what lets every locale share one
@@ -2032,17 +2105,19 @@ fn detect_locale_prefix_path_collision(
 fn apply_locale_prefix_routing(
     excluded_router: axum::Router<AppState>,
     content_router: &axum::Router<AppState>,
-    included_paths: &[&'static str],
+    path_method_filters: &[(&'static str, axum::routing::MethodFilter)],
     i18n: &crate::i18n::I18nConfig,
     valid_locales: &[String],
 ) -> axum::Router<AppState> {
     let mut router = excluded_router;
 
-    if !included_paths.is_empty() && !valid_locales.is_empty() {
+    if !path_method_filters.is_empty() && !valid_locales.is_empty() {
         let mut redirect_router = axum::Router::<AppState>::new();
-        for path in included_paths {
-            redirect_router =
-                redirect_router.route(path, axum::routing::any(locale_prefix_redirect_handler));
+        for (path, filter) in path_method_filters {
+            redirect_router = redirect_router.route(
+                path,
+                axum::routing::on(*filter, locale_prefix_redirect_handler),
+            );
         }
         router = router.merge(redirect_router);
     }
@@ -6490,6 +6565,98 @@ mod tests {
                 }
                 other => panic!("expected LocalePrefixPathCollision, got {other:?}"),
             }
+        }
+
+        /// Codex review (P1): a generated locale path can collide with an
+        /// existing route that has the SAME matchit shape but a DIFFERENT
+        /// capture name (`/en/users/{id}` generated from `/users/{id}`, vs.
+        /// an existing `/en/users/{slug}`) — axum's `Router::route` rejects
+        /// this as a conflict regardless of the capture name, exactly like
+        /// the exact-duplicate-path case, so it must be caught the same way.
+        #[tokio::test]
+        async fn generated_locale_path_collision_via_capture_name_mismatch_is_a_build_error() {
+            let config = config(&["en"], &[]);
+            let users_id = slug_route("/users/{id}", "users_id");
+            let en_users_slug = slug_route("/en/users/{slug}", "en_users_slug");
+            let err = try_build_router(vec![users_id, en_users_slug], &config, test_state())
+                .expect_err("a capture-name-mismatched shape collision must be a build error");
+            assert!(
+                matches!(err, RouterBuildError::LocalePrefixPathCollision { .. }),
+                "expected LocalePrefixPathCollision, got {err:?}"
+            );
+        }
+
+        /// Codex review (P2): a locale segment beginning with `:` (axum 0.7
+        /// capture syntax) must not panic at router-construction time — axum
+        /// 0.8's `Router::route` rejects it during assembly (the same
+        /// restriction `InvalidMcpPath` guards for MCP mount paths).
+        #[tokio::test]
+        async fn colon_prefixed_locale_segment_does_not_panic() {
+            let config = config(&["en", ":en"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en"])));
+
+            let en = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en.status(), StatusCode::OK);
+            assert_eq!(body_string(en).await, "en");
+        }
+
+        /// Codex review (P1): the bare-path redirect must claim only the
+        /// methods actually registered at that path, not every method via
+        /// `any()`. A user route at `POST /health` (a different method than
+        /// the framework's own auto-mounted `GET /health` probe) must not
+        /// have its redirect swallow GET too — that would collide with the
+        /// probe's later auto-mount, which has no visibility into methods
+        /// the redirect already claimed.
+        #[tokio::test]
+        async fn bare_path_redirect_claims_only_registered_methods_not_every_method() {
+            async fn user_health_post() -> &'static str {
+                "posted"
+            }
+
+            let config = config(&["en"], &[]);
+            let route = Route {
+                method: http::Method::POST,
+                path: "/health",
+                handler: axum::routing::post(user_health_post),
+                name: "user_health_post",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path: "/health",
+                    operation_id: "user_health_post",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            };
+
+            // Before the fix, the redirect's `any()` claimed GET at /health
+            // too, colliding with the framework's own auto-mounted probe and
+            // panicking inside `axum::Router::route`.
+            let app = build_router(vec![route], &config, test_state());
+
+            let health = request(&app, "/health", &[]).await;
+            assert_eq!(
+                health.status(),
+                StatusCode::OK,
+                "the framework's own health probe must still respond at GET /health"
+            );
+
+            let redirected = request_method(&app, http::Method::POST, "/health", &[]).await;
+            assert_eq!(redirected.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                redirected
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en/health")
+            );
         }
 
         /// Codex review (P2): `LocaleRoutingConfig` (and the default-locale
