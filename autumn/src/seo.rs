@@ -91,7 +91,7 @@
 //! ```
 //!
 //! `sitemap.xml` also lists one entry per supported locale for each eligible
-//! static route automatically when the flag is on — see [`assemble_seo_bodies`].
+//! static route automatically when the flag is on.
 //!
 //! ## Sitemap
 //!
