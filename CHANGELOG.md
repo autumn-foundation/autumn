@@ -354,19 +354,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #1797) and the CI-facing `sim-sweep` `[[bin]]`: `sweep_proptest(seeds,
   &strategy, body)` runs `Sim::run_proptest` across a batch of seeds on a
   `std::thread::available_parallelism`-sized worker pool and reports the
-  lowest-index failing seed (if any), with its shrunk op-sequence plus a
-  replay command — deterministic regardless of thread scheduling, since every
-  seed in the batch always runs to completion before the lowest-index failure
-  is selected. Folds every proptest case's `sometimes!` observations (not
-  just the last of up to 256 cases per seed — `Sim::run_proptest_with_case_hook`
-  is a new `pub(crate)` hook for this) into a cross-seed aggregate, so a
-  fully-green sweep is only reported as `Passed` when it is also non-vacuous
-  (`Vacuous` otherwise, if some label was observed but never satisfied
-  anywhere in the range). `AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web
-  --release --features sim-testing --bin sim-sweep` sweeps seeds `0..1000`
-  against a built-in account demo scenario; a new standalone CI job runs it
-  at seed count 512 on every push/PR, structured like the `loom` job.
-  [no-plugin]
+  lowest-index failing seed (if any), with its shrunk op-sequence — the
+  library's own `SweepFailure` is caller-agnostic (it doesn't prescribe a
+  replay command, since `sweep_proptest` has no idea what test or binary is
+  calling it); the `sim-sweep` bin appends its own replay suggestion when it
+  prints a failure, since it knows its own invocation. Deterministic
+  regardless of thread scheduling, since every seed in the batch always runs
+  to completion before the lowest-index failure is selected. Folds every
+  proptest case's `sometimes!` observations (not just the last of up to 256
+  cases per seed — `Sim::run_proptest_with_case_hook` is a new `pub(crate)`
+  hook for this) into a cross-seed aggregate, so a fully-green sweep is only
+  reported as `Passed` when it is also non-vacuous (`Vacuous` otherwise, if
+  some label was observed but never satisfied anywhere in the range).
+  `AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release --features
+  sim-testing --bin sim-sweep` sweeps seeds `0..1000` against a built-in
+  account demo scenario; a new standalone CI job runs it at seed count 512 on
+  every push/PR, structured like the `loom` job. [no-plugin]
 - **sim-testing:** add a property-based **op-driver** (`sim::op`, W6 PR2,
   #1797) behind the new `sim-testing` feature: `Sim::gen_ops::<T>()` /
   `Sim::gen_ops_with(strategy)` deterministically draw an arbitrary `Vec<T>`

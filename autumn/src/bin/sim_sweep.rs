@@ -81,6 +81,19 @@ fn seed_count() -> u64 {
         .unwrap_or(DEFAULT_SEED_COUNT)
 }
 
+/// This binary's own replay suggestion for a failing `seed` — appended after
+/// `SweepFailure`'s (caller-agnostic) `Display` output, since only this
+/// binary knows it's the one being invoked. The count is decimal, matching
+/// `seed_count`'s decimal-only parser: printing it as hex here would
+/// silently fail to parse there and fall back to the default seed count
+/// instead of covering the failing seed.
+fn replay_command(seed: u64) -> String {
+    format!(
+        "  replay: AUTUMN_SIM_SEEDS={} cargo run -p autumn-web --release --features sim-testing --bin sim-sweep",
+        seed.wrapping_add(1),
+    )
+}
+
 fn main() {
     let count = seed_count();
     let strategy = proptest::collection::vec(any::<Op>(), 1..32);
@@ -93,6 +106,7 @@ fn main() {
         SweepOutcome::Failed { seeds_run, failure } => {
             eprintln!("sim-sweep: FAILED after {seeds_run} seed(s)");
             eprintln!("{failure}");
+            eprintln!("{}", replay_command(failure.seed));
             std::process::exit(1);
         }
         SweepOutcome::Vacuous {
@@ -106,5 +120,31 @@ fn main() {
             );
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_command_emits_a_seed_count_that_covers_the_failing_seed_and_parses_as_plain_decimal()
+    {
+        let command = replay_command(300);
+        let count_str = command
+            .split("AUTUMN_SIM_SEEDS=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("replay command must carry a seed count");
+        // Mirrors `seed_count`'s own decimal-only parser — this is the exact
+        // failure mode the P2 review comment caught: a hex count here would
+        // silently fail this same parse and fall back to `DEFAULT_SEED_COUNT`.
+        let count: u64 = count_str.parse().unwrap_or_else(|err| {
+            panic!("replay count {count_str:?} must parse as plain decimal u64: {err}")
+        });
+        assert!(
+            count > 300,
+            "replay count {count} must exceed the failing seed 300 so re-sweeping 0..{count} reaches it"
+        );
     }
 }

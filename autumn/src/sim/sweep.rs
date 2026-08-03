@@ -2,12 +2,14 @@
 //!
 //! This is the **sweep** lane of the sim harness: running
 //! [`Sim::run_proptest`] across a batch of seeds, in parallel, and reporting
-//! the lowest-index failing seed (if any) — its shrunk minimal op-sequence
-//! (proptest's own shrink loop, run per-seed by [`Sim::run_proptest`]) plus a
-//! deterministic replay command. The `sim-sweep` `[[bin]]`
-//! (`autumn/src/bin/sim_sweep.rs`) is the CI-facing driver; [`sweep_proptest`]
-//! is the reusable library function it (and the `sim_sweep_driver` `DoD`
-//! test) calls.
+//! the lowest-index failing seed (if any) and its shrunk minimal op-sequence
+//! (proptest's own shrink loop, run per-seed by [`Sim::run_proptest`]).
+//! [`sweep_proptest`] is a caller-agnostic public library function — it does
+//! not prescribe a replay command, since it has no idea what test or binary
+//! is calling it with what strategy; a caller that knows its own invocation
+//! context appends its own replay suggestion when it reports the failure
+//! (see `autumn/src/bin/sim_sweep.rs`, the CI-facing driver, for a worked
+//! example).
 //!
 //! # Design: parallel across available cores, full batch, deterministic result
 //!
@@ -79,20 +81,22 @@ pub struct SweepFailure<T> {
 
 impl<T: fmt::Debug> fmt::Display for SweepFailure<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The replay count is decimal, matching `AUTUMN_SIM_SEEDS`'s own
-        // decimal parser (`sim_sweep.rs`'s `seed_count`) — printing it as hex
-        // here would silently fail to parse and fall back to the default
-        // seed count, producing a replay command that doesn't actually
-        // replay the reported failure.
+        // Caller-agnostic — [`sweep_proptest`] is a public library function
+        // any application can call with its own strategy/body, so this must
+        // not prescribe a specific command (that was a real bug: it used to
+        // hard-code the `sim-sweep` bin's own invocation, which runs an
+        // unrelated built-in demo and can pass even when the reported seed
+        // reliably fails the *caller's* property). Mirrors
+        // [`Sim::run_proptest`]'s own replay line for the same reason — a
+        // caller that knows its own invocation context (like the `sim-sweep`
+        // bin) appends its own replay suggestion when it prints this.
         write!(
             f,
-            "AUTUMN_SIM_SEED=0x{:x} — shrunk to {} op(s): {:?} ({})\n  \
-             replay: AUTUMN_SIM_SEEDS={} cargo run -p autumn-web --release --features sim-testing --bin sim-sweep",
+            "AUTUMN_SIM_SEED=0x{:x} — shrunk to {} op(s): {:?} ({})",
             self.seed,
             self.shrunk_ops.len(),
             self.shrunk_ops,
             self.reason,
-            self.seed.wrapping_add(1),
         )
     }
 }
@@ -244,34 +248,27 @@ mod tests {
     }
 
     #[test]
-    fn failure_display_prints_a_decimal_replay_count_that_covers_the_failing_seed() {
-        // `AUTUMN_SIM_SEEDS` (`sim_sweep.rs`'s `seed_count`) parses with plain
-        // `str::parse::<u64>()`, i.e. decimal only — printing the replay count
-        // as `0x…` here would silently fail to parse there and fall back to
-        // the default seed count, producing a replay command that doesn't
-        // actually cover (and so can't reproduce) the reported failure.
+    fn failure_display_is_caller_agnostic_and_does_not_prescribe_a_replay_command() {
+        // `sweep_proptest` is a public library function any application can
+        // call with its own strategy/body — `Display` used to hard-code a
+        // `cargo run ... --bin sim-sweep` suggestion, which is wrong for
+        // every caller except that one specific demo binary (that command
+        // runs sim-sweep's *own* built-in scenario, not the caller's). A
+        // caller that knows its own invocation context appends its own
+        // suggestion instead (see `sim_sweep.rs`'s `main`).
         let failure = SweepFailure {
             seed: 300u64,
             shrunk_ops: vec![TinyOp::Inc],
             reason: "example".to_owned(),
         };
         let rendered = failure.to_string();
-        let replay_line = rendered
-            .lines()
-            .find(|line| line.contains("AUTUMN_SIM_SEEDS="))
-            .expect("Display must print a replay line");
-        let count_str = replay_line
-            .split("AUTUMN_SIM_SEEDS=")
-            .nth(1)
-            .and_then(|rest| rest.split_whitespace().next())
-            .expect("replay line must carry a seed count");
-        let count: u64 = count_str.parse().unwrap_or_else(|err| {
-            panic!("replay count {count_str:?} must parse as plain decimal u64: {err}")
-        });
         assert!(
-            count > failure.seed,
-            "replay count {count} must exceed the failing seed {} so re-sweeping 0..{count} reaches it",
-            failure.seed
+            !rendered.contains("cargo run") && !rendered.contains("sim-sweep"),
+            "Display must not prescribe a specific replay command, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("0x12c"),
+            "Display must still report the failing seed, got: {rendered:?}"
         );
     }
 
