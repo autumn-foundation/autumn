@@ -1,8 +1,8 @@
 //! Seed sweep runner (sim-testing W6 PR3, issue #1797).
 //!
 //! This is the **sweep** lane of the sim harness: running
-//! [`Sim::run_proptest`] across a batch of seeds, in parallel, and reporting
-//! the lowest-index failing seed (if any) and its shrunk minimal op-sequence
+//! [`Sim::run_proptest`] across a batch of seeds, sequentially, and reporting
+//! the first failing seed (if any) and its shrunk minimal op-sequence
 //! (proptest's own shrink loop, run per-seed by [`Sim::run_proptest`]).
 //! [`sweep_proptest`] is a caller-agnostic public library function — it does
 //! not prescribe a replay command, since it has no idea what test or binary
@@ -11,39 +11,61 @@
 //! (see `autumn/src/bin/sim_sweep.rs`, the CI-facing driver, for a worked
 //! example).
 //!
-//! # Design: parallel across available cores, full batch, deterministic result
+//! # Design: sequential, not parallel — and why that's not a regression
 //!
-//! [`sweep_proptest`] dispatches the swept seeds across a
-//! [`std::thread::available_parallelism`]-sized worker pool
-//! ([`std::thread::scope`], no new dependency) rather than one seed at a
-//! time. Two things make that safe and still fully deterministic:
+//! An earlier revision of this module parallelized the sweep across a
+//! `std::thread`-per-core worker pool. Review caught four escalating,
+//! genuinely real bugs in that design, and the last two are not
+//! patch-level fixes — they're a hard architectural wall:
 //!
-//! - The only shared mutable state a `Sim` run touches is the
-//!   [`sometimes!`](crate::sometimes) reachability registry
-//!   ([`sim::assert`](super::assert)), and it's **thread-local** — every
-//!   other seam (`SimRng`, the clock, chaos/crash schedules) is a pure
-//!   function of the seed, owned by that seed's own `Sim` value. Each worker
-//!   folds *its own* thread's registry into a seed-local accumulator (see
-//!   below) before handing that off to a shared aggregate — never reading or
-//!   resetting another thread's registry.
-//! - Every seed in the requested range is run to completion (no worker
-//!   aborts early just because a peer found a failure elsewhere in the
-//!   batch). After every worker finishes, the **lowest-index** failing seed
-//!   among everything collected is reported — deterministic regardless of
-//!   which worker happened to reach a failure first. This trades "stop the
-//!   instant any failure is found" for a simpler, race-free result; for a
-//!   *bounded* batch (`AUTUMN_SIM_SEEDS=N`, not an open-ended search) the
-//!   worst-case total work is the same either way (≤ N seed-runs), so the
-//!   only real cost is CI wall-clock in the failing case, not correctness.
+//! - **Process-global state.** `TestApp::build` (what `Sim::build`/`body`
+//!   calls to mount a real app) unconditionally clears process-global state
+//!   at the top of the function — the cache (`crate::cache::clear_global_cache`)
+//!   and the event bus (`crate::events::clear_global_event_bus`) — and, when
+//!   the app configures jobs, installs a process-global `GLOBAL_JOB_CLIENT`
+//!   (`job.rs`). None of this is per-`Sim`-instance or thread-local. Two
+//!   `body` closures calling `sim.build(...)` **concurrently** on different
+//!   worker threads race on all of it — one seed's app can clear or
+//!   redirect another seed's cache, event bus, or job routing mid-run. This
+//!   isn't something a worker-local fix (like the paused-runtime-per-worker
+//!   fix an intermediate revision added) can solve; it needs either a global
+//!   lock serializing every `sim.build`-calling case (which defeats the
+//!   point of parallelizing exactly the scenarios that matter most) or
+//!   process-per-worker isolation (far outside this PR's scope).
+//! - **The sync-only `body` signature can't drive spawned work.**
+//!   `Sim::run_proptest`'s `body: Fn(&mut Sim, &[T])` is plain synchronous —
+//!   it cannot `.await` anything, so it can never call [`Sim::advance`] or
+//!   [`Sim::run_to_idle`] (both `async fn`) to actually drain a mounted
+//!   app's background job workers. Merely `.enter()`ing a Tokio runtime on
+//!   each worker (as the intermediate revision did) stops `tokio::spawn`
+//!   from panicking, but never *polls* the runtime, so any spawned
+//!   background tasks stay permanently inert — a job-backed property would
+//!   silently test against an app whose workers never run. Fixing this for
+//!   real needs `Sim::run_proptest`'s body to become async — a breaking
+//!   change to the already-shipped W6 PR2 signature, out of scope here.
 //!
-//! Each worker also builds and [`enter`](tokio::runtime::Runtime::enter)s its
-//! **own** paused current-thread Tokio runtime — the exact construction
-//! [`#[sim_test]`](crate::sim_test) uses — for its whole lifetime, reused
-//! across every seed it processes. A raw `std::thread::scope` thread
-//! otherwise inherits no ambient Tokio context, so a `body` that mounts a
-//! real app (`sim.build`, which starts the job runtime via `tokio::spawn`)
-//! would panic with "there is no reactor running" — a real bug an earlier
-//! revision of this parallelization had, caught in review.
+//! Both are specific to `body` closures that call `sim.build`/mount a real
+//! app — every scenario this PR actually ships (the `sim-sweep` bin's demo,
+//! `sim_sweep_driver`'s `DoD` tests, this module's own unit tests) is a
+//! self-contained op-application model with no app-mounting at all, so
+//! neither bug is reachable from anything merged here. But `sweep_proptest`
+//! is a *public* function; a future caller mounting a real app is exactly
+//! the scenario the whole sim-testing effort exists for, and it must not
+//! silently corrupt itself. Sequential execution sidesteps both bugs
+//! entirely — there is never more than one `body` invocation in flight, so
+//! there is nothing to race regardless of what `body` does — while costing
+//! only sweep wall-clock, not correctness or coverage: **sweep-level
+//! threading is orthogonal to the harness's actual concurrency-bug-finding
+//! power**, which comes from exploring different seeds (each driving a
+//! *single-threaded, deterministic* `Sim` executor internally, per W1's
+//! design), not from how many OS threads process the outer seed range.
+//!
+//! This also matches the already-shipped W6 PR1 [`sometimes!`](crate::sometimes)
+//! non-vacuity registry ([`sim::assert`](super::assert)), whose own module
+//! docs already named this exact sweep as "the sweep (which runs seeds
+//! sequentially on one thread)" — sequential was the original, reviewed
+//! design; the parallel revision was a detour that review correctly walked
+//! back.
 //!
 //! # Non-vacuity
 //!
@@ -65,8 +87,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use proptest::strategy::Strategy;
 use proptest::test_runner::TestError;
@@ -77,8 +97,8 @@ use super::assert::{reset_sometimes_registry, sometimes_snapshot};
 /// The seed a sweep reports as failing, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepFailure<T> {
-    /// The lowest-index seed (in sweep order) whose [`Sim::run_proptest`] run
-    /// failed among every seed in the swept batch.
+    /// The first seed (in sweep order) whose [`Sim::run_proptest`] run
+    /// failed; the sweep stopped there without running any later seed.
     pub seed: u64,
     /// The minimal op-sequence proptest shrunk this seed's failure down to.
     /// Empty for a [`TestError::Abort`] (the run itself could not proceed —
@@ -116,13 +136,14 @@ pub enum SweepOutcome<T> {
     /// Every swept seed passed, and every [`sometimes!`](crate::sometimes)
     /// label observed across the whole sweep was satisfied at least once.
     Passed {
-        /// How many seeds were run.
+        /// How many seeds were run before the sweep concluded.
         seeds_run: u64,
     },
-    /// `failure` is the lowest-index seed (in sweep order) that failed.
+    /// `failure.seed` was the first seed (in sweep order) to fail; the sweep
+    /// stopped there without running any later seed.
     Failed {
-        /// How many seeds were run (always the full requested batch — see
-        /// the module docs for why the sweep doesn't abort early).
+        /// How many seeds were run before the sweep stopped (includes the
+        /// failing seed itself).
         seeds_run: u64,
         /// The failing seed and its shrunk reproduction.
         failure: SweepFailure<T>,
@@ -138,115 +159,60 @@ pub enum SweepOutcome<T> {
     },
 }
 
-/// Sweep `seeds` across a worker pool through [`Sim::run_proptest`].
+/// Sweep `seeds` sequentially through [`Sim::run_proptest`].
 ///
-/// Reports the lowest-index failing seed (if any), folding every case's
+/// Stops at the first failing seed (fail-fast) and folds every case's
 /// [`sometimes!`](crate::sometimes) observations (not just the last case per
-/// seed) into a cross-seed non-vacuity aggregate. See the module docs for the
-/// parallelism and non-vacuity design.
+/// seed) into a cross-seed non-vacuity aggregate. See the module docs for why
+/// this runs sequentially rather than in parallel.
 ///
-/// `strategy` and `body` are each shared by reference across every seed and
-/// every worker — neither needs to be `Clone`.
-///
-/// # Panics
-///
-/// Panics if a worker thread panics while holding the internal aggregation
-/// lock — this does not happen in ordinary use: a panic inside `body` (e.g.
-/// an [`always!`](crate::always) violation) is caught by proptest's
-/// `TestRunner` itself and turned into a case failure, never propagating to
-/// the worker thread.
+/// `strategy` and `body` are each shared by reference across every seed —
+/// neither needs to be `Clone`.
 pub fn sweep_proptest<T, S, F>(
     seeds: impl IntoIterator<Item = u64>,
     strategy: &S,
     body: F,
 ) -> SweepOutcome<T>
 where
-    T: fmt::Debug + Send,
-    S: Strategy<Value = Vec<T>> + Sync,
-    F: Fn(&mut Sim, &[T]) + Sync,
+    T: fmt::Debug,
+    S: Strategy<Value = Vec<T>>,
+    F: Fn(&mut Sim, &[T]),
 {
-    let seeds: Vec<u64> = seeds.into_iter().collect();
-    let seeds_run = seeds.len() as u64;
-    let worker_count = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(seeds.len().max(1));
+    let mut seeds_run = 0u64;
+    let mut all_observed = BTreeSet::new();
+    let mut all_satisfied = BTreeSet::new();
 
-    let next_index = AtomicUsize::new(0);
-    let aggregate: Mutex<(BTreeSet<String>, BTreeSet<String>)> =
-        Mutex::new((BTreeSet::new(), BTreeSet::new()));
-    // (seed index, failure) for every seed in the batch that failed —
-    // reduced to the lowest-index entry after every worker has finished the
-    // whole batch, so the reported seed never depends on thread scheduling.
-    let failures: Mutex<Vec<(usize, SweepFailure<T>)>> = Mutex::new(Vec::new());
+    for seed in seeds {
+        seeds_run += 1;
 
-    std::thread::scope(|scope| {
-        for _ in 0..worker_count {
-            scope.spawn(|| {
-                // A raw `std::thread::scope` worker inherits no ambient Tokio
-                // context — unlike `#[sim_test]`'s single `block_on`-driven
-                // thread, which every case in the (formerly sequential) sweep
-                // used to share. A `body` that mounts a real app (`sim.build`,
-                // which starts the job runtime via `tokio::spawn` —
-                // `job.rs`'s worker-loop spawn) would panic with "there is no
-                // reactor running" without this. One paused current-thread
-                // runtime per worker, entered for its whole lifetime — mirrors
-                // `#[sim_test]`'s own runtime exactly (`sim_test.rs`), reused
-                // across every seed this worker processes rather than rebuilt
-                // per seed.
-                let __sweep_worker_runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .start_paused(true)
-                    .build()
-                    .expect("failed to build a paused sim runtime for this sweep worker");
-                let _sweep_worker_runtime_guard = __sweep_worker_runtime.enter();
+        let mut seed_observed = BTreeSet::new();
+        let mut seed_satisfied = BTreeSet::new();
+        let result = Sim::run_proptest_with_case_hook(seed, strategy, &body, || {
+            let (observed, satisfied) = sometimes_snapshot();
+            seed_observed.extend(observed);
+            seed_satisfied.extend(satisfied);
+            reset_sometimes_registry();
+        });
 
-                loop {
-                    let index = next_index.fetch_add(1, Ordering::Relaxed);
-                    let Some(&seed) = seeds.get(index) else {
-                        break;
-                    };
+        all_observed.extend(seed_observed);
+        all_satisfied.extend(seed_satisfied);
 
-                    let mut seed_observed = BTreeSet::new();
-                    let mut seed_satisfied = BTreeSet::new();
-                    let result = Sim::run_proptest_with_case_hook(seed, strategy, &body, || {
-                        let (observed, satisfied) = sometimes_snapshot();
-                        seed_observed.extend(observed);
-                        seed_satisfied.extend(satisfied);
-                        reset_sometimes_registry();
-                    });
-
-                    {
-                        let mut agg = aggregate.lock().unwrap();
-                        agg.0.extend(seed_observed);
-                        agg.1.extend(seed_satisfied);
-                    }
-
-                    if let Err(err) = result {
-                        let (reason, shrunk_ops) = match err {
-                            TestError::Fail(reason, shrunk_ops) => (reason.to_string(), shrunk_ops),
-                            TestError::Abort(reason) => (format!("aborted: {reason}"), Vec::new()),
-                        };
-                        failures.lock().unwrap().push((
-                            index,
-                            SweepFailure {
-                                seed,
-                                shrunk_ops,
-                                reason,
-                            },
-                        ));
-                    }
-                }
-            });
+        if let Err(err) = result {
+            let (reason, shrunk_ops) = match err {
+                TestError::Fail(reason, shrunk_ops) => (reason.to_string(), shrunk_ops),
+                TestError::Abort(reason) => (format!("aborted: {reason}"), Vec::new()),
+            };
+            return SweepOutcome::Failed {
+                seeds_run,
+                failure: SweepFailure {
+                    seed,
+                    shrunk_ops,
+                    reason,
+                },
+            };
         }
-    });
-
-    let mut failures = failures.into_inner().unwrap();
-    failures.sort_by_key(|(index, _)| *index);
-    if let Some((_, failure)) = failures.into_iter().next() {
-        return SweepOutcome::Failed { seeds_run, failure };
     }
 
-    let (all_observed, all_satisfied) = aggregate.into_inner().unwrap();
     let unsatisfied: BTreeSet<String> = all_observed.difference(&all_satisfied).cloned().collect();
     if unsatisfied.is_empty() {
         SweepOutcome::Passed { seeds_run }
@@ -272,29 +238,6 @@ mod tests {
 
     fn tiny_op_strategy() -> impl Strategy<Value = Vec<TinyOp>> {
         proptest::collection::vec(prop_oneof![Just(TinyOp::Inc), Just(TinyOp::Dec)], 0..16)
-    }
-
-    #[test]
-    fn sweep_workers_have_a_reactor_so_body_can_spawn_tokio_tasks() {
-        // A raw `std::thread::scope` worker inherits no ambient Tokio
-        // context. A `body` that mounts a real app (`sim.build`) starts the
-        // job runtime via a bare `tokio::spawn` (`job.rs`) — reproduce that
-        // exact failure mode directly (no need for the full `TestApp`/job
-        // machinery) with `tokio::spawn` in `body`: it would panic with
-        // "there is no reactor running" on a worker with no runtime entered.
-        // `worker_count` in `sweep_proptest` is
-        // `available_parallelism().min(seeds.len())`, so a range with more
-        // seeds than one guarantees more than one worker thread is exercised
-        // whenever this test runs on a multi-core machine.
-        let strategy = tiny_op_strategy();
-        let outcome = sweep_proptest(0..16, &strategy, |_sim, _ops| {
-            let _ = tokio::spawn(async {});
-        });
-        assert!(
-            matches!(outcome, SweepOutcome::Passed { seeds_run: 16 }),
-            "every worker must have an entered Tokio runtime so `tokio::spawn` \
-             in `body` doesn't panic, got {outcome:?}"
-        );
     }
 
     #[test]
@@ -377,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_finds_the_lowest_index_failing_seed_in_the_batch() {
+    fn sweep_stops_at_the_first_failing_seed_and_shrinks_it() {
         // Fails whenever three or more `Inc`s appear back to back.
         let strategy = tiny_op_strategy();
         let outcome = sweep_proptest(0..16, &strategy, |_sim, ops| {
@@ -389,10 +332,7 @@ mod tests {
         });
         match outcome {
             SweepOutcome::Failed { seeds_run, failure } => {
-                assert_eq!(
-                    seeds_run, 16,
-                    "the full batch runs regardless of where the failure is"
-                );
+                assert!(seeds_run >= 1);
                 assert_eq!(
                     failure.shrunk_ops,
                     vec![TinyOp::Inc, TinyOp::Inc, TinyOp::Inc]

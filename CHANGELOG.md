@@ -352,25 +352,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the generator emits 3.1.0). [no-plugin]
 - **sim-testing:** add the **seed-sweep runner** (`sim::sweep`, W6 PR3,
   #1797) and the CI-facing `sim-sweep` `[[bin]]`: `sweep_proptest(seeds,
-  &strategy, body)` runs `Sim::run_proptest` across a batch of seeds on a
-  `std::thread::available_parallelism`-sized worker pool — each worker builds
-  and enters its own paused current-thread Tokio runtime (the same
-  construction `#[sim_test]` uses), so a `body` that mounts a real app via
-  `sim.build` (which starts the job runtime through `tokio::spawn`) doesn't
-  panic with "there is no reactor running" on a raw, contextless worker
-  thread — and reports the lowest-index failing seed (if any), with its
-  shrunk op-sequence. The
-  library's own `SweepFailure` is caller-agnostic (it doesn't prescribe a
-  replay command, since `sweep_proptest` has no idea what test or binary is
-  calling it); the `sim-sweep` bin appends its own replay suggestion when it
-  prints a failure, since it knows its own invocation. Deterministic
-  regardless of thread scheduling, since every seed in the batch always runs
-  to completion before the lowest-index failure is selected. Folds every
-  proptest case's `sometimes!` observations (not just the last of up to 256
-  cases per seed — `Sim::run_proptest_with_case_hook` is a new `pub(crate)`
-  hook for this) into a cross-seed aggregate, so a fully-green sweep is only
-  reported as `Passed` when it is also non-vacuous (`Vacuous` otherwise, if
-  some label was observed but never satisfied anywhere in the range).
+  &strategy, body)` runs `Sim::run_proptest` sequentially across a batch of
+  seeds, stopping at the first failing seed and reporting its shrunk
+  op-sequence. `SweepFailure`'s `Display` is caller-agnostic (it doesn't
+  prescribe a replay command, since `sweep_proptest` has no idea what test or
+  binary is calling it); the `sim-sweep` bin appends its own replay
+  suggestion when it prints a failure, since it knows its own invocation.
+  Folds every proptest case's `sometimes!` observations (not just the last of
+  up to 256 cases per seed — `Sim::run_proptest_with_case_hook` is a new
+  `pub(crate)` hook for this) into a cross-seed aggregate, so a fully-green
+  sweep is only reported as `Passed` when it is also non-vacuous (`Vacuous`
+  otherwise, if some label was observed but never satisfied anywhere in the
+  range). Deliberately sequential rather than parallel across a worker pool:
+  review of an earlier revision surfaced that `TestApp::build` (what a
+  `body` mounting a real app calls) unconditionally touches process-global
+  state (the cache, the event bus, and — when jobs are configured — a global
+  job client), which concurrent workers would race on, and that
+  `Sim::run_proptest`'s sync-only `body` signature can't `.await`
+  `Sim::run_to_idle` to drain spawned background work even with a runtime
+  entered — both architectural, not patchable within this sweep. Sequential
+  execution sidesteps both; sweep-level threading was orthogonal to the
+  harness's actual concurrency-bug-finding power anyway (that comes from
+  exploring seeds against W1's single-threaded deterministic executor, not
+  from how many OS threads process the outer seed range).
   `AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release --features
   sim-testing --bin sim-sweep` sweeps seeds `0..1000` against a built-in
   account demo scenario; a new standalone CI job runs it at seed count 512 on
