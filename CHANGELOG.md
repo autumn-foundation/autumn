@@ -659,6 +659,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is W5.a; it stacks on W5.0 and is a sibling of W5.b (item 6). [no-plugin]
 ### Fixed
 
+- **sim-testing:** the op-driver's embedded proptest runners
+  (`Sim::gen_ops_with`, `Sim::run_proptest`, #1797) no longer inherit ambient
+  `PROPTEST_FORK` / `PROPTEST_TIMEOUT` env vars from `Config::default()`.
+  Neither runner has a `test_name` to give proptest's forking machinery, so
+  inheriting fork mode panicked with "Must supply test_name when forking
+  enabled" before a single op could be generated; both configs now force fork
+  mode and the fork timeout off explicitly.
 - **mail:** the prod `deliver_later` durability guard no longer aborts app
   startup for applications that never call `deliver_later`/`deliver_later_eager`
   (#2142). Previously, `install_mailer` hard-failed at boot in `prod` whenever
