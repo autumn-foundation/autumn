@@ -353,8 +353,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **sim-testing:** add the **seed-sweep runner** (`sim::sweep`, W6 PR3,
   #1797) and the CI-facing `sim-sweep` `[[bin]]`: `sweep_proptest(seeds,
   &strategy, body)` runs `Sim::run_proptest` across a batch of seeds on a
-  `std::thread::available_parallelism`-sized worker pool and reports the
-  lowest-index failing seed (if any), with its shrunk op-sequence — the
+  `std::thread::available_parallelism`-sized worker pool — each worker builds
+  and enters its own paused current-thread Tokio runtime (the same
+  construction `#[sim_test]` uses), so a `body` that mounts a real app via
+  `sim.build` (which starts the job runtime through `tokio::spawn`) doesn't
+  panic with "there is no reactor running" on a raw, contextless worker
+  thread — and reports the lowest-index failing seed (if any), with its
+  shrunk op-sequence. The
   library's own `SweepFailure` is caller-agnostic (it doesn't prescribe a
   replay command, since `sweep_proptest` has no idea what test or binary is
   calling it); the `sim-sweep` bin appends its own replay suggestion when it

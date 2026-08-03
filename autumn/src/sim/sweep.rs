@@ -36,6 +36,15 @@
 //!   worst-case total work is the same either way (≤ N seed-runs), so the
 //!   only real cost is CI wall-clock in the failing case, not correctness.
 //!
+//! Each worker also builds and [`enter`](tokio::runtime::Runtime::enter)s its
+//! **own** paused current-thread Tokio runtime — the exact construction
+//! [`#[sim_test]`](crate::sim_test) uses — for its whole lifetime, reused
+//! across every seed it processes. A raw `std::thread::scope` thread
+//! otherwise inherits no ambient Tokio context, so a `body` that mounts a
+//! real app (`sim.build`, which starts the job runtime via `tokio::spawn`)
+//! would panic with "there is no reactor running" — a real bug an earlier
+//! revision of this parallelization had, caught in review.
+//!
 //! # Non-vacuity
 //!
 //! A sweep is only meaningfully green if it is also **non-vacuous**: every
@@ -173,6 +182,24 @@ where
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
             scope.spawn(|| {
+                // A raw `std::thread::scope` worker inherits no ambient Tokio
+                // context — unlike `#[sim_test]`'s single `block_on`-driven
+                // thread, which every case in the (formerly sequential) sweep
+                // used to share. A `body` that mounts a real app (`sim.build`,
+                // which starts the job runtime via `tokio::spawn` —
+                // `job.rs`'s worker-loop spawn) would panic with "there is no
+                // reactor running" without this. One paused current-thread
+                // runtime per worker, entered for its whole lifetime — mirrors
+                // `#[sim_test]`'s own runtime exactly (`sim_test.rs`), reused
+                // across every seed this worker processes rather than rebuilt
+                // per seed.
+                let __sweep_worker_runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .start_paused(true)
+                    .build()
+                    .expect("failed to build a paused sim runtime for this sweep worker");
+                let _sweep_worker_runtime_guard = __sweep_worker_runtime.enter();
+
                 loop {
                     let index = next_index.fetch_add(1, Ordering::Relaxed);
                     let Some(&seed) = seeds.get(index) else {
@@ -245,6 +272,29 @@ mod tests {
 
     fn tiny_op_strategy() -> impl Strategy<Value = Vec<TinyOp>> {
         proptest::collection::vec(prop_oneof![Just(TinyOp::Inc), Just(TinyOp::Dec)], 0..16)
+    }
+
+    #[test]
+    fn sweep_workers_have_a_reactor_so_body_can_spawn_tokio_tasks() {
+        // A raw `std::thread::scope` worker inherits no ambient Tokio
+        // context. A `body` that mounts a real app (`sim.build`) starts the
+        // job runtime via a bare `tokio::spawn` (`job.rs`) — reproduce that
+        // exact failure mode directly (no need for the full `TestApp`/job
+        // machinery) with `tokio::spawn` in `body`: it would panic with
+        // "there is no reactor running" on a worker with no runtime entered.
+        // `worker_count` in `sweep_proptest` is
+        // `available_parallelism().min(seeds.len())`, so a range with more
+        // seeds than one guarantees more than one worker thread is exercised
+        // whenever this test runs on a multi-core machine.
+        let strategy = tiny_op_strategy();
+        let outcome = sweep_proptest(0..16, &strategy, |_sim, _ops| {
+            let _ = tokio::spawn(async {});
+        });
+        assert!(
+            matches!(outcome, SweepOutcome::Passed { seeds_run: 16 }),
+            "every worker must have an entered Tokio runtime so `tokio::spawn` \
+             in `body` doesn't panic, got {outcome:?}"
+        );
     }
 
     #[test]
