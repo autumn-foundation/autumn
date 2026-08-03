@@ -65,7 +65,7 @@ accept aliases like `Integer` or `Boolean`.
 | `DateTime` | `TIMESTAMPTZ NOT NULL` | `DateTime<Utc>` |
 | `Uuid` | `UUID NOT NULL` | `Uuid` |
 | `Bytea` | `BYTEA NOT NULL` | `Vec<u8>` |
-| `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) — **requires the `storage` feature**. **(trunk-dev)** the scaffold auto-enables autumn-web's `storage` + `multipart` (and uuid `v4`) in the project's Cargo.toml when an Attachment field is present, so it compiles with no manual edits; on published 0.5.0 add the `storage` feature by hand. **(trunk-dev)** the scaffold's create/update handlers take a `Multipart` extractor and stream to the blob store via `save_to_blob_store` (issue #1236) |
+| `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) — **requires the `storage` feature**. **(trunk-dev)** the scaffold auto-enables autumn-web's `storage` + `multipart` (and uuid `v4`) in the project's Cargo.toml when an Attachment field is present, so it compiles with no manual edits; on published 0.5.0 add the `storage` feature by hand. **(trunk-dev)** the scaffold's create/update handlers take a `Multipart` extractor and stream to the blob store via `save_to_blob_store`, and the show/edit views render the stored file as a signed download link (issue #1236) |
 | `Option<T>` | Nullable version of any above | `Option<T>` |
 | `references` **(trunk-dev)** | `post:references` → `post_id BIGINT NOT NULL REFERENCES posts(id)` + auto index | `i64` (field name gets `_id` appended; `post:references?` for `Option<i64>`) |
 | `enum{a,b,c}` **(trunk-dev)** | `TEXT` + `CHECK (col IN (...))` | Generated PascalCase Rust enum with Diesel/serde impls + `<select>` widget; `--default field=variant` sets SQL DEFAULT + `#[default]`. Quote the token in bash/zsh (brace expansion) |
@@ -226,7 +226,10 @@ columns excluded). Owner-scoped and `--live` indexes opt out (issue #1126).
 `Multipart` extractor and stream to the blob store via `save_to_blob_store`
 — the scaffold planner auto-enables autumn-web's `storage` and `multipart`
 features (and uuid's `v4`) in the project's Cargo.toml, so a freshly
-scaffolded resource compiles with no manual edits (issue #1236).
+scaffolded resource compiles with no manual edits. The show and edit views
+render the stored file as a signed, time-bounded download link
+(`attachment_url` / `attachment_link`), and the edit form labels the currently
+stored file above the file input (issue #1236).
 
 ### controller (trunk-dev)
 ```

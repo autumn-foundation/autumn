@@ -157,6 +157,20 @@
     margin: 0;
 }
 
+/* Currently stored file shown above an attachment column's file input, and the
+   type/size annotation beside a rendered attachment link — issue #1236. A file
+   input can't be repopulated, so this line is the only signal that the record
+   already holds a blob. */
+.autumn-field__current {
+    font-size: 0.875rem;
+    margin: 0 0 0.25rem;
+}
+
+.autumn-attachment__meta {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
 /* ── Rich text (autumn-rich-text) — issue #1255 ───────────────────────────── */
 
 .autumn-rich-text {
