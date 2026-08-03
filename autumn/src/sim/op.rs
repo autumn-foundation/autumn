@@ -34,8 +34,8 @@
 //!    untouched.
 //! 3. **`proptest` promoted to an optional *library* dependency** behind the
 //!    new `sim-testing` feature (see `autumn/Cargo.toml`), since this module
-//!    lives in `src/`, not `tests/`, and the forthcoming `sim-sweep` `[[bin]]`
-//!    (W6 PR3) needs it as a lib dep too — a `[[bin]]` cannot use dev-deps.
+//!    lives in `src/`, not `tests/`, and the `sim-sweep` `[[bin]]` ([`sim::sweep`](super::sweep),
+//!    W6 PR3) needs it as a lib dep too — a `[[bin]]` cannot use dev-deps.
 //!
 //! # Determinism
 //!
@@ -196,13 +196,7 @@ impl Sim {
         S: Strategy<Value = Vec<T>>,
         F: Fn(&mut Self, &[T]),
     {
-        let mut runner =
-            TestRunner::new_with_rng(embedded_config(), stream_rng(seed, OP_GEN_STREAM_SALT));
-        let result = runner.run(&strategy, |ops| {
-            let mut sim = Self::from_seed(seed);
-            body(&mut sim, &ops);
-            Ok(())
-        });
+        let result = Self::run_proptest_with_ref(seed, &strategy, body);
         if let Err(ref err) = result
             && let TestError::Fail(ref reason, ref shrunk_ops) = *err
         {
@@ -212,6 +206,36 @@ impl Sim {
             );
         }
         result
+    }
+
+    /// The shared core [`Sim::run_proptest`] delegates to, taking `strategy`
+    /// by reference instead of by value.
+    ///
+    /// `pub(crate)` rather than a second public entrypoint: [`sim::sweep`](super::sweep)
+    /// is the only other caller, and it needs to run the **same** strategy and
+    /// body across many seeds without requiring either to be `Clone` — a
+    /// reference is enough because [`TestRunner::run`] itself only ever
+    /// borrows the strategy. Does not print the replay line; callers own their
+    /// own failure reporting ([`Sim::run_proptest`] prints its single-seed
+    /// line, [`sim::sweep`](super::sweep) reports the seed that stopped the
+    /// sweep).
+    pub(crate) fn run_proptest_with_ref<T, S, F>(
+        seed: u64,
+        strategy: &S,
+        body: F,
+    ) -> Result<(), TestError<Vec<T>>>
+    where
+        T: fmt::Debug,
+        S: Strategy<Value = Vec<T>>,
+        F: Fn(&mut Self, &[T]),
+    {
+        let mut runner =
+            TestRunner::new_with_rng(embedded_config(), stream_rng(seed, OP_GEN_STREAM_SALT));
+        runner.run(strategy, |ops| {
+            let mut sim = Self::from_seed(seed);
+            body(&mut sim, &ops);
+            Ok(())
+        })
     }
 }
 

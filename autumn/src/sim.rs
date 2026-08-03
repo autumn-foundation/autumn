@@ -47,7 +47,10 @@
 //! - **W6** adds the [`always!`](crate::always) / [`sometimes!`](crate::sometimes)
 //!   assertion macros ([`mod@assert`]) and, behind the `sim-testing` feature, a
 //!   property-based op-driver (`sim::op`) — `Sim::gen_ops`/`Sim::gen_ops_with` for
-//!   deterministic generation and `Sim::run_proptest` for shrink-capable runs.
+//!   deterministic generation and `Sim::run_proptest` for shrink-capable runs —
+//!   plus a seed-sweep runner (`sim::sweep`): `sweep_proptest` runs
+//!   `Sim::run_proptest` across a batch of seeds, stopping and reporting at the
+//!   first failure, driven in CI by the `sim-sweep` `[[bin]]`.
 //!
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
@@ -124,6 +127,19 @@ pub use crash::{CrashPoint, CrashSchedule};
 // `proptest` as a library (not just dev) dependency — see `autumn/Cargo.toml`.
 #[cfg(feature = "sim-testing")]
 pub mod op;
+
+// The W6 seed-sweep runner (PR3, issue #1797): `sweep_proptest` runs
+// `Sim::run_proptest` sequentially across a batch of seeds, stopping (and
+// reporting) at the first failing seed, and folds `sometimes!` reachability
+// across the whole swept range so a green sweep is provably non-vacuous. The
+// `sim-sweep` `[[bin]]` (`autumn/src/bin/sim_sweep.rs`) is its CI-facing
+// driver. Same `sim-testing` feature gate as `op` — it builds directly on
+// `Sim::run_proptest_with_ref`.
+#[cfg(feature = "sim-testing")]
+pub mod sweep;
+
+#[cfg(feature = "sim-testing")]
+pub use sweep::{SweepFailure, SweepOutcome, sweep_proptest};
 
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.

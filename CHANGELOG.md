@@ -350,6 +350,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guides (#2099). Also corrects stale rustdoc that advertised a `/v3/api-docs`
   default (the served default is `/openapi.json`) and an "OpenAPI 3.0" document
   (the generator emits 3.1.0). [no-plugin]
+- **sim-testing:** add the **seed-sweep runner** (`sim::sweep`, W6 PR3,
+  #1797) and the CI-facing `sim-sweep` `[[bin]]`: `sweep_proptest(seeds,
+  &strategy, body)` runs `Sim::run_proptest` sequentially across a batch of
+  seeds, stopping at the first failing seed and reporting its shrunk
+  op-sequence plus a replay command, and folds each seed's `sometimes!`
+  reachability into a cross-seed aggregate so a fully-green sweep is only
+  reported as `Passed` when it is also non-vacuous (`Vacuous` otherwise, if
+  some label was observed but never satisfied anywhere in the range). Runs
+  sequentially on one thread rather than in parallel — the `sometimes!`
+  non-vacuity registry is thread-local, and the sweep is documented as its
+  aggregator, so spreading seeds across OS threads would fragment it.
+  `AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release --features
+  sim-testing --bin sim-sweep` sweeps seeds `0..1000` against a built-in
+  account demo scenario; a new standalone CI job runs it at seed count 512 on
+  every push/PR, structured like the `loom` job. [no-plugin]
 - **sim-testing:** add a property-based **op-driver** (`sim::op`, W6 PR2,
   #1797) behind the new `sim-testing` feature: `Sim::gen_ops::<T>()` /
   `Sim::gen_ops_with(strategy)` deterministically draw an arbitrary `Vec<T>`

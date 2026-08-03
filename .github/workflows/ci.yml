@@ -356,6 +356,10 @@ jobs:
         # dependency for `sim::op` — lint it here (alongside the sqlite lib
         # lint above) since it's not part of any other feature combo above.
         run: cargo clippy -p autumn-web --features "sqlite,sim-testing" --lib -- -D warnings
+      - name: Clippy (autumn-web bin, sim-sweep)
+        # `sim-sweep` (W6 PR3, issue #1797) is a `[[bin]]`, not part of `--lib`
+        # above, so it needs its own explicit clippy invocation.
+        run: cargo clippy -p autumn-web --features "sqlite,sim-testing" --bin sim-sweep -- -D warnings
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
@@ -402,6 +406,36 @@ jobs:
         run: |
           cargo test -p autumn-web --features sim-testing \
             --test sim_op_driver
+      - name: Run the sim seed-sweep DoD suite (W6 PR3, issue #1797)
+        # `sim_sweep_driver` proves `sim::sweep::sweep_proptest` itself — finds
+        # and shrinks an injected invariant break across a batch of seeds,
+        # deterministic replay of the failing seed, and the cross-seed
+        # `sometimes!` non-vacuity aggregate. Same `sim-testing` feature gate
+        # and rationale as the op-driver DoD suite above; kept as its own step
+        # for the same reason (isolated `[[test]]` binary, no `sqlite` need).
+        run: |
+          cargo test -p autumn-web --features sim-testing \
+            --test sim_sweep_driver
+
+  # Sim seed sweep (W6 PR3, issue #1797): sweeps `AUTUMN_SIM_SEEDS` seeds
+  # sequentially (see `sim::sweep`'s module docs for why sequential, not
+  # parallel) through the `sim-sweep` `[[bin]]`'s built-in, deliberately
+  # CORRECT account demo scenario — this job proves the seed-sweep mechanism
+  # itself scales to many seeds without a false positive. A genuine invariant
+  # break IS caught and shrunk: that's the `sim_sweep_driver` DoD suite in the
+  # sqlite-runtime job above, not this job (which must always stay green).
+  # Structured like the `loom` job below: its own bounded, standalone step.
+  sim-sweep:
+    name: Sim sweep (sim-testing)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Run the sim-sweep seed sweep
+        run: cargo run -p autumn-web --release --features sim-testing --bin sim-sweep
+        env:
+          AUTUMN_SIM_SEEDS: "512"
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings
