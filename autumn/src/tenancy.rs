@@ -414,14 +414,31 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
 /// routing (issue #1251) is enabled and that segment names a configured
 /// supported locale, so [`is_public_path`] evaluates the same logical path
 /// regardless of which locale prefix carried the request. Returns `path`
-/// unchanged otherwise (feature off, routing disabled, or no matching
-/// locale segment).
+/// unchanged otherwise (feature off, routing disabled, no matching locale
+/// segment, or `path` itself matches a configured locale-prefix exclusion).
+///
+/// That last case matters: a route excluded from locale-prefix routing
+/// (`[i18n] locale_prefix_exclude`/an auto-excluded `#[static_get]` route)
+/// was never actually nested under `/{locale}` — its first segment merely
+/// *resembles* a locale. E.g. locale `en`, exclusion `/en`, public path
+/// `/login`: `/en/login` is a real, still-tenant-scoped route (excluded from
+/// locale-prefixing), not the locale-prefixed `/login` — stripping it would
+/// wrongly exempt it from tenant resolution (Codex review).
 #[cfg(feature = "i18n")]
 fn strip_locale_prefix_for_tenancy<'a>(
     path: &'a str,
     config: &crate::config::AutumnConfig,
 ) -> &'a str {
     if !config.i18n.locale_prefix_enabled {
+        return path;
+    }
+    if config
+        .i18n
+        .locale_prefix_exclude_exact
+        .iter()
+        .any(|p| p == path)
+        || crate::router::matches_locale_exclude_prefix(path, &config.i18n.locale_prefix_exclude)
+    {
         return path;
     }
     let Some(rest) = path.strip_prefix('/') else {
@@ -816,6 +833,27 @@ mod tests {
         assert!(
             !is_public_path("/fr/login", &c),
             "an unsupported locale segment must not be stripped"
+        );
+    }
+
+    /// Codex review (P1): a path that itself matches a configured
+    /// locale-prefix exclusion was never actually nested under `/{locale}` —
+    /// its first segment merely resembles a locale — so it must NOT be
+    /// stripped. Locale `en`, exclusion `/en`, public path `/login`: `/en/login`
+    /// is a real, still-tenant-scoped route (excluded from locale-prefixing),
+    /// not the locale-prefixed `/login`.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn locale_lookalike_prefix_is_not_stripped_when_it_matches_an_exclusion() {
+        let mut c = public_paths_config(&["/login"]);
+        c.i18n.locale_prefix_enabled = true;
+        c.i18n.supported_locales = vec!["en".to_owned()];
+        c.i18n.locale_prefix_exclude = vec!["/en".to_owned()];
+
+        assert!(
+            !is_public_path("/en/login", &c),
+            "/en/login matches the /en exclusion, so it must stay tenant-scoped, \
+             not be treated as the locale-prefixed /login"
         );
     }
 

@@ -179,6 +179,28 @@ pub enum RouterBuildError {
         /// The original path template registered by the second handler.
         incoming_path: String,
     },
+    /// Locale-prefix routing (issue #1251) would generate a path that
+    /// collides with another route already registered at that exact path —
+    /// e.g. an app defines both `/foo` and `/en/foo` while `en` is a
+    /// supported locale: the bare-path redirect (mounted at every
+    /// locale-prefix-eligible path, claiming every HTTP method) already owns
+    /// `/en/foo`, so nesting `/foo`'s content under `/en` collides and axum
+    /// panics on the overlapping route at router-construction time. Detected
+    /// and surfaced as a build error instead (Codex review).
+    #[cfg(feature = "i18n")]
+    #[error(
+        "locale-prefix routing generates {generated:?} (locale {locale:?} + route {path:?}), \
+         which collides with another route already registered at that path — rename one of the \
+         routes, or exclude it via `[i18n] locale_prefix_exclude`"
+    )]
+    LocalePrefixPathCollision {
+        /// The supported locale whose nest produced the collision.
+        locale: String,
+        /// The original, locale-prefix-eligible route path that got nested.
+        path: String,
+        /// The resulting generated path (`/{locale}{path}`) that collides.
+        generated: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -577,7 +599,7 @@ fn build_router_pre_state(
         opaque_app_layers_present,
         state,
         config,
-    );
+    )?;
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
@@ -1796,14 +1818,14 @@ fn mount_user_routes(
     opaque_app_layers_present: bool,
     state: &AppState,
     config: &AutumnConfig,
-) -> axum::Router<AppState> {
+) -> Result<axum::Router<AppState>, RouterBuildError> {
     if !config.i18n.locale_prefix_enabled {
-        return group_and_mount_routes(
+        return Ok(group_and_mount_routes(
             route_list,
             idempotency_layers,
             opaque_app_layers_present,
             state,
-        );
+        ));
     }
 
     let (included, excluded) = partition_routes_for_locale_prefix(
@@ -1814,6 +1836,18 @@ fn mount_user_routes(
     let mut included_paths: Vec<&'static str> = included.iter().map(|route| route.path).collect();
     included_paths.sort_unstable();
     included_paths.dedup();
+
+    let mut excluded_paths: Vec<&'static str> = excluded.iter().map(|route| route.path).collect();
+    excluded_paths.sort_unstable();
+    excluded_paths.dedup();
+
+    let valid_locales = validated_locale_prefix_locales(&config.i18n);
+
+    if let Some(err) =
+        detect_locale_prefix_path_collision(&included_paths, &excluded_paths, &valid_locales)
+    {
+        return Err(err);
+    }
 
     let content_router = group_and_mount_routes(
         included,
@@ -1827,12 +1861,13 @@ fn mount_user_routes(
         opaque_app_layers_present,
         state,
     );
-    apply_locale_prefix_routing(
+    Ok(apply_locale_prefix_routing(
         excluded_router,
         &content_router,
         &included_paths,
         &config.i18n,
-    )
+        &valid_locales,
+    ))
 }
 
 #[cfg(not(feature = "i18n"))]
@@ -1842,13 +1877,13 @@ fn mount_user_routes(
     opaque_app_layers_present: bool,
     state: &AppState,
     _config: &AutumnConfig,
-) -> axum::Router<AppState> {
-    group_and_mount_routes(
+) -> Result<axum::Router<AppState>, RouterBuildError> {
+    Ok(group_and_mount_routes(
         route_list,
         idempotency_layers,
         opaque_app_layers_present,
         state,
-    )
+    ))
 }
 
 /// Splits `route_list` into `(included, excluded)` for locale-prefix
@@ -1893,8 +1928,14 @@ fn partition_routes_for_locale_prefix(
 /// matched exactly: stripping its trailing slash would normalize it to an
 /// empty prefix, which the empty-prefix guard below then silently rejects,
 /// so `"/"` would never actually get excluded (Codex review).
+///
+/// `pub(crate)` so `tenancy::strip_locale_prefix_for_tenancy` can reuse the
+/// same exclusion semantics rather than a third divergent copy (`seo.rs`
+/// keeps its own, feature-independent copy to avoid a hard dependency on
+/// `i18n`-gated router internals; `tenancy.rs`'s caller is already
+/// `i18n`-gated, so reuse here doesn't add one).
 #[cfg(feature = "i18n")]
-fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
+pub(crate) fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|raw| {
         let prefix = raw.strip_suffix("/*").unwrap_or(raw.as_str());
         let prefix = if prefix == "/" {
@@ -1917,16 +1958,73 @@ fn is_valid_locale_segment(locale: &str) -> bool {
     !locale.is_empty() && !locale.contains(['/', '{', '}', '*'])
 }
 
+/// The subset of `i18n.supported_locales` that's actually valid and unique —
+/// i.e. exactly the locales [`apply_locale_prefix_routing`] nests (invalid
+/// entries are dropped by [`is_valid_locale_segment`], duplicates by
+/// order-preserving dedup). Negotiation data (`LocaleRoutingConfig`, the
+/// default-locale fallback) must be built from this validated list rather
+/// than the raw config — otherwise a request could negotiate to a locale
+/// that was silently skipped and has no nest, trading a config typo's
+/// build-time no-op for a runtime 404 (Codex review).
+#[cfg(feature = "i18n")]
+fn validated_locale_prefix_locales(i18n: &crate::i18n::I18nConfig) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    i18n.supported_locales
+        .iter()
+        .filter(|locale| is_valid_locale_segment(locale) && seen.insert(locale.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Detects a route path that collides with a path locale-prefix nesting will
+/// itself generate — e.g. an app defines both `/foo` and `/en/foo` while
+/// `en` is a supported locale: the bare-path redirect (mounted at every
+/// locale-prefix-eligible path via `axum::routing::any`, which claims every
+/// HTTP method) already owns `/en/foo`, so nesting `/foo`'s content under
+/// `/en` collides and axum panics on the overlapping route at
+/// router-construction time. Checked against both `included_paths` (which
+/// all get that bare-path redirect) and `excluded_paths` (mounted verbatim
+/// at the top level) so either kind of pre-existing route is caught
+/// (Codex review).
+#[cfg(feature = "i18n")]
+fn detect_locale_prefix_path_collision(
+    included_paths: &[&'static str],
+    excluded_paths: &[&'static str],
+    valid_locales: &[String],
+) -> Option<RouterBuildError> {
+    for locale in valid_locales {
+        for path in included_paths {
+            let generated = if *path == "/" {
+                format!("/{locale}")
+            } else {
+                format!("/{locale}{path}")
+            };
+            let collides = included_paths.iter().any(|p| *p == generated)
+                || excluded_paths.iter().any(|p| *p == generated);
+            if collides {
+                return Some(RouterBuildError::LocalePrefixPathCollision {
+                    locale: locale.clone(),
+                    path: (*path).to_owned(),
+                    generated,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Builds the locale-prefixed router: `excluded_router` (and a bare-path
 /// redirect for every `included_paths` entry) mount at the top level;
-/// `content_router` is cloned and nested once per supported locale.
+/// `content_router` is cloned and nested once per entry in `valid_locales`
+/// (see [`validated_locale_prefix_locales`] — already deduped and filtered
+/// to safe `Router::nest` segments).
 ///
 /// Cloning `content_router` — a cheap, `Arc`-backed `axum::Router` — rather
 /// than the underlying [`Route`] list is what lets every locale share one
 /// router build: no route definition is duplicated by hand or in code.
 ///
-/// When `i18n.supported_locales` is empty (a degenerate config — locale-prefix
-/// routing on with nothing to prefix with), no nest is created and the
+/// When `valid_locales` is empty (a degenerate config — locale-prefix
+/// routing on with nothing valid to prefix with), no nest is created and the
 /// bare-path redirect is skipped too: redirecting to an unnested
 /// `/{default_locale}/...` target that structurally can't exist would just
 /// swap a direct 404 for a 308-then-404 round trip.
@@ -1936,10 +2034,11 @@ fn apply_locale_prefix_routing(
     content_router: &axum::Router<AppState>,
     included_paths: &[&'static str],
     i18n: &crate::i18n::I18nConfig,
+    valid_locales: &[String],
 ) -> axum::Router<AppState> {
     let mut router = excluded_router;
 
-    if !included_paths.is_empty() && !i18n.supported_locales.is_empty() {
+    if !included_paths.is_empty() && !valid_locales.is_empty() {
         let mut redirect_router = axum::Router::<AppState>::new();
         for path in included_paths {
             redirect_router =
@@ -1948,24 +2047,7 @@ fn apply_locale_prefix_routing(
         router = router.merge(redirect_router);
     }
 
-    // Dedup while preserving order: a repeated entry in `supported_locales`
-    // would otherwise `.nest()` the same path twice, which axum rejects with
-    // an overlapping-route panic at router-construction time (i.e. app
-    // startup), rather than a graceful config error.
-    let mut seen_locales = std::collections::HashSet::new();
-    for locale in &i18n.supported_locales {
-        // Skip a malformed locale entry rather than crash app startup: an
-        // empty string would `.nest("/", ...)`, which axum panics on (nesting
-        // at the root isn't supported), and `/`, `{`, `}`, `*` would otherwise
-        // be interpreted as axum route syntax (a literal sub-path, a path
-        // parameter capture, or a wildcard) instead of a single opaque locale
-        // segment (Codex review).
-        if !is_valid_locale_segment(locale) {
-            continue;
-        }
-        if !seen_locales.insert(locale.as_str()) {
-            continue;
-        }
+    for locale in valid_locales {
         let nested = content_router
             .clone()
             .fallback(crate::middleware::error_page_filter::fallback_404_handler)
@@ -1988,20 +2070,20 @@ fn apply_locale_prefix_routing(
     //
     // `default_locale` itself is only used here as the negotiation fallback,
     // so it must name a locale that's actually nested above — a misconfigured
-    // `default_locale` absent from `supported_locales` (Codex review) would
-    // otherwise negotiate to a locale with no `/{locale}` nest, and the
+    // `default_locale` absent from the validated locale set (Codex review)
+    // would otherwise negotiate to a locale with no `/{locale}` nest, and the
     // bare-path redirect would 308 straight into a 404. Fall back to the
-    // first supported locale (i.e. the first one actually mounted) instead.
-    let effective_default_locale = if i18n.supported_locales.contains(&i18n.default_locale) {
+    // first valid locale (i.e. the first one actually mounted) instead.
+    let effective_default_locale = if valid_locales.contains(&i18n.default_locale) {
         i18n.default_locale.clone()
     } else {
-        i18n.supported_locales
+        valid_locales
             .first()
             .cloned()
             .unwrap_or_else(|| i18n.default_locale.clone())
     };
     router.layer(axum::Extension(crate::i18n::LocaleRoutingConfig {
-        supported_locales: i18n.supported_locales.clone(),
+        supported_locales: valid_locales.to_vec(),
         default_locale: effective_default_locale,
     }))
 }
@@ -6380,6 +6462,62 @@ mod tests {
             let es = request(&app, "/es/posts", &[]).await;
             assert_eq!(es.status(), StatusCode::OK);
             assert_eq!(body_string(es).await, "es");
+        }
+
+        /// Codex review (P1): an app that defines both `/foo` and the exact
+        /// path its own locale-prefix nesting would generate for it
+        /// (`/en/foo`, when `en` is supported) must not panic at
+        /// router-construction time — the bare-path redirect (mounted at
+        /// every locale-prefix-eligible path via `any()`, which claims every
+        /// HTTP method) already owns `/en/foo`, so nesting `/foo`'s content
+        /// under `/en` collides. Surfaced as a structured build error.
+        #[tokio::test]
+        async fn generated_locale_path_collision_is_a_build_error_not_a_panic() {
+            let config = config(&["en", "es"], &[]);
+            let foo = simple_route("/foo", "foo", false);
+            let en_foo = simple_route("/en/foo", "en_foo", false);
+            let err = try_build_router(vec![foo, en_foo], &config, test_state())
+                .expect_err("a generated-path collision must be a build error, not a panic");
+            match err {
+                RouterBuildError::LocalePrefixPathCollision {
+                    ref locale,
+                    ref path,
+                    ref generated,
+                } => {
+                    assert_eq!(locale, "en");
+                    assert_eq!(path, "/foo");
+                    assert_eq!(generated, "/en/foo");
+                }
+                other => panic!("expected LocalePrefixPathCollision, got {other:?}"),
+            }
+        }
+
+        /// Codex review (P2): `LocaleRoutingConfig` (and the default-locale
+        /// negotiation fallback) must be built from the validated,
+        /// deduplicated locale set — the same one actually nested — not the
+        /// raw `supported_locales`. Otherwise a skipped invalid entry could
+        /// still be selected as the negotiated locale (or as the fallback
+        /// default) and 404, since no `/{locale}` nest exists for it.
+        #[tokio::test]
+        async fn skipped_invalid_locale_is_never_selected_by_negotiation() {
+            let mut config = config(&["", "en"], &[]);
+            config.i18n.default_locale = String::new();
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state());
+
+            // The empty "default" is invalid and skipped, so the bare-path
+            // redirect must fall back to "en" — the only validly-nested
+            // locale — not attempt an unreachable "//posts".
+            let response = request(&app, "/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en/posts"),
+                "must redirect to the validly-nested locale, not the skipped empty default"
+            );
         }
 
         /// AC: an unknown `{locale}` prefix 404s — no panic.
