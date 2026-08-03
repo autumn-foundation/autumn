@@ -1018,6 +1018,34 @@ fn plan_scaffold_with_options_impl(
                 owner_dir: Some(models_dir.clone()),
             });
         }
+
+        // The Cargo features make the scaffold COMPILE; a configured backend is
+        // what makes an upload actually persist. `StorageConfig::backend`
+        // defaults to `Disabled`, so without a `[storage]` block the generated
+        // `create` handler answers 500 "storage not configured" on the very
+        // first submit. We don't write the block ourselves — `autumn.toml` is
+        // the operator's file and the right backend is a deployment decision —
+        // but an author must not have to discover this by hitting the 500.
+        let autumn_toml = project_root.join("autumn.toml");
+        let toml_contents = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &autumn_toml => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&autumn_toml));
+        if !toml_contents.contains("[storage]") {
+            plan.warnings.push(
+                "attachment columns need a storage backend: `autumn.toml` has no `[storage]` \
+                 section, so uploads will fail with 500 \"storage not configured\". Add:\n\
+                 \n    [storage]\n    backend = \"local\"\n\n    [storage.local]\n    \
+                 root = \"target/blobs\"\n    mount_path = \"/_blobs\"\n\n\
+                 for development (see docs/guide/storage.md for S3 in production)."
+                    .to_owned(),
+            );
+        }
     }
 
     // Issue #1255: a scaffold with `richtext` columns needs autumn-web's
@@ -2350,12 +2378,41 @@ fn render_routes_file(
     // than failing the whole page.
     let attachment_read_back_helpers = if has_attachments {
         format!(
-            "\n/// Signed, time-bounded URL for a stored attachment (issue #1236).\n\
+            "\n/// The dot-extension to give a stored blob, derived from the browser-supplied\n\
+             /// filename so a downloaded file still opens in the right application.\n\
              ///\n\
-             /// `None` when the column is NULL or the app has no `[storage]` backend\n\
-             /// configured — `attachment_link` then renders the stored file's name\n\
-             /// without a link. Widen or narrow the link's validity window by changing\n\
-             /// the {ATTACHMENT_URL_TTL_SECS}-second expiry below.\n\
+             /// Deliberately paranoid: the submitted name is attacker-controlled and this\n\
+             /// becomes part of a `BlobStore` key, so only a short run of ASCII\n\
+             /// alphanumerics survives — lowercased, because keys must be lowercase and\n\
+             /// portable across the local and S3 backends — and `.meta` (reserved by the\n\
+             /// local backend for its sidecar files) is dropped. Returns `\"\"` when there\n\
+             /// is nothing safe to use; the unique part of the key is the timestamp +\n\
+             /// UUID in front of it either way.\n\
+             fn upload_extension(file_name: Option<&str>) -> String {{\n    \
+             let ext = file_name\n        \
+             .and_then(|name| name.rsplit(['/', '\\\\']).next())\n        \
+             .and_then(|name| name.rsplit_once('.'))\n        \
+             .map(|(_, ext)| ext.to_ascii_lowercase())\n        \
+             .unwrap_or_default();\n    \
+             if ext.is_empty()\n        \
+             || ext.len() > 8\n        \
+             || ext == \"meta\"\n        \
+             || !ext.chars().all(|c| c.is_ascii_alphanumeric())\n    \
+             {{\n        \
+             return String::new();\n    \
+             }}\n    \
+             format!(\".{{ext}}\")\n\
+             }}\n\n\
+             /// Signed, time-bounded URL for a stored attachment (issue #1236).\n\
+             ///\n\
+             /// `None` when the column is NULL, the app has no `[storage]` backend\n\
+             /// configured, or the backend declined to sign — `attachment_link` then\n\
+             /// renders the file name without a link instead of failing the page.\n\
+             ///\n\
+             /// The {ATTACHMENT_URL_TTL_SECS}-second window is set here, not read from\n\
+             /// config: `storage.local.default_url_expiry_secs` applies only when the\n\
+             /// caller passes `Duration::ZERO`, and the S3 backend has no such fallback.\n\
+             /// Change the literal below to widen or narrow it.\n\
              async fn attachment_url(\n    \
              state: &autumn_web::AppState,\n    \
              blob: Option<&autumn_web::storage::Blob>,\n\
@@ -2365,33 +2422,57 @@ fn render_routes_file(
              .extension::<autumn_web::storage::BlobStoreState>()?\n        \
              .store()\n        \
              .clone();\n    \
-             store\n        \
+             match store\n        \
              .presigned_url(&blob.key, std::time::Duration::from_secs({ATTACHMENT_URL_TTL_SECS}))\n        \
-             .await\n        \
-             .ok()\n\
+             .await\n    \
+             {{\n        \
+             Ok(url) => Some(url),\n        \
+             Err(err) => {{\n            \
+             autumn_web::reexports::tracing::warn!(\n                \
+             error = %err,\n                \
+             key = %blob.key,\n                \
+             \"could not sign a URL for a stored attachment; rendering it without a link\"\n            \
+             );\n            \
+             None\n        \
+             }}\n    \
+             }}\n\
              }}\n\n\
              /// Render a stored attachment: a download link when a signed URL is\n\
-             /// available, the stored file's name alone when it isn't, and an em dash\n\
-             /// when the column is NULL.\n\
+             /// available, the file name alone when it isn't, and an em dash when the\n\
+             /// column is NULL. `label` is the column's name — `Blob` records the store\n\
+             /// key, media type and size but not the original filename, so the link is\n\
+             /// labelled `<label>.<ext>` rather than with the opaque key.\n\
              ///\n\
-             /// The link carries `download` deliberately. With the local backend the\n\
-             /// blob is served from this app's own origin with the content type it was\n\
-             /// uploaded under, so a click that NAVIGATED to an uploaded `.html`/`.svg`\n\
-             /// would run it as same-origin script; `download` makes the browser save\n\
-             /// the file instead. Serving user uploads from a separate origin (or an\n\
-             /// S3 presigned URL, where `download` is moot) avoids the question\n\
-             /// entirely. Restrict what can be uploaded with\n\
-             /// `security.upload.allowed_mime_types`.\n\
-             fn attachment_link(blob: Option<&autumn_web::storage::Blob>, url: Option<&str>) -> Markup {{\n    \
+             /// SECURITY: the link carries `download` so a click SAVES the file instead\n\
+             /// of navigating to it. That matters because the local backend serves blobs\n\
+             /// from this app's own origin, replaying the content type they were\n\
+             /// uploaded under and setting no `Content-Disposition` — so an uploaded\n\
+             /// `.html`/`.svg` reached by NAVIGATION runs as same-origin content.\n\
+             /// `download` only governs this anchor; it does not protect anyone who\n\
+             /// opens the URL directly. The durable fix is to restrict what can be\n\
+             /// uploaded — set `security.upload.allowed_mime_types` (and\n\
+             /// `reject_on_content_type_mismatch = true`) in `autumn.toml` — or to serve\n\
+             /// uploads from a separate origin / S3, where the question doesn't arise.\n\
+             ///\n\
+             /// Emitted as a raw `<a>` rather than `autumn_web::a11y::Link` because that\n\
+             /// primitive has no `download` builder.\n\
+             fn attachment_link(\n    \
+             blob: Option<&autumn_web::storage::Blob>,\n    \
+             url: Option<&str>,\n    \
+             label: &str,\n\
+             ) -> Markup {{\n    \
              let Some(blob) = blob else {{\n        \
              return html! {{ \"—\" }};\n    \
              }};\n    \
-             let name = blob.key.rsplit('/').next().unwrap_or(blob.key.as_str());\n    \
+             let file_name = match blob.key.rsplit('/').next().and_then(|s| s.rsplit_once('.')) {{\n        \
+             Some((_, ext)) => format!(\"{{label}}.{{ext}}\"),\n        \
+             None => label.to_owned(),\n    \
+             }};\n    \
              html! {{\n        \
              @if let Some(url) = url {{\n            \
-             a href=(url) rel=\"noopener\" download=(name) {{ (name) }}\n        \
+             a href=(url) download=(file_name) {{ (file_name) }}\n        \
              }} @else {{\n            \
-             span {{ (name) }}\n        \
+             span {{ (file_name) }}\n        \
              }}\n        \
              \" \"\n        \
              span class=\"autumn-attachment__meta\" {{ \"(\" (blob.content_type) \", \" (blob.byte_size) \" bytes)\" }}\n    \
@@ -2404,38 +2485,65 @@ fn render_routes_file(
 
     // The `show` detail page resolves one signed URL per attachment column
     // before building its property list. The list index deliberately does NOT:
-    // its `data_table` column closure is synchronous and runs per row, so a
-    // signed URL there would mean one round-trip per row per page.
-    // Two spellings of the same binds: the `show` handler owns a `State<_>`
-    // wrapper (`&state`), while the state-machine `show_view` helper is handed
-    // an already-borrowed `&AppState` (`state`).
+    // `widgets::Column`'s cell closure is SYNCHRONOUS and `presigned_url` is
+    // async, so there is nowhere to await it. (Signing itself is cheap and
+    // local — an HMAC for the local backend, local SigV4 for S3 — so cost is
+    // not the reason; the index stays a presence marker.)
+    // Two spellings of the same binds. `&state` would compile at both sites
+    // (`&&AppState` reborrows), but generated code is user-owned code: emitting
+    // `&state` where `state` is already a `&AppState` trips
+    // `clippy::needless_borrow` in the app's own lint run. The `show` handler
+    // owns a `State<_>` wrapper and needs the borrow; the state-machine
+    // `show_view` helper is handed a `&AppState` and must not add one.
+    // `authorize` destructures `State(state)` to a bare `AppState`; the
+    // unauthorized form keeps the `State<_>` wrapper and needs the borrow.
+    let show_state_recv = if authorize { "&state" } else { "&*state" };
     let mut show_attachment_url_binds = String::new();
     let mut show_view_attachment_url_binds = String::new();
     for f in &attachment_fields {
         let name = &f.name;
         let _ = writeln!(
             show_attachment_url_binds,
-            "    let {name}_url = attachment_url(&state, row.{name}.as_ref()).await;"
+            "    let {name}_url = attachment_url({show_state_recv}, row.{name}.as_ref()).await;"
         );
         let _ = writeln!(
             show_view_attachment_url_binds,
             "    let {name}_url = attachment_url(state, row.{name}.as_ref()).await;"
         );
     }
-    // `show` has no `State` extractor of its own (it never authorizes), so an
-    // attachment scaffold adds one. Deref coercion at the call site means the
-    // same `attachment_url(&state, …)` works whether `state` is a `State<_>`
-    // wrapper (here) or an already-destructured `AppState` (the authorized
-    // handlers).
-    let show_state_param = if has_attachments {
-        ", state: autumn_web::extract::State<autumn_web::AppState>"
+    // `show` never carried a `State` extractor — it does no authorization. An
+    // attachment scaffold adds one, because rendering the stored file needs the
+    // blob store.
+    //
+    // SECURITY (issue #1236 review): it also adds the record-policy check that
+    // `show` has never had. Before this slice the detail page disclosed only the
+    // word "attachment"; now it hands out a signed `presigned_url`, and the
+    // serving route validates that signature ALONE — no session, no policy — so
+    // the rendered link is a working bearer capability for the bytes for as long
+    // as it is valid. Emitting it from a handler that never consults
+    // `can_show` would make the generated `Policy`'s "Reads are public by
+    // default. Tighten this if shows should be gated." comment a lie for the one
+    // column where it matters most. Under the generated default policy
+    // (`can_show` -> true) this is a no-op; it starts enforcing the moment an
+    // author narrows it. Scaffolds with no attachment column keep the historical
+    // unauthorized `show` — closing that generally is a separate change.
+    let (show_state_param, show_state_param_line, show_authz_call) = if has_attachments && authorize
+    {
+        (
+            ", autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>, session: autumn_web::session::Session",
+            "\n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,",
+            format!(
+                "    autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"show\", &row).await?;\n"
+            ),
+        )
+    } else if has_attachments {
+        (
+            ", state: autumn_web::extract::State<autumn_web::AppState>",
+            "\n    state: autumn_web::extract::State<autumn_web::AppState>,",
+            String::new(),
+        )
     } else {
-        ""
-    };
-    let show_state_param_line = if has_attachments {
-        "\n    state: autumn_web::extract::State<autumn_web::AppState>,"
-    } else {
-        ""
+        ("", "", String::new())
     };
     // The state-machine variant renders through a shared `show_view` helper
     // called by `show` and by each transition handler's 422 re-render, so the
@@ -2453,13 +2561,13 @@ fn render_routes_file(
     // to tell an empty column from one holding a blob they simply didn't
     // replace. Both live in the SHARED edit body, so `GET /{plural}/{id}/edit`
     // and every 422 re-render of that form show the same thing — which is why
-    // `update` loads `current` before validating (see `update_load_current_block`).
+    // `update` loads `current` before validating (see `update_load_and_authorize_block`).
     //
     // The shared body reads the row through a binding named `current` — the name
     // `update` already uses — so `edit_form` renames its own loaded row to match
     // once the changeset has been seeded from it.
     let edit_current_bind = if has_attachments {
-        "let current = row;\n    "
+        "// `current` is the name the shared edit body — and `update`, which\n             // re-renders that same body at 422 — reads the row through, so the\n             // stored-attachment block below can't drift between the two.\n             let current = row;\n    "
     } else {
         ""
     };
@@ -2470,22 +2578,88 @@ fn render_routes_file(
     } else {
         ""
     };
-    let mut edit_attachment_url_loads = String::new();
+    let mut edit_attachment_url_binds = String::new();
     let mut edit_current_attachment_markup = String::new();
     for f in &attachment_fields {
         let name = &f.name;
         let label = humanize_label(name);
         let _ = writeln!(
-            edit_attachment_url_loads,
+            edit_attachment_url_binds,
             "        let {name}_url = attachment_url(&state, current.{name}.as_ref()).await;"
         );
         let _ = write!(
             edit_current_attachment_markup,
             "@if let Some(blob) = current.{name}.as_ref() {{\n            \
-             p class=\"autumn-field__current\" {{ \"Current {label}: \" (attachment_link(Some(blob), {name}_url.as_deref())) }}\n        \
+             p class=\"autumn-field__current\" {{ \"Current {label}: \" (attachment_link(Some(blob), {name}_url.as_deref(), \"{name}\")) }}\n        \
              }}\n        "
         );
     }
+
+    // The read-back helpers are pure functions, so the scaffold ships real unit
+    // tests for them right next to the code — `cargo test` in the generated app
+    // exercises the em-dash / no-link / labelled-link branches and the
+    // key-sanitizing rules, rather than leaving them proven only by the
+    // generator's own string assertions. They live INSIDE the routes module
+    // because a `tests/` integration binary cannot import a project's bin crate.
+    let attachment_read_back_unit_tests = if has_attachments {
+        String::from(
+            r#"
+
+#[cfg(test)]
+mod attachment_read_back_tests {
+    use super::{attachment_link, upload_extension};
+    use autumn_web::storage::Blob;
+
+    fn blob(key: &str) -> Blob {
+        Blob::new("test", key, "image/png", 17)
+    }
+
+    #[test]
+    fn renders_an_em_dash_when_the_column_is_null() {
+        assert_eq!(attachment_link(None, None, "cover").into_string(), "\u{2014}");
+    }
+
+    #[test]
+    fn labels_the_link_from_the_column_and_the_stored_extension() {
+        let stored = blob("posts/cover/1700000000_abc.png");
+        let html = attachment_link(Some(&stored), Some("/_blobs/x?sig=1"), "cover").into_string();
+        assert!(html.contains("href=\"/_blobs/x?sig=1\""), "{html}");
+        // Not the opaque key: a download has to land with a usable name.
+        assert!(html.contains("download=\"cover.png\""), "{html}");
+        assert!(html.contains(">cover.png<"), "{html}");
+        assert!(html.contains("image/png"), "{html}");
+        assert!(html.contains("17 bytes"), "{html}");
+    }
+
+    #[test]
+    fn drops_the_anchor_when_no_url_could_be_signed() {
+        let stored = blob("posts/cover/1700000000_abc.png");
+        let html = attachment_link(Some(&stored), None, "cover").into_string();
+        assert!(!html.contains("<a "), "{html}");
+        assert!(html.contains("cover.png"), "{html}");
+    }
+
+    #[test]
+    fn keeps_only_a_short_safe_lowercase_extension() {
+        assert_eq!(upload_extension(Some("holiday.PNG")), ".png");
+        assert_eq!(upload_extension(Some("archive.tar.gz")), ".gz");
+        // No extension to take, or nothing safe to take.
+        assert_eq!(upload_extension(None), "");
+        assert_eq!(upload_extension(Some("noextension")), "");
+        assert_eq!(upload_extension(Some("a.verylongextension")), "");
+        assert_eq!(upload_extension(Some("evil.p g")), "");
+        assert_eq!(upload_extension(Some("evil.p/g")), "");
+        // `.meta` is the local backend's sidecar suffix and is reserved.
+        assert_eq!(upload_extension(Some("sneaky.meta")), "");
+        // A traversal attempt keeps nothing but the final extension.
+        assert_eq!(upload_extension(Some("../../etc/passwd.png")), ".png");
+    }
+}
+"#,
+        )
+    } else {
+        String::new()
+    };
 
     // Issue #1872: the create/update handlers stream each uploaded file to the
     // blob store *before* changeset validation and the DB write, so any early
@@ -2548,9 +2722,10 @@ fn render_routes_file(
                 "            Some(\"{name}\") => {{\n                \
                  if field.file_name().is_some_and(|file_name| !file_name.is_empty()) {{\n                    \
                  let key = format!(\n                        \
-                 \"{plural}/{name}/{{}}_{{}}\",\n                        \
+                 \"{plural}/{name}/{{}}_{{}}{{}}\",\n                        \
                  chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),\n                        \
-                 uuid::Uuid::new_v4()\n                    \
+                 uuid::Uuid::new_v4(),\n                        \
+                 upload_extension(field.file_name())\n                    \
                  );\n                    \
                  let blob = field.save_to_blob_store(&*store, key).await?;\n                    \
                  saved_blob_keys.push(blob.key.clone());\n                    \
@@ -2634,7 +2809,7 @@ fn render_routes_file(
     // file is currently stored (a file input can't be repopulated). Loading first
     // also runs the record policy before the re-render, so a forbidden actor is
     // denied instead of being handed the form back.
-    let (update_load_current_block, update_new_block) = if has_attachments {
+    let (update_load_and_authorize_block, update_new_block) = if has_attachments {
         // Issue #1872: loading the current row also happens after the blob save,
         // so its fallible steps clean up the just-saved blob(s) before returning.
         let load_current = if live && !sharded {
@@ -2765,24 +2940,12 @@ fn render_routes_file(
              }}\n    \
              }})"
         );
-        // The edit body additionally resolves a signed URL per attachment column
-        // (issue #1236). Both bodies become block expressions as soon as either
-        // kind of prelude is needed, so the same string splices into the GET
-        // handlers and the 422 re-renders unchanged.
-        let (new_form_body, edit_form_body) = if has_reference_selects || has_attachments {
-            (
-                if has_reference_selects {
-                    format!("{{\n{option_loads}        {new_form_layout}\n    }}")
-                } else {
-                    new_form_layout
-                },
-                format!(
-                    "{{\n{option_loads}{edit_attachment_url_loads}        {edit_form_layout}\n    }}"
-                ),
-            )
-        } else {
-            (new_form_layout, edit_form_layout)
-        };
+        let (new_form_body, edit_form_body) = wrap_form_bodies(
+            new_form_layout,
+            edit_form_layout,
+            &option_loads,
+            &edit_attachment_url_binds,
+        );
         // The referenced-row option loaders are emitted regardless: they
         // populate the in-form `<select>` (issue #1750) AND the issue #1146
         // index parent-label map (`render_index_reference_label_loads` collects
@@ -2830,24 +2993,12 @@ fn render_routes_file(
              }}\n    \
              }})"
         );
-        // The edit body additionally resolves a signed URL per attachment column
-        // (issue #1236). Both bodies become block expressions as soon as either
-        // kind of prelude is needed, so the same string splices into the GET
-        // handlers and the 422 re-renders unchanged.
-        let (new_form_body, edit_form_body) = if has_reference_selects || has_attachments {
-            (
-                if has_reference_selects {
-                    format!("{{\n{option_loads}        {new_form_layout}\n    }}")
-                } else {
-                    new_form_layout
-                },
-                format!(
-                    "{{\n{option_loads}{edit_attachment_url_loads}        {edit_form_layout}\n    }}"
-                ),
-            )
-        } else {
-            (new_form_layout, edit_form_layout)
-        };
+        let (new_form_body, edit_form_body) = wrap_form_bodies(
+            new_form_layout,
+            edit_form_layout,
+            &option_loads,
+            &edit_attachment_url_binds,
+        );
         (
             new_form_body,
             edit_form_body,
@@ -3072,7 +3223,7 @@ fn render_routes_file(
          use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
          {authz_update_preamble}\
          {form_decode_block}\n    \
-         {update_load_current_block}\
+         {update_load_and_authorize_block}\
          let changeset = form.into_changeset();\n    \
          if !changeset.is_valid() {{\n        \
          {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n    \
@@ -3990,7 +4141,7 @@ pub async fn show(
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-    show_view(db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref(){show_view_state_arg_call}).await
+{show_authz_call}    show_view(db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref(){show_view_state_arg_call}).await
 }}"#
             );
             // Issue #1326 security fix (IDOR): a transition mutates an existing
@@ -4094,7 +4245,7 @@ pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash{show_state_
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-{show_label_loads}{show_attachment_url_binds}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_authz_call}{show_label_loads}{show_attachment_url_binds}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
     Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
         h1 {{ "{pascal_name} #" (row.id) }}
@@ -4242,6 +4393,7 @@ pub async fn events(
         + &preview_handlers
         + &paths_macro
         + &search_handler
+        + &attachment_read_back_unit_tests
 }
 
 /// The `UNIQUE_CONSTRAINTS` module-level const the generated `create`/
@@ -4287,6 +4439,34 @@ fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
 /// render (issue #1236). Long enough to browse a detail page and click through
 /// to the file, short enough that a copied link isn't a durable capability.
 const ATTACHMENT_URL_TTL_SECS: u64 = 300;
+
+/// Wrap the new/edit view bodies in a block expression when either needs a
+/// prelude: `option_loads` for `references` selects (issue #1146/#1750) and
+/// `edit_attachment_url_binds` for the signed attachment URLs the edit view
+/// renders (issue #1236). Both bodies splice into a GET handler AND into the
+/// matching 422 re-render, so the prelude has to travel inside the body string
+/// rather than sit in one handler — otherwise the two sites drift.
+///
+/// Only the edit body ever carries attachment binds: a new record has no
+/// stored file to render.
+fn wrap_form_bodies(
+    new_form_layout: String,
+    edit_form_layout: String,
+    option_loads: &str,
+    edit_attachment_url_binds: &str,
+) -> (String, String) {
+    let new_body = if option_loads.is_empty() {
+        new_form_layout
+    } else {
+        format!("{{\n{option_loads}        {new_form_layout}\n    }}")
+    };
+    let edit_body = if option_loads.is_empty() && edit_attachment_url_binds.is_empty() {
+        edit_form_layout
+    } else {
+        format!("{{\n{option_loads}{edit_attachment_url_binds}        {edit_form_layout}\n    }}")
+    };
+    (new_body, edit_body)
+}
 
 /// Whether any field in `fields` is a file attachment.
 fn has_attachment_fields(fields: &[Field]) -> bool {
@@ -5507,7 +5687,7 @@ fn render_show_property_rows(
             // resolved into `{name}_url` — instead of the index's cheap
             // presence marker. See `attachment_link` in the generated routes.
             let name = &f.name;
-            format!("attachment_link(row.{name}.as_ref(), {name}_url.as_deref())")
+            format!("attachment_link(row.{name}.as_ref(), {name}_url.as_deref(), \"{name}\")")
         } else if f.kind.is_rich_text() {
             // Issue #1255: the column stores user-submitted Markdown SOURCE, so
             // the show page renders it through `render_user_content` — raw-HTML
@@ -6649,7 +6829,7 @@ async fn __PLURAL___multipart_upload_binds_blob_key() {
 /// handler honours whatever the app configures.
 #[tokio::test]
 async fn __PLURAL___multipart_upload_over_limit_is_413() {
-    use autumn_web::storage::BlobStoreState;
+    use autumn_web::storage::{BlobStore, BlobStoreState};
 
     #[post("/__PLURAL__/limit-probe")]
     async fn create(
@@ -6674,6 +6854,7 @@ async fn __PLURAL___multipart_upload_over_limit_is_413() {
     }
 
     let (blob_store, blob_root) = __PLURAL___probe_blob_store();
+    let store_handle = blob_store.clone();
 
     // Same defaults `TestApp::new()` uses, with a deliberately tiny per-file cap.
     let mut config = autumn_web::config::AutumnConfig::default();
@@ -6696,6 +6877,20 @@ async fn __PLURAL___multipart_upload_over_limit_is_413() {
         .send()
         .await
         .assert_status(413);
+
+    // Rejected part-way through, the store holds no object at the key: the
+    // backend writes to a temp sibling and unlinks it when the cap trips, so
+    // neither partial bytes nor a `.meta` sidecar survive. (The key's parent
+    // directories are still created, so this asserts on the object, not the
+    // directory tree.)
+    let residue = store_handle
+        .head("__PLURAL__/__ATTACH__/over-limit")
+        .await
+        .expect("head on a missing key reports absence, not an error");
+    assert!(
+        residue.is_none(),
+        "a rejected oversized upload must leave no object behind: {residue:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&blob_root);
 }

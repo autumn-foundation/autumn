@@ -592,7 +592,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside `security.csrf.token_scan_bytes` however large the upload is. The note
   now names the real limits (`max_file_size_bytes` → 413,
   `max_request_size_bytes` → global body cap). The index list stays a cheap
-  presence marker (its `data_table` column closure is sync and per row).
+  presence marker (`widgets::Column`'s cell closure is synchronous and
+  `presigned_url` is async, so there is nowhere to await it).
+
+  Follow-ups from the review of that work, in the same slice: the `show` handler
+  now runs the record policy before it renders — the link it emits is a signed
+  bearer capability for the bytes, and the blob-serving route validates that
+  signature alone, so disclosing one from a handler that never consults
+  `can_show` would have made the generated policy's "tighten this if shows
+  should be gated" comment untrue (a no-op under the default policy, which
+  allows reads); the minted blob key now carries a sanitized extension derived
+  from the uploaded filename, so a download opens in the right application
+  instead of landing as an extensionless `1785…_5cf1a2be-…`; a failure to sign
+  logs a warning instead of silently degrading to a link-less name; and
+  generating an `Attachment` column now warns when `autumn.toml` has no
+  `[storage]` section, since `backend` defaults to `disabled` and the first
+  upload would otherwise answer `500 storage not configured`. The two
+  `#[ignore]`d gates that compile — and run — a freshly scaffolded project are
+  wired into `generator-conformance.yml`; the consolidated `cli_tests` binary's
+  only other CI `--ignored` sweep filters on `offsite`, so without that they
+  never executed anywhere. `autumn-field__current` / `autumn-attachment__meta`
+  are now real classes in `widgets.css` rather than invented ones, and
+  `docs/guide/storage.md` documents the scaffolded no-JS path and frames
+  presigned direct upload as the opt-in advanced alternative.
+
   Generator-only; no `autumn-web` API change.
 
 - **jobs:** routed the job runtime's recorded timestamps (enqueued_at/started_at/finished_at, due-at filtering, and the backoff-delay computation) through the injected `ClockSource` seam instead of reading `Utc::now()` directly, so recorded job timestamps are deterministic under the sim harness (production defaults to `SystemClock`, behavior unchanged). The in-memory/sim job path is now fully deterministic; the Postgres durable path still uses server-side SQL `NOW()` (#2111). [no-plugin]

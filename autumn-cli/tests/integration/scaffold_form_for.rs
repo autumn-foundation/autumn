@@ -723,8 +723,25 @@ fn scaffold_attachment_show_view_renders_stored_attachment() {
         "show must resolve the stored attachment's URL:\n{show}"
     );
     assert!(
-        show.contains("(attachment_link(row.image.as_ref(), image_url.as_deref()))"),
+        show.contains("(attachment_link(row.image.as_ref(), image_url.as_deref(), \"image\"))"),
         "show must render the stored attachment, not a presence placeholder:\n{show}"
+    );
+    // Issue #1236 review: the rendered link is a signed bearer capability for
+    // the bytes — the blob-serving route checks the signature and nothing else —
+    // so the handler that emits it must run the record policy. Under the
+    // generated default policy (`can_show` -> true) this changes nothing; it
+    // starts enforcing the moment an author narrows `can_show`.
+    assert!(
+        show.contains(
+            "autumn_web::authorization::authorize::<Photo>(&state, &session, \"show\", &row).await?;"
+        ),
+        "show must record-authorize before disclosing a signed attachment URL:\n{show}"
+    );
+    let authz_at = show.find("authorize::<Photo>").unwrap();
+    let url_at = show.find("let image_url =").unwrap();
+    assert!(
+        authz_at < url_at,
+        "the policy check must run before the URL is signed:\n{show}"
     );
     assert!(
         !show.contains(r#"if row.image.is_some() { "attachment" }"#),
@@ -770,7 +787,7 @@ fn scaffold_attachment_edit_view_renders_current_attachment() {
     assert!(edit.contains(url_bind), "{edit}");
     assert!(edit.contains(current_block), "{edit}");
     assert!(
-        edit.contains("(attachment_link(Some(blob), image_url.as_deref()))"),
+        edit.contains("(attachment_link(Some(blob), image_url.as_deref(), \"image\"))"),
         "{edit}"
     );
 
@@ -884,6 +901,7 @@ fn scaffold_attachment_note_does_not_claim_a_csrf_size_ceiling() {
     // Presign stays documented, as the opt-in advanced path.
     assert!(note.contains("ADVANCED (opt-in)"), "{note}");
     assert!(note.contains("complete_direct_upload"), "{note}");
+    assert!(note.contains("direct_upload_input"), "{note}");
     assert!(note.contains("examples/reddit-clone"), "{note}");
 }
 
@@ -904,7 +922,7 @@ fn generated_attachment_scaffold_multipart_test_passes() {
     patch_autumn_web_path(&project);
 
     let run = Command::new("cargo")
-        .args(["test", "--test", "photo"])
+        .args(["test"])
         .current_dir(&project)
         .output()
         .unwrap();
@@ -916,13 +934,186 @@ fn generated_attachment_scaffold_multipart_test_passes() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     for name in [
+        // `tests/photo.rs` — the write path.
         "photos_multipart_upload_binds_blob_key",
         "photos_multipart_upload_over_limit_is_413",
         "photos_multipart_create_without_file_is_null",
+        // `src/routes/photos.rs` — the read-back helpers.
+        "attachment_read_back_tests::renders_an_em_dash_when_the_column_is_null",
+        "attachment_read_back_tests::labels_the_link_from_the_column_and_the_stored_extension",
+        "attachment_read_back_tests::drops_the_anchor_when_no_url_could_be_signed",
+        "attachment_read_back_tests::keeps_only_a_short_safe_lowercase_extension",
     ] {
         assert!(
             stdout.contains(&format!("test {name} ... ok")),
             "generated test `{name}` must run and pass (it must not be ignored):\n{stdout}"
         );
     }
+}
+
+/// Issue #1236 review: `Blob` records the store key, media type and size — but
+/// not the uploaded file's name. Without help, the show/edit link text and its
+/// `download` filename were the raw key tail (`1785…_5cf1a2be-…`), so a
+/// download landed as an EXTENSIONLESS file that no application would open.
+/// The handler now folds a sanitized extension into the key, and the link is
+/// labelled `<column>.<ext>`.
+#[test]
+fn scaffold_attachment_preserves_a_safe_upload_extension() {
+    let (_tmp, project) = scaffold_project(
+        "attach-ext-app",
+        "Photo",
+        &["caption:String", "image:Attachment"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/photos.rs")).unwrap();
+
+    assert!(
+        routes.contains("fn upload_extension(file_name: Option<&str>) -> String {"),
+        "{routes}"
+    );
+    // Folded into the minted key, so the stored object carries the extension.
+    assert!(
+        routes.contains("upload_extension(field.file_name())"),
+        "the create/update key must carry the uploaded extension:\n{routes}"
+    );
+    assert!(
+        routes.contains("\"photos/image/{}_{}{}\""),
+        "the key keeps its timestamp + uuid uniqueness prefix:\n{routes}"
+    );
+
+    // The submitted name is attacker-controlled and lands in a `BlobStore` key,
+    // so only a short lowercase ASCII-alphanumeric run survives, and `.meta`
+    // (the local backend's sidecar suffix) is refused.
+    for guard in [
+        "ext.len() > 8",
+        "ext == \"meta\"",
+        "!ext.chars().all(|c| c.is_ascii_alphanumeric())",
+        ".map(|(_, ext)| ext.to_ascii_lowercase())",
+    ] {
+        assert!(
+            routes.contains(guard),
+            "upload_extension must keep the guard `{guard}`:\n{routes}"
+        );
+    }
+
+    // The link is labelled from the column, not the opaque key.
+    assert!(
+        routes.contains("Some((_, ext)) => format!(\"{label}.{ext}\"),"),
+        "{routes}"
+    );
+    assert!(
+        !routes.contains("rel=\"noopener\""),
+        "`rel=noopener` is inert without `target`; it must not imply a protection \
+         that isn't in play:\n{routes}"
+    );
+    // `download` stays: the local backend serves blobs from the app's own origin.
+    assert!(
+        routes.contains("a href=(url) download=(file_name)"),
+        "{routes}"
+    );
+}
+
+/// Issue #1236 review: the Cargo features make an attachment scaffold COMPILE,
+/// but `StorageConfig::backend` defaults to `Disabled` — so with no `[storage]`
+/// section the first upload answers 500 "storage not configured". The generator
+/// doesn't write the operator's config for them, but it must not let them
+/// discover this by hitting the 500.
+#[test]
+fn scaffold_attachment_warns_when_no_storage_backend_is_configured() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn(tmp.path(), &["new", "attach-warn-app"]);
+    let project = tmp.path().join("attach-warn-app");
+
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let out = Command::new(autumn_bin)
+        .args(["generate", "scaffold", "Photo", "image:Attachment"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run autumn");
+    assert!(out.status.success());
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        printed.contains("[storage]") && printed.contains("storage not configured"),
+        "generating an attachment scaffold must surface the missing storage \
+         backend and the TOML to add:\n{printed}"
+    );
+    assert!(printed.contains("backend = \"local\""), "{printed}");
+
+    // A plain scaffold has nothing to warn about.
+    let plain = Command::new(autumn_bin)
+        .args(["generate", "scaffold", "Article", "title:String"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run autumn");
+    let plain_printed = String::from_utf8_lossy(&plain.stdout).to_string();
+    assert!(
+        !plain_printed.contains("storage not configured"),
+        "{plain_printed}"
+    );
+}
+
+/// AC2, closing a coverage hole the #1236 audit found: nothing asserted the
+/// literal `enctype` in generated output — the guarantee was a two-hop chain of
+/// a generator string-match plus a separate framework unit test. Both scaffold
+/// form paths are checked here: the standard `form_for` path (where
+/// `FieldControl::File` flips the enctype inside the framework) and the
+/// `--live-validation` path (which hand-rolls its own `<form>` tag).
+#[test]
+fn scaffold_attachment_form_is_multipart_encoded() {
+    // Standard path: `form_for` derives the enctype from the File control, so
+    // assert the control is there AND that the framework turns it into an
+    // enctype (autumn/src/form.rs::form_for_file_field_sets_multipart).
+    let (_tmp, project) = scaffold_project("attach-enc-app", "Photo", &["image:Attachment"]);
+    let routes = fs::read_to_string(project.join("src/routes/photos.rs")).unwrap();
+    assert!(
+        routes.contains(".override_field(\"image\", autumn_web::form::FieldControl::File)"),
+        "{routes}"
+    );
+    // No hand-rolled enctype in the emitted markup on this path — it must come
+    // from the File control, so the two can never disagree. (The module's
+    // header note still mentions the enctype in prose, hence the markup-shaped
+    // needle rather than a bare `enctype=`.)
+    assert!(
+        !routes.contains("method=\"post\" enctype="),
+        "the standard path must not hand-roll an enctype:\n{routes}"
+    );
+
+    // `--live-validation` emits per-field inputs inside its own `<form>` tag, so
+    // it carries the enctype literally and needs its own guard.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn(tmp.path(), &["new", "attach-enc-lv-app"]);
+    let lv = tmp.path().join("attach-enc-lv-app");
+    run_autumn(
+        &lv,
+        &[
+            "generate",
+            "scaffold",
+            "Photo",
+            "image:Attachment",
+            "--live-validation",
+        ],
+    );
+    let lv_routes = fs::read_to_string(lv.join("src/routes/photos.rs")).unwrap();
+    assert!(
+        lv_routes.contains("method=\"post\" enctype=\"multipart/form-data\""),
+        "the --live-validation form must be multipart-encoded:\n{lv_routes}"
+    );
+    // Every form that posts the attachment carries it: new, edit, and both 422
+    // re-renders of each.
+    assert!(
+        lv_routes.matches("enctype=\"multipart/form-data\"").count() >= 4,
+        "every emitted create/update form must carry the enctype:\n{lv_routes}"
+    );
+
+    // A plain scaffold stays URL-encoded on both paths.
+    let (_tmp2, plain) = scaffold_project("plain-enc-app", "Article", &["title:String"]);
+    let plain_routes = fs::read_to_string(plain.join("src/routes/articles.rs")).unwrap();
+    assert!(!plain_routes.contains("enctype"), "{plain_routes}");
+    assert!(
+        !plain_routes.contains("FieldControl::File"),
+        "{plain_routes}"
+    );
 }
