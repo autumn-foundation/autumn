@@ -36,7 +36,7 @@
 //! deterministic `AUTUMN_SIM_SEED=…` replay line. With the fix in place the
 //! same seed passes.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use autumn_web::app::AppBuilder;
@@ -47,8 +47,8 @@ use autumn_web::sim::Sim;
 use autumn_web::sim_test;
 use autumn_web::test::TestApp;
 use autumn_web::{always, sometimes};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant as TokioInstant;
 
 /// Number of jobs made to fail "simultaneously" under the sim's virtual clock.
 /// Large enough that an equal-jitter spread over its ~500ms window collides to
@@ -65,9 +65,18 @@ struct StormArgs {
 /// of the test so repeated invocations (e.g. under a sweep) start clean.
 static ATTEMPTS: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
 
-/// The virtual instant (per the injected clock, not wall time) each job's
-/// *retry* (second) attempt actually ran, in enqueue order.
-static RETRY_TIMES: Mutex<Vec<DateTime<Utc>>> = Mutex::new(Vec::new());
+/// The paused Tokio timer wheel's `Instant` (**not** the framework's injected
+/// `ClockSource` — see the module docs) each job's *retry* (second) attempt
+/// actually ran at, in enqueue order.
+///
+/// `Sim::advance` steps the framework `ClockSource` straight to its target in
+/// one jump, before any timer fires, so every retry observed through
+/// `state.clock()` would read the *same* end-of-window instant regardless of
+/// jitter. Tokio's own paused clock, by contrast, walks forward through each
+/// due timer's real deadline as it fires it — precisely the granularity a
+/// backoff-spread observation needs — so this reads `tokio::time::Instant::now()`
+/// instead.
+static RETRY_TIMES: Mutex<Vec<TokioInstant>> = Mutex::new(Vec::new());
 
 fn reset_probe_state() {
     *ATTEMPTS.lock().unwrap() = Some(HashMap::new());
@@ -77,7 +86,7 @@ fn reset_probe_state() {
 /// Fails its first attempt unconditionally, then succeeds — the minimal shape
 /// that puts every enqueued job's retry through the backoff path being tested.
 #[job(name = "storm_probe", max_attempts = 2, backoff_ms = 1000)]
-async fn storm_probe(state: AppState, args: StormArgs) -> AutumnResult<()> {
+async fn storm_probe(_state: AppState, args: StormArgs) -> AutumnResult<()> {
     let attempt = {
         let mut guard = ATTEMPTS.lock().unwrap();
         let attempts = guard.as_mut().expect("reset_probe_state must run first");
@@ -90,7 +99,7 @@ async fn storm_probe(state: AppState, args: StormArgs) -> AutumnResult<()> {
             "forced failure (simulated downstream blip)",
         )))
     } else {
-        RETRY_TIMES.lock().unwrap().push(state.clock().now());
+        RETRY_TIMES.lock().unwrap().push(TokioInstant::now());
         Ok(())
     }
 }
@@ -140,16 +149,16 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
         "every job must have retried and succeeded"
     );
 
-    let distinct: BTreeSet<DateTime<Utc>> = retry_times.iter().copied().collect();
+    let first = retry_times[0];
+    let spread = retry_times.iter().any(|instant| *instant != first);
     sometimes!(
-        distinct.len() > 1,
+        spread,
         "retries observed spread across more than one virtual instant"
     );
     always!(
-        distinct.len() > 1,
-        "all {STORM_SIZE} retries landed on the exact same virtual instant \
-         ({:?}) — a synchronized thundering herd (seed={:#x})",
-        retry_times.first(),
+        spread,
+        "all {STORM_SIZE} retries landed on the exact same virtual instant — \
+         a synchronized thundering herd (seed={:#x})",
         sim.seed,
     );
 
