@@ -40,7 +40,7 @@
 //! record which increment each retry landed in — the technique this test uses
 //! (`CHECKPOINT`).
 //!
-//! `retries_are_not_synchronized_under_load` is the DoD proof for this wave:
+//! `retries_are_not_synchronized_under_load` is the `DoD` proof for this wave:
 //! reverting `jittered_retry_delay_ms` to the old unjittered
 //! `backoff_ms.saturating_mul(2_u64.saturating_pow(attempt - 1))` locally and
 //! rerunning this test reproduces the herd — every retry lands in the exact
@@ -110,8 +110,11 @@ fn reset_probe_state() {
 #[job(name = "storm_probe", max_attempts = 2, backoff_ms = 1000)]
 async fn storm_probe(_state: AppState, args: StormArgs) -> AutumnResult<()> {
     let attempt = {
-        let mut guard = ATTEMPTS.lock().unwrap();
-        let attempts = guard.as_mut().expect("reset_probe_state must run first");
+        let attempts = ATTEMPTS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("reset_probe_state must run first");
         let counter = attempts.entry(args.id).or_insert(0);
         *counter += 1;
         *counter
