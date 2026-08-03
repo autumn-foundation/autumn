@@ -1906,6 +1906,17 @@ fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
     })
 }
 
+/// `true` when `locale` is safe to use as a literal [`Router::nest`](axum::Router::nest)
+/// segment: non-empty (an empty string would nest at `"/"`, which axum
+/// panics on — nesting at the root isn't supported) and free of characters
+/// axum's route syntax interprets specially — `/` (would silently nest an
+/// extra sub-path instead of one opaque segment), `{`/`}` (path-parameter
+/// capture syntax), and `*` (wildcard capture) (Codex review).
+#[cfg(feature = "i18n")]
+fn is_valid_locale_segment(locale: &str) -> bool {
+    !locale.is_empty() && !locale.contains(['/', '{', '}', '*'])
+}
+
 /// Builds the locale-prefixed router: `excluded_router` (and a bare-path
 /// redirect for every `included_paths` entry) mount at the top level;
 /// `content_router` is cloned and nested once per supported locale.
@@ -1943,6 +1954,15 @@ fn apply_locale_prefix_routing(
     // startup), rather than a graceful config error.
     let mut seen_locales = std::collections::HashSet::new();
     for locale in &i18n.supported_locales {
+        // Skip a malformed locale entry rather than crash app startup: an
+        // empty string would `.nest("/", ...)`, which axum panics on (nesting
+        // at the root isn't supported), and `/`, `{`, `}`, `*` would otherwise
+        // be interpreted as axum route syntax (a literal sub-path, a path
+        // parameter capture, or a wildcard) instead of a single opaque locale
+        // segment (Codex review).
+        if !is_valid_locale_segment(locale) {
+            continue;
+        }
         if !seen_locales.insert(locale.as_str()) {
             continue;
         }
@@ -6328,6 +6348,27 @@ mod tests {
         #[tokio::test]
         async fn duplicate_supported_locale_does_not_panic_and_still_routes() {
             let config = config(&["en", "es", "en"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let en = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en.status(), StatusCode::OK);
+            assert_eq!(body_string(en).await, "en");
+
+            let es = request(&app, "/es/posts", &[]).await;
+            assert_eq!(es.status(), StatusCode::OK);
+            assert_eq!(body_string(es).await, "es");
+        }
+
+        /// Codex review (P2): an empty-string entry in `supported_locales`
+        /// must not panic at router-construction time — `.nest("/", ...)`
+        /// (an empty locale segment) is a root nest, which axum rejects.
+        /// Skip the malformed entry instead; the other, valid locale must
+        /// still route normally.
+        #[tokio::test]
+        async fn malformed_locale_segment_does_not_panic_and_valid_locale_still_routes() {
+            let config = config(&["en", "", "es"], &[]);
             let route = simple_route("/posts", "posts", true);
             let app = build_router(vec![route], &config, test_state())
                 .layer(axum::Extension(bundle(&["en", "es"])));
