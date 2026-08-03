@@ -254,9 +254,10 @@ fn generated_form_for_scaffold_cargo_checks() {
 
 /// Patch the generated project to use this workspace's `autumn-web`, then
 /// `cargo check --tests` it, asserting success.
-fn assert_project_cargo_checks(project: &Path) {
-    // Point the generated project at the local autumn-web crate so the check
-    // exercises this workspace's `form_for`, not a published version.
+/// Point a generated project at this workspace's `autumn-web` rather than a
+/// published version, so a compile/run of the generated code exercises the
+/// code under test.
+fn patch_autumn_web_path(project: &Path) {
     let cargo_toml_path = project.join("Cargo.toml");
     let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -269,6 +270,10 @@ fn assert_project_cargo_checks(project: &Path) {
         autumn_web.display().to_string().replace('\\', "/")
     );
     fs::write(&cargo_toml_path, content).unwrap();
+}
+
+fn assert_project_cargo_checks(project: &Path) {
+    patch_autumn_web_path(project);
 
     let check = Command::new("cargo")
         .args(["check", "--tests"])
@@ -410,8 +415,10 @@ fn scaffold_attachment_emits_zero_js_multipart_handlers() {
     assert!(!routes.contains("complete_direct_upload(&"), "{routes}");
 
     // Preserve-on-update and create-binding.
+    // `.clone()` rather than a move: issue #1236 keeps `current` whole so the
+    // unique-violation 422 can still render the currently stored attachment.
     assert!(
-        routes.contains("new.image = image_blob.or(current.image);"),
+        routes.contains("new.image = image_blob.or(current.image.clone());"),
         "{routes}"
     );
     assert!(routes.contains("new.image = image_blob;"), "{routes}");
@@ -642,18 +649,18 @@ fn scaffold_attachment_cleans_up_saved_blob_on_early_return() {
     // Cleanup guards every update early return that can occur after the first
     // blob is saved. Codex P2 centralized the parse span: the mid-loop save
     // failure, `next_field`, `bytes_limited`, the UTF-8 conversion, and
-    // `decode_form` collapse to ONE cleanup inside the parse block. The six
-    // post-parse returns keep their own cleanup: validation 422, the current-row
-    // load, `into_new`, the unique-violation 422, the generic DB `Err`, and the
-    // not-found (`updated == 0`) guard.
+    // `decode_form` collapse to ONE cleanup inside the parse block. The seven
+    // post-parse returns keep their own cleanup: the current-row load, the
+    // record-policy denial, validation 422, `into_new`, the unique-violation
+    // 422, the generic DB `Err`, and the not-found (`updated == 0`) guard.
     assert_eq!(
         update_early
             .matches("let _ = store.delete(key).await;")
             .count(),
-        7,
-        "update must clean up the saved blob on all seven early-return sites \
-         (one central parse-span cleanup, plus validation, current-row load, into_new, \
-         unique-violation, DB error, not-found):\n{update}"
+        8,
+        "update must clean up the saved blob on all eight early-return sites \
+         (one central parse-span cleanup, plus current-row load, authorize, validation, \
+         into_new, unique-violation, DB error, not-found):\n{update}"
     );
     assert!(
         !update_success.contains("store.delete("),
@@ -663,7 +670,7 @@ fn scaffold_attachment_cleans_up_saved_blob_on_early_return() {
     // The preserve-on-update bind is untouched: only `image_blob` (the freshly
     // saved upload) is ever deleted, never the preserved `current.image`.
     assert!(
-        routes.contains("new.image = image_blob.or(current.image);"),
+        routes.contains("new.image = image_blob.or(current.image.clone());"),
         "{routes}"
     );
 
@@ -672,4 +679,250 @@ fn scaffold_attachment_cleans_up_saved_blob_on_early_return() {
     let plain_routes = fs::read_to_string(plain.join("src/routes/articles.rs")).unwrap();
     assert!(!plain_routes.contains("saved_blob_keys"), "{plain_routes}");
     assert!(!plain_routes.contains("store.delete("), "{plain_routes}");
+}
+
+/// AC3 (read-back half): after a zero-JS upload the record references a blob,
+/// and the **show** view must render that stored attachment — not the literal
+/// word "attachment". The generated `show` handler resolves a signed,
+/// time-bounded URL through the configured `BlobStore` (`presigned_url`, so it
+/// works for both the local disk backend and S3) and renders a download link.
+/// A NULL column renders an em dash; an app with no blob store configured
+/// degrades to the blob's name with no link, never an error.
+#[test]
+fn scaffold_attachment_show_view_renders_stored_attachment() {
+    let (_tmp, project) = scaffold_project(
+        "attach-show-app",
+        "Photo",
+        &["caption:String", "image:Attachment"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/photos.rs")).unwrap();
+
+    // The read-back helpers are emitted.
+    assert!(
+        routes.contains("async fn attachment_url("),
+        "attachment scaffolds must emit the signed-URL resolver:\n{routes}"
+    );
+    assert!(
+        routes.contains(".presigned_url(&blob.key,"),
+        "the resolver must sign through the configured BlobStore:\n{routes}"
+    );
+    assert!(
+        routes.contains("fn attachment_link("),
+        "attachment scaffolds must emit the link renderer:\n{routes}"
+    );
+
+    // `show` carries the state it needs to reach the blob store, resolves the
+    // URL for the column, and renders the link in its property list.
+    let show = handler_body(&routes, "pub async fn show(", "/// `GET /photos/new`");
+    assert!(
+        show.contains("autumn_web::extract::State<autumn_web::AppState>"),
+        "show must take the app state to reach the blob store:\n{show}"
+    );
+    assert!(
+        show.contains("let image_url = attachment_url(&state, row.image.as_ref()).await;"),
+        "show must resolve the stored attachment's URL:\n{show}"
+    );
+    assert!(
+        show.contains("(attachment_link(row.image.as_ref(), image_url.as_deref()))"),
+        "show must render the stored attachment, not a presence placeholder:\n{show}"
+    );
+    assert!(
+        !show.contains(r#"if row.image.is_some() { "attachment" }"#),
+        "show must no longer render the literal word \"attachment\":\n{show}"
+    );
+
+    // The index list stays presence-only: its `data_table` column closure is
+    // sync and per-row, so resolving one signed URL per row is not on the table.
+    let index = handler_body(&routes, "pub async fn index(", "pub async fn show(");
+    assert!(
+        index.contains(r#"if row.image.is_some() { "attachment" }"#),
+        "the index column stays a cheap presence marker:\n{index}"
+    );
+
+    // A plain scaffold gets none of the read-back machinery.
+    let (_tmp2, plain) = scaffold_project("plain-show-app", "Article", &["title:String"]);
+    let plain_routes = fs::read_to_string(plain.join("src/routes/articles.rs")).unwrap();
+    assert!(!plain_routes.contains("attachment_url("), "{plain_routes}");
+    assert!(!plain_routes.contains("attachment_link("), "{plain_routes}");
+}
+
+/// AC3 (read-back half, edit view): the edit form shows which file is already
+/// stored — a file `<input>` cannot be repopulated, so without this the user
+/// has no way to tell whether the record already has an attachment. The block
+/// lives in the SHARED edit body, so the 422 re-render after a rejected submit
+/// shows the same thing as `GET /photos/{id}/edit` (no markup drift).
+#[test]
+fn scaffold_attachment_edit_view_renders_current_attachment() {
+    // `email:String:unique` gives the update handler its second 422 branch (the
+    // unique-violation re-render) as well as the validation one.
+    let (_tmp, project) = scaffold_project(
+        "attach-edit-app",
+        "Photo",
+        &["caption:String", "image:Attachment", "email:String:unique"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/photos.rs")).unwrap();
+
+    let current_block = "@if let Some(blob) = current.image.as_ref() {";
+    let url_bind = "let image_url = attachment_url(&state, current.image.as_ref()).await;";
+
+    // Rendered on the GET edit page…
+    let edit = handler_body(&routes, "pub async fn edit_form(", "pub async fn update(");
+    assert!(edit.contains(url_bind), "{edit}");
+    assert!(edit.contains(current_block), "{edit}");
+    assert!(
+        edit.contains("(attachment_link(Some(blob), image_url.as_deref()))"),
+        "{edit}"
+    );
+
+    // …and identically on every 422 re-render of that same form, which means
+    // `current` has to be loaded before validation rejects the submit.
+    let update = handler_body(&routes, "pub async fn update(", "pub async fn destroy(");
+    assert_eq!(
+        update.matches(current_block).count(),
+        2,
+        "both update 422 re-renders must show the current attachment:\n{update}"
+    );
+    let load_at = update
+        .find("let current: Photo = match photos::table")
+        .unwrap_or_else(|| panic!("missing current-row load:\n{update}"));
+    let validate_at = update
+        .find("if !changeset.is_valid() {")
+        .unwrap_or_else(|| panic!("missing validation guard:\n{update}"));
+    assert!(
+        load_at < validate_at,
+        "the current row must load before the validation 422 so the re-render \
+         can show the stored attachment (and so the record policy runs first):\n{update}"
+    );
+
+    // The new-record form has nothing stored yet, so it renders no such block.
+    let new_form = handler_body(&routes, "pub async fn new_form(", "pub async fn create(");
+    assert!(!new_form.contains("attachment_link("), "{new_form}");
+}
+
+/// AC4: the generated write-path test covers BOTH AC4 clauses — an oversized
+/// upload is rejected with `413` honoring `security.upload.max_file_size_bytes`,
+/// and a submit with no file on an optional attachment succeeds with the column
+/// left NULL.
+#[test]
+fn scaffold_attachment_emits_generated_size_limit_and_null_tests() {
+    let (_tmp, project) = scaffold_project(
+        "attach-limits-app",
+        "Photo",
+        &["caption:String", "image:Attachment"],
+    );
+    let test_src = fs::read_to_string(project.join("tests/photo.rs")).unwrap();
+
+    assert!(
+        test_src.contains("#[tokio::test]\nasync fn photos_multipart_upload_over_limit_is_413() {"),
+        "AC4 needs a generated oversized-upload test:\n{test_src}"
+    );
+    assert!(
+        test_src.contains("config.security.upload.max_file_size_bytes ="),
+        "the oversized test must drive the real config knob:\n{test_src}"
+    );
+    assert!(
+        test_src.contains(".assert_status(413)"),
+        "an oversized upload must surface 413:\n{test_src}"
+    );
+
+    assert!(
+        test_src
+            .contains("#[tokio::test]\nasync fn photos_multipart_create_without_file_is_null() {"),
+        "AC4 needs a generated no-file-is-NULL test:\n{test_src}"
+    );
+    assert!(
+        test_src.contains("the optional attachment column must stay NULL"),
+        "{test_src}"
+    );
+
+    // A plain scaffold gets neither.
+    let (_tmp2, plain) = scaffold_project("plain-limits-app", "Article", &["title:String"]);
+    let plain_src = fs::read_to_string(plain.join("tests/article.rs")).unwrap();
+    assert!(!plain_src.contains("over_limit_is_413"), "{plain_src}");
+    assert!(!plain_src.contains("without_file_is_null"), "{plain_src}");
+}
+
+/// AC5: the generated handler note must not push authors back onto the
+/// JavaScript presign path. It previously claimed a "~2 MiB size ceiling with
+/// CSRF on" — that is false for the form the scaffold emits: `form_for` renders
+/// the CSRF hidden input as the FIRST child of the `<form>` and the scaffold
+/// `.prepend`s the submit token right after it, so both tokens land inside
+/// `security.csrf.token_scan_bytes` (2 MiB) however large the file is. See
+/// `autumn/src/security/csrf.rs::post_large_multipart_token_first_streams_full_body_and_passes`.
+#[test]
+fn scaffold_attachment_note_does_not_claim_a_csrf_size_ceiling() {
+    let (_tmp, project) = scaffold_project(
+        "attach-note-app",
+        "Photo",
+        &["caption:String", "image:Attachment"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/photos.rs")).unwrap();
+    let note = handler_body(
+        &routes,
+        "//! This scaffold includes",
+        "use autumn_web::extract",
+    );
+
+    assert!(
+        !note.contains("SIZE CEILING"),
+        "the note must not claim a CSRF size ceiling the generated form does not have:\n{note}"
+    );
+    assert!(
+        !note.contains("rejected with\n//! 403") && !note.contains("403"),
+        "the note must not tell authors large uploads 403:\n{note}"
+    );
+    // It states the real limits instead.
+    assert!(note.contains("max_file_size_bytes"), "{note}");
+    assert!(
+        note.contains("413"),
+        "the note must name the real 413 cap:\n{note}"
+    );
+    assert!(
+        note.contains("max_request_size_bytes"),
+        "the note must name the whole-request cap:\n{note}"
+    );
+    // Presign stays documented, as the opt-in advanced path.
+    assert!(note.contains("ADVANCED (opt-in)"), "{note}");
+    assert!(note.contains("complete_direct_upload"), "{note}");
+    assert!(note.contains("examples/reddit-clone"), "{note}");
+}
+
+/// AC6 (the missing half): the generated multipart write-path tests are not
+/// just string-shaped — they must actually PASS in a freshly scaffolded
+/// project. Compiles and RUNS the generated `tests/photo.rs` binary, which
+/// covers the AC6 create-binds-a-blob-key test plus the AC4 413 / NULL tests.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-tests a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_attachment_scaffold_multipart_test_passes() {
+    let (_tmp, project) = scaffold_project(
+        "attach-run",
+        "Photo",
+        &["caption:String", "image:Attachment"],
+    );
+    patch_autumn_web_path(&project);
+
+    let run = Command::new("cargo")
+        .args(["test", "--test", "photo"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "generated multipart write-path tests failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    for name in [
+        "photos_multipart_upload_binds_blob_key",
+        "photos_multipart_upload_over_limit_is_413",
+        "photos_multipart_create_without_file_is_null",
+    ] {
+        assert!(
+            stdout.contains(&format!("test {name} ... ok")),
+            "generated test `{name}` must run and pass (it must not be ignored):\n{stdout}"
+        );
+    }
 }

@@ -568,6 +568,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **generate:** finished the zero-JS file-upload slice (#1236) on the read-back
+  side. A scaffold with an `Attachment` column now *shows* what it stored: the
+  generated `show` and edit views resolve a signed, time-bounded URL through the
+  configured `BlobStore` (`attachment_url`) and render a download link
+  (`attachment_link`) instead of the literal word "attachment", degrading to the
+  stored file's name when no `[storage]` backend is configured. The edit form
+  additionally labels the currently stored file above the file input — a file
+  `<input>` can't be repopulated, so without it there was no way to tell an
+  empty column from one holding a blob you simply didn't replace — and it
+  renders identically on the 422 re-render, which is why `update` now loads the
+  current row *before* validating (that also runs the record policy before the
+  form is handed back, and the policy denial joins the #1872 blob-cleanup paths
+  so a forbidden update no longer orphans the just-uploaded file). The generated
+  write-path test grew the two AC4 cases — an upload over
+  `security.upload.max_file_size_bytes` is rejected with `413`, and a submit
+  with no file leaves the optional column `NULL` — and a new (`#[ignore]`d)
+  gate compiles *and runs* a freshly scaffolded project's test binary, so the
+  emitted tests are proven to pass rather than only string-matched. Finally, the
+  generated handler note dropped a false "~2 MiB CSRF size ceiling" warning that
+  pushed authors back onto the JavaScript presign path: `form_for` renders the
+  CSRF and submit-token hidden inputs as the form's *first* fields, so both land
+  inside `security.csrf.token_scan_bytes` however large the upload is. The note
+  now names the real limits (`max_file_size_bytes` → 413,
+  `max_request_size_bytes` → global body cap). The index list stays a cheap
+  presence marker (its `data_table` column closure is sync and per row).
+  Generator-only; no `autumn-web` API change.
+
 - **jobs:** routed the job runtime's recorded timestamps (enqueued_at/started_at/finished_at, due-at filtering, and the backoff-delay computation) through the injected `ClockSource` seam instead of reading `Utc::now()` directly, so recorded job timestamps are deterministic under the sim harness (production defaults to `SystemClock`, behavior unchanged). The in-memory/sim job path is now fully deterministic; the Postgres durable path still uses server-side SQL `NOW()` (#2111). [no-plugin]
 
 - **admin-plugin:** made the core connection surface backend-agnostic so
