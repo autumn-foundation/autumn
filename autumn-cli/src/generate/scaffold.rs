@@ -2879,6 +2879,10 @@ fn render_routes_file(
          }}\n"
     );
 
+    // A slug field is always `unique` (issue #1260), so a slug scaffold
+    // always takes THIS branch — the `has_attachments`/plain branches below
+    // still hard-code the pre-#1260 `*id` literal, safe only because they're
+    // unreachable whenever a slug field is present.
     let update_apply_block = if !unique_fields.is_empty() {
         // Issue #1872: `{blob_cleanup}` (empty unless the scaffold has attachment
         // fields) best-effort deletes the just-saved blob(s) on the
