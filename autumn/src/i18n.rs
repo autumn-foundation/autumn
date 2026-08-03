@@ -1421,7 +1421,13 @@ mod tests {
         // bundle's own supported_locales/default_locale disagree — but the
         // bundle itself must still be attached, so `t()` keeps working.
         let cfg = cfg("en", &["en", "es"]);
-        let bundle = Arc::new(bundle_with(&[("en", &[("greeting", "Hello")]), ("es", &[("greeting", "Hola")])], &cfg));
+        let bundle = Arc::new(bundle_with(
+            &[
+                ("en", &[("greeting", "Hello")]),
+                ("es", &[("greeting", "Hola")]),
+            ],
+            &cfg,
+        ));
         let mut parts = build_parts("/", &[]);
         parts.extensions.insert(bundle);
         parts.extensions.insert(LocaleRoutingConfig {
