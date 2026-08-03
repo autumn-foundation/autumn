@@ -350,6 +350,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guides (#2099). Also corrects stale rustdoc that advertised a `/v3/api-docs`
   default (the served default is `/openapi.json`) and an "OpenAPI 3.0" document
   (the generator emits 3.1.0). [no-plugin]
+- **sim-testing:** add the **seed-sweep runner** (`sim::sweep`, W6 PR3,
+  #1797) and the CI-facing `sim-sweep` `[[bin]]`: `sweep_proptest(seeds,
+  &strategy, body)` runs `Sim::run_proptest` sequentially across a batch of
+  seeds, stopping at the first failing seed and reporting its shrunk
+  op-sequence. `SweepFailure`'s `Display` is caller-agnostic (it doesn't
+  prescribe a replay command, since `sweep_proptest` has no idea what test or
+  binary is calling it); the `sim-sweep` bin appends its own replay
+  suggestion when it prints a failure, since it knows its own invocation.
+  Folds every proptest case's `sometimes!` observations (not just the last of
+  up to 256 cases per seed — `Sim::run_proptest_with_case_hook` is a new
+  `pub(crate)` hook for this) into a cross-seed aggregate, so a fully-green
+  sweep is only reported as `Passed` when it is also non-vacuous (`Vacuous`
+  otherwise, if some label was observed but never satisfied anywhere in the
+  range). Deliberately sequential rather than parallel across a worker pool:
+  review of an earlier revision surfaced that `TestApp::build` (what a
+  `body` mounting a real app calls) unconditionally touches process-global
+  state (the cache, the event bus, and — when jobs are configured — a global
+  job client), which concurrent workers would race on, and that
+  `Sim::run_proptest`'s sync-only `body` signature can't `.await`
+  `Sim::run_to_idle` to drain spawned background work even with a runtime
+  entered — both architectural, not patchable within this sweep. Sequential
+  execution sidesteps both; sweep-level threading was orthogonal to the
+  harness's actual concurrency-bug-finding power anyway (that comes from
+  exploring seeds against W1's single-threaded deterministic executor, not
+  from how many OS threads process the outer seed range). An empty seed range
+  (`AUTUMN_SIM_SEEDS=0`, or any empty iterator passed to `sweep_proptest`)
+  reports the new `SweepOutcome::Empty` rather than silently falling through
+  to `Passed { seeds_run: 0 }` — the bin treats it as a failure (exit `1`) so
+  a misconfigured seed count can't quietly green the CI job without testing
+  anything. `embedded_config()` (the op-driver's internal proptest `Config`,
+  already forcing fork/timeout off regardless of ambient `PROPTEST_FORK`/
+  `PROPTEST_TIMEOUT`) now also pins the case count to a fixed 256, ignoring
+  `PROPTEST_CASES` entirely: `PROPTEST_CASES=0` would otherwise make a case
+  closure never run at all while still reporting success, and even a bare
+  "clamp to at least 1" would still collapse proptest's automatic shrink
+  budget (`cases × 4`) to 4 iterations, aborting shrinking early with a
+  far-from-minimal counterexample. `AUTUMN_SIM_SEEDS=1000 cargo run -p
+  autumn-web --release --features sim-testing --bin sim-sweep` sweeps seeds
+  `0..1000` against a built-in account demo scenario; a new standalone CI job
+  runs it at seed count 512 on every push/PR, structured like the `loom`
+  job. [no-plugin]
 - **sim-testing:** add a property-based **op-driver** (`sim::op`, W6 PR2,
   #1797) behind the new `sim-testing` feature: `Sim::gen_ops::<T>()` /
   `Sim::gen_ops_with(strategy)` deterministically draw an arbitrary `Vec<T>`
