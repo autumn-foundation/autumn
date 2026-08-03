@@ -1923,7 +1923,15 @@ fn apply_locale_prefix_routing(
         router = router.merge(redirect_router);
     }
 
+    // Dedup while preserving order: a repeated entry in `supported_locales`
+    // would otherwise `.nest()` the same path twice, which axum rejects with
+    // an overlapping-route panic at router-construction time (i.e. app
+    // startup), rather than a graceful config error.
+    let mut seen_locales = std::collections::HashSet::new();
     for locale in &i18n.supported_locales {
+        if !seen_locales.insert(locale.as_str()) {
+            continue;
+        }
         let nested = content_router
             .clone()
             .fallback(crate::middleware::error_page_filter::fallback_404_handler)
@@ -1933,13 +1941,16 @@ fn apply_locale_prefix_routing(
         router = router.nest(&format!("/{locale}"), nested);
     }
 
-    // Fallback negotiation data for the `Locale` extractor (issue #1251) —
-    // covers apps that enable `locale_prefix_enabled` without also calling
+    // Negotiation data for the `Locale` extractor (issue #1251) — covers
+    // apps that enable `locale_prefix_enabled` without also calling
     // `.i18n()`/`.i18n_auto()`, so the bare-path redirect (and any handler
     // under an excluded prefix that still takes a `Locale` param) negotiates
     // against the configured `supported_locales`/`default_locale` instead of
-    // an empty list and a hard-coded `"en"`. A real `Bundle`, if installed,
-    // always takes precedence — see `Locale::from_request_parts`.
+    // an empty list and a hard-coded `"en"`. This is authoritative for
+    // negotiation even when a `Bundle` is also installed, since the router's
+    // reachable locale segments come from `I18nConfig`, not the bundle — see
+    // `Locale::from_request_parts`. A real `Bundle`, if installed, remains
+    // authoritative only for `t()`/`t_with()` translation lookups.
     router.layer(axum::Extension(crate::i18n::LocaleRoutingConfig {
         supported_locales: i18n.supported_locales.clone(),
         default_locale: i18n.default_locale.clone(),
@@ -6211,6 +6222,26 @@ mod tests {
         #[tokio::test]
         async fn route_reachable_under_every_supported_locale() {
             let config = config(&["en", "es"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let en = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en.status(), StatusCode::OK);
+            assert_eq!(body_string(en).await, "en");
+
+            let es = request(&app, "/es/posts", &[]).await;
+            assert_eq!(es.status(), StatusCode::OK);
+            assert_eq!(body_string(es).await, "es");
+        }
+
+        /// Codex review (P1): a duplicate entry in `supported_locales` must
+        /// not panic at router-construction time (axum rejects nesting the
+        /// same path twice as an overlapping route) — it should simply be
+        /// deduped, and the locale should still route normally.
+        #[tokio::test]
+        async fn duplicate_supported_locale_does_not_panic_and_still_routes() {
+            let config = config(&["en", "es", "en"], &[]);
             let route = simple_route("/posts", "posts", true);
             let app = build_router(vec![route], &config, test_state())
                 .layer(axum::Extension(bundle(&["en", "es"])));

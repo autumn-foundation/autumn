@@ -725,22 +725,23 @@ where
         // extension and threaded through via a layer; for tests we build
         // [`Locale`] directly via [`Locale::new`] / [`Locale::with_bundle`].)
         let bundle = parts.extensions.get::<Arc<Bundle>>().cloned();
-        // Fall back to the router's `LocaleRoutingConfig` (issue #1251) when
-        // no bundle is installed, so `locale_prefix_enabled` negotiates
-        // correctly even without `.i18n()`/`.i18n_auto()`.
-        let routing_config = bundle
-            .is_none()
-            .then(|| parts.extensions.get::<LocaleRoutingConfig>().cloned())
-            .flatten();
-        let supported: Vec<String> = bundle
+        // Read the router's `LocaleRoutingConfig` (issue #1251) regardless of
+        // whether a bundle is installed: when locale-prefix routing is on,
+        // the router's nests/redirects are built entirely from `I18nConfig`,
+        // so that config — not an independently-constructed `Bundle` — must
+        // be authoritative for which locales are actually reachable and
+        // what the fallback default is. The bundle stays authoritative only
+        // for `t()`/`t_with()` translation lookups (see `with_bundle` below).
+        let routing_config = parts.extensions.get::<LocaleRoutingConfig>().cloned();
+        let supported: Vec<String> = routing_config
             .as_ref()
-            .map(|b| b.supported_locales.clone())
-            .or_else(|| routing_config.as_ref().map(|c| c.supported_locales.clone()))
+            .map(|c| c.supported_locales.clone())
+            .or_else(|| bundle.as_ref().map(|b| b.supported_locales.clone()))
             .unwrap_or_default();
-        let default = bundle
+        let default = routing_config
             .as_ref()
-            .map(|b| b.default_locale.clone())
-            .or_else(|| routing_config.as_ref().map(|c| c.default_locale.clone()))
+            .map(|c| c.default_locale.clone())
+            .or_else(|| bundle.as_ref().map(|b| b.default_locale.clone()))
             .unwrap_or_else(|| "en".to_owned());
 
         // Resolution order: URL locale prefix (issue #1251, when the router's
@@ -1388,20 +1389,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundle_takes_precedence_over_locale_routing_config() {
+    async fn locale_routing_config_takes_precedence_over_bundle_for_negotiation() {
         // Both installed (e.g. app calls .i18n_auto() AND enables
-        // locale_prefix_enabled) — the real translation bundle must win, not
-        // the router's fallback config.
+        // locale_prefix_enabled) — the router's `LocaleRoutingConfig` must
+        // win for NEGOTIATION, since the router's nests/redirects are built
+        // entirely from `I18nConfig`: a locale the bundle "supports" but the
+        // router doesn't route is unreachable anyway, and a locale the
+        // router routes but the bundle doesn't list must still negotiate
+        // successfully (see `bundle_translation_lookup_still_works_when_locale_routing_config_wins`
+        // for confirmation the bundle remains authoritative for `t()`).
         let cfg = cfg("en", &["en", "es"]);
         let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
-        let mut parts = build_parts("/", &[(header::ACCEPT_LANGUAGE.as_str(), "es-MX,es;q=0.9")]);
+        let mut parts = build_parts("/", &[(header::ACCEPT_LANGUAGE.as_str(), "fr-CA,fr;q=0.9")]);
         parts.extensions.insert(bundle);
         parts.extensions.insert(LocaleRoutingConfig {
             supported_locales: vec!["fr".to_owned()],
             default_locale: "fr".to_owned(),
         });
         let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(
+            locale.tag(),
+            "fr",
+            "LocaleRoutingConfig must be authoritative for negotiation, since the \
+             router's reachable locale segments come from I18nConfig, not the bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_translation_lookup_still_works_when_locale_routing_config_wins() {
+        // Negotiation lands on "es" via LocaleRoutingConfig even though the
+        // bundle's own supported_locales/default_locale disagree — but the
+        // bundle itself must still be attached, so `t()` keeps working.
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[("greeting", "Hello")]), ("es", &[("greeting", "Hola")])], &cfg));
+        let mut parts = build_parts("/", &[]);
+        parts.extensions.insert(bundle);
+        parts.extensions.insert(LocaleRoutingConfig {
+            supported_locales: vec!["es".to_owned()],
+            default_locale: "es".to_owned(),
+        });
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(locale.tag(), "es");
+        assert_eq!(locale.t("greeting"), "Hola");
     }
 
     #[test]
