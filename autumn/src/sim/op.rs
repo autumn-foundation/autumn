@@ -57,6 +57,29 @@
 //! `test_name` to hand proptest's forking machinery), so inheriting fork mode
 //! would panic instead of generating ops.
 //!
+//! # Calling `body` closures that mount an app
+//!
+//! [`Sim::run_proptest`] itself neither builds nor enters a Tokio runtime — it
+//! calls `body` directly, on whatever thread and in whatever ambient context
+//! the caller invoked it from (this predates the op-driver; it was already
+//! true of every earlier `Sim` entrypoint). A `body` that mounts a real app
+//! via [`Sim::build`] therefore needs the **caller** to already have an
+//! entered Tokio runtime — [`Sim::build`] starts the local job runtime
+//! through a bare `tokio::spawn` (`job.rs`) when the app configures jobs,
+//! which panics with `"there is no reactor running"` outside one. Call
+//! [`Sim::run_proptest`] synchronously from inside an already-running async
+//! context (e.g. a `#[tokio::test]` function, or code already inside
+//! `Runtime::block_on`) rather than from a bare `fn main()` or a plain,
+//! non-async `#[test]`.
+//!
+//! Even with a runtime entered, `body: Fn(&mut Sim, &[T])` is plain
+//! synchronous — it can never itself `.await` [`Sim::advance`] /
+//! [`Sim::run_to_idle`] to drain a mounted app's background job workers
+//! mid-body, so job-backed invariants are better proven with
+//! [`#[sim_test]`](crate::sim_test) (whose body is `async` and can drive
+//! `run_to_idle` directly) than with the op-driver until a future async-body
+//! variant of `run_proptest` exists.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -69,6 +92,9 @@
 //!     Transfer { to: u8, amount: u32 },
 //! }
 //!
+//! // Called from inside a `#[tokio::test]` (or otherwise already inside a
+//! // running Tokio runtime) — see "Calling `body` closures that mount an
+//! // app" above for why that's required here.
 //! let result = Sim::run_proptest(0, proptest::collection::vec(any::<Op>(), 1..32), |sim, ops| {
 //!     sim.build(app());
 //!     for op in ops {

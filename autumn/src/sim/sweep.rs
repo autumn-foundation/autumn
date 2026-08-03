@@ -67,6 +67,16 @@
 //! design; the parallel revision was a detour that review correctly walked
 //! back.
 //!
+//! Sequential execution removes the *concurrency* hazards above, but a
+//! `body` that calls `sim.build` still inherits [`Sim::run_proptest`]'s own,
+//! older precondition unchanged (see its module docs' "Calling `body`
+//! closures that mount an app"): [`sweep_proptest`] neither builds nor
+//! enters a Tokio runtime itself — every seed's case runs on whichever
+//! thread and in whatever ambient context *the caller* invoked
+//! [`sweep_proptest`] from, identical to a bare [`Sim::run_proptest`] call.
+//! Call it from somewhere already inside a running Tokio runtime if `body`
+//! mounts a real app.
+//!
 //! # Non-vacuity
 //!
 //! A sweep is only meaningfully green if it is also **non-vacuous**: every
