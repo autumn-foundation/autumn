@@ -5,9 +5,10 @@
 
 use autumn_web::assets::asset_url;
 use autumn_web::cache::cache_fragment_global;
+use autumn_web::config::AutumnConfig;
 use autumn_web::extract::{Form, Path};
 use autumn_web::i18n::Locale;
-use autumn_web::seo::SeoMeta;
+use autumn_web::seo::{SeoMeta, locale_alternates};
 use autumn_web::widgets::{Crumb, HeroConfig, breadcrumb, hero, locale_switcher};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, t};
 use diesel::prelude::*;
@@ -323,6 +324,7 @@ pub async fn show(
     uri: autumn_web::reexports::http::Uri,
     slug: Path<String>,
     seo: SeoMeta,
+    config: AutumnConfig,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let p = Post::find_by_slug(&slug, &mut db).await?;
@@ -340,6 +342,21 @@ pub async fn show(
             .take(160)
             .collect::<String>(),
     );
+
+    // hreflang alternates (issue #1251): `/posts/{slug}` is a dynamic
+    // (`#[get]`) route, so — unlike the static `/about` page — it's genuinely
+    // reachable at `/en/posts/{slug}` and `/es/posts/{slug}`, and these
+    // alternates point at real, working URLs.
+    let seo = if let Some(base_url) = config.seo.base_url.as_deref() {
+        seo.hreflang_alternates(locale_alternates(
+            base_url,
+            &format!("/posts/{}", *slug),
+            locale.bundle().map_or("en", |b| b.default_locale()),
+            locale.bundle().map_or(&[], |b| b.supported_locales()),
+        ))
+    } else {
+        seo
+    };
 
     Ok(layout_with_seo(
         &locale,

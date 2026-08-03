@@ -3350,6 +3350,13 @@ impl AppBuilder {
             merge_routers.push(router);
         }
 
+        // Static routes are pre-rendered by requesting their single,
+        // unprefixed path — never locale-aware — so they must stay excluded
+        // from locale-prefix routing even when it's enabled (issue #1251).
+        // Must run before both the sitemap generation below and the router
+        // build further down, so the two agree on which paths are excluded.
+        exclude_static_routes_from_locale_prefix(&mut config, &static_metas);
+
         // Register SEO routes (/robots.txt and /sitemap.xml) when any SEO
         // configuration is present or dynamic sources are registered.
         if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
@@ -3444,6 +3451,7 @@ impl AppBuilder {
                 merge_routers.push(axum_router);
             }
         }
+
         // Worker role does not serve user routes: build a probe-only router that
         // exposes just the framework liveness/readiness probes and the actuator,
         // so orchestrators can supervise the process and `/actuator/jobs` works.
@@ -4699,6 +4707,10 @@ impl AppBuilder {
         if let Some(router) = storage_router {
             merge_routers.push(router);
         }
+        // Static routes are pre-rendered by requesting their single,
+        // unprefixed path — never locale-aware — so they must stay excluded
+        // from locale-prefix routing even when it's enabled (issue #1251).
+        exclude_static_routes_from_locale_prefix(&mut config, &static_metas);
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -7198,6 +7210,42 @@ fn embedded_i18n_bundle(
             )
         })
     })
+}
+
+/// Excludes every `#[static_get]` route from locale-prefix routing (issue
+/// #1251).
+///
+/// `#[static_get]` pre-rendering (`autumn build`, and ISR re-renders) is not
+/// locale-aware: it requests each `StaticRouteMeta::path` once and writes the
+/// single response it gets back to disk. Locale-prefixing that same path
+/// would replace its content with a bare-path 308 redirect (the locale
+/// segment is only known once nested under `/{locale}`), and
+/// `render_static_routes` treats any non-2xx response as a build failure —
+/// so without this exclusion, enabling `locale_prefix_enabled` breaks
+/// `autumn build` for every app with a static route.
+///
+/// Static routes therefore keep serving at their single, unprefixed path
+/// (matching pre-#1251 behavior) even when locale-prefix routing is on for
+/// the rest of the app. Full per-locale static generation is a natural
+/// follow-up, not attempted here.
+#[cfg(feature = "i18n")]
+fn exclude_static_routes_from_locale_prefix(
+    config: &mut AutumnConfig,
+    static_metas: &[crate::static_gen::StaticRouteMeta],
+) {
+    if config.i18n.locale_prefix_enabled {
+        config
+            .i18n
+            .locale_prefix_exclude
+            .extend(static_metas.iter().map(|meta| meta.path.to_owned()));
+    }
+}
+
+#[cfg(not(feature = "i18n"))]
+fn exclude_static_routes_from_locale_prefix(
+    _config: &mut AutumnConfig,
+    _static_metas: &[crate::static_gen::StaticRouteMeta],
+) {
 }
 
 /// Derives the sitemap's locale-prefix config (issue #1251) from
@@ -10769,6 +10817,70 @@ mod tests {
 
         assert!(builder.i18n_bundle.is_none());
         assert!(builder.i18n_auto_load);
+    }
+
+    // ── exclude_static_routes_from_locale_prefix (issue #1251, Codex review) ──
+    //
+    // `#[static_get]` pre-rendering requests each route's single, unprefixed
+    // path and rejects any non-2xx response; without this exclusion,
+    // enabling `locale_prefix_enabled` would replace that path with a 308
+    // redirect and break `autumn build` for every app with a static route.
+
+    #[cfg(feature = "i18n")]
+    fn static_meta(path: &'static str) -> crate::static_gen::StaticRouteMeta {
+        crate::static_gen::StaticRouteMeta {
+            path,
+            name: "test_static_route",
+            revalidate: None,
+            params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+        }
+    }
+
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn static_routes_are_excluded_when_locale_prefix_is_enabled() {
+        let mut config = AutumnConfig::default();
+        config.i18n.locale_prefix_enabled = true;
+        let metas = vec![static_meta("/about"), static_meta("/pricing")];
+
+        exclude_static_routes_from_locale_prefix(&mut config, &metas);
+
+        assert_eq!(
+            config.i18n.locale_prefix_exclude,
+            vec!["/about".to_owned(), "/pricing".to_owned()]
+        );
+    }
+
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn static_route_exclusion_is_a_noop_when_locale_prefix_is_disabled() {
+        let mut config = AutumnConfig::default();
+        assert!(!config.i18n.locale_prefix_enabled);
+        let metas = vec![static_meta("/about")];
+
+        exclude_static_routes_from_locale_prefix(&mut config, &metas);
+
+        assert!(
+            config.i18n.locale_prefix_exclude.is_empty(),
+            "must not touch the exclude list when the feature is off"
+        );
+    }
+
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn static_route_exclusion_preserves_existing_exclude_entries() {
+        let mut config = AutumnConfig::default();
+        config.i18n.locale_prefix_enabled = true;
+        config.i18n.locale_prefix_exclude = vec!["/api".to_owned()];
+        let metas = vec![static_meta("/about")];
+
+        exclude_static_routes_from_locale_prefix(&mut config, &metas);
+
+        assert_eq!(
+            config.i18n.locale_prefix_exclude,
+            vec!["/api".to_owned(), "/about".to_owned()]
+        );
     }
 
     #[cfg(feature = "i18n")]

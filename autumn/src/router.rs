@@ -1924,7 +1924,17 @@ fn apply_locale_prefix_routing(
         router = router.nest(&format!("/{locale}"), nested);
     }
 
-    router
+    // Fallback negotiation data for the `Locale` extractor (issue #1251) —
+    // covers apps that enable `locale_prefix_enabled` without also calling
+    // `.i18n()`/`.i18n_auto()`, so the bare-path redirect (and any handler
+    // under an excluded prefix that still takes a `Locale` param) negotiates
+    // against the configured `supported_locales`/`default_locale` instead of
+    // an empty list and a hard-coded `"en"`. A real `Bundle`, if installed,
+    // always takes precedence — see `Locale::from_request_parts`.
+    router.layer(axum::Extension(crate::i18n::LocaleRoutingConfig {
+        supported_locales: i18n.supported_locales.clone(),
+        default_locale: i18n.default_locale.clone(),
+    }))
 }
 
 /// Fallback handler mounted at every locale-prefix-eligible bare path:
@@ -6074,6 +6084,39 @@ mod tests {
                 api_version: None,
                 sunset_opt_out: false,
             }
+        }
+
+        /// Codex review (P1): an app that enables `locale_prefix_enabled`
+        /// without also calling `.i18n()`/`.i18n_auto()` (no `Bundle`
+        /// installed) must still redirect to — and correctly serve — its
+        /// *configured* locale, not a hard-coded `"en"` that may not even be
+        /// in `supported_locales`.
+        #[tokio::test]
+        async fn locale_prefix_redirect_works_without_an_i18n_bundle() {
+            let config = config(&["fr"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            // No `.layer(axum::Extension(bundle(...)))` — deliberately no
+            // Bundle, unlike every other test in this module.
+            let app = build_router(vec![route], &config, test_state());
+
+            let redirected = request(&app, "/posts", &[]).await;
+            assert_eq!(redirected.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                redirected
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/fr/posts"),
+                "must redirect to the configured locale, not a hard-coded \"en\""
+            );
+
+            let target = request(&app, "/fr/posts", &[]).await;
+            assert_eq!(
+                target.status(),
+                StatusCode::OK,
+                "the redirect target must actually resolve"
+            );
+            assert_eq!(body_string(target).await, "fr");
         }
 
         /// AC: default off — no behavior change for existing apps. The bare
