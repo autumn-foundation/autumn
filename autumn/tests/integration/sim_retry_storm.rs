@@ -109,12 +109,12 @@ fn reset_probe_state() {
 /// that puts every enqueued job's retry through the backoff path being tested.
 #[job(name = "storm_probe", max_attempts = 2, backoff_ms = 1000)]
 async fn storm_probe(_state: AppState, args: StormArgs) -> AutumnResult<()> {
+    // The guard necessarily spans the read-modify-write on the `entry` API
+    // below; there's no meaningful way to tighten it further.
+    #[allow(clippy::significant_drop_tightening)]
     let attempt = {
-        let attempts = ATTEMPTS
-            .lock()
-            .unwrap()
-            .as_mut()
-            .expect("reset_probe_state must run first");
+        let mut guard = ATTEMPTS.lock().unwrap();
+        let attempts = guard.as_mut().expect("reset_probe_state must run first");
         let counter = attempts.entry(args.id).or_insert(0);
         *counter += 1;
         *counter
