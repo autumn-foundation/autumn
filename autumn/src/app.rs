@@ -7242,7 +7242,7 @@ fn exclude_static_routes_from_locale_prefix(
 }
 
 #[cfg(not(feature = "i18n"))]
-fn exclude_static_routes_from_locale_prefix(
+const fn exclude_static_routes_from_locale_prefix(
     _config: &mut AutumnConfig,
     _static_metas: &[crate::static_gen::StaticRouteMeta],
 ) {
