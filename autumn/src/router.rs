@@ -555,7 +555,7 @@ fn build_router_pre_state(
 
     // Build the per-route timeout override table before `route_list` and the
     // scoped groups are consumed by the mounting steps below.
-    let route_timeouts = build_route_timeout_table(&route_list, &ctx.scoped_groups);
+    let route_timeouts = build_route_timeout_table(&route_list, &ctx.scoped_groups, config);
 
     let idempotency_layers = build_idempotency_layers(config, state)?;
     // Both `.layer(..)` custom layers and `.static_gate(..)` gate layers are
@@ -1965,9 +1965,24 @@ fn apply_locale_prefix_routing(
     // reachable locale segments come from `I18nConfig`, not the bundle — see
     // `Locale::from_request_parts`. A real `Bundle`, if installed, remains
     // authoritative only for `t()`/`t_with()` translation lookups.
+    //
+    // `default_locale` itself is only used here as the negotiation fallback,
+    // so it must name a locale that's actually nested above — a misconfigured
+    // `default_locale` absent from `supported_locales` (Codex review) would
+    // otherwise negotiate to a locale with no `/{locale}` nest, and the
+    // bare-path redirect would 308 straight into a 404. Fall back to the
+    // first supported locale (i.e. the first one actually mounted) instead.
+    let effective_default_locale = if i18n.supported_locales.contains(&i18n.default_locale) {
+        i18n.default_locale.clone()
+    } else {
+        i18n.supported_locales
+            .first()
+            .cloned()
+            .unwrap_or_else(|| i18n.default_locale.clone())
+    };
     router.layer(axum::Extension(crate::i18n::LocaleRoutingConfig {
         supported_locales: i18n.supported_locales.clone(),
-        default_locale: i18n.default_locale.clone(),
+        default_locale: effective_default_locale,
     }))
 }
 
@@ -2921,9 +2936,14 @@ pub struct RequestDeadlineCancelled;
 /// Build the per-route timeout override table from the top-level routes and any
 /// scoped (prefixed) groups. Group routes are keyed by their nested template so
 /// the runtime lookup matches [`axum::extract::MatchedPath`].
+///
+/// `config` is only consulted (behind the `i18n` feature) to expand each
+/// locale-prefix-eligible entry under `/{locale}{path}` too — see
+/// [`expand_route_timeout_table_for_locale_prefix`].
 fn build_route_timeout_table(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
+    #[cfg_attr(not(feature = "i18n"), allow(unused_variables))] config: &AutumnConfig,
 ) -> RouteTimeoutTable {
     let mut table: std::collections::HashMap<
         String,
@@ -2969,7 +2989,58 @@ fn build_route_timeout_table(
             );
         }
     }
+    #[cfg(feature = "i18n")]
+    expand_route_timeout_table_for_locale_prefix(&mut table, route_list, &config.i18n);
     std::sync::Arc::new(table)
+}
+
+/// `Router::nest("/{locale}", ...)` mounts each locale under a *literal*
+/// segment (`"/en"`, `"/es"`, ...), not an axum path parameter, so axum
+/// reports `MatchedPath` for a locale-prefixed request as `/{locale}{path}`
+/// verbatim (see `join_nested_path_matches_axum_matched_path`, which pins the
+/// same literal-concatenation behavior for scoped groups). The base timeout
+/// table above is built from `route_list`'s bare, unprefixed paths, so a
+/// request that actually matched through a locale nest would never find its
+/// override there — this duplicates every locale-prefix-eligible entry under
+/// each supported locale's segment too (Codex review). Scoped-group routes are
+/// deliberately excluded: they mount after locale-prefix nesting and are never
+/// locale-prefixed themselves (see `scoped_group_routes_are_not_locale_prefixed`).
+#[cfg(feature = "i18n")]
+fn expand_route_timeout_table_for_locale_prefix(
+    table: &mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<http::Method, crate::route::RouteTimeout>,
+    >,
+    route_list: &[Route],
+    i18n: &crate::i18n::I18nConfig,
+) {
+    if !i18n.locale_prefix_enabled || i18n.supported_locales.is_empty() {
+        return;
+    }
+    for route in route_list {
+        if i18n
+            .locale_prefix_exclude_exact
+            .iter()
+            .any(|p| p == route.path)
+            || matches_locale_exclude_prefix(route.path, &i18n.locale_prefix_exclude)
+        {
+            continue;
+        }
+        let Some(by_method) = table.get(route.path).cloned() else {
+            continue;
+        };
+        for locale in &i18n.supported_locales {
+            let prefixed_path = if route.path == "/" {
+                format!("/{locale}")
+            } else {
+                format!("/{locale}{}", route.path)
+            };
+            table
+                .entry(prefixed_path)
+                .or_default()
+                .extend(by_method.clone());
+        }
+    }
 }
 
 /// Apply the built-in inbound request timeout.
@@ -6613,6 +6684,38 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
 
+        /// Codex review (P2): a misconfigured `default_locale` absent from
+        /// `supported_locales` (e.g. `default_locale = "fr"`,
+        /// `supported_locales = ["en"]`) must not negotiate a bare request to
+        /// an unreachable `/fr/...` target — only `en` is actually nested.
+        /// The negotiation fallback clamps to the first supported (i.e.
+        /// actually mounted) locale instead.
+        #[tokio::test]
+        async fn misconfigured_default_locale_falls_back_to_a_mounted_locale() {
+            let mut config = config(&["en"], &[]);
+            config.i18n.default_locale = "fr".to_owned();
+
+            let route = simple_route("/posts", "posts", true);
+            // No bundle — exercises the router's own `LocaleRoutingConfig`
+            // fallback, same as `locale_prefix_redirect_works_without_an_i18n_bundle`.
+            let app = build_router(vec![route], &config, test_state());
+
+            let redirected = request(&app, "/posts", &[]).await;
+            assert_eq!(redirected.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                redirected
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en/posts"),
+                "must redirect to a locale that's actually mounted, not the \
+                 misconfigured default_locale"
+            );
+
+            let target = request(&app, "/en/posts", &[]).await;
+            assert_eq!(target.status(), StatusCode::OK);
+        }
+
         /// Routes registered via `AppBuilder::scoped()` are mounted by a
         /// separate pipeline (`mount_scoped_groups`, which runs after
         /// locale-prefix mounting) and are therefore untouched by
@@ -10050,7 +10153,7 @@ mod trusted_host_tests {
         // End-to-end keying (top-level + nested groups) is covered by the
         // `request_timeout` integration tests via the macro attribute; here we
         // assert the no-route base case yields a zero-overhead empty table.
-        let table = build_route_timeout_table(&[], &[]);
+        let table = build_route_timeout_table(&[], &[], &AutumnConfig::default());
         assert!(table.is_empty(), "no routes ⇒ empty override table");
     }
 
@@ -10096,7 +10199,7 @@ mod trusted_host_tests {
             timeout_route(http::Method::POST, "/submit", override_10s),
         ];
 
-        let table = build_route_timeout_table(&routes, &[]);
+        let table = build_route_timeout_table(&routes, &[], &AutumnConfig::default());
 
         // GET override is reachable via both GET and HEAD.
         let export = table.get("/export").expect("/export keyed");
@@ -10142,7 +10245,8 @@ mod trusted_host_tests {
             apply_layer: Box::new(|r| r),
         };
 
-        let table = build_route_timeout_table(&[], &[make_group("/api/")]);
+        let table =
+            build_route_timeout_table(&[], &[make_group("/api/")], &AutumnConfig::default());
         assert_eq!(
             table.get("/api/").and_then(|m| m.get(&http::Method::GET)),
             Some(&override_5s),
@@ -10154,11 +10258,79 @@ mod trusted_host_tests {
         );
 
         // The no-trailing-slash form still keys at "/api".
-        let table = build_route_timeout_table(&[], &[make_group("/api")]);
+        let table = build_route_timeout_table(&[], &[make_group("/api")], &AutumnConfig::default());
         assert_eq!(
             table.get("/api").and_then(|m| m.get(&http::Method::GET)),
             Some(&override_5s),
         );
+    }
+
+    /// Codex review (P1): `Router::nest("/{locale}", ...)` mounts each locale
+    /// under a literal segment, so a locale-prefixed request's `MatchedPath`
+    /// is `/{locale}{path}` verbatim — the timeout table must carry an entry
+    /// there too, or a `timeout = "off"` long-poll route gets silently
+    /// cancelled by the global deadline once locale-prefix routing is on.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn build_route_timeout_table_expands_entries_under_each_locale_prefix() {
+        let disabled = crate::route::RouteTimeout::Disabled;
+        let routes = vec![timeout_route(http::Method::GET, "/events", disabled)];
+        let mut config = AutumnConfig::default();
+        config.i18n.locale_prefix_enabled = true;
+        config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+
+        let table = build_route_timeout_table(&routes, &[], &config);
+
+        for path in ["/events", "/en/events", "/es/events"] {
+            assert_eq!(
+                table.get(path).and_then(|m| m.get(&http::Method::GET)),
+                Some(&disabled),
+                "expected a timeout override at {path}"
+            );
+        }
+    }
+
+    /// A route excluded from locale-prefix routing never gets nested under
+    /// `/{locale}`, so its timeout table entry must stay bare-path only.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn build_route_timeout_table_does_not_expand_excluded_routes() {
+        let override_5s = crate::route::RouteTimeout::Override(std::time::Duration::from_secs(5));
+        let routes = vec![timeout_route(http::Method::GET, "/api/keys", override_5s)];
+        let mut config = AutumnConfig::default();
+        config.i18n.locale_prefix_enabled = true;
+        config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+        config.i18n.locale_prefix_exclude = vec!["/api".to_owned()];
+
+        let table = build_route_timeout_table(&routes, &[], &config);
+
+        assert_eq!(
+            table
+                .get("/api/keys")
+                .and_then(|m| m.get(&http::Method::GET)),
+            Some(&override_5s)
+        );
+        assert!(
+            table.get("/en/api/keys").is_none(),
+            "an excluded route must not gain a locale-prefixed timeout entry"
+        );
+    }
+
+    /// Locale-prefix routing off (the default) must never expand the table,
+    /// regardless of what `supported_locales` happens to contain.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn build_route_timeout_table_does_not_expand_when_locale_prefix_disabled() {
+        let override_5s = crate::route::RouteTimeout::Override(std::time::Duration::from_secs(5));
+        let routes = vec![timeout_route(http::Method::GET, "/events", override_5s)];
+        let mut config = AutumnConfig::default();
+        assert!(!config.i18n.locale_prefix_enabled);
+        config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+
+        let table = build_route_timeout_table(&routes, &[], &config);
+
+        assert_eq!(table.len(), 1, "only the bare-path entry should exist");
+        assert!(table.get("/en/events").is_none());
     }
 
     // ----------------------------------------------------------------------
