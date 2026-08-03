@@ -117,6 +117,15 @@ fn main() {
             );
             std::process::exit(1);
         }
+        SweepOutcome::Empty => {
+            // `count` was 0 (or somehow otherwise produced an empty range) —
+            // fail loudly rather than let a misconfigured AUTUMN_SIM_SEEDS
+            // silently green this CI job without testing anything.
+            eprintln!(
+                "sim-sweep: EMPTY — AUTUMN_SIM_SEEDS={count} swept zero seeds; nothing was tested"
+            );
+            std::process::exit(1);
+        }
     }
 }
 

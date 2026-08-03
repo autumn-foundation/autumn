@@ -374,11 +374,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   execution sidesteps both; sweep-level threading was orthogonal to the
   harness's actual concurrency-bug-finding power anyway (that comes from
   exploring seeds against W1's single-threaded deterministic executor, not
-  from how many OS threads process the outer seed range).
-  `AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release --features
-  sim-testing --bin sim-sweep` sweeps seeds `0..1000` against a built-in
-  account demo scenario; a new standalone CI job runs it at seed count 512 on
-  every push/PR, structured like the `loom` job. [no-plugin]
+  from how many OS threads process the outer seed range). An empty seed range
+  (`AUTUMN_SIM_SEEDS=0`, or any empty iterator passed to `sweep_proptest`)
+  reports the new `SweepOutcome::Empty` rather than silently falling through
+  to `Passed { seeds_run: 0 }` — the bin treats it as a failure (exit `1`) so
+  a misconfigured seed count can't quietly green the CI job without testing
+  anything. `AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release
+  --features sim-testing --bin sim-sweep` sweeps seeds `0..1000` against a
+  built-in account demo scenario; a new standalone CI job runs it at seed
+  count 512 on every push/PR, structured like the `loom` job. [no-plugin]
 - **sim-testing:** add a property-based **op-driver** (`sim::op`, W6 PR2,
   #1797) behind the new `sim-testing` feature: `Sim::gen_ops::<T>()` /
   `Sim::gen_ops_with(strategy)` deterministically draw an arbitrary `Vec<T>`

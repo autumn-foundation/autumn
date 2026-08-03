@@ -167,6 +167,12 @@ pub enum SweepOutcome<T> {
         /// The unsatisfied labels, in stable sorted order.
         unsatisfied: BTreeSet<String>,
     },
+    /// `seeds` was empty (or, equivalently, `AUTUMN_SIM_SEEDS=0`) — no seed
+    /// ran, so nothing was tested. Distinct from [`SweepOutcome::Passed`]: a
+    /// zero-length sweep isn't "every seed passed," it's "no seed was
+    /// attempted," and a caller (like the `sim-sweep` bin) should treat this
+    /// as a misconfiguration to surface loudly rather than a quiet green.
+    Empty,
 }
 
 /// Sweep `seeds` sequentially through [`Sim::run_proptest`].
@@ -221,6 +227,14 @@ where
                 },
             };
         }
+    }
+
+    if seeds_run == 0 {
+        // An empty `seeds` iterator ran the loop above zero times, so both
+        // aggregate sets are (vacuously) empty too — without this check
+        // that would fall through to `Passed { seeds_run: 0 }` below,
+        // silently reporting success for a sweep that tested nothing.
+        return SweepOutcome::Empty;
     }
 
     let unsatisfied: BTreeSet<String> = all_observed.difference(&all_satisfied).cloned().collect();
@@ -285,6 +299,18 @@ mod tests {
             }
         });
         assert_eq!(outcome, SweepOutcome::Passed { seeds_run: 8 });
+    }
+
+    #[test]
+    fn sweep_reports_empty_rather_than_a_silent_pass_for_a_zero_length_range() {
+        // `AUTUMN_SIM_SEEDS=0` (or any empty `seeds` iterator) must not
+        // silently report `Passed { seeds_run: 0 }` — that would let a
+        // misconfigured seed count green a CI job that tested nothing.
+        let strategy = tiny_op_strategy();
+        let outcome = sweep_proptest(0..0, &strategy, |_sim, _ops| {
+            panic!("body must never run for an empty seed range");
+        });
+        assert_eq!(outcome, SweepOutcome::Empty);
     }
 
     #[test]
