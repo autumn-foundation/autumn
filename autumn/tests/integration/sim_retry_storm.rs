@@ -28,16 +28,29 @@
 //! out using real OS entropy in production, while staying bit-for-bit
 //! reproducible under a fixed `#[sim_test]` seed.
 //!
+//! # Observing sub-window timing under the sim
+//!
+//! Neither the framework's injected [`autumn_web::time::ClockSource`] nor
+//! Tokio's own paused clock is useful for observing *when within* a single big
+//! [`Sim::advance`] call a retry fired: both jump straight to the target
+//! instant in one step before any timer runs, so every task woken by that
+//! advance reads the *same* `now()` regardless of its individual deadline.
+//! Distinguishing "fired at delay=520ms" from "fired at delay=980ms" therefore
+//! needs the *test* to step through the window in bounded increments and
+//! record which increment each retry landed in — the technique this test uses
+//! (`CHECKPOINT`).
+//!
 //! `retries_are_not_synchronized_under_load` is the DoD proof for this wave:
 //! reverting `jittered_retry_delay_ms` to the old unjittered
 //! `backoff_ms.saturating_mul(2_u64.saturating_pow(attempt - 1))` locally and
-//! rerunning this test reproduces the herd — every retry lands on the exact
-//! same virtual instant — and the `always!` invariant below fails, printing the
-//! deterministic `AUTUMN_SIM_SEED=…` replay line. With the fix in place the
+//! rerunning this test reproduces the herd — every retry lands in the exact
+//! same checkpoint bucket — and the `always!` invariant below fails, printing
+//! the deterministic `AUTUMN_SIM_SEED=…` replay line. With the fix in place the
 //! same seed passes.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_web::app::AppBuilder;
 use autumn_web::job;
@@ -48,13 +61,25 @@ use autumn_web::sim_test;
 use autumn_web::test::TestApp;
 use autumn_web::{always, sometimes};
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant as TokioInstant;
 
 /// Number of jobs made to fail "simultaneously" under the sim's virtual clock.
-/// Large enough that an equal-jitter spread over its ~500ms window collides to
-/// a single instant only with astronomically low probability, while staying
-/// small enough that the drain settles well inside `Sim::run_to_idle`'s bound.
+/// Large enough that an equal-jitter spread over the ~500ms checkpointed
+/// window collides into a single checkpoint bucket only with astronomically
+/// low probability, while staying small enough that the drain settles well
+/// inside `Sim::run_to_idle`'s bound.
 const STORM_SIZE: u32 = 12;
+
+/// The virtual-time window this test steps through in checkpoints, in
+/// milliseconds elapsed since the jobs' first (failing) attempt.
+///
+/// `storm_probe` is configured with `backoff_ms = 1000`, so the un-jittered
+/// exponential delay at attempt 1 is exactly 1000ms; equal jitter spreads the
+/// jittered delay across `[500, 1000)`. These six increments (summing to
+/// 1500ms, past the worst case) straddle that whole range finely enough to
+/// tell "spread across several buckets" (the fix) apart from "every retry
+/// lands in the last bucket" (the un-jittered bug, since 1000ms falls in
+/// `[950, 1500)`).
+const CHECKPOINT_STEPS_MS: [u64; 6] = [550, 100, 100, 100, 100, 550];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StormArgs {
@@ -65,22 +90,19 @@ struct StormArgs {
 /// of the test so repeated invocations (e.g. under a sweep) start clean.
 static ATTEMPTS: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
 
-/// The paused Tokio timer wheel's `Instant` (**not** the framework's injected
-/// `ClockSource` — see the module docs) each job's *retry* (second) attempt
-/// actually ran at, in enqueue order.
-///
-/// `Sim::advance` steps the framework `ClockSource` straight to its target in
-/// one jump, before any timer fires, so every retry observed through
-/// `state.clock()` would read the *same* end-of-window instant regardless of
-/// jitter. Tokio's own paused clock, by contrast, walks forward through each
-/// due timer's real deadline as it fires it — precisely the granularity a
-/// backoff-spread observation needs — so this reads `tokio::time::Instant::now()`
-/// instead.
-static RETRY_TIMES: Mutex<Vec<TokioInstant>> = Mutex::new(Vec::new());
+/// Incremented by the test before draining each step in
+/// [`CHECKPOINT_STEPS_MS`], so a retry that runs during that drain can record
+/// which step it landed in.
+static CHECKPOINT: AtomicU32 = AtomicU32::new(0);
+
+/// The checkpoint index (see [`CHECKPOINT`]) each job's *retry* (second)
+/// attempt actually ran in, in enqueue order.
+static RETRY_CHECKPOINTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 fn reset_probe_state() {
     *ATTEMPTS.lock().unwrap() = Some(HashMap::new());
-    RETRY_TIMES.lock().unwrap().clear();
+    RETRY_CHECKPOINTS.lock().unwrap().clear();
+    CHECKPOINT.store(0, Ordering::SeqCst);
 }
 
 /// Fails its first attempt unconditionally, then succeeds — the minimal shape
@@ -99,7 +121,10 @@ async fn storm_probe(_state: AppState, args: StormArgs) -> AutumnResult<()> {
             "forced failure (simulated downstream blip)",
         )))
     } else {
-        RETRY_TIMES.lock().unwrap().push(TokioInstant::now());
+        RETRY_CHECKPOINTS
+            .lock()
+            .unwrap()
+            .push(CHECKPOINT.load(Ordering::SeqCst));
         Ok(())
     }
 }
@@ -136,29 +161,35 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
     // retry via a backoff timer; none of the retries are due yet.
     sim.run_to_idle().await;
 
-    // Advance past the worst-case backoff — jitter only ever *shortens* the
-    // delay relative to the unjittered exponential value (1000ms at attempt
-    // 1), never lengthens it — then drain the retries.
-    sim.advance(std::time::Duration::from_millis(1_500)).await;
-    sim.run_to_idle().await;
+    // Step through the backoff window in checkpoints (see
+    // `CHECKPOINT_STEPS_MS`), recording which checkpoint each retry lands in.
+    for (index, step_ms) in CHECKPOINT_STEPS_MS.into_iter().enumerate() {
+        sim.advance(std::time::Duration::from_millis(step_ms)).await;
+        CHECKPOINT.store(
+            u32::try_from(index + 1).expect("checkpoint index fits in u32"),
+            Ordering::SeqCst,
+        );
+        sim.run_to_idle().await;
+    }
 
-    let retry_times = RETRY_TIMES.lock().unwrap().clone();
+    let retry_checkpoints = RETRY_CHECKPOINTS.lock().unwrap().clone();
     assert_eq!(
-        retry_times.len(),
+        retry_checkpoints.len(),
         STORM_SIZE as usize,
         "every job must have retried and succeeded"
     );
 
-    let first = retry_times[0];
-    let spread = retry_times.iter().any(|instant| *instant != first);
+    let first = retry_checkpoints[0];
+    let spread = retry_checkpoints.iter().any(|checkpoint| *checkpoint != first);
     sometimes!(
         spread,
-        "retries observed spread across more than one virtual instant"
+        "retries observed spread across more than one checkpoint of the backoff window"
     );
     always!(
         spread,
-        "all {STORM_SIZE} retries landed on the exact same virtual instant — \
-         a synchronized thundering herd (seed={:#x})",
+        "all {STORM_SIZE} retries landed in the exact same checkpoint of the backoff \
+         window ({:?}) — a synchronized thundering herd (seed={:#x})",
+        retry_checkpoints.first(),
         sim.seed,
     );
 
