@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **slug:** a public `autumn_web::slugify(&str) -> String` helper (#1260) —
+  lowercases, best-effort ASCII-folds accented Latin characters
+  (`"café"` -> `"cafe"`), treats everything else as a separator, collapses
+  runs to a single `-`, and falls back to a stable non-empty token for input
+  that slugifies to nothing. `autumn generate scaffold`/`model` gain a
+  `slug:slug{from:col}` DSL token that composes with the existing `unique`
+  (#1032) and `references` (#1026) machinery rather than a parallel system: a
+  `NOT NULL` column with its own `UNIQUE INDEX`, a free `find_by_slug`
+  repository lookup, create-time auto-derivation from the named `from` field
+  with a deterministic `-2`/`-3` collision suffix on a blank submission, and
+  slug-keyed `show`/`edit`/`update`/`delete` HTML routes and generated links
+  (`GET /posts/{slug}` instead of `GET /posts/{id}`) with a 404 on miss. A
+  model supports at most one `slug` field; the combination with
+  `--live`/`--live-validation`/`--sharded`/an `Attachment` field/a
+  `:states(...)` field is rejected at generate time rather than silently
+  emitting `id`-keyed routes. A non-slug scaffold's generated output is
+  unaffected. `examples/blog`, `examples/wiki`, and `examples/reddit-clone`
+  now use the shared helper instead of their own hand-rolled duplicates.
+
 - **consent:** `autumn new` now scaffolds a cookie-consent banner and a real
   consent gate, so a fresh app is cookie-compliant by default (#1214). The new
   `autumn_web::consent` module provides a `Consent` extractor

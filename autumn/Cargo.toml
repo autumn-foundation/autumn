@@ -203,6 +203,10 @@ acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
 autumn-macros = { version = "0.6.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
+# Best-effort ASCII folding for `slug::slugify` (issue #1260, e.g. "café" ->
+# "cafe"). Already resolved transitively (via `stringprep`, the Postgres
+# SCRAM-auth crate), so this adds no new entry to the dependency graph.
+unicode-normalization = "0.1"
 http-body = "1"
 http-body-util = "0.1"
 # Both already resolved transitively via tower-http's compression-gzip/

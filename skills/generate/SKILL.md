@@ -71,6 +71,7 @@ accept aliases like `Integer` or `Boolean`.
 | `enum{a,b,c}` **(trunk-dev)** | `TEXT` + `CHECK (col IN (...))` | Generated PascalCase Rust enum with Diesel/serde impls + `<select>` widget; `--default field=variant` sets SQL DEFAULT + `#[default]`. Quote the token in bash/zsh (brace expansion) |
 | `decimal` / `decimal{10,2}` **(trunk-dev)** | `NUMERIC(12,2)` default, or explicit precision/scale | `rust_decimal::Decimal` (dependency added automatically); use for money, never `f64` |
 | `:unique` modifier **(trunk-dev)** | `email:String:unique` → `CREATE UNIQUE INDEX` in the migration | Also generates a free `find_by_<field>` lookup and 23505 → 422 inline "already exists" form error. `--unique FIELD` is the flag equivalent |
+| `slug{from:col}` **(trunk-dev)** | `TEXT NOT NULL` + implicit `:unique`'s `CREATE UNIQUE INDEX` | `String`; free `find_by_slug`; `show`/`edit`/`update`/`delete` routes and generated links key off the slug, not `id` (`GET /posts/{slug}`); blank on create auto-derives via `autumn_web::slugify(&new.<col>)` with a deterministic `-2`/`-3` collision suffix. At most one per model; not yet supported with `--live`/`--live-validation`/`--sharded`/an `Attachment` field/a `:states(...)` field. Quote the token in bash/zsh (brace expansion) |
 
 **Foreign keys** (published 0.5.0 CLI only — no `references` token): scaffold
 an `i64` field and hand-edit the generated migration to add

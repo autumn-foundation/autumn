@@ -11,7 +11,7 @@ use diesel_async::RunQueryDsl;
 use crate::models::NewSubreddit;
 use crate::repositories::{PgSubredditRepository, SubredditRepository};
 use crate::schema::users;
-use crate::slugify::slugify;
+use autumn_web::slugify;
 
 use super::layout::{layout, time_ago};
 

@@ -34,13 +34,23 @@ pub struct FieldConstraints {
     /// `belongs_to` `<select>` label render from (issue #1146). `references`
     /// only; never a `#[validate]`/HTML5 constraint.
     pub label: Option<String>,
+    /// `from:col` — the source field a `slug` field auto-derives from on
+    /// create when the submitted value is blank (issue #1260), e.g.
+    /// `slug:slug{from:title}`. `slug` only; never a `#[validate]`/HTML5
+    /// constraint.
+    pub from: Option<String>,
 }
 
 impl FieldConstraints {
     /// True when no constraint modifier was declared.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.min.is_none() && self.max.is_none() && !self.email && !self.url && self.label.is_none()
+        self.min.is_none()
+            && self.max.is_none()
+            && !self.email
+            && !self.url
+            && self.label.is_none()
+            && self.from.is_none()
     }
 }
 
@@ -351,6 +361,20 @@ pub enum FieldKind {
         /// Number of digits after the decimal point (`NUMERIC(_, scale)`).
         scale: u32,
     },
+    /// `slug{from:col}` — a human-readable, URL-safe routing key auto-derived
+    /// from another field (issue #1260), e.g. `slug:slug{from:title}`.
+    /// Storage-identical to [`FieldKind::String`] (`TEXT`, `String`), but
+    /// always [`Field::unique`] (so it falls into the existing `unique`-field
+    /// `UNIQUE INDEX` and `find_by_slug` repository machinery from issue
+    /// #1032 for free) and never [`Field::nullable`] — a record with no slug
+    /// would have no URL. The source field it derives from lives in
+    /// [`FieldConstraints::from`], parsed from the mandatory `{from:...}`
+    /// modifier. On create, a blank submitted value is auto-derived via
+    /// [`autumn_web::slug::slugify`] and made unique with a deterministic
+    /// `-2`, `-3`, ... suffix on collision; the scaffold's `show`/`edit`/
+    /// `update`/`delete` routes resolve the record by this field instead of
+    /// `id`.
+    Slug,
 }
 
 impl FieldKind {
@@ -364,7 +388,7 @@ impl FieldKind {
             // `Enum`'s "String" here is a storage-representation fallback
             // only — `Field::rust_type()` overrides it with the generated
             // enum's real type name.
-            Self::String | Self::Text | Self::RichText | Self::Enum => "String",
+            Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "String",
             Self::I32 => "i32",
             // `References` is always `i64`, matching the default `i64` PK convention.
             Self::I64 | Self::References => "i64",
@@ -384,7 +408,7 @@ impl FieldKind {
     #[must_use]
     pub const fn schema_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text | Self::RichText | Self::Enum => "Text",
+            Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "Text",
             Self::I32 => "Int4",
             Self::I64 | Self::References => "Int8",
             Self::Bool => "Bool",
@@ -403,7 +427,7 @@ impl FieldKind {
     #[must_use]
     pub const fn sql_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text | Self::RichText | Self::Enum => "TEXT",
+            Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "TEXT",
             Self::I32 => "INTEGER",
             Self::I64 | Self::References => "BIGINT",
             Self::Bool => "BOOLEAN",
@@ -444,7 +468,7 @@ impl FieldKind {
     )]
     pub const fn sqlite_sql_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text | Self::RichText | Self::Enum => "TEXT",
+            Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "TEXT",
             Self::I32 | Self::I64 | Self::References | Self::Bool => "INTEGER",
             Self::F32 | Self::F64 => "REAL",
             Self::Uuid => "TEXT",
@@ -508,7 +532,7 @@ impl FieldKind {
     )]
     pub const fn sqlite_schema_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text | Self::RichText | Self::Enum => "Text",
+            Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "Text",
             Self::I32 => "Int4",
             Self::I64 | Self::References => "Int8",
             Self::Bool => "Bool",
@@ -600,6 +624,16 @@ impl FieldKind {
     #[must_use]
     pub const fn is_rich_text(self) -> bool {
         matches!(self, Self::RichText)
+    }
+
+    /// Returns `true` for a `slug{from:col}` routing-key field (issue #1260).
+    ///
+    /// Used by the scaffold generator to key `show`/`edit`/`update`/`delete`
+    /// routes and generated links off this field instead of `id`, and to
+    /// auto-derive its value from [`FieldConstraints::from`] on create.
+    #[must_use]
+    pub const fn is_slug(self) -> bool {
+        matches!(self, Self::Slug)
     }
 
     /// Returns `true` for an exact-precision `decimal` field.
@@ -733,7 +767,7 @@ impl IdType {
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, \
-    enum{a,b,…}, decimal{precision,scale}, Option<…>, :unique";
+    enum{a,b,…}, decimal{precision,scale}, slug{from:col}, Option<…>, :unique";
 
 /// The DSL field kinds that map to a working diesel `SQLite` conversion
 /// (issue #1614 AC #4; #1924) — the complement of the kinds
@@ -741,7 +775,8 @@ pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, 
 /// `Enum`). Used in the generate-time rejection message so the user knows which
 /// field kinds a `SQLite` app supports today.
 pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
-    NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, Option<…>, :unique";
+    NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, slug{from:col}, Option<…>, \
+    :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -793,6 +828,11 @@ pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
     clippy::too_many_lines,
     reason = "a linear name→modifier→type→constraint parse; the early-return \
               validation guards read more clearly inline than split across helpers"
+)]
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "the `{from:<field>}`/`{from:title}` mentions in the slug error message are the \
+              DSL's own constraint-modifier syntax, not format-string placeholders"
 )]
 pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     let (name, rest) = token
@@ -974,6 +1014,33 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     } else {
         name.to_owned()
     };
+
+    // A `slug` field (issue #1260) is always the record's routing key: it
+    // can never be nullable (every record needs a URL) and always needs a
+    // `{from:...}` modifier naming the field it auto-derives from on
+    // create — enforced here rather than left to a downstream codegen panic.
+    if kind == FieldKind::Slug {
+        if nullable {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `slug` field cannot be nullable — it is the record's routing key \
+                         and every record needs a URL"
+                    .into(),
+            });
+        }
+        if constraints.from.is_none() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "a `slug` field requires a `{from:<field>}` modifier naming its \
+                         source field, e.g. `slug:slug{from:title}`"
+                    .into(),
+            });
+        }
+    }
+    // A slug is implicitly unique (it's the routing key) — falls into the
+    // existing `unique`-field `UNIQUE INDEX` and `find_by_slug` repository
+    // machinery (issue #1032) for free, whether or not `:unique` was typed.
+    let unique = unique || kind == FieldKind::Slug;
 
     Ok(Field {
         name,
@@ -1167,21 +1234,23 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
         FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
     );
     let is_reference = kind.is_reference();
+    let is_slug = kind.is_slug();
 
     for raw in body.split(',') {
         let tok = raw.trim();
         if tok.is_empty() {
             return Err("empty constraint (stray comma) in the `{…}` block".to_owned());
         }
-        // `label:col` (references display column) uses a colon; every other
-        // key/value pair uses `=`. Bare tokens (`email`, `url`) have neither.
+        // `label:col` (references display column) and `from:col` (slug source
+        // field) use a colon; every other key/value pair uses `=`. Bare
+        // tokens (`email`, `url`) have neither.
         if let Some((key, value)) = tok.split_once('=') {
             parse_constraint_kv(&mut c, key.trim(), value.trim(), kind)?;
         } else if let Some((key, value)) = tok.split_once(':') {
-            if key.trim() == "label" {
-                set_label_constraint(&mut c, value.trim(), is_reference)?;
-            } else {
-                return Err(unknown_constraint_message(key.trim(), kind));
+            match key.trim() {
+                "label" => set_label_constraint(&mut c, value.trim(), is_reference)?,
+                "from" => set_from_constraint(&mut c, value.trim(), is_slug)?,
+                other => return Err(unknown_constraint_message(other, kind)),
             }
         } else {
             match tok {
@@ -1267,6 +1336,7 @@ fn parse_constraint_kv(
             Ok(())
         }
         "label" => set_label_constraint(c, value, kind.is_reference()),
+        "from" => set_from_constraint(c, value, kind.is_slug()),
         _ => Err(unknown_constraint_message(key, kind)),
     }
 }
@@ -1370,6 +1440,21 @@ fn set_label_constraint(
     Ok(())
 }
 
+/// Set the `slug` source-field override (issue #1260), rejecting `from` on a
+/// non-`slug` field and a value that isn't a valid `snake_case` identifier.
+fn set_from_constraint(c: &mut FieldConstraints, value: &str, is_slug: bool) -> Result<(), String> {
+    if !is_slug {
+        return Err("the `from` constraint only applies to `slug` fields".to_owned());
+    }
+    if !is_valid_ident(value) {
+        return Err(format!(
+            "slug source field '{value}' is not a valid snake_case identifier"
+        ));
+    }
+    c.from = Some(value.to_owned());
+    Ok(())
+}
+
 /// A per-kind "unknown constraint" message that names the offending token and
 /// lists what the kind *does* accept (issue #1388 AC5).
 fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
@@ -1382,6 +1467,7 @@ fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
             "min=N, max=N"
         }
         FieldKind::References => "label:col",
+        FieldKind::Slug => "from:col",
         _ => "(none — this field type takes no constraint modifiers)",
     };
     format!(
@@ -1585,9 +1671,13 @@ fn parse_decimal_type(ty: &str) -> Result<Option<(u32, u32, bool)>, String> {
 /// It re-emits as a `#[state_machine(transitions(…))]` attribute on the field.
 ///
 /// # Errors
-/// Bubbles up the first failed token, and rejects duplicate field names —
+/// Bubbles up the first failed token, rejects duplicate field names —
 /// emitting two entries with the same column name would produce duplicate
-/// struct members and duplicate SQL columns.
+/// struct members and duplicate SQL columns — and (issue #1260) validates
+/// every `slug{from:...}` field's cross-field constraints: at most one slug
+/// field per model (it's the routing key), and its `from` must name a
+/// declared `String`/`Text`/`richtext` field (declaration order doesn't
+/// matter — a slug may derive from a field declared later in the list).
 pub fn parse_fields(tokens: &[String]) -> Result<Vec<Field>, GenerateError> {
     let mut fields: Vec<Field> = Vec::with_capacity(tokens.len());
     for token in tokens {
@@ -1604,7 +1694,78 @@ pub fn parse_fields(tokens: &[String]) -> Result<Vec<Field>, GenerateError> {
         }
         fields.push(field);
     }
+    validate_slug_fields(tokens, &fields)?;
     Ok(fields)
+}
+
+/// Cross-field validation for every `slug{from:...}` field in `fields`
+/// (issue #1260) — see [`parse_fields`]. Runs after every token has parsed
+/// individually, since `from`'s target may be declared earlier OR later in
+/// the token list.
+fn validate_slug_fields(tokens: &[String], fields: &[Field]) -> Result<(), GenerateError> {
+    let slug_fields: Vec<&Field> = fields.iter().filter(|f| f.kind.is_slug()).collect();
+    if slug_fields.len() > 1 {
+        let second = slug_fields[1];
+        return Err(GenerateError::InvalidField {
+            token: tokens
+                .get(
+                    fields
+                        .iter()
+                        .position(|f| f.name == second.name)
+                        .unwrap_or(0),
+                )
+                .cloned()
+                .unwrap_or_default(),
+            reason: format!(
+                "only one `slug` field is supported per model (it's the routing key) — \
+                 found both '{}' and '{}'",
+                slug_fields[0].name, second.name
+            ),
+        });
+    }
+    for slug_field in &slug_fields {
+        // Presence of `constraints.from` is already enforced per-token in
+        // `parse_field`; this is the cross-field half of that check.
+        let from = slug_field
+            .constraints
+            .from
+            .as_deref()
+            .expect("parse_field rejects a slug field with no `from` constraint");
+        let token = tokens
+            .get(
+                fields
+                    .iter()
+                    .position(|f| f.name == slug_field.name)
+                    .unwrap_or(0),
+            )
+            .cloned()
+            .unwrap_or_default();
+        let Some(source) = fields.iter().find(|f| f.name == from) else {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "slug field '{}' derives `from:{from}`, but no field named '{from}' is \
+                     declared",
+                    slug_field.name
+                ),
+            });
+        };
+        if !matches!(
+            source.kind,
+            FieldKind::String | FieldKind::Text | FieldKind::RichText
+        ) {
+            return Err(GenerateError::InvalidField {
+                token,
+                reason: format!(
+                    "slug field '{}' derives `from:{from}`, but '{from}' is a {} field — \
+                     slug can only derive from a String/Text/richtext field",
+                    slug_field.name,
+                    source.rust_type()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn parse_type(ty: &str) -> Option<(FieldKind, bool)> {
@@ -1657,6 +1818,9 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         // `markdown::render_user_content`. All three spellings are accepted so
         // the token reads naturally however the author types it.
         "richtext" | "RichText" | "rich_text" => Some(FieldKind::RichText),
+        // slug (issue #1260): a URL-safe routing key auto-derived from
+        // another field, e.g. `slug:slug{from:title}`.
+        "slug" | "Slug" => Some(FieldKind::Slug),
         _ => {
             // Allow `Vec<u8>` as a synonym for `Bytea`.
             strip_wrapper(ty, "Vec").and_then(|inner| {
@@ -2066,6 +2230,63 @@ mod tests {
         let f = parse_field(" name : String ").unwrap();
         assert_eq!(f.name, "name");
         assert_eq!(f.kind, FieldKind::String);
+    }
+
+    // ── slug cross-field validation (issue #1260) ──────────────────────────
+
+    #[test]
+    fn parse_fields_accepts_slug_deriving_from_earlier_string_field() {
+        let tokens = vec!["title:String".into(), "slug:slug{from:title}".into()];
+        let fs = parse_fields(&tokens).unwrap();
+        assert_eq!(fs[1].constraints.from.as_deref(), Some("title"));
+    }
+
+    #[test]
+    fn parse_fields_accepts_slug_deriving_from_later_string_field() {
+        // Declaration order shouldn't matter for the `from` reference.
+        let tokens = vec!["slug:slug{from:title}".into(), "title:String".into()];
+        assert!(parse_fields(&tokens).is_ok());
+    }
+
+    #[test]
+    fn parse_fields_rejects_slug_from_unknown_field() {
+        let tokens = vec!["slug:slug{from:headline}".into()];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("headline"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_rejects_slug_from_non_string_field() {
+        let tokens = vec!["count:i32".into(), "slug:slug{from:count}".into()];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("count"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn parse_fields_accepts_slug_deriving_from_text_field() {
+        let tokens = vec!["body:Text".into(), "slug:slug{from:body}".into()];
+        assert!(parse_fields(&tokens).is_ok());
+    }
+
+    #[test]
+    fn parse_fields_accepts_slug_deriving_from_richtext_field() {
+        let tokens = vec!["body:richtext".into(), "slug:slug{from:body}".into()];
+        assert!(parse_fields(&tokens).is_ok());
+    }
+
+    #[test]
+    fn parse_fields_rejects_more_than_one_slug_field() {
+        // A slug is the model's routing key -- only one makes sense.
+        let tokens = vec![
+            "title:String".into(),
+            "slug:slug{from:title}".into(),
+            "slug2:slug{from:title}".into(),
+        ];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("slug"), "unexpected error: {msg}");
     }
 
     // ── RED: Attachment field kind ──────────────────────────────────────────
@@ -2683,6 +2904,78 @@ mod tests {
         let f = parse_field("email:String{email}:unique").unwrap();
         assert!(f.unique);
         assert!(f.constraints.email);
+    }
+
+    // ── slug (issue #1260) ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_slug_field_with_from() {
+        let f = parse_field("slug:slug{from:title}").unwrap();
+        assert_eq!(f.name, "slug");
+        assert_eq!(f.kind, FieldKind::Slug);
+        assert_eq!(f.constraints.from.as_deref(), Some("title"));
+        assert_eq!(f.rust_type(), "String");
+        assert_eq!(f.sql_type(), "TEXT");
+    }
+
+    #[test]
+    fn slug_field_is_implicitly_unique() {
+        // A slug is the record's routing key, so it must be unique even
+        // without an explicit `:unique` modifier — this is what lets it
+        // fall into the existing `unique`-field migration/repository
+        // machinery (issue #1032) for free.
+        let f = parse_field("slug:slug{from:title}").unwrap();
+        assert!(f.unique);
+    }
+
+    #[test]
+    fn slug_field_explicit_unique_modifier_is_harmless() {
+        let f = parse_field("slug:slug{from:title}:unique").unwrap();
+        assert!(f.unique);
+        assert_eq!(f.constraints.from.as_deref(), Some("title"));
+    }
+
+    #[test]
+    fn slug_field_is_never_nullable() {
+        // A slug is always the routing key; a nullable slug would mean some
+        // records have no URL. `NOT NULL` is unconditional (AC3), so reject
+        // rather than silently drop the modifier.
+        let err = parse_field("slug:Option<slug>{from:title}").unwrap_err();
+        assert!(
+            err.to_string().contains("slug") && err.to_string().contains("nullable"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn slug_field_requires_from_modifier() {
+        let err = parse_field("slug:slug").unwrap_err();
+        assert!(err.to_string().contains("from"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn slug_field_rejects_empty_constraint_block() {
+        let err = parse_field("slug:slug{}").unwrap_err();
+        assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn from_constraint_only_applies_to_slug_fields() {
+        let err = parse_field("title:String{from:body}").unwrap_err();
+        assert!(err.to_string().contains("from"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn slug_field_rejects_non_ident_from_value() {
+        let err = parse_field("slug:slug{from:not a field}").unwrap_err();
+        assert!(err.to_string().contains("from"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn slug_field_rejects_min_max_constraints() {
+        // Sanity: `slug` doesn't accidentally pick up unrelated constraints.
+        let err = parse_field("slug:slug{from:title,min=3}").unwrap_err();
+        assert!(err.to_string().contains("min"), "unexpected error: {err}");
     }
 
     #[test]

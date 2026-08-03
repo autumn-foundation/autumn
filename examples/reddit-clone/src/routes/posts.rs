@@ -22,7 +22,7 @@ use crate::models::{
 };
 use crate::repositories::{PgPostRepository, PgVoteRepository, PostRepository};
 use crate::schema::{posts, subreddits, tags};
-use crate::slugify::slugify;
+use autumn_web::slugify;
 
 fn posts_per_page() -> i64 {
     crate::config_svc()

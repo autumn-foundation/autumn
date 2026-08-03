@@ -1,4 +1,5 @@
 use autumn_web::error::{AutumnError, AutumnResult};
+use autumn_web::slugify;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -123,33 +124,4 @@ pub struct UpdatePost {
     /// Never deserialized from form/JSON input; the handler always sets it.
     #[serde(skip)]
     pub updated_at: Option<chrono::NaiveDateTime>,
-}
-
-/// Convert a string into a URL-safe slug.
-///
-/// ⚡ Bolt Optimization:
-/// This avoids multiple heap allocations (an intermediate `String` and `Vec`)
-/// by iterating through characters in a single pass and pushing to a pre-allocated String.
-pub fn slugify(s: &str) -> String {
-    let mut slug = String::with_capacity(s.len());
-    let mut last_was_dash = true; // Start true to prevent leading dashes
-
-    for c in s.chars() {
-        if c.is_alphanumeric() {
-            // Using flat_map to handle potential multiple chars from lowercase conversion
-            for lc in c.to_lowercase() {
-                slug.push(lc);
-            }
-            last_was_dash = false;
-        } else if !last_was_dash {
-            slug.push('-');
-            last_was_dash = true;
-        }
-    }
-
-    if slug.ends_with('-') {
-        slug.pop();
-    }
-
-    slug
 }
