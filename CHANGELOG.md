@@ -616,6 +616,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/guide/storage.md` documents the scaffolded no-JS path and frames
   presigned direct upload as the opt-in advanced alternative.
 
+  From the PR review: `attachment_url` refuses to issue a URL at all for content
+  a browser would execute as same-origin script. The local backend serves blobs
+  from the app's own origin, replaying the content type they were uploaded under
+  with no `Content-Disposition`, and the default CSP allows `script-src 'self'`
+  — so a stored `text/html` or `image/svg+xml` reached by direct *navigation*
+  would run with the visitor's cookies, and an anchor's `download` attribute
+  governs clicks on that anchor rather than navigation to the URL. The generated
+  `LINKABLE_CONTENT_TYPES` is fail-closed and covers the types a scaffold is
+  actually used for (images, PDF, plain text, media, archives, office
+  documents); anything else still renders on the page, just without a link. It
+  also compares `blob.provider_id` against the configured store before signing,
+  so a blob left over from a previous backend degrades to the no-link path
+  instead of linking to a nonexistent object — or to unrelated bytes that happen
+  to share its key.
+
   Generator-only; no `autumn-web` API change.
 
 - **jobs:** routed the job runtime's recorded timestamps (enqueued_at/started_at/finished_at, due-at filtering, and the backoff-delay computation) through the injected `ClockSource` seam instead of reading `Utc::now()` directly, so recorded job timestamps are deterministic under the sim harness (production defaults to `SystemClock`, behavior unchanged). The in-memory/sim job path is now fully deterministic; the Postgres durable path still uses server-side SQL `NOW()` (#2111). [no-plugin]

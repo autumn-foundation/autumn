@@ -938,11 +938,14 @@ fn generated_attachment_scaffold_multipart_test_passes() {
         "photos_multipart_upload_binds_blob_key",
         "photos_multipart_upload_over_limit_is_413",
         "photos_multipart_create_without_file_is_null",
-        // `src/routes/photos.rs` — the read-back helpers.
-        "attachment_read_back_tests::renders_an_em_dash_when_the_column_is_null",
-        "attachment_read_back_tests::labels_the_link_from_the_column_and_the_stored_extension",
-        "attachment_read_back_tests::drops_the_anchor_when_no_url_could_be_signed",
-        "attachment_read_back_tests::keeps_only_a_short_safe_lowercase_extension",
+        // `src/routes/photos.rs` — the read-back helpers. libtest reports a bin
+        // crate's unit tests under their full module path, so these carry the
+        // `routes::<plural>::` prefix the `tests/` binary's names don't have.
+        "routes::photos::attachment_read_back_tests::renders_an_em_dash_when_the_column_is_null",
+        "routes::photos::attachment_read_back_tests::labels_the_link_from_the_column_and_the_stored_extension",
+        "routes::photos::attachment_read_back_tests::drops_the_anchor_when_no_url_could_be_signed",
+        "routes::photos::attachment_read_back_tests::keeps_only_a_short_safe_lowercase_extension",
+        "routes::photos::attachment_read_back_tests::refuses_to_link_content_types_that_execute_as_same_origin_script",
     ] {
         assert!(
             stdout.contains(&format!("test {name} ... ok")),
@@ -1115,5 +1118,69 @@ fn scaffold_attachment_form_is_multipart_encoded() {
     assert!(
         !plain_routes.contains("FieldControl::File"),
         "{plain_routes}"
+    );
+}
+
+/// PR #2161 review (Codex P1/P2): `attachment_url` must refuse to sign a URL
+/// for content a browser would execute as same-origin script, and for a blob
+/// recorded against a different storage provider.
+///
+/// The local backend serves blobs from the app's own origin, replaying the
+/// content type they were uploaded under with no `Content-Disposition`, and the
+/// default CSP allows `script-src 'self'` — so a stored `text/html` reached by
+/// direct navigation is stored XSS. The anchor's `download` attribute does not
+/// govern navigation, so refusing to issue the URL is the actual control.
+#[test]
+fn scaffold_attachment_url_refuses_unsafe_content_types_and_foreign_providers() {
+    let (_tmp, project) = scaffold_project("attach-safe-app", "Photo", &["image:Attachment"]);
+    let routes = fs::read_to_string(project.join("src/routes/photos.rs")).unwrap();
+
+    assert!(
+        routes.contains("const LINKABLE_CONTENT_TYPES: &[&str] = &["),
+        "{routes}"
+    );
+    assert!(
+        routes.contains("if !LINKABLE_CONTENT_TYPES.contains(&essence.as_str()) {"),
+        "the signed URL must be gated on the stored media type:\n{routes}"
+    );
+    // Compared on the media-type essence, so `text/plain; charset=utf-8` matches.
+    assert!(routes.contains(".split(';')"), "{routes}");
+
+    // Scoped to the const's own entries — the dangerous names legitimately appear
+    // in the surrounding doc comment ("do NOT add ...") and in the emitted unit
+    // test that asserts their absence.
+    let allowlist = handler_body(&routes, "const LINKABLE_CONTENT_TYPES", "];");
+    for dangerous in [
+        "\"text/html\"",
+        "\"image/svg+xml\"",
+        "\"application/xhtml+xml\"",
+        "\"text/xml\"",
+        "\"application/javascript\"",
+    ] {
+        assert!(
+            !allowlist.contains(dangerous),
+            "{dangerous} must never be linkable from a scaffolded view:\n{allowlist}"
+        );
+    }
+    // …while the ordinary upload types stay usable.
+    for safe in ["\"image/png\"", "\"image/jpeg\"", "\"application/pdf\""] {
+        assert!(
+            allowlist.contains(safe),
+            "{safe} should be linkable:\n{allowlist}"
+        );
+    }
+
+    // A blob from a previous backend is not this store's object: signing its key
+    // would link to nothing, or to unrelated bytes that happen to share the key.
+    assert!(
+        routes.contains("if blob.provider_id != store.provider_id() {"),
+        "a provider mismatch must degrade to the no-link path:\n{routes}"
+    );
+
+    // `download` is documented as a convenience, not the security boundary —
+    // browsers ignore it for the cross-origin URL an S3 backend returns.
+    assert!(
+        routes.contains("NOT the security\n/// boundary"),
+        "the note must not present `download` as the control:\n{routes}"
     );
 }

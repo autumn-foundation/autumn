@@ -2403,11 +2403,57 @@ fn render_routes_file(
              }}\n    \
              format!(\".{{ext}}\")\n\
              }}\n\n\
+             /// Media types this scaffold is willing to hand out a URL for.\n\
+             ///\n\
+             /// SECURITY: the local backend serves blobs from THIS app's origin and\n\
+             /// replays the content type they were uploaded under, setting no\n\
+             /// `Content-Disposition`; the default CSP allows `script-src 'self'`. So a\n\
+             /// stored `text/html` or `image/svg+xml` reached by direct NAVIGATION would\n\
+             /// run as same-origin script with the visitor's cookies — and an anchor's\n\
+             /// `download` attribute governs clicks on that anchor, not navigation to\n\
+             /// the URL. A URL is therefore only ever issued for types a browser either\n\
+             /// renders inertly (images, PDF, plain text, media) or simply downloads\n\
+             /// (archives, office documents); an unlisted type still shows on the page,\n\
+             /// just without a link.\n\
+             ///\n\
+             /// Fail-CLOSED by design. Widen it freely for inert types you accept, but\n\
+             /// do NOT add `text/html`, `application/xhtml+xml`, `image/svg+xml`, any\n\
+             /// `*/xml`, or any script type unless you are serving uploads from a\n\
+             /// SEPARATE origin. Constraining `security.upload.allowed_mime_types` in\n\
+             /// `autumn.toml` is the complementary control on the write side.\n\
+             const LINKABLE_CONTENT_TYPES: &[&str] = &[\n    \
+             // Rendered inertly by the browser.\n    \
+             \"image/png\",\n    \
+             \"image/jpeg\",\n    \
+             \"image/gif\",\n    \
+             \"image/webp\",\n    \
+             \"image/avif\",\n    \
+             \"image/bmp\",\n    \
+             \"application/pdf\",\n    \
+             \"text/plain\",\n    \
+             \"text/csv\",\n    \
+             \"audio/mpeg\",\n    \
+             \"audio/ogg\",\n    \
+             \"audio/wav\",\n    \
+             \"video/mp4\",\n    \
+             \"video/webm\",\n    \
+             // No inline renderer, so the browser downloads rather than executes.\n    \
+             \"application/zip\",\n    \
+             \"application/gzip\",\n    \
+             \"application/octet-stream\",\n    \
+             \"application/msword\",\n    \
+             \"application/vnd.ms-excel\",\n    \
+             \"application/vnd.openxmlformats-officedocument.wordprocessingml.document\",\n    \
+             \"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\",\n    \
+             \"application/vnd.openxmlformats-officedocument.presentationml.presentation\",\n\
+             ];\n\n\
              /// Signed, time-bounded URL for a stored attachment (issue #1236).\n\
              ///\n\
-             /// `None` when the column is NULL, the app has no `[storage]` backend\n\
-             /// configured, or the backend declined to sign — `attachment_link` then\n\
-             /// renders the file name without a link instead of failing the page.\n\
+             /// `None` — so `attachment_link` renders the file name without a link\n\
+             /// rather than failing the page — when the column is NULL, the app has no\n\
+             /// `[storage]` backend configured, the media type is not in\n\
+             /// `LINKABLE_CONTENT_TYPES`, the blob belongs to a different storage\n\
+             /// provider, or the backend declined to sign.\n\
              ///\n\
              /// The {ATTACHMENT_URL_TTL_SECS}-second window is set here, not read from\n\
              /// config: `storage.local.default_url_expiry_secs` applies only when the\n\
@@ -2418,10 +2464,35 @@ fn render_routes_file(
              blob: Option<&autumn_web::storage::Blob>,\n\
              ) -> Option<String> {{\n    \
              let blob = blob?;\n    \
+             // Compare on the media-type ESSENCE: a stored type may carry parameters\n    \
+             // (`text/plain; charset=utf-8`).\n    \
+             let essence = blob\n        \
+             .content_type\n        \
+             .split(';')\n        \
+             .next()\n        \
+             .unwrap_or_default()\n        \
+             .trim()\n        \
+             .to_ascii_lowercase();\n    \
+             if !LINKABLE_CONTENT_TYPES.contains(&essence.as_str()) {{\n        \
+             return None;\n    \
+             }}\n    \
              let store = state\n        \
              .extension::<autumn_web::storage::BlobStoreState>()?\n        \
              .store()\n        \
              .clone();\n    \
+             // A blob recorded against a different provider is not this store's object.\n    \
+             // Signing its key would produce a link to nothing — or, if that key happens\n    \
+             // to exist here, to unrelated bytes. `Blob::provider_id` exists to catch\n    \
+             // exactly this after a backend swap.\n    \
+             if blob.provider_id != store.provider_id() {{\n        \
+             autumn_web::reexports::tracing::warn!(\n            \
+             blob_provider = %blob.provider_id,\n            \
+             store_provider = %store.provider_id(),\n            \
+             key = %blob.key,\n            \
+             \"attachment belongs to a different storage provider; rendering it without a link\"\n        \
+             );\n        \
+             return None;\n    \
+             }}\n    \
              match store\n        \
              .presigned_url(&blob.key, std::time::Duration::from_secs({ATTACHMENT_URL_TTL_SECS}))\n        \
              .await\n    \
@@ -2443,16 +2514,15 @@ fn render_routes_file(
              /// key, media type and size but not the original filename, so the link is\n\
              /// labelled `<label>.<ext>` rather than with the opaque key.\n\
              ///\n\
-             /// SECURITY: the link carries `download` so a click SAVES the file instead\n\
-             /// of navigating to it. That matters because the local backend serves blobs\n\
-             /// from this app's own origin, replaying the content type they were\n\
-             /// uploaded under and setting no `Content-Disposition` — so an uploaded\n\
-             /// `.html`/`.svg` reached by NAVIGATION runs as same-origin content.\n\
-             /// `download` only governs this anchor; it does not protect anyone who\n\
-             /// opens the URL directly. The durable fix is to restrict what can be\n\
-             /// uploaded — set `security.upload.allowed_mime_types` (and\n\
-             /// `reject_on_content_type_mismatch = true`) in `autumn.toml` — or to serve\n\
-             /// uploads from a separate origin / S3, where the question doesn't arise.\n\
+             /// The link carries `download` so a same-origin click SAVES the file rather\n\
+             /// than rendering it in a tab. It is a convenience, NOT the security\n\
+             /// boundary — it governs clicks on this anchor only, and browsers ignore it\n\
+             /// entirely for the cross-origin URL an S3 backend returns (so an S3-hosted\n\
+             /// image opens inline instead of saving; encode a response\n\
+             /// `Content-Disposition` into the presign if that matters to you). What\n\
+             /// actually keeps a stored `.html`/`.svg` from running as same-origin script\n\
+             /// is `attachment_url` refusing to issue a URL for it at all — see\n\
+             /// `LINKABLE_CONTENT_TYPES`.\n\
              ///\n\
              /// Emitted as a raw `<a>` rather than `autumn_web::a11y::Link` because that\n\
              /// primitive has no `download` builder.\n\
@@ -2607,7 +2677,7 @@ fn render_routes_file(
 
 #[cfg(test)]
 mod attachment_read_back_tests {
-    use super::{attachment_link, upload_extension};
+    use super::{LINKABLE_CONTENT_TYPES, attachment_link, upload_extension};
     use autumn_web::storage::Blob;
 
     fn blob(key: &str) -> Blob {
@@ -2637,6 +2707,32 @@ mod attachment_read_back_tests {
         let html = attachment_link(Some(&stored), None, "cover").into_string();
         assert!(!html.contains("<a "), "{html}");
         assert!(html.contains("cover.png"), "{html}");
+    }
+
+    #[test]
+    fn refuses_to_link_content_types_that_execute_as_same_origin_script() {
+        // The local backend replays the stored content type from THIS origin with
+        // no `Content-Disposition`, and the default CSP allows `script-src 'self'`,
+        // so navigating to a stored `.html`/`.svg` would run it as same-origin
+        // script. `attachment_url` must not hand out a URL for those at all.
+        for dangerous in [
+            "text/html",
+            "image/svg+xml",
+            "application/xhtml+xml",
+            "text/xml",
+            "application/xml",
+            "text/javascript",
+            "application/javascript",
+        ] {
+            assert!(
+                !LINKABLE_CONTENT_TYPES.contains(&dangerous),
+                "{dangerous} must never be linkable"
+            );
+        }
+        // The ordinary upload types a scaffold is actually used for stay linkable.
+        for safe in ["image/png", "image/jpeg", "application/pdf", "text/plain"] {
+            assert!(LINKABLE_CONTENT_TYPES.contains(&safe), "{safe} should link");
+        }
     }
 
     #[test]
