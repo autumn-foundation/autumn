@@ -379,10 +379,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports the new `SweepOutcome::Empty` rather than silently falling through
   to `Passed { seeds_run: 0 }` — the bin treats it as a failure (exit `1`) so
   a misconfigured seed count can't quietly green the CI job without testing
-  anything. `AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release
-  --features sim-testing --bin sim-sweep` sweeps seeds `0..1000` against a
-  built-in account demo scenario; a new standalone CI job runs it at seed
-  count 512 on every push/PR, structured like the `loom` job. [no-plugin]
+  anything. `embedded_config()` (the op-driver's internal proptest `Config`,
+  already forcing fork/timeout off regardless of ambient `PROPTEST_FORK`/
+  `PROPTEST_TIMEOUT`) now also pins the case count to a fixed 256, ignoring
+  `PROPTEST_CASES` entirely: `PROPTEST_CASES=0` would otherwise make a case
+  closure never run at all while still reporting success, and even a bare
+  "clamp to at least 1" would still collapse proptest's automatic shrink
+  budget (`cases × 4`) to 4 iterations, aborting shrinking early with a
+  far-from-minimal counterexample. `AUTUMN_SIM_SEEDS=1000 cargo run -p
+  autumn-web --release --features sim-testing --bin sim-sweep` sweeps seeds
+  `0..1000` against a built-in account demo scenario; a new standalone CI job
+  runs it at seed count 512 on every push/PR, structured like the `loom`
+  job. [no-plugin]
 - **sim-testing:** add a property-based **op-driver** (`sim::op`, W6 PR2,
   #1797) behind the new `sim-testing` feature: `Sim::gen_ops::<T>()` /
   `Sim::gen_ops_with(strategy)` deterministically draw an arbitrary `Vec<T>`

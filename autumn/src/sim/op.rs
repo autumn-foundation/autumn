@@ -136,23 +136,43 @@ fn stream_rng(seed: u64, salt: u64) -> TestRng {
     TestRng::from_seed(RngAlgorithm::ChaCha, &bytes)
 }
 
+/// The case count [`embedded_config`] pins regardless of any ambient
+/// `PROPTEST_CASES` — matches proptest's own documented default
+/// (`Config::default().cases` absent any env override), so callers who never
+/// set `PROPTEST_CASES` see no behavior change.
+const EMBEDDED_CASES: u32 = 256;
+
 /// A [`Config`] for the embedded, in-process runners [`Sim::gen_ops_with`] and
 /// [`Sim::run_proptest`] own directly (as opposed to a runner `#[test]`-owned
 /// proptest picks up via `proptest!`/`#[proptest_derive]`).
 ///
 /// Disables proptest's own file-based failure persistence (see the module
 /// docs' "Determinism" section for why) and, since [`Config::default`] also
-/// pulls in whatever `PROPTEST_FORK` / `PROPTEST_TIMEOUT` env vars happen to
-/// be set process-wide, forces fork mode and the fork timeout off — this
-/// runner has no `test_name` to give proptest's forking machinery, so
-/// inheriting fork mode from the environment would panic
-/// (`Must supply test_name when forking enabled`) before a single op could be
-/// generated.
+/// pulls in whatever `PROPTEST_FORK` / `PROPTEST_TIMEOUT` / `PROPTEST_CASES`
+/// env vars happen to be set process-wide:
+///
+/// - forces fork mode and the fork timeout off — this runner has no
+///   `test_name` to give proptest's forking machinery, so inheriting fork
+///   mode from the environment would panic (`Must supply test_name when
+///   forking enabled`) before a single op could be generated;
+/// - pins the case count to [`EMBEDDED_CASES`], entirely ignoring
+///   `PROPTEST_CASES` — `PROPTEST_CASES=0` would otherwise make
+///   [`TestRunner::run`] return `Ok(())` without ever invoking the case
+///   closure, so `body` (and any `always!`/`sometimes!` inside it) never
+///   runs at all while [`Sim::run_proptest`] still reports success, silently
+///   defeating the whole point of the sweep this backs
+///   ([`sim::sweep`](super::sweep)). A bare `.max(1)` clamp would avoid that
+///   specific failure but still shrinks worse: proptest's automatic
+///   `max_shrink_iters` is `cases.saturating_mul(4)`, so clamping to the
+///   bare minimum of 1 case also collapses the shrink budget to 4
+///   iterations, aborting shrinking early with a far-from-minimal
+///   counterexample — pinning the whole case count sidesteps that too.
 fn embedded_config() -> Config {
     Config {
         failure_persistence: None,
         fork: false,
         timeout: 0,
+        cases: EMBEDDED_CASES,
         ..Config::default()
     }
 }
@@ -371,6 +391,25 @@ mod tests {
         assert_eq!(
             config.timeout, 0,
             "the embedded op-driver runner has no fork timeout to honor"
+        );
+    }
+
+    #[test]
+    fn embedded_config_pins_the_case_count_ignoring_proptest_cases() {
+        // `PROPTEST_CASES=0` in the environment would otherwise make
+        // `Config::default().cases` zero, so `TestRunner::run` returns
+        // `Ok(())` without ever invoking the case closure — `body` (and any
+        // `always!`/`sometimes!` inside it) never runs, yet `run_proptest`
+        // still reports success. A bare `.max(1)` clamp would avoid that but
+        // also collapse proptest's automatic shrink budget
+        // (`cases.saturating_mul(4)`) to 4 iterations — assert the exact
+        // pinned value instead, same reasoning as
+        // `embedded_config_forces_fork_and_timeout_off` above (the env var
+        // is read once, process-lifetime, via a `LazyLock`).
+        assert_eq!(
+            embedded_config().cases,
+            EMBEDDED_CASES,
+            "the embedded op-driver runner must always run exactly EMBEDDED_CASES cases"
         );
     }
 

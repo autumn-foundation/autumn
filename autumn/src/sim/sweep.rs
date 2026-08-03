@@ -82,13 +82,14 @@
 //! A sweep is only meaningfully green if it is also **non-vacuous**: every
 //! [`sometimes!`](crate::sometimes) reachability label observed across the
 //! *entire* swept range was satisfied by *some* seed. A single seed's
-//! `Sim::run_proptest` drives up to `Config::default().cases` (256) candidate
-//! op-sequences internally, each starting with a fresh registry (a fresh
-//! `Sim::from_seed` resets it) — so [`sweep_proptest`] folds *every case's*
-//! snapshot via [`Sim::run_proptest_with_case_hook`], not just a single
-//! snapshot read after the whole seed finishes (which would silently see
-//! only the last of up to 256 cases). Each seed's case-folded observations
-//! are then merged into the sweep-wide aggregate; if the whole range passes
+//! `Sim::run_proptest` drives up to `op::EMBEDDED_CASES` (256, pinned
+//! regardless of any ambient `PROPTEST_CASES`) candidate op-sequences
+//! internally, each starting with a fresh registry (a fresh `Sim::from_seed`
+//! resets it) — so [`sweep_proptest`] folds *every case's* snapshot via
+//! [`Sim::run_proptest_with_case_hook`], not just a single snapshot read
+//! after the whole seed finishes (which would silently see only the last of
+//! up to 256 cases). Each seed's case-folded observations are then merged
+//! into the sweep-wide aggregate; if the whole range passes
 //! but some label was observed and never satisfied anywhere in it, the
 //! outcome is [`SweepOutcome::Vacuous`] instead of [`SweepOutcome::Passed`] —
 //! the same "never ship a vacuously-green suite" guarantee
@@ -337,7 +338,7 @@ mod tests {
 
     #[test]
     fn sweep_aggregates_sometimes_observations_across_every_case_in_a_seed() {
-        // `Config::default().cases` is 256 — a `sometimes!` satisfied by only
+        // `op::EMBEDDED_CASES` is 256 — a `sometimes!` satisfied by only
         // SOME of those 256 candidate op-sequences (not necessarily the last
         // one tried) must still show up as satisfied in the aggregate. A
         // single seed (0..1) makes this a direct test of the per-case fold,
