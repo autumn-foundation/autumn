@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
-  (#1251). A new `[i18n] locale_prefix_routes` flag (default `false` — no
+  (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via
   `AppBuilder::routes` also reachable under `/{locale}/...` for each
   configured `supported_locales`, with zero hand-duplicated route

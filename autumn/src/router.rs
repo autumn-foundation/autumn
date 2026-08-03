@@ -1786,7 +1786,7 @@ fn group_and_mount_routes(
 }
 
 /// Mount the user route table, applying locale-prefixed routing (issue
-/// #1251) when [`I18nConfig::locale_prefix_routes`](crate::i18n::I18nConfig::locale_prefix_routes)
+/// #1251) when [`I18nConfig::locale_prefix_enabled`](crate::i18n::I18nConfig::locale_prefix_enabled)
 /// is enabled. Delegates straight to [`group_and_mount_routes`] otherwise, so
 /// apps that don't opt in see no behavior change.
 #[cfg(feature = "i18n")]
@@ -1797,7 +1797,7 @@ fn mount_user_routes(
     state: &AppState,
     config: &AutumnConfig,
 ) -> axum::Router<AppState> {
-    if !config.i18n.locale_prefix_routes {
+    if !config.i18n.locale_prefix_enabled {
         return group_and_mount_routes(
             route_list,
             idempotency_layers,
@@ -1890,6 +1890,12 @@ fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
 /// Cloning `content_router` — a cheap, `Arc`-backed `axum::Router` — rather
 /// than the underlying [`Route`] list is what lets every locale share one
 /// router build: no route definition is duplicated by hand or in code.
+///
+/// When `i18n.supported_locales` is empty (a degenerate config — locale-prefix
+/// routing on with nothing to prefix with), no nest is created and the
+/// bare-path redirect is skipped too: redirecting to an unnested
+/// `/{default_locale}/...` target that structurally can't exist would just
+/// swap a direct 404 for a 308-then-404 round trip.
 #[cfg(feature = "i18n")]
 fn apply_locale_prefix_routing(
     excluded_router: axum::Router<AppState>,
@@ -1899,7 +1905,7 @@ fn apply_locale_prefix_routing(
 ) -> axum::Router<AppState> {
     let mut router = excluded_router;
 
-    if !included_paths.is_empty() {
+    if !included_paths.is_empty() && !i18n.supported_locales.is_empty() {
         let mut redirect_router = axum::Router::<AppState>::new();
         for path in included_paths {
             redirect_router =
@@ -1912,7 +1918,7 @@ fn apply_locale_prefix_routing(
         let nested = content_router
             .clone()
             .fallback(crate::middleware::error_page_filter::fallback_404_handler)
-            .layer(axum::Extension(crate::i18n::UrlPrefixedLocale(
+            .layer(axum::Extension(crate::i18n::UriPrefixedLocale(
                 locale.clone(),
             )));
         router = router.nest(&format!("/{locale}"), nested);
@@ -1924,7 +1930,7 @@ fn apply_locale_prefix_routing(
 /// Fallback handler mounted at every locale-prefix-eligible bare path:
 /// 308-redirects to the negotiated locale's prefixed path, preserving the
 /// query string. Reuses the unmodified [`Locale`](crate::i18n::Locale)
-/// extractor (no [`UrlPrefixedLocale`](crate::i18n::UrlPrefixedLocale) is set
+/// extractor (no [`UriPrefixedLocale`](crate::i18n::UriPrefixedLocale) is set
 /// this far outside any locale nest) so the redirect target matches exactly
 /// what the request would have resolved to anyway.
 #[cfg(feature = "i18n")]
@@ -1932,7 +1938,16 @@ async fn locale_prefix_redirect_handler(
     locale: crate::i18n::Locale,
     uri: axum::http::Uri,
 ) -> axum::response::Redirect {
-    let mut target = format!("/{}{}", locale.tag(), uri.path());
+    let path = uri.path();
+    // Axum's `nest(prefix, router)` makes the *bare* `prefix` (no trailing
+    // slash) match the inner router's own `"/"` route — `prefix/` 404s. So
+    // the root path's redirect target is `/{locale}`, not `/{locale}/`,
+    // unlike every other path, which is a plain concatenation.
+    let mut target = if path == "/" {
+        format!("/{}", locale.tag())
+    } else {
+        format!("/{}{path}", locale.tag())
+    };
     if let Some(query) = uri.query() {
         target.push('?');
         target.push_str(query);
@@ -5932,7 +5947,7 @@ mod tests {
 
         fn config(supported: &[&str], exclude: &[&str]) -> AutumnConfig {
             let mut config = AutumnConfig::default();
-            config.i18n.locale_prefix_routes = true;
+            config.i18n.locale_prefix_enabled = true;
             config.i18n.default_locale = supported.first().copied().unwrap_or("en").to_owned();
             config.i18n.supported_locales = supported.iter().map(|s| (*s).to_owned()).collect();
             config.i18n.locale_prefix_exclude = exclude.iter().map(|s| (*s).to_owned()).collect();
@@ -5945,7 +5960,7 @@ mod tests {
                 supported_locales: supported.iter().map(|s| (*s).to_owned()).collect(),
                 fallback_chain: vec![],
                 dir: "i18n".to_owned(),
-                locale_prefix_routes: false,
+                locale_prefix_enabled: false,
                 locale_prefix_exclude: vec![],
             };
             Arc::new(Bundle::from_messages(
@@ -5959,7 +5974,16 @@ mod tests {
             uri: &str,
             headers: &[(&str, &str)],
         ) -> axum::response::Response {
-            let mut req = Request::builder().uri(uri);
+            request_method(router, http::Method::GET, uri, headers).await
+        }
+
+        async fn request_method(
+            router: &axum::Router,
+            method: http::Method,
+            uri: &str,
+            headers: &[(&str, &str)],
+        ) -> axum::response::Response {
+            let mut req = Request::builder().method(method).uri(uri);
             for (k, v) in headers {
                 req = req.header(*k, *v);
             }
@@ -5975,12 +5999,89 @@ mod tests {
             String::from_utf8(bytes.to_vec()).unwrap()
         }
 
+        async fn uri_probe(uri: axum::http::Uri) -> String {
+            uri.path().to_owned()
+        }
+
+        async fn slug_probe(
+            locale: Locale,
+            axum::extract::Path(slug): axum::extract::Path<String>,
+        ) -> String {
+            format!("{}:{slug}", locale.tag())
+        }
+
+        fn uri_probe_route(path: &'static str, name: &'static str) -> Route {
+            Route {
+                method: http::Method::GET,
+                path,
+                handler: axum::routing::get(uri_probe),
+                name,
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path,
+                    operation_id: name,
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }
+        }
+
+        fn slug_route(path: &'static str, name: &'static str) -> Route {
+            Route {
+                method: http::Method::GET,
+                path,
+                handler: axum::routing::get(slug_probe),
+                name,
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path,
+                    operation_id: name,
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }
+        }
+
+        fn make_post_route(path: &'static str, name: &'static str) -> Route {
+            Route {
+                method: http::Method::POST,
+                path,
+                handler: axum::routing::post(plain_ok),
+                name,
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path,
+                    operation_id: name,
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }
+        }
+
         /// AC: default off — no behavior change for existing apps. The bare
         /// route serves directly; no locale nest exists.
         #[tokio::test]
         async fn locale_prefix_routing_off_by_default() {
             let mut config = AutumnConfig::default();
-            assert!(!config.i18n.locale_prefix_routes);
+            assert!(!config.i18n.locale_prefix_enabled);
             config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
 
             let route = simple_route("/posts", "posts", false);
@@ -5995,6 +6096,60 @@ mod tests {
                 prefixed.status(),
                 StatusCode::NOT_FOUND,
                 "no locale nest should exist when the flag is off"
+            );
+        }
+
+        /// The root path (`/`) is axum's nest-plus-root special case: `nest(
+        /// "/en", router_with_route_at("/"))` makes bare `/en` (no trailing
+        /// slash) match, while `/en/` 404s — the opposite of every other
+        /// path, where the locale segment is a plain concatenation. Both the
+        /// redirect target and direct nested access must account for this.
+        #[tokio::test]
+        async fn root_path_redirects_to_bare_locale_prefix_without_trailing_slash() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/", "root", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let bare = request(&app, "/", &[]).await;
+            assert_eq!(bare.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                bare.headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en"),
+                "root redirect target must have no trailing slash"
+            );
+
+            let nested = request(&app, "/en", &[]).await;
+            assert_eq!(nested.status(), StatusCode::OK);
+            assert_eq!(body_string(nested).await, "en");
+
+            let nested_with_slash = request(&app, "/en/", &[]).await;
+            assert_eq!(
+                nested_with_slash.status(),
+                StatusCode::NOT_FOUND,
+                "axum's nest-plus-root case does not also match the trailing-slash form"
+            );
+        }
+
+        /// The root path with a query string preserves the query and still
+        /// omits the trailing slash before it.
+        #[tokio::test]
+        async fn root_path_redirect_preserves_query_without_trailing_slash() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/", "root", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(&app, "/?ref=newsletter", &[]).await;
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en?ref=newsletter")
             );
         }
 
@@ -6108,6 +6263,210 @@ mod tests {
                 nested.status(),
                 StatusCode::NOT_FOUND,
                 "excluded route must not be nested under a locale prefix"
+            );
+        }
+
+        /// A trailing `/*` on a configured exclude prefix is equivalent to
+        /// the bare prefix — `"/api"` and `"/api/*"` behave identically.
+        #[tokio::test]
+        async fn exclude_prefix_accepts_trailing_glob_suffix() {
+            let config = config(&["en", "es"], &["/api/*"]);
+            let route = simple_route("/api/status", "api_status", false);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let direct = request(&app, "/api/status", &[]).await;
+            assert_eq!(direct.status(), StatusCode::OK);
+
+            let nested = request(&app, "/en/api/status", &[]).await;
+            assert_eq!(nested.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// A path that merely starts with an exclude prefix's characters
+        /// (`/apikeys` vs the configured `/api`) is NOT a prefix match — only
+        /// an exact path or a `/`-delimited sub-path counts. Otherwise
+        /// `/apikeys` would be wrongly swept into the excluded/unprefixed
+        /// group alongside genuine `/api/*` routes.
+        #[tokio::test]
+        async fn exclude_prefix_does_not_match_unrelated_path_sharing_a_string_prefix() {
+            let config = config(&["en", "es"], &["/api"]);
+            let route = simple_route("/apikeys", "apikeys", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let bare = request(&app, "/apikeys", &[]).await;
+            assert_eq!(
+                bare.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "/apikeys must be treated as included (locale-prefixed), not excluded"
+            );
+
+            let nested = request(&app, "/en/apikeys", &[]).await;
+            assert_eq!(
+                nested.status(),
+                StatusCode::OK,
+                "/apikeys must be nested under the locale prefix like any other included route"
+            );
+        }
+
+        /// A parameterized route (`/posts/{slug}`) is reachable through a
+        /// locale nest exactly like a static path — dynamic-segment matching
+        /// works the same whether or not the route is nested.
+        #[tokio::test]
+        async fn parameterized_route_reachable_under_locale_prefix() {
+            let config = config(&["en", "es"], &[]);
+            let route = slug_route("/posts/{slug}", "posts_show");
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(&app, "/es/posts/hello-world", &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_string(response).await, "es:hello-world");
+        }
+
+        /// Core assumption underpinning `locale_switcher`/hreflang
+        /// (documented on `widgets::localized_path` and
+        /// `seo::locale_alternates`): axum's `nest()` strips the matched
+        /// locale segment before extraction, so a handler's plain `Uri`
+        /// extractor inside the nest sees the locale-stripped path — not the
+        /// `/es/posts` the client actually requested.
+        #[tokio::test]
+        async fn uri_extractor_inside_locale_nest_sees_locale_stripped_path() {
+            let config = config(&["en", "es"], &[]);
+            let route = uri_probe_route("/posts", "posts_uri_probe");
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(&app, "/es/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                body_string(response).await,
+                "/posts",
+                "Uri extractor inside a locale nest must see the prefix-stripped path"
+            );
+        }
+
+        /// The redirect handler is mounted via `any()`, so it must redirect
+        /// non-GET methods too, not just the GET case every other test uses.
+        #[tokio::test]
+        async fn bare_path_redirect_applies_to_non_get_methods() {
+            let config = config(&["en", "es"], &[]);
+            let route = make_post_route("/posts", "posts_create");
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request_method(&app, http::Method::POST, "/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en/posts")
+            );
+        }
+
+        /// Two routes sharing one path under different HTTP methods must
+        /// still dedup to a single bare-path redirect registration — the
+        /// `included_paths.sort_unstable(); included_paths.dedup();` step in
+        /// `mount_user_routes` exists precisely to prevent `Router::route`
+        /// panicking on the same path registered twice.
+        #[tokio::test]
+        async fn same_path_different_methods_dedups_to_one_redirect_route() {
+            let config = config(&["en", "es"], &[]);
+            let get_route = simple_route("/posts", "posts_list", true);
+            let post_route = make_post_route("/posts", "posts_create");
+            let app = build_router(vec![get_route, post_route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let get_redirect = request(&app, "/posts", &[]).await;
+            assert_eq!(get_redirect.status(), StatusCode::PERMANENT_REDIRECT);
+            let post_redirect = request_method(&app, http::Method::POST, "/posts", &[]).await;
+            assert_eq!(post_redirect.status(), StatusCode::PERMANENT_REDIRECT);
+
+            let en_get = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en_get.status(), StatusCode::OK);
+            let en_post = request_method(&app, http::Method::POST, "/en/posts", &[]).await;
+            assert_eq!(en_post.status(), StatusCode::OK);
+        }
+
+        /// A region-subtagged locale code (`es-MX`) works as a literal nest
+        /// prefix like any other configured locale, and an uppercase variant
+        /// of a configured code is treated as unknown (404) — the nest
+        /// prefix is a literal path segment, not case-negotiated.
+        #[tokio::test]
+        async fn region_subtag_locale_nests_and_prefix_is_case_sensitive() {
+            let config = config(&["en", "es-MX"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es-MX"])));
+
+            let response = request(&app, "/es-MX/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_string(response).await, "es-MX");
+
+            let wrong_case = request(&app, "/ES-MX/posts", &[]).await;
+            assert_eq!(
+                wrong_case.status(),
+                StatusCode::NOT_FOUND,
+                "the locale nest prefix is a literal path segment, not case-negotiated"
+            );
+        }
+
+        /// `supported_locales = []` is a degenerate config (locale-prefix
+        /// routing on, nothing to prefix with): no nest is created, and the
+        /// bare-path redirect is skipped rather than 308-ing to an
+        /// unreachable `/{default_locale}/...` target — a clean 404 beats a
+        /// redirect-then-404 round trip.
+        #[tokio::test]
+        async fn empty_supported_locales_serves_clean_404_not_redirect_to_nowhere() {
+            let mut config = AutumnConfig::default();
+            config.i18n.locale_prefix_enabled = true;
+            config.i18n.supported_locales = vec![];
+
+            let route = simple_route("/posts", "posts", false);
+            let app = build_router(vec![route], &config, test_state());
+
+            let response = request(&app, "/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// Routes registered via `AppBuilder::scoped()` are mounted by a
+        /// separate pipeline (`mount_scoped_groups`, which runs after
+        /// locale-prefix mounting) and are therefore untouched by
+        /// locale-prefix routing — no locale nest, no bare-path redirect —
+        /// exactly as if the flag were off. This guards the framework's
+        /// documented boundary: only the top-level `routes![...]` table is
+        /// locale-prefixed.
+        #[tokio::test]
+        async fn scoped_group_routes_are_not_locale_prefixed() {
+            let config = config(&["en", "es"], &[]);
+            let scoped_route = duplicate_test_route(http::Method::GET, "/status", "scoped_status");
+            let group = crate::app::ScopedGroup {
+                prefix: "/admin".to_owned(),
+                routes: vec![scoped_route],
+                source: crate::route_listing::RouteSource::User,
+                apply_layer: Box::new(|r| r),
+            };
+            let mut ctx = duplicate_test_ctx();
+            ctx.scoped_groups.push(group);
+
+            let router = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+                .expect("router with a scoped group under locale-prefix routing should build")
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let direct = request(&router, "/admin/status", &[]).await;
+            assert_eq!(
+                direct.status(),
+                StatusCode::OK,
+                "scoped route must serve directly, unprefixed"
+            );
+
+            let nested = request(&router, "/en/admin/status", &[]).await;
+            assert_eq!(
+                nested.status(),
+                StatusCode::NOT_FOUND,
+                "scoped routes are mounted after locale-prefix nesting, so no nest exists for them"
             );
         }
     }

@@ -104,10 +104,10 @@ pub struct I18nConfig {
     /// path, preserving the query string. The locale segment takes
     /// precedence over cookie/session/`Accept-Language` for the [`Locale`]
     /// extractor on requests within a prefixed path.
-    pub locale_prefix_routes: bool,
+    pub locale_prefix_enabled: bool,
 
     /// Route path prefixes exempt from locale-prefixing and from the
-    /// bare-path redirect, even when [`Self::locale_prefix_routes`] is
+    /// bare-path redirect, even when [`Self::locale_prefix_enabled`] is
     /// enabled (e.g. `["/api", "/actuator"]` for machine endpoints defined
     /// as normal routes). A trailing `/*` is accepted and ignored (`"/api"`
     /// and `"/api/*"` are equivalent). A route matches when its path equals
@@ -122,7 +122,7 @@ impl Default for I18nConfig {
             supported_locales: vec!["en".to_owned()],
             fallback_chain: Vec::new(),
             dir: "i18n".to_owned(),
-            locale_prefix_routes: false,
+            locale_prefix_enabled: false,
             locale_prefix_exclude: Vec::new(),
         }
     }
@@ -189,7 +189,7 @@ pub enum LoadError {
 ///
 /// # Resolution order
 ///
-/// 1. URL locale prefix (issue #1251 — set when [`I18nConfig::locale_prefix_routes`]
+/// 1. URL locale prefix (issue #1251 — set when [`I18nConfig::locale_prefix_enabled`]
 ///    is enabled and the request matched a `/{locale}/...` nest)
 /// 2. `?locale=xx` query parameter (explicit override, useful for testing)
 /// 3. `autumn_locale` cookie (set by application code, e.g. on a switcher
@@ -738,7 +738,7 @@ where
         // plain cookie (legacy / sessions-off) → Accept-Language → default.
         let mut resolved = parts
             .extensions
-            .get::<UrlPrefixedLocale>()
+            .get::<UriPrefixedLocale>()
             .and_then(|url_locale| negotiate(&url_locale.0, &supported))
             .map(str::to_owned);
         if resolved.is_none() {
@@ -772,7 +772,7 @@ where
 /// of any cookie or header — with zero changes to handlers, which keep
 /// taking a plain [`Locale`] parameter.
 #[derive(Debug, Clone)]
-pub struct UrlPrefixedLocale(pub String);
+pub struct UriPrefixedLocale(pub String);
 
 /// Session key used for the persisted locale.
 ///
@@ -932,7 +932,7 @@ mod tests {
             supported_locales: supported.iter().map(|s| (*s).to_owned()).collect(),
             fallback_chain: vec![],
             dir: "i18n".to_owned(),
-            locale_prefix_routes: false,
+            locale_prefix_enabled: false,
             locale_prefix_exclude: vec![],
         }
     }
@@ -1280,7 +1280,7 @@ mod tests {
             ],
         );
         parts.extensions.insert(bundle.clone());
-        parts.extensions.insert(UrlPrefixedLocale("es".to_owned()));
+        parts.extensions.insert(UriPrefixedLocale("es".to_owned()));
         let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(
             locale.tag(),
@@ -1297,7 +1297,7 @@ mod tests {
         parts.extensions.insert(bundle.clone());
         // Defensive: a bogus/unsupported injected value must not be trusted
         // blindly — it should fall through to the next resolution step.
-        parts.extensions.insert(UrlPrefixedLocale("zz".to_owned()));
+        parts.extensions.insert(UriPrefixedLocale("zz".to_owned()));
         let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(locale.tag(), "es");
     }

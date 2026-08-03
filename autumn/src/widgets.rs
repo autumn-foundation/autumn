@@ -1328,19 +1328,31 @@ fn nav_link_is_active(current_path: &str, href: &str, mode: NavLinkMatch) -> boo
 /// `"/posts"` or `"/posts?sort=asc"`. Any query string is preserved
 /// verbatim; only the locale segment changes.
 ///
-/// # Examples
+/// The root path is a special case: axum's `nest("/{locale}", router)` makes
+/// the *bare* `/{locale}` (no trailing slash) match the inner router's own
+/// `"/"` route — `/{locale}/` 404s — so `localized_path("/", "es")` returns
+/// `"/es"`, not `"/es/"`.
+///
+/// # Example
 ///
 /// ```rust
 /// use autumn_web::widgets::localized_path;
 ///
 /// assert_eq!(localized_path("/posts", "es"), "/es/posts");
 /// assert_eq!(localized_path("/posts?sort=asc", "es"), "/es/posts?sort=asc");
-/// assert_eq!(localized_path("/", "es"), "/es/");
+/// assert_eq!(localized_path("/", "es"), "/es");
+/// assert_eq!(localized_path("/?ref=newsletter", "es"), "/es?ref=newsletter");
 /// ```
 #[must_use]
 pub fn localized_path(path: &str, locale: &str) -> String {
-    let rest = path.strip_prefix('/').unwrap_or(path);
-    format!("/{locale}/{rest}")
+    let (before_query, query) = path.find('?').map_or((path, ""), |i| path.split_at(i));
+    let joined = if before_query == "/" || before_query.is_empty() {
+        format!("/{locale}")
+    } else {
+        let rest = before_query.strip_prefix('/').unwrap_or(before_query);
+        format!("/{locale}/{rest}")
+    };
+    format!("{joined}{query}")
 }
 
 /// Render links to the current page in each supported locale (issue #1251),
@@ -1350,7 +1362,7 @@ pub fn localized_path(path: &str, locale: &str) -> String {
 /// `current_locale`'s entry renders as inert text with `aria-current="true"`
 /// rather than a self-link.
 ///
-/// # Examples
+/// # Example
 ///
 /// ```rust
 /// use autumn_web::widgets::locale_switcher;
@@ -5703,7 +5715,17 @@ mod tests {
 
     #[test]
     fn localized_path_handles_root() {
-        assert_eq!(localized_path("/", "es"), "/es/");
+        // No trailing slash: axum's `nest("/es", router)` makes bare "/es"
+        // match the inner router's "/" route, while "/es/" 404s.
+        assert_eq!(localized_path("/", "es"), "/es");
+    }
+
+    #[test]
+    fn localized_path_handles_root_with_query() {
+        assert_eq!(
+            localized_path("/?ref=newsletter", "es"),
+            "/es?ref=newsletter"
+        );
     }
 
     #[test]

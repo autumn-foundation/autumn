@@ -140,7 +140,7 @@ builder), then refine them with per-request data before calling
 are also recorded on `Route::seo` as a `SeoRouteDefaults`.
 
 **Locale-prefixed routing** (**unreleased** — trunk-dev, #1251): `[i18n]
-locale_prefix_routes = true` in `autumn.toml` (default `false`, no behavior
+locale_prefix_enabled = true` in `autumn.toml` (default `false`, no behavior
 change) makes every route registered via `routes(...)` also reachable under
 `/{locale}/...` for each `supported_locales` entry — no route definitions are
 duplicated. An unknown `{locale}` prefix 404s (never panics); a bare,

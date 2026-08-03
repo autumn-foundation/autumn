@@ -7201,14 +7201,14 @@ fn embedded_i18n_bundle(
 }
 
 /// Derives the sitemap's locale-prefix config (issue #1251) from
-/// `[i18n] locale_prefix_routes`. `None` when the feature is off, disabled,
+/// `[i18n] locale_prefix_enabled`. `None` when the feature is off, disabled,
 /// or the `i18n` cargo feature isn't compiled in — the sitemap then lists a
 /// single unprefixed URL per static path, exactly as before this feature.
 #[cfg(feature = "i18n")]
 fn sitemap_locale_config(config: &AutumnConfig) -> Option<crate::seo::SitemapLocaleConfig<'_>> {
     config
         .i18n
-        .locale_prefix_routes
+        .locale_prefix_enabled
         .then_some(crate::seo::SitemapLocaleConfig {
             supported_locales: &config.i18n.supported_locales,
             exclude_prefixes: &config.i18n.locale_prefix_exclude,
@@ -7216,7 +7216,9 @@ fn sitemap_locale_config(config: &AutumnConfig) -> Option<crate::seo::SitemapLoc
 }
 
 #[cfg(not(feature = "i18n"))]
-fn sitemap_locale_config(_config: &AutumnConfig) -> Option<crate::seo::SitemapLocaleConfig<'_>> {
+const fn sitemap_locale_config(
+    _config: &AutumnConfig,
+) -> Option<crate::seo::SitemapLocaleConfig<'_>> {
     None
 }
 

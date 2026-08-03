@@ -318,7 +318,7 @@ attribute supplies *values*, not markup: the handler still emits them, normally
 via `seo.render()` inside the layout's `<head>`.
 
 **Locale-prefixed routing (issue #1251, unreleased — trunk-dev):** set
-`[i18n] locale_prefix_routes = true` in `autumn.toml` (default `false`) and
+`[i18n] locale_prefix_enabled = true` in `autumn.toml` (default `false`) and
 every route registered via `routes![...]` becomes reachable under
 `/{locale}/...` for each `supported_locales` entry — zero duplicated route
 definitions. An unknown `{locale}` 404s; a bare, non-prefixed path

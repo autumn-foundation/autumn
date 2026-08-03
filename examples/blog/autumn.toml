@@ -22,7 +22,7 @@ supported_locales = ["en", "es"]
 # reachable under `/en/...` and `/es/...` with zero duplicated route
 # definitions. `/posts` (bare) 308-redirects to the negotiated locale's
 # prefixed path. Machine/internal routes stay unprefixed.
-locale_prefix_routes = true
+locale_prefix_enabled = true
 locale_prefix_exclude = ["/api", "/auth", "/admin", "/feed.xml"]
 
 [seo]

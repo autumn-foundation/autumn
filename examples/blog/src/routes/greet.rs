@@ -2,7 +2,7 @@
 //! locale-prefixed routing and the path-preserving switcher (issue #1251).
 //!
 //! Loads its strings from `i18n/{en,es}.ftl` via the bundle registered in
-//! `main.rs` with `.i18n_auto()`. With `[i18n] locale_prefix_routes = true`
+//! `main.rs` with `.i18n_auto()`. With `[i18n] locale_prefix_enabled = true`
 //! in `autumn.toml`, this same handler serves `/en/greet` and `/es/greet`
 //! directly — `/greet` (bare) 308-redirects to whichever locale negotiation
 //! picks. `Locale` resolves the request locale (URL prefix first), `t!()`

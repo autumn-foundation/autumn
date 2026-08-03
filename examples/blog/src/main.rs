@@ -20,7 +20,7 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 /// produce a valid `/sitemap.xml` without requiring a live database.
 ///
 /// Only `/` is listed here — `/about` is a `#[static_get]` route, so it's
-/// already covered (and, with `[i18n] locale_prefix_routes = true`, already
+/// already covered (and, with `[i18n] locale_prefix_enabled = true`, already
 /// listed once per supported locale) automatically from the static-route
 /// table (issue #1251). A `SitemapSource`'s entries are explicit,
 /// app-authored URLs — the framework never rewrites them — so `/`, a
