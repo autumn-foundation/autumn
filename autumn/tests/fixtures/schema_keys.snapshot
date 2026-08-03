@@ -150,6 +150,8 @@ i18n
 i18n.default_locale
 i18n.dir
 i18n.fallback_chain
+i18n.locale_prefix_enabled
+i18n.locale_prefix_exclude
 i18n.supported_locales
 idempotency
 idempotency.allow_memory_in_production

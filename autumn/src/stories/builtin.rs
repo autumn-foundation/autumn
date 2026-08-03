@@ -234,6 +234,26 @@ pub(super) fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Navigation",
+            "Locale switcher",
+            {
+                use autumn_web::widgets::{locale_switcher, localized_path};
+
+                maud::html! {
+                    p { "Current page: " code { "/posts" } }
+                    (locale_switcher(
+                        "/posts",
+                        "en",
+                        &["en".to_owned(), "es".to_owned(), "fr".to_owned()],
+                    ))
+                    p class="text-xs text-stone-500" {
+                        "Each link is built with " code { "localized_path" }
+                        " — e.g. " code { (localized_path("/posts", "es")) }
+                    }
+                }
+            }
+        },
+        story! {
             "Marketing",
             "Hero",
             {

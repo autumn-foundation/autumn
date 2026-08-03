@@ -502,6 +502,28 @@
     }
 }
 
+/* ── Locale switcher (autumn-locale-switcher, issue #1251) ───────────────────── */
+
+.autumn-locale-switcher {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.autumn-locale-switcher a {
+    color: var(--text);
+    text-decoration: none;
+}
+
+.autumn-locale-switcher a:hover {
+    color: var(--primary);
+}
+
+.autumn-locale-switcher__current {
+    font-weight: 600;
+    color: var(--text-muted);
+}
+
 /* ── Breadcrumb (autumn-breadcrumb) ───────────────────────────────────────── */
 
 .autumn-breadcrumb {
