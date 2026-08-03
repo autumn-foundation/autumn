@@ -2028,17 +2028,6 @@ fn render_routes_file(
     // binds `AppState` directly via the injected `State(state)`.
     let create_update_state_expr = if has_attachments { "&*state" } else { "&state" };
     let edit_destroy_state_expr = "&state";
-    // The attachment `update` handler loads `current` after parsing the multipart
-    // body (to preserve un-replaced blobs); record-authorize the actor against
-    // that same already-loaded row before writing, instead of a second load.
-    // Spliced into `update_new_block` right after its `current` load.
-    let authz_attachment_update = if authorize && has_attachments {
-        format!(
-            "autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await?;\n    "
-        )
-    } else {
-        String::new()
-    };
     // Every PRESENT `references` field (its target model — and so its
     // `src/schema.rs` entry — is in the project; `missing_reference_targets`
     // excludes the rest, which the caller already warned about and which fall
@@ -2397,6 +2386,9 @@ fn render_routes_file(
                 match_arms,
                 "            Some(\"{name}\") => {{\n                \
                  if field.file_name().is_some_and(|file_name| !file_name.is_empty()) {{\n                    \
+                 if {name}_blob.is_some() {{\n                        \
+                 return Err(AutumnError::bad_request_msg(\"duplicate attachment field: {name}\"));\n                    \
+                 }}\n                    \
                  let key = format!(\n                        \
                  \"{plural}/{name}/{{}}_{{}}\",\n                        \
                  chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),\n                        \
@@ -2525,7 +2517,15 @@ fn render_routes_file(
             let name = &f.name;
             let _ = write!(binds, "\n    new.{name} = {name}_blob.or(current.{name});");
         }
-        format!("{load_current}{authz_attachment_update}{into_new_bind}{binds}")
+        // Authorized attachment updates already loaded `current` in the
+        // up-front authorization preamble, before multipart parsing. Other
+        // attachment variants still load it here for preserve-on-empty.
+        let load_current = if authorize {
+            String::new()
+        } else {
+            load_current
+        };
+        format!("{load_current}{into_new_bind}{binds}")
     } else {
         format!("let new = {into_new_call};")
     };
@@ -2841,11 +2841,10 @@ fn render_routes_file(
             )
         }
     };
-    // Update: on the attachment path the handler already loads `current` (after
-    // parsing multipart, to preserve un-replaced blobs) and authorizes there via
-    // `authz_attachment_update`, so no up-front preamble is emitted. Every other
-    // variant loads + authorizes here.
-    let authz_update_preamble = if authorize && !has_attachments {
+    // Load and authorize before parsing the request body on every authorized
+    // update. For attachments this ensures a denied actor cannot stream bytes
+    // into storage and an authorization `?` cannot bypass staged-blob cleanup.
+    let authz_update_preamble = if authorize {
         format!(
             "{load}autumn_web::authorization::authorize::<{pascal_name}>({state}, &session, \"update\", &current).await?;\n    ",
             load = load_current_stmt("current"),
@@ -3663,13 +3662,9 @@ use crate::schema::{schema_import};",
              //! resulting `Blob` on the record. An edit that doesn't re-upload preserves\n\
              //! the existing attachment.\n\
              //!\n\
-             //! SIZE CEILING with CSRF on (the prod-profile default): the CSRF middleware\n\
-             //! buffers the request body only up to ~2 MiB while scanning for the form\n\
-             //! token, so a zero-JS multipart upload larger than ~2 MiB is rejected with\n\
-             //! 403 (token not found in the truncated body) BEFORE the handler's\n\
-             //! `max_file_size_bytes`/413 check can run. For files above that ceiling, use\n\
-             //! the advanced presigned direct-upload path below (it doesn't route the file\n\
-             //! bytes through the CSRF-scanned form body).\n\
+             //! CSRF scans only a bounded prefix and then streams the complete body onward;\n\
+             //! this generated form places its token first, so the upload limit remains the\n\
+             //! configured `max_file_size_bytes` and oversized files retain their 413.\n\
              //!\n\
              //! The `storage` + `multipart` features are enabled on `autumn-web`\n\
              //! automatically; configure `[storage]` in `autumn.toml` (local disk for dev,\n\
@@ -5166,9 +5161,14 @@ fn render_live_reference_select(field: &Field, changeset_var: &str) -> String {
 fn cell_value_expr(field: &Field) -> String {
     let name = &field.name;
     match (field.nullable, field.kind) {
-        // Attachment: always Option<Blob>; show presence only, no Blob internals.
+        // Attachment: always Option<Blob>. Render non-sensitive stored metadata
+        // so a reloaded index/show view distinguishes the bound upload without
+        // exposing the backend's internal object key. Keep the value escaped
+        // through maud's ordinary `Render` path.
         (_, FieldKind::Attachment) => {
-            format!("if row.{name}.is_some() {{ \"attachment\" }} else {{ \"—\" }}")
+            format!(
+                "row.{name}.as_ref().map_or_else(|| \"—\".to_owned(), |blob| format!(\"{{}} ({{}} bytes)\", blob.content_type, blob.byte_size))"
+            )
         }
         (true, FieldKind::Bytea) => {
             format!(
