@@ -487,10 +487,12 @@ fn split_into_fitting_chunks(
 /// [`Word::Break`]s. Each returned line is a list of [`StyledWord`]s in
 /// left-to-right order; the caller positions each word itself rather than
 /// this function merging same-style runs, keeping the wrapping logic simple
-/// and easy to verify. A glued word is always kept on the same line as the
-/// word before it, even if that overflows `max_width_pt` slightly —
-/// splitting a short glued run (e.g. a "$" bolded separately from its
-/// amount) across two lines would look worse than a minor overflow.
+/// and easy to verify. A glued word is kept on the same line as the word
+/// before it whenever it fits — but if it wouldn't (e.g. two large,
+/// differently-styled runs immediately adjacent in the source HTML with no
+/// whitespace between them), the line still breaks before it, the same as
+/// an ordinary word boundary would; the only difference glue makes is that
+/// no rendered space is inserted, which a line break doesn't need anyway.
 ///
 /// A single word wider than `max_width_pt` on its own (a long URL, hash, or
 /// identifier with nowhere to break) is character-wrapped via
@@ -533,13 +535,21 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
                     }
                     continue;
                 }
-                let glued = *glue && !current.is_empty();
-                if !glued {
-                    let needed = if current.is_empty() { w } else { w + space_w };
-                    if !current.is_empty() && current_width + needed > max_width_pt {
-                        lines.push(std::mem::take(&mut current));
-                        current_width = 0.0;
-                    }
+                let mut glued = *glue && !current.is_empty();
+                // Glued words skip the space width (nothing renders between
+                // them and the previous word) but otherwise get the same
+                // fit check as any other word — a glued run that doesn't
+                // fit still breaks the line, it just doesn't gain a
+                // rendered space by doing so.
+                let needed = if current.is_empty() || glued {
+                    w
+                } else {
+                    w + space_w
+                };
+                if !current.is_empty() && current_width + needed > max_width_pt {
+                    lines.push(std::mem::take(&mut current));
+                    current_width = 0.0;
+                    glued = false;
                 }
                 current_width += if current.is_empty() || glued {
                     w
@@ -903,6 +913,52 @@ mod tests {
         ];
         let lines = wrap(&words, 1000.0, 12.0);
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn glued_run_that_cannot_fit_still_breaks_the_line() {
+        // Regression: two adjacently-styled runs with no whitespace between
+        // them (e.g. `<strong>...</strong><em>...</em>`) were always kept on
+        // one line regardless of size, because the fit check was skipped
+        // entirely for glued words — each individually fit under
+        // `max_width_pt`, but their combined width could run to nearly
+        // double it, clipping the second run past the column/page boundary.
+        let words = vec![
+            Word::Text {
+                text: "WWWW".to_owned(),
+                bold: false,
+                italic: false,
+                glue: false,
+            },
+            Word::Text {
+                text: "WWWW".to_owned(),
+                bold: false,
+                italic: false,
+                glue: true,
+            },
+        ];
+        let max_width_pt = 50.0;
+        let word_width = text_width_pt("WWWW", 12.0, false);
+        assert!(
+            word_width <= max_width_pt,
+            "fixture word must fit alone on a line"
+        );
+        assert!(
+            word_width * 2.0 > max_width_pt,
+            "fixture pair must not fit together on one line"
+        );
+        let lines = wrap(&words, max_width_pt, 12.0);
+        assert_eq!(
+            lines.len(),
+            2,
+            "the glued word must move to its own line rather than overflow"
+        );
+        assert_eq!(lines[0], vec![("WWWW".to_owned(), false, false, false)]);
+        assert_eq!(
+            lines[1],
+            vec![("WWWW".to_owned(), false, false, false)],
+            "the word that moved to a new line is no longer glued to anything on it"
+        );
     }
 
     #[test]

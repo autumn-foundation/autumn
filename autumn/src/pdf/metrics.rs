@@ -16,17 +16,34 @@
 /// wider) without claiming per-glyph accuracy.
 const fn base_width_1000em(ch: char) -> u16 {
     match ch {
-        ' ' => 278,
-        '.' | ',' | '\'' | '!' | ':' | ';' | '|' | 'i' | 'j' | 'l' | 'I' => 222,
-        '(' | ')' | '[' | ']' | '"' | '-' | 'f' | 'r' | 't' | '/' | '\\' => 333,
-        '0'..='9' => 556,
+        ' ' | '\u{00A0}' => 278, // space, non-breaking space
+        // narrow ASCII punctuation, plus curly single quotes and low-9 quote
+        '.' | ',' | '\'' | '!' | ':' | ';' | '|' | 'i' | 'j' | 'l' | 'I' | '\u{2018}'
+        | '\u{2019}' | '\u{201A}' => 222,
+        // wider ASCII punctuation, plus curly double quotes and double low-9 quote
+        '(' | ')' | '[' | ']' | '"' | '-' | 'f' | 'r' | 't' | '/' | '\\' | '\u{201C}'
+        | '\u{201D}' | '\u{201E}' => 333,
+        '0'..='9' | '\u{2013}' /* – en dash */ | '\u{20AC}' /* € euro */ => 556,
         'm' | 'M' | 'w' | 'W' | '@' | '%' => 833,
         'A'..='Z' => 667,
+        '\u{00C0}'..='\u{00DE}' if ch != '\u{00D7}' => 667, // Latin-1 uppercase accented (approx like A-Z)
+        '\u{2014}' | '\u{2026}' | '\u{2030}' | '\u{2122}' => 1000, // — em dash, … ellipsis, ‰, ™
+        '\u{00A9}' | '\u{00AE}' => 737,                     // © copyright, ® registered
+        '\u{2022}' => 350,                                  // • bullet
+        '\u{2020}' | '\u{2021}' => 500,                     // † dagger, ‡ double dagger
+        '\u{00B0}' => 400,                                  // ° degree
         _ if ch.is_ascii() => 556,
-        // Non-ASCII glyphs aren't in the base-14 WinAnsi encoding; printpdf
-        // renders them as `?` (222/1000 em under the classification above),
-        // so estimate accordingly rather than assuming a full-width glyph.
-        _ => 222,
+        '\u{00DF}'..='\u{00FF}' if ch != '\u{00F7}' => 556, // Latin-1 lowercase accented (approx default)
+        // Everything else that WinAnsi (`printpdf`'s built-in-font encoding,
+        // effectively CP1252) *can* represent renders as its actual glyph,
+        // not a placeholder — approximate it at the same "ordinary letter"
+        // width used for plain ASCII above rather than assuming it's
+        // narrow. Characters WinAnsi truly can't represent (CJK, emoji,
+        // ...) are replaced with a literal `?` glyph by `printpdf`, whose
+        // own Helvetica width is also 556 (it isn't in the narrow-glyph
+        // list above), so the same estimate is correct for both cases —
+        // unlike the previous 222 estimate, which matched neither.
+        _ => 556,
     }
 }
 
@@ -86,5 +103,35 @@ mod tests {
         #[allow(clippy::float_cmp)]
         let is_zero = text_width_pt("", 12.0, false) == 0.0;
         assert!(is_zero);
+    }
+
+    #[test]
+    fn em_dash_is_not_estimated_as_narrow_punctuation() {
+        // Regression: an em dash (what `&mdash;` decodes to — see
+        // `html::decode_one_entity`) is representable in WinAnsi and
+        // printpdf renders it as a real, wide glyph, not `?`. The generic
+        // non-ASCII fallback used to estimate it at the same width as a
+        // narrow character like `.` or `,`, underestimating a real em
+        // dash's width by roughly 4-5x and letting em-dash-heavy text run
+        // past a line/column boundary that a correct estimate would have
+        // wrapped before.
+        let narrow = char_width_1000em('.', false);
+        let em_dash = char_width_1000em('\u{2014}', false);
+        assert!(
+            em_dash > narrow * 3,
+            "em dash ({em_dash}) must be estimated much wider than narrow punctuation ({narrow})"
+        );
+    }
+
+    #[test]
+    fn non_win_ansi_character_gets_the_same_width_as_a_literal_question_mark() {
+        // `printpdf` substitutes `?` for any character WinAnsi can't
+        // represent (CJK, emoji, ...) — the estimate for such a character
+        // should match a real `?`'s own width, not an arbitrary narrower
+        // guess (the previous 222/1000em estimate matched neither).
+        assert_eq!(
+            char_width_1000em('维', false),
+            char_width_1000em('?', false)
+        );
     }
 }
