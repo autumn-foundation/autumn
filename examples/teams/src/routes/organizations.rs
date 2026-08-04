@@ -10,8 +10,7 @@ use autumn_web::tenancy::with_tenant;
 
 use crate::models::{Membership, NewMembership, NewOrganization};
 use crate::repositories::{
-    MembershipRepository, OrganizationRepository, PgMembershipRepository,
-    PgOrganizationRepository,
+    MembershipRepository, OrganizationRepository, PgMembershipRepository, PgOrganizationRepository,
 };
 use crate::role::Role;
 

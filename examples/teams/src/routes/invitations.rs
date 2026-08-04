@@ -26,11 +26,10 @@ use serde::Deserialize;
 
 use crate::mailers::invitation_mailer::InvitationMailer;
 use crate::models::{
-    InviteForm, Invitation, Membership, NewInvitation, NewUser, UpdateInvitation, User,
+    Invitation, InviteForm, Membership, NewInvitation, NewUser, UpdateInvitation, User,
 };
 use crate::repositories::{
-    InvitationRepository, OrganizationRepository, PgInvitationRepository,
-    PgOrganizationRepository,
+    InvitationRepository, OrganizationRepository, PgInvitationRepository, PgOrganizationRepository,
 };
 use crate::role::{Role, require_role};
 use crate::schema::{invitations, memberships, users};
@@ -66,7 +65,9 @@ pub async fn create_invitation(
 
     let email = form.email.trim().to_lowercase();
     if !email.contains('@') || email.len() > 254 {
-        return Err(AutumnError::unprocessable_msg("Enter a valid email address"));
+        return Err(AutumnError::unprocessable_msg(
+            "Enter a valid email address",
+        ));
     }
     let Some(role) = Role::parse(&form.role) else {
         return Err(AutumnError::unprocessable_msg("Unknown role"));
@@ -87,7 +88,8 @@ pub async fn create_invitation(
             token_hash: hash_api_token(&raw_token),
             status: "pending".to_owned(),
             invited_by_user_id: inviter_id,
-            expires_at: chrono::Utc::now().naive_utc() + chrono::Duration::days(INVITATION_TTL_DAYS),
+            expires_at: chrono::Utc::now().naive_utc()
+                + chrono::Duration::days(INVITATION_TTL_DAYS),
         })
         .await?;
 
@@ -168,7 +170,9 @@ pub async fn show_invitation(
     if let Some(message) = invitation_status_error(&invitation) {
         return Ok((StatusCode::GONE, invitation_error_page(message)).into_response());
     }
-    let Some(organization) = org_repo.find_by_id(parse_tenant_id(&invitation.tenant_id)?).await?
+    let Some(organization) = org_repo
+        .find_by_id(parse_tenant_id(&invitation.tenant_id)?)
+        .await?
     else {
         return Ok((
             StatusCode::NOT_FOUND,
@@ -310,8 +314,7 @@ pub async fn accept_invitation(
                 let password_cfg = state.config().auth.password;
                 let policy = password_cfg.policy();
                 let validation =
-                    autumn_web::auth::validate_password(password, &policy, &[email.as_str()])
-                        .await;
+                    autumn_web::auth::validate_password(password, &policy, &[email.as_str()]).await;
                 if !validation.is_valid() {
                     let messages = validation.messages();
                     let message = if messages.is_empty() {
@@ -413,7 +416,13 @@ pub async fn accept_invitation(
             "Corrupt membership role",
         ));
     };
-    establish_session(&session, target_user_id, &membership.tenant_id, resolved_role).await;
+    establish_session(
+        &session,
+        target_user_id,
+        &membership.tenant_id,
+        resolved_role,
+    )
+    .await;
     Ok(Redirect::to("/members").into_response())
 }
 
@@ -474,15 +483,25 @@ pub async fn resend_invitation(
             token_hash: hash_api_token(&raw_token),
             status: "pending".to_owned(),
             invited_by_user_id: inviter_id,
-            expires_at: chrono::Utc::now().naive_utc() + chrono::Duration::days(INVITATION_TTL_DAYS),
+            expires_at: chrono::Utc::now().naive_utc()
+                + chrono::Duration::days(INVITATION_TTL_DAYS),
         })
         .await?;
 
-    let Some(organization) = org_repo.find_by_id(parse_tenant_id(&old.tenant_id)?).await? else {
+    let Some(organization) = org_repo
+        .find_by_id(parse_tenant_id(&old.tenant_id)?)
+        .await?
+    else {
         return Err(AutumnError::not_found_msg("Organization not found"));
     };
     let accept_url = format!("{}/invitations/{raw_token}", app_base_url());
-    InvitationMailer.deliver_later_invite(&mailer, old.email, organization.name, old.role, accept_url);
+    InvitationMailer.deliver_later_invite(
+        &mailer,
+        old.email,
+        organization.name,
+        old.role,
+        accept_url,
+    );
 
     Ok(Redirect::to("/members").into_response())
 }

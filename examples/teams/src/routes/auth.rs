@@ -26,8 +26,7 @@ use crate::models::{
     LoginForm, Membership, NewMembership, NewOrganization, NewUser, SignupForm, User,
 };
 use crate::repositories::{
-    MembershipRepository, OrganizationRepository, PgMembershipRepository,
-    PgOrganizationRepository,
+    MembershipRepository, OrganizationRepository, PgMembershipRepository, PgOrganizationRepository,
 };
 use crate::role::Role;
 use crate::schema::users;
