@@ -21,6 +21,16 @@ scoped-futures = "0.1"
 autumn-web = { path = "../../autumn", features = ["test-support"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 tempfile = "3"
+example-e2e = { path = "../../example-e2e" }
+
+[features]
+# Enable the headless-browser system smoke. Requires Chromium on the host.
+#   cargo test -p teams --features system-tests --test smoke -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"
 
 [lints.rust]
 unsafe_code = "forbid"

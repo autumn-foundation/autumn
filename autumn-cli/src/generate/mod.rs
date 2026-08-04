@@ -34,6 +34,7 @@ pub mod system_test;
 pub mod task;
 pub mod tauri;
 pub mod tauri_mobile;
+pub mod teams;
 pub mod wizard;
 
 use std::path::{Path, PathBuf};

@@ -22,11 +22,18 @@ pool_size = 10
 # `Membership` row, and `tenant_scoped` repositories (Membership, Invitation)
 # filter every query by it automatically — no second isolation mechanism on top
 # of the row-level multi-tenancy seam (#695).
+#
+# `public_paths` matches by path *prefix*, so the invitee-facing accept flow
+# lives under its own `/invite` prefix rather than sharing `/invitations` with
+# the Admin-only create/revoke/resend routes — listing `/invitations` here
+# would have accidentally exempted those too, letting them run with no
+# ambient tenant and fail every request (see `routes/invitations.rs`'s module
+# doc comment).
 [tenancy]
 enabled = true
 source = "session"
 session_key = "organization_id"
-public_paths = ["/", "/login", "/signup", "/logout", "/static", "/favicon.ico", "/invitations"]
+public_paths = ["/", "/login", "/signup", "/logout", "/static", "/favicon.ico", "/invite"]
 login_redirect = "/login"
 
 # Dev default: log emails to stdout. Point at a real SMTP relay in production,

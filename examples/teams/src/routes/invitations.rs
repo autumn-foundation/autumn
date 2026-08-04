@@ -9,12 +9,22 @@
 //!   "Accept" button that joins under the current session.
 //!
 //! A logged-out visitor whose email already has an account is sent to
-//! `/login?next=/invitations/{token}` — completing the round trip converts
+//! `/login?next=/invite/{token}` — completing the round trip converts
 //! them into case (b).
 //!
 //! Accepting is idempotent (AC5): a second click never creates a second
 //! `Membership` row or 500s. Expired/revoked/already-consumed tokens render a
 //! clear error page (AC6), never a panic.
+//!
+//! The invitee-facing routes live under `/invite/...` — a *different* path
+//! prefix than the admin-only `/invitations` routes below (`create`/`revoke`/
+//! `resend`) — deliberately. `[tenancy] public_paths` matches by path
+//! *prefix* (see `autumn.toml`), so an anonymous visitor following an accept
+//! link needs `/invite` exempted from the tenancy gate, but the admin routes
+//! must stay gated (they need the ambient tenant the gate establishes). A
+//! single shared `/invitations` prefix would have exempted the admin routes
+//! too — this split keeps the public surface exactly as small as it needs to
+//! be instead of relying on a fragile allowlist.
 
 use autumn_web::auth::{generate_raw_token, hash_api_token, hash_password};
 use autumn_web::prelude::*;
@@ -35,9 +45,35 @@ use crate::role::{Role, require_role};
 use crate::schema::{invitations, memberships, users};
 
 use super::auth::establish_session;
-use super::layout::{invitation_error_page, layout};
+use super::layout::{csrf_value, invitation_error_page, layout};
 
 const INVITATION_TTL_DAYS: i64 = 7;
+
+// Raw-insert structs for the two places that write `memberships`/`invitations`
+// inside a hand-rolled `db.tx` transaction rather than through the
+// `tenant_scoped` repository (whose CRUD methods each acquire their own
+// pooled connection, which can't share an outer transaction's connection) —
+// see `accept_invitation` and `resend_invitation`.
+
+#[derive(diesel::Insertable)]
+#[diesel(table_name = memberships)]
+struct InsertMembership {
+    tenant_id: String,
+    user_id: i64,
+    role: String,
+}
+
+#[derive(diesel::Insertable)]
+#[diesel(table_name = invitations)]
+struct InsertInvitation {
+    tenant_id: String,
+    email: String,
+    role: String,
+    token_hash: String,
+    status: String,
+    invited_by_user_id: i64,
+    expires_at: chrono::NaiveDateTime,
+}
 
 // ── Create ───────────────────────────────────────────────────────────────────
 
@@ -48,7 +84,9 @@ fn app_base_url() -> String {
 }
 
 /// Send an invitation into the *active* organization. Gated `Admin` or
-/// higher (issue #1261 AC7).
+/// higher (issue #1261 AC7); inviting someone as `Owner` itself requires the
+/// caller to already be an `Owner` — otherwise an Admin could mint a fresh
+/// Owner account of their own choosing.
 #[post("/invitations")]
 pub async fn create_invitation(
     session: Session,
@@ -58,7 +96,7 @@ pub async fn create_invitation(
     mailer: Mailer,
     Form(form): Form<InviteForm>,
 ) -> AutumnResult<Response> {
-    require_role(&session, Role::Admin).await?;
+    let caller_role = require_role(&session, Role::Admin).await?;
     let Some(inviter_id) = session.get("user_id").await.and_then(|s| s.parse().ok()) else {
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };
@@ -72,6 +110,11 @@ pub async fn create_invitation(
     let Some(role) = Role::parse(&form.role) else {
         return Err(AutumnError::unprocessable_msg("Unknown role"));
     };
+    if role == Role::Owner && caller_role != Role::Owner {
+        return Err(AutumnError::forbidden_msg(
+            "Only an owner can invite someone as owner",
+        ));
+    }
 
     let org_id: i64 = org_id.parse().map_err(|_| {
         AutumnError::internal_server_error_msg("Corrupt organization id in session")
@@ -93,14 +136,20 @@ pub async fn create_invitation(
         })
         .await?;
 
-    let accept_url = format!("{}/invitations/{raw_token}", app_base_url());
-    InvitationMailer.deliver_later_invite(
-        &mailer,
-        email,
-        organization.name,
-        role.as_str().to_owned(),
-        accept_url,
-    );
+    let accept_url = format!("{}/invite/{raw_token}", app_base_url());
+    // Sent synchronously (not `deliver_later_invite`): the success metric is
+    // "an invite email is delivered to the dev mailbox within the same
+    // request cycle" (issue #1261), which a fire-and-forget background send
+    // can't guarantee.
+    InvitationMailer
+        .send_invite(
+            &mailer,
+            email,
+            organization.name,
+            role.as_str().to_owned(),
+            accept_url,
+        )
+        .await?;
 
     Ok(Redirect::to("/members").into_response())
 }
@@ -152,23 +201,28 @@ fn invitation_status_error(invitation: &Invitation) -> Option<&'static str> {
     }
 }
 
-#[get("/invitations/{token}")]
+#[get("/invite/{token}")]
 pub async fn show_invitation(
     session: Session,
     mut db: Db,
     invitation_repo: PgInvitationRepository,
     org_repo: PgOrganizationRepository,
+    csrf: Option<CsrfToken>,
     Path(raw_token): Path<String>,
 ) -> AutumnResult<Response> {
     let Some(invitation) = load_pending_invitation(&invitation_repo, &raw_token).await? else {
         return Ok((
             StatusCode::NOT_FOUND,
-            invitation_error_page("This invitation link is invalid."),
+            invitation_error_page(csrf_value(&csrf), "This invitation link is invalid."),
         )
             .into_response());
     };
     if let Some(message) = invitation_status_error(&invitation) {
-        return Ok((StatusCode::GONE, invitation_error_page(message)).into_response());
+        return Ok((
+            StatusCode::GONE,
+            invitation_error_page(csrf_value(&csrf), message),
+        )
+            .into_response());
     }
     let Some(organization) = org_repo
         .find_by_id(parse_tenant_id(&invitation.tenant_id)?)
@@ -176,7 +230,10 @@ pub async fn show_invitation(
     else {
         return Ok((
             StatusCode::NOT_FOUND,
-            invitation_error_page("This invitation's organization no longer exists."),
+            invitation_error_page(
+                csrf_value(&csrf),
+                "This invitation's organization no longer exists.",
+            ),
         )
             .into_response());
     };
@@ -187,11 +244,13 @@ pub async fn show_invitation(
         layout(
             "Accept invitation",
             true,
+            csrf_value(&csrf),
             html! {
                 div class="bg-white rounded-lg shadow p-6 max-w-md" {
                     h1 class="text-xl font-bold mb-2" { "Join " (organization.name) }
                     p class="text-gray-600 mb-4" { "You've been invited as " (invitation.role) "." }
-                    form action={"/invitations/" (raw_token) "/accept"} method="post" {
+                    form action={"/invite/" (raw_token) "/accept"} method="post" {
+                        input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                         button type="submit"
                                class="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700" {
                             "Accept invitation"
@@ -213,6 +272,7 @@ pub async fn show_invitation(
             layout(
                 "Accept invitation",
                 false,
+                csrf_value(&csrf),
                 html! {
                     div class="bg-white rounded-lg shadow p-6 max-w-md" {
                         h1 class="text-xl font-bold mb-2" { "Join " (organization.name) }
@@ -220,7 +280,7 @@ pub async fn show_invitation(
                             "You've been invited as " (invitation.role) ". Log in as "
                             strong { (invitation.email) } " to accept."
                         }
-                        a href={"/login?next=/invitations/" (raw_token)}
+                        a href={"/login?next=/invite/" (raw_token)}
                           class="inline-block bg-indigo-600 text-white py-2 px-4 rounded hover:bg-indigo-700" {
                             "Log in to accept"
                         }
@@ -231,6 +291,7 @@ pub async fn show_invitation(
             layout(
                 "Accept invitation",
                 false,
+                csrf_value(&csrf),
                 html! {
                     div class="bg-white rounded-lg shadow p-6 max-w-md" {
                         h1 class="text-xl font-bold mb-2" { "Join " (organization.name) }
@@ -238,7 +299,8 @@ pub async fn show_invitation(
                             "You've been invited as " (invitation.role)
                             ". Create an account to accept."
                         }
-                        form action={"/invitations/" (raw_token) "/accept"} method="post" class="space-y-4" {
+                        form action={"/invite/" (raw_token) "/accept"} method="post" class="space-y-4" {
+                            input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                             div {
                                 label for="email" class="block text-sm font-medium mb-1" { "Email" }
                                 input #email type="email" value=(invitation.email) readonly disabled
@@ -264,19 +326,20 @@ pub async fn show_invitation(
 
 // ── Accept (confirm) ─────────────────────────────────────────────────────────
 
-#[post("/invitations/{token}/accept")]
+#[post("/invite/{token}/accept")]
 pub async fn accept_invitation(
     session: Session,
     mut db: Db,
     invitation_repo: PgInvitationRepository,
     State(state): State<AppState>,
+    csrf: Option<CsrfToken>,
     Path(raw_token): Path<String>,
     Form(form): Form<AcceptForm>,
 ) -> AutumnResult<Response> {
     let Some(invitation) = load_pending_invitation(&invitation_repo, &raw_token).await? else {
         return Ok((
             StatusCode::NOT_FOUND,
-            invitation_error_page("This invitation link is invalid."),
+            invitation_error_page(csrf_value(&csrf), "This invitation link is invalid."),
         )
             .into_response());
     };
@@ -288,7 +351,27 @@ pub async fn accept_invitation(
     // transaction: case (a) creates the account here rather than via
     // `/signup`, which would otherwise saddle the new user with an unwanted
     // default organization.
+    //
+    // Security-critical: this must never silently authenticate the *caller*
+    // as an existing account. A visitor with no session is only ever allowed
+    // to join by proving they own the invited email — either by creating a
+    // fresh account with a password (case a), or by actually logging in
+    // first (redirected below) — never by the mere possession of the token.
+    // An already-authenticated caller may only redeem an invite addressed to
+    // their own email; otherwise anyone who obtains a token not meant for
+    // them (a forwarded link, a mail-scanner fetch, a shared clipboard)
+    // could join — or silently log in as — an account that isn't theirs.
     let target_user_id = if let Some(uid) = existing_session_user {
+        let caller: User = users::table
+            .filter(users::id.eq(uid))
+            .select(User::as_select())
+            .first(&mut *db)
+            .await?;
+        if normalize_email(&caller.email) != normalize_email(&invitation.email) {
+            return Err(AutumnError::forbidden_msg(
+                "This invitation was sent to a different email address",
+            ));
+        }
         uid
     } else {
         let email = normalize_email(&invitation.email);
@@ -299,7 +382,15 @@ pub async fn accept_invitation(
             .await
             .optional()?;
         match existing_user {
-            Some(u) => u.id,
+            Some(_) => {
+                // An account already exists for this email but the visitor
+                // isn't authenticated as it — never adopt it on their behalf.
+                // The `show_invitation` GET page already points them at this
+                // same login-first flow; this POST must enforce it too.
+                return Err(AutumnError::unauthorized_msg(
+                    "An account already exists for this email — log in to accept",
+                ));
+            }
             None => {
                 let Some(password) = form.password.as_deref().filter(|p| !p.is_empty()) else {
                     return Err(AutumnError::unprocessable_msg(
@@ -383,13 +474,6 @@ pub async fn accept_invitation(
                     ));
                 }
 
-                #[derive(diesel::Insertable)]
-                #[diesel(table_name = memberships)]
-                struct InsertMembership {
-                    tenant_id: String,
-                    user_id: i64,
-                    role: String,
-                }
                 let membership: Membership = diesel::insert_into(memberships::table)
                     .values(&InsertMembership {
                         tenant_id: tenant_id.clone(),
@@ -450,9 +534,13 @@ pub async fn revoke_invitation(
 
 /// Re-send a pending invitation: revoke the old token and mint a fresh one
 /// with a new expiry (issue #1261 AC6 — "new token, old token invalidated").
+/// The revoke-then-create pair runs in one transaction so a failure between
+/// the two steps can never leave the organization with neither a valid old
+/// nor a new invitation.
 #[post("/invitations/{id}/resend")]
 pub async fn resend_invitation(
     session: Session,
+    mut db: Db,
     org_repo: PgOrganizationRepository,
     invitation_repo: PgInvitationRepository,
     mailer: Mailer,
@@ -462,46 +550,55 @@ pub async fn resend_invitation(
     let Some(inviter_id) = session.get("user_id").await.and_then(|s| s.parse().ok()) else {
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };
+    // `find_by_id` is tenant-scoped, so this also proves `invitation_id`
+    // belongs to the caller's active organization before anything is written.
     let Some(old) = invitation_repo.find_by_id(invitation_id).await? else {
         return Err(AutumnError::not_found_msg("Invitation not found"));
     };
-    invitation_repo
-        .update(
-            invitation_id,
-            &UpdateInvitation {
-                status: Patch::Set("revoked".to_owned()),
-                ..Default::default()
-            },
-        )
-        .await?;
 
+    let tenant_id = old.tenant_id.clone();
+    let email = old.email.clone();
+    let role = old.role.clone();
     let raw_token = generate_raw_token();
-    invitation_repo
-        .save(&NewInvitation {
-            email: old.email.clone(),
-            role: old.role.clone(),
-            token_hash: hash_api_token(&raw_token),
-            status: "pending".to_owned(),
-            invited_by_user_id: inviter_id,
-            expires_at: chrono::Utc::now().naive_utc()
-                + chrono::Duration::days(INVITATION_TTL_DAYS),
+    let token_hash = hash_api_token(&raw_token);
+    let new: Invitation = db
+        .tx(move |conn| {
+            async move {
+                diesel::update(invitations::table.filter(invitations::id.eq(invitation_id)))
+                    .set(invitations::status.eq("revoked"))
+                    .execute(conn)
+                    .await?;
+
+                let new: Invitation = diesel::insert_into(invitations::table)
+                    .values(&InsertInvitation {
+                        tenant_id,
+                        email,
+                        role,
+                        token_hash,
+                        status: "pending".to_owned(),
+                        invited_by_user_id: inviter_id,
+                        expires_at: chrono::Utc::now().naive_utc()
+                            + chrono::Duration::days(INVITATION_TTL_DAYS),
+                    })
+                    .returning(Invitation::as_returning())
+                    .get_result(conn)
+                    .await?;
+                Ok::<_, AutumnError>(new)
+            }
+            .scope_boxed()
         })
         .await?;
 
     let Some(organization) = org_repo
-        .find_by_id(parse_tenant_id(&old.tenant_id)?)
+        .find_by_id(parse_tenant_id(&new.tenant_id)?)
         .await?
     else {
         return Err(AutumnError::not_found_msg("Organization not found"));
     };
-    let accept_url = format!("{}/invitations/{raw_token}", app_base_url());
-    InvitationMailer.deliver_later_invite(
-        &mailer,
-        old.email,
-        organization.name,
-        old.role,
-        accept_url,
-    );
+    let accept_url = format!("{}/invite/{raw_token}", app_base_url());
+    InvitationMailer
+        .send_invite(&mailer, new.email, organization.name, new.role, accept_url)
+        .await?;
 
     Ok(Redirect::to("/members").into_response())
 }

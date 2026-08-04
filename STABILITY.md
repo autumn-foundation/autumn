@@ -377,6 +377,47 @@ fn csv_export_row(&self, columns: &[&str], record: &Value) -> Vec<String> {
 }
 ```
 
+## Team membership (issue #1261)
+
+### SemVer impact
+
+This is additive: a new opt-in `autumn generate teams` CLI subcommand plus a
+new `examples/teams` reference application. **No public API in the
+`autumn`/`autumn-web` or `autumn-macros` crates changed** — every capability
+`teams` uses already shipped and is already stable: `#[repository(...,
+tenant_scoped)]` (issue #695), the session `"role"` key convention
+(`#[secured("...")]`/`PolicyContext::has_role`, issue #496), and the Mail
+stack's `#[mailer]`/`#[mailer_preview]`. No new Cargo feature gate was
+needed for this, since nothing in the library crates' public API changed —
+`autumn-cli` alone gained the new subcommand.
+
+### New public items
+
+| Item | Location | Notes |
+|------|----------|-------|
+| `autumn generate teams` | `autumn-cli` subcommand | No name argument — always emits the fixed `Organization`/`Membership`/`Invitation` set |
+| `autumn destroy teams` | `autumn-cli` subcommand | Reverses a matching `generate teams` (issue #1048's destroy convention) |
+
+No new public Rust API in `autumn-web`/`autumn-macros`: the generated
+`src/teams/` module is ordinary, freely-editable application code composed
+entirely from already-stable primitives, not a new library surface.
+
+### What it generates
+
+| File | Purpose |
+|------|---------|
+| `src/teams/models.rs` | `Organization`, `Membership`, `Invitation` `#[model]` structs |
+| `src/teams/role.rs` | `Role` enum (`Owner`/`Admin`/`Member`), `require_role`, `establish_org_session` |
+| `src/teams/repositories.rs` | `#[repository]` traits, `Membership`/`Invitation` `tenant_scoped` |
+| `src/teams/mailers/invitation_mailer.rs` | `InvitationMailer` (`#[mailer]`) |
+| `src/teams/routes/{organizations,invitations,members}.rs` | Route handlers, plus the `provision_default_organization` signup-integration helper |
+| `migrations/<timestamp>_create_teams/` | `organizations`/`memberships`/`invitations` tables |
+| `src/main.rs` (modified) | `mod teams;` + routes wired into `routes![...]` |
+| `Cargo.toml` (modified) | `"mail"` feature enabled on `autumn-web` |
+
+See `docs/generate-teams.md` for the two-line auth-integration seam this
+generator relies on instead of generating its own login/signup.
+
 ## Pre-1.0 notes
 
 Until Autumn reaches `1.0.0`:

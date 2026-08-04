@@ -46,7 +46,7 @@ fn enable_tenancy(config: &mut AutumnConfig) {
         "/signup".to_string(),
         "/logout".to_string(),
         "/static".to_string(),
-        "/invitations".to_string(),
+        "/invite".to_string(),
     ];
     config.tenancy.login_redirect = Some("/login".to_string());
 }
@@ -135,7 +135,7 @@ fn count_emls(dir: &std::path::Path) -> usize {
 }
 
 /// Pull the raw invite token out of the most recently written `.eml` file's
-/// `/invitations/{token}` link.
+/// `/invite/{token}` link.
 fn latest_invite_token(dir: &std::path::Path) -> String {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .expect("mail dir readable")
@@ -145,7 +145,7 @@ fn latest_invite_token(dir: &std::path::Path) -> String {
     entries.sort_by_key(std::fs::DirEntry::path);
     let latest = entries.last().expect("at least one .eml written");
     let body = std::fs::read_to_string(latest.path()).expect("read .eml");
-    let marker = "/invitations/";
+    let marker = "/invite/";
     let start = body.find(marker).expect("accept link present in email") + marker.len();
     let rest = &body[start..];
     let end = rest
@@ -213,14 +213,14 @@ async fn invite_and_accept_as_new_user() {
 
     // The accept page shows a signup form for an unknown email.
     client
-        .get(&format!("/invitations/{token}"))
+        .get(&format!("/invite/{token}"))
         .send()
         .await
         .assert_ok()
         .assert_body_contains("Create an account to accept");
 
     let accept = client
-        .post(&format!("/invitations/{token}/accept"))
+        .post(&format!("/invite/{token}/accept"))
         .form("password=An0ther-Str0ng-Pa55word")
         .send()
         .await;
@@ -259,7 +259,7 @@ async fn invite_and_accept_as_existing_authenticated_user() {
     // Signed in as second-owner (owner of their *own* org), the accept page
     // shows a direct one-click accept, not a signup form.
     client
-        .get(&format!("/invitations/{token}"))
+        .get(&format!("/invite/{token}"))
         .header("cookie", &other_cookie)
         .send()
         .await
@@ -267,7 +267,7 @@ async fn invite_and_accept_as_existing_authenticated_user() {
         .assert_body_contains("Accept invitation");
 
     let accept = client
-        .post(&format!("/invitations/{token}/accept"))
+        .post(&format!("/invite/{token}/accept"))
         .header("cookie", &other_cookie)
         .send()
         .await;
@@ -282,6 +282,118 @@ async fn invite_and_accept_as_existing_authenticated_user() {
         .assert_ok()
         .assert_body_contains("second-owner@acme.test")
         .assert_body_contains("admin");
+}
+
+/// Security regression: an unauthenticated visitor must never be able to
+/// silently accept-as (and thereby log in as) an account that already exists
+/// for the invited email, just by possessing the token — no password check.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn accept_without_session_for_existing_account_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+    // The invited email already has its own account (and its own org).
+    signup(&client, "existing@acme.test").await;
+
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=existing@acme.test&role=admin")
+        .send()
+        .await
+        .assert_status(303);
+    let token = latest_invite_token(dir.path());
+
+    // No session cookie, no password field: must be rejected, not silently
+    // logged in as the existing account.
+    let resp = client.post(&format!("/invite/{token}/accept")).send().await;
+    resp.assert_status(401);
+    assert!(
+        resp.header("set-cookie").is_none(),
+        "a rejected accept must not establish a session"
+    );
+}
+
+/// Security regression: an authenticated user may only redeem an invite
+/// addressed to their own email — not one meant for a different account.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn accept_rejects_authenticated_user_with_mismatched_email() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+    let bystander_cookie = signup(&client, "bystander@acme.test").await;
+
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=intended@acme.test&role=admin")
+        .send()
+        .await
+        .assert_status(303);
+    let token = latest_invite_token(dir.path());
+
+    let resp = client
+        .post(&format!("/invite/{token}/accept"))
+        .header("cookie", &bystander_cookie)
+        .send()
+        .await;
+    resp.assert_status(403);
+
+    // The bystander must not have joined the inviting org under any role.
+    let body = client
+        .get("/members")
+        .header("cookie", &owner_cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(!body.contains("bystander@acme.test"));
+}
+
+/// Security regression: an Admin (not Owner) must not be able to grant the
+/// `Owner` role to anyone, whether via a fresh invite or an existing member —
+/// otherwise Admin -> Owner is a one-request privilege escalation.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn admin_cannot_grant_owner_role() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=admin-user@acme.test&role=admin")
+        .send()
+        .await
+        .assert_status(303);
+    let token = latest_invite_token(dir.path());
+    let accept = client
+        .post(&format!("/invite/{token}/accept"))
+        .form("password=An0ther-Str0ng-Pa55word")
+        .send()
+        .await;
+    let admin_cookie = session_cookie(&accept);
+
+    // The Admin cannot invite a fresh account straight in as Owner...
+    let invite_resp = client
+        .post("/invitations")
+        .header("cookie", &admin_cookie)
+        .form("email=wannabe-owner@acme.test&role=owner")
+        .send()
+        .await;
+    invite_resp.assert_status(403);
+
+    // ...nor promote themselves (member id 2, after the owner's own id 1) to Owner.
+    let promote_resp = client
+        .post("/members/2/role")
+        .header("cookie", &admin_cookie)
+        .form("role=owner")
+        .send()
+        .await;
+    promote_resp.assert_status(403);
 }
 
 /// AC5: a double-clicked accept link is a no-op, not a duplicate membership
@@ -302,7 +414,7 @@ async fn double_accept_is_idempotent() {
     let token = latest_invite_token(dir.path());
 
     let first = client
-        .post(&format!("/invitations/{token}/accept"))
+        .post(&format!("/invite/{token}/accept"))
         .form("password=An0ther-Str0ng-Pa55word")
         .send()
         .await;
@@ -312,7 +424,7 @@ async fn double_accept_is_idempotent() {
     // Second click reuses the now-authenticated session rather than
     // resubmitting the signup form (mirrors a browser back-button replay).
     let second = client
-        .post(&format!("/invitations/{token}/accept"))
+        .post(&format!("/invite/{token}/accept"))
         .header("cookie", &cookie)
         .send()
         .await;
@@ -366,7 +478,7 @@ async fn revoked_invitation_shows_clear_error() {
         .assert_status(303);
 
     client
-        .get(&format!("/invitations/{token}"))
+        .get(&format!("/invite/{token}"))
         .send()
         .await
         .assert_status(410)
@@ -406,7 +518,7 @@ async fn member_cannot_invite() {
         .assert_status(303);
     let token = latest_invite_token(dir.path());
     let accept = client
-        .post(&format!("/invitations/{token}/accept"))
+        .post(&format!("/invite/{token}/accept"))
         .form("password=An0ther-Str0ng-Pa55word")
         .send()
         .await;

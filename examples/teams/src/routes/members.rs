@@ -3,7 +3,20 @@
 //!
 //! Every mutating action is gated `require_role(&session, Role::Admin)`, and
 //! the last `Owner` in an organization can neither be demoted nor removed —
-//! otherwise an organization could be left with no one able to manage it.
+//! otherwise no one could ever grant `Owner` again (`Admin`+ can still invite/
+//! remove/change non-Owner roles regardless). Granting the `Owner` role
+//! itself additionally requires the *caller* to already be an `Owner` — an
+//! `Admin` gate alone would let any Admin promote themselves (or an ally) to
+//! `Owner` and from there demote/remove the organization's real owners.
+//!
+//! The last-owner check reads `find_all()` then acts without a row lock, so
+//! two concurrent requests demoting/removing each of exactly two remaining
+//! owners could in principle both pass the check. A production app should
+//! close that window with a `SELECT ... FOR UPDATE` transaction (mirroring
+//! `routes::invitations::accept_invitation`'s row-locked pattern); left as a
+//! narrow, documented gap here rather than duplicating that machinery for a
+//! race that only costs the ability to grant a *new* Owner, not any existing
+//! capability.
 
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
@@ -15,7 +28,7 @@ use crate::repositories::{
 use crate::role::{Role, require_role};
 use crate::schema::users;
 
-use super::layout::layout;
+use super::layout::{csrf_value, layout};
 
 /// Count how many `owner` members remain in the active organization. Used to
 /// block demoting/removing the last one.
@@ -32,6 +45,7 @@ pub async fn list_members(
     session: Session,
     membership_repo: PgMembershipRepository,
     invitation_repo: PgInvitationRepository,
+    csrf: Option<CsrfToken>,
 ) -> AutumnResult<Response> {
     // Any member (not just Admin+) can view the roster; only Admin+ sees the
     // management controls below.
@@ -57,12 +71,14 @@ pub async fn list_members(
     let page = layout(
         "Members",
         true,
+        csrf_value(&csrf),
         html! {
             h1 class="text-2xl font-bold mb-6" { "Members" }
 
             @if can_manage {
                 form action="/invitations" method="post"
                      class="flex gap-2 mb-6 bg-white rounded-lg shadow p-4" {
+                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                     input name="email" type="email" required placeholder="teammate@example.com"
                           aria-label="Email to invite" class="flex-1 border rounded px-3 py-2";
                     select name="role" aria-label="Role" class="border rounded px-3 py-2" {
@@ -90,6 +106,7 @@ pub async fn list_members(
                             div class="flex items-center gap-2" {
                                 @let last_owner = membership.role == Role::Owner.as_str() && owners <= 1;
                                 form action={"/members/" (membership.id) "/role"} method="post" class="flex items-center gap-1" {
+                                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                                     select name="role" aria-label="Change role" disabled[last_owner] {
                                         option value="member" selected[membership.role == "member"] { "Member" }
                                         option value="admin" selected[membership.role == "admin"] { "Admin" }
@@ -99,6 +116,7 @@ pub async fn list_members(
                                            class="text-xs px-2 py-1 border rounded hover:bg-gray-50" { "Update" }
                                 }
                                 form action={"/members/" (membership.id) "/remove"} method="post" {
+                                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                                     button type="submit" disabled[last_owner]
                                            class="text-xs px-2 py-1 border rounded text-red-600 hover:bg-red-50 \
                                                   disabled:text-gray-300 disabled:hover:bg-transparent" {
@@ -122,11 +140,13 @@ pub async fn list_members(
                             }
                             div class="flex items-center gap-2" {
                                 form action={"/invitations/" (invitation.id) "/resend"} method="post" {
+                                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                                     button type="submit" class="text-xs px-2 py-1 border rounded hover:bg-gray-50" {
                                         "Resend"
                                     }
                                 }
                                 form action={"/invitations/" (invitation.id) "/revoke"} method="post" {
+                                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                                     button type="submit"
                                            class="text-xs px-2 py-1 border rounded text-red-600 hover:bg-red-50" {
                                         "Revoke"
@@ -164,7 +184,8 @@ async fn load_emails(
 }
 
 /// Change a member's role within the active organization. Gated `Admin` or
-/// higher; refuses to demote the last `Owner`.
+/// higher (granting `Owner` itself requires the caller to already be an
+/// `Owner`); refuses to demote the last `Owner`.
 #[post("/members/{id}/role")]
 pub async fn change_role(
     session: Session,
@@ -172,10 +193,15 @@ pub async fn change_role(
     Path(membership_id): Path<i64>,
     Form(form): Form<ChangeRoleForm>,
 ) -> AutumnResult<Response> {
-    require_role(&session, Role::Admin).await?;
+    let caller_role = require_role(&session, Role::Admin).await?;
     let Some(new_role) = Role::parse(&form.role) else {
         return Err(AutumnError::unprocessable_msg("Unknown role"));
     };
+    if new_role == Role::Owner && caller_role != Role::Owner {
+        return Err(AutumnError::forbidden_msg(
+            "Only an owner can grant the owner role",
+        ));
+    }
 
     let memberships = membership_repo.find_all().await?;
     let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {

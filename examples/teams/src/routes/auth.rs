@@ -31,22 +31,24 @@ use crate::repositories::{
 use crate::role::Role;
 use crate::schema::users;
 
-use super::layout::layout;
+use super::layout::{csrf_value, layout};
 
 // bcrypt hash used as a dummy target when the email is not found, so the
 // login handler takes the same wall time whether or not the account exists.
 const DUMMY_HASH: &str = "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfNXwi.2K";
 
-fn signup_page(min_len: usize, error: Option<&str>) -> Markup {
+fn signup_page(min_len: usize, csrf_token: &str, error: Option<&str>) -> Markup {
     layout(
         "Sign up",
         false,
+        csrf_token,
         html! {
             h1 class="text-2xl font-bold mb-6" { "Create your account" }
             @if let Some(error) = error {
                 p class="mb-4 text-sm text-red-600" role="alert" { (error) }
             }
             form action="/signup" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
+                input type="hidden" name="_csrf" value=(csrf_token);
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
                     input #email type="email" name="email" required autocomplete="email"
@@ -70,8 +72,12 @@ fn signup_page(min_len: usize, error: Option<&str>) -> Markup {
 }
 
 #[get("/signup")]
-pub async fn signup_form(State(state): State<AppState>) -> Markup {
-    signup_page(state.config().auth.password.min_length, None)
+pub async fn signup_form(State(state): State<AppState>, csrf: Option<CsrfToken>) -> Markup {
+    signup_page(
+        state.config().auth.password.min_length,
+        csrf_value(&csrf),
+        None,
+    )
 }
 
 #[post("/signup")]
@@ -81,6 +87,7 @@ pub async fn signup(
     mut db: Db,
     org_repo: PgOrganizationRepository,
     membership_repo: PgMembershipRepository,
+    csrf: Option<CsrfToken>,
     Form(form): Form<SignupForm>,
 ) -> AutumnResult<Response> {
     let email = form.email.trim().to_lowercase();
@@ -105,7 +112,9 @@ pub async fn signup(
         } else {
             messages.join("\n")
         };
-        return Ok(signup_page(password_cfg.min_length, Some(&message)).into_response());
+        return Ok(
+            signup_page(password_cfg.min_length, csrf_value(&csrf), Some(&message)).into_response(),
+        );
     }
 
     let password_hash = hash_password(&form.password).await?;
@@ -160,14 +169,19 @@ fn safe_next(next: Option<&str>) -> &str {
 }
 
 #[get("/login")]
-pub async fn login_form(Query(query): Query<crate::models::NextQuery>) -> Markup {
+pub async fn login_form(
+    Query(query): Query<crate::models::NextQuery>,
+    csrf: Option<CsrfToken>,
+) -> Markup {
     let next = query.next.unwrap_or_default();
     layout(
         "Log in",
         false,
+        csrf_value(&csrf),
         html! {
             h1 class="text-2xl font-bold mb-6" { "Log in" }
             form action="/login" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
+                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                 @if !next.is_empty() {
                     input type="hidden" name="next" value=(next);
                 }
