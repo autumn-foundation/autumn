@@ -271,7 +271,7 @@ fn render_schema_rs() -> String {
     SCHEMA_RS.to_owned()
 }
 
-const SCHEMA_RS: &str = r#"//! Diesel table definitions for the `teams` module (issue #1261). These
+const SCHEMA_RS: &str = r"//! Diesel table definitions for the `teams` module (issue #1261). These
 //! mirror `migrations/<timestamp>_create_teams/`.
 //!
 //! Deliberately NOT `joinable!`/FK-coupled to your app's own `users` table —
@@ -312,7 +312,7 @@ diesel::table! {
         created_at -> Timestamp,
     }
 }
-"#;
+";
 
 fn render_models_rs() -> String {
     MODELS_RS.to_owned()
@@ -1520,7 +1520,7 @@ pub async fn remove_member(
 // generators, `teams` has no `SQLite`-dialect variant (issue #1614's
 // backend-aware DDL work did not extend to this generator).
 
-const MIGRATION_UP: &str = r#"-- Organizations, memberships, and invitations for team membership (issue
+const MIGRATION_UP: &str = r"-- Organizations, memberships, and invitations for team membership (issue
 -- #1261). Deliberately does NOT create (or reference via REFERENCES) a
 -- `users` table — your app already has its own from `autumn generate auth`;
 -- `memberships.user_id` / `invitations.invited_by_user_id` are bare BIGINT
@@ -1579,7 +1579,7 @@ CREATE TABLE invitations (
 );
 CREATE INDEX idx_invitations_tenant ON invitations (tenant_id);
 CREATE INDEX idx_invitations_email ON invitations (email);
-"#;
+";
 
 const MIGRATION_DOWN: &str = "DROP TABLE IF EXISTS invitations;\nDROP TABLE IF EXISTS memberships;\nDROP TABLE IF EXISTS organizations;\n";
 

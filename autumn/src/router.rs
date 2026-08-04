@@ -2302,7 +2302,7 @@ fn apply_locale_prefix_routing(
 /// this far outside any locale nest) so the redirect target matches exactly
 /// what the request would have resolved to anyway.
 ///
-/// **Known limitation** (Codex review): a mutating form POSTing directly to
+/// **Known limitation** (Codex review): a mutating form `POSTing` directly to
 /// its bare, unprefixed path with a `[SubmitTokenLayer](crate::security::SubmitTokenLayer)`-protected
 /// `_submit_token` hits this 308 *before* reaching the real handler.
 /// `SubmitTokenLayer` caches 3xx responses so a replayed submit returns the

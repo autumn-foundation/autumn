@@ -4685,14 +4685,14 @@ fn generate_teams_emits_organization_membership_invitation_models() {
     assert!(project.join("src/teams/routes/members.rs").is_file());
 
     // Migration: organizations, memberships, invitations tables.
-    let migrations_dir = project.join("migrations");
-    let migration_dir = fs::read_dir(&migrations_dir)
+    let migrations_root = project.join("migrations");
+    let teams_migration_dir = fs::read_dir(&migrations_root)
         .unwrap()
         .filter_map(Result::ok)
         .find(|e| e.file_name().to_string_lossy().ends_with("_create_teams"))
         .expect("a *_create_teams migration must be generated")
         .path();
-    let up = fs::read_to_string(migration_dir.join("up.sql")).unwrap();
+    let up = fs::read_to_string(teams_migration_dir.join("up.sql")).unwrap();
     assert!(up.contains("CREATE TABLE organizations"), "{up}");
     assert!(up.contains("CREATE TABLE memberships"), "{up}");
     assert!(up.contains("CREATE TABLE invitations"), "{up}");
