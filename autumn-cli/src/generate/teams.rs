@@ -1155,6 +1155,30 @@ pub async fn remove_all_memberships_on_conn(
         .await?;
 
     for owner_membership in &owned {
+        // Lock the organization row FIRST — before anything else for this
+        // organization — as the shared serialization point with
+        // `accept_invitation` (see that function's own matching org-row
+        // lock). Without a lock shared across both functions, this
+        // successor lookup below could decide "no successor exists" a
+        // moment before a concurrent `accept_invitation` commits a
+        // brand-new membership for this same organization — this function
+        // would then delete the sole Owner anyway, leaving the newly
+        // joined member in an organization that can never regain an Owner
+        // (Codex review finding). Both functions lock organizations before
+        // memberships/invitations, in that same order, so whichever gets
+        // here first completes wholly before the other proceeds, instead
+        // of deadlocking.
+        let org_id: i64 = owner_membership.tenant_id.parse().map_err(|_| {
+            AutumnError::internal_server_error_msg("Corrupt organization id in membership")
+        })?;
+        organizations::table
+            .find(org_id)
+            .for_update()
+            .select(Organization::as_select())
+            .first(conn)
+            .await
+            .optional()?;
+
         // Only this organization's *sole* Owner needs a successor — if
         // another live Owner remains, ownership doesn't need transferring,
         // and promoting anyone else here would grant an unrequested second
@@ -1344,13 +1368,13 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::teams::mailers::invitation_mailer::InvitationMailer;
-use crate::teams::models::{InviteForm, Invitation, Membership, UpdateInvitation};
+use crate::teams::models::{InviteForm, Invitation, Membership, Organization, UpdateInvitation};
 use crate::teams::repositories::{
     InvitationRepository, OrganizationRepository, PgInvitationRepository, PgMembershipRepository,
     PgOrganizationRepository,
 };
 use crate::teams::role::{Role, establish_org_session, require_role};
-use crate::teams::schema::{invitations, memberships};
+use crate::teams::schema::{invitations, memberships, organizations};
 
 use super::{csrf_value, minimal_page};
 
@@ -1691,6 +1715,30 @@ pub async fn accept_invitation(
     let membership: Membership = db
         .tx(move |conn| {
             async move {
+                // Lock the organization row FIRST — before the invitation
+                // row below — as the shared serialization point with
+                // `remove_all_memberships_on_conn` (see its own matching
+                // org-row lock). Without a lock shared across both
+                // functions, an account deletion concurrently cleaning up
+                // this same organization could decide "no successor member
+                // exists" a moment before this accept commits a brand-new
+                // membership, then delete the sole Owner anyway — leaving
+                // this invitee joined to an organization that can never
+                // regain an Owner (Codex review finding). Both functions
+                // must lock organizations before memberships/invitations,
+                // in that same order, or they could deadlock instead of
+                // serializing.
+                let org_id: i64 = tenant_id.parse().map_err(|_| {
+                    AutumnError::internal_server_error_msg("Corrupt organization id in invitation")
+                })?;
+                organizations::table
+                    .find(org_id)
+                    .for_update()
+                    .select(Organization::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+
                 // Lock the invitation row so two concurrent accepts serialize
                 // rather than race past the pending/expiry check together.
                 let invitation: Invitation = invitations::table
@@ -3166,6 +3214,54 @@ async fn main() {
                     && w.contains("autumn generate auth Account")),
             "{:?}",
             plan.warnings
+        );
+    }
+
+    /// `remove_all_memberships_on_conn` and `accept_invitation` both touch a
+    /// given organization's memberships/invitations, from two entirely
+    /// separate `db.tx` transactions — one triggered by account deletion,
+    /// one by a concurrent invitation accept. Without a lock shared between
+    /// them, the cleanup could decide "no successor exists" a moment before
+    /// the accept commits a brand-new membership, then delete the sole
+    /// Owner anyway. Both must lock the `organizations` row for that tenant
+    /// FIRST — before touching memberships or invitations — so whichever
+    /// runs first completes wholly before the other proceeds, and in the
+    /// same order in both functions, so they serialize instead of
+    /// deadlocking (Codex review finding).
+    #[test]
+    fn accept_invitation_and_remove_all_memberships_lock_organizations_first() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        let accept_org_lock_pos = invitations
+            .find("organizations::table\n                    .find(org_id)\n                    .for_update()")
+            .unwrap_or_else(|| panic!("missing org-row lock in accept_invitation: {invitations}"));
+        let accept_invitation_lock_pos = invitations
+            .find("let invitation: Invitation = invitations::table\n                    .filter(invitations::id.eq(invitation_id))\n                    .for_update()")
+            .unwrap_or_else(|| panic!("missing invitation-row lock: {invitations}"));
+        assert!(
+            accept_org_lock_pos < accept_invitation_lock_pos,
+            "accept_invitation must lock organizations before invitations"
+        );
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
+        let cleanup_org_lock_pos = organizations
+            .find("organizations::table\n            .find(org_id)\n            .for_update()")
+            .unwrap_or_else(|| {
+                panic!("missing org-row lock in remove_all_memberships_on_conn: {organizations}")
+            });
+        let cleanup_other_owner_pos = organizations
+            .find("let other_owner: Option<Membership> = memberships::table")
+            .unwrap();
+        assert!(
+            cleanup_org_lock_pos < cleanup_other_owner_pos,
+            "remove_all_memberships_on_conn must lock organizations before checking for a successor"
         );
     }
 }
