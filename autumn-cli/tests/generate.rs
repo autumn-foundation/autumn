@@ -4632,6 +4632,214 @@ fn generate_mailer_preview_registry_wired_into_main() {
     );
 }
 
+// ── autumn generate teams (issue #1261) ────────────────────────────────────
+
+#[test]
+fn generate_teams_emits_organization_membership_invitation_models() {
+    let (_tmp, project) = fresh_project("teams-app");
+    let (stdout, _stderr) = run_autumn(&project, &["generate", "teams"]);
+    assert!(
+        stdout.contains("Created") || stdout.contains("teams"),
+        "output should mention created files: {stdout}"
+    );
+
+    // Models: Organization, Membership, Invitation.
+    assert!(project.join("src/teams/models.rs").is_file());
+    let models = fs::read_to_string(project.join("src/teams/models.rs")).unwrap();
+    assert!(models.contains("pub struct Organization"), "{models}");
+    assert!(models.contains("pub struct Membership"), "{models}");
+    assert!(models.contains("pub struct Invitation"), "{models}");
+
+    // Role enum + require_role guard.
+    assert!(project.join("src/teams/role.rs").is_file());
+    let role = fs::read_to_string(project.join("src/teams/role.rs")).unwrap();
+    assert!(role.contains("pub enum Role"), "{role}");
+    assert!(role.contains("Owner"), "{role}");
+    assert!(role.contains("Admin"), "{role}");
+    assert!(role.contains("Member"), "{role}");
+    assert!(role.contains("pub async fn require_role"), "{role}");
+    assert!(
+        role.contains("pub async fn establish_org_session"),
+        "{role}"
+    );
+
+    // Repositories, tenant_scoped.
+    assert!(project.join("src/teams/repositories.rs").is_file());
+    let repos = fs::read_to_string(project.join("src/teams/repositories.rs")).unwrap();
+    assert!(repos.contains("tenant_scoped"), "{repos}");
+
+    // InvitationMailer.
+    assert!(
+        project
+            .join("src/teams/mailers/invitation_mailer.rs")
+            .is_file()
+    );
+    let mailer =
+        fs::read_to_string(project.join("src/teams/mailers/invitation_mailer.rs")).unwrap();
+    assert!(mailer.contains("pub struct InvitationMailer"), "{mailer}");
+    assert!(mailer.contains("#[mailer]"), "{mailer}");
+
+    // Route handlers.
+    assert!(project.join("src/teams/routes/organizations.rs").is_file());
+    assert!(project.join("src/teams/routes/invitations.rs").is_file());
+    assert!(project.join("src/teams/routes/members.rs").is_file());
+
+    // Migration: organizations, memberships, invitations tables.
+    let migrations_dir = project.join("migrations");
+    let migration_dir = fs::read_dir(&migrations_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_create_teams"))
+        .expect("a *_create_teams migration must be generated")
+        .path();
+    let up = fs::read_to_string(migration_dir.join("up.sql")).unwrap();
+    assert!(up.contains("CREATE TABLE organizations"), "{up}");
+    assert!(up.contains("CREATE TABLE memberships"), "{up}");
+    assert!(up.contains("CREATE TABLE invitations"), "{up}");
+
+    // main.rs wiring.
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main.contains("mod teams;"), "{main}");
+    assert!(
+        main.contains("teams::routes::organizations::create_organization"),
+        "{main}"
+    );
+    assert!(
+        main.contains("teams::routes::invitations::accept_invitation"),
+        "{main}"
+    );
+    assert!(
+        main.contains("teams::routes::members::list_members"),
+        "{main}"
+    );
+
+    // Cargo.toml: mail feature enabled.
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"mail\""),
+        "Cargo.toml must include the mail feature: {cargo}"
+    );
+}
+
+#[test]
+fn generate_teams_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("teams-dry-app");
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let (stdout, _) = run_autumn(&project, &["generate", "teams", "--dry-run"]);
+    assert!(
+        stdout.contains("Dry run"),
+        "dry run must print Dry run header: {stdout}"
+    );
+    assert!(
+        !project.join("src/teams").exists(),
+        "dry run must not create the src/teams directory"
+    );
+    let has_teams_migration = fs::read_dir(project.join("migrations")).is_ok_and(|rd| {
+        rd.filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().ends_with("_create_teams"))
+    });
+    assert!(
+        !has_teams_migration,
+        "dry run must not create a *_create_teams migration"
+    );
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        !main.contains("mod teams;"),
+        "dry run must not touch main.rs: {main}"
+    );
+    let cargo_after = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert_eq!(
+        cargo_after, cargo_before,
+        "dry run must not touch Cargo.toml"
+    );
+}
+
+#[test]
+fn generate_teams_invite_accept_routes_use_invite_prefix_not_invitations() {
+    let (_tmp, project) = fresh_project("teams-invite-prefix-app");
+    run_autumn(&project, &["generate", "teams"]);
+
+    let invitations = fs::read_to_string(project.join("src/teams/routes/invitations.rs")).unwrap();
+
+    // Invitee-facing accept flow lives under its own `/invite` prefix so
+    // `[tenancy] public_paths = ["/invite"]` doesn't also exempt the
+    // Admin-only routes below from tenant resolution.
+    assert!(
+        invitations.contains(r#"#[get("/invite/{token}")]"#),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains(r#"#[post("/invite/{token}/accept")]"#),
+        "{invitations}"
+    );
+    assert!(
+        !invitations.contains(r#"#[get("/invitations/{token}")]"#),
+        "{invitations}"
+    );
+    assert!(
+        !invitations.contains(r#"#[post("/invitations/{token}/accept")]"#),
+        "{invitations}"
+    );
+
+    // Admin-only create/revoke/resend stay under `/invitations`.
+    assert!(
+        invitations.contains(r#"#[post("/invitations")]"#),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains(r#"#[post("/invitations/{id}/revoke")]"#),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains(r#"#[post("/invitations/{id}/resend")]"#),
+        "{invitations}"
+    );
+}
+
+#[test]
+fn generate_teams_sends_invite_mail_synchronously_not_deliver_later() {
+    let (_tmp, project) = fresh_project("teams-sync-mail-app");
+    run_autumn(&project, &["generate", "teams"]);
+
+    let invitations = fs::read_to_string(project.join("src/teams/routes/invitations.rs")).unwrap();
+    assert!(
+        invitations.contains(".send_invite("),
+        "invite mail must be sent synchronously: {invitations}"
+    );
+    assert!(
+        !invitations.contains(".deliver_later_invite("),
+        "invite mail must not be a fire-and-forget background send: {invitations}"
+    );
+}
+
+#[test]
+fn generate_teams_guards_against_admin_self_promotion_to_owner() {
+    let (_tmp, project) = fresh_project("teams-owner-guard-app");
+    run_autumn(&project, &["generate", "teams"]);
+
+    // create_invitation: an Admin cannot mint a fresh Owner invite.
+    let invitations = fs::read_to_string(project.join("src/teams/routes/invitations.rs")).unwrap();
+    assert!(
+        invitations.contains("role == Role::Owner && caller_role != Role::Owner"),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains("Only an owner can invite someone as owner"),
+        "{invitations}"
+    );
+
+    // change_role: an Admin cannot promote an existing member to Owner.
+    let members = fs::read_to_string(project.join("src/teams/routes/members.rs")).unwrap();
+    assert!(
+        members.contains("new_role == Role::Owner && caller_role != Role::Owner"),
+        "{members}"
+    );
+    assert!(
+        members.contains("Only an owner can grant the owner role"),
+        "{members}"
+    );
+}
+
 // ── autumn generate auth email confirmation (issue #823) ──────────────────────
 //
 // RED phase: these tests capture the full acceptance criteria from #823.
