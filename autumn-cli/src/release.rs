@@ -273,19 +273,22 @@ const AZURE_GITIGNORE_ENTRIES: &[&str] = &[
 fn ensure_azure_gitignore_entries(dir: &Path) -> std::io::Result<()> {
     let path = dir.join(".gitignore");
     let existing = fs::read_to_string(&path).unwrap_or_default();
-    let missing: Vec<&&str> = AZURE_GITIGNORE_ENTRIES
+    let missing: Vec<&str> = AZURE_GITIGNORE_ENTRIES
         .iter()
-        .filter(|line| !existing.lines().any(|l| l.trim() == **line))
+        .copied()
+        .filter(|line| !existing.lines().any(|l| l.trim() == *line))
         .collect();
     if missing.is_empty() {
         return Ok(());
     }
 
     let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
+    if !updated.is_empty() {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
         updated.push('\n');
     }
-    updated.push('\n');
     for line in missing {
         updated.push_str(line);
         updated.push('\n');
