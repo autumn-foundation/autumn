@@ -900,9 +900,10 @@ string from the Postgres server this same apply creates, from its FQDN plus
 ```bash
 cp terraform.tfvars.example terraform.tfvars   # edit app_name/location/subscription_id/etc.
 # Azure's Postgres complexity policy needs 3 of {upper, lower, digit,
-# symbol} — `openssl rand -hex` is lowercase-only and Azure rejects it;
-# -base64 reliably mixes upper/lower/digit.
-export TF_VAR_database_admin_password="$(openssl rand -base64 24)"
+# symbol} — `openssl rand -hex` is lowercase-only, and even -base64 alone
+# only samples its alphabet randomly (a small fraction of outputs could
+# still miss a category). Appending "Aa1!" guarantees all 4 regardless.
+export TF_VAR_database_admin_password="$(openssl rand -base64 18)Aa1!"
 export TF_VAR_signing_secret="$(openssl rand -hex 32)"
 
 terraform init

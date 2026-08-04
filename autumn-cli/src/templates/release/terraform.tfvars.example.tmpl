@@ -21,13 +21,17 @@ enable_redis_cache  = false
 # There is no database_url variable to set: main.tf derives the connection
 # string from the Postgres server this same apply creates.
 #
-#   export TF_VAR_database_admin_password="$(openssl rand -base64 24)"
+#   export TF_VAR_database_admin_password="$(openssl rand -base64 18)Aa1!"
 #   export TF_VAR_signing_secret="$(openssl rand -hex 32)"
 #
 # database_admin_password must satisfy Azure's Postgres complexity policy —
 # 3 of {uppercase, lowercase, digit, symbol}. `openssl rand -hex` only ever
-# produces lowercase hex digits (2 of 4 categories) and Azure will reject
-# server creation; `-base64` reliably mixes upper/lower/digit.
+# produces lowercase hex digits (2 of 4 categories), and even `-base64`
+# alone only samples its alphabet randomly — a small fraction of outputs
+# could still land on just 2 categories (e.g. all upper+lowercase, no
+# digit). Appending a fixed "Aa1!" guarantees all 4 categories are present
+# regardless of what the random portion contains, rather than relying on
+# probability.
 # signing_secret has no such constraint — hex is fine there.
 #
 # database_admin_password = (set via TF_VAR_database_admin_password)

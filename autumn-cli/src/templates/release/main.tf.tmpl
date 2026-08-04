@@ -199,20 +199,29 @@ resource "azurerm_key_vault_secret" "signing_secret" {
 }
 
 resource "azurerm_postgresql_flexible_server" "this" {
-  name                          = "${local.app_name_alnum}-pg-${random_id.suffix.hex}"
-  resource_group_name           = azurerm_resource_group.this.name
-  location                      = azurerm_resource_group.this.location
-  version                       = "16"
-  administrator_login           = "autumn_admin"
-  administrator_password        = var.database_admin_password
-  storage_mb                    = 32768
-  sku_name                      = var.db_sku
-  zone                          = "1"
+  name                    = "${local.app_name_alnum}-pg-${random_id.suffix.hex}"
+  resource_group_name     = azurerm_resource_group.this.name
+  location                = azurerm_resource_group.this.location
+  version                 = "16"
+  administrator_login     = "autumn_admin"
+  administrator_password  = var.database_admin_password
+  storage_mb              = 32768
+  sku_name                = var.db_sku
+  # No explicit `zone` — not every Container Apps region offers Postgres
+  # Flexible Server availability zone 1, and a hardcoded zone fails
+  # `terraform apply` in those regions even though an unzoned server would
+  # succeed. Omitting it lets Azure pick an available placement itself.
   public_network_access_enabled = true
 }
 
 resource "azurerm_postgresql_flexible_server_database" "this" {
-  name      = replace(var.app_name, "-", "_")
+  # Postgres database identifiers are capped at 63 bytes; a long Cargo
+  # package name (up to 64 characters) would otherwise overflow it. Reuses
+  # the already-sanitized (lowercase, alphanumeric-and-hyphens,
+  # collapsed/trimmed) app_name_hyphenated local rather than re-deriving
+  # sanitization here, swapping hyphens for underscores since Postgres
+  # identifiers conventionally use those as the word separator.
+  name      = substr(replace(local.app_name_hyphenated, "-", "_"), 0, 63)
   server_id = azurerm_postgresql_flexible_server.this.id
   collation = "en_US.utf8"
   charset   = "UTF8"

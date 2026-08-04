@@ -76,10 +76,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable on the provider (AzureRM v4 made it mandatory even under `az
   login` CLI auth), bounds `local.app_name_alnum` (ACR/Postgres/Redis) to 30
   characters so a long Cargo package name can't overflow ACR's 50-character
-  limit, and `terraform.tfvars.example` generates
-  `database_admin_password` with `openssl rand -base64` instead of `-hex` —
-  hex-only output can't satisfy Azure Postgres's password-complexity policy
-  (3 of uppercase/lowercase/digit/symbol).
+  limit, bounds the Postgres database name to 63 characters for the same
+  reason, and no longer pins the Postgres Flexible Server to availability
+  zone 1 (not every Container Apps region offers it, and a hardcoded zone
+  fails `terraform apply` in those regions even though an unzoned server
+  would succeed). `terraform.tfvars.example` generates
+  `database_admin_password` as `openssl rand -base64` plus a fixed
+  upper/lower/digit/symbol suffix — Azure's Postgres complexity policy
+  needs 3 of those 4 categories, `-hex` output is lowercase-only, and even
+  `-base64` alone only samples its alphabet randomly rather than
+  guaranteeing coverage.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

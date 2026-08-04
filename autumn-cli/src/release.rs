@@ -1330,6 +1330,57 @@ previous_secrets = []
     }
 
     #[test]
+    fn main_tf_postgres_server_does_not_hardcode_availability_zone() {
+        // Not every Container Apps region offers Postgres Flexible Server
+        // availability zone 1 — a hardcoded `zone = "1"` fails
+        // `terraform apply` in those regions even though an unzoned server
+        // would succeed. Omitting `zone` lets Azure pick a placement itself.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let server_block = content
+            .split("resource \"azurerm_postgresql_flexible_server\" \"this\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the postgresql_flexible_server resource");
+        // Check for an actual `zone = ...` attribute assignment, not just
+        // the substring "zone" — the resource's own explanatory comment
+        // about why zone is omitted legitimately mentions the word.
+        assert!(
+            !server_block.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with('#') && t.starts_with("zone ")
+            }),
+            "the Postgres Flexible Server must not pin an availability zone: {server_block}"
+        );
+    }
+
+    #[test]
+    fn main_tf_postgres_database_name_is_length_bounded() {
+        // Postgres database identifiers are capped at 63 bytes; a 64
+        // -character Cargo package name (valid) would otherwise overflow
+        // it since the name was previously passed through unbounded.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let db_block = content
+            .split("resource \"azurerm_postgresql_flexible_server_database\" \"this\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the postgresql_flexible_server_database resource");
+        let name_line = db_block
+            .lines()
+            .find(|l| l.trim_start().starts_with("name"))
+            .expect("the database resource must set a name");
+        assert!(
+            name_line.contains("substr(") && name_line.contains(", 63)"),
+            "the Postgres database name must be truncated to 63 characters: {name_line}"
+        );
+    }
+
+    #[test]
     fn main_tf_has_key_vault_with_database_and_signing_secrets() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -1891,15 +1942,19 @@ previous_secrets = []
         // Azure Postgres Flexible Server requires the admin password to use
         // characters from at least 3 of {uppercase, lowercase, digit,
         // symbol}. `openssl rand -hex` only ever produces lowercase hex
-        // digits (2 of 4 categories) — Azure rejects it at server creation.
+        // digits (2 of 4 categories); even `-base64` alone only samples its
+        // alphabet randomly and could still land on just 2 categories. The
+        // command must deterministically guarantee coverage, not rely on
+        // probability, by appending a fixed suffix containing all 4.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
         assert!(
-            content.contains("TF_VAR_database_admin_password=\"$(openssl rand -base64 24)\""),
-            "the documented database_admin_password generator must use -base64, not \
-             -hex, so it satisfies Azure's Postgres password complexity policy: {content}"
+            content.contains("TF_VAR_database_admin_password=\"$(openssl rand -base64 18)Aa1!\""),
+            "the documented database_admin_password generator must append a fixed \
+             upper/lower/digit/symbol suffix so all 4 character classes are guaranteed, \
+             not merely probable: {content}"
         );
     }
 
