@@ -235,7 +235,11 @@ pub fn plan_teams(
          logged-out invitees to load the invite-accept page, add \"/invite\" (NOT \
          \"/invitations\") to [tenancy] public_paths — public_paths matches by path \
          prefix, so listing \"/invitations\" would also exempt the Admin-only \
-         create/revoke/resend routes from tenant resolution.",
+         create/revoke/resend routes from tenant resolution. src/teams/routes/invitations.rs' \
+         `caller_email_lookup` module hard-codes a `users` table name — if you generated \
+         auth with a custom resource name (e.g. `autumn generate auth Account`, whose table \
+         is `accounts`, not `users`), edit that module to match your actual auth table or \
+         invitation acceptance will fail with a missing-relation database error.",
     );
 
     Ok(plan)
@@ -1101,91 +1105,121 @@ pub async fn provision_default_organization_on_conn(
 /// raw queries against `db` rather than the generated `tenant_scoped`
 /// repository, which can only ever see the caller's single active tenant.
 ///
+/// This opens and commits its own transaction, independent of whatever your
+/// account-deletion handler does around it (Codex review finding): called
+/// *before* your account `DELETE`, a subsequent failure of that `DELETE`
+/// leaves a still-live account permanently stripped of its memberships;
+/// called *after*, a failure partway through this call itself leaves a
+/// deleted account's memberships behind — the exact stale-access gap this
+/// function exists to close. If your account-deletion handler already runs
+/// inside its own `db.tx(...)` (or you're willing to add one), call
+/// [`remove_all_memberships_on_conn`] on that same `conn` instead, so
+/// cleanup and the account `DELETE` commit or roll back together:
+///
+/// ```ignore
+/// use scoped_futures::ScopedFutureExt;
+///
+/// db.tx(move |conn| {
+///     async move {
+///         teams::routes::organizations::remove_all_memberships_on_conn(conn, user_id).await?;
+///         diesel::delete(users::table.find(user_id)).execute(conn).await?;
+///         Ok::<_, AutumnError>(())
+///     }
+///     .scope_boxed()
+/// })
+/// .await?;
+/// ```
+///
 /// ```ignore
 /// teams::routes::organizations::remove_all_memberships(user_id, &mut db).await?;
 /// ```
 pub async fn remove_all_memberships(user_id: i64, db: &mut Db) -> AutumnResult<()> {
-    db.tx(move |conn| {
-        async move {
-            let owned: Vec<Membership> = memberships::table
-                .filter(memberships::user_id.eq(user_id))
-                .filter(memberships::role.eq(Role::Owner.as_str()))
+    db.tx(move |conn| remove_all_memberships_on_conn(conn, user_id).scope_boxed())
+        .await
+}
+
+/// The building block behind [`remove_all_memberships`]: the same cleanup,
+/// run directly on an already-open `conn` instead of opening its own
+/// transaction — see that function's doc comment for when to reach for this
+/// instead, and `docs/generate-teams.md` for a full worked example.
+pub async fn remove_all_memberships_on_conn(
+    conn: &mut autumn_web::db::PooledConnection,
+    user_id: i64,
+) -> AutumnResult<()> {
+    let owned: Vec<Membership> = memberships::table
+        .filter(memberships::user_id.eq(user_id))
+        .filter(memberships::role.eq(Role::Owner.as_str()))
+        .select(Membership::as_select())
+        .for_update()
+        .load(conn)
+        .await?;
+
+    for owner_membership in &owned {
+        // Only this organization's *sole* Owner needs a successor — if
+        // another live Owner remains, ownership doesn't need transferring,
+        // and promoting anyone else here would grant an unrequested second
+        // Owner (Codex review finding).
+        let other_owner: Option<Membership> = memberships::table
+            .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
+            .filter(memberships::user_id.ne(user_id))
+            .filter(memberships::role.eq(Role::Owner.as_str()))
+            .select(Membership::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .optional()?;
+        if other_owner.is_some() {
+            continue;
+        }
+
+        let mut successor: Option<Membership> = memberships::table
+            .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
+            .filter(memberships::user_id.ne(user_id))
+            .filter(memberships::role.eq(Role::Admin.as_str()))
+            .select(Membership::as_select())
+            .order(memberships::id.asc())
+            .for_update()
+            .first(conn)
+            .await
+            .optional()?;
+        if successor.is_none() {
+            successor = memberships::table
+                .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
+                .filter(memberships::user_id.ne(user_id))
                 .select(Membership::as_select())
+                .order(memberships::id.asc())
                 .for_update()
-                .load(conn)
-                .await?;
-
-            for owner_membership in &owned {
-                // Only this organization's *sole* Owner needs a successor —
-                // if another live Owner remains, ownership doesn't need
-                // transferring, and promoting anyone else here would grant
-                // an unrequested second Owner (Codex review finding).
-                let other_owner: Option<Membership> = memberships::table
-                    .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
-                    .filter(memberships::user_id.ne(user_id))
-                    .filter(memberships::role.eq(Role::Owner.as_str()))
-                    .select(Membership::as_select())
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()?;
-                if other_owner.is_some() {
-                    continue;
-                }
-
-                let mut successor: Option<Membership> = memberships::table
-                    .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
-                    .filter(memberships::user_id.ne(user_id))
-                    .filter(memberships::role.eq(Role::Admin.as_str()))
-                    .select(Membership::as_select())
-                    .order(memberships::id.asc())
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()?;
-                if successor.is_none() {
-                    successor = memberships::table
-                        .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
-                        .filter(memberships::user_id.ne(user_id))
-                        .select(Membership::as_select())
-                        .order(memberships::id.asc())
-                        .for_update()
-                        .first(conn)
-                        .await
-                        .optional()?;
-                }
-                if let Some(successor) = successor {
-                    diesel::update(memberships::table.filter(memberships::id.eq(successor.id)))
-                        .set(memberships::role.eq(Role::Owner.as_str()))
-                        .execute(conn)
-                        .await?;
-                } else {
-                    // No other member exists at all: this organization is
-                    // about to be left with zero memberships, permanently —
-                    // revoke any pending invitations too, so a later accept
-                    // can't repopulate a headless organization no one will
-                    // ever be able to manage or promote a new Owner in
-                    // (Codex review finding).
-                    diesel::update(
-                        invitations::table
-                            .filter(invitations::tenant_id.eq(&owner_membership.tenant_id))
-                            .filter(invitations::status.eq("pending")),
-                    )
-                    .set(invitations::status.eq("revoked"))
-                    .execute(conn)
-                    .await?;
-                }
-            }
-
-            diesel::delete(memberships::table.filter(memberships::user_id.eq(user_id)))
+                .first(conn)
+                .await
+                .optional()?;
+        }
+        if let Some(successor) = successor {
+            diesel::update(memberships::table.filter(memberships::id.eq(successor.id)))
+                .set(memberships::role.eq(Role::Owner.as_str()))
                 .execute(conn)
                 .await?;
-
-            Ok::<_, AutumnError>(())
+        } else {
+            // No other member exists at all: this organization is about to
+            // be left with zero memberships, permanently — revoke any
+            // pending invitations too, so a later accept can't repopulate a
+            // headless organization no one will ever be able to manage or
+            // promote a new Owner in (Codex review finding).
+            diesel::update(
+                invitations::table
+                    .filter(invitations::tenant_id.eq(&owner_membership.tenant_id))
+                    .filter(invitations::status.eq("pending")),
+            )
+            .set(invitations::status.eq("revoked"))
+            .execute(conn)
+            .await?;
         }
-        .scope_boxed()
-    })
-    .await
+    }
+
+    diesel::delete(memberships::table.filter(memberships::user_id.eq(user_id)))
+        .execute(conn)
+        .await?;
+
+    Ok(())
 }
 
 /// Create a new organization; the caller becomes its `Owner` and it becomes
@@ -1347,6 +1381,15 @@ struct InsertInvitation {
 // `Membership::user_id`/`Invitation::invited_by_user_id`. If your app's
 // `users` table's primary key or email column differs from this, adjust the
 // two lines below to match.
+//
+// The table NAME itself is a placeholder, not introspected from your
+// project: `autumn generate auth` accepts a custom resource name (e.g.
+// `autumn generate auth Account` creates a table named `accounts`, not
+// `users`), and `teams` has no way to know which name you used when you ran
+// it — a different generator invocation entirely, with no shared state.
+// Rename `users` below to your actual auth table if it isn't the default,
+// or invitation acceptance will fail at runtime with a missing-relation
+// database error (Codex review finding).
 mod caller_email_lookup {
     diesel::table! {
         users (id) {
@@ -3031,9 +3074,7 @@ async fn main() {
             .find("let other_owner: Option<Membership> = memberships::table")
             .unwrap_or_else(|| panic!("missing other-owner guard: {organizations}"));
         assert!(
-            organizations.contains(
-                "if other_owner.is_some() {\n                    continue;\n                }"
-            ),
+            organizations.contains("if other_owner.is_some() {\n            continue;\n        }"),
             "{organizations}"
         );
         let admin_lookup_pos = organizations
@@ -3071,6 +3112,60 @@ async fn main() {
                 && organizations.contains(".filter(invitations::status.eq(\"pending\"))")
                 && organizations.contains(".set(invitations::status.eq(\"revoked\"))"),
             "{organizations}"
+        );
+    }
+
+    /// `remove_all_memberships` opens its own transaction, independent of
+    /// whatever an account-deletion handler does around it — a failure on
+    /// either side of that boundary leaves the account and its memberships
+    /// out of sync. `remove_all_memberships_on_conn` is the shared-connection
+    /// building block that lets a caller compose cleanup with their own
+    /// account `DELETE` in one outer transaction instead (Codex review
+    /// finding, mirrors `provision_default_organization`/
+    /// `provision_default_organization_on_conn`'s identical split).
+    #[test]
+    fn remove_all_memberships_on_conn_exists_for_full_atomicity() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
+        assert!(
+            organizations.contains("pub async fn remove_all_memberships_on_conn("),
+            "{organizations}"
+        );
+        assert!(
+            organizations.contains("conn: &mut autumn_web::db::PooledConnection"),
+            "{organizations}"
+        );
+        assert!(
+            organizations.contains(
+                "db.tx(move |conn| remove_all_memberships_on_conn(conn, user_id).scope_boxed())"
+            ),
+            "{organizations}"
+        );
+    }
+
+    /// The `caller_email_lookup` module's hard-coded `users` table name is a
+    /// placeholder, not introspected from the project — a project generated
+    /// with a custom `autumn generate auth` resource name (producing a
+    /// differently-named table) needs to edit it manually, or invitation
+    /// acceptance fails at runtime. This must be surfaced at generate time,
+    /// not only in prose docs a user might not read (Codex review finding).
+    #[test]
+    fn plan_warns_about_custom_auth_resource_table_name() {
+        let tmp = project();
+        let plan = plan_teams(tmp.path(), "20260101000000", false).unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("caller_email_lookup")
+                    && w.contains("autumn generate auth Account")),
+            "{:?}",
+            plan.warnings
         );
     }
 }

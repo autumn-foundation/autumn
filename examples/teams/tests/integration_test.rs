@@ -237,6 +237,60 @@ async fn invite_and_accept_as_new_user() {
         .assert_body_contains("member");
 }
 
+/// Two concurrent submissions of the same signup-and-join accept form (a
+/// double-submit, or a browser retry) must not leave one of them with a
+/// raw 422 — the invitation lock must serialize the two requests, so the
+/// loser recognizes the account the winner just created and joins it too,
+/// rather than racing the winner to the `users.email` unique constraint
+/// and failing before it ever reaches the invitation lock (Codex review
+/// finding).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_signup_and_accept_for_the_same_new_email_both_succeed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    let token = latest_invite_token(dir.path());
+
+    let (first, second) = tokio::join!(
+        client
+            .post(&format!("/invite/{token}/accept"))
+            .form("password=An0ther-Str0ng-Pa55word")
+            .send(),
+        client
+            .post(&format!("/invite/{token}/accept"))
+            .form("password=An0ther-Str0ng-Pa55word")
+            .send(),
+    );
+
+    assert_eq!(
+        [first.status.as_u16(), second.status.as_u16()],
+        [303, 303],
+        "both concurrent submissions of the same accept-and-join should succeed"
+    );
+
+    let new_member_cookie = session_cookie(&first);
+    let members_body = client
+        .get("/members")
+        .header("cookie", &new_member_cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert_eq!(
+        members_body.matches("newbie@acme.test").count(),
+        1,
+        "concurrent double-submit must not create two accounts or two memberships: {members_body}"
+    );
+}
+
 /// AC5(b): an already-authenticated user accepting an invite joins directly,
 /// no signup step.
 #[tokio::test]

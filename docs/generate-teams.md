@@ -51,6 +51,17 @@ this module has no idea what your `User` model or `users` table look like.
 `Membership::user_id` / `Invitation::invited_by_user_id` are bare `i64` with
 no foreign-key coupling to your schema.
 
+**If you generated auth with a custom resource name** (e.g.
+`autumn generate auth Account`, whose table is `accounts` rather than the
+default `users`), you have one more manual edit: `src/teams/routes/
+invitations.rs`'s `caller_email_lookup` module hard-codes a `diesel::table!
+{ users (id) { ... } }` declaration for the accept-invitation email check.
+`teams` has no way to know which name you used — it's a separate generator
+invocation with no shared state — so this is a placeholder, not something
+introspected from your project. Rename it to match your actual table, or
+every invitation acceptance will fail at runtime with a missing-relation
+database error.
+
 Two lines of integration code — the issue's ≤ 3 commands / ≤ 20 lines
 success metric — are all that's needed:
 
@@ -172,6 +183,30 @@ all sessions for this user"; a single `session.destroy()` only clears the
 call `POST /organizations` and mint a brand-new organization — that route
 has no existing membership to check against, so removing this user's old
 memberships doesn't prevent it from creating new ones.
+
+`remove_all_memberships` opens and commits its own transaction, independent
+of whatever your account-deletion handler does around it. Called before the
+account row is deleted, a subsequent failure of that delete leaves a
+still-live account permanently stripped of its memberships; called after, a
+failure partway through this call itself leaves a deleted account's
+memberships behind — the exact gap this function exists to close. If you
+need the two to commit or roll back together, wrap your own account
+`DELETE` in `db.tx(...)` and call `remove_all_memberships_on_conn` — the
+same cleanup, minus the transaction wrapper — on the same `conn`:
+
+```rust
+use scoped_futures::ScopedFutureExt;
+
+db.tx(move |conn| {
+    async move {
+        teams::routes::organizations::remove_all_memberships_on_conn(conn, user.id).await?;
+        diesel::delete(users::table.find(user.id)).execute(conn).await?;
+        Ok::<_, AutumnError>(())
+    }
+    .scope_boxed()
+})
+.await?;
+```
 
 ## Guarding routes by role
 

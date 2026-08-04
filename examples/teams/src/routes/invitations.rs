@@ -505,41 +505,58 @@ pub async fn accept_invitation(
     let (membership, target_user_id): (Membership, i64) = db
         .tx(move |conn| {
             async move {
-                let target_user_id = match joiner {
-                    Joiner::Existing(uid) => uid,
-                    Joiner::New {
-                        email,
-                        password_hash,
-                    } => {
-                        // Race guard: two concurrent accepts for the same
-                        // not-yet-existing email could both pass the
-                        // pre-transaction existence check above; `users.email`
-                        // is `UNIQUE`, so a second concurrent insert here
-                        // fails cleanly instead of creating a duplicate
-                        // account.
-                        let user: User = diesel::insert_into(users::table)
-                            .values(&NewUser {
-                                email,
-                                password_hash,
-                            })
-                            .returning(User::as_returning())
-                            .get_result(conn)
-                            .await
-                            .map_err(|_| {
-                                AutumnError::unprocessable_msg("Could not create account")
-                            })?;
-                        user.id
-                    }
-                };
-
-                // Lock the invitation row so two concurrent accepts serialize
-                // rather than race past the pending/expiry check together.
+                // Lock the invitation row FIRST — before touching `users` at
+                // all — so two concurrent accepts of the same signup-and-join
+                // form serialize on this lock rather than racing each other
+                // to the `users.email` unique constraint. Locking after the
+                // account insert (the prior order) meant the loser blocked on
+                // that constraint instead, then failed with a raw 422 even
+                // though the winner's request was about to complete the very
+                // same accept for it (Codex review finding).
                 let invitation: Invitation = invitations::table
                     .filter(invitations::id.eq(invitation_id))
                     .for_update()
                     .select(Invitation::as_select())
                     .first(conn)
                     .await?;
+
+                let target_user_id = match joiner {
+                    Joiner::Existing(uid) => uid,
+                    Joiner::New {
+                        email,
+                        password_hash,
+                    } => {
+                        // Now that concurrent accepts are serialized on the
+                        // invitation lock above, check whether the account
+                        // was already created by an earlier request for this
+                        // exact accept (the pre-transaction existence check
+                        // only ruled out a *pre-existing* account, not one
+                        // just created by a concurrent twin of this same
+                        // request) before inserting a new one.
+                        let existing_user: Option<User> = users::table
+                            .filter(users::email.eq(&email))
+                            .select(User::as_select())
+                            .first(conn)
+                            .await
+                            .optional()?;
+                        if let Some(user) = existing_user {
+                            user.id
+                        } else {
+                            let user: User = diesel::insert_into(users::table)
+                                .values(&NewUser {
+                                    email,
+                                    password_hash,
+                                })
+                                .returning(User::as_returning())
+                                .get_result(conn)
+                                .await
+                                .map_err(|_| {
+                                    AutumnError::unprocessable_msg("Could not create account")
+                                })?;
+                            user.id
+                        }
+                    }
+                };
 
                 // Reject a revoked, or expired-while-still-pending, token up
                 // front — before the existing-membership shortcut below.
