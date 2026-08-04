@@ -39,6 +39,16 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    # Two overlapping runs (e.g. two rapid tag pushes, or a tag push racing
+    # a manual dispatch) must not interleave: the older run's later
+    # `az containerapp update` could execute after the newer one and roll
+    # production back, or leave stale code serving against a schema the
+    # newer run just migrated. One queue per repo, `cancel-in-progress:
+    # false` so a run is never killed mid-migration/mid-cutover — it waits
+    # its turn instead.
+    concurrency:
+      group: azure-deploy-${{ github.repository }}
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
@@ -46,16 +56,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # A `v*` push tag or a workflow_dispatch branch name may legally
-      # contain characters Docker tags reject — not just "/" (branches like
-      # "feature/login"), but also e.g. "+" (a valid SemVer tag like
-      # "v1.2.3+build") and anything else outside Docker's
-      # [A-Za-z0-9_.-]{1,128} tag charset. Map every other character to "-"
-      # and cap the length rather than special-casing "/" alone.
-      - name: Compute a Docker-safe image tag
+      # Must be unique per run, not just per ref: two workflow_dispatch runs
+      # on the same branch would otherwise compute the identical tag despite
+      # different commits. Re-pushing bytes under a tag Azure already has
+      # configured on the Container App isn't guaranteed to register as a
+      # revision-scope change (Azure Container Apps' revision model — see
+      # https://learn.microsoft.com/en-us/azure/container-apps/revisions —
+      # keys off the image reference string, not its digest), so the old
+      # binary could keep serving against a newly migrated schema. The
+      # commit SHA is always unique; keep the sanitized ref/tag as a
+      # human-readable prefix (a `v*` push tag or a workflow_dispatch branch
+      # name may legally contain characters Docker tags reject — not just
+      # "/" in branches like "feature/login", but e.g. "+" in a SemVer tag
+      # like "v1.2.3+build" — so it still needs sanitizing).
+      - name: Compute a unique, Docker-safe image tag
         id: image_tag
         run: |
-          echo "value=$(echo -n "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-128)" >> "$GITHUB_OUTPUT"
+          SAFE_REF=$(echo -n "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-100)
+          echo "value=${SAFE_REF}-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
 
       - name: Azure login
         uses: azure/login@v2

@@ -85,7 +85,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upper/lower/digit/symbol suffix — Azure's Postgres complexity policy
   needs 3 of those 4 categories, `-hex` output is lowercase-only, and even
   `-base64` alone only samples its alphabet randomly rather than
-  guaranteeing coverage.
+  guaranteeing coverage. The generated workflow's image tag now always
+  includes the commit SHA (not just the sanitized ref) so two
+  `workflow_dispatch` runs on the same branch can never collide on an
+  identical tag — re-pushing bytes under a tag the Container App already
+  has configured isn't guaranteed to register as a revision-scope change —
+  and the job sets a per-repository `concurrency` group with
+  `cancel-in-progress: false` so overlapping runs queue instead of racing
+  each other's migration/cutover ordering.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

@@ -2117,11 +2117,15 @@ previous_secrets = []
             "azure-deploy.yml must reference the migration job by its Terraform output: {content}"
         );
 
+        // Match the actual invocations (with their line-continuation
+        // backslash), not just the bare phrase — an explanatory comment
+        // elsewhere (e.g. about concurrency) may legitimately mention
+        // "az containerapp update" in prose without a trailing "\".
         let job_pos = content
-            .find("az containerapp job start")
+            .find("az containerapp job start \\")
             .expect("migration job start must be present");
         let deploy_pos = content
-            .find("az containerapp update")
+            .find("az containerapp update \\")
             .expect("deploy step must be present");
         assert!(
             job_pos < deploy_pos,
@@ -2192,9 +2196,8 @@ previous_secrets = []
         // A `v*` push tag or a workflow_dispatch branch name may contain
         // characters Docker tags reject beyond just "/" (a branch like
         // "feature/login") — e.g. "+" (a valid SemVer tag like
-        // "v1.2.3+build"). Docker tags only allow [A-Za-z0-9_.-], up to 128
-        // characters, so every other character must be sanitized, not just
-        // "/" special-cased.
+        // "v1.2.3+build"). Docker tags only allow [A-Za-z0-9_.-], so every
+        // other character must be sanitized, not just "/" special-cased.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2205,13 +2208,56 @@ previous_secrets = []
              (not just \"/\") to \"-\": {content}"
         );
         assert!(
-            content.contains("cut -c1-128"),
-            "azure-deploy.yml must cap the computed tag at Docker's 128-character limit: \
-             {content}"
-        );
-        assert!(
             !content.contains(":${GITHUB_REF_NAME}") && !content.contains(":$GITHUB_REF_NAME"),
             "no docker/az command may use the raw, unsanitized ref as an image tag: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_image_tag_includes_commit_sha() {
+        // Two workflow_dispatch runs on the same branch would otherwise
+        // compute the identical tag despite different commits. Re-pushing
+        // bytes under a tag Azure already has configured on the Container
+        // App isn't guaranteed to register as a revision-scope change, so
+        // the old binary could keep serving against a newly migrated
+        // schema. The commit SHA is always unique per run.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("${GITHUB_SHA:0:12}"),
+            "the computed image tag must include the commit SHA, not just the \
+             sanitized ref, so repeated runs on the same branch never collide: {content}"
+        );
+        // Docker tags cap at 128 characters; reserve room for the SHA
+        // suffix rather than letting the sanitized ref alone consume it.
+        assert!(
+            content.contains("cut -c1-100"),
+            "the sanitized ref portion must leave headroom for the SHA suffix within \
+             Docker's 128-character tag limit: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_serializes_overlapping_runs() {
+        // Two overlapping runs (e.g. two rapid tag pushes, or a tag push
+        // racing a manual dispatch) must not interleave: the older run's
+        // later `az containerapp update` could execute after the newer one
+        // and roll production back.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("concurrency:"),
+            "azure-deploy.yml must define a concurrency group so overlapping runs \
+             queue instead of racing: {content}"
+        );
+        assert!(
+            content.contains("cancel-in-progress: false"),
+            "cancel-in-progress must be false — killing a run mid-migration or \
+             mid-cutover is worse than making the next run wait: {content}"
         );
     }
 

@@ -962,10 +962,20 @@ same group, and Azure RBAC granted on one resource does not inherit to a
 sibling — a principal scoped only to the app 403s the moment the workflow
 tries to start the migration job.
 
-**On `workflow_dispatch`, the image tag is derived from the selected
-branch**, not the tag that triggered a `v*` push (there isn't one). Since a
-branch name may contain `/` — invalid in a Docker tag — the workflow
-replaces it with `-` before using it as the image tag.
+**The image tag always includes the commit SHA**, e.g. `v1.2.3-a1b2c3d4e5f6`
+or `main-a1b2c3d4e5f6` on `workflow_dispatch` — not just the sanitized ref
+(a branch or tag name may contain characters Docker tags reject, like `/` in
+`feature/login` or `+` in a SemVer tag). The SHA suffix matters beyond
+uniqueness: re-running `workflow_dispatch` on the same branch without it
+would push new bytes under a tag Azure Container Apps already has configured
+on the app, which isn't guaranteed to register as a revision-scope change —
+the old binary could keep serving even after the newer run's migrations.
+
+**Overlapping runs are serialized, never interleaved.** The job sets a
+`concurrency` group per repository with `cancel-in-progress: false`, so a
+second tag push or dispatch while one is still running queues behind it
+instead of racing it — without this, the older run's `az containerapp
+update` could land after the newer one and silently roll production back.
 
 **State file security.** `terraform apply` writes `database_admin_password`,
 the derived database connection string, and `signing_secret` into
