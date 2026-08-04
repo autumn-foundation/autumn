@@ -226,6 +226,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replication lag can make `terraform apply` intermittently fail with
   `PrincipalNotFound` on a fresh apply, even though the identity it's
   granting the role to was just created successfully by that same apply.
+  The Postgres reserved-database-name guard now also covers `template0`
+  and `template1` — every Postgres cluster, on any host, is initialized
+  with those two as its own templates, not just the three Azure-specific
+  system databases the guard already listed; an app literally named either
+  one previously collided the same way. The generated `.dockerignore` now
+  also excludes `.terraform/`/`*.tfstate*`/`terraform.tfvars`: without
+  those, running `docker build .` from the crate directory (where
+  `autumn release init --target azure-container-apps` scaffolds Terraform
+  files) after `terraform apply` uploaded the plaintext state file — every
+  secret value, `sensitive` flag or not — into the build context/cache
+  even though no stage ever copies it into the final image.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

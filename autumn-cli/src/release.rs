@@ -916,6 +916,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dockerignore_excludes_terraform_state() {
+        // The azure-container-apps target scaffolds main.tf/terraform.tfvars
+        // directly alongside the Dockerfile in the same directory. Docker's
+        // build context is whatever the positional path argument points at
+        // (`docker build .`), so running that from this directory AFTER
+        // `terraform apply` would otherwise upload the plaintext
+        // terraform.tfstate — every secret value, `sensitive` flag or not —
+        // into the builder/build cache even though no stage ever COPYs it
+        // into the final image.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
+        for pattern in [".terraform/", "*.tfstate", "terraform.tfvars"] {
+            assert!(
+                content.contains(pattern),
+                ".dockerignore must exclude {pattern:?} so terraform.tfstate is never sent \
+                 to the Docker build context: {content}"
+            );
+        }
+    }
+
     // ── signing-secret smoke gate ─────────────────────────────────────────────
 
     #[test]
@@ -1493,15 +1516,24 @@ previous_secrets = []
     #[test]
     fn main_tf_postgres_database_name_avoids_reserved_names() {
         // A fresh Flexible Server already owns "postgres", "azure_maintenance",
-        // and "azure_sys" as system databases — a Cargo package literally named
-        // one of those (or "azure-sys", which sanitizes to the same underscored
-        // form) must not collide with them, or `terraform apply` fails trying
-        // to create/manage a database Azure already has.
+        // and "azure_sys" as Azure-specific system databases, plus
+        // "template0"/"template1" — every Postgres cluster, on any host, is
+        // initialized with those two as its own templates. A Cargo package
+        // literally named one of those (or "azure-sys"/"template0", which
+        // sanitize to the same underscored form) must not collide with them,
+        // or `terraform apply` fails trying to create/manage a database that
+        // already exists.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join("main.tf")).unwrap();
-        for reserved in ["postgres", "azure_maintenance", "azure_sys"] {
+        for reserved in [
+            "postgres",
+            "azure_maintenance",
+            "azure_sys",
+            "template0",
+            "template1",
+        ] {
             assert!(
                 content.contains(&format!("\"{reserved}\"")),
                 "the reserved-name guard must list {reserved:?}: {content}"

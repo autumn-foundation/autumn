@@ -138,16 +138,18 @@ locals {
   postgres_admin_login = "autumnadmin"
 
   # A fresh Flexible Server already contains "postgres", "azure_maintenance",
-  # and "azure_sys" as system databases — a Cargo package literally named one
-  # of those (or e.g. "azure-sys", which sanitizes to the same underscored
-  # name) would derive an identical database name here, and `terraform
-  # apply` fails trying to create/manage a database Azure already owns.
-  # Append a suffix in that case; re-truncate first so the suffixed name
-  # still respects the 63-byte limit even though every reserved name is far
-  # short of it today.
+  # and "azure_sys" as Azure-specific system databases, plus "template0" and
+  # "template1" — every Postgres cluster, on any host, is initialized with
+  # those two as the templates new databases are cloned from. A Cargo
+  # package literally named any of those (or e.g. "azure-sys"/"template0",
+  # which sanitize to the same underscored name) would derive an identical
+  # database name here, and `terraform apply` fails trying to create/manage
+  # a database that already exists. Append a suffix in that case;
+  # re-truncate first so the suffixed name still respects the 63-byte limit
+  # even though every reserved name is far short of it today.
   postgres_database_name_raw = substr(replace(local.app_name_hyphenated, "-", "_"), 0, 63)
   postgres_database_name = contains(
-    ["postgres", "azure_maintenance", "azure_sys"],
+    ["postgres", "azure_maintenance", "azure_sys", "template0", "template1"],
     local.postgres_database_name_raw
     ) ? "${substr(local.postgres_database_name_raw, 0, 58)}_prod" : local.postgres_database_name_raw
 }
