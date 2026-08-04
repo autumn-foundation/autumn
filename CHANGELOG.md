@@ -165,9 +165,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name, and violating resource types (Key Vault) that require a
   letter-led name rather than just an alphanumeric one. The manual deploy
   walkthrough's image tag is no longer a fixed `v1` either — like the
-  generated workflow, it now derives a unique tag (the short commit SHA)
-  so a second manual deploy can't reuse a tag the app already has
-  configured and risk not registering as a new revision. The generated
+  generated workflow, it now derives a unique tag so a second manual
+  deploy can't reuse a tag the app already has configured and risk not
+  registering as a new revision; the commit SHA alone still wasn't enough
+  (re-running the walkthrough at the same `HEAD` — uncommitted local
+  changes, or merely a fresh `AUTUMN_BUILD_TIMESTAMP` — pushes different
+  bytes under the same tag), so it now also folds in a UTC timestamp,
+  unique per build rather than per commit. The generated
   workflow's own image tag now also folds in `GITHUB_RUN_ID`/
   `GITHUB_RUN_ATTEMPT`, not just the ref and commit SHA — re-running
   `workflow_dispatch`, or clicking "Re-run jobs" on an existing run, reuses

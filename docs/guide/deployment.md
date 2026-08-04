@@ -919,13 +919,15 @@ image, run migrations, then cut the app over:
 APP_NAME="$(terraform output -raw app_name)"           # sanitized — may differ from your Cargo package name
 ACR="$(terraform output -raw acr_login_server)"
 RG="$(terraform output -raw resource_group_name)"
-# Must be unique per deploy, not a fixed "v1": re-running this block for a
-# second manual release would otherwise push new bytes under a tag Azure
-# already has configured on the app, which isn't guaranteed to register as
-# a revision-scope change (see the automated workflow's identical
-# reasoning) — the old binary could keep serving even after these
-# migrations complete.
-TAG="$(git rev-parse --short=12 HEAD)"
+# Must be unique per BUILD, not just per commit: the commit SHA alone
+# collides if you re-run this block at the same HEAD (uncommitted local
+# changes, or merely a fresh AUTUMN_BUILD_TIMESTAMP baked in below) — same
+# tag, different bytes pushed to ACR. Azure isn't guaranteed to treat a
+# re-pushed tag it already has configured on the app as a revision-scope
+# change (see the automated workflow's identical reasoning: it folds in
+# GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT for the same reason), so the old binary
+# could keep serving even after these migrations complete.
+TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
 
 az acr login --name "${ACR%%.azurecr.io}"
 # The Dockerfile's AUTUMN_BUILD_* ARGs default to empty unless passed here —
