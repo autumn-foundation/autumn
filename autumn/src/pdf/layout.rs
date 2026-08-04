@@ -107,6 +107,38 @@ fn is_non_rendered(tag: &str) -> bool {
     )
 }
 
+/// Tags that are block-level when a browser lays them out, but that can turn
+/// up *inside* a context this renderer represents as flat [`Span`]s rather
+/// than nested [`Block`]s — a list item's or table cell's content
+/// (`<li><p>First</p><p>Second</p></li>`, a `<td>` with multiple
+/// paragraphs). `inline_spans` can't give these their own [`Block`] the way
+/// `flatten_blocks` does for a top-level `<div>`, but it can still keep
+/// their text from gluing directly onto whatever comes before/after by
+/// inserting a line break around them — the smallest change that stops
+/// `<li><p>First</p><p>Second</p></li>` from rendering as "`FirstSecond`".
+fn is_block_boundary_in_inline_context(tag: &str) -> bool {
+    heading_level(tag).is_some() || matches!(tag, "p" | "div" | "blockquote" | "li")
+}
+
+/// Push a line break unless `out` is empty or already ends with one —
+/// avoids emitting consecutive/leading [`Span::Break`]s when several block
+/// boundaries are adjacent.
+fn push_block_break(out: &mut Vec<Span>) {
+    if !matches!(out.last(), None | Some(Span::Break)) {
+        out.push(Span::Break);
+    }
+}
+
+/// Drop a trailing [`Span::Break`] left over from [`push_block_break`]
+/// wrapping the *last* nested block in a finished span list (a list item, a
+/// table cell, ...) — nothing follows it, so it would only render as a
+/// stray blank line.
+fn trim_trailing_break(spans: &mut Vec<Span>) {
+    if matches!(spans.last(), Some(Span::Break)) {
+        spans.pop();
+    }
+}
+
 /// Walk `nodes` collecting inline [`Span`]s, tracking bold/italic state
 /// through `strong`/`b` and `em`/`i`, translating `br` to [`Span::Break`],
 /// and treating any other tag (including unrecognized ones) as a transparent
@@ -132,6 +164,11 @@ fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut 
                 "strong" | "b" => inline_spans(children, true, italic, depth + 1, out),
                 "em" | "i" => inline_spans(children, bold, true, depth + 1, out),
                 _ if is_non_rendered(tag) => {}
+                _ if is_block_boundary_in_inline_context(tag) => {
+                    push_block_break(out);
+                    inline_spans(children, bold, italic, depth + 1, out);
+                    push_block_break(out);
+                }
                 _ => inline_spans(children, bold, italic, depth + 1, out),
             },
         }
@@ -163,6 +200,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
                         // `cell_children` is two levels below `tr`'s `depth`
                         // (tr -> td/th -> cell_children).
                         inline_spans(cell_children, is_header, false, depth + 2, &mut spans);
+                        trim_trailing_break(&mut spans);
                         cells.push((spans, is_header));
                     }
                 }
@@ -181,6 +219,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
             _ => {
                 let mut spans = Vec::new();
                 inline_spans(children, false, false, depth + 1, &mut spans);
+                trim_trailing_break(&mut spans);
                 if !spans.is_empty() {
                     out.push(TableRow {
                         cells: vec![(spans, false)],
@@ -211,6 +250,7 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
         };
         let mut spans = Vec::new();
         inline_spans(children, false, false, depth + 1, &mut spans);
+        trim_trailing_break(&mut spans);
         out.push(Block::ListItem { marker, spans });
     }
 }
@@ -254,6 +294,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     flush(&mut pending, out);
                     let mut spans = Vec::new();
                     inline_spans(children, true, false, depth + 1, &mut spans);
+                    trim_trailing_break(&mut spans);
                     out.push(Block::Heading(level, spans));
                     continue;
                 }
@@ -268,6 +309,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                         flush(&mut pending, out);
                         let mut spans = Vec::new();
                         inline_spans(children, false, false, depth + 1, &mut spans);
+                        trim_trailing_break(&mut spans);
                         out.push(Block::Paragraph(spans));
                     }
                     // `div`/`blockquote` commonly wrap *other block
@@ -1025,6 +1067,71 @@ mod tests {
             matches!(&blocks[0], Block::Paragraph(spans) if spans == &[Span::Run {
                 text: "Quote text".to_owned(), bold: false, italic: false,
             }])
+        );
+    }
+
+    #[test]
+    fn list_item_with_nested_paragraphs_keeps_them_separate() {
+        // Regression: `<li>`'s content goes through `inline_spans`, which
+        // had no notion of a block boundary — `<li><p>First</p><p>Second</p></li>`
+        // rendered "FirstSecond" with no separator at all (worse than plain
+        // whitespace collapsing: there wasn't even a space).
+        let nodes = super::super::html::parse("<ul><li><p>First</p><p>Second</p></li></ul>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(blocks.len(), 1);
+        let Block::ListItem { spans, .. } = &blocks[0] else {
+            panic!("expected a list item block");
+        };
+        assert_eq!(
+            spans,
+            &[
+                Span::Run {
+                    text: "First".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+                Span::Break,
+                Span::Run {
+                    text: "Second".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+            ],
+            "nested paragraphs must be line-break separated, with no trailing break"
+        );
+    }
+
+    #[test]
+    fn table_cell_with_nested_paragraphs_keeps_them_separate() {
+        // Same bug as `list_item_with_nested_paragraphs_keeps_them_separate`,
+        // reported for `<td>`/`<th>` cell content.
+        let nodes = super::super::html::parse("<table><tr><td><p>A</p><p>B</p></td></tr></table>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(blocks.len(), 1);
+        let Block::Table(rows) = &blocks[0] else {
+            panic!("expected a table block");
+        };
+        assert_eq!(rows.len(), 1);
+        let (spans, is_header) = &rows[0].cells[0];
+        assert!(!is_header);
+        assert_eq!(
+            spans,
+            &[
+                Span::Run {
+                    text: "A".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+                Span::Break,
+                Span::Run {
+                    text: "B".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+            ],
+            "nested paragraphs inside a cell must be line-break separated, with no trailing break"
         );
     }
 

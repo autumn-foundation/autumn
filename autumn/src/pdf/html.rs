@@ -181,14 +181,16 @@ fn push_text(stack: &mut [(String, Vec<Node>)], text: &str) {
 /// back to treating just the `<` as literal text and retries at the very
 /// next byte), that unbounded cost gets paid again at every subsequent `<` —
 /// O(n^2) overall, the same shape of bug `decode_entities` was fixed for.
-/// Real tag names and attribute lists are essentially never anywhere near
-/// this long, so capping the window just makes a malformed/adversarial `<`
-/// fall back to being treated as literal text — same as it already would if
-/// genuinely unterminated. Kept small (not just "generous") because the
-/// tag-name allocation below is sized off this window on every match
-/// attempt — a large bound would keep the *asymptotic* cost linear but still
-/// make the constant factor expensive in practice.
-const MAX_TAG_SCAN: usize = 256;
+/// This bound must stay in place (an earlier draft that dropped it entirely
+/// reintroduced the O(n^2) scan cost) but doesn't need to be tight: the
+/// tag-name allocation below only happens *after* `>` is found, so a large
+/// window costs nothing extra on the (bounded-scan, no-allocation) failure
+/// path — only real matches pay for the window size, and a real match is
+/// one allocation per tag in the document, not per byte scanned. Sized
+/// generously (4 KiB) so a long but genuine attribute list — a Tailwind
+/// utility-class soup, several `data-*`/`aria-*` attributes — still parses
+/// instead of being rejected and leaked into the PDF as literal text.
+const MAX_TAG_SCAN: usize = 4096;
 
 fn parse_open_tag(s: &str) -> Option<(String, bool, usize)> {
     debug_assert!(s.starts_with('<'));
@@ -198,11 +200,14 @@ fn parse_open_tag(s: &str) -> Option<(String, bool, usize)> {
         return None;
     }
 
-    let window_end = rest
-        .char_indices()
-        .map(|(i, _)| i)
-        .find(|&i| i >= MAX_TAG_SCAN)
-        .unwrap_or(rest.len());
+    // Find the window boundary by byte length, not by walking `char_indices`
+    // (cheap regardless of `MAX_TAG_SCAN`'s size — no per-char iterator
+    // overhead — unlike scanning every char up to the bound), then nudge it
+    // back to a char boundary so the slice below can't panic.
+    let mut window_end = rest.len().min(MAX_TAG_SCAN);
+    while window_end > 0 && !rest.is_char_boundary(window_end) {
+        window_end -= 1;
+    }
     let window = &rest[..window_end];
 
     // Find `>` first and bail before doing any allocation if it's not in the
@@ -413,6 +418,30 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(2),
             "parse_open_tag took {:?} — looks quadratic again",
             start.elapsed()
+        );
+    }
+
+    #[test]
+    fn valid_tag_with_long_attribute_list_still_parses() {
+        // Regression: a real Tailwind-style `class` attribute easily runs
+        // past a couple hundred bytes on its own — MAX_TAG_SCAN must stay
+        // generous enough that a genuine (if verbose) opening tag doesn't
+        // get rejected and leaked into the PDF as literal `<div ...>` text.
+        let long_class = "flex items-center justify-between px-4 py-2 bg-white \
+            dark:bg-gray-900 border border-gray-200 rounded-lg shadow-sm \
+            hover:shadow-md transition-shadow duration-200 text-sm font-medium \
+            text-gray-700 dark:text-gray-300 focus:outline-none focus:ring-2 \
+            focus:ring-offset-2 data-controller=\"dropdown\" aria-label=\"menu\"";
+        assert!(
+            long_class.len() > 256,
+            "test fixture must exceed the old, too-tight window"
+        );
+        let html = format!("<div class=\"{long_class}\">Hello</div>");
+        let nodes = parse(&html);
+        assert_eq!(
+            text(&nodes),
+            "Hello",
+            "a long but well-formed opening tag must parse, not leak as literal text"
         );
     }
 
