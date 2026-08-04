@@ -94,9 +94,21 @@ jobs:
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
 
+      # The Dockerfile declares AUTUMN_BUILD_* ARGs (see its own header
+      # comment) that build.rs bakes into the binary for /actuator/info's
+      # git provenance — but ARGs default to empty unless passed at
+      # `docker build` time, and .dockerignore excludes .git from the build
+      # context, so build.rs has no other way to discover them. Without
+      # these, every image this workflow builds reports null git info.
       - name: Build release image
         run: |
-          docker build -t "$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG" .
+          docker build \
+            --build-arg AUTUMN_BUILD_GIT_SHA="$GITHUB_SHA" \
+            --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="${GITHUB_SHA:0:8}" \
+            --build-arg AUTUMN_BUILD_GIT_BRANCH="$GITHUB_REF_NAME" \
+            --build-arg AUTUMN_BUILD_GIT_DIRTY=false \
+            --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG" .
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
           AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
@@ -153,9 +165,15 @@ jobs:
 
           # Poll for completion — `az containerapp job execution list` is the
           # documented way to check a started execution's status; there is no
-          # blocking "wait" subcommand. 5 min budget (30 x 10s) comfortably
-          # covers a healthy migration; adjust if yours run longer.
-          for _ in $(seq 1 30); do
+          # blocking "wait" subcommand. Budget MUST exceed the migration
+          # job's own replica_timeout_in_seconds (600s, main.tf) — Azure
+          # self-terminates the execution at that point regardless, so
+          # polling any shorter risks reporting "timed out" on a migration
+          # that's still validly running and would have succeeded, while
+          # leaving it to keep mutating the schema in the background after
+          # this workflow has already given up and left the old app live.
+          # 660s (66 x 10s) gives 60s of margin over that ceiling.
+          for _ in $(seq 1 66); do
             STATUS=$(az containerapp job execution list \
               --name "$AZURE_MIGRATE_JOB_NAME" \
               --resource-group "$AZURE_RESOURCE_GROUP" \

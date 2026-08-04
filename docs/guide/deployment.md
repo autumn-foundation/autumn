@@ -921,7 +921,17 @@ ACR="$(terraform output -raw acr_login_server)"
 RG="$(terraform output -raw resource_group_name)"
 
 az acr login --name "${ACR%%.azurecr.io}"
-docker build -t "$ACR/$APP_NAME:v1" .
+# The Dockerfile's AUTUMN_BUILD_* ARGs default to empty unless passed here —
+# .dockerignore excludes .git from the build context, so this is the only
+# way for /actuator/info to report real git provenance (see the Dockerfile's
+# own header comment for the full --build-arg list this mirrors).
+docker build \
+  --build-arg AUTUMN_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="$(git rev-parse --short HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_DIRTY="$([ -z "$(git status --porcelain)" ] && echo false || echo true)" \
+  --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t "$ACR/$APP_NAME:v1" .
 docker push "$ACR/$APP_NAME:v1"
 
 # Run migrations to completion BEFORE updating the app — the generated
@@ -937,7 +947,7 @@ EXECUTION=$(az containerapp job start \
   --resource-group "$RG" \
   --image "$ACR/$APP_NAME:v1" \
   --query name -o tsv)
-for _ in $(seq 1 30); do
+for _ in $(seq 1 66); do   # 660s — must exceed the job's own 600s replica_timeout_in_seconds
   STATUS=$(az containerapp job execution list \
     --name "$MIGRATE_JOB" \
     --resource-group "$RG" \

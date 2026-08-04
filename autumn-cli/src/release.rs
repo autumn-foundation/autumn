@@ -228,6 +228,15 @@ pub fn init(
         }
     }
 
+    // Validate/merge .gitignore BEFORE writing any scaffold file below, not
+    // after: this can fail (an existing .gitignore that isn't valid UTF-8,
+    // say), and failing after the other files are already on disk would
+    // leave a partial, complete-looking scaffold that then blocks a retry
+    // without --force on the very files this call just created.
+    if matches!(target, Target::AzureContainerApps) {
+        ensure_azure_gitignore_entries(dir)?;
+    }
+
     // Embed assets into the binary only when the project opts in via the
     // `embed-assets` feature (as `autumn new` generates). Pre-existing apps
     // without that feature get the disk-based build (`cargo build --release`
@@ -245,10 +254,6 @@ pub fn init(
         }
         fs::write(&path, render(template, project_name, embed, split_workers))?;
         created.push(name.to_string());
-    }
-
-    if matches!(target, Target::AzureContainerApps) {
-        ensure_azure_gitignore_entries(dir)?;
     }
 
     Ok(created)
@@ -2181,6 +2186,72 @@ previous_secrets = []
     }
 
     #[test]
+    fn azure_workflow_passes_git_provenance_build_args_to_docker() {
+        // The Dockerfile's AUTUMN_BUILD_* ARGs default to empty unless
+        // passed at `docker build` time, and .dockerignore excludes .git
+        // from the build context — so without these, every image this
+        // workflow builds reports null git provenance at /actuator/info.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        for arg in [
+            "AUTUMN_BUILD_GIT_SHA",
+            "AUTUMN_BUILD_GIT_SHA_SHORT",
+            "AUTUMN_BUILD_GIT_BRANCH",
+            "AUTUMN_BUILD_GIT_DIRTY",
+            "AUTUMN_BUILD_TIMESTAMP",
+        ] {
+            assert!(
+                content.contains(&format!("--build-arg {arg}=")),
+                "azure-deploy.yml's docker build must pass --build-arg {arg}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_workflow_migration_poll_budget_exceeds_job_timeout() {
+        // main.tf sets replica_timeout_in_seconds = 600 on the migration
+        // job; Azure self-terminates the execution at that point
+        // regardless. Polling for any less risks reporting "timed out" on
+        // a migration that's still validly running (and would have
+        // succeeded), while leaving it to keep mutating the schema in the
+        // background after this workflow has already given up.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let job_timeout: u64 = main_tf
+            .split("replica_timeout_in_seconds = ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("main.tf must declare the migration job's replica_timeout_in_seconds");
+
+        let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        let iterations: u64 = workflow
+            .split("seq 1 ")
+            .nth(1)
+            .and_then(|rest| rest.split([')', ' ']).next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("the migration poll loop must use `seq 1 N`");
+        let sleep_secs: u64 = workflow
+            .split("sleep ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .and_then(|s| s.trim().parse().ok())
+            .expect("the migration poll loop must sleep a fixed number of seconds per iteration");
+        let poll_budget = iterations * sleep_secs;
+
+        assert!(
+            poll_budget > job_timeout,
+            "the poll budget ({poll_budget}s = {iterations} x {sleep_secs}s) must exceed \
+             the migration job's own replica_timeout_in_seconds ({job_timeout}s), or a \
+             still-valid migration can be falsely reported as timed out: {workflow}"
+        );
+    }
+
+    #[test]
     fn azure_workflow_never_hardcodes_credentials() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -2563,6 +2634,36 @@ previous_secrets = []
         // The original (if unreadable) content must be left untouched.
         let raw = fs::read(dir.join(".gitignore")).unwrap();
         assert_eq!(raw, vec![0xFF, 0xFE, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn azure_target_gitignore_failure_leaves_no_partial_scaffold() {
+        // The .gitignore merge must be validated BEFORE any scaffold file
+        // is written — otherwise a read failure here leaves a partial,
+        // complete-looking scaffold on disk, and a retry without --force
+        // immediately fails on the files this very call just created.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap_err();
+
+        for name in [
+            "Dockerfile",
+            ".dockerignore",
+            "autumn.production.toml.example",
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+            ".github/workflows/azure-deploy.yml",
+        ] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must not exist after init() fails on the .gitignore merge \
+                 (found a partial scaffold, which blocks retrying without --force)"
+            );
+        }
     }
 
     #[test]

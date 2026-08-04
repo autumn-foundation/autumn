@@ -136,7 +136,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protection). Reading an existing `.gitignore` that fails for a reason
   other than not existing (invalid UTF-8, a permission error) now
   propagates that error instead of silently treating it as empty and
-  overwriting the file's real content with just the Terraform entries.
+  overwriting the file's real content with just the Terraform entries —
+  and does so BEFORE any scaffold file is written, so that failure never
+  leaves a partial, complete-looking scaffold on disk that then blocks a
+  retry without `--force` on files this same call just created. The
+  migration poll budget in both the generated workflow and the manual
+  walkthrough is now 660s, comfortably past the migration job's own
+  `replica_timeout_in_seconds` (600s) — polling any shorter risked
+  reporting "timed out" on a migration that was still validly running (and
+  would have succeeded) while leaving it to keep mutating the schema in
+  the background after the deploy had already been abandoned. `docker
+  build` (both the generated workflow and the manual walkthrough) now
+  passes the `AUTUMN_BUILD_*` `--build-arg`s the Dockerfile declares —
+  without them every Azure-deployed image reported null git provenance at
+  `/actuator/info`, since those ARGs default to empty and `.dockerignore`
+  excludes `.git` from the build context.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via
