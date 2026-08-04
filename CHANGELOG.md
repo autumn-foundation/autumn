@@ -125,10 +125,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mirroring the generated workflow's. The `.gitignore` merge
   (`ensure_azure_gitignore_entries`) now applies git's own "last matching
   rule wins" semantics instead of a naive exact-line presence check: an
-  existing `.gitignore` with `terraform.tfvars` followed later by
-  `!terraform.tfvars` actually leaves the file trackable despite the
-  earlier line being present, so that case now re-appends the entry after
-  the negation rather than wrongly treating it as already protected.
+  existing `.gitignore` with `terraform.tfvars` followed later by any
+  negation — an exact `!terraform.tfvars`, or a broader wildcard like
+  `!*.tfvars`/`!*` — actually leaves the file trackable despite the
+  earlier line being present, so any of those cases now re-append the
+  entry after the negation rather than wrongly treating it as already
+  protected (matching gitignore's full glob syntax is out of scope, so any
+  negation line is conservatively treated as potentially applying, at
+  worst causing a harmless extra re-append rather than a false sense of
+  protection). Reading an existing `.gitignore` that fails for a reason
+  other than not existing (invalid UTF-8, a permission error) now
+  propagates that error instead of silently treating it as empty and
+  overwriting the file's real content with just the Terraform entries.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

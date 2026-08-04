@@ -267,19 +267,23 @@ const AZURE_GITIGNORE_ENTRIES: &[&str] = &[
 ];
 
 /// Whether `pattern` is still in effect by the end of `existing`, applying
-/// git's own "last matching rule wins" semantics: an exact `!pattern` line
-/// anywhere after a `pattern` line un-ignores it again, even though the
-/// (now-superseded) earlier line is still textually present. A naive
-/// presence check would treat that file as already protected and add
-/// nothing — exactly backwards, since the file is actually trackable.
+/// git's own "last matching rule wins" semantics. Deliberately conservative
+/// rather than a full gitignore glob engine (`*`, `**`, `?`, character
+/// classes, directory-anchoring rules): once `pattern` has appeared, ANY
+/// later negation line — not just an exact `!pattern` match — is treated
+/// as potentially un-ignoring it again, since a broader wildcard like
+/// `!*.tfvars` or a blanket `!*` also defeats it and being unable to prove
+/// a negation doesn't apply must never be mistaken for proof that it
+/// doesn't. The cost of this conservatism is, at worst, an unrelated
+/// negation elsewhere in the file causing a harmless re-append (a
+/// duplicate line) on the next run — never a false "already protected".
 fn gitignore_pattern_still_effective(existing: &str, pattern: &str) -> bool {
-    let negated = format!("!{pattern}");
     let mut effective = false;
     for line in existing.lines() {
         let line = line.trim();
         if line == pattern {
             effective = true;
-        } else if line == negated {
+        } else if effective && line.starts_with('!') {
             effective = false;
         }
     }
@@ -295,7 +299,16 @@ fn gitignore_pattern_still_effective(existing: &str, pattern: &str) -> bool {
 /// final (and therefore effective) matching rule again.
 fn ensure_azure_gitignore_entries(dir: &Path) -> std::io::Result<()> {
     let path = dir.join(".gitignore");
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    // Only a missing file is safe to default to empty. Any other read
+    // failure (invalid UTF-8, permission denied, ...) must propagate —
+    // silently treating it as "no file" would make the fs::write below
+    // replace the operator's existing (unreadable-by-us, but still real)
+    // content with just the Terraform entries.
+    let existing = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
     let missing: Vec<&str> = AZURE_GITIGNORE_ENTRIES
         .iter()
         .copied()
@@ -2505,6 +2518,51 @@ previous_secrets = []
             content[after_negation..].contains("terraform.tfvars"),
             "terraform.tfvars must be re-added after the negation that defeated it: {content}"
         );
+    }
+
+    #[test]
+    fn azure_target_reasserts_entry_after_a_broader_wildcard_negation() {
+        // A wildcard negation like "!*.tfvars" or a blanket "!*" also
+        // un-ignores "terraform.tfvars" under git's own semantics, not
+        // just an exact "!terraform.tfvars" match. Matching gitignore's
+        // full glob syntax is out of scope, so any negation line
+        // appearing after the pattern must conservatively be treated as
+        // potentially applying to it.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), "terraform.tfvars\n!*.tfvars\n").unwrap();
+
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+
+        let after_negation = content.find("!*.tfvars").unwrap() + "!*.tfvars".len();
+        assert!(
+            content[after_negation..].contains("terraform.tfvars"),
+            "terraform.tfvars must be re-added after a broader wildcard negation too: \
+             {content}"
+        );
+    }
+
+    #[test]
+    fn azure_target_propagates_gitignore_read_errors_instead_of_clobbering_it() {
+        // A read failure that ISN'T "file doesn't exist" (invalid UTF-8,
+        // permission denied, ...) must not be silently treated as "no
+        // file" — doing so would make the merge overwrite the operator's
+        // real (if unreadable-by-us) .gitignore with just the Terraform
+        // entries, destroying whatever rules were already there.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+
+        let err = init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap_err();
+        assert!(
+            matches!(err, ReleaseError::Io(_)),
+            "an unreadable .gitignore must surface as an I/O error, not be silently \
+             replaced: {err}"
+        );
+        // The original (if unreadable) content must be left untouched.
+        let raw = fs::read(dir.join(".gitignore")).unwrap();
+        assert_eq!(raw, vec![0xFF, 0xFE, 0x00, 0xFF]);
     }
 
     #[test]
