@@ -68,6 +68,48 @@ teams::routes::organizations::provision_default_organization(
 membership inserts run in one transaction on it, so a failure between the
 two can never leave an orphaned organization with no members.
 
+That covers the organization + membership pair, but not your own preceding
+user insert — a plain function call invoked *after* that insert has no way
+to join a transaction it wasn't called inside of. If your signup handler
+doesn't wrap its own user insert in a transaction (e.g.
+`autumn generate auth`'s scaffolded `signup` doesn't), a failure in
+`provision_default_organization` still leaves that account stranded with no
+organization and no way to retry signup (the email is already taken).
+
+**If you need full 3-way atomicity** (account + organization + membership
+all-or-nothing), wrap your own user insert in `db.tx(...)` and call
+`provision_default_organization_on_conn` — the same two inserts, minus the
+transaction wrapper — on the same `conn`:
+
+```rust
+use scoped_futures::ScopedFutureExt;
+
+let user: User = db
+    .tx(move |conn| {
+        async move {
+            let user: User = diesel::insert_into(users::table)
+                .values(&new_user)
+                .returning(User::as_returning())
+                .get_result(conn)
+                .await?;
+            teams::routes::organizations::provision_default_organization_on_conn(
+                conn, user.id,
+            )
+            .await?;
+            Ok::<_, AutumnError>(user)
+        }
+        .scope_boxed()
+    })
+    .await?;
+```
+
+This means inlining your account-creation insert into a transaction — a
+manual step, since `teams` and your auth generator are independent and
+neither knows about the other's schema or transaction boundaries. Not
+needed for most apps (a stranded, retriable-by-changing-the-email account
+row is a rare edge case, not silent data corruption), but available when
+you want the stronger guarantee.
+
 This deliberately does **not** touch the session — signup and "the user is
 authenticated" aren't the same event for every app. `autumn generate auth`'s
 own scaffolded `signup` creates the account but doesn't log it in: it's

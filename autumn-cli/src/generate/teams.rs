@@ -406,6 +406,16 @@ const MOD_RS: &str = r#"//! Team membership, roles, and email invitations (issue
 //!    ).await?;
 //!    ```
 //!
+//!    This covers the organization + membership pair atomically, but not
+//!    your own preceding user insert — if your signup handler doesn't wrap
+//!    that insert in a transaction (like `autumn generate auth`'s
+//!    scaffolded one), a failure here still leaves the account stranded
+//!    with no organization. For full 3-way atomicity, wrap your own user
+//!    insert in `db.tx(...)` and call
+//!    [`routes::organizations::provision_default_organization_on_conn`] on
+//!    the same `conn` instead — see `docs/generate-teams.md` for a worked
+//!    example.
+//!
 //! 2. **At login**, after your handler authenticates the user, resolve their
 //!    active organization/role and set it on the session — this is what
 //!    actually establishes the org session, on the user's first real login:
@@ -986,35 +996,59 @@ struct InsertMembership {
 /// `db` is your own signup handler's `Db` extractor: the organization and
 /// membership inserts run in one transaction on it, so a failure between
 /// the two can never leave an orphaned organization with no members. This
-/// can't extend to your own preceding user insert (a plain function call
-/// has no way to join an arbitrary caller's already-open transaction) —
-/// if you need that too, run this function's two inserts inline inside
-/// your own `db.tx(...)` block instead of calling it separately.
+/// can't extend to your own preceding user insert — a plain function call
+/// invoked *after* that insert has no way to join a transaction it wasn't
+/// called inside of (even sharing the same connection wouldn't help once
+/// the earlier insert has already committed on its own). If your signup
+/// handler creates the account outside its own transaction (e.g.
+/// `autumn generate auth`'s scaffolded `signup`, which doesn't wrap its
+/// user insert in `db.tx(...)`), a failure here still leaves that account
+/// stranded with no organization. Closing that gap needs the account
+/// insert to run inside a transaction too, with
+/// [`provision_default_organization_on_conn`] called on the same `conn` —
+/// see that function's doc comment and `docs/generate-teams.md` for the
+/// full atomic pattern.
 pub async fn provision_default_organization(user_id: i64, db: &mut Db) -> AutumnResult<()> {
-    db.tx(move |conn| {
-        async move {
-            let org: Organization = diesel::insert_into(organizations::table)
-                .values(&InsertOrganization {
-                    name: format!("User {user_id}'s Organization"),
-                })
-                .returning(Organization::as_returning())
-                .get_result(conn)
-                .await?;
+    db.tx(move |conn| provision_default_organization_on_conn(conn, user_id).scope_boxed())
+        .await
+}
 
-            diesel::insert_into(memberships::table)
-                .values(&InsertMembership {
-                    tenant_id: org.id.to_string(),
-                    user_id,
-                    role: Role::Owner.as_str().to_owned(),
-                })
-                .execute(conn)
-                .await?;
+/// The building block behind [`provision_default_organization`]: the same
+/// two inserts, run directly on an already-open `conn` instead of opening
+/// its own transaction.
+///
+/// Call this instead of [`provision_default_organization`] from *inside*
+/// your own signup handler's `db.tx(move |conn| { ... }.scope_boxed())`
+/// block — alongside your own user insert, on the same `conn` — when a
+/// failure partway through must roll back the account too, not just leave
+/// it with no organization. This is what makes true 3-way atomicity
+/// (account + organization + membership) possible despite
+/// [`provision_default_organization`] itself only being able to cover the
+/// latter two: a plain function call has no way to join a transaction it
+/// wasn't invoked inside of. See `docs/generate-teams.md` for a full
+/// worked example.
+pub async fn provision_default_organization_on_conn(
+    conn: &mut autumn_web::db::PooledConnection,
+    user_id: i64,
+) -> AutumnResult<()> {
+    let org: Organization = diesel::insert_into(organizations::table)
+        .values(&InsertOrganization {
+            name: format!("User {user_id}'s Organization"),
+        })
+        .returning(Organization::as_returning())
+        .get_result(conn)
+        .await?;
 
-            Ok::<_, AutumnError>(())
-        }
-        .scope_boxed()
-    })
-    .await
+    diesel::insert_into(memberships::table)
+        .values(&InsertMembership {
+            tenant_id: org.id.to_string(),
+            user_id,
+            role: Role::Owner.as_str().to_owned(),
+        })
+        .execute(conn)
+        .await?;
+
+    Ok(())
 }
 
 /// Create a new organization; the caller becomes its `Owner` and it becomes
@@ -2596,6 +2630,32 @@ async fn main() {
         assert!(
             !body.contains("establish_org_session"),
             "provision_default_organization must not establish a session: {body}"
+        );
+    }
+
+    /// `provision_default_organization_on_conn` must exist and take a raw
+    /// `conn` (not its own `Db`), so a caller who needs full 3-way atomicity
+    /// (account + organization + membership) can run it inside their own
+    /// `db.tx(...)` block alongside their own user insert — a plain
+    /// standalone call can never cover an insert that already committed
+    /// before it ran (Codex review finding).
+    #[test]
+    fn provision_default_organization_on_conn_exists_for_full_atomicity() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
+        assert!(
+            organizations.contains("pub async fn provision_default_organization_on_conn("),
+            "{organizations}"
+        );
+        assert!(
+            organizations.contains("conn: &mut autumn_web::db::PooledConnection"),
+            "{organizations}"
         );
     }
 
