@@ -167,7 +167,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   walkthrough's image tag is no longer a fixed `v1` either — like the
   generated workflow, it now derives a unique tag (the short commit SHA)
   so a second manual deploy can't reuse a tag the app already has
-  configured and risk not registering as a new revision.
+  configured and risk not registering as a new revision. The generated
+  workflow's own image tag now also folds in `GITHUB_RUN_ID`/
+  `GITHUB_RUN_ATTEMPT`, not just the ref and commit SHA — re-running
+  `workflow_dispatch`, or clicking "Re-run jobs" on an existing run, reuses
+  the identical ref and commit while still producing a genuinely different
+  build (a fresh `AUTUMN_BUILD_TIMESTAMP`, possibly different base-image
+  bytes), so a tag built only from ref+SHA could still collide with a
+  previous run's. The run-ordering staleness guard no longer filters by
+  status or conclusion either — it now rejects a run the moment ANY other
+  run of the workflow with a higher `run_number` exists, regardless of
+  outcome: a newer run can migrate (the actual point of no return) and
+  then fail on a later step, reporting an overall conclusion of `failure`
+  that a status-filtered check would have missed entirely.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

@@ -995,14 +995,20 @@ same group, and Azure RBAC granted on one resource does not inherit to a
 sibling — a principal scoped only to the app 403s the moment the workflow
 tries to start the migration job.
 
-**The image tag always includes the commit SHA**, e.g. `v1.2.3-a1b2c3d4e5f6`
-or `main-a1b2c3d4e5f6` on `workflow_dispatch` — not just the sanitized ref
-(a branch or tag name may contain characters Docker tags reject, like `/` in
-`feature/login` or `+` in a SemVer tag). The SHA suffix matters beyond
-uniqueness: re-running `workflow_dispatch` on the same branch without it
-would push new bytes under a tag Azure Container Apps already has configured
-on the app, which isn't guaranteed to register as a revision-scope change —
-the old binary could keep serving even after the newer run's migrations.
+**The image tag is unique per execution, not just per commit**, e.g.
+`v1.2.3-a1b2c3d4e5f6-4821903-1` — the sanitized ref, the commit SHA, the
+GitHub Actions run ID, and the run attempt number. All four matter: the
+sanitized ref alone can't be used as a Docker tag verbatim (a branch or tag
+name may contain characters Docker tags reject, like `/` in `feature/login`
+or `+` in a SemVer tag); the run ID and attempt matter beyond the commit SHA
+because re-running `workflow_dispatch` on the same branch, or clicking
+"Re-run jobs" on an existing run, reuses the identical ref *and* commit —
+yet still produces a genuinely different build (a fresh
+`AUTUMN_BUILD_TIMESTAMP`, and possibly different bytes entirely if base
+image packages updated in between). Pushing different bytes under a tag
+Azure Container Apps already has configured on the app isn't guaranteed to
+register as a revision-scope change, so without a truly unique tag the old
+binary could keep serving even after a newer run's migrations.
 
 **Overlapping runs are serialized, never interleaved.** The job sets a
 `concurrency` group per repository with `cancel-in-progress: false`, so a
@@ -1015,12 +1021,18 @@ trigger their own run against their own ref, so a same-ref check alone can't
 see a newer release land under a different tag. The workflow instead checks
 — immediately before migrating, as late as practical — whether any other run
 of this same workflow with a higher `run_number` (GitHub's own counter,
-monotonic in trigger order regardless of which ref triggered it) is either
-still active OR has *already completed successfully*: if GitHub scheduled
-the newer run first and it already finished deploying by the time this
-older run gets here, proceeding would migrate/deploy older code over a
-release that already went out, so both cases abort rather than deploy out of
-order.
+monotonic in trigger order regardless of which ref triggered it) exists at
+all, regardless of its status or conclusion, and aborts if so. That last
+part is deliberate: filtering to only "still active" or "completed
+successfully" runs isn't enough, because a newer run can migrate — the
+actual point of no return, since the schema is advanced at that point — and
+then fail on the deploy step *after* migrating, reporting an overall
+conclusion of `failure`. There's no cheap way to tell "failed before
+migrating" apart from "failed after migrating" from a run's top-level
+status, so the guard treats the mere existence of any newer run as
+disqualifying: if a newer run failed for an unrelated CI reason before ever
+reaching migration, the fix is to re-trigger it, not to let an older run
+sneak through in the meantime.
 
 **The app's own hostname is a trusted host, automatically.** Autumn's
 `prod` profile fails fast at startup — the process never binds — when

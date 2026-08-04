@@ -2473,28 +2473,41 @@ previous_secrets = []
     }
 
     #[test]
-    fn azure_workflow_image_tag_includes_commit_sha() {
+    fn azure_workflow_image_tag_is_unique_per_execution() {
         // Two workflow_dispatch runs on the same branch would otherwise
-        // compute the identical tag despite different commits. Re-pushing
-        // bytes under a tag Azure already has configured on the Container
-        // App isn't guaranteed to register as a revision-scope change, so
-        // the old binary could keep serving against a newly migrated
-        // schema. The commit SHA is always unique per run.
+        // compute the identical tag despite different commits — the commit
+        // SHA guards against that. But re-running workflow_dispatch on the
+        // same branch, or clicking "Re-run jobs" on an existing run, reuses
+        // the identical ref AND commit while still producing a genuinely
+        // different build (a fresh AUTUMN_BUILD_TIMESTAMP, possibly
+        // different base-image bytes) — so the tag must also include
+        // GITHUB_RUN_ID (unique per trigger) and GITHUB_RUN_ATTEMPT
+        // (disambiguates re-runs of that same trigger) to be unique per
+        // actual execution, not just per commit. Re-pushing bytes under a
+        // tag Azure already has configured on the Container App isn't
+        // guaranteed to register as a revision-scope change, so the old
+        // binary could keep serving against a newly migrated schema.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
         assert!(
             content.contains("${GITHUB_SHA:0:12}"),
-            "the computed image tag must include the commit SHA, not just the \
-             sanitized ref, so repeated runs on the same branch never collide: {content}"
+            "the computed image tag must include the commit SHA: {content}"
         );
-        // Docker tags cap at 128 characters; reserve room for the SHA
-        // suffix rather than letting the sanitized ref alone consume it.
         assert!(
-            content.contains("cut -c1-100"),
-            "the sanitized ref portion must leave headroom for the SHA suffix within \
-             Docker's 128-character tag limit: {content}"
+            content.contains("${GITHUB_RUN_ID}") && content.contains("${GITHUB_RUN_ATTEMPT}"),
+            "the computed image tag must also include the run ID and run attempt, so \
+             a re-run of the same trigger (same ref, same commit) never collides with \
+             the original run's tag: {content}"
+        );
+        // Docker tags cap at 128 characters; reserve room for the
+        // SHA/run-id/run-attempt suffix rather than letting the sanitized
+        // ref alone consume it.
+        assert!(
+            content.contains("cut -c1-80"),
+            "the sanitized ref portion must leave headroom for the rest of the tag \
+             within Docker's 128-character limit: {content}"
         );
     }
 
@@ -2527,8 +2540,8 @@ previous_secrets = []
         // enough either: two DIFFERENT immutable tags (e.g. v1 then v2)
         // each trigger their own run against their own never-moving ref,
         // so the guard must be ref-agnostic — comparing run_number (GitHub's
-        // own monotonic-in-trigger-order counter) against other still-active
-        // runs of this workflow, not "has my own ref moved".
+        // own monotonic-in-trigger-order counter) against other runs of
+        // this workflow, not "has my own ref moved".
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2542,22 +2555,25 @@ previous_secrets = []
             "the guard must compare against other runs' run_number, not just whether \
              this run's own ref has moved: {content}"
         );
+        // The guard must NOT filter by status/conclusion (e.g. only
+        // "in_progress"/"queued", or "completed" + conclusion == "success")
+        // — a newer run can migrate (the actual point of no return, since
+        // the schema is advanced at that point) and then fail on a LATER
+        // step, reporting an overall conclusion of "failure". There's no
+        // cheap way to tell "failed before migrating" apart from "failed
+        // after migrating" from a run's top-level status, so the mere
+        // existence of any newer run must be disqualifying, full stop.
+        let guard_step = content
+            .split("Abort if a newer run of this workflow exists")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("the run_number staleness guard step must be present");
         assert!(
-            // The template's jq filter is itself inside a double-quoted
-            // bash argument, so its own string literals are backslash-
-            // escaped: \"in_progress\", not a bare "in_progress".
-            content.contains("\\\"in_progress\\\"") && content.contains("\\\"queued\\\""),
-            "the guard must check both in-progress and queued runs: {content}"
-        );
-        assert!(
-            // If GitHub scheduled a higher-numbered run first and it
-            // already finished deploying by the time this older run gets
-            // here, "queued"/"in_progress" alone won't see it — it must
-            // also reject a newer run that already completed successfully.
-            content.contains("\\\"completed\\\"")
-                && content.contains(".conclusion == \\\"success\\\""),
-            "the guard must also reject a newer run that has already completed \
-             successfully, not just ones still queued or in progress: {content}"
+            !guard_step.contains("in_progress")
+                && !guard_step.contains("queued")
+                && !guard_step.contains("conclusion"),
+            "the guard must not filter by status or conclusion — any newer run_number \
+             must disqualify this run regardless of outcome: {guard_step}"
         );
 
         let guard_pos = content

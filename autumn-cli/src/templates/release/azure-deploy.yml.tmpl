@@ -73,14 +73,26 @@ jobs:
       - name: Compute a unique, Docker-safe image tag
         id: image_tag
         run: |
-          SAFE_REF=$(echo -n "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-100)
+          SAFE_REF=$(echo -n "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-80)
           # Docker's tag grammar requires the FIRST character to be a word
           # character ([A-Za-z0-9_]) — "." and "-" are allowed elsewhere but
           # not at position zero. A ref starting with e.g. "+hotfix" would
           # otherwise sanitize to a leading "-", which `docker build` rejects.
           SAFE_REF=$(echo -n "$SAFE_REF" | sed -E 's/^[.-]+//')
           [ -z "$SAFE_REF" ] && SAFE_REF="build"
-          echo "value=${SAFE_REF}-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          # GITHUB_SHA alone isn't enough: a workflow_dispatch re-run (or
+          # clicking "Re-run jobs") on the same ref reuses the identical
+          # commit, so a tag built only from ref+SHA collides with the
+          # previous run's tag despite this being a genuinely different
+          # build — a fresh AUTUMN_BUILD_TIMESTAMP, and possibly different
+          # bytes entirely if base image packages updated in between.
+          # Pushing different bytes under a tag Azure already has
+          # configured on the app isn't guaranteed to register as a
+          # revision-scope change. GITHUB_RUN_ID is unique per trigger;
+          # GITHUB_RUN_ATTEMPT disambiguates re-runs of that same trigger —
+          # together they make the tag unique per actual execution, not
+          # just per commit.
+          echo "value=${SAFE_REF}-${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
       - name: Azure login
         uses: azure/login@v2
@@ -131,21 +143,28 @@ jobs:
       # increasing in trigger order for this workflow file regardless of
       # which ref triggered it — so check right before the point of no
       # return (migrating/deploying) whether any OTHER run of this workflow
-      # with a higher run_number is either still active OR has *already
-      # completed successfully* (not just "queued"/"in_progress": if GitHub
-      # scheduled a higher-numbered run first and it already finished
-      # deploying by the time this older run gets here, this run must still
-      # be rejected — proceeding would migrate/deploy older code over a
-      # newer release that already went out).
-      - name: Abort if a newer run of this workflow has started or finished
+      # with a higher run_number exists AT ALL, regardless of its status or
+      # conclusion. Filtering to only "still active" or "completed
+      # successfully" runs is NOT enough: a newer run can migrate (the
+      # actual point of no return — the schema is advanced) and then fail
+      # on the deploy step after it, reporting an overall conclusion of
+      # "failure" — a status-filtered check would miss it entirely and let
+      # this older run migrate/deploy right over a release whose schema
+      # change already went out. There's no cheap way to distinguish
+      # "failed before migrating" from "failed after migrating" from a
+      # run's top-level status, so treat the mere existence of any newer
+      # run as disqualifying, full stop — if it failed for an unrelated CI
+      # reason before ever reaching migration, the fix is to re-trigger it,
+      # not to let an older run sneak through in the meantime.
+      - name: Abort if a newer run of this workflow exists
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           NEWER=$(gh api "repos/${{ github.repository }}/actions/workflows/azure-deploy.yml/runs?per_page=50" \
-            --jq "[.workflow_runs[] | select(.run_number > ${{ github.run_number }} and ((.status == \"in_progress\") or (.status == \"queued\") or (.status == \"completed\" and .conclusion == \"success\")))] | length")
+            --jq "[.workflow_runs[] | select(.run_number > ${{ github.run_number }})] | length")
           if [ "$NEWER" -gt 0 ]; then
-            echo "::error::a newer run of this workflow (run_number > ${{ github.run_number }}) is already active or has already deployed successfully — this run is superseded, aborting before migrating/deploying out of order"
+            echo "::error::a newer run of this workflow (run_number > ${{ github.run_number }}) exists — this run is superseded, aborting before migrating/deploying out of order"
             exit 1
           fi
 
