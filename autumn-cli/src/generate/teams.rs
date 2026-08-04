@@ -1146,17 +1146,25 @@ pub async fn remove_all_memberships_on_conn(
     conn: &mut autumn_web::db::PooledConnection,
     user_id: i64,
 ) -> AutumnResult<()> {
-    let owned: Vec<Membership> = memberships::table
+    // Deliberately NOT `for_update()` here: this is just a scan to discover
+    // which organizations need per-owner handling below, where the actual
+    // locks are taken (org row first, then this user's own membership row
+    // only after that). Locking these rows up front — before any org row —
+    // is what caused a real deadlock (Codex review finding): if two owners
+    // of the *same* organization delete their accounts concurrently, each
+    // would lock its own row here first, then each need the org lock *and*
+    // the other's row (via the other-owner check below) — a lock-order
+    // cycle Postgres has no choice but to break by aborting one deletion.
+    let owned_tenant_ids: Vec<String> = memberships::table
         .filter(memberships::user_id.eq(user_id))
         .filter(memberships::role.eq(Role::Owner.as_str()))
-        .select(Membership::as_select())
-        .for_update()
+        .select(memberships::tenant_id)
         .load(conn)
         .await?;
 
-    for owner_membership in &owned {
-        // Lock the organization row FIRST — before anything else for this
-        // organization — as the shared serialization point with
+    for tenant_id in &owned_tenant_ids {
+        // Lock the organization row FIRST — before any membership row for
+        // this organization — as the shared serialization point with
         // `accept_invitation` (see that function's own matching org-row
         // lock). Without a lock shared across both functions, this
         // successor lookup below could decide "no successor exists" a
@@ -1168,7 +1176,7 @@ pub async fn remove_all_memberships_on_conn(
         // memberships/invitations, in that same order, so whichever gets
         // here first completes wholly before the other proceeds, instead
         // of deadlocking.
-        let org_id: i64 = owner_membership.tenant_id.parse().map_err(|_| {
+        let org_id: i64 = tenant_id.parse().map_err(|_| {
             AutumnError::internal_server_error_msg("Corrupt organization id in membership")
         })?;
         organizations::table
@@ -1178,6 +1186,25 @@ pub async fn remove_all_memberships_on_conn(
             .first(conn)
             .await
             .optional()?;
+
+        // Re-fetch and lock this user's own membership row now that the
+        // organization lock is held — the unlocked scan above could be
+        // stale (e.g. a concurrent `change_role` may have already demoted
+        // this user in this organization).
+        let Some(owner_membership) = memberships::table
+            .filter(memberships::tenant_id.eq(tenant_id))
+            .filter(memberships::user_id.eq(user_id))
+            .select(Membership::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .optional()?
+        else {
+            continue;
+        };
+        if owner_membership.role != Role::Owner.as_str() {
+            continue;
+        }
 
         // Only this organization's *sole* Owner needs a successor — if
         // another live Owner remains, ownership doesn't need transferring,
@@ -1476,6 +1503,25 @@ pub async fn create_invitation(
     let insert_role = role.as_str().to_owned();
     db.tx(move |conn| {
         async move {
+            // Lock the organization row FIRST — the same shared
+            // serialization point `accept_invitation`/
+            // `remove_all_memberships_on_conn` use — before issuing a new
+            // pending invitation. Without it, an in-flight account
+            // deletion's cleanup could decide "no successor exists",
+            // revoke every pending invitation, and delete the
+            // organization's last Owner, all while this uncoordinated
+            // transaction inserts a fresh pending invitation the cleanup
+            // never saw — accepting that token later repopulates the
+            // organization without an Owner, recreating the exact
+            // invariant cleanup exists to prevent (Codex review finding).
+            organizations::table
+                .find(org_id)
+                .for_update()
+                .select(Organization::as_select())
+                .first(conn)
+                .await
+                .optional()?;
+
             // Revoke any other still-pending invitation to this email in
             // this organization before creating the new one — otherwise
             // both tokens would stay independently valid, and accepting
@@ -1899,6 +1945,25 @@ pub async fn resend_invitation(
     let new: Invitation = db
         .tx(move |conn| {
             async move {
+                // Lock the organization row FIRST — the same shared
+                // serialization point `create_invitation`/
+                // `accept_invitation`/`remove_all_memberships_on_conn` use
+                // — before issuing the replacement invitation, for the same
+                // reason `create_invitation` does (see its own comment):
+                // this is another path that issues a fresh pending
+                // invitation and must not slip past an in-flight account
+                // deletion's cleanup (Codex review finding).
+                let org_id: i64 = tenant_id.parse().map_err(|_| {
+                    AutumnError::internal_server_error_msg("Corrupt organization id in invitation")
+                })?;
+                organizations::table
+                    .find(org_id)
+                    .for_update()
+                    .select(Organization::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+
                 // Lock and re-check status inside the transaction: a
                 // double-clicked resend (or two concurrent ones) must not
                 // both pass a stale "it's pending" read from before the
@@ -1985,13 +2050,17 @@ const ROUTES_MEMBERS_RS: &str = r#"//! Member-management surface: list members +
 
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
+use autumn_web::reexports::scoped_futures::ScopedFutureExt;
 use autumn_web::security::CsrfToken;
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 
-use crate::teams::models::{ChangeRoleForm, Invitation, Membership, UpdateMembership};
+use crate::teams::models::{ChangeRoleForm, Invitation, Membership};
 use crate::teams::repositories::{
     InvitationRepository, MembershipRepository, PgInvitationRepository, PgMembershipRepository,
 };
 use crate::teams::role::{Role, require_role};
+use crate::teams::schema::memberships;
 
 use super::{csrf_value, minimal_page};
 
@@ -2112,6 +2181,8 @@ pub async fn list_members(
 #[post("/members/{id}/role")]
 pub async fn change_role(
     session: Session,
+    mut db: Db,
+    Tenant(tenant_id): Tenant,
     membership_repo: PgMembershipRepository,
     Path(membership_id): Path<i64>,
     Form(form): Form<ChangeRoleForm>,
@@ -2126,36 +2197,53 @@ pub async fn change_role(
         ));
     }
 
-    let memberships = membership_repo.find_all().await?;
-    let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
-        return Err(AutumnError::not_found_msg("Member not found"));
-    };
-    // The `Owner > Admin` hierarchy must hold regardless of how many owners
-    // exist: an Admin changing an Owner's role — even with other owners
-    // still in place — is a demotion of a higher role by a lower one.
-    if target.role == Role::Owner.as_str() && caller_role != Role::Owner {
-        return Err(AutumnError::forbidden_msg(
-            "Only an owner can change another owner's role",
-        ));
-    }
-    if target.role == Role::Owner.as_str()
-        && new_role != Role::Owner
-        && owner_count(&memberships) <= 1
-    {
-        return Err(AutumnError::conflict_msg(
-            "Cannot demote the last owner of an organization",
-        ));
-    }
+    // Raw query (not the `tenant_scoped` repository's plain `find_all()`)
+    // inside one locked transaction: reading the owner count and mutating
+    // the target must be atomic, or two concurrent requests each demoting/
+    // removing a *different* one of exactly two remaining owners could both
+    // read the same two-owner snapshot, both pass the last-owner check
+    // below, and leave the organization with none (Codex review finding —
+    // mirrors `examples/teams/src/routes/members.rs`'s identical fix).
+    db.tx(move |conn| {
+        async move {
+            let memberships: Vec<Membership> = memberships::table
+                .filter(memberships::tenant_id.eq(&tenant_id))
+                .for_update()
+                .select(Membership::as_select())
+                .load(conn)
+                .await?;
+            let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
+                return Err(AutumnError::not_found_msg("Member not found"));
+            };
+            // The `Owner > Admin` hierarchy must hold regardless of how many
+            // owners exist: an Admin changing an Owner's role — even with
+            // other owners still in place — is a demotion of a higher role
+            // by a lower one.
+            if target.role == Role::Owner.as_str() && caller_role != Role::Owner {
+                return Err(AutumnError::forbidden_msg(
+                    "Only an owner can change another owner's role",
+                ));
+            }
+            if target.role == Role::Owner.as_str()
+                && new_role != Role::Owner
+                && owner_count(&memberships) <= 1
+            {
+                return Err(AutumnError::conflict_msg(
+                    "Cannot demote the last owner of an organization",
+                ));
+            }
 
-    membership_repo
-        .update(
-            membership_id,
-            &UpdateMembership {
-                role: Patch::Set(new_role.as_str().to_owned()),
-                ..Default::default()
-            },
-        )
-        .await?;
+            diesel::update(memberships::table.filter(memberships::id.eq(membership_id)))
+                .set(memberships::role.eq(new_role.as_str()))
+                .execute(conn)
+                .await?;
+
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
+
     Ok(Redirect::to("/members").into_response())
 }
 
@@ -2166,27 +2254,50 @@ pub async fn change_role(
 #[post("/members/{id}/remove")]
 pub async fn remove_member(
     session: Session,
+    mut db: Db,
+    Tenant(tenant_id): Tenant,
     membership_repo: PgMembershipRepository,
     Path(membership_id): Path<i64>,
 ) -> AutumnResult<Response> {
     let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
 
-    let memberships = membership_repo.find_all().await?;
-    let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
-        return Err(AutumnError::not_found_msg("Member not found"));
-    };
-    if target.role == Role::Owner.as_str() && caller_role != Role::Owner {
-        return Err(AutumnError::forbidden_msg(
-            "Only an owner can remove another owner",
-        ));
-    }
-    if target.role == Role::Owner.as_str() && owner_count(&memberships) <= 1 {
-        return Err(AutumnError::conflict_msg(
-            "Cannot remove the last owner of an organization",
-        ));
-    }
+    // Same race as `change_role` (see its comment): the owner-count check
+    // and the removal must run inside one locked transaction, or two
+    // concurrent requests removing two different owners could both pass
+    // the last-owner check and leave the organization with none (Codex
+    // review finding).
+    db.tx(move |conn| {
+        async move {
+            let memberships: Vec<Membership> = memberships::table
+                .filter(memberships::tenant_id.eq(&tenant_id))
+                .for_update()
+                .select(Membership::as_select())
+                .load(conn)
+                .await?;
+            let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
+                return Err(AutumnError::not_found_msg("Member not found"));
+            };
+            if target.role == Role::Owner.as_str() && caller_role != Role::Owner {
+                return Err(AutumnError::forbidden_msg(
+                    "Only an owner can remove another owner",
+                ));
+            }
+            if target.role == Role::Owner.as_str() && owner_count(&memberships) <= 1 {
+                return Err(AutumnError::conflict_msg(
+                    "Cannot remove the last owner of an organization",
+                ));
+            }
 
-    membership_repo.delete_by_id(membership_id).await?;
+            diesel::delete(memberships::table.filter(memberships::id.eq(membership_id)))
+                .execute(conn)
+                .await?;
+
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
+
     Ok(Redirect::to("/members").into_response())
 }
 "#;
@@ -3262,6 +3373,125 @@ async fn main() {
         assert!(
             cleanup_org_lock_pos < cleanup_other_owner_pos,
             "remove_all_memberships_on_conn must lock organizations before checking for a successor"
+        );
+    }
+
+    /// `remove_all_memberships_on_conn`'s initial scan for which
+    /// organizations to process must NOT lock the rows it finds — locking
+    /// a user's own membership row before the organization row created a
+    /// real deadlock: two owners of the *same* organization deleting their
+    /// accounts concurrently would each lock their own row first, then
+    /// each need the org lock *and* the other's row (via the other-owner
+    /// check), a lock-order cycle Postgres can only break by aborting one
+    /// deletion (Codex review finding).
+    #[test]
+    fn remove_all_memberships_on_conn_does_not_lock_the_initial_scan() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
+        assert!(
+            organizations.contains(
+                "let owned_tenant_ids: Vec<String> = memberships::table\n        .filter(memberships::user_id.eq(user_id))\n        .filter(memberships::role.eq(Role::Owner.as_str()))\n        .select(memberships::tenant_id)\n        .load(conn)\n        .await?;"
+            ),
+            "{organizations}"
+        );
+        // The user's own membership row for each organization must be
+        // re-locked only after the organization lock.
+        let org_lock_pos = organizations
+            .find("organizations::table\n            .find(org_id)\n            .for_update()")
+            .unwrap();
+        let own_row_relock_pos = organizations
+            .find("let Some(owner_membership) = memberships::table")
+            .unwrap();
+        assert!(org_lock_pos < own_row_relock_pos);
+    }
+
+    /// `create_invitation` and `resend_invitation` both mint a fresh
+    /// pending invitation — each must lock the organization row first, the
+    /// same shared serialization point `accept_invitation`/
+    /// `remove_all_memberships_on_conn` use. Without it, an in-flight
+    /// account deletion's cleanup could decide "no successor exists,"
+    /// revoke every pending invitation, and delete the last Owner, while
+    /// one of these uncoordinated transactions inserts a fresh invitation
+    /// the cleanup never saw — repopulating the organization without an
+    /// Owner once accepted (Codex review finding).
+    #[test]
+    fn create_and_resend_invitation_lock_organizations_before_issuing_a_token() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+
+        let create_org_lock_pos = invitations
+            .find("organizations::table\n                .find(org_id)\n                .for_update()")
+            .unwrap_or_else(|| panic!("missing org-row lock in create_invitation: {invitations}"));
+        let create_insert_pos = invitations
+            .find("diesel::insert_into(invitations::table)")
+            .unwrap();
+        assert!(
+            create_org_lock_pos < create_insert_pos,
+            "create_invitation must lock organizations before inserting"
+        );
+
+        let resend_org_lock_pos = invitations
+            .find("organizations::table\n                    .find(org_id)\n                    .for_update()")
+            .unwrap_or_else(|| panic!("missing org-row lock in resend_invitation: {invitations}"));
+        let resend_status_check_pos = invitations
+            .find("if current.status != \"pending\"")
+            .unwrap();
+        assert!(
+            resend_org_lock_pos < resend_status_check_pos,
+            "resend_invitation must lock organizations before its own invitation-status recheck"
+        );
+    }
+
+    /// `change_role`/`remove_member` must read the owner count and perform
+    /// the mutation inside one locked transaction, not a separate
+    /// `find_all()` followed by an independent `.update()`/
+    /// `.delete_by_id()` — otherwise two concurrent requests each
+    /// demoting/removing a *different* one of exactly two remaining owners
+    /// could both read the same two-owner snapshot and leave the
+    /// organization with none (Codex review finding — mirrors
+    /// `examples/teams/src/routes/members.rs`'s identical, earlier fix).
+    #[test]
+    fn generated_change_role_and_remove_member_lock_memberships_transactionally() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let members = fs::read_to_string(tmp.path().join("src/teams/routes/members.rs")).unwrap();
+        assert!(
+            !members.contains("membership_repo.update("),
+            "change_role must no longer use the non-transactional repository update: {members}"
+        );
+        assert!(
+            !members.contains("membership_repo.delete_by_id("),
+            "remove_member must no longer use the non-transactional repository delete: {members}"
+        );
+        assert_eq!(
+            members.matches("db.tx(move |conn| {").count(),
+            2,
+            "both change_role and remove_member must run inside a locked transaction: {members}"
+        );
+        assert_eq!(
+            members
+                .matches(
+                    ".filter(memberships::tenant_id.eq(&tenant_id))\n                .for_update()"
+                )
+                .count(),
+            2,
+            "both handlers must lock every membership row in the active organization: {members}"
         );
     }
 }
