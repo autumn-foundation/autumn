@@ -11,6 +11,16 @@ maud = { version = "0.27", features = ["axum"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+example-e2e = { path = "../../example-e2e" }
+
+[features]
+# Enable the headless-browser system smoke. Requires Chromium on the host.
+#   cargo test -p invoice --features system-tests --test smoke -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"
 
 [lints.rust]
 unsafe_code = "forbid"

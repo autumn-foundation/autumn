@@ -4151,6 +4151,7 @@ version = "0.1.0"
 dependencies = [
  "autumn-web",
  "chrono",
+ "example-e2e",
  "maud",
  "tokio",
 ]
