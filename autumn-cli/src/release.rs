@@ -337,6 +337,28 @@ condition: service_completed_successfully\n    restart: unless-stopped\n";
 /// jobs backend so enqueues land in the queue the worker process drains.
 const WEB_ROLE_ENV: &str = "\n      AUTUMN_ROLE: web\n      AUTUMN_JOBS__BACKEND: postgres";
 
+/// Sanitize `name` into an Azure Container Apps-safe identifier: lowercase
+/// alphanumerics and hyphens only. Cargo package names (the default
+/// `project_name`) may legally contain underscores or uppercase letters,
+/// both invalid in Container App/environment names, so anything outside
+/// that set becomes a hyphen.
+///
+/// Mirrors `local.app_name_safe` in `main.tf.tmpl`
+/// (`lower(replace(var.app_name, "/[^a-zA-Z0-9-]/", "-"))`) byte-for-byte —
+/// the azure-deploy.yml workflow is plain YAML with no Terraform to compute
+/// this for it, so it needs the identical name baked in at scaffold time.
+fn azure_safe_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) -> String {
     let (build_step, static_copy) = if embed {
         (
@@ -367,6 +389,7 @@ fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) 
     template
         .replace("{{worker_service}}", worker_service)
         .replace("{{app_role_env}}", web_role_env)
+        .replace("{{azure_app_name}}", &azure_safe_name(project_name))
         .replace("{{project_name}}", project_name)
         .replace(
             "{{rust_version}}",
@@ -1440,6 +1463,124 @@ previous_secrets = []
     }
 
     #[test]
+    fn main_tf_derives_database_url_from_created_postgres_server() {
+        // A single `terraform apply` must be enough: the connection string
+        // is computed from the Postgres server this same apply creates
+        // (its FQDN + the admin password variable), never taken as a
+        // separate pre-computed `var.database_url` input.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_postgresql_flexible_server.this.fqdn"),
+            "main.tf must derive the database URL from the Postgres server's own FQDN: {content}"
+        );
+        assert!(
+            !content.contains("var.database_url"),
+            "main.tf must not reference a database_url variable: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_container_apps_family_resources_use_sanitized_name() {
+        // Log Analytics, the Container Apps environment, the app, its
+        // container, and the migration job all require lowercase
+        // alphanumerics-and-hyphens — unlike ACR/Key Vault/Postgres/Redis,
+        // they DO allow hyphens, so they share `local.app_name_safe` (not
+        // `app_name_alnum`, which strips hyphens too) rather than raw
+        // `var.app_name`, which may contain underscores/uppercase from a
+        // Cargo package name.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+
+        for resource in [
+            "azurerm_log_analytics_workspace\" \"this",
+            "azurerm_container_app_environment\" \"this",
+            "azurerm_container_app\" \"this",
+            "azurerm_container_app_job\" \"migrate",
+        ] {
+            let block = content
+                .split(&format!("resource \"{resource}\""))
+                .nth(1)
+                .unwrap_or_else(|| {
+                    panic!("main.tf must declare resource \"{resource}\": {content}")
+                });
+            let name_line = block
+                .lines()
+                .find(|l| l.trim_start().starts_with("name"))
+                .unwrap_or_else(|| panic!("{resource} must set a name: {block}"));
+            assert!(
+                name_line.contains("local.app_name_safe"),
+                "{resource} must use the sanitized local.app_name_safe, not raw \
+                 var.app_name or a literal project name: {name_line}"
+            );
+        }
+
+        assert!(
+            !content.contains("\"{{project_name}}\""),
+            "main.tf must not hardcode the raw (unsanitized) project name as a \
+             resource identifier: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_uses_bootstrap_image_and_ignores_later_image_drift() {
+        // Container Apps must pull an image to create the app's/job's first
+        // revision, but a brand-new ACR has none yet, so Terraform points
+        // both at a public placeholder and then ignores further image
+        // changes so a later `terraform apply` doesn't revert a live
+        // `az containerapp update`/job deploy back to the placeholder.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("image  = var.bootstrap_image")
+                || content.contains("image = var.bootstrap_image"),
+            "main.tf must set the container image to var.bootstrap_image: {content}"
+        );
+        assert_eq!(
+            content
+                .matches("ignore_changes = [template[0].container[0].image]")
+                .count(),
+            2,
+            "both the app and the migration job must ignore image drift after bootstrap: {content}"
+        );
+        assert!(
+            !content.contains("${var.image_tag}"),
+            "main.tf must not build the Terraform-managed image from var.image_tag — \
+             CI manages the real image out-of-band after bootstrap: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_has_migration_job() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_container_app_job\" \"migrate\""),
+            "main.tf must provision a one-shot migration Container Apps Job: {content}"
+        );
+        assert!(
+            content.contains("manual_trigger_config"),
+            "the migration job must only run when CI explicitly starts it: {content}"
+        );
+        assert!(
+            content.contains("autumn migrate"),
+            "the migration job must run `autumn migrate`: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_DATABASE__PRIMARY_URL"),
+            "the migration job must be wired to the same database secret as the app: {content}"
+        );
+    }
+
+    #[test]
     fn main_tf_wires_redis_url_into_container_app_when_enabled() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -1541,8 +1682,8 @@ previous_secrets = []
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
         assert!(
-            content.contains("variable \"database_url\""),
-            "variables.tf must declare a database_url secret variable: {content}"
+            content.contains("variable \"database_admin_password\""),
+            "variables.tf must declare a database_admin_password secret variable: {content}"
         );
         assert!(
             content.contains("variable \"signing_secret\""),
@@ -1561,6 +1702,37 @@ previous_secrets = []
     }
 
     #[test]
+    fn variables_tf_does_not_declare_database_url() {
+        // A single `terraform apply` must succeed without a second, targeted
+        // apply to fill in a value that depends on a resource the same apply
+        // is about to create. main.tf derives the connection string from the
+        // Postgres server it creates instead of requiring this as an input —
+        // regression guard against reintroducing that two-apply footgun.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            !content.contains("variable \"database_url\""),
+            "variables.tf must NOT declare a database_url variable — it must be derived \
+             in main.tf from the Postgres server the same apply creates: {content}"
+        );
+    }
+
+    #[test]
+    fn variables_tf_declares_bootstrap_image() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            content.contains("variable \"bootstrap_image\""),
+            "variables.tf must declare bootstrap_image, the placeholder image Terraform \
+             uses before any real image has been pushed to ACR: {content}"
+        );
+    }
+
+    #[test]
     fn outputs_tf_has_app_fqdn_and_acr_login_server() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -1573,6 +1745,10 @@ previous_secrets = []
         assert!(
             content.contains("output \"acr_login_server\""),
             "outputs.tf must expose the ACR login server: {content}"
+        );
+        assert!(
+            content.contains("output \"migrate_job_name\""),
+            "outputs.tf must expose the migration job's name so CI can start it: {content}"
         );
         assert!(
             !content.contains("{{"),
@@ -1657,6 +1833,89 @@ previous_secrets = []
             content.contains("secrets."),
             "azure-deploy.yml must source credentials from GitHub Actions secrets, \
              never hardcode them: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_runs_migrations_before_updating_the_app() {
+        // The generated production config sets auto_migrate_in_production =
+        // false, so nothing else runs migrations; without this step, new
+        // replicas would start against an unmigrated schema on any release
+        // that includes a migration.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("az containerapp job start"),
+            "azure-deploy.yml must start the one-shot migration job: {content}"
+        );
+        assert!(
+            content.contains("AZURE_MIGRATE_JOB_NAME"),
+            "azure-deploy.yml must reference the migration job by its Terraform output: {content}"
+        );
+
+        let job_pos = content
+            .find("az containerapp job start")
+            .expect("migration job start must be present");
+        let deploy_pos = content
+            .find("az containerapp update")
+            .expect("deploy step must be present");
+        assert!(
+            job_pos < deploy_pos,
+            "the migration job must run BEFORE the app is updated to the new image: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_aborts_deploy_on_migration_failure() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        let migration_step = content
+            .split("Run database migrations")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("a 'Run database migrations' step must exist");
+        assert!(
+            migration_step.contains("set -euo pipefail") || migration_step.contains("exit 1"),
+            "the migration step must fail the job (and therefore never reach the deploy \
+             step) when the job execution doesn't succeed: {migration_step}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_and_main_tf_use_the_same_sanitized_app_name() {
+        // Cargo package names may contain underscores/uppercase, both
+        // invalid in Container App names. main.tf sanitizes via
+        // local.app_name_safe; the workflow is plain YAML with no
+        // Terraform to compute that for it, so `render()` must bake in the
+        // identical sanitized name via {{azure_app_name}}.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "My_Test_App");
+        init(
+            &dir,
+            "My_Test_App",
+            false,
+            Target::AzureContainerApps,
+            false,
+        )
+        .unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("my-test-app"),
+            "azure-deploy.yml must use the sanitized app name (lowercase, hyphens for \
+             underscores/uppercase): {content}"
+        );
+        assert!(
+            !content.contains("My_Test_App"),
+            "azure-deploy.yml must not reference the raw, unsanitized project name in \
+             any Azure resource identifier: {content}"
+        );
+        assert!(
+            !content.contains("{{azure_app_name}}") && !content.contains("{{project_name}}"),
+            "azure-deploy.yml must not contain unsubstituted placeholders: {content}"
         );
     }
 
@@ -1895,6 +2154,13 @@ previous_secrets = []
             "azure-container-apps".parse::<Target>().unwrap(),
             Target::AzureContainerApps
         );
+    }
+
+    #[test]
+    fn azure_safe_name_lowercases_and_hyphenates_invalid_characters() {
+        assert_eq!(azure_safe_name("my-app"), "my-app");
+        assert_eq!(azure_safe_name("My_Test_App"), "my-test-app");
+        assert_eq!(azure_safe_name("blog2"), "blog2");
     }
 
     #[test]

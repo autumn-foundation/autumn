@@ -13,9 +13,21 @@ variable "location" {
 }
 
 variable "image_tag" {
-  description = "Tag of the {{project_name}} image in Azure Container Registry to deploy."
+  description = "Tag of the {{project_name}} image in Azure Container Registry to deploy. Documents the tag scheme used by `az containerapp update`/CI after bootstrap — Terraform itself only ever sets `bootstrap_image` (see below) and never manages the image after the first apply."
   type        = string
   default     = "latest"
+}
+
+# Container Apps must pull an image to create the app's (and the migration
+# job's) first revision, but a brand-new ACR has none yet — so Terraform
+# points both at this public placeholder on the first apply, then ignores
+# further image drift (see the `lifecycle.ignore_changes` blocks in main.tf)
+# once `az containerapp update`/the migration job start in azure-deploy.yml
+# take over managing the real image.
+variable "bootstrap_image" {
+  description = "Public placeholder image Terraform uses to create the Container App and migration job before any real image has been pushed to ACR."
+  type        = string
+  default     = "mcr.microsoft.com/k8se/quickstart:latest"
 }
 
 variable "db_sku" {
@@ -49,15 +61,15 @@ variable "enable_redis_cache" {
 
 # ── Secrets — no default. Supply via TF_VAR_* env vars or your CI's secret
 # store. Never commit real values in terraform.tfvars. ──────────────────────
+#
+# Note: there is no `database_url` variable. A single `terraform apply` must
+# succeed without a second, targeted apply to fill in a value that depends on
+# a resource the same apply is about to create — so main.tf derives the full
+# connection string from `azurerm_postgresql_flexible_server.this`'s FQDN and
+# this password, rather than requiring the operator to pre-compute it.
 
 variable "database_admin_password" {
   description = "Administrator password for the Postgres Flexible Server."
-  type        = string
-  sensitive   = true
-}
-
-variable "database_url" {
-  description = "Full connection string stored in Key Vault as AUTUMN_DATABASE__PRIMARY_URL; bound into the Container App as a secret ref."
   type        = string
   sensitive   = true
 }

@@ -8,16 +8,18 @@ location  = "eastus"
 image_tag = "latest"
 db_sku    = "B_Standard_B1ms"
 
+# bootstrap_image = "mcr.microsoft.com/k8se/quickstart:latest"  # rarely needs to change
+
 min_replicas        = 1
 max_replicas        = 10
 enable_redis_cache  = false
 
 # ── Secrets — set these out-of-band, never as literals in this file ────────
+# There is no database_url variable to set: main.tf derives the connection
+# string from the Postgres server this same apply creates.
 #
 #   export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
-#   export TF_VAR_database_url="postgres://autumn_admin:...@<server>.postgres.database.azure.com:5432/{{project_name}}?sslmode=require"
 #   export TF_VAR_signing_secret="$(openssl rand -hex 32)"
 #
 # database_admin_password = (set via TF_VAR_database_admin_password)
-# database_url            = (set via TF_VAR_database_url)
 # signing_secret          = (set via TF_VAR_signing_secret)

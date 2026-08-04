@@ -15,8 +15,9 @@
 #
 # Required repository variables (same Settings page, "Variables" tab — not
 # secret, just config the job needs):
-#   ACR_LOGIN_SERVER    — output of `terraform output acr_login_server`.
+#   ACR_LOGIN_SERVER     — output of `terraform output acr_login_server`.
 #   AZURE_RESOURCE_GROUP — output of `terraform output resource_group_name`.
+#   AZURE_MIGRATE_JOB_NAME — output of `terraform output migrate_job_name`.
 
 name: azure-deploy
 
@@ -50,21 +51,60 @@ jobs:
 
       - name: Build release image
         run: |
-          docker build -t "$ACR_LOGIN_SERVER/{{project_name}}:${GITHUB_REF_NAME}" .
+          docker build -t "$ACR_LOGIN_SERVER/{{azure_app_name}}:${GITHUB_REF_NAME}" .
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
 
       - name: Push to Azure Container Registry
-        run: docker push "$ACR_LOGIN_SERVER/{{project_name}}:${GITHUB_REF_NAME}"
+        run: docker push "$ACR_LOGIN_SERVER/{{azure_app_name}}:${GITHUB_REF_NAME}"
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+
+      # Runs `autumn migrate` to completion in a one-shot Container Apps Job
+      # BEFORE the app is updated, so new replicas never start against an
+      # unmigrated schema (production config disables startup migrations —
+      # see docs/guide/deployment.md). Aborts the workflow — never reaching
+      # the deploy step below — if the migration job fails.
+      - name: Run database migrations
+        run: |
+          set -euo pipefail
+          EXECUTION=$(az containerapp job start \
+            --name "$AZURE_MIGRATE_JOB_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --image "$ACR_LOGIN_SERVER/{{azure_app_name}}:${GITHUB_REF_NAME}" \
+            --query name -o tsv)
+
+          # Poll for completion — `az containerapp job execution list` is the
+          # documented way to check a started execution's status; there is no
+          # blocking "wait" subcommand. 5 min budget (30 x 10s) comfortably
+          # covers a healthy migration; adjust if yours run longer.
+          for _ in $(seq 1 30); do
+            STATUS=$(az containerapp job execution list \
+              --name "$AZURE_MIGRATE_JOB_NAME" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --query "[?name=='$EXECUTION'].properties.status" -o tsv)
+            case "$STATUS" in
+              Succeeded) exit 0 ;;
+              Failed|Stopped)
+                echo "::error::migration job execution $EXECUTION $STATUS" >&2
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          echo "::error::migration job execution $EXECUTION did not finish within the time budget" >&2
+          exit 1
+        env:
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_MIGRATE_JOB_NAME: ${{ vars.AZURE_MIGRATE_JOB_NAME }}
 
       - name: Deploy new image to Azure Container Apps
         run: |
           az containerapp update \
-            --name {{project_name}} \
+            --name {{azure_app_name}} \
             --resource-group "$AZURE_RESOURCE_GROUP" \
-            --image "$ACR_LOGIN_SERVER/{{project_name}}:${GITHUB_REF_NAME}"
+            --image "$ACR_LOGIN_SERVER/{{azure_app_name}}:${GITHUB_REF_NAME}"
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}

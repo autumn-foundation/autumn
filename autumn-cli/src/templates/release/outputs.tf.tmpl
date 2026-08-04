@@ -14,3 +14,8 @@ output "resource_group_name" {
   description = "Resource group containing every resource provisioned for {{project_name}}."
   value       = azurerm_resource_group.this.name
 }
+
+output "migrate_job_name" {
+  description = "Name of the one-shot Container Apps Job that runs `autumn migrate`; azure-deploy.yml starts it before deploying a new image."
+  value       = azurerm_container_app_job.migrate.name
+}

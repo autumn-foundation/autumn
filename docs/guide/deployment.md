@@ -851,11 +851,21 @@ This generates:
 
 | File | Purpose |
 |---|---|
-| `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, Azure Database for PostgreSQL Flexible Server, and a Key Vault that feeds secrets into the app via a user-assigned managed identity. An optional Redis Cache is gated behind `enable_redis_cache`. |
-| `variables.tf` | `app_name`, `location`, `image_tag`, `db_sku`, `min_replicas`/`max_replicas` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `database_url`, `signing_secret`). |
-| `outputs.tf` | `app_fqdn`, `acr_login_server`, and `resource_group_name`. |
+| `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, a one-shot migration job, Azure Database for PostgreSQL Flexible Server, and a Key Vault that feeds secrets into the app via a user-assigned managed identity. An optional Redis Cache is gated behind `enable_redis_cache`. |
+| `variables.tf` | `app_name`, `location`, `image_tag`, `db_sku`, `bootstrap_image`, `min_replicas`/`max_replicas` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
+| `outputs.tf` | `app_fqdn`, `acr_login_server`, `resource_group_name`, and `migrate_job_name`. |
 | `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
-| `.github/workflows/azure-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to ACR, and runs `az containerapp update` on a `v*` tag push (or manual dispatch). |
+| `.github/workflows/azure-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to ACR, runs the migration job to completion, and runs `az containerapp update` on a `v*` tag push (or manual dispatch). |
+
+**Resource names are sanitized, not verbatim.** A Cargo package name may
+contain underscores or uppercase letters (both invalid in Container App
+names), so every Container Apps-family resource name (the app, its
+environment, Log Analytics, the migration job) is lowercased with any other
+character mapped to a hyphen — `my_app`/`My App` all become `my-app`. ACR,
+Key Vault, Postgres, and Redis use a stricter sanitization (no hyphens at
+all, since ACR forbids them). The generated workflow computes the identical
+sanitized name at scaffold time so its `az containerapp`/`docker build`
+commands always target what Terraform actually created.
 
 Why Container Apps and not App Service or AKS: it is the closest managed
 analog to Fly.io — scale-to-zero capable, managed ingress with automatic TLS,
@@ -863,32 +873,49 @@ and no cluster to operate — while Azure-heavy shops already have the
 IAM/RBAC patterns in place.
 
 Provision the infrastructure and set secrets via Terraform variables (never
-as literals in `terraform.tfvars`):
+as literals in `terraform.tfvars`). A single apply is enough — there is no
+`database_url` variable to pre-compute: main.tf derives the connection
+string from the Postgres server this same apply creates, from its FQDN plus
+`database_admin_password`.
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars   # edit the non-secret values
 export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
 export TF_VAR_signing_secret="$(openssl rand -hex 32)"
-# TF_VAR_database_url is derived from the server Terraform is about to create;
-# apply once to provision it, then set TF_VAR_database_url and re-apply so the
-# Key Vault secret (and the app's AUTUMN_DATABASE__PRIMARY_URL) point at it.
 
 terraform init
 terraform apply
 ```
 
-Build and push the first image, then let the workflow take over for
-subsequent releases:
+The Container App and migration job both start from a public placeholder
+image (`bootstrap_image` — Container Apps must pull *some* image to create a
+first revision, and a brand-new ACR has none yet). Build and push your real
+image, run migrations, then cut the app over:
 
 ```bash
 az acr login --name "$(terraform output -raw acr_login_server | cut -d. -f1)"
 docker build -t "$(terraform output -raw acr_login_server)/myapp:v1" .
 docker push "$(terraform output -raw acr_login_server)/myapp:v1"
+
+# Run migrations to completion BEFORE updating the app — the generated
+# production config sets auto_migrate_in_production = false, so nothing
+# else does this for you.
+az containerapp job start \
+  --name "$(terraform output -raw migrate_job_name)" \
+  --resource-group "$(terraform output -raw resource_group_name)" \
+  --image "$(terraform output -raw acr_login_server)/myapp:v1"
+# az containerapp job execution list --name ... --resource-group ... shows
+# the execution's status; wait for Succeeded before continuing.
+
 az containerapp update \
   --name myapp \
   --resource-group "$(terraform output -raw resource_group_name)" \
   --image "$(terraform output -raw acr_login_server)/myapp:v1"
 ```
+
+Terraform is told to ignore both resources' image afterward
+(`lifecycle.ignore_changes`), so a later `terraform apply` won't revert a
+live deploy back to the bootstrap placeholder.
 
 **Automated deploys on tag push:** `.github/workflows/azure-deploy.yml` only
 runs once you add the required repository secrets and variables it documents
@@ -896,13 +923,15 @@ in its header comment — secrets `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/
 `AZURE_SUBSCRIPTION_ID` for OIDC login (no client secret needed: the
 workflow's `id-token: write` permission plus a federated credential on the
 app registration is enough), and variables (not secrets — they're just
-config) `ACR_LOGIN_SERVER`/`AZURE_RESOURCE_GROUP` — until then it stays
-dormant. Once configured, pushing a `v*` tag builds, pushes to ACR, and runs
-`az containerapp update` automatically.
+config) `ACR_LOGIN_SERVER`/`AZURE_RESOURCE_GROUP`/`AZURE_MIGRATE_JOB_NAME` —
+until then it stays dormant. Once configured, pushing a `v*` tag builds,
+pushes to ACR, runs the migration job to completion (aborting before any
+deploy if it fails), and runs `az containerapp update` automatically.
 
 **State file security.** `terraform apply` writes `database_admin_password`,
-`database_url`, and `signing_secret` into `terraform.tfstate` **in
-plaintext** — Terraform's `sensitive = true` only redacts CLI plan/apply
+the derived database connection string, and `signing_secret` into
+`terraform.tfstate` **in plaintext** — Terraform's `sensitive = true` only
+redacts CLI plan/apply
 output, never the state file itself. Add `*.tfstate*`, `.terraform/`, and
 `terraform.tfvars` to `.gitignore` before running `terraform init`
 (`autumn release init --target azure-container-apps` does this for you,

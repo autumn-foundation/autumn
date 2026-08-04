@@ -13,24 +13,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scaffolds a production-ready Azure deployment alongside the existing `fly`
   and `docker-compose` targets: `main.tf` (resource group, Azure Container
   Registry, Log Analytics workspace, Container Apps environment + the app
-  itself, Azure Database for PostgreSQL Flexible Server, a Key Vault that
-  feeds `AUTUMN_DATABASE__PRIMARY_URL`/`AUTUMN_SECURITY__SIGNING_SECRET` into
-  the app as secret refs via a user-assigned managed identity (with its own
-  Key Vault access policy granted to Terraform's caller identity, since
+  itself, a one-shot migration job, Azure Database for PostgreSQL Flexible
+  Server, and a Key Vault that feeds
+  `AUTUMN_DATABASE__PRIMARY_URL`/`AUTUMN_SECURITY__SIGNING_SECRET` into the
+  app as secret refs via a user-assigned managed identity (with its own Key
+  Vault access policy granted to Terraform's caller identity, since
   access-policy-model vaults grant no data-plane access by default), and an
   optional Redis Cache gated behind `enable_redis_cache` and fully wired in
   as `AUTUMN_CACHE__REDIS_URL` when enabled), `variables.tf`
-  (`app_name`, `location`, `image_tag`, `db_sku`, `min_replicas`/
-  `max_replicas` — defaulting to the 1/10 scale range — and
+  (`app_name`, `location`, `image_tag`, `db_sku`, `bootstrap_image`,
+  `min_replicas`/`max_replicas` — defaulting to the 1/10 scale range — and
   `enable_redis_cache`, plus `sensitive`, no-default secret variables for
-  `database_admin_password`/`database_url`/`signing_secret`),
-  `outputs.tf` (`app_fqdn`, `acr_login_server`, `resource_group_name`), a
-  `terraform.tfvars.example` that documents non-secret defaults without ever
-  committing a literal secret, and `.github/workflows/azure-deploy.yml` — an
-  opt-in OIDC-based workflow (triggers only on a `v*` tag push or manual
-  dispatch, and every credential comes from GitHub secrets that don't exist
-  until configured — no client secret needed) that builds the release
-  image, pushes it to ACR, and runs `az containerapp update`.
+  `database_admin_password`/`signing_secret`),
+  `outputs.tf` (`app_fqdn`, `acr_login_server`, `resource_group_name`,
+  `migrate_job_name`), a `terraform.tfvars.example` that documents
+  non-secret defaults without ever committing a literal secret, and
+  `.github/workflows/azure-deploy.yml` — an opt-in OIDC-based workflow
+  (triggers only on a `v*` tag push or manual dispatch, and every credential
+  comes from GitHub secrets that don't exist until configured — no client
+  secret needed) that builds the release image, pushes it to ACR, runs the
+  migration job to completion (aborting the deploy if it fails), and runs
+  `az containerapp update`. The database connection string is derived
+  inside Terraform from the Postgres server the same apply creates rather
+  than taken as an input variable, so a single `terraform apply` is enough.
+  Every Container Apps-family resource name (the app, its environment, Log
+  Analytics, the migration job) is sanitized to lowercase
+  alphanumerics-and-hyphens — a Cargo package name may legally contain
+  underscores or uppercase letters, both invalid there — and the generated
+  workflow computes the identical sanitized name so its `az
+  containerapp`/`docker build` commands always match what Terraform
+  created. The app and migration job both start from a public placeholder
+  image (`bootstrap_image`) since Container Apps must pull an image to
+  create a first revision and a brand-new ACR has none yet; Terraform
+  ignores further image drift once CI takes over.
   `autumn release init`'s file-existence guard and directory creation are
   now generic over nested output paths, so `--force`/collision checks cover
   `.github/workflows/azure-deploy.yml` the same way they cover root-level
