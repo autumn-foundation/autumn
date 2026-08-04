@@ -396,6 +396,67 @@ async fn admin_cannot_grant_owner_role() {
     promote_resp.assert_status(403);
 }
 
+/// `Owner > Admin` must hold regardless of headcount: an Admin may never
+/// demote or remove an Owner, even when the organization has more than one
+/// (only the *last*-owner protection is about headcount).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn admin_cannot_demote_or_remove_an_owner_even_with_multiple_owners() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+
+    // A second Owner (member id 2) — only the founding Owner can invite as
+    // owner, so this is done by the owner_cookie.
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=co-owner@acme.test&role=owner")
+        .send()
+        .await
+        .assert_status(303);
+    let co_owner_token = latest_invite_token(dir.path());
+    client
+        .post(&format!("/invite/{co_owner_token}/accept"))
+        .form("password=An0ther-Str0ng-Pa55word")
+        .send()
+        .await
+        .assert_status(303);
+
+    // An Admin (member id 3).
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=admin-user@acme.test&role=admin")
+        .send()
+        .await
+        .assert_status(303);
+    let admin_token = latest_invite_token(dir.path());
+    let admin_accept = client
+        .post(&format!("/invite/{admin_token}/accept"))
+        .form("password=An0ther-Str0ng-Pa55word")
+        .send()
+        .await;
+    let admin_cookie = session_cookie(&admin_accept);
+
+    // Two owners now exist, so the last-owner protection alone would let
+    // this through — the Owner-vs-Admin check must be what blocks it.
+    let demote_resp = client
+        .post("/members/2/role")
+        .header("cookie", &admin_cookie)
+        .form("role=member")
+        .send()
+        .await;
+    demote_resp.assert_status(403);
+
+    let remove_resp = client
+        .post("/members/2/remove")
+        .header("cookie", &admin_cookie)
+        .send()
+        .await;
+    remove_resp.assert_status(403);
+}
+
 /// AC5: a double-clicked accept link is a no-op, not a duplicate membership
 /// or a 500 — the success metric's exact wording.
 #[tokio::test]
@@ -441,6 +502,66 @@ async fn double_accept_is_idempotent() {
         body.matches("newbie@acme.test").count(),
         1,
         "double-accept must not create a second membership row"
+    );
+}
+
+/// A second, independent pending invitation to an email that's already a
+/// member (e.g. invited twice, or already joined some other way) must be
+/// consumed on accept, not left dangling — a lingering `pending` token would
+/// stay redeemable indefinitely and could regrant membership after removal.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn accepting_a_lingering_invite_for_an_existing_member_consumes_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    let first_token = latest_invite_token(dir.path());
+
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    let second_token = latest_invite_token(dir.path());
+
+    let accept = client
+        .post(&format!("/invite/{first_token}/accept"))
+        .form("password=An0ther-Str0ng-Pa55word")
+        .send()
+        .await;
+    accept.assert_status(303);
+    let member_cookie = session_cookie(&accept);
+
+    // Accepting the second, still-pending invite while already a member
+    // must consume it too — not leave it pending forever.
+    client
+        .post(&format!("/invite/{second_token}/accept"))
+        .header("cookie", &member_cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    let members_body = client
+        .get("/members")
+        .header("cookie", &owner_cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert_eq!(
+        members_body.matches("newbie@acme.test").count(),
+        1,
+        "the second invitation must be consumed (accepted), not left listed as pending: {members_body}"
     );
 }
 

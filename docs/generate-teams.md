@@ -89,12 +89,16 @@ Gate any admin-only handler the same way `require_role` is used throughout
 the generated `src/teams/routes/`:
 
 ```rust
-teams::role::require_role(&session, teams::role::Role::Admin).await?;
+teams::role::require_role(&session, &membership_repo, teams::role::Role::Admin).await?;
 ```
 
-`require_role` returns the caller's resolved `Role` on success, so a
-handler that needs to branch on it (e.g. to show owner-only controls) does
-not have to look it up twice.
+`membership_repo` is a `teams::repositories::PgMembershipRepository` handler
+extractor (`membership_repo: teams::repositories::PgMembershipRepository`) —
+`require_role` re-reads the caller's live `Membership` row through it rather
+than trusting a cached session value, so a revoked/demoted member's stale
+session can't keep passing this check. `require_role` returns the caller's
+resolved `Role` on success, so a handler that needs to branch on it (e.g. to
+show owner-only controls) does not have to look it up twice.
 
 ## `[tenancy]` configuration
 

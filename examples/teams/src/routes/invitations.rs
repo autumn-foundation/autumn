@@ -495,10 +495,24 @@ pub async fn accept_invitation(
                     .await
                     .optional()?;
                 if let Some(existing) = existing {
-                    // Idempotent double-click: the membership this accept
-                    // would create already exists (from an earlier accept of
-                    // this same token). Succeed as a no-op rather than
-                    // erroring or inserting a duplicate.
+                    // The user already belongs to this organization — either
+                    // this exact token was already redeemed (idempotent
+                    // double-click: `invitation.status` is already
+                    // "accepted"), or they joined some other way while this
+                    // invitation sat pending. Either way there's no new
+                    // membership to insert, but a still-pending invitation
+                    // must be consumed here too — otherwise its token stays
+                    // valid indefinitely and, if this membership is later
+                    // removed, redeeming the lingering token again would
+                    // silently regrant it.
+                    if invitation.status == "pending" {
+                        diesel::update(
+                            invitations::table.filter(invitations::id.eq(invitation_id)),
+                        )
+                        .set(invitations::status.eq("accepted"))
+                        .execute(conn)
+                        .await?;
+                    }
                     return Ok::<_, AutumnError>((existing, target_user_id));
                 }
 

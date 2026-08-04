@@ -1,13 +1,18 @@
 //! Member-management surface: list members + pending invitations, invite,
 //! change role, revoke invite, remove member (issue #1261 AC7).
 //!
-//! Every mutating action is gated `require_role(&session, Role::Admin)`, and
-//! the last `Owner` in an organization can neither be demoted nor removed —
-//! otherwise no one could ever grant `Owner` again (`Admin`+ can still invite/
-//! remove/change non-Owner roles regardless). Granting the `Owner` role
-//! itself additionally requires the *caller* to already be an `Owner` — an
-//! `Admin` gate alone would let any Admin promote themselves (or an ally) to
-//! `Owner` and from there demote/remove the organization's real owners.
+//! Every mutating action is gated `require_role(&session, Role::Admin)`, but
+//! an `Admin` may only change or remove `Member`/`Admin` memberships — never
+//! an `Owner`'s, no matter how many owners the organization has (`Admin`+
+//! can still invite/remove/change non-Owner roles regardless). Without that,
+//! `Owner > Admin` wouldn't hold: an Admin could demote or eject any owner
+//! as long as a second one existed. Only an `Owner` may touch another
+//! `Owner`'s membership, and even an `Owner` can neither demote nor remove
+//! the organization's *last* `Owner` — otherwise no one could ever grant
+//! `Owner` again. Granting the `Owner` role itself additionally requires the
+//! *caller* to already be an `Owner` — an `Admin` gate alone would let any
+//! Admin promote themselves (or an ally) to `Owner` and from there demote/
+//! remove the organization's real owners.
 //!
 //! The last-owner check reads `find_all()` then acts without a row lock, so
 //! two concurrent requests demoting/removing each of exactly two remaining
@@ -104,20 +109,27 @@ pub async fn list_members(
                         }
                         @if can_manage {
                             div class="flex items-center gap-2" {
-                                @let last_owner = membership.role == Role::Owner.as_str() && owners <= 1;
+                                // Locked when the target is an Owner and either
+                                // the caller isn't one too (only an Owner may
+                                // touch another Owner's membership) or it's the
+                                // organization's last Owner (never demotable/
+                                // removable by anyone) — mirrors the server-side
+                                // checks in `change_role`/`remove_member`.
+                                @let locked = membership.role == Role::Owner.as_str()
+                                    && (caller_role != Role::Owner || owners <= 1);
                                 form action={"/members/" (membership.id) "/role"} method="post" class="flex items-center gap-1" {
                                     input type="hidden" name="_csrf" value=(csrf_value(&csrf));
-                                    select name="role" aria-label="Change role" disabled[last_owner] {
+                                    select name="role" aria-label="Change role" disabled[locked] {
                                         option value="member" selected[membership.role == "member"] { "Member" }
                                         option value="admin" selected[membership.role == "admin"] { "Admin" }
                                         option value="owner" selected[membership.role == "owner"] { "Owner" }
                                     }
-                                    button type="submit" disabled[last_owner]
+                                    button type="submit" disabled[locked]
                                            class="text-xs px-2 py-1 border rounded hover:bg-gray-50" { "Update" }
                                 }
                                 form action={"/members/" (membership.id) "/remove"} method="post" {
                                     input type="hidden" name="_csrf" value=(csrf_value(&csrf));
-                                    button type="submit" disabled[last_owner]
+                                    button type="submit" disabled[locked]
                                            class="text-xs px-2 py-1 border rounded text-red-600 hover:bg-red-50 \
                                                   disabled:text-gray-300 disabled:hover:bg-transparent" {
                                         "Remove"
@@ -184,8 +196,10 @@ async fn load_emails(
 }
 
 /// Change a member's role within the active organization. Gated `Admin` or
-/// higher (granting `Owner` itself requires the caller to already be an
-/// `Owner`); refuses to demote the last `Owner`.
+/// higher — but an `Admin` may only change a `Member`'s or `Admin`'s role,
+/// never an existing `Owner`'s (granting `Owner`, same as touching one,
+/// requires the caller to already be an `Owner`); refuses to demote the
+/// last `Owner`.
 #[post("/members/{id}/role")]
 pub async fn change_role(
     session: Session,
@@ -207,6 +221,14 @@ pub async fn change_role(
     let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
         return Err(AutumnError::not_found_msg("Member not found"));
     };
+    // The `Owner > Admin` hierarchy must hold regardless of how many owners
+    // exist: an Admin changing an Owner's role — even with other owners
+    // still in place — is a demotion of a higher role by a lower one.
+    if target.role == Role::Owner.as_str() && caller_role != Role::Owner {
+        return Err(AutumnError::forbidden_msg(
+            "Only an owner can change another owner's role",
+        ));
+    }
     if target.role == Role::Owner.as_str()
         && new_role != Role::Owner
         && owner_count(&memberships) <= 1
@@ -228,20 +250,27 @@ pub async fn change_role(
     Ok(Redirect::to("/members").into_response())
 }
 
-/// Remove a member from the active organization. Gated `Admin` or higher;
-/// refuses to remove the last `Owner`.
+/// Remove a member from the active organization. Gated `Admin` or higher —
+/// but an `Admin` may never remove an `Owner` (regardless of how many
+/// owners exist); refuses to remove the last `Owner` even for a caller who
+/// is themselves an `Owner`.
 #[post("/members/{id}/remove")]
 pub async fn remove_member(
     session: Session,
     membership_repo: PgMembershipRepository,
     Path(membership_id): Path<i64>,
 ) -> AutumnResult<Response> {
-    require_role(&session, &membership_repo, Role::Admin).await?;
+    let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
 
     let memberships = membership_repo.find_all().await?;
     let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
         return Err(AutumnError::not_found_msg("Member not found"));
     };
+    if target.role == Role::Owner.as_str() && caller_role != Role::Owner {
+        return Err(AutumnError::forbidden_msg(
+            "Only an owner can remove another owner",
+        ));
+    }
     if target.role == Role::Owner.as_str() && owner_count(&memberships) <= 1 {
         return Err(AutumnError::conflict_msg(
             "Cannot remove the last owner of an organization",
