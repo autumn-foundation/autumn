@@ -448,7 +448,19 @@ fn words_of(spans: &[Span]) -> Vec<Word> {
                 let starts_with_ws = text.starts_with(char::is_whitespace);
                 let ends_with_ws = text.ends_with(char::is_whitespace);
                 let mut emitted_any = false;
-                for (i, w) in text.split_whitespace().enumerate() {
+                // Split on breakable whitespace only — NBSP (`&nbsp;`,
+                // decoded to U+00A0) satisfies `char::is_whitespace()` so
+                // `split_whitespace()` would treat it as an ordinary word
+                // separator, discarding the entire point of a *non*-breaking
+                // space: it stays inside the resulting token instead, so a
+                // line can never break between the words it joins (it still
+                // renders as a real space — `char_width_1000em` gives it the
+                // same width as a plain space — the token is just atomic).
+                for (i, w) in text
+                    .split(|c: char| c.is_whitespace() && c != '\u{00A0}')
+                    .filter(|w| !w.is_empty())
+                    .enumerate()
+                {
                     words.push(Word::Text {
                         text: w.to_owned(),
                         bold: *bold,
@@ -932,6 +944,38 @@ mod tests {
         ];
         let lines = wrap(&words, 1000.0, 12.0);
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn non_breaking_space_keeps_its_words_on_one_line() {
+        // Regression: `&nbsp;` decodes to U+00A0, which satisfies
+        // `char::is_whitespace()` — `split_whitespace()` treated it as an
+        // ordinary word separator, discarding its entire point (a line must
+        // never break between the words it joins). `words_of` must keep an
+        // NBSP-joined run as a single atomic token instead.
+        let words = words_of(&[Span::Run {
+            text: "Invoice\u{00A0}#42".to_owned(),
+            bold: false,
+            italic: false,
+        }]);
+        assert_eq!(
+            words,
+            vec![Word::Text {
+                text: "Invoice\u{00A0}#42".to_owned(),
+                bold: false,
+                italic: false,
+                glue: false,
+            }],
+            "NBSP must not split the run into two breakable words"
+        );
+        // Even at a width that fits neither word comfortably alongside the
+        // other, the pair must stay on one line — same as any other single
+        // token, just with a real (not zero-width) space rendered in it.
+        let narrow_width = text_width_pt("Invoice\u{00A0}#42", 12.0, false) + 1.0;
+        let lines = wrap(&words, narrow_width, 12.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), 1);
+        assert_eq!(lines[0][0].0, "Invoice\u{00A0}#42");
     }
 
     #[test]
