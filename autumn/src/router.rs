@@ -595,6 +595,7 @@ fn build_router_pre_state(
 
     let mut router = mount_user_routes(
         route_list,
+        &ctx.scoped_groups,
         idempotency_layers.as_ref(),
         opaque_app_layers_present,
         state,
@@ -1814,6 +1815,7 @@ fn group_and_mount_routes(
 #[cfg(feature = "i18n")]
 fn mount_user_routes(
     route_list: Vec<Route>,
+    scoped_groups: &[ScopedGroup],
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
     opaque_app_layers_present: bool,
     state: &AppState,
@@ -1833,23 +1835,23 @@ fn mount_user_routes(
         &config.i18n.locale_prefix_exclude,
         &config.i18n.locale_prefix_exclude_exact,
     );
-    let mut included_paths: Vec<&'static str> = included.iter().map(|route| route.path).collect();
-    included_paths.sort_unstable();
-    included_paths.dedup();
 
-    let mut excluded_paths: Vec<&'static str> = excluded.iter().map(|route| route.path).collect();
-    excluded_paths.sort_unstable();
-    excluded_paths.dedup();
+    let included_path_methods = route_list_path_methods(&included);
+    let excluded_path_methods = route_list_path_methods(&excluded);
+    let scoped_path_methods = scoped_group_path_methods(scoped_groups);
 
     let valid_locales = validated_locale_prefix_locales(&config.i18n);
 
-    if let Some(err) =
-        detect_locale_prefix_path_collision(&included_paths, &excluded_paths, &valid_locales)
-    {
+    if let Some(err) = detect_locale_prefix_path_collision(
+        &included_path_methods,
+        &excluded_path_methods,
+        &scoped_path_methods,
+        &valid_locales,
+    ) {
         return Err(err);
     }
 
-    let path_method_filters = included_path_method_filters(&included);
+    let path_method_filters = path_method_filters(&included_path_methods);
 
     let content_router = group_and_mount_routes(
         included,
@@ -1875,6 +1877,7 @@ fn mount_user_routes(
 #[cfg(not(feature = "i18n"))]
 fn mount_user_routes(
     route_list: Vec<Route>,
+    _scoped_groups: &[ScopedGroup],
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
     opaque_app_layers_present: bool,
     state: &AppState,
@@ -2003,10 +2006,74 @@ fn method_filter_for(method: &http::Method) -> axum::routing::MethodFilter {
     }
 }
 
-/// For each locale-prefix-included path, the exact HTTP methods actually
-/// registered there — after the same `WS`→`GET` and `GET`→`+HEAD` aliasing
-/// [`build_route_timeout_table`] applies, so the bare-path redirect claims
-/// precisely what the nested content will serve.
+/// For each DISTINCT path in `routes`, the effective HTTP methods actually
+/// registered there — `WS`→`GET` via [`effective_mount_method`], and
+/// `GET`→`+HEAD` (axum also serves `HEAD` through a `#[get]` handler),
+/// mirroring exactly what [`build_route_timeout_table`] already does for
+/// the same reason.
+#[cfg(feature = "i18n")]
+fn route_list_path_methods(
+    routes: &[Route],
+) -> std::collections::HashMap<String, Vec<http::Method>> {
+    let mut map: std::collections::HashMap<String, Vec<http::Method>> =
+        std::collections::HashMap::new();
+    for route in routes {
+        let effective = effective_mount_method(&route.method);
+        let methods = map.entry(route.path.to_owned()).or_default();
+        if !methods.contains(&effective) {
+            methods.push(effective.clone());
+        }
+        if effective == http::Method::GET && !methods.contains(&http::Method::HEAD) {
+            methods.push(http::Method::HEAD);
+        }
+    }
+    map
+}
+
+/// The same per-path method collection as [`route_list_path_methods`], but
+/// for routes mounted via `AppBuilder::scoped()` — resolved to their final
+/// `{prefix}{path}` mount point via [`join_nested_path`] (the same helper
+/// [`build_route_timeout_table`] uses), since a scoped group's routes are
+/// never part of `route_list` and so are otherwise invisible to locale-prefix
+/// collision detection even though they mount onto the SAME router
+/// (`mount_scoped_groups`, after this module returns) and can collide with a
+/// generated locale path just as easily as a top-level route (Codex review).
+#[cfg(feature = "i18n")]
+fn scoped_group_path_methods(
+    scoped_groups: &[ScopedGroup],
+) -> std::collections::HashMap<String, Vec<http::Method>> {
+    let mut map: std::collections::HashMap<String, Vec<http::Method>> =
+        std::collections::HashMap::new();
+    for group in scoped_groups {
+        for route in &group.routes {
+            let resolved = join_nested_path(&group.prefix, route.path);
+            let effective = effective_mount_method(&route.method);
+            let methods = map.entry(resolved).or_default();
+            if !methods.contains(&effective) {
+                methods.push(effective.clone());
+            }
+            if effective == http::Method::GET && !methods.contains(&http::Method::HEAD) {
+                methods.push(http::Method::HEAD);
+            }
+        }
+    }
+    map
+}
+
+/// Combines a path's registered methods into the single [`axum::routing::MethodFilter`]
+/// the bare-path redirect must claim there.
+#[cfg(feature = "i18n")]
+fn path_method_filter(methods: &[http::Method]) -> axum::routing::MethodFilter {
+    methods
+        .iter()
+        .map(method_filter_for)
+        .reduce(axum::routing::MethodFilter::or)
+        .unwrap_or(axum::routing::MethodFilter::GET)
+}
+
+/// For each locale-prefix-included path, the [`axum::routing::MethodFilter`]
+/// the bare-path redirect must claim there — so it claims precisely what the
+/// nested content will serve.
 ///
 /// Claiming every method via `axum::routing::any` (the prior behavior)
 /// would otherwise reserve, say, GET at `/health` for the redirect even
@@ -2015,68 +2082,77 @@ fn method_filter_for(method: &http::Method) -> axum::routing::MethodFilter {
 /// (`mount_probe_endpoints`, well after this function returns) and has no
 /// visibility into methods the redirect already claimed (Codex review).
 #[cfg(feature = "i18n")]
-fn included_path_method_filters(
-    included: &[Route],
-) -> Vec<(&'static str, axum::routing::MethodFilter)> {
-    let mut filters: std::collections::HashMap<&'static str, axum::routing::MethodFilter> =
-        std::collections::HashMap::new();
-    for route in included {
-        let effective = effective_mount_method(&route.method);
-        let mut filter = method_filter_for(&effective);
-        if effective == http::Method::GET {
-            filter = filter.or(axum::routing::MethodFilter::HEAD);
-        }
-        filters
-            .entry(route.path)
-            .and_modify(|existing| *existing = existing.or(filter))
-            .or_insert(filter);
-    }
-    let mut result: Vec<_> = filters.into_iter().collect();
-    result.sort_unstable_by_key(|(path, _)| *path);
+fn path_method_filters(
+    included_path_methods: &std::collections::HashMap<String, Vec<http::Method>>,
+) -> Vec<(String, axum::routing::MethodFilter)> {
+    let mut result: Vec<_> = included_path_methods
+        .iter()
+        .map(|(path, methods)| (path.clone(), path_method_filter(methods)))
+        .collect();
+    result.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     result
 }
 
 /// Detects a route path that collides with a path locale-prefix nesting will
 /// itself generate — e.g. an app defines both `/foo` and `/en/foo` while
 /// `en` is a supported locale: the bare-path redirect (mounted at every
-/// locale-prefix-eligible path via `axum::routing::any`, which claims every
-/// HTTP method) already owns `/en/foo`, so nesting `/foo`'s content under
-/// `/en` collides and axum panics on the overlapping route at
-/// router-construction time. Checked against both `included_paths` (which
-/// all get that bare-path redirect) and `excluded_paths` (mounted verbatim
-/// at the top level) so either kind of pre-existing route is caught
-/// (Codex review).
+/// locale-prefix-eligible path, claiming only the methods actually
+/// registered there — see [`path_method_filters`]) already owns some methods
+/// at `/en/foo`, so nesting `/foo`'s content under `/en` collides if those
+/// methods overlap, and axum panics on the overlapping route at
+/// router-construction time. Checked against `included`, `excluded`
+/// (mounted verbatim at the top level), and `scoped` (mounted later via
+/// `mount_scoped_groups`, but onto the same router) so any pre-existing
+/// route is caught regardless of how it was registered (Codex review).
 ///
-/// Uses [`paths_conflict_under_matchit`] rather than exact string equality:
-/// two templates with different capture *names* at the same position (e.g.
-/// `/en/users/{id}` generated from `/users/{id}`, vs. an existing
-/// `/en/users/{slug}`) are a DIFFERENT string but the SAME matchit shape,
-/// which axum's `Router::route` rejects as a conflict regardless — the
-/// exact-duplicate-path preflight elsewhere in this file already delegates
-/// to the same matchit oracle for this reason (Codex review).
+/// Two DIFFERENT kinds of collision are distinguished, matching
+/// `reject_duplicate_user_routes`'s established model:
+///   - An EXACT path match is only a real conflict if the methods overlap —
+///     axum legally merges the SAME path template across DIFFERENT methods
+///     (`GET /foo` generating `GET /en/foo` must coexist with an existing
+///     `POST /en/foo`).
+///   - A DIFFERENT template that [`paths_conflict_under_matchit`] flags is a
+///     conflict regardless of method: two templates with different capture
+///     *names* at the same position (e.g. `/en/users/{id}` generated from
+///     `/users/{id}`, vs. an existing `/en/users/{slug}`) can never coexist,
+///     because matchit's tree rejects the shape clash before axum even gets
+///     to method-router merging.
 #[cfg(feature = "i18n")]
 fn detect_locale_prefix_path_collision(
-    included_paths: &[&'static str],
-    excluded_paths: &[&'static str],
+    included: &std::collections::HashMap<String, Vec<http::Method>>,
+    excluded: &std::collections::HashMap<String, Vec<http::Method>>,
+    scoped: &std::collections::HashMap<String, Vec<http::Method>>,
     valid_locales: &[String],
 ) -> Option<RouterBuildError> {
+    let all_other_paths: Vec<&String> = excluded
+        .keys()
+        .chain(scoped.keys())
+        .chain(included.keys())
+        .collect();
+
     for locale in valid_locales {
-        for path in included_paths {
-            let generated = if *path == "/" {
+        for (path, methods) in included {
+            let generated = if path == "/" {
                 format!("/{locale}")
             } else {
                 format!("/{locale}{path}")
             };
-            let collides = included_paths
+
+            let exact_conflict = excluded
+                .get(&generated)
+                .into_iter()
+                .chain(scoped.get(&generated))
+                .chain(included.get(&generated))
+                .any(|other_methods| methods.iter().any(|m| other_methods.contains(m)));
+
+            let shape_conflict = all_other_paths
                 .iter()
-                .any(|p| paths_conflict_under_matchit(p, &generated))
-                || excluded_paths
-                    .iter()
-                    .any(|p| paths_conflict_under_matchit(p, &generated));
-            if collides {
+                .any(|p| **p != generated && paths_conflict_under_matchit(p, &generated));
+
+            if exact_conflict || shape_conflict {
                 return Some(RouterBuildError::LocalePrefixPathCollision {
                     locale: locale.clone(),
-                    path: (*path).to_owned(),
+                    path: path.clone(),
                     generated,
                 });
             }
@@ -2087,8 +2163,8 @@ fn detect_locale_prefix_path_collision(
 
 /// Builds the locale-prefixed router: `excluded_router` (and a bare-path
 /// redirect for every `path_method_filters` entry, claiming only the exact
-/// methods registered there — see [`included_path_method_filters`]) mount at
-/// the top level; `content_router` is cloned and nested once per entry in
+/// methods registered there — see [`path_method_filters`](fn@path_method_filters))
+/// mount at the top level; `content_router` is cloned and nested once per entry in
 /// `valid_locales` (see [`validated_locale_prefix_locales`] — already
 /// deduped and filtered to safe `Router::nest` segments).
 ///
@@ -2105,7 +2181,7 @@ fn detect_locale_prefix_path_collision(
 fn apply_locale_prefix_routing(
     excluded_router: axum::Router<AppState>,
     content_router: &axum::Router<AppState>,
-    path_method_filters: &[(&'static str, axum::routing::MethodFilter)],
+    path_method_filters: &[(String, axum::routing::MethodFilter)],
     i18n: &crate::i18n::I18nConfig,
     valid_locales: &[String],
 ) -> axum::Router<AppState> {
@@ -6580,6 +6656,57 @@ mod tests {
             let en_users_slug = slug_route("/en/users/{slug}", "en_users_slug");
             let err = try_build_router(vec![users_id, en_users_slug], &config, test_state())
                 .expect_err("a capture-name-mismatched shape collision must be a build error");
+            assert!(
+                matches!(err, RouterBuildError::LocalePrefixPathCollision { .. }),
+                "expected LocalePrefixPathCollision, got {err:?}"
+            );
+        }
+
+        /// Codex review (P2): a legal cross-method exact-path match must
+        /// NOT be flagged as a collision — axum merges the SAME path
+        /// template across DIFFERENT methods. `GET /foo` generates
+        /// `GET /en/foo`, which must coexist with a separately registered
+        /// `POST /en/foo`.
+        #[tokio::test]
+        async fn exact_generated_path_with_different_method_is_not_a_collision() {
+            let config = config(&["en"], &[]);
+            let get_foo = simple_route("/foo", "foo_get", false);
+            let post_en_foo = duplicate_test_route(http::Method::POST, "/en/foo", "post_en_foo");
+
+            // Must build without panicking or erroring.
+            let app = build_router(vec![get_foo, post_en_foo], &config, test_state());
+
+            let get_resp = request(&app, "/en/foo", &[]).await;
+            assert_eq!(
+                get_resp.status(),
+                StatusCode::OK,
+                "GET /en/foo must resolve to the nested /foo content"
+            );
+        }
+
+        /// Codex review (P1): a route mounted via `AppBuilder::scoped()`
+        /// lives outside `route_list` entirely, but still mounts onto the
+        /// same router (`mount_scoped_groups`, after this module returns) —
+        /// a scoped route whose resolved path collides with a generated
+        /// locale path must be caught here too, not just top-level routes.
+        #[tokio::test]
+        async fn generated_locale_path_colliding_with_a_scoped_route_is_a_build_error() {
+            let config = config(&["en"], &[]);
+            let foo = simple_route("/foo", "foo", false);
+            let scoped_route = duplicate_test_route(http::Method::GET, "/foo", "scoped_foo");
+            let group = crate::app::ScopedGroup {
+                prefix: "/en".to_owned(),
+                routes: vec![scoped_route],
+                source: crate::route_listing::RouteSource::User,
+                apply_layer: Box::new(|r| r),
+            };
+            let mut ctx = duplicate_test_ctx();
+            ctx.scoped_groups.push(group);
+
+            let err = super::try_build_router_inner(vec![foo], &config, test_state(), ctx)
+                .expect_err(
+                    "a scoped route colliding with a generated locale path must be a build error",
+                );
             assert!(
                 matches!(err, RouterBuildError::LocalePrefixPathCollision { .. }),
                 "expected LocalePrefixPathCollision, got {err:?}"
