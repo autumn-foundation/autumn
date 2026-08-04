@@ -109,7 +109,13 @@ locals {
 }
 
 resource "azurerm_resource_group" "this" {
-  name     = "${var.app_name}-rg"
+  # local.app_name_safe, not raw var.app_name: resource groups (90-char
+  # limit) and the identity below (128-char limit) both accept far more
+  # generous lengths than Container Apps-family resources, but a Cargo
+  # package name is unbounded — a name longer than 87 characters would
+  # overflow the resource group's own limit once "-rg" is appended.
+  # app_name_safe is already bounded well under either ceiling.
+  name     = "${local.app_name_safe}-rg"
   location = var.location
 }
 
@@ -139,7 +145,7 @@ resource "azurerm_container_app_environment" "this" {
 # The Container App authenticates to ACR and Key Vault with this identity
 # instead of admin credentials or committed secrets.
 resource "azurerm_user_assigned_identity" "this" {
-  name                = "${var.app_name}-identity"
+  name                = "${local.app_name_safe}-identity"
   resource_group_name = azurerm_resource_group.this.name
   location            = azurerm_resource_group.this.location
 }

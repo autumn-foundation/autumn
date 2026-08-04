@@ -150,7 +150,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes the `AUTUMN_BUILD_*` `--build-arg`s the Dockerfile declares —
   without them every Azure-deployed image reported null git provenance at
   `/actuator/info`, since those ARGs default to empty and `.dockerignore`
-  excludes `.git` from the build context.
+  excludes `.git` from the build context. The resource group and
+  user-assigned identity now use the same length-bounded
+  `local.app_name_safe` as every other Container Apps-family resource
+  instead of raw `var.app_name`, which — unlike the character-set
+  sanitization those two already got — was still unbounded in length: a
+  Cargo package name longer than 87 characters overflowed the resource
+  group's own 90-character limit once `-rg` was appended.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

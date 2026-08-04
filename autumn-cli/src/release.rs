@@ -1710,6 +1710,42 @@ previous_secrets = []
     }
 
     #[test]
+    fn main_tf_resource_group_and_identity_use_bounded_name() {
+        // Resource groups (90-char limit) and the user-assigned identity
+        // (128-char limit) are far more permissive than Container
+        // Apps-family resources, but a Cargo package name is unbounded —
+        // one longer than 87 characters overflows the resource group's own
+        // limit once "-rg" is appended. Both must use the already
+        // length-safe local.app_name_safe, not raw var.app_name.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+
+        for resource in [
+            "azurerm_resource_group\" \"this",
+            "azurerm_user_assigned_identity\" \"this",
+        ] {
+            let block = content
+                .split(&format!("resource \"{resource}\""))
+                .nth(1)
+                .unwrap_or_else(|| {
+                    panic!("main.tf must declare resource \"{resource}\": {content}")
+                });
+            let name_line = block
+                .lines()
+                .find(|l| l.trim_start().starts_with("name"))
+                .unwrap_or_else(|| panic!("{resource} must set a name: {block}"));
+            assert!(
+                name_line.contains("local.app_name_safe"),
+                "{resource} must use the length-bounded local.app_name_safe, not raw \
+                 var.app_name (unbounded — a long Cargo package name would overflow \
+                 this resource's own name-length limit): {name_line}"
+            );
+        }
+    }
+
+    #[test]
     fn main_tf_uses_bootstrap_image_and_ignores_later_image_drift() {
         // Container Apps must pull an image to create the app's/job's first
         // revision, but a brand-new ACR has none yet, so Terraform points
