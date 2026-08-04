@@ -977,18 +977,28 @@ second tag push or dispatch while one is still running queues behind it
 instead of racing it — without this, the older run's `az containerapp
 update` could land after the newer one and silently roll production back.
 GitHub doesn't document strict FIFO ordering for which queued run goes next,
-though, so the workflow also checks — immediately before migrating, as late
-as practical — whether a newer commit has since landed on the same ref, and
-aborts rather than deploy a superseded commit out of order.
+though, and two *different* immutable tags (e.g. `v1` then `v2`) each
+trigger their own run against their own ref, so a same-ref check alone can't
+see a newer release land under a different tag. The workflow instead checks
+— immediately before migrating, as late as practical — whether any other run
+of this same workflow with a higher `run_number` (GitHub's own counter,
+monotonic in trigger order regardless of which ref triggered it) is still
+queued or in progress, and aborts rather than deploy a superseded run out of
+order.
 
 **The app's own hostname is a trusted host, automatically.** Autumn's
 `prod` profile fails fast at startup — the process never binds — when
 [`security.trusted_hosts.hosts`](#trusted-hosts-host-header-allow-list) is
 empty, and `main.tf` sets `AUTUMN_PROFILE=prod`. The Container App's default
 ingress hostname (`<app_name>.<environment default domain>`) is derived in
-Terraform and passed in as `AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS` so the
-first `az containerapp update` actually serves traffic instead of
-crash-looping. Add a comma-separated custom domain there once you bind one.
+Terraform (`local.app_fqdn`) and passed in as
+`AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS` so the first `az containerapp
+update` actually serves traffic instead of crash-looping — the same value
+`terraform output app_fqdn` prints, deliberately the *stable* ingress
+hostname rather than a revision-specific one (which would send a `Host`
+header the app doesn't trust, and would go stale the moment CI creates a new
+revision outside Terraform). Add a comma-separated custom domain to the env
+var once you bind one.
 
 **State file security.** `terraform apply` writes `database_admin_password`,
 the derived database connection string, and `signing_secret` into

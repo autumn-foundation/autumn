@@ -93,10 +93,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the job sets a per-repository `concurrency` group with
   `cancel-in-progress: false` so overlapping runs queue instead of racing
   each other's migration/cutover ordering, plus an explicit staleness guard
-  immediately before migrating (GitHub doesn't document strict FIFO
-  ordering for which queued run in a concurrency group goes next, so a run
-  could still reach that point after a newer commit has since been pushed
-  to the same ref — it now aborts rather than deploy out of order). `main.tf`
+  immediately before migrating — compared against GitHub's own `run_number`
+  (monotonic in trigger order regardless of which ref triggered a run,
+  since two *different* immutable tags each trigger their own run against
+  their own never-moving ref, so a same-ref check alone can't see a newer
+  release land under a different tag) rather than merely whether the
+  triggering ref itself has moved, and aborts if a run with a higher
+  `run_number` is still queued or in progress. The computed image tag can
+  no longer start with an invalid character either (Docker's tag grammar
+  requires a leading word character; sanitizing e.g. a `+hotfix` ref could
+  otherwise leave a leading `-`). `main.tf`
   also derives the Container App's default-ingress hostname from its
   environment (`azurerm_container_app_environment.this.default_domain`,
   computable before the app itself exists — referencing the app's own
@@ -104,7 +110,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS`: `AUTUMN_PROFILE=prod` makes
   Autumn's `fail_fast_on_invalid_trusted_hosts` exit immediately when that
   list is empty, so without this the container would never bind after the
-  first real deploy.
+  first real deploy. The same derived hostname (not
+  `latest_revision_fqdn`, which names a specific revision rather than the
+  stable ingress endpoint, and would go stale the moment CI creates a new
+  revision outside Terraform) is exposed as the `app_fqdn` output.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

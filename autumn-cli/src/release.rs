@@ -2012,6 +2012,35 @@ previous_secrets = []
     }
 
     #[test]
+    fn outputs_tf_app_fqdn_is_the_stable_ingress_hostname_not_revision_specific() {
+        // azurerm_container_app.this.latest_revision_fqdn names a specific
+        // *revision*, not the app's stable ingress hostname — visiting it
+        // sends a different Host header than AUTUMN_SECURITY__
+        // TRUSTED_HOSTS__HOSTS allows (400), and it would go stale as soon
+        // as CI creates a new revision outside Terraform. Must use the same
+        // local.app_fqdn already wired into the trusted-hosts env var.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        let app_fqdn_block = content
+            .split("output \"app_fqdn\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("outputs.tf must declare the app_fqdn output");
+        assert!(
+            app_fqdn_block.contains("local.app_fqdn"),
+            "app_fqdn must be local.app_fqdn, not a revision-specific attribute: \
+             {app_fqdn_block}"
+        );
+        assert!(
+            !app_fqdn_block.contains("latest_revision_fqdn"),
+            "app_fqdn must not use latest_revision_fqdn, which names a specific \
+             revision rather than the stable ingress hostname: {app_fqdn_block}"
+        );
+    }
+
+    #[test]
     fn tfvars_example_documents_non_secret_defaults_without_committing_secrets() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-blog");
@@ -2238,6 +2267,28 @@ previous_secrets = []
     }
 
     #[test]
+    fn azure_workflow_image_tag_never_starts_with_invalid_character() {
+        // Docker's tag grammar requires the first character to be a word
+        // character ([A-Za-z0-9_]) — "." and "-" are valid elsewhere but
+        // not at position zero. `tr` mapping invalid characters to "-" can
+        // leave one at the start (e.g. a ref beginning with "+"), which
+        // `docker build` rejects.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("sed -E 's/^[.-]+//'"),
+            "azure-deploy.yml must strip a leading \".\"/\"-\" left by sanitization: {content}"
+        );
+        assert!(
+            content.contains("[ -z \"$SAFE_REF\" ] && SAFE_REF=\"build\""),
+            "azure-deploy.yml must fall back to a valid literal if stripping leaves an \
+             empty ref (a ref made entirely of invalid characters): {content}"
+        );
+    }
+
+    #[test]
     fn azure_workflow_image_tag_includes_commit_sha() {
         // Two workflow_dispatch runs on the same branch would otherwise
         // compute the identical tag despite different commits. Re-pushing
@@ -2286,25 +2337,38 @@ previous_secrets = []
     }
 
     #[test]
-    fn azure_workflow_guards_against_superseded_commit_before_migrating() {
+    fn azure_workflow_guards_against_superseded_run_before_migrating() {
         // GitHub does not document strict FIFO ordering for which queued
-        // run in a concurrency group goes next, so a run that started
-        // against an older commit could still reach the migration/deploy
-        // steps after a newer commit has since been pushed to the same
-        // ref. Must abort rather than deploy out of order.
+        // run in a concurrency group goes next. A same-ref check isn't
+        // enough either: two DIFFERENT immutable tags (e.g. v1 then v2)
+        // each trigger their own run against their own never-moving ref,
+        // so the guard must be ref-agnostic — comparing run_number (GitHub's
+        // own monotonic-in-trigger-order counter) against other still-active
+        // runs of this workflow, not "has my own ref moved".
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
         assert!(
-            content.contains("git ls-remote origin \"$GITHUB_REF\""),
-            "azure-deploy.yml must check the ref's current remote HEAD before \
-             migrating: {content}"
+            content.contains("actions: read"),
+            "azure-deploy.yml must grant actions: read to query other workflow runs: {content}"
+        );
+        assert!(
+            content.contains("run_number > ${{ github.run_number }}"),
+            "the guard must compare against other runs' run_number, not just whether \
+             this run's own ref has moved: {content}"
+        );
+        assert!(
+            // The template's jq filter is itself inside a double-quoted
+            // bash argument, so its own string literals are backslash-
+            // escaped: \"in_progress\", not a bare "in_progress".
+            content.contains("\\\"in_progress\\\"") && content.contains("\\\"queued\\\""),
+            "the guard must check both in-progress and queued runs: {content}"
         );
 
         let guard_pos = content
-            .find("git ls-remote origin")
-            .expect("the staleness guard must be present");
+            .find("gh api")
+            .expect("the run_number staleness guard must be present");
         let job_pos = content
             .find("az containerapp job start \\")
             .expect("migration job start must be present");
