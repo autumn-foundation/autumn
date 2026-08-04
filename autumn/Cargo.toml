@@ -168,6 +168,14 @@ system-info = []
 # `autumn data` CLI subcommand.  Off by default so the `csv` crate is
 # opt-in.
 csv = ["dep:csv"]
+# Render server-side templates (Maud views, or any HTML string) to a
+# downloadable PDF document (issue #1317). Adds `autumn_web::pdf::Pdf`, an
+# `IntoResponse` built on top of `Download`. Renders a deliberately-scoped
+# HTML subset (headings, paragraphs, tables, bold/italic) with the built-in
+# PDF base-14 fonts — no embedded font files and no system-installed
+# browser/renderer, keeping the single-binary story intact. Off by default so
+# the `printpdf` dependency is opt-in.
+pdf = ["dep:printpdf"]
 # First-class system tests driving a headless Chromium browser against a
 # live Autumn server. Off by default — intended as a dev-dependency only.
 # Adds `autumn_web::system_test::{SystemTest, Page, BrowserCheck}`.
@@ -326,6 +334,12 @@ getrandom = "0.2"
 hex = "0.4"
 include_dir = { version = "0.7", optional = true }
 csv = { workspace = true, optional = true }
+# Pure-Rust PDF writer for `autumn_web::pdf` (issue #1317). `default-features
+# = false` drops the `html` feature (an azul-based CSS layout engine plus
+# `rust-fontconfig` system-font scanning) — Autumn ships its own deliberately
+# small HTML-subset-to-PDF layout using the built-in base-14 fonts, so no
+# system font lookup and no embedded font files are needed at runtime.
+printpdf = { workspace = true, optional = true }
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
 # CSS inliner for HTML email (issue #1254). `default-features = false` drops the
 # optional network (`http`/reqwest) and local-file stylesheet fetchers — Autumn
