@@ -57,6 +57,55 @@ fn is_void_element(tag: &str) -> bool {
     )
 }
 
+/// "Raw text" elements per the HTML5 parsing spec: their content is never
+/// tokenized as markup at all, even if it contains characters that look
+/// like tags (e.g. a JS comparison `a<b` inside `<script>`, or a CSS `>`
+/// combinator inside `<style>`) — only the literal closing tag ends them.
+/// Without this, such a `<` can be parsed as a bogus opening tag that
+/// swallows the real `</script>`, leaving the element unclosed and nesting
+/// (and, since `is_non_rendered` in `layout.rs` skips its subtree, hiding)
+/// everything that follows.
+fn is_raw_text_element(tag: &str) -> bool {
+    matches!(tag, "script" | "style")
+}
+
+/// Scan `input[pos..]` for the literal, case-insensitive closing tag for a
+/// [raw text element](is_raw_text_element) (e.g. `</script>`, allowing
+/// whitespace before the `>`), returning the text before it and the
+/// position just past the closing tag. If no closing tag is found, all of
+/// `input[pos..]` is returned as text with the position at end of input —
+/// matching this parser's usual "auto-close at EOF" tolerance for
+/// unterminated tags.
+fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usize) {
+    let rest = &input[pos..];
+    for (i, _) in rest.match_indices('<') {
+        let Some(after_slash) = rest[i + 1..].strip_prefix('/') else {
+            continue;
+        };
+        if after_slash.len() < tag.len()
+            || !after_slash.as_bytes()[..tag.len()].eq_ignore_ascii_case(tag.as_bytes())
+        {
+            continue;
+        }
+        let after_tag = &after_slash[tag.len()..];
+        // Must be immediately followed by whitespace or '>' — not e.g.
+        // "</scripty>" merely starting with "script".
+        let is_boundary = after_tag
+            .chars()
+            .next()
+            .is_none_or(|c| c == '>' || c.is_whitespace());
+        if !is_boundary {
+            continue;
+        }
+        let Some(gt) = after_tag.find('>') else {
+            continue;
+        };
+        let consumed = i + 2 + tag.len() + gt + 1;
+        return (&rest[..i], pos + consumed);
+    }
+    (rest, input.len())
+}
+
 /// Bound on how many frames back [`parse`]'s closing-tag matcher scans
 /// looking for the nearest open tag with a given name. Well-formed HTML
 /// (even deeply nested) closes tags in the order they were opened, so a
@@ -130,6 +179,25 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             }
             if let Some((tag, self_closing, tag_end)) = parse_open_tag(&input[pos..]) {
                 pos += tag_end;
+                if !self_closing && is_raw_text_element(&tag) {
+                    // `<script>`/`<style>` content is never tokenized as
+                    // markup — see `consume_raw_text` — so a `<` that
+                    // merely *looks* like the start of a tag (a JS
+                    // comparison, a CSS selector combinator) can't swallow
+                    // the real closing tag.
+                    let (text, new_pos) = consume_raw_text(input, pos, &tag);
+                    pos = new_pos;
+                    let mut children = Vec::new();
+                    if !text.is_empty() {
+                        children.push(Node::Text(text.to_owned()));
+                    }
+                    stack
+                        .last_mut()
+                        .expect("root frame is never popped")
+                        .1
+                        .push(Node::Element { tag, children });
+                    continue;
+                }
                 if self_closing || is_void_element(&tag) {
                     stack
                         .last_mut()
@@ -346,6 +414,41 @@ mod tests {
         assert_eq!(tag, "p");
         assert_eq!(text(children), "Hello bold world");
         assert!(matches!(&children[1], Node::Element { tag, .. } if tag == "strong"));
+    }
+
+    #[test]
+    fn script_content_with_a_stray_angle_bracket_does_not_swallow_later_siblings() {
+        // Regression: `<script>`/`<style>` content used to be tokenized as
+        // ordinary markup, so a `<` that merely *looks* like the start of a
+        // tag (e.g. a JS comparison `a<b`) got parsed as a bogus opening
+        // tag — which then consumed the *real* `</script>` as part of its
+        // own (malformed) closing, leaving `script` unclosed and nesting
+        // everything that followed (here, the `<p>`) inside it instead of
+        // as a sibling.
+        let nodes = parse("<script>if(a<b){}</script><p>Visible</p>");
+        assert_eq!(
+            nodes.len(),
+            2,
+            "the <p> must be a sibling of <script>, not swallowed into it"
+        );
+        assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "script"));
+        let Node::Element { tag, children } = &nodes[1] else {
+            panic!("expected the second top-level node to be an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn style_content_with_a_stray_angle_bracket_does_not_swallow_later_siblings() {
+        let nodes = parse("<style>/* a<b */</style><p>Visible</p>");
+        assert_eq!(nodes.len(), 2);
+        assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "style"));
+        let Node::Element { tag, children } = &nodes[1] else {
+            panic!("expected the second top-level node to be an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "Visible");
     }
 
     #[test]
