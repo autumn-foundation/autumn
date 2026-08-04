@@ -63,30 +63,54 @@ locals {
   # room for at most 39; 30 leaves comfortable margin and is also safely
   # under Postgres/Redis's own 63-character limits after their longer fixed
   # suffixes. (Key Vault truncates independently, tighter still, below.)
-  app_name_alnum = substr(lower(replace(var.app_name, "/[^a-zA-Z0-9]/", "")), 0, 30)
+  #
+  # A Cargo package name made entirely of characters this strips (e.g. the
+  # legal-but-unusual name "_") sanitizes to an empty string, which would
+  # otherwise produce a Postgres server name starting with "-" (main.tf's
+  # "${app_name_alnum}-pg-..." pattern) or violate a resource type that
+  # (unlike ACR) requires the name to start with a letter, not just be
+  # alphanumeric — Key Vault does. So: fall back to a fixed "app" prefix
+  # whenever sanitization leaves nothing, or leaves a value not starting
+  # with a letter (a leading digit survives sanitization but several of
+  # these resource types don't accept it).
+  app_name_alnum_raw = lower(replace(var.app_name, "/[^a-zA-Z0-9]/", ""))
+  app_name_alnum = substr(
+    local.app_name_alnum_raw == "" ? "app" : (
+      can(regex("^[a-z]", local.app_name_alnum_raw)) ? local.app_name_alnum_raw : "app${local.app_name_alnum_raw}"
+    ),
+    0, 30
+  )
 
   # Container Apps-family resources (the environment, the app, the migration
   # job, and Log Analytics) allow lowercase alphanumerics AND hyphens, must
-  # be 2-32 characters, must not contain consecutive hyphens, and must end
-  # in an alphanumeric character. `var.app_name` comes straight from the
-  # Cargo package name by default, which — unlike these Azure names — may
-  # legally contain underscores or uppercase letters, or its own hyphens
-  # adjacent to one mapped from an underscore (e.g. "my_app" and "my-app"
-  # both risk producing "my--app" if invalid characters are merely swapped
-  # for a hyphen one-for-one), and may be as short as one character or
-  # longer than 32. So: map anything else to a hyphen, collapse any
-  # resulting run of hyphens to one, trim a leading/trailing hyphen, pad a
-  # too-short result up to Azure's 2-character minimum, then cap the base at
-  # 24 characters — leaving headroom for the longest suffix appended to any
-  # of these resources ("-migrate", 8 characters) so the full name never
+  # be 2-32 characters, must start with a letter, must not contain
+  # consecutive hyphens, and must end in an alphanumeric character.
+  # `var.app_name` comes straight from the Cargo package name by default,
+  # which — unlike these Azure names — may legally contain underscores or
+  # uppercase letters, or its own hyphens adjacent to one mapped from an
+  # underscore (e.g. "my_app" and "my-app" both risk producing "my--app" if
+  # invalid characters are merely swapped for a hyphen one-for-one), may be
+  # entirely characters that sanitize away to nothing (e.g. "_"), and may be
+  # as short as one character or longer than 32. So: map anything else to a
+  # hyphen, collapse any resulting run of hyphens to one, trim a
+  # leading/trailing hyphen, fall back to a fixed "app" prefix if that
+  # leaves nothing or leaves a non-letter-leading value, pad a too-short
+  # result up to Azure's 2-character minimum, then cap the base at 24
+  # characters — leaving headroom for the longest suffix appended to any of
+  # these resources ("-migrate", 8 characters) so the full name never
   # exceeds Azure's 32-character maximum — and trim once more in case
   # truncation happened to land on a hyphen.
-  app_name_hyphenated = trim(
+  app_name_hyphenated_raw = trim(
     replace(
       lower(replace(var.app_name, "/[^a-zA-Z0-9-]/", "-")),
       "/-+/", "-"
     ),
     "-"
+  )
+  app_name_hyphenated = (
+    local.app_name_hyphenated_raw == "" ? "app" : (
+      can(regex("^[a-z]", local.app_name_hyphenated_raw)) ? local.app_name_hyphenated_raw : "app-${local.app_name_hyphenated_raw}"
+    )
   )
   app_name_safe = trim(
     substr(

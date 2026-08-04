@@ -156,7 +156,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of raw `var.app_name`, which — unlike the character-set
   sanitization those two already got — was still unbounded in length: a
   Cargo package name longer than 87 characters overflowed the resource
-  group's own 90-character limit once `-rg` was appended.
+  group's own 90-character limit once `-rg` was appended. Both base
+  sanitization locals (`app_name_alnum`, `app_name_hyphenated`) now fall
+  back to a fixed `app` prefix whenever the input sanitizes to nothing or
+  to a value not starting with a letter — a legal-but-unusual Cargo
+  package name like `_` previously sanitized to an empty string, producing
+  a Postgres server name starting with `-`, an empty Postgres database
+  name, and violating resource types (Key Vault) that require a
+  letter-led name rather than just an alphanumeric one. The manual deploy
+  walkthrough's image tag is no longer a fixed `v1` either — like the
+  generated workflow, it now derives a unique tag (the short commit SHA)
+  so a second manual deploy can't reuse a tag the app already has
+  configured and risk not registering as a new revision.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

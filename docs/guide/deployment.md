@@ -919,6 +919,13 @@ image, run migrations, then cut the app over:
 APP_NAME="$(terraform output -raw app_name)"           # sanitized — may differ from your Cargo package name
 ACR="$(terraform output -raw acr_login_server)"
 RG="$(terraform output -raw resource_group_name)"
+# Must be unique per deploy, not a fixed "v1": re-running this block for a
+# second manual release would otherwise push new bytes under a tag Azure
+# already has configured on the app, which isn't guaranteed to register as
+# a revision-scope change (see the automated workflow's identical
+# reasoning) — the old binary could keep serving even after these
+# migrations complete.
+TAG="$(git rev-parse --short=12 HEAD)"
 
 az acr login --name "${ACR%%.azurecr.io}"
 # The Dockerfile's AUTUMN_BUILD_* ARGs default to empty unless passed here —
@@ -931,8 +938,8 @@ docker build \
   --build-arg AUTUMN_BUILD_GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
   --build-arg AUTUMN_BUILD_GIT_DIRTY="$([ -z "$(git status --porcelain)" ] && echo false || echo true)" \
   --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t "$ACR/$APP_NAME:v1" .
-docker push "$ACR/$APP_NAME:v1"
+  -t "$ACR/$APP_NAME:$TAG" .
+docker push "$ACR/$APP_NAME:$TAG"
 
 # Run migrations to completion BEFORE updating the app — the generated
 # production config sets auto_migrate_in_production = false, so nothing
@@ -945,7 +952,7 @@ MIGRATE_JOB="$(terraform output -raw migrate_job_name)"
 EXECUTION=$(az containerapp job start \
   --name "$MIGRATE_JOB" \
   --resource-group "$RG" \
-  --image "$ACR/$APP_NAME:v1" \
+  --image "$ACR/$APP_NAME:$TAG" \
   --query name -o tsv)
 for _ in $(seq 1 66); do   # 660s — must exceed the job's own 600s replica_timeout_in_seconds
   STATUS=$(az containerapp job execution list \
@@ -963,7 +970,7 @@ done
 az containerapp update \
   --name "$APP_NAME" \
   --resource-group "$RG" \
-  --image "$ACR/$APP_NAME:v1"
+  --image "$ACR/$APP_NAME:$TAG"
 ```
 
 Terraform is told to ignore both resources' image afterward

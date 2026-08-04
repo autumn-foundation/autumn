@@ -1682,6 +1682,41 @@ previous_secrets = []
     }
 
     #[test]
+    fn main_tf_sanitized_locals_fall_back_when_input_sanitizes_to_nothing_or_a_digit() {
+        // A Cargo package name made entirely of characters sanitization
+        // strips (e.g. the legal-but-unusual name "_") sanitizes to an
+        // empty string, which would otherwise produce a Postgres server
+        // name starting with "-" (the "${app_name_alnum}-pg-..." pattern),
+        // an empty Postgres database name, and violate resource types that
+        // require a letter-led name (Key Vault) rather than just
+        // alphanumeric (ACR). Both base locals must fall back to a fixed
+        // alphabetic prefix whenever sanitization leaves nothing, or
+        // leaves a value not starting with a letter (a leading digit
+        // survives sanitization but several consumers don't accept it).
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let locals_block = content
+            .split("locals {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare a locals block");
+
+        assert!(
+            locals_block.contains("app_name_alnum_raw == \"\" ? \"app\"")
+                && locals_block.contains("app_name_hyphenated_raw == \"\" ? \"app\""),
+            "both base locals must fall back to a non-empty alphabetic value when \
+             sanitization leaves nothing: {locals_block}"
+        );
+        assert!(
+            locals_block.matches("regex(\"^[a-z]\"").count() >= 2,
+            "both base locals must check for (and fall back on) a non-letter-leading \
+             sanitized value, not just an empty one: {locals_block}"
+        );
+    }
+
+    #[test]
     fn main_tf_app_name_alnum_is_length_bounded() {
         // ACR names are capped at 50 characters; "${app_name_alnum}acr" +
         // an 8-hex-char suffix reserves 11, so an unbounded app_name_alnum
