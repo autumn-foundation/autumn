@@ -93,6 +93,20 @@ fn heading_level(tag: &str) -> Option<u8> {
     }
 }
 
+/// Tags whose content is never rendered as visible text, even though the
+/// generic "unrecognized tag = transparent passthrough" rule would otherwise
+/// walk into them. A full server-rendered page (the natural input for
+/// `Pdf::from_html` when it isn't a purpose-built Maud fragment) commonly
+/// carries a `<head>` (with `<title>`/`<meta>`/`<link>`) and inline
+/// `<script>`/`<style>` blocks; without this, their raw source text would be
+/// emitted into the PDF ahead of (or interleaved with) the actual content.
+fn is_non_rendered(tag: &str) -> bool {
+    matches!(
+        tag,
+        "script" | "style" | "noscript" | "template" | "head" | "title"
+    )
+}
+
 /// Walk `nodes` collecting inline [`Span`]s, tracking bold/italic state
 /// through `strong`/`b` and `em`/`i`, translating `br` to [`Span::Break`],
 /// and treating any other tag (including unrecognized ones) as a transparent
@@ -117,6 +131,7 @@ fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut 
                 "br" => out.push(Span::Break),
                 "strong" | "b" => inline_spans(children, true, italic, depth + 1, out),
                 "em" | "i" => inline_spans(children, bold, true, depth + 1, out),
+                _ if is_non_rendered(tag) => {}
                 _ => inline_spans(children, bold, italic, depth + 1, out),
             },
         }
@@ -156,6 +171,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
             // Structural wrappers (thead/tbody/tfoot) — descend without
             // emitting a row themselves.
             "thead" | "tbody" | "tfoot" => extract_table_rows(children, depth + 1, out),
+            _ if is_non_rendered(tag) => {}
             // Anything else inside a <table> (most commonly <caption>, or a
             // stray text-bearing tag) isn't a row — but its text must still
             // render somewhere, matching this renderer's "unknown tags pass
@@ -217,7 +233,15 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     for node in nodes {
         match node {
             Node::Text(text) => {
-                if !text.trim().is_empty() {
+                // Pushed even when whitespace-only: a text node between two
+                // loose inline elements (`<span>Hello</span> <span>world</span>`)
+                // carries the one significant space HTML collapses runs of
+                // whitespace to — dropping it here would make `words_of`
+                // glue the surrounding words together with no space at all.
+                // A whitespace-only span still contributes zero *words* (see
+                // `words_of`), so this never emits a visible extra blank
+                // line — it only preserves the separator.
+                if !text.is_empty() {
                     pending.push(Span::Run {
                         text: text.clone(),
                         bold: false,
@@ -261,6 +285,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     "br" => pending.push(Span::Break),
                     "strong" | "b" => inline_spans(children, true, false, depth + 1, &mut pending),
                     "em" | "i" => inline_spans(children, false, true, depth + 1, &mut pending),
+                    _ if is_non_rendered(tag) => {}
                     // Transparent passthrough: unknown/inline wrapper tags
                     // (span, a, ...) flow their children into the current
                     // implicit paragraph rather than being dropped.
@@ -286,7 +311,10 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
     for node in nodes {
         match node {
             Node::Text(text) => {
-                if !text.trim().is_empty() {
+                // See the matching comment in `flatten_blocks` — a
+                // whitespace-only text node is a significant separator
+                // between loose inline elements, not noise to discard.
+                if !text.is_empty() {
                     pending.push(Span::Run {
                         text: text.clone(),
                         bold: false,
@@ -310,6 +338,7 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
                         "br" => pending.push(Span::Break),
                         "strong" | "b" => inline_spans(children, true, false, depth + 1, pending),
                         "em" | "i" => inline_spans(children, false, true, depth + 1, pending),
+                        _ if is_non_rendered(tag) => {}
                         _ => flatten_into_pending(children, depth + 1, pending, out),
                     }
                 }
@@ -560,6 +589,23 @@ impl Writer {
         self.y_from_top += 14.0;
     }
 
+    /// Draw `rows` as a naive equal-width-column table.
+    ///
+    /// Known limitation: a single row is never split across a page
+    /// boundary — `ensure_space(row_height)` below reserves room for the
+    /// *whole* row up front, and if `row_height` alone exceeds a full page
+    /// (e.g. one cell wraps to dozens of lines of a long description), that
+    /// reservation is a no-op (see [`ensure_space`](Self::ensure_space)) and
+    /// [`draw_lines`](Self::draw_lines) is deliberately told not to page-break
+    /// mid-column (`break_pages: false`, see its docs) to avoid corrupting
+    /// later columns' position. The row's content past the bottom margin is
+    /// then clipped — present in the source and in `extract_text`'s output,
+    /// but not visible in the rendered PDF. Splitting one oversized row
+    /// across pages with all columns advancing in lockstep is a real
+    /// layout-engine feature this deliberately-simple renderer doesn't
+    /// attempt (see the module docs on scope); tables sized for realistic
+    /// scaffold content (invoice line items, a handful of columns) never
+    /// approach this limit.
     // Column/row counts are bounded by how many cells a template author
     // writes into one table (never remotely close to f32's 24-bit mantissa),
     // so the usize/f32 conversions below can't meaningfully lose precision.
@@ -806,6 +852,61 @@ mod tests {
         assert!(
             matches!(&blocks[0], Block::Paragraph(spans) if spans == &[Span::Run {
                 text: "hi".to_owned(), bold: false, italic: false,
+            }])
+        );
+    }
+
+    #[test]
+    fn whitespace_between_loose_inline_elements_is_not_dropped() {
+        // Regression: a whitespace-only text node separating two loose
+        // inline elements used to be filtered out entirely (treated the
+        // same as insignificant whitespace between block tags), so
+        // `words_of` never saw a boundary and glued the two words together
+        // ("Helloworld" instead of "Hello world").
+        let nodes = super::super::html::parse("<span>Hello</span> <span>world</span>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(blocks.len(), 1);
+        let Block::Paragraph(spans) = &blocks[0] else {
+            panic!("expected a paragraph block")
+        };
+        let words = words_of(spans);
+        assert_eq!(
+            words,
+            vec![
+                Word::Text {
+                    text: "Hello".to_owned(),
+                    bold: false,
+                    italic: false,
+                    glue: false,
+                },
+                Word::Text {
+                    text: "world".to_owned(),
+                    bold: false,
+                    italic: false,
+                    glue: false,
+                },
+            ],
+            "the space between the two spans must survive as a real word boundary"
+        );
+    }
+
+    #[test]
+    fn script_and_style_content_is_never_rendered() {
+        // Regression: `<script>`/`<style>` (and `<head>`/`<title>`) matched
+        // the generic "unrecognized tag = transparent passthrough" rule,
+        // so a full server-rendered page's inline CSS/JS source text was
+        // emitted into the PDF as visible content.
+        let nodes = super::super::html::parse(
+            "<head><title>Ignored</title><style>body { color: red; }</style></head>\
+             <script>alert('hi');</script><p>Visible</p>",
+        );
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "Visible".to_owned(), bold: false, italic: false,
             }])
         );
     }

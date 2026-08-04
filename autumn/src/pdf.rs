@@ -35,12 +35,19 @@
 //! `<a>`, widget-generated wrapper markup, ...) is treated as a transparent
 //! container: its text content still renders, just without special styling —
 //! so a typical scaffold view degrades gracefully instead of dropping
-//! content or erroring.
+//! content or erroring. `<script>`, `<style>`, `<noscript>`, `<template>`,
+//! `<head>`, and `<title>` are the exception — their content is never
+//! rendered as visible text, matching how a browser treats them, so passing
+//! a full server-rendered page (not just a purpose-built fragment) to
+//! [`Pdf::from_html`] doesn't leak inline CSS/JS source into the PDF.
 //!
 //! Text outside the base-14 fonts' WinAnsi encoding (CJK, emoji, ...) is
 //! rendered as `?` by the underlying PDF writer rather than corrupting the
 //! output — a known limitation of avoiding embedded font files (see the
-//! "Runtime dependencies" section below).
+//! "Runtime dependencies" section below). A single table cell whose content
+//! wraps to more than a full page of lines is clipped at the bottom margin
+//! rather than spilling onto a second page — realistic scaffold tables
+//! (invoice line items, a handful of columns) never approach this.
 //!
 //! # Determinism
 //!
