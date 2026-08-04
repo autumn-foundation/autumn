@@ -39,7 +39,8 @@ use crate::models::{
     Invitation, InviteForm, Membership, NewInvitation, NewUser, UpdateInvitation, User,
 };
 use crate::repositories::{
-    InvitationRepository, OrganizationRepository, PgInvitationRepository, PgOrganizationRepository,
+    InvitationRepository, OrganizationRepository, PgInvitationRepository, PgMembershipRepository,
+    PgOrganizationRepository,
 };
 use crate::role::{Role, require_role};
 use crate::schema::{invitations, memberships, users};
@@ -93,10 +94,11 @@ pub async fn create_invitation(
     Tenant(org_id): Tenant,
     org_repo: PgOrganizationRepository,
     invitation_repo: PgInvitationRepository,
+    membership_repo: PgMembershipRepository,
     mailer: Mailer,
     Form(form): Form<InviteForm>,
 ) -> AutumnResult<Response> {
-    let caller_role = require_role(&session, Role::Admin).await?;
+    let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
     let Some(inviter_id) = session.get("user_id").await.and_then(|s| s.parse().ok()) else {
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };
@@ -176,6 +178,17 @@ pub struct AcceptForm {
     /// already-authenticated session is joining directly (case b).
     #[serde(default)]
     pub password: Option<String>,
+}
+
+/// Who is accepting the invitation: an already-authenticated user, or the
+/// not-yet-created account for case (a), whose insert is deferred into the
+/// membership transaction (see `accept_invitation`).
+enum Joiner {
+    Existing(i64),
+    New {
+        email: String,
+        password_hash: String,
+    },
 }
 
 async fn load_pending_invitation(
@@ -347,10 +360,10 @@ pub async fn accept_invitation(
     let existing_session_user: Option<i64> =
         session.get("user_id").await.and_then(|s| s.parse().ok());
 
-    // Resolve (or create) the joining user *before* the membership
-    // transaction: case (a) creates the account here rather than via
-    // `/signup`, which would otherwise saddle the new user with an unwanted
-    // default organization.
+    // Resolve *who* is joining, but don't create anything yet: case (a)'s
+    // account creation happens inside the transaction below (alongside the
+    // membership insert), so a failure partway through the accept can never
+    // leave an orphaned account with no membership.
     //
     // Security-critical: this must never silently authenticate the *caller*
     // as an existing account. A visitor with no session is only ever allowed
@@ -361,7 +374,7 @@ pub async fn accept_invitation(
     // their own email; otherwise anyone who obtains a token not meant for
     // them (a forwarded link, a mail-scanner fetch, a shared clipboard)
     // could join — or silently log in as — an account that isn't theirs.
-    let target_user_id = if let Some(uid) = existing_session_user {
+    let joiner = if let Some(uid) = existing_session_user {
         let caller: User = users::table
             .filter(users::id.eq(uid))
             .select(User::as_select())
@@ -372,7 +385,7 @@ pub async fn accept_invitation(
                 "This invitation was sent to a different email address",
             ));
         }
-        uid
+        Joiner::Existing(uid)
     } else {
         let email = normalize_email(&invitation.email);
         let existing_user: Option<User> = users::table
@@ -416,16 +429,10 @@ pub async fn accept_invitation(
                     return Err(AutumnError::unprocessable_msg(message));
                 }
                 let password_hash = hash_password(password).await?;
-                let user: User = diesel::insert_into(users::table)
-                    .values(&NewUser {
-                        email: email.clone(),
-                        password_hash,
-                    })
-                    .returning(User::as_returning())
-                    .get_result(&mut *db)
-                    .await
-                    .map_err(|_| AutumnError::unprocessable_msg("Could not create account"))?;
-                user.id
+                Joiner::New {
+                    email,
+                    password_hash,
+                }
             }
         }
     };
@@ -437,11 +444,40 @@ pub async fn accept_invitation(
     // Raw queries (not the generated `tenant_scoped` repository) inside one
     // transaction: the repository's CRUD methods each acquire their own
     // pooled connection, which can't share this transaction's connection —
-    // and atomicity across the row-lock + insert + status update is exactly
-    // what makes double-click acceptance idempotent instead of racy.
-    let membership: Membership = db
+    // and atomicity across the account creation + row-lock + insert + status
+    // update is exactly what makes double-click acceptance idempotent
+    // instead of racy, and what stops a mid-flight failure from leaving a
+    // freshly-created account with no membership.
+    let (membership, target_user_id): (Membership, i64) = db
         .tx(move |conn| {
             async move {
+                let target_user_id = match joiner {
+                    Joiner::Existing(uid) => uid,
+                    Joiner::New {
+                        email,
+                        password_hash,
+                    } => {
+                        // Race guard: two concurrent accepts for the same
+                        // not-yet-existing email could both pass the
+                        // pre-transaction existence check above; `users.email`
+                        // is `UNIQUE`, so a second concurrent insert here
+                        // fails cleanly instead of creating a duplicate
+                        // account.
+                        let user: User = diesel::insert_into(users::table)
+                            .values(&NewUser {
+                                email,
+                                password_hash,
+                            })
+                            .returning(User::as_returning())
+                            .get_result(conn)
+                            .await
+                            .map_err(|_| {
+                                AutumnError::unprocessable_msg("Could not create account")
+                            })?;
+                        user.id
+                    }
+                };
+
                 // Lock the invitation row so two concurrent accepts serialize
                 // rather than race past the pending/expiry check together.
                 let invitation: Invitation = invitations::table
@@ -463,7 +499,7 @@ pub async fn accept_invitation(
                     // would create already exists (from an earlier accept of
                     // this same token). Succeed as a no-op rather than
                     // erroring or inserting a duplicate.
-                    return Ok::<_, AutumnError>(existing);
+                    return Ok::<_, AutumnError>((existing, target_user_id));
                 }
 
                 if invitation.status != "pending"
@@ -489,7 +525,7 @@ pub async fn accept_invitation(
                     .execute(conn)
                     .await?;
 
-                Ok(membership)
+                Ok((membership, target_user_id))
             }
             .scope_boxed()
         })
@@ -517,9 +553,10 @@ pub async fn accept_invitation(
 pub async fn revoke_invitation(
     session: Session,
     invitation_repo: PgInvitationRepository,
+    membership_repo: PgMembershipRepository,
     Path(invitation_id): Path<i64>,
 ) -> AutumnResult<Response> {
-    require_role(&session, Role::Admin).await?;
+    require_role(&session, &membership_repo, Role::Admin).await?;
     invitation_repo
         .update(
             invitation_id,
@@ -543,10 +580,11 @@ pub async fn resend_invitation(
     mut db: Db,
     org_repo: PgOrganizationRepository,
     invitation_repo: PgInvitationRepository,
+    membership_repo: PgMembershipRepository,
     mailer: Mailer,
     Path(invitation_id): Path<i64>,
 ) -> AutumnResult<Response> {
-    require_role(&session, Role::Admin).await?;
+    require_role(&session, &membership_repo, Role::Admin).await?;
     let Some(inviter_id) = session.get("user_id").await.and_then(|s| s.parse().ok()) else {
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };

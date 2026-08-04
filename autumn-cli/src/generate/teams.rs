@@ -46,7 +46,10 @@
 //! - `src/main.rs` — `mod teams;` declaration and the ten generated routes
 //!   wired into `routes![...]`.
 //! - `Cargo.toml` — ensures the `mail` Cargo feature is enabled on the
-//!   `autumn-web` dependency (needed for `InvitationMailer`'s `#[mailer]`).
+//!   `autumn-web` dependency (needed for `InvitationMailer`'s `#[mailer]`),
+//!   and ensures the generated code's own direct dependencies (`diesel`,
+//!   `diesel-async`, `pq-sys`, `chrono`, `serde`, `serde_json`, `validator`)
+//!   are present.
 //!
 //! Warns (does not auto-edit `autumn.toml` — too many possible existing
 //! shapes/profiles to safely text-patch) that `[tenancy]` needs
@@ -55,8 +58,49 @@
 use std::path::Path;
 
 use super::emit::{Plan, Revert};
+use super::model::{TEMPLATE_SHIPPED_CARGO_DEPS, ensure_cargo_dependencies};
 use super::schema_edit::{ensure_autumn_web_feature, update_main_rs};
 use super::{GenerateError, ensure_project_root, read_or_empty};
+
+/// Direct dependencies the generated `src/teams/*` code requires at compile
+/// time — a bare `autumn new` project's `Cargo.toml` doesn't carry these by
+/// default (they're only pulled in by other generators, e.g.
+/// `autumn generate model`), so `teams` must ensure them itself rather than
+/// silently relying on some other generator having already run.
+///
+/// Mirrors `model.rs`'s `MODEL_DEPS` (every `#[autumn_web::model(...)]`
+/// struct's generated code needs the same base set, including `serde_json`,
+/// which the macro expansion references even though no template field is
+/// itself JSON), minus `uuid` (every id here is a bare `i64`, and `model.rs`
+/// itself only adds `uuid` when a model actually has a UUID-typed field).
+/// `validator` is added on top: `model.rs` only pulls it in when its
+/// CLI-parsed field metadata says a model has validation rules, but that
+/// metadata doesn't exist for this generator's fixed, hand-written
+/// templates — `Organization.name`'s `#[validate(length(...))]` (see
+/// `models.rs`) needs it unconditionally. `diesel_migrations` is omitted:
+/// already in every project's template `Cargo.toml` via
+/// `TEMPLATE_SHIPPED_CARGO_DEPS`.
+const TEAMS_DEPS: &[(&str, &str)] = &[
+    ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
+    (
+        "diesel",
+        "{ version = \"2\", features = [\"postgres\", \"chrono\"] }",
+    ),
+    (
+        "diesel-async",
+        "{ version = \"0.9\", features = [\"postgres\"] }",
+    ),
+    (
+        "pq-sys",
+        "{ version = \"0.7\", features = [\"bundled_without_openssl\"] }",
+    ),
+    ("serde", "{ version = \"1\", features = [\"derive\"] }"),
+    ("serde_json", "\"1\""),
+    (
+        "validator",
+        "{ version = \"0.20\", features = [\"derive\"] }",
+    ),
+];
 
 /// Compute the file actions for `autumn generate teams`.
 ///
@@ -138,18 +182,43 @@ pub fn plan_teams(
         entries: route_entries,
     });
 
-    // ── Cargo.toml: ensure autumn-web has the "mail" feature ───────────────
+    // ── Cargo.toml: "mail" feature + the generated code's direct deps ─────
+    // Both edits land in a single `plan.modify()` call: `ensure_*` helpers
+    // are pure string transforms over an in-memory `String`, not aware of
+    // each other's pending edits, so chaining them here (rather than two
+    // separate `read_or_empty` + `plan.modify` round trips against the same
+    // path) is what stops the second edit from being computed against
+    // pre-first-edit disk content and clobbering it when `Plan::execute`
+    // applies both `Action::Modify`s in order (mirrors `channel.rs`'s
+    // combined feature+deps Cargo.toml edit).
     let cargo_path = project_root.join("Cargo.toml");
     let cargo_existing = read_or_empty(&cargo_path);
-    let updated_cargo = ensure_autumn_web_feature(&cargo_existing, "mail");
+    let mut updated_cargo = ensure_autumn_web_feature(&cargo_existing, "mail");
+    updated_cargo = ensure_cargo_dependencies(&updated_cargo, TEAMS_DEPS);
     if updated_cargo != cargo_existing {
         plan.modify(cargo_path.clone(), updated_cargo);
     }
     plan.push_revert(Revert::CargoAutumnWebFeature {
-        path: cargo_path,
+        path: cargo_path.clone(),
         feature: "mail".to_owned(),
-        owner_dir: Some(teams_dir),
+        owner_dir: Some(teams_dir.clone()),
     });
+    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
+    // model.rs: destroy recomputes this plan against the already-generated
+    // Cargo.toml, where these entries are by definition already present.
+    let dep_names: Vec<String> = TEAMS_DEPS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !TEMPLATE_SHIPPED_CARGO_DEPS.contains(name))
+        .map(str::to_owned)
+        .collect();
+    if !dep_names.is_empty() {
+        plan.push_revert(Revert::CargoDeps {
+            path: cargo_path,
+            names: dep_names,
+            owner_dir: teams_dir,
+        });
+    }
 
     // ── [tenancy] config reminder ────────────────────────────────────────
     // Never auto-edited (too many possible existing shapes/profiles to
@@ -252,7 +321,9 @@ const MOD_RS: &str = r#"//! Team membership, roles, and email invitations (issue
 //!    ```
 //!
 //! Gate any admin-only handler with
-//! `teams::role::require_role(&session, teams::role::Role::Admin).await?;`.
+//! `teams::role::require_role(&session, &membership_repo, teams::role::Role::Admin).await?;`
+//! (taking `membership_repo: teams::repositories::PgMembershipRepository` as
+//! a handler parameter).
 //!
 //! See `examples/teams` in the Autumn repository for a fully-wired reference
 //! application — it owns its whole app (including the `users` table), so it
@@ -322,6 +393,8 @@ const MODELS_RS: &str = r#"//! `Organization`, `Membership`, `Invitation` models
 //! (issue #1261).
 
 use serde::Deserialize;
+
+use crate::teams::schema::{invitations, memberships, organizations};
 
 // ── Organization ─────────────────────────────────────────────────────────
 //
@@ -424,14 +497,20 @@ const ROLE_RS: &str = r#"//! The closed membership-role enum, the `require_role`
 //! through [`Role::parse`] — an unrecognized string can never silently pass
 //! an authorization check.
 //!
-//! [`require_role`] reads the same session `"role"` key that
-//! `#[secured("...")]` and `PolicyContext::has_role` already read (populated
-//! by [`establish_org_session`], called from your own login/signup handler
-//! and from this module's own org-switch/invite-accept routes), so this is a
-//! hierarchy-aware guard layered on top of the existing session/Policy
-//! plumbing, not a second authorization mechanism (issue #1261 AC2).
+//! [`require_role`] resolves the caller's role by looking up their live
+//! `Membership` row in the active organization — it only uses the session to
+//! find *which user* is asking (`"user_id"`, set by
+//! [`establish_org_session`]), the same identity signal
+//! `#[secured("...")]`/`PolicyContext::has_role` rely on (issue #496), so this
+//! is a hierarchy-aware guard layered on top of the existing session/Policy
+//! plumbing, not a second authorization mechanism (issue #1261 AC2). Roles are
+//! never trusted from the session's cached `"role"` string: that value can go
+//! stale the instant another request revokes or changes the caller's
+//! membership, so every check re-reads the database.
 
 use autumn_web::prelude::*;
+
+use crate::teams::repositories::{MembershipRepository, PgMembershipRepository};
 
 /// A membership role, ordered `Member < Admin < Owner`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,23 +557,40 @@ impl Role {
 }
 
 /// Require that the signed-in user's role in the active organization is
-/// `required` or higher, e.g. `require_role(&session, Role::Admin).await?`.
+/// `required` or higher, e.g.
+/// `require_role(&session, &membership_repo, Role::Admin).await?`.
 ///
-/// Reads the session `"role"` key established by [`establish_org_session`].
-/// Returns the resolved role on success so callers that need it (e.g. to
-/// decide whether to show owner-only controls) don't have to look it up
-/// twice.
+/// Resolves `user_id` from the session (set by [`establish_org_session`]),
+/// then re-reads that user's `Membership` row for the active organization
+/// (`membership_repo` is `tenant_scoped`, so this is automatically filtered
+/// to the caller's active tenant — see `repositories.rs`) rather than
+/// trusting the session's cached `"role"` string, which can go stale as soon
+/// as another request changes or revokes the caller's membership. Returns
+/// the resolved role on success so callers that need it (e.g. to decide
+/// whether to show owner-only controls) don't have to look it up twice.
 ///
 /// # Errors
 ///
-/// - `401 Unauthorized` when no role is present in the session (no active
-///   organization — the caller isn't a member of one, or isn't signed in).
+/// - `401 Unauthorized` when there's no signed-in user, or the signed-in user
+///   has no membership in the active organization.
 /// - `403 Forbidden` when the resolved role does not meet `required`.
-pub async fn require_role(session: &Session, required: Role) -> AutumnResult<Role> {
-    let Some(role_str) = session.get("role").await else {
+pub async fn require_role(
+    session: &Session,
+    membership_repo: &PgMembershipRepository,
+    required: Role,
+) -> AutumnResult<Role> {
+    let Some(user_id) = session
+        .get("user_id")
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
         return Err(AutumnError::unauthorized_msg("no active organization"));
     };
-    let Some(role) = Role::parse(&role_str) else {
+    let memberships = membership_repo.find_by_user_id(user_id).await?;
+    let Some(membership) = memberships.into_iter().next() else {
+        return Err(AutumnError::unauthorized_msg("no active organization"));
+    };
+    let Some(role) = Role::parse(&membership.role) else {
         return Err(AutumnError::forbidden_msg("insufficient permissions"));
     };
     if role.at_least(required) {
@@ -523,19 +619,12 @@ pub async fn establish_org_session(session: &Session, user_id: i64, tenant_id: &
     session.insert("role", role.as_str()).await;
 }
 
+// `require_role` needs a live `Membership` row (see above), so it is exercised
+// end-to-end by your own integration tests against a real database rather
+// than with a session-only unit test here.
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-
-    fn session_with_role(role: Option<&str>) -> Session {
-        let mut data = HashMap::new();
-        if let Some(r) = role {
-            data.insert("role".to_owned(), r.to_owned());
-        }
-        Session::new_for_test(String::new(), data)
-    }
 
     #[test]
     fn hierarchy_owner_satisfies_admin_and_member() {
@@ -570,34 +659,6 @@ mod tests {
         assert_eq!(Role::parse("superadmin"), None);
         assert_eq!(Role::parse(""), None);
         assert_eq!(Role::parse("Owner"), None); // case-sensitive, no silent coercion
-    }
-
-    #[tokio::test]
-    async fn require_role_unauthorized_without_session_role() {
-        let session = session_with_role(None);
-        let err = require_role(&session, Role::Member).await.unwrap_err();
-        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn require_role_forbidden_for_garbage_session_role() {
-        let session = session_with_role(Some("superadmin"));
-        let err = require_role(&session, Role::Member).await.unwrap_err();
-        assert_eq!(err.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn require_role_forbidden_when_below_required() {
-        let session = session_with_role(Some("member"));
-        let err = require_role(&session, Role::Admin).await.unwrap_err();
-        assert_eq!(err.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn require_role_ok_when_at_or_above_required() {
-        let session = session_with_role(Some("owner"));
-        let role = require_role(&session, Role::Admin).await.unwrap();
-        assert_eq!(role, Role::Owner);
     }
 }
 "#;
@@ -911,7 +972,8 @@ use crate::teams::models::{
     InviteForm, Invitation, Membership, NewInvitation, UpdateInvitation,
 };
 use crate::teams::repositories::{
-    InvitationRepository, OrganizationRepository, PgInvitationRepository, PgOrganizationRepository,
+    InvitationRepository, OrganizationRepository, PgInvitationRepository, PgMembershipRepository,
+    PgOrganizationRepository,
 };
 use crate::teams::role::{Role, establish_org_session, require_role};
 use crate::teams::schema::{invitations, memberships};
@@ -937,6 +999,23 @@ struct InsertInvitation {
     expires_at: chrono::NaiveDateTime,
 }
 
+// A minimal, read-only view onto your app's own `users` table — just enough
+// to verify an accept-invitation caller's email address (see
+// `accept_invitation` below). This module has no `User` model to import (see
+// `crate::teams`'s module doc), so it leans on the same i64-primary-key,
+// `users`-table-name convention it already assumes for
+// `Membership::user_id`/`Invitation::invited_by_user_id`. If your app's
+// `users` table's primary key or email column differs from this, adjust the
+// two lines below to match.
+mod caller_email_lookup {
+    diesel::table! {
+        users (id) {
+            id -> BigInt,
+            email -> Text,
+        }
+    }
+}
+
 // ── Create ───────────────────────────────────────────────────────────────
 
 /// Absolute base URL for links embedded in emails, matching the convention
@@ -955,10 +1034,11 @@ pub async fn create_invitation(
     Tenant(org_id): Tenant,
     org_repo: PgOrganizationRepository,
     invitation_repo: PgInvitationRepository,
+    membership_repo: PgMembershipRepository,
     mailer: Mailer,
     Form(form): Form<InviteForm>,
 ) -> AutumnResult<Response> {
-    let caller_role = require_role(&session, Role::Admin).await?;
+    let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
     let Some(inviter_id) = session.get("user_id").await.and_then(|s| s.parse().ok()) else {
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };
@@ -1139,6 +1219,24 @@ pub async fn accept_invitation(
             .into_response());
     };
 
+    // Security-critical: an authenticated caller may only redeem an invite
+    // addressed to their own email. Without this check, anyone who obtains a
+    // token not meant for them (a forwarded link, a mail-scanner fetch, a
+    // shared clipboard) while already signed in as a different account could
+    // join — at whatever role the invite grants — an organization they were
+    // never invited to.
+    use caller_email_lookup::users as caller_users;
+    let caller_email: String = caller_users::table
+        .filter(caller_users::id.eq(user_id))
+        .select(caller_users::email)
+        .first(&mut *db)
+        .await?;
+    if caller_email.trim().to_lowercase() != invitation.email.trim().to_lowercase() {
+        return Err(AutumnError::forbidden_msg(
+            "This invitation was sent to a different email address",
+        ));
+    }
+
     let invitation_id = invitation.id;
     let tenant_id = invitation.tenant_id.clone();
     let role = invitation.role.clone();
@@ -1227,9 +1325,10 @@ pub async fn accept_invitation(
 pub async fn revoke_invitation(
     session: Session,
     invitation_repo: PgInvitationRepository,
+    membership_repo: PgMembershipRepository,
     Path(invitation_id): Path<i64>,
 ) -> AutumnResult<Response> {
-    require_role(&session, Role::Admin).await?;
+    require_role(&session, &membership_repo, Role::Admin).await?;
     invitation_repo
         .update(
             invitation_id,
@@ -1253,10 +1352,11 @@ pub async fn resend_invitation(
     mut db: Db,
     org_repo: PgOrganizationRepository,
     invitation_repo: PgInvitationRepository,
+    membership_repo: PgMembershipRepository,
     mailer: Mailer,
     Path(invitation_id): Path<i64>,
 ) -> AutumnResult<Response> {
-    require_role(&session, Role::Admin).await?;
+    require_role(&session, &membership_repo, Role::Admin).await?;
     let Some(inviter_id) = session.get("user_id").await.and_then(|s| s.parse().ok()) else {
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };
@@ -1321,7 +1421,7 @@ fn render_routes_members_rs() -> String {
 const ROUTES_MEMBERS_RS: &str = r#"//! Member-management surface: list members + pending invitations, change
 //! role, remove member (issue #1261 AC7).
 //!
-//! Every mutating action is gated `require_role(&session, Role::Admin)`, and
+//! Every mutating action is gated `require_role(&session, &membership_repo, Role::Admin)`, and
 //! the last `Owner` in an organization can neither be demoted nor removed —
 //! otherwise no one could ever grant `Owner` again (`Admin`+ can still
 //! invite/remove/change non-Owner roles regardless). Granting the `Owner`
@@ -1363,7 +1463,7 @@ pub async fn list_members(
 ) -> AutumnResult<Response> {
     // Any member (not just Admin+) can view the roster; only Admin+ sees the
     // management controls below.
-    let caller_role = require_role(&session, Role::Member).await?;
+    let caller_role = require_role(&session, &membership_repo, Role::Member).await?;
 
     let memberships = membership_repo.find_all().await?;
     let pending_invitations: Vec<Invitation> = invitation_repo
@@ -1452,7 +1552,7 @@ pub async fn change_role(
     Path(membership_id): Path<i64>,
     Form(form): Form<ChangeRoleForm>,
 ) -> AutumnResult<Response> {
-    let caller_role = require_role(&session, Role::Admin).await?;
+    let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
     let Some(new_role) = Role::parse(&form.role) else {
         return Err(AutumnError::unprocessable_msg("Unknown role"));
     };
@@ -1495,7 +1595,7 @@ pub async fn remove_member(
     membership_repo: PgMembershipRepository,
     Path(membership_id): Path<i64>,
 ) -> AutumnResult<Response> {
-    require_role(&session, Role::Admin).await?;
+    require_role(&session, &membership_repo, Role::Admin).await?;
 
     let memberships = membership_repo.find_all().await?;
     let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
@@ -1901,7 +2001,9 @@ async fn main() {
         let invitations =
             fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
         assert!(
-            invitations.contains("let caller_role = require_role(&session, Role::Admin).await?;"),
+            invitations.contains(
+                "let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;"
+            ),
             "{invitations}"
         );
         assert!(
@@ -1924,7 +2026,9 @@ async fn main() {
 
         let members = fs::read_to_string(tmp.path().join("src/teams/routes/members.rs")).unwrap();
         assert!(
-            members.contains("let caller_role = require_role(&session, Role::Admin).await?;"),
+            members.contains(
+                "let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;"
+            ),
             "{members}"
         );
         assert!(

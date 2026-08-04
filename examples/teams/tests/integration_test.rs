@@ -532,3 +532,56 @@ async fn member_cannot_invite() {
         .await;
     resp.assert_status(403);
 }
+
+/// `require_role` must revalidate against the live `Membership` row, not the
+/// session's cached `"role"` string — otherwise a removed member's still-live
+/// session cookie would keep authorizing requests until it expired.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn removed_member_loses_access_immediately_despite_cached_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    let token = latest_invite_token(dir.path());
+    let accept = client
+        .post(&format!("/invite/{token}/accept"))
+        .form("password=An0ther-Str0ng-Pa55word")
+        .send()
+        .await;
+    let member_cookie = session_cookie(&accept);
+
+    // The member's own view of the roster works before removal.
+    client
+        .get("/members")
+        .header("cookie", &member_cookie)
+        .send()
+        .await
+        .assert_ok();
+
+    // The owner removes them (member id 2, after the owner's own id 1), but
+    // the removed member's session cookie is still live — nothing signs them
+    // out server-side.
+    client
+        .post("/members/2/remove")
+        .header("cookie", &owner_cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    // The stale cookie must no longer authorize anything: their `Membership`
+    // row is gone, so `require_role` rejects them even though the session
+    // still carries the old `"role"` value from login.
+    client
+        .get("/members")
+        .header("cookie", &member_cookie)
+        .send()
+        .await
+        .assert_status(401);
+}

@@ -5,14 +5,19 @@
 //! through [`Role::parse`] — an unrecognized string can never silently pass
 //! an authorization check.
 //!
-//! [`require_role`] reads the same session `"role"` key that
-//! `#[secured("...")]` and `PolicyContext::has_role` already read (populated
-//! from the caller's active-organization `Membership` at login/signup/org
-//! switch/invite-accept — see `routes/auth.rs`), so this is a hierarchy-aware
-//! guard layered on top of the existing session/Policy plumbing, not a second
-//! authorization mechanism (issue #1261 AC2).
+//! [`require_role`] resolves the caller's role by looking up their live
+//! `Membership` row in the active organization — it only uses the session to
+//! find *which user* is asking (`"user_id"`), the same identity signal
+//! `#[secured("...")]`/`PolicyContext::has_role` rely on (issue #496), so this
+//! is a hierarchy-aware guard layered on top of the existing session/Policy
+//! plumbing, not a second authorization mechanism (issue #1261 AC2). Roles are
+//! never trusted from the session's cached `"role"` string: that value can go
+//! stale the instant another request revokes or changes the caller's
+//! membership, so every check re-reads the database.
 
 use autumn_web::prelude::*;
+
+use crate::repositories::{MembershipRepository, PgMembershipRepository};
 
 /// A membership role, ordered `Member < Admin < Owner`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,24 +64,40 @@ impl Role {
 }
 
 /// Require that the signed-in user's role in the active organization is
-/// `required` or higher, e.g. `require_role(&session, Role::Admin).await?`.
+/// `required` or higher, e.g.
+/// `require_role(&session, &membership_repo, Role::Admin).await?`.
 ///
-/// Reads the session `"role"` key established for the active organization
-/// (see `establish_session` / `switch_active_organization` in
-/// `routes/auth.rs`). Returns the resolved role on success so callers that
-/// need it (e.g. to decide whether to show owner-only controls) don't have to
-/// look it up twice.
+/// Resolves `user_id` from the session, then re-reads that user's
+/// `Membership` row for the active organization (`membership_repo` is
+/// `tenant_scoped`, so this is automatically filtered to the caller's active
+/// tenant — see `repositories.rs`) rather than trusting the session's cached
+/// `"role"` string, which can go stale as soon as another request changes or
+/// revokes the caller's membership. Returns the resolved role on success so
+/// callers that need it (e.g. to decide whether to show owner-only controls)
+/// don't have to look it up twice.
 ///
 /// # Errors
 ///
-/// - `401 Unauthorized` when no role is present in the session (no active
-///   organization — the caller isn't a member of one, or isn't signed in).
+/// - `401 Unauthorized` when there's no signed-in user, or the signed-in user
+///   has no membership in the active organization.
 /// - `403 Forbidden` when the resolved role does not meet `required`.
-pub async fn require_role(session: &Session, required: Role) -> AutumnResult<Role> {
-    let Some(role_str) = session.get("role").await else {
+pub async fn require_role(
+    session: &Session,
+    membership_repo: &PgMembershipRepository,
+    required: Role,
+) -> AutumnResult<Role> {
+    let Some(user_id) = session
+        .get("user_id")
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
         return Err(AutumnError::unauthorized_msg("no active organization"));
     };
-    let Some(role) = Role::parse(&role_str) else {
+    let memberships = membership_repo.find_by_user_id(user_id).await?;
+    let Some(membership) = memberships.into_iter().next() else {
+        return Err(AutumnError::unauthorized_msg("no active organization"));
+    };
+    let Some(role) = Role::parse(&membership.role) else {
         return Err(AutumnError::forbidden_msg("insufficient permissions"));
     };
     if role.at_least(required) {
@@ -86,19 +107,14 @@ pub async fn require_role(session: &Session, required: Role) -> AutumnResult<Rol
     }
 }
 
+// `require_role` itself now needs a live `Membership` row (see above), so it
+// is exercised end-to-end via `tests/integration_test.rs`
+// (`removed_member_loses_access_immediately_despite_cached_session` and the
+// role-gated `admin_cannot_grant_owner_role` / `member_cannot_invite` tests)
+// rather than with a session-only unit test here.
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-
-    fn session_with_role(role: Option<&str>) -> Session {
-        let mut data = HashMap::new();
-        if let Some(r) = role {
-            data.insert("role".to_owned(), r.to_owned());
-        }
-        Session::new_for_test(String::new(), data)
-    }
 
     #[test]
     fn hierarchy_owner_satisfies_admin_and_member() {
@@ -133,33 +149,5 @@ mod tests {
         assert_eq!(Role::parse("superadmin"), None);
         assert_eq!(Role::parse(""), None);
         assert_eq!(Role::parse("Owner"), None); // case-sensitive, no silent coercion
-    }
-
-    #[tokio::test]
-    async fn require_role_unauthorized_without_session_role() {
-        let session = session_with_role(None);
-        let err = require_role(&session, Role::Member).await.unwrap_err();
-        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn require_role_forbidden_for_garbage_session_role() {
-        let session = session_with_role(Some("superadmin"));
-        let err = require_role(&session, Role::Member).await.unwrap_err();
-        assert_eq!(err.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn require_role_forbidden_when_below_required() {
-        let session = session_with_role(Some("member"));
-        let err = require_role(&session, Role::Admin).await.unwrap_err();
-        assert_eq!(err.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn require_role_ok_when_at_or_above_required() {
-        let session = session_with_role(Some("owner"));
-        let role = require_role(&session, Role::Admin).await.unwrap();
-        assert_eq!(role, Role::Owner);
     }
 }

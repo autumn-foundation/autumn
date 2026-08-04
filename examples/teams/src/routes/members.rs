@@ -49,7 +49,7 @@ pub async fn list_members(
 ) -> AutumnResult<Response> {
     // Any member (not just Admin+) can view the roster; only Admin+ sees the
     // management controls below.
-    let caller_role = require_role(&session, Role::Member).await?;
+    let caller_role = require_role(&session, &membership_repo, Role::Member).await?;
 
     let memberships = membership_repo.find_all().await?;
     let pending_invitations: Vec<Invitation> = invitation_repo
@@ -193,7 +193,7 @@ pub async fn change_role(
     Path(membership_id): Path<i64>,
     Form(form): Form<ChangeRoleForm>,
 ) -> AutumnResult<Response> {
-    let caller_role = require_role(&session, Role::Admin).await?;
+    let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
     let Some(new_role) = Role::parse(&form.role) else {
         return Err(AutumnError::unprocessable_msg("Unknown role"));
     };
@@ -236,7 +236,7 @@ pub async fn remove_member(
     membership_repo: PgMembershipRepository,
     Path(membership_id): Path<i64>,
 ) -> AutumnResult<Response> {
-    require_role(&session, Role::Admin).await?;
+    require_role(&session, &membership_repo, Role::Admin).await?;
 
     let memberships = membership_repo.find_all().await?;
     let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
