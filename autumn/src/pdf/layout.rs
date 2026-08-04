@@ -117,7 +117,8 @@ fn is_non_rendered(tag: &str) -> bool {
 /// inserting a line break around them — the smallest change that stops
 /// `<li><p>First</p><p>Second</p></li>` from rendering as "`FirstSecond`".
 fn is_block_boundary_in_inline_context(tag: &str) -> bool {
-    heading_level(tag).is_some() || matches!(tag, "p" | "div" | "blockquote" | "li")
+    heading_level(tag).is_some()
+        || matches!(tag, "p" | "div" | "blockquote" | "li" | "dl" | "dt" | "dd")
 }
 
 /// Push a line break unless `out` is empty or already ends with one —
@@ -305,17 +306,26 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     // paragraph is a reasonable degrade — and `li`'s normal
                     // path is `extract_list_items` below, not here; this arm
                     // only sees a stray `<li>` outside a `<ul>`/`<ol>`.
-                    "p" | "li" => {
+                    // `dt`/`dd` (a description list's term/value pair) are
+                    // the same shape: each is its own block-level unit whose
+                    // content is normally inline, so it gets its own
+                    // paragraph rather than gluing onto its sibling term or
+                    // value — without this, `<dl><dt>Title</dt><dd>My
+                    // Post</dd>...</dl>` (as emitted by scaffold detail
+                    // views, e.g. a `property_list` widget) renders as one
+                    // run of unbroken text with no row boundaries at all.
+                    "p" | "li" | "dt" | "dd" => {
                         flush(&mut pending, out);
                         let mut spans = Vec::new();
                         inline_spans(children, false, false, depth + 1, &mut spans);
                         trim_trailing_break(&mut spans);
                         out.push(Block::Paragraph(spans));
                     }
-                    // `div`/`blockquote` commonly wrap *other block
+                    // `div`/`blockquote`/`dl` commonly wrap *other block
                     // elements* (`<div><h1>...</h1><p>...</p></div>`,
-                    // `<blockquote><p>...</p></blockquote>`) — recursing
-                    // through `flatten_blocks` (rather than flattening every
+                    // `<blockquote><p>...</p></blockquote>`, a `<dl>`'s
+                    // `<dt>`/`<dd>` children) — recursing through
+                    // `flatten_blocks` (rather than flattening every
                     // descendant through `inline_spans` into one paragraph,
                     // which would merge a heading and two paragraphs into a
                     // single run of unbroken text) lets nested block tags
@@ -324,7 +334,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     // `flatten_blocks`'s own pending/flush accumulator
                     // produces exactly the same single implicit paragraph
                     // this used to build directly.
-                    "div" | "blockquote" => {
+                    "div" | "blockquote" | "dl" => {
                         flush(&mut pending, out);
                         flatten_blocks(children, depth + 1, out);
                     }
@@ -1189,6 +1199,37 @@ mod tests {
             ],
             "nested paragraphs inside a cell must be line-break separated, with no trailing break"
         );
+    }
+
+    #[test]
+    fn description_list_terms_and_values_keep_their_own_blocks() {
+        // Regression: `<dl>`/`<dt>`/`<dd>` (as emitted by scaffold detail
+        // views — e.g. a `property_list` widget) fell through the generic
+        // "unknown tag = transparent passthrough" rule with no block
+        // separation at all, so `<dl><dt>Title</dt><dd>My Post</dd>
+        // <dt>Published</dt><dd>true</dd></dl>` rendered as one glued run,
+        // "TitleMy PostPublishedtrue", instead of four separate rows.
+        let nodes = super::super::html::parse(
+            "<dl><dt>Title</dt><dd>My Post</dd><dt>Published</dt><dd>true</dd></dl>",
+        );
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        let texts: Vec<String> = blocks
+            .iter()
+            .map(|block| {
+                let Block::Paragraph(spans) = block else {
+                    panic!("expected a paragraph block, got {block:?}")
+                };
+                spans
+                    .iter()
+                    .map(|span| match span {
+                        Span::Run { text, .. } => text.as_str(),
+                        Span::Break => "",
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(texts, vec!["Title", "My Post", "Published", "true"]);
     }
 
     #[test]
