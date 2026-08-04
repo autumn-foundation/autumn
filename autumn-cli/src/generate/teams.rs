@@ -1581,22 +1581,29 @@ pub async fn create_invitation(
                 ));
             }
 
-            // Revoke any other still-pending invitation to this email in
-            // this organization before creating the new one — otherwise
-            // both tokens would stay independently valid, and accepting
-            // one would leave the other pending indefinitely (the same
-            // lingering-token issue `accept_invitation` guards against for
-            // an already-a-member accept, but here at creation time for
-            // two never-yet-accepted invitations to the same address).
-            diesel::update(
-                invitations::table
-                    .filter(invitations::tenant_id.eq(&tenant_id))
-                    .filter(invitations::email.eq(&insert_email))
-                    .filter(invitations::status.eq("pending")),
-            )
-            .set(invitations::status.eq("revoked"))
-            .execute(conn)
-            .await?;
+            // Reject rather than silently revoke-and-replace a still-pending
+            // invitation to this email — now that the organization lock
+            // above serializes concurrent `create_invitation` calls for
+            // this organization, a second request for an email that's
+            // already pending is a genuine conflict the caller should see,
+            // not a race to resolve by rewriting history underneath them.
+            // Revoking-and-replacing here also sent two invite emails out
+            // of release-lock order, so a reordered delivery could leave
+            // the invitee's newest message holding an already-revoked
+            // token (Codex review finding).
+            let existing_pending: Option<Invitation> = invitations::table
+                .filter(invitations::tenant_id.eq(&tenant_id))
+                .filter(invitations::email.eq(&insert_email))
+                .filter(invitations::status.eq("pending"))
+                .select(Invitation::as_select())
+                .first(conn)
+                .await
+                .optional()?;
+            if existing_pending.is_some() {
+                return Err(AutumnError::conflict_msg(
+                    "An invitation to this email is already pending for this organization",
+                ));
+            }
 
             diesel::insert_into(invitations::table)
                 .values(&InsertInvitation {
@@ -1618,14 +1625,14 @@ pub async fn create_invitation(
     })
     .await
     .map_err(|err| {
-        // Two concurrent requests for the same (tenant_id, email) can both
-        // pass the revoke step (a no-op when no prior pending row exists)
-        // and then race to insert here — the transaction alone doesn't
-        // serialize them, since there's no existing row for either to lock.
+        // The organization lock plus the explicit pending-email check above
+        // already serialize concurrent `create_invitation` calls for this
+        // organization, so this should be unreachable in practice.
         // `idx_invitations_pending_email` (a partial unique index on
         // `(tenant_id, email) WHERE status = 'pending'`, see MIGRATION_UP)
-        // is the backstop: the loser's INSERT fails closed instead of
-        // leaving two live pending tokens for the same invitee.
+        // stays as defense in depth: any INSERT that still slips past the
+        // check above fails closed instead of leaving two live pending
+        // tokens for the same invitee.
         if autumn_web::error::unique_violation_field(
             &err,
             &[(
@@ -2233,12 +2240,12 @@ use autumn_web::security::CsrfToken;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::teams::models::{ChangeRoleForm, Invitation, Membership};
+use crate::teams::models::{ChangeRoleForm, Invitation, Membership, Organization};
 use crate::teams::repositories::{
     InvitationRepository, MembershipRepository, PgInvitationRepository, PgMembershipRepository,
 };
 use crate::teams::role::{Role, require_role};
-use crate::teams::schema::memberships;
+use crate::teams::schema::{memberships, organizations};
 
 use super::{csrf_value, minimal_page};
 
@@ -2382,6 +2389,28 @@ pub async fn change_role(
     // mirrors `examples/teams/src/routes/members.rs`'s identical fix).
     db.tx(move |conn| {
         async move {
+            // Lock the organization row FIRST — before any membership row
+            // below — matching `remove_all_memberships_on_conn`'s lock
+            // order. Without it, an in-flight account-deletion cleanup
+            // (which locks the organization, then the departing owner's
+            // own row, then a successor candidate's row, in that order)
+            // could deadlock against this transaction's own unordered
+            // `memberships` load: if this load happens to lock a
+            // successor candidate's row before the owner's row cleanup
+            // already holds, each transaction ends up waiting on a row
+            // the other holds, and Postgres aborts one with no retry
+            // (Codex review finding).
+            let org_id: i64 = tenant_id.parse().map_err(|_| {
+                AutumnError::internal_server_error_msg("Corrupt organization id in session")
+            })?;
+            organizations::table
+                .find(org_id)
+                .for_update()
+                .select(Organization::as_select())
+                .first(conn)
+                .await
+                .optional()?;
+
             let memberships: Vec<Membership> = memberships::table
                 .filter(memberships::tenant_id.eq(&tenant_id))
                 .for_update()
@@ -2470,6 +2499,21 @@ pub async fn remove_member(
     // review finding).
     db.tx(move |conn| {
         async move {
+            // Lock the organization row FIRST — before any membership row
+            // below — matching `remove_all_memberships_on_conn`'s and
+            // `change_role`'s lock order (see `change_role`'s comment for
+            // the full deadlock rationale; Codex review finding).
+            let org_id: i64 = tenant_id.parse().map_err(|_| {
+                AutumnError::internal_server_error_msg("Corrupt organization id in session")
+            })?;
+            organizations::table
+                .find(org_id)
+                .for_update()
+                .select(Organization::as_select())
+                .first(conn)
+                .await
+                .optional()?;
+
             let memberships: Vec<Membership> = memberships::table
                 .filter(memberships::tenant_id.eq(&tenant_id))
                 .for_update()
@@ -3194,7 +3238,7 @@ async fn main() {
     /// tokens — the older one must be revoked in the same transaction as
     /// the new one is inserted (Codex review finding).
     #[test]
-    fn create_invitation_revokes_prior_pending_invitation_for_same_email() {
+    fn create_invitation_rejects_rather_than_replaces_a_pending_invitation_for_same_email() {
         let tmp = project();
         plan_teams(tmp.path(), "20260101000000", false)
             .unwrap()
@@ -3203,10 +3247,19 @@ async fn main() {
 
         let invitations =
             fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        let create_start = invitations.find("pub async fn create_invitation(").unwrap();
+        let create_end = invitations
+            .find("// ── Accept (show) ")
+            .unwrap_or(invitations.len());
+        let body = &invitations[create_start..create_end];
         assert!(
-            invitations.contains(".filter(invitations::status.eq(\"pending\"))")
-                && invitations.contains(".set(invitations::status.eq(\"revoked\"))"),
-            "{invitations}"
+            body.contains("if existing_pending.is_some()")
+                && body.contains("AutumnError::conflict_msg("),
+            "{body}"
+        );
+        assert!(
+            !body.contains(".set(invitations::status.eq(\"revoked\"))"),
+            "create_invitation must reject rather than revoke a prior pending invitation: {body}"
         );
     }
 
