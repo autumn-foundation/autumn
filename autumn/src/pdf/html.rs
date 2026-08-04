@@ -173,6 +173,23 @@ fn push_text(stack: &mut [(String, Vec<Node>)], text: &str) {
 /// contents — so a literal `>` inside a quoted attribute value is not
 /// specially handled and will end the tag early. Developer-authored template
 /// markup essentially never does this in practice; see the module docs.
+/// Bound on how far [`parse_open_tag`] scans looking for the closing `>`. A
+/// long run of unterminated `<tag` fragments with no `>` anywhere
+/// (adversarial or just malformed input, e.g. `"<a".repeat(n)`) would
+/// otherwise make that scan cover the *entire remainder* of the document —
+/// and because a failed parse doesn't consume any input (the caller falls
+/// back to treating just the `<` as literal text and retries at the very
+/// next byte), that unbounded cost gets paid again at every subsequent `<` —
+/// O(n^2) overall, the same shape of bug `decode_entities` was fixed for.
+/// Real tag names and attribute lists are essentially never anywhere near
+/// this long, so capping the window just makes a malformed/adversarial `<`
+/// fall back to being treated as literal text — same as it already would if
+/// genuinely unterminated. Kept small (not just "generous") because the
+/// tag-name allocation below is sized off this window on every match
+/// attempt — a large bound would keep the *asymptotic* cost linear but still
+/// make the constant factor expensive in practice.
+const MAX_TAG_SCAN: usize = 256;
+
 fn parse_open_tag(s: &str) -> Option<(String, bool, usize)> {
     debug_assert!(s.starts_with('<'));
     let rest = &s[1..];
@@ -180,13 +197,24 @@ fn parse_open_tag(s: &str) -> Option<(String, bool, usize)> {
     if !first.is_ascii_alphabetic() {
         return None;
     }
-    let name_end = rest
-        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-        .unwrap_or(rest.len());
-    let tag = rest[..name_end].to_ascii_lowercase();
 
-    let gt = rest.find('>')?;
-    let self_closing = rest[..gt].trim_end().ends_with('/');
+    let window_end = rest
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| i >= MAX_TAG_SCAN)
+        .unwrap_or(rest.len());
+    let window = &rest[..window_end];
+
+    // Find `>` first and bail before doing any allocation if it's not in the
+    // window — the common failure case (a malformed/unterminated `<`) then
+    // costs only the bounded scan above, never a string allocation.
+    let gt = window.find('>')?;
+
+    let name_end = window[..gt]
+        .find(|c: char| c.is_whitespace() || c == '/')
+        .unwrap_or(gt);
+    let tag = window[..name_end].to_ascii_lowercase();
+    let self_closing = window[..gt].trim_end().ends_with('/');
     Some((tag, self_closing, 1 + gt + 1))
 }
 
@@ -360,6 +388,30 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "decode_entities took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_run_of_unterminated_open_tags_is_linear_not_quadratic() {
+        // Regression: `parse_open_tag`'s search for the closing `>` (and the
+        // tag-name search before it) scanned the entire remainder of the
+        // string, and on failure returned `None` *without consuming any
+        // input* — so the outer loop retried at the very next byte and paid
+        // that same unbounded scan again, for every `<` in a long run of
+        // unterminated fragments (e.g. `"<a".repeat(n)`, with no `>`
+        // anywhere) — O(n^2) overall.
+        let html = "<a".repeat(100_000);
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(
+            text(&nodes),
+            html,
+            "unterminated `<a` fragments pass through unchanged as literal text"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "parse_open_tag took {:?} — looks quadratic again",
             start.elapsed()
         );
     }

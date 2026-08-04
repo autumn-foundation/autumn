@@ -258,11 +258,33 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     continue;
                 }
                 match tag.as_str() {
-                    "p" | "div" | "li" | "blockquote" => {
+                    // `p`/`li` cannot legally nest another block element in
+                    // HTML (a nested block inside them is already malformed
+                    // input), so flattening their content to one implicit
+                    // paragraph is a reasonable degrade — and `li`'s normal
+                    // path is `extract_list_items` below, not here; this arm
+                    // only sees a stray `<li>` outside a `<ul>`/`<ol>`.
+                    "p" | "li" => {
                         flush(&mut pending, out);
                         let mut spans = Vec::new();
                         inline_spans(children, false, false, depth + 1, &mut spans);
                         out.push(Block::Paragraph(spans));
+                    }
+                    // `div`/`blockquote` commonly wrap *other block
+                    // elements* (`<div><h1>...</h1><p>...</p></div>`,
+                    // `<blockquote><p>...</p></blockquote>`) — recursing
+                    // through `flatten_blocks` (rather than flattening every
+                    // descendant through `inline_spans` into one paragraph,
+                    // which would merge a heading and two paragraphs into a
+                    // single run of unbroken text) lets nested block tags
+                    // still produce their own blocks. When the children are
+                    // purely inline (e.g. `<div><span>hi</span></div>`),
+                    // `flatten_blocks`'s own pending/flush accumulator
+                    // produces exactly the same single implicit paragraph
+                    // this used to build directly.
+                    "div" | "blockquote" => {
+                        flush(&mut pending, out);
+                        flatten_blocks(children, depth + 1, out);
                     }
                     "hr" => {
                         flush(&mut pending, out);
@@ -957,6 +979,51 @@ mod tests {
         assert!(
             matches!(&blocks[0], Block::Paragraph(spans) if spans == &[Span::Run {
                 text: "hi".to_owned(), bold: false, italic: false,
+            }])
+        );
+    }
+
+    #[test]
+    fn div_wrapper_preserves_nested_block_structure() {
+        // Regression: `<div>` used to flatten every descendant through
+        // `inline_spans` into one paragraph, merging a heading and two
+        // paragraphs into a single unbroken run of text ("TitleFirstSecond")
+        // — exactly the "one div wraps the whole page body" shape a typical
+        // Maud layout function produces.
+        let nodes = super::super::html::parse("<div><h1>Title</h1><p>First</p><p>Second</p></div>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(
+            blocks.len(),
+            3,
+            "expected 3 separate blocks, got {blocks:?}"
+        );
+        assert!(
+            matches!(&blocks[0], Block::Heading(1, spans) if spans == &[Span::Run {
+                text: "Title".to_owned(), bold: true, italic: false,
+            }])
+        );
+        assert!(
+            matches!(&blocks[1], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "First".to_owned(), bold: false, italic: false,
+            }])
+        );
+        assert!(
+            matches!(&blocks[2], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "Second".to_owned(), bold: false, italic: false,
+            }])
+        );
+    }
+
+    #[test]
+    fn blockquote_wrapper_preserves_nested_paragraph() {
+        let nodes = super::super::html::parse("<blockquote><p>Quote text</p></blockquote>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "Quote text".to_owned(), bold: false, italic: false,
             }])
         );
     }
