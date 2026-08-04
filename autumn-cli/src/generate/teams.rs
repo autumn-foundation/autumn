@@ -184,9 +184,22 @@ pub fn plan_teams(
     );
 
     // ── migrations/<timestamp>_create_teams ─────────────────────────────
-    let migration_dir = project_root
-        .join("migrations")
-        .join(format!("{timestamp}_create_teams"));
+    // `teams` is a singleton scaffold (fixed table set, no per-invocation
+    // resource name): re-running — especially with `--force` to refresh
+    // it — must not mint a SECOND `*_create_teams` directory, since two
+    // `CREATE TABLE organizations/memberships/invitations` migrations would
+    // fail the next `autumn migrate` on the duplicate tables (Codex review
+    // finding; mirrors `notifications.rs`'s identical singleton-migration
+    // fix from PR #2144 finding B). Reuse an existing `*_create_teams` dir
+    // when one is present, minting a fresh timestamped dir only on a clean
+    // project. `autumn destroy teams` matches by the same suffix regardless
+    // (see `emit.rs`'s `resolve_migration_removal`), so this doesn't change
+    // destroy behavior.
+    let migration_dir = existing_teams_migration_dir(project_root).unwrap_or_else(|| {
+        project_root
+            .join("migrations")
+            .join(format!("{timestamp}_create_teams"))
+    });
     plan.create(migration_dir.join("up.sql"), MIGRATION_UP.to_owned());
     plan.create(migration_dir.join("down.sql"), MIGRATION_DOWN.to_owned());
 
@@ -293,6 +306,33 @@ fn plan_teams_cargo_toml(plan: &mut Plan, project_root: &Path, teams_dir: PathBu
     }
 }
 
+/// The existing `migrations/<ts>_create_teams/` directory, if the project
+/// already has one — so a re-run reuses it in place rather than minting a
+/// second singleton migration. Matched by the same `_create_teams` suffix
+/// destroy uses (see `emit::resolve_migration_removal`), so the two stay in
+/// agreement. Mirrors `notifications.rs`'s `existing_notifications_migration_dir`.
+///
+/// If more than one somehow exists (a hand-added duplicate, or one left
+/// over from before this reuse check existed), the lexicographically-smallest
+/// is chosen deterministically — the same tie-break `emit`'s destroy scan
+/// applies — rather than depending on `read_dir` order.
+fn existing_teams_migration_dir(project_root: &Path) -> Option<PathBuf> {
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(project_root.join("migrations"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("_create_teams"))
+        })
+        .collect();
+    matches.sort();
+    matches.into_iter().next()
+}
+
 /// The ten generated route handlers, in the fully-qualified
 /// `teams::routes::<module>::<fn>` form `routes![...]` needs (`mod teams;`
 /// makes `teams` a top-level module from `src/main.rs`'s perspective, one
@@ -358,7 +398,7 @@ const MOD_RS: &str = r#"//! Team membership, roles, and email invitations (issue
 //!
 //!    ```ignore
 //!    teams::routes::organizations::provision_default_organization(
-//!        &session, user.id, &org_repo, &membership_repo,
+//!        &session, user.id, &mut db,
 //!    ).await?;
 //!    ```
 //!
@@ -878,39 +918,71 @@ const ROUTES_ORGANIZATIONS_RS: &str = r#"//! Creating additional organizations, 
 
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
-use autumn_web::tenancy::with_tenant;
+use autumn_web::reexports::scoped_futures::ScopedFutureExt;
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 
-use crate::teams::models::{Membership, NewMembership, NewOrganization};
-use crate::teams::repositories::{
-    MembershipRepository, OrganizationRepository, PgMembershipRepository,
-    PgOrganizationRepository,
-};
+use crate::teams::models::{Membership, Organization};
+use crate::teams::repositories::{MembershipRepository, PgMembershipRepository};
 use crate::teams::role::{Role, establish_org_session};
+use crate::teams::schema::{memberships, organizations};
+
+#[derive(diesel::Insertable)]
+#[diesel(table_name = organizations)]
+struct InsertOrganization {
+    name: String,
+}
+
+#[derive(diesel::Insertable)]
+#[diesel(table_name = memberships)]
+struct InsertMembership {
+    tenant_id: String,
+    user_id: i64,
+    role: String,
+}
 
 /// Create a personal organization for a brand-new user and make them its
 /// `Owner` — call this as the last line of your own signup handler, right
 /// after it establishes the base session (issue #1261 AC3; see
 /// `crate::teams`'s module doc for the full two-step integration).
+///
+/// `db` is your own signup handler's `Db` extractor: the organization and
+/// membership inserts run in one transaction on it, so a failure between
+/// the two can never leave an orphaned organization with no members. This
+/// can't extend to your own preceding user insert (a plain function call
+/// has no way to join an arbitrary caller's already-open transaction) —
+/// if you need that too, run this function's two inserts inline inside
+/// your own `db.tx(...)` block instead of calling it separately.
 pub async fn provision_default_organization(
     session: &Session,
     user_id: i64,
-    org_repo: &PgOrganizationRepository,
-    membership_repo: &PgMembershipRepository,
+    db: &mut Db,
 ) -> AutumnResult<()> {
-    let org = org_repo
-        .save(&NewOrganization {
-            name: format!("User {user_id}'s Organization"),
+    let org: Organization = db
+        .tx(move |conn| {
+            async move {
+                let org: Organization = diesel::insert_into(organizations::table)
+                    .values(&InsertOrganization {
+                        name: format!("User {user_id}'s Organization"),
+                    })
+                    .returning(Organization::as_returning())
+                    .get_result(conn)
+                    .await?;
+
+                diesel::insert_into(memberships::table)
+                    .values(&InsertMembership {
+                        tenant_id: org.id.to_string(),
+                        user_id,
+                        role: Role::Owner.as_str().to_owned(),
+                    })
+                    .execute(conn)
+                    .await?;
+
+                Ok::<_, AutumnError>(org)
+            }
+            .scope_boxed()
         })
         .await?;
-    with_tenant(org.id.to_string(), async {
-        membership_repo
-            .save(&NewMembership {
-                user_id,
-                role: Role::Owner.as_str().to_owned(),
-            })
-            .await
-    })
-    .await?;
     establish_org_session(session, user_id, &org.id.to_string(), Role::Owner).await;
     Ok(())
 }
@@ -920,8 +992,7 @@ pub async fn provision_default_organization(
 #[post("/organizations")]
 pub async fn create_organization(
     session: Session,
-    org_repo: PgOrganizationRepository,
-    membership_repo: PgMembershipRepository,
+    mut db: Db,
     Form(form): Form<crate::teams::models::NewOrganizationForm>,
 ) -> AutumnResult<Response> {
     let Some(user_id) = session.get("user_id").await.and_then(|s| s.parse().ok()) else {
@@ -935,16 +1006,32 @@ pub async fn create_organization(
         ));
     }
 
-    let org = org_repo.save(&NewOrganization { name }).await?;
-    with_tenant(org.id.to_string(), async {
-        membership_repo
-            .save(&NewMembership {
-                user_id,
-                role: Role::Owner.as_str().to_owned(),
-            })
-            .await
-    })
-    .await?;
+    // One transaction: without it, a failure between the org insert and the
+    // owner-membership insert would leave an orphaned `Organization` row no
+    // one is a member of.
+    let org: Organization = db
+        .tx(move |conn| {
+            async move {
+                let org: Organization = diesel::insert_into(organizations::table)
+                    .values(&InsertOrganization { name })
+                    .returning(Organization::as_returning())
+                    .get_result(conn)
+                    .await?;
+
+                diesel::insert_into(memberships::table)
+                    .values(&InsertMembership {
+                        tenant_id: org.id.to_string(),
+                        user_id,
+                        role: Role::Owner.as_str().to_owned(),
+                    })
+                    .execute(conn)
+                    .await?;
+
+                Ok::<_, AutumnError>(org)
+            }
+            .scope_boxed()
+        })
+        .await?;
 
     establish_org_session(&session, user_id, &org.id.to_string(), Role::Owner).await;
     Ok(Redirect::to("/members").into_response())
@@ -1906,18 +1993,63 @@ async fn main() {
             })
             .unwrap();
 
-        // The second run's migration directory is created alongside the
-        // first — `--force` only affects file collisions, not migration
-        // directory naming (a fresh timestamp is a different directory).
+        // The second run reuses the first run's migration directory — a
+        // singleton scaffold like `teams` must not mint a second
+        // `*_create_teams` directory on `--force` (two `CREATE TABLE
+        // organizations` migrations would fail `autumn migrate` on the
+        // duplicate table).
         assert!(
             tmp.path()
                 .join("migrations/20260101000000_create_teams")
                 .exists()
         );
         assert!(
-            tmp.path()
+            !tmp.path()
                 .join("migrations/20260102000000_create_teams")
                 .exists()
+        );
+    }
+
+    /// Codex review finding: `--force` regeneration must reuse the existing
+    /// `*_create_teams` migration in place, not mint a second one.
+    #[test]
+    fn force_reuses_existing_migration_up_and_down_sql() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        // Hand-edit the migration to prove the second run actually reuses
+        // (overwrites in place) this exact directory rather than leaving it
+        // untouched alongside a fresh one.
+        let up_path = tmp
+            .path()
+            .join("migrations/20260101000000_create_teams/up.sql");
+        fs::write(&up_path, "-- stale\n").unwrap();
+
+        plan_teams(tmp.path(), "20260102000000", false)
+            .unwrap()
+            .execute(Flags {
+                dry_run: false,
+                force: true,
+            })
+            .unwrap();
+
+        let migrations_root = tmp.path().join("migrations");
+        let entries: Vec<_> = fs::read_dir(&migrations_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one *_create_teams migration directory must exist after --force: {entries:?}"
+        );
+        let up = fs::read_to_string(&up_path).unwrap();
+        assert!(
+            up.contains("CREATE TABLE organizations"),
+            "the original directory's up.sql must be refreshed, not left stale: {up}"
         );
     }
 

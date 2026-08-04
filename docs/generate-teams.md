@@ -60,9 +60,13 @@ organization and make them its `Owner`:
 
 ```rust
 teams::routes::organizations::provision_default_organization(
-    &session, user.id, &org_repo, &membership_repo,
+    &session, user.id, &mut db,
 ).await?;
 ```
+
+`db` is your own signup handler's `Db` extractor — the organization and
+membership inserts run in one transaction on it, so a failure between the
+two can never leave an orphaned organization with no members.
 
 **2. At login**, after your handler authenticates the user, resolve their
 active organization/role and set it on the session:
