@@ -214,15 +214,17 @@ pub async fn change_role(
     Path(membership_id): Path<i64>,
     Form(form): Form<ChangeRoleForm>,
 ) -> AutumnResult<Response> {
-    let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
+    require_role(&session, &membership_repo, Role::Admin).await?;
+    let Some(caller_id) = session
+        .get("user_id")
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return Err(AutumnError::unauthorized_msg("authentication required"));
+    };
     let Some(new_role) = Role::parse(&form.role) else {
         return Err(AutumnError::unprocessable_msg("Unknown role"));
     };
-    if new_role == Role::Owner && caller_role != Role::Owner {
-        return Err(AutumnError::forbidden_msg(
-            "Only an owner can grant the owner role",
-        ));
-    }
 
     // Raw query (not the `tenant_scoped` repository's plain `find_all()`)
     // inside one locked transaction: reading the owner count and demoting
@@ -240,6 +242,28 @@ pub async fn change_role(
                 .select(Membership::as_select())
                 .load(conn)
                 .await?;
+
+            // Revalidate the caller's own role from this same locked
+            // snapshot instead of the `require_role` result computed
+            // before the transaction — another request could have
+            // demoted or removed the caller while this one waited to
+            // acquire the lock above (Codex review finding).
+            let Some(caller_membership) = memberships.iter().find(|m| m.user_id == caller_id)
+            else {
+                return Err(AutumnError::unauthorized_msg("no active organization"));
+            };
+            let Some(caller_role) = Role::parse(&caller_membership.role) else {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            };
+            if !caller_role.at_least(Role::Admin) {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            }
+            if new_role == Role::Owner && caller_role != Role::Owner {
+                return Err(AutumnError::forbidden_msg(
+                    "Only an owner can grant the owner role",
+                ));
+            }
+
             let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
                 return Err(AutumnError::not_found_msg("Member not found"));
             };
@@ -287,7 +311,14 @@ pub async fn remove_member(
     membership_repo: PgMembershipRepository,
     Path(membership_id): Path<i64>,
 ) -> AutumnResult<Response> {
-    let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
+    require_role(&session, &membership_repo, Role::Admin).await?;
+    let Some(caller_id) = session
+        .get("user_id")
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return Err(AutumnError::unauthorized_msg("authentication required"));
+    };
 
     // Same race as `change_role` (see its comment): the owner-count check
     // and the removal must run inside one locked transaction, or two
@@ -302,6 +333,22 @@ pub async fn remove_member(
                 .select(Membership::as_select())
                 .load(conn)
                 .await?;
+
+            // Revalidate the caller's own role from this same locked
+            // snapshot instead of the `require_role` result computed
+            // before the transaction (Codex review finding — see
+            // `change_role`'s identical fix for the full rationale).
+            let Some(caller_membership) = memberships.iter().find(|m| m.user_id == caller_id)
+            else {
+                return Err(AutumnError::unauthorized_msg("no active organization"));
+            };
+            let Some(caller_role) = Role::parse(&caller_membership.role) else {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            };
+            if !caller_role.at_least(Role::Admin) {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            }
+
             let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
                 return Err(AutumnError::not_found_msg("Member not found"));
             };

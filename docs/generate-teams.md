@@ -192,13 +192,24 @@ failure partway through this call itself leaves a deleted account's
 memberships behind — the exact gap this function exists to close. If you
 need the two to commit or roll back together, wrap your own account
 `DELETE` in `db.tx(...)` and call `remove_all_memberships_on_conn` — the
-same cleanup, minus the transaction wrapper — on the same `conn`:
+same cleanup, minus the transaction wrapper — on the same `conn`.
+
+**Lock (`SELECT ... FOR UPDATE`) your own `users` row *first*, before calling
+`remove_all_memberships_on_conn`, not after — and delete it last:**
 
 ```rust
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 
 db.tx(move |conn| {
     async move {
+        users::table
+            .find(user.id)
+            .for_update()
+            .select(User::as_select())
+            .first(conn)
+            .await?;
         teams::routes::organizations::remove_all_memberships_on_conn(conn, user.id).await?;
         diesel::delete(users::table.find(user.id)).execute(conn).await?;
         Ok::<_, AutumnError>(())
@@ -207,6 +218,22 @@ db.tx(move |conn| {
 })
 .await?;
 ```
+
+This ordering matters: `teams::routes::invitations::accept_invitation` locks
+the invitee's own `users` row the same way, as the very first thing it does,
+specifically to serialize against this handler. If your account-deletion
+transaction locked (or deleted) the `users` row *last* instead, a concurrent
+`accept_invitation` for an organization this account doesn't have a
+membership in yet could slip its own account-row lock in between —
+`remove_all_memberships_on_conn` only cleans up memberships that already
+exist when it runs, so it would never see (and therefore never revoke) a
+membership `accept_invitation` inserts moments later, right before this
+handler's own `DELETE` finally removes the account. Locking the `users` row
+first, in the same order on both sides, closes that gap: whichever
+transaction reaches it first now runs to completion — including
+`remove_all_memberships_on_conn`'s org-by-org cleanup, which would then
+correctly see any membership the other side already committed — before the
+other can proceed at all.
 
 ## Guarding routes by role
 

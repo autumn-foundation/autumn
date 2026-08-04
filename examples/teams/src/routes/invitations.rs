@@ -129,6 +129,34 @@ pub async fn create_invitation(
     let insert_role = role.as_str().to_owned();
     db.tx(move |conn| {
         async move {
+            // Revalidate the inviter's own membership inside the
+            // transaction, instead of trusting the `require_role` result
+            // computed before it — another request could have demoted or
+            // removed the inviter while this one was still building the
+            // invitation (Codex review finding).
+            let inviter_membership: Option<Membership> = memberships::table
+                .filter(memberships::tenant_id.eq(&tenant_id))
+                .filter(memberships::user_id.eq(inviter_id))
+                .select(Membership::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()?;
+            let Some(inviter_membership) = inviter_membership else {
+                return Err(AutumnError::unauthorized_msg("no active organization"));
+            };
+            let Some(current_caller_role) = Role::parse(&inviter_membership.role) else {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            };
+            if !current_caller_role.at_least(Role::Admin) {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            }
+            if role == Role::Owner && current_caller_role != Role::Owner {
+                return Err(AutumnError::forbidden_msg(
+                    "Only an owner can invite someone as owner",
+                ));
+            }
+
             // Revoke any other still-pending invitation to this email in
             // this organization before creating the new one — otherwise
             // both tokens would stay independently valid, and accepting
@@ -734,6 +762,27 @@ pub async fn resend_invitation(
     let new: Invitation = db
         .tx(move |conn| {
             async move {
+                // Revalidate the caller's own membership inside the
+                // transaction — see `create_invitation`'s identical fix for
+                // the full rationale (Codex review finding).
+                let inviter_membership: Option<Membership> = memberships::table
+                    .filter(memberships::tenant_id.eq(&tenant_id))
+                    .filter(memberships::user_id.eq(inviter_id))
+                    .select(Membership::as_select())
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()?;
+                let Some(inviter_membership) = inviter_membership else {
+                    return Err(AutumnError::unauthorized_msg("no active organization"));
+                };
+                let Some(current_caller_role) = Role::parse(&inviter_membership.role) else {
+                    return Err(AutumnError::forbidden_msg("insufficient permissions"));
+                };
+                if !current_caller_role.at_least(Role::Admin) {
+                    return Err(AutumnError::forbidden_msg("insufficient permissions"));
+                }
+
                 // Lock and re-check status inside the transaction: a
                 // double-clicked resend (or two concurrent ones) must not
                 // both pass a stale "it's pending" read from before the

@@ -1147,22 +1147,36 @@ pub async fn remove_all_memberships_on_conn(
     user_id: i64,
 ) -> AutumnResult<()> {
     // Deliberately NOT `for_update()` here: this is just a scan to discover
-    // which organizations need per-owner handling below, where the actual
-    // locks are taken (org row first, then this user's own membership row
-    // only after that). Locking these rows up front — before any org row —
-    // is what caused a real deadlock (Codex review finding): if two owners
-    // of the *same* organization delete their accounts concurrently, each
-    // would lock its own row here first, then each need the org lock *and*
-    // the other's row (via the other-owner check below) — a lock-order
-    // cycle Postgres has no choice but to break by aborting one deletion.
-    let owned_tenant_ids: Vec<String> = memberships::table
+    // which organizations this user needs handling in below, where the
+    // actual locks are taken (org row first, then this user's own
+    // membership row only after that). Locking these rows up front —
+    // before any org row — is what caused a real deadlock (Codex review
+    // finding): if two owners of the *same* organization delete their
+    // accounts concurrently, each would lock its own row here first, then
+    // each need the org lock *and* the other's row (via the other-owner
+    // check below) — a lock-order cycle Postgres has no choice but to
+    // break by aborting one deletion.
+    //
+    // Every organization this user is a member of at all — not just the
+    // ones they currently *own* — is scanned and processed one at a time
+    // below, each removed only after its own organization lock is held
+    // (Codex review finding): scanning only `role = 'owner'` here missed a
+    // real scenario — two users deleting their accounts concurrently,
+    // where one is merely an Admin in an organization solely owned by the
+    // other. That Admin's own scan would never even look at that
+    // organization (it doesn't own it *yet*), so nothing would stop this
+    // function's final step from unconditionally deleting the Admin's
+    // membership row there — including one a concurrent sibling
+    // transaction just promoted to Owner moments earlier — leaving the
+    // organization ownerless despite the successor logic below having
+    // already run for it.
+    let member_tenant_ids: Vec<String> = memberships::table
         .filter(memberships::user_id.eq(user_id))
-        .filter(memberships::role.eq(Role::Owner.as_str()))
         .select(memberships::tenant_id)
         .load(conn)
         .await?;
 
-    for tenant_id in &owned_tenant_ids {
+    for tenant_id in &member_tenant_ids {
         // Lock the organization row FIRST — before any membership row for
         // this organization — as the shared serialization point with
         // `accept_invitation` (see that function's own matching org-row
@@ -1190,8 +1204,10 @@ pub async fn remove_all_memberships_on_conn(
         // Re-fetch and lock this user's own membership row now that the
         // organization lock is held — the unlocked scan above could be
         // stale (e.g. a concurrent `change_role` may have already demoted
-        // this user in this organization).
-        let Some(owner_membership) = memberships::table
+        // this user in this organization, or — the scenario the widened
+        // scan above exists for — a concurrent sibling deletion may have
+        // just *promoted* this user to Owner here as its own successor).
+        let Some(own_membership) = memberships::table
             .filter(memberships::tenant_id.eq(tenant_id))
             .filter(memberships::user_id.eq(user_id))
             .select(Membership::as_select())
@@ -1202,73 +1218,78 @@ pub async fn remove_all_memberships_on_conn(
         else {
             continue;
         };
-        if owner_membership.role != Role::Owner.as_str() {
-            continue;
-        }
 
-        // Only this organization's *sole* Owner needs a successor — if
-        // another live Owner remains, ownership doesn't need transferring,
-        // and promoting anyone else here would grant an unrequested second
-        // Owner (Codex review finding).
-        let other_owner: Option<Membership> = memberships::table
-            .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
-            .filter(memberships::user_id.ne(user_id))
-            .filter(memberships::role.eq(Role::Owner.as_str()))
-            .select(Membership::as_select())
-            .for_update()
-            .first(conn)
-            .await
-            .optional()?;
-        if other_owner.is_some() {
-            continue;
-        }
-
-        let mut successor: Option<Membership> = memberships::table
-            .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
-            .filter(memberships::user_id.ne(user_id))
-            .filter(memberships::role.eq(Role::Admin.as_str()))
-            .select(Membership::as_select())
-            .order(memberships::id.asc())
-            .for_update()
-            .first(conn)
-            .await
-            .optional()?;
-        if successor.is_none() {
-            successor = memberships::table
-                .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
+        // Only a *sole* Owner needs a successor — if this user isn't
+        // currently Owner here at all (the common case for a plain
+        // Admin/Member row), or another live Owner remains, ownership
+        // doesn't need transferring, and promoting anyone here would grant
+        // an unrequested second Owner (Codex review finding).
+        if own_membership.role == Role::Owner.as_str() {
+            let other_owner: Option<Membership> = memberships::table
+                .filter(memberships::tenant_id.eq(&own_membership.tenant_id))
                 .filter(memberships::user_id.ne(user_id))
+                .filter(memberships::role.eq(Role::Owner.as_str()))
                 .select(Membership::as_select())
-                .order(memberships::id.asc())
                 .for_update()
                 .first(conn)
                 .await
                 .optional()?;
+            if other_owner.is_none() {
+                let mut successor: Option<Membership> = memberships::table
+                    .filter(memberships::tenant_id.eq(&own_membership.tenant_id))
+                    .filter(memberships::user_id.ne(user_id))
+                    .filter(memberships::role.eq(Role::Admin.as_str()))
+                    .select(Membership::as_select())
+                    .order(memberships::id.asc())
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if successor.is_none() {
+                    successor = memberships::table
+                        .filter(memberships::tenant_id.eq(&own_membership.tenant_id))
+                        .filter(memberships::user_id.ne(user_id))
+                        .select(Membership::as_select())
+                        .order(memberships::id.asc())
+                        .for_update()
+                        .first(conn)
+                        .await
+                        .optional()?;
+                }
+                if let Some(successor) = successor {
+                    diesel::update(memberships::table.filter(memberships::id.eq(successor.id)))
+                        .set(memberships::role.eq(Role::Owner.as_str()))
+                        .execute(conn)
+                        .await?;
+                } else {
+                    // No other member exists at all: this organization is
+                    // about to be left with zero memberships, permanently —
+                    // revoke any pending invitations too, so a later accept
+                    // can't repopulate a headless organization no one will
+                    // ever be able to manage or promote a new Owner in
+                    // (Codex review finding).
+                    diesel::update(
+                        invitations::table
+                            .filter(invitations::tenant_id.eq(&own_membership.tenant_id))
+                            .filter(invitations::status.eq("pending")),
+                    )
+                    .set(invitations::status.eq("revoked"))
+                    .execute(conn)
+                    .await?;
+                }
+            }
         }
-        if let Some(successor) = successor {
-            diesel::update(memberships::table.filter(memberships::id.eq(successor.id)))
-                .set(memberships::role.eq(Role::Owner.as_str()))
-                .execute(conn)
-                .await?;
-        } else {
-            // No other member exists at all: this organization is about to
-            // be left with zero memberships, permanently — revoke any
-            // pending invitations too, so a later accept can't repopulate a
-            // headless organization no one will ever be able to manage or
-            // promote a new Owner in (Codex review finding).
-            diesel::update(
-                invitations::table
-                    .filter(invitations::tenant_id.eq(&owner_membership.tenant_id))
-                    .filter(invitations::status.eq("pending")),
-            )
-            .set(invitations::status.eq("revoked"))
+
+        // Remove this user's own membership in *this* organization now,
+        // under its lock — rather than one blanket `DELETE ... WHERE
+        // user_id = user_id` after the loop, which would fall outside
+        // every organization's lock and could remove a row a concurrent
+        // sibling deletion just promoted to Owner moments after this loop
+        // last read it (the same finding the widened scan above closes).
+        diesel::delete(memberships::table.filter(memberships::id.eq(own_membership.id)))
             .execute(conn)
             .await?;
-        }
     }
-
-    diesel::delete(memberships::table.filter(memberships::user_id.eq(user_id)))
-        .execute(conn)
-        .await?;
 
     Ok(())
 }
@@ -1780,6 +1801,7 @@ pub async fn accept_invitation(
 
     let invitation_id = invitation.id;
     let tenant_id = invitation.tenant_id.clone();
+    let invitation_email = invitation.email.clone();
     let role = invitation.role.clone();
 
     // Raw queries (not the generated `tenant_scoped` repository) inside one
@@ -1790,19 +1812,69 @@ pub async fn accept_invitation(
     let membership: Membership = db
         .tx(move |conn| {
             async move {
-                // Lock the organization row FIRST — before the invitation
-                // row below — as the shared serialization point with
-                // `remove_all_memberships_on_conn` (see its own matching
-                // org-row lock). Without a lock shared across both
-                // functions, an account deletion concurrently cleaning up
-                // this same organization could decide "no successor member
-                // exists" a moment before this accept commits a brand-new
+                // Lock and revalidate the caller's own account row FIRST —
+                // before the organization lock below, and before anything
+                // else in this transaction. The email-match check earlier
+                // in this handler ran on a standalone, unlocked connection
+                // before this transaction even started, checking only that
+                // the account existed with a matching email at that moment
+                // — if the account is deleted, or its email is changed via
+                // your app's own email-change flow, in the gap between
+                // that check and this transaction actually acquiring this
+                // lock, nothing else would notice: `Membership.user_id` has
+                // no FK to your `users` table, so the insert below would
+                // otherwise happily create a membership — and this handler
+                // would establish a session — for an account that no
+                // longer exists, or no longer owns the invited address
+                // (Codex review finding — re-compares the live email, not
+                // just existence).
+                //
+                // This must be the FIRST lock taken, before organizations,
+                // and your own account-deletion handler must lock/verify
+                // its `users` row before calling
+                // `remove_all_memberships_on_conn` too (see
+                // `docs/generate-teams.md`'s worked example) — otherwise
+                // account deletion could finish its membership cleanup,
+                // which never touches this not-yet-existing membership,
+                // before this transaction gets a chance to insert it,
+                // leaving a live membership for a since-deleted account
+                // cleanup never saw. Locking the account row first, in the
+                // same order on both sides, closes that gap: whichever
+                // transaction reaches it first now runs to completion
+                // before the other proceeds at all.
+                let live_caller_email: Option<String> = caller_users::table
+                    .filter(caller_users::id.eq(user_id))
+                    .select(caller_users::email)
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()?;
+                let Some(live_caller_email) = live_caller_email else {
+                    return Err(AutumnError::unauthorized_msg(
+                        "log in or sign up first, then revisit this invitation link",
+                    ));
+                };
+                if live_caller_email.trim().to_lowercase() != invitation_email.trim().to_lowercase()
+                {
+                    return Err(AutumnError::forbidden_msg(
+                        "This invitation was sent to a different email address",
+                    ));
+                }
+
+                // Lock the organization row — as the shared serialization
+                // point with `remove_all_memberships_on_conn` (see its own
+                // matching org-row lock, and the account-row-first note
+                // above). Without a lock shared across both functions, an
+                // account deletion concurrently cleaning up this same
+                // organization could decide "no successor member exists" a
+                // moment before this accept commits a brand-new
                 // membership, then delete the sole Owner anyway — leaving
                 // this invitee joined to an organization that can never
                 // regain an Owner (Codex review finding). Both functions
-                // must lock organizations before memberships/invitations,
-                // in that same order, or they could deadlock instead of
-                // serializing.
+                // lock organizations before memberships/invitations, in
+                // that same order, so whichever gets here first completes
+                // wholly before the other proceeds, instead of
+                // deadlocking.
                 let org_id: i64 = tenant_id.parse().map_err(|_| {
                     AutumnError::internal_server_error_msg("Corrupt organization id in invitation")
                 })?;
@@ -1840,32 +1912,6 @@ pub async fn accept_invitation(
                 {
                     return Err(AutumnError::gone_msg(
                         "This invitation is no longer available",
-                    ));
-                }
-
-                // Re-lock and revalidate the caller's own account row now
-                // that the organization lock is held, through the
-                // membership insert below. The email-match check earlier in
-                // this handler ran on a standalone, unlocked connection
-                // before this transaction even started — if the account is
-                // deleted in the gap between that check and this
-                // transaction actually acquiring the lock above (e.g. an
-                // account-deletion request racing this same accept),
-                // nothing else would notice: `Membership.user_id` has no FK
-                // to your `users` table, so the insert below would
-                // otherwise happily create a membership — and this handler
-                // would establish a session — for an account that no
-                // longer exists (Codex review finding).
-                let live_caller: Option<i64> = caller_users::table
-                    .filter(caller_users::id.eq(user_id))
-                    .select(caller_users::id)
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()?;
-                if live_caller.is_none() {
-                    return Err(AutumnError::unauthorized_msg(
-                        "log in or sign up first, then revisit this invitation link",
                     ));
                 }
 
@@ -3281,7 +3327,7 @@ async fn main() {
         );
         assert!(
             organizations.contains(
-                "diesel::delete(memberships::table.filter(memberships::user_id.eq(user_id)))"
+                "diesel::delete(memberships::table.filter(memberships::id.eq(own_membership.id)))"
             ),
             "{organizations}"
         );
@@ -3318,13 +3364,16 @@ async fn main() {
             "{organizations}"
         );
         // The promotion query (successor lookup) must run, and complete,
-        // before the bulk delete — verified by source order, since the
-        // delete would otherwise remove the very row being promoted.
+        // before this user's own membership row is deleted — verified by
+        // source order, since the delete would otherwise remove the very
+        // row being promoted.
         let promote_pos = organizations
             .find(".filter(memberships::role.eq(Role::Admin.as_str()))")
             .unwrap();
         let delete_pos = organizations
-            .find("diesel::delete(memberships::table.filter(memberships::user_id.eq(user_id)))")
+            .find(
+                "diesel::delete(memberships::table.filter(memberships::id.eq(own_membership.id)))",
+            )
             .unwrap();
         assert!(promote_pos < delete_pos);
     }
@@ -3348,7 +3397,7 @@ async fn main() {
             .find("let other_owner: Option<Membership> = memberships::table")
             .unwrap_or_else(|| panic!("missing other-owner guard: {organizations}"));
         assert!(
-            organizations.contains("if other_owner.is_some() {\n            continue;\n        }"),
+            organizations.contains("if other_owner.is_none() {"),
             "{organizations}"
         );
         let admin_lookup_pos = organizations
@@ -3381,8 +3430,7 @@ async fn main() {
             "{organizations}"
         );
         assert!(
-            organizations
-                .contains(".filter(invitations::tenant_id.eq(&owner_membership.tenant_id))")
+            organizations.contains(".filter(invitations::tenant_id.eq(&own_membership.tenant_id))")
                 && organizations.contains(".filter(invitations::status.eq(\"pending\"))")
                 && organizations.contains(".set(invitations::status.eq(\"revoked\"))"),
             "{organizations}"
@@ -3511,7 +3559,7 @@ async fn main() {
             fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
         assert!(
             organizations.contains(
-                "let owned_tenant_ids: Vec<String> = memberships::table\n        .filter(memberships::user_id.eq(user_id))\n        .filter(memberships::role.eq(Role::Owner.as_str()))\n        .select(memberships::tenant_id)\n        .load(conn)\n        .await?;"
+                "let member_tenant_ids: Vec<String> = memberships::table\n        .filter(memberships::user_id.eq(user_id))\n        .select(memberships::tenant_id)\n        .load(conn)\n        .await?;"
             ),
             "{organizations}"
         );
@@ -3521,7 +3569,7 @@ async fn main() {
             .find("organizations::table\n            .find(org_id)\n            .for_update()")
             .unwrap();
         let own_row_relock_pos = organizations
-            .find("let Some(owner_membership) = memberships::table")
+            .find("let Some(own_membership) = memberships::table")
             .unwrap();
         assert!(org_lock_pos < own_row_relock_pos);
     }
@@ -3694,23 +3742,81 @@ async fn main() {
 
         let invitations =
             fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        let account_relock_pos = invitations
+            .find("let live_caller_email: Option<String> = caller_users::table")
+            .unwrap_or_else(|| panic!("missing account-row relock: {invitations}"));
         let org_lock_pos = invitations
             .find("organizations::table\n                    .find(org_id)\n                    .for_update()")
             .unwrap();
-        let account_relock_pos = invitations
-            .find("let live_caller: Option<i64> = caller_users::table")
-            .unwrap_or_else(|| panic!("missing account-row relock: {invitations}"));
         let insert_pos = invitations
             .find("let membership: Membership = diesel::insert_into(memberships::table)")
             .unwrap();
         assert!(
-            org_lock_pos < account_relock_pos,
-            "account row must be relocked after the organization lock"
+            account_relock_pos < org_lock_pos,
+            "account row must be locked FIRST, before the organization lock — the same order \
+             an account-deletion handler must use (see docs/generate-teams.md)"
         );
         assert!(
-            account_relock_pos < insert_pos,
-            "account row must be revalidated before the membership insert"
+            org_lock_pos < insert_pos,
+            "organization lock must precede the membership insert"
         );
-        assert!(invitations.contains(".filter(caller_users::id.eq(user_id))\n                    .select(caller_users::id)\n                    .for_update()"), "{invitations}");
+        assert!(
+            invitations.contains(
+                ".filter(caller_users::id.eq(user_id))\n                    .select(caller_users::email)\n                    .for_update()"
+            ),
+            "{invitations}"
+        );
+        // The live email must be re-compared, not just existence checked
+        // (Codex review finding: an email-change flow could move the
+        // account off the invited address between the standalone
+        // pre-transaction check and this lock).
+        assert!(
+            invitations.contains(
+                "live_caller_email.trim().to_lowercase() != invitation_email.trim().to_lowercase()"
+            ),
+            "{invitations}"
+        );
+    }
+
+    /// `remove_all_memberships_on_conn` must scan and lock *every*
+    /// organization a departing user is a member of at all, not only the
+    /// ones they currently own — otherwise a user who is merely an Admin
+    /// in an organization solely owned by someone else (also deleting
+    /// their account concurrently) would never have that organization
+    /// org-locked at all, and the final cleanup could remove a membership
+    /// row a concurrent sibling deletion just promoted to Owner, leaving
+    /// the organization ownerless despite the successor logic already
+    /// having run for it (Codex review finding).
+    #[test]
+    fn remove_all_memberships_on_conn_scans_every_membership_not_just_owned_ones() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
+        assert!(
+            organizations.contains(
+                "let member_tenant_ids: Vec<String> = memberships::table\n        .filter(memberships::user_id.eq(user_id))\n        .select(memberships::tenant_id)\n        .load(conn)\n        .await?;"
+            ),
+            "the initial scan must not filter by role — a plain Admin/Member row must be \
+             included too: {organizations}"
+        );
+        // No blanket delete outside the per-organization loop — every
+        // removal must happen under that organization's own lock.
+        assert!(
+            !organizations.contains(
+                "diesel::delete(memberships::table.filter(memberships::user_id.eq(user_id)))"
+            ),
+            "{organizations}"
+        );
+        assert!(
+            organizations.contains(
+                "diesel::delete(memberships::table.filter(memberships::id.eq(own_membership.id)))"
+            ),
+            "{organizations}"
+        );
     }
 }
