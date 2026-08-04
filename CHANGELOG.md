@@ -20,32 +20,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vault access policy granted to Terraform's caller identity, since
   access-policy-model vaults grant no data-plane access by default), and an
   optional Redis Cache gated behind `enable_redis_cache` and fully wired in
-  as `AUTUMN_CACHE__REDIS_URL` when enabled), `variables.tf`
+  as `AUTUMN_CACHE__BACKEND=redis` / `AUTUMN_CACHE__REDIS__URL` — Autumn's
+  actual config path — when enabled), `variables.tf`
   (`app_name`, `location`, `image_tag`, `db_sku`, `bootstrap_image`,
   `min_replicas`/`max_replicas` — defaulting to the 1/10 scale range — and
   `enable_redis_cache`, plus `sensitive`, no-default secret variables for
   `database_admin_password`/`signing_secret`),
   `outputs.tf` (`app_fqdn`, `acr_login_server`, `resource_group_name`,
-  `migrate_job_name`), a `terraform.tfvars.example` that documents
-  non-secret defaults without ever committing a literal secret, and
-  `.github/workflows/azure-deploy.yml` — an opt-in OIDC-based workflow
+  `migrate_job_name`, `app_name`), a `terraform.tfvars.example` that
+  documents non-secret defaults without ever committing a literal secret,
+  and `.github/workflows/azure-deploy.yml` — an opt-in OIDC-based workflow
   (triggers only on a `v*` tag push or manual dispatch, and every credential
-  comes from GitHub secrets that don't exist until configured — no client
-  secret needed) that builds the release image, pushes it to ACR, runs the
-  migration job to completion (aborting the deploy if it fails), and runs
-  `az containerapp update`. The database connection string is derived
-  inside Terraform from the Postgres server the same apply creates rather
-  than taken as an input variable, so a single `terraform apply` is enough.
-  Every Container Apps-family resource name (the app, its environment, Log
-  Analytics, the migration job) is sanitized to lowercase
-  alphanumerics-and-hyphens — a Cargo package name may legally contain
-  underscores or uppercase letters, both invalid there — and the generated
-  workflow computes the identical sanitized name so its `az
-  containerapp`/`docker build` commands always match what Terraform
-  created. The app and migration job both start from a public placeholder
-  image (`bootstrap_image`) since Container Apps must pull an image to
-  create a first revision and a brand-new ACR has none yet; Terraform
-  ignores further image drift once CI takes over.
+  comes from GitHub secrets/variables that don't exist until configured — no
+  client secret needed) that builds the release image, pushes it to ACR,
+  runs the migration job to completion (aborting the deploy if it fails),
+  and runs `az containerapp update`. The database connection string is
+  derived inside Terraform from the Postgres server the same apply creates
+  rather than taken as an input variable, so a single `terraform apply` is
+  enough. Every Container Apps-family resource name (the app, its
+  environment, Log Analytics, the migration job) is sanitized to lowercase
+  alphanumerics-and-hyphens, with hyphen runs collapsed and a leading/
+  trailing hyphen trimmed — a Cargo package name may legally contain
+  underscores, uppercase letters, or its own hyphens adjacent to a mapped
+  one, all invalid or malformed there — computed once in Terraform
+  (`local.app_name_safe`) and exposed as the `app_name` output; the
+  generated workflow reads it back as a variable rather than ever hardcoding
+  a name, so editing `app_name` in `terraform.tfvars` after scaffolding is
+  picked up automatically. The workflow also sanitizes `GITHUB_REF_NAME` for
+  use as a Docker tag (a `workflow_dispatch` branch may contain `/`, invalid
+  there) and documents that its service principal needs Contributor at the
+  resource-group scope, not just on the Container App — RBAC on the app
+  doesn't inherit to the sibling migration job. The app and migration job
+  both start from a public placeholder image (`bootstrap_image`) since
+  Container Apps must pull an image to create a first revision and a
+  brand-new ACR has none yet; Terraform ignores further image drift once CI
+  takes over.
   `autumn release init`'s file-existence guard and directory creation are
   now generic over nested output paths, so `--force`/collision checks cover
   `.github/workflows/azure-deploy.yml` the same way they cover root-level

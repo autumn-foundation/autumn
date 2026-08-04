@@ -57,12 +57,22 @@ locals {
   app_name_alnum = lower(replace(var.app_name, "/[^a-zA-Z0-9]/", ""))
 
   # Container Apps-family resources (the environment, the app, the migration
-  # job, and Log Analytics) allow lowercase alphanumerics AND hyphens.
-  # `var.app_name` comes straight from the Cargo package name by default,
-  # which — unlike these Azure names — may legally contain underscores or
-  # uppercase letters (e.g. "My_App"), so map anything else to a hyphen
-  # rather than passing it through and having Azure reject the name.
-  app_name_safe = lower(replace(var.app_name, "/[^a-zA-Z0-9-]/", "-"))
+  # job, and Log Analytics) allow lowercase alphanumerics AND hyphens, but
+  # must not contain consecutive hyphens and must end in an alphanumeric
+  # character. `var.app_name` comes straight from the Cargo package name by
+  # default, which — unlike these Azure names — may legally contain
+  # underscores or uppercase letters, or its own hyphens adjacent to one
+  # mapped from an underscore (e.g. "my_app" and "my-app" both risk
+  # producing "my--app" if invalid characters are merely swapped for a
+  # hyphen one-for-one). So: map anything else to a hyphen, collapse any
+  # resulting run of hyphens to one, then trim a leading/trailing hyphen.
+  app_name_safe = trim(
+    replace(
+      lower(replace(var.app_name, "/[^a-zA-Z0-9-]/", "-")),
+      "/-+/", "-"
+    ),
+    "-"
+  )
 }
 
 resource "azurerm_resource_group" "this" {
@@ -300,10 +310,24 @@ resource "azurerm_container_app" "this" {
         secret_name = "signing-secret"
       }
 
+      # Autumn's cache config is `[cache] backend` + `[cache.redis] url`
+      # (env: AUTUMN_CACHE__BACKEND / AUTUMN_CACHE__REDIS__URL — note the
+      # double underscore before URL, matching the nested `cache.redis.url`
+      # TOML path). Without the backend switch, Autumn stays on its default
+      # in-memory cache and never reads the URL at all, silently ignoring
+      # this (paid) Redis instance.
       dynamic "env" {
         for_each = var.enable_redis_cache ? [1] : []
         content {
-          name        = "AUTUMN_CACHE__REDIS_URL"
+          name  = "AUTUMN_CACHE__BACKEND"
+          value = "redis"
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.enable_redis_cache ? [1] : []
+        content {
+          name        = "AUTUMN_CACHE__REDIS__URL"
           secret_name = "redis-url"
         }
       }

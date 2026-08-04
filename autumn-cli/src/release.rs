@@ -337,28 +337,6 @@ condition: service_completed_successfully\n    restart: unless-stopped\n";
 /// jobs backend so enqueues land in the queue the worker process drains.
 const WEB_ROLE_ENV: &str = "\n      AUTUMN_ROLE: web\n      AUTUMN_JOBS__BACKEND: postgres";
 
-/// Sanitize `name` into an Azure Container Apps-safe identifier: lowercase
-/// alphanumerics and hyphens only. Cargo package names (the default
-/// `project_name`) may legally contain underscores or uppercase letters,
-/// both invalid in Container App/environment names, so anything outside
-/// that set becomes a hyphen.
-///
-/// Mirrors `local.app_name_safe` in `main.tf.tmpl`
-/// (`lower(replace(var.app_name, "/[^a-zA-Z0-9-]/", "-"))`) byte-for-byte —
-/// the azure-deploy.yml workflow is plain YAML with no Terraform to compute
-/// this for it, so it needs the identical name baked in at scaffold time.
-fn azure_safe_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
 fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) -> String {
     let (build_step, static_copy) = if embed {
         (
@@ -389,7 +367,6 @@ fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) 
     template
         .replace("{{worker_service}}", worker_service)
         .replace("{{app_role_env}}", web_role_env)
-        .replace("{{azure_app_name}}", &azure_safe_name(project_name))
         .replace("{{project_name}}", project_name)
         .replace(
             "{{rust_version}}",
@@ -1527,6 +1504,34 @@ previous_secrets = []
     }
 
     #[test]
+    fn main_tf_app_name_safe_collapses_and_trims_hyphens() {
+        // Naively mapping every invalid character to "-" turns "my__app"
+        // into "my--app" (consecutive hyphens, invalid) and "my-" into a
+        // name with a trailing hyphen (also invalid — Container App names
+        // must end in an alphanumeric character). The local must collapse
+        // hyphen runs and trim leading/trailing hyphens after substitution.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let locals_block = content
+            .split("app_name_safe = ")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare local.app_name_safe");
+        assert!(
+            locals_block.contains("\"/-+/\""),
+            "app_name_safe must collapse runs of hyphens to one via a regex like /-+/: \
+             {locals_block}"
+        );
+        assert!(
+            locals_block.trim_start().starts_with("trim("),
+            "app_name_safe must trim leading/trailing hyphens after substitution: \
+             {locals_block}"
+        );
+    }
+
+    #[test]
     fn main_tf_uses_bootstrap_image_and_ignores_later_image_drift() {
         // Container Apps must pull an image to create the app's/job's first
         // revision, but a brand-new ACR has none yet, so Terraform points
@@ -1590,10 +1595,29 @@ previous_secrets = []
             content.contains("azurerm_key_vault_secret\" \"redis_url\""),
             "main.tf must store the Redis connection string in Key Vault: {content}"
         );
+        // Autumn's actual config path is `[cache.redis] url` (env:
+        // AUTUMN_CACHE__REDIS__URL, double underscore before URL) — not
+        // AUTUMN_CACHE__REDIS_URL, which Autumn never reads.
         assert!(
-            content.contains("AUTUMN_CACHE__REDIS_URL"),
-            "main.tf must wire AUTUMN_CACHE__REDIS_URL into the Container App \
+            content.contains("AUTUMN_CACHE__REDIS__URL"),
+            "main.tf must wire AUTUMN_CACHE__REDIS__URL into the Container App \
              when enable_redis_cache is true: {content}"
+        );
+        assert!(
+            !content.contains("AUTUMN_CACHE__REDIS_URL\""),
+            "main.tf must not use the single-underscore variant, which Autumn ignores: {content}"
+        );
+        // Without selecting the backend, Autumn stays on its default
+        // in-memory cache and never reads the URL at all.
+        assert!(
+            content.contains("name  = \"AUTUMN_CACHE__BACKEND\"")
+                || content.contains("name = \"AUTUMN_CACHE__BACKEND\""),
+            "main.tf must set AUTUMN_CACHE__BACKEND=redis so Autumn actually selects the \
+             Redis cache backend: {content}"
+        );
+        assert!(
+            content.contains("value = \"redis\""),
+            "AUTUMN_CACHE__BACKEND must be set to \"redis\": {content}"
         );
     }
 
@@ -1751,6 +1775,11 @@ previous_secrets = []
             "outputs.tf must expose the migration job's name so CI can start it: {content}"
         );
         assert!(
+            content.contains("output \"app_name\""),
+            "outputs.tf must expose the sanitized Container App name so CI never has to \
+             hardcode it: {content}"
+        );
+        assert!(
             !content.contains("{{"),
             "outputs.tf must not contain unsubstituted template placeholders: {content}"
         );
@@ -1799,6 +1828,37 @@ previous_secrets = []
         assert!(
             content.contains("workflow_dispatch:"),
             "azure-deploy.yml must also support manual dispatch: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_documents_resource_group_scope_rbac() {
+        // RBAC granted on the Container App does not inherit to the
+        // sibling migration Container Apps Job — a service principal with
+        // Contributor scoped only to the app would 403 when the migration
+        // step tries to start the job. The header must say resource-group
+        // scope, not "on the Container App".
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        // Scope to the header comment (before the workflow body) — the body
+        // legitimately contains `--resource-group` CLI flags, which would
+        // make a bare substring check pass regardless of whether the header
+        // actually documents the RBAC scoping requirement.
+        let header = content
+            .split("\nname: azure-deploy")
+            .next()
+            .expect("azure-deploy.yml must have a header comment before `name:`");
+        let header_lower = header.to_lowercase();
+        assert!(
+            header_lower.contains("resource-group") || header_lower.contains("resource group"),
+            "azure-deploy.yml's header must document resource-group-scoped Contributor \
+             access, covering both the app and the migration job: {header}"
+        );
+        assert!(
+            header_lower.contains("contributor"),
+            "azure-deploy.yml's header must mention the Contributor role: {header}"
         );
     }
 
@@ -1886,12 +1946,14 @@ previous_secrets = []
     }
 
     #[test]
-    fn azure_workflow_and_main_tf_use_the_same_sanitized_app_name() {
-        // Cargo package names may contain underscores/uppercase, both
-        // invalid in Container App names. main.tf sanitizes via
-        // local.app_name_safe; the workflow is plain YAML with no
-        // Terraform to compute that for it, so `render()` must bake in the
-        // identical sanitized name via {{azure_app_name}}.
+    fn azure_workflow_sources_app_name_from_terraform_not_hardcoded() {
+        // If an operator edits `app_name` in terraform.tfvars after
+        // scaffolding, Terraform renames the Container App to match — the
+        // workflow must follow that rename, not target whatever the Cargo
+        // package was called when `autumn release init` ran. So it reads
+        // AZURE_APP_NAME from `terraform output app_name` (like
+        // AZURE_RESOURCE_GROUP/AZURE_MIGRATE_JOB_NAME) rather than having
+        // any project-derived name baked in at scaffold time.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "My_Test_App");
         init(
@@ -1904,18 +1966,43 @@ previous_secrets = []
         .unwrap();
         let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
         assert!(
-            content.contains("my-test-app"),
-            "azure-deploy.yml must use the sanitized app name (lowercase, hyphens for \
-             underscores/uppercase): {content}"
+            content.contains("AZURE_APP_NAME"),
+            "azure-deploy.yml must reference AZURE_APP_NAME: {content}"
         );
         assert!(
-            !content.contains("My_Test_App"),
-            "azure-deploy.yml must not reference the raw, unsanitized project name in \
-             any Azure resource identifier: {content}"
+            content.contains("vars.AZURE_APP_NAME"),
+            "AZURE_APP_NAME must be sourced from a repository variable \
+             (terraform output app_name), not hardcoded: {content}"
+        );
+        assert!(
+            !content.contains("My_Test_App") && !content.contains("my-test-app"),
+            "azure-deploy.yml must not bake in any form of the project name as an \
+             Azure resource identifier: {content}"
         );
         assert!(
             !content.contains("{{azure_app_name}}") && !content.contains("{{project_name}}"),
             "azure-deploy.yml must not contain unsubstituted placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_sanitizes_ref_name_for_docker_tag() {
+        // On workflow_dispatch an operator can pick any branch, including
+        // one with a "/" (e.g. "feature/login") — invalid in a Docker tag.
+        // A `v*` tag push never contains "/", but the workflow can't tell
+        // which trigger fired it, so it must sanitize unconditionally.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("GITHUB_REF_NAME//"),
+            "azure-deploy.yml must replace \"/\" in GITHUB_REF_NAME before using it as a \
+             Docker tag: {content}"
+        );
+        assert!(
+            !content.contains(":${GITHUB_REF_NAME}") && !content.contains(":$GITHUB_REF_NAME"),
+            "no docker/az command may use the raw, unsanitized ref as an image tag: {content}"
         );
     }
 
@@ -2154,13 +2241,6 @@ previous_secrets = []
             "azure-container-apps".parse::<Target>().unwrap(),
             Target::AzureContainerApps
         );
-    }
-
-    #[test]
-    fn azure_safe_name_lowercases_and_hyphenates_invalid_characters() {
-        assert_eq!(azure_safe_name("my-app"), "my-app");
-        assert_eq!(azure_safe_name("My_Test_App"), "my-test-app");
-        assert_eq!(azure_safe_name("blog2"), "blog2");
     }
 
     #[test]

@@ -9,15 +9,24 @@
 #   AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
 #     — an app registration with a federated credential for this repo (OIDC;
 #       see `az ad app federated-credential create`), granted AcrPush on the
-#       registry and Contributor on the Container App. No client secret is
-#       needed: `permissions.id-token: write` below plus azure/login's
-#       client-id/tenant-id/subscription-id inputs is enough for OIDC login.
+#       registry and Contributor at the RESOURCE-GROUP scope — not just on
+#       the Container App: this workflow also starts the sibling migration
+#       Container Apps Job, and Azure RBAC granted on one resource does not
+#       inherit to another, even a sibling in the same environment. No
+#       client secret is needed: `permissions.id-token: write` below plus
+#       azure/login's client-id/tenant-id/subscription-id inputs is enough
+#       for OIDC login.
 #
 # Required repository variables (same Settings page, "Variables" tab — not
 # secret, just config the job needs):
-#   ACR_LOGIN_SERVER     — output of `terraform output acr_login_server`.
-#   AZURE_RESOURCE_GROUP — output of `terraform output resource_group_name`.
+#   ACR_LOGIN_SERVER       — output of `terraform output acr_login_server`.
+#   AZURE_RESOURCE_GROUP   — output of `terraform output resource_group_name`.
 #   AZURE_MIGRATE_JOB_NAME — output of `terraform output migrate_job_name`.
+#   AZURE_APP_NAME         — output of `terraform output app_name`. Always
+#     read from Terraform, never hardcoded: if `app_name` is edited in
+#     terraform.tfvars after scaffolding, Terraform renames the Container
+#     App to match, and this workflow must follow — not target whatever the
+#     project was called when `autumn release init` ran.
 
 name: azure-deploy
 
@@ -37,6 +46,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # On a `v*` tag push, GITHUB_REF_NAME is the tag itself (no slashes).
+      # On workflow_dispatch, an operator can pick any branch — including
+      # one with a "/" in its name (e.g. "feature/login") — and Docker tags
+      # don't allow "/"; a raw ref there would produce an invalid image
+      # reference and fail the build before anything is pushed.
+      - name: Compute a Docker-safe image tag
+        id: image_tag
+        run: echo "value=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
       - name: Azure login
         uses: azure/login@v2
         with:
@@ -51,14 +69,18 @@ jobs:
 
       - name: Build release image
         run: |
-          docker build -t "$ACR_LOGIN_SERVER/{{azure_app_name}}:${GITHUB_REF_NAME}" .
+          docker build -t "$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG" .
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
+          IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
 
       - name: Push to Azure Container Registry
-        run: docker push "$ACR_LOGIN_SERVER/{{azure_app_name}}:${GITHUB_REF_NAME}"
+        run: docker push "$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG"
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
+          IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
 
       # Runs `autumn migrate` to completion in a one-shot Container Apps Job
       # BEFORE the app is updated, so new replicas never start against an
@@ -71,7 +93,7 @@ jobs:
           EXECUTION=$(az containerapp job start \
             --name "$AZURE_MIGRATE_JOB_NAME" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
-            --image "$ACR_LOGIN_SERVER/{{azure_app_name}}:${GITHUB_REF_NAME}" \
+            --image "$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG" \
             --query name -o tsv)
 
           # Poll for completion — `az containerapp job execution list` is the
@@ -96,15 +118,19 @@ jobs:
           exit 1
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
+          IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
           AZURE_MIGRATE_JOB_NAME: ${{ vars.AZURE_MIGRATE_JOB_NAME }}
 
       - name: Deploy new image to Azure Container Apps
         run: |
           az containerapp update \
-            --name {{azure_app_name}} \
+            --name "$AZURE_APP_NAME" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
-            --image "$ACR_LOGIN_SERVER/{{azure_app_name}}:${GITHUB_REF_NAME}"
+            --image "$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG"
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
+          IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}

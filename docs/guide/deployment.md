@@ -853,19 +853,23 @@ This generates:
 |---|---|
 | `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, a one-shot migration job, Azure Database for PostgreSQL Flexible Server, and a Key Vault that feeds secrets into the app via a user-assigned managed identity. An optional Redis Cache is gated behind `enable_redis_cache`. |
 | `variables.tf` | `app_name`, `location`, `image_tag`, `db_sku`, `bootstrap_image`, `min_replicas`/`max_replicas` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
-| `outputs.tf` | `app_fqdn`, `acr_login_server`, `resource_group_name`, and `migrate_job_name`. |
+| `outputs.tf` | `app_fqdn`, `acr_login_server`, `resource_group_name`, `migrate_job_name`, and `app_name`. |
 | `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
 | `.github/workflows/azure-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to ACR, runs the migration job to completion, and runs `az containerapp update` on a `v*` tag push (or manual dispatch). |
 
 **Resource names are sanitized, not verbatim.** A Cargo package name may
 contain underscores or uppercase letters (both invalid in Container App
 names), so every Container Apps-family resource name (the app, its
-environment, Log Analytics, the migration job) is lowercased with any other
-character mapped to a hyphen — `my_app`/`My App` all become `my-app`. ACR,
-Key Vault, Postgres, and Redis use a stricter sanitization (no hyphens at
-all, since ACR forbids them). The generated workflow computes the identical
-sanitized name at scaffold time so its `az containerapp`/`docker build`
-commands always target what Terraform actually created.
+environment, Log Analytics, the migration job) is lowercased, any other
+character is mapped to a hyphen, runs of hyphens are collapsed to one, and a
+leading/trailing hyphen is trimmed — `my_app`/`My App`/`my--app` all become
+`my-app`. ACR, Key Vault, Postgres, and Redis use a stricter sanitization (no
+hyphens at all, since ACR forbids them). Sanitization happens once, in
+Terraform (`local.app_name_safe`) — the generated workflow never hardcodes a
+name; it reads the result back via `terraform output app_name` (as the
+`AZURE_APP_NAME` repository variable), so editing `app_name` in
+`terraform.tfvars` after scaffolding is picked up automatically instead of
+silently deploying under a stale name.
 
 Why Container Apps and not App Service or AKS: it is the closest managed
 analog to Fly.io — scale-to-zero capable, managed ingress with automatic TLS,
@@ -893,24 +897,28 @@ first revision, and a brand-new ACR has none yet). Build and push your real
 image, run migrations, then cut the app over:
 
 ```bash
-az acr login --name "$(terraform output -raw acr_login_server | cut -d. -f1)"
-docker build -t "$(terraform output -raw acr_login_server)/myapp:v1" .
-docker push "$(terraform output -raw acr_login_server)/myapp:v1"
+APP_NAME="$(terraform output -raw app_name)"           # sanitized — may differ from your Cargo package name
+ACR="$(terraform output -raw acr_login_server)"
+RG="$(terraform output -raw resource_group_name)"
+
+az acr login --name "${ACR%%.azurecr.io}"
+docker build -t "$ACR/$APP_NAME:v1" .
+docker push "$ACR/$APP_NAME:v1"
 
 # Run migrations to completion BEFORE updating the app — the generated
 # production config sets auto_migrate_in_production = false, so nothing
 # else does this for you.
 az containerapp job start \
   --name "$(terraform output -raw migrate_job_name)" \
-  --resource-group "$(terraform output -raw resource_group_name)" \
-  --image "$(terraform output -raw acr_login_server)/myapp:v1"
+  --resource-group "$RG" \
+  --image "$ACR/$APP_NAME:v1"
 # az containerapp job execution list --name ... --resource-group ... shows
 # the execution's status; wait for Succeeded before continuing.
 
 az containerapp update \
-  --name myapp \
-  --resource-group "$(terraform output -raw resource_group_name)" \
-  --image "$(terraform output -raw acr_login_server)/myapp:v1"
+  --name "$APP_NAME" \
+  --resource-group "$RG" \
+  --image "$ACR/$APP_NAME:v1"
 ```
 
 Terraform is told to ignore both resources' image afterward
@@ -923,10 +931,22 @@ in its header comment — secrets `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/
 `AZURE_SUBSCRIPTION_ID` for OIDC login (no client secret needed: the
 workflow's `id-token: write` permission plus a federated credential on the
 app registration is enough), and variables (not secrets — they're just
-config) `ACR_LOGIN_SERVER`/`AZURE_RESOURCE_GROUP`/`AZURE_MIGRATE_JOB_NAME` —
-until then it stays dormant. Once configured, pushing a `v*` tag builds,
+config) `ACR_LOGIN_SERVER`/`AZURE_RESOURCE_GROUP`/`AZURE_MIGRATE_JOB_NAME`/
+`AZURE_APP_NAME` (all four are `terraform output` values — never hand-typed)
+— until then it stays dormant. Once configured, pushing a `v*` tag builds,
 pushes to ACR, runs the migration job to completion (aborting before any
 deploy if it fails), and runs `az containerapp update` automatically.
+
+**Grant the service principal Contributor at the resource-group scope**, not
+just on the Container App: the migration job is a separate resource in the
+same group, and Azure RBAC granted on one resource does not inherit to a
+sibling — a principal scoped only to the app 403s the moment the workflow
+tries to start the migration job.
+
+**On `workflow_dispatch`, the image tag is derived from the selected
+branch**, not the tag that triggered a `v*` push (there isn't one). Since a
+branch name may contain `/` — invalid in a Docker tag — the workflow
+replaces it with `-` before using it as the image tag.
 
 **State file security.** `terraform apply` writes `database_admin_password`,
 the derived database connection string, and `signing_secret` into

@@ -5,6 +5,16 @@ output "app_fqdn" {
   value       = azurerm_container_app.this.latest_revision_fqdn
 }
 
+# The sanitized name Terraform actually gave the Container App
+# (local.app_name_safe) — never the raw project name baked in at scaffold
+# time. If `app_name` is later edited in terraform.tfvars, this output (and
+# therefore azure-deploy.yml, which reads it as a workflow variable rather
+# than hardcoding a name) tracks the change automatically.
+output "app_name" {
+  description = "Sanitized Azure name of the Container App (see local.app_name_safe)."
+  value       = azurerm_container_app.this.name
+}
+
 output "acr_login_server" {
   description = "Login server for the Azure Container Registry (used by `docker push`/`docker login` and the azure-deploy.yml workflow)."
   value       = azurerm_container_registry.this.login_server
