@@ -400,7 +400,16 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
                 if heading_level(tag).is_some()
                     || matches!(
                         tag.as_str(),
-                        "p" | "div" | "li" | "blockquote" | "hr" | "table" | "ul" | "ol"
+                        "p" | "div"
+                            | "li"
+                            | "blockquote"
+                            | "hr"
+                            | "table"
+                            | "ul"
+                            | "ol"
+                            | "dl"
+                            | "dt"
+                            | "dd"
                     )
                 {
                     if !pending.is_empty() {
@@ -1230,6 +1239,36 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["Title", "My Post", "Published", "true"]);
+    }
+
+    #[test]
+    fn description_list_inside_a_transparent_wrapper_still_keeps_blocks_separate() {
+        // Regression: `flatten_into_pending` (the path a `<dl>` takes when
+        // nested inside an unrecognized transparent wrapper, e.g.
+        // `<span><dl>...</dl></span>`) keeps its own separate block-tag
+        // list rather than sharing `flatten_blocks`'s — it was missed when
+        // `dl`/`dt`/`dd` were added there, so this path still glued terms
+        // and values together despite the top-level fix.
+        let nodes =
+            super::super::html::parse("<span><dl><dt>Title</dt><dd>My Post</dd></dl></span>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        let texts: Vec<String> = blocks
+            .iter()
+            .map(|block| {
+                let Block::Paragraph(spans) = block else {
+                    panic!("expected a paragraph block, got {block:?}")
+                };
+                spans
+                    .iter()
+                    .map(|span| match span {
+                        Span::Run { text, .. } => text.as_str(),
+                        Span::Break => "",
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(texts, vec!["Title", "My Post"]);
     }
 
     #[test]
