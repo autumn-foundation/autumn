@@ -1117,7 +1117,7 @@ pub async fn provision_default_organization_on_conn(
 /// cleanup and the account `DELETE` commit or roll back together:
 ///
 /// ```ignore
-/// use scoped_futures::ScopedFutureExt;
+/// use autumn_web::reexports::scoped_futures::ScopedFutureExt;
 ///
 /// db.tx(move |conn| {
 ///     async move {

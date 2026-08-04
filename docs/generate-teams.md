@@ -93,7 +93,7 @@ all-or-nothing), wrap your own user insert in `db.tx(...)` and call
 transaction wrapper — on the same `conn`:
 
 ```rust
-use scoped_futures::ScopedFutureExt;
+use autumn_web::reexports::scoped_futures::ScopedFutureExt;
 
 let user: User = db
     .tx(move |conn| {
@@ -198,9 +198,9 @@ same cleanup, minus the transaction wrapper — on the same `conn`.
 `remove_all_memberships_on_conn`, not after — and delete it last:**
 
 ```rust
+use autumn_web::reexports::scoped_futures::ScopedFutureExt;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use scoped_futures::ScopedFutureExt;
 
 db.tx(move |conn| {
     async move {
