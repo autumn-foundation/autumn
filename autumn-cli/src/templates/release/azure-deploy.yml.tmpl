@@ -5,11 +5,17 @@
 # manually), and every credential comes from repo/environment secrets that
 # don't exist until you add them — it never fires unauthenticated.
 #
-# Required repository secrets:
-#   AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
-#     — a service principal with AcrPush on the registry and Contributor on
-#       the Container App (see `az ad sp create-for-rbac`).
-#   ACR_LOGIN_SERVER   — output of `terraform output acr_login_server`.
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
+#     — an app registration with a federated credential for this repo (OIDC;
+#       see `az ad app federated-credential create`), granted AcrPush on the
+#       registry and Contributor on the Container App. No client secret is
+#       needed: `permissions.id-token: write` below plus azure/login's
+#       client-id/tenant-id/subscription-id inputs is enough for OIDC login.
+#
+# Required repository variables (same Settings page, "Variables" tab — not
+# secret, just config the job needs):
+#   ACR_LOGIN_SERVER    — output of `terraform output acr_login_server`.
 #   AZURE_RESOURCE_GROUP — output of `terraform output resource_group_name`.
 
 name: azure-deploy
@@ -40,18 +46,18 @@ jobs:
       - name: Log in to Azure Container Registry
         run: az acr login --name "${ACR_LOGIN_SERVER%%.azurecr.io}"
         env:
-          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
 
       - name: Build release image
         run: |
           docker build -t "$ACR_LOGIN_SERVER/{{project_name}}:${GITHUB_REF_NAME}" .
         env:
-          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
 
       - name: Push to Azure Container Registry
         run: docker push "$ACR_LOGIN_SERVER/{{project_name}}:${GITHUB_REF_NAME}"
         env:
-          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
 
       - name: Deploy new image to Azure Container Apps
         run: |
@@ -60,5 +66,5 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --image "$ACR_LOGIN_SERVER/{{project_name}}:${GITHUB_REF_NAME}"
         env:
-          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
-          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}

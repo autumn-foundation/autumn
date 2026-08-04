@@ -246,7 +246,51 @@ pub fn init(
         fs::write(&path, render(template, project_name, embed, split_workers))?;
         created.push(name.to_string());
     }
+
+    if matches!(target, Target::AzureContainerApps) {
+        ensure_azure_gitignore_entries(dir)?;
+    }
+
     Ok(created)
+}
+
+/// Terraform state (`*.tfstate*`) holds every secret value in plaintext —
+/// `sensitive = true` on a variable only redacts CLI plan/apply output, never
+/// the state file — and a real `terraform.tfvars` holds the operator's own
+/// secret values. None of that may ever land in version control.
+const AZURE_GITIGNORE_ENTRIES: &[&str] = &[
+    "# Terraform (autumn release init --target azure-container-apps)",
+    ".terraform/",
+    "*.tfstate",
+    "*.tfstate.*",
+    "terraform.tfvars",
+];
+
+/// Ensure `dir/.gitignore` excludes Terraform state and the operator's real
+/// `terraform.tfvars`, merging into an existing file (creating one if
+/// missing) without touching unrelated lines. Idempotent: a re-run (e.g.
+/// under `--force`) never duplicates entries already present.
+fn ensure_azure_gitignore_entries(dir: &Path) -> std::io::Result<()> {
+    let path = dir.join(".gitignore");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let missing: Vec<&&str> = AZURE_GITIGNORE_ENTRIES
+        .iter()
+        .filter(|line| !existing.lines().any(|l| l.trim() == **line))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push('\n');
+    for line in missing {
+        updated.push_str(line);
+        updated.push('\n');
+    }
+    fs::write(path, updated)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -1303,6 +1347,113 @@ previous_secrets = []
     }
 
     #[test]
+    fn main_tf_grants_key_vault_access_to_terraform_identity() {
+        // Access-policy-model Key Vaults grant NO data-plane access by
+        // default (subscription-level Owner/Contributor does not imply Key
+        // Vault secret access), so without a policy for Terraform's own
+        // caller identity, `terraform apply` fails at the
+        // azurerm_key_vault_secret resources with a 403.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("data.azurerm_client_config.current.object_id"),
+            "main.tf must grant Key Vault access to Terraform's own caller \
+             identity (data.azurerm_client_config.current.object_id), not \
+             just the container app's identity: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_key_vault_name_never_exceeds_azure_length_limit() {
+        // Azure Key Vault names are capped at 24 characters. Extract the
+        // substr() bound and random_id byte_length from the template and
+        // verify the worst-case rendered name (prefix + "kv" + hex suffix)
+        // fits, so a future edit to either constant can't silently regress
+        // past the limit.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+
+        let substr_bound: usize = content
+            .split("substr(local.app_name_alnum, 0, ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("main.tf must call substr(local.app_name_alnum, 0, N) for the vault name");
+        let byte_length: usize = content
+            .split("byte_length = ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("main.tf must declare random_id.suffix's byte_length");
+        let hex_len = byte_length * 2;
+        let worst_case_len = substr_bound + "kv".len() + hex_len;
+        assert!(
+            worst_case_len <= 24,
+            "worst-case Key Vault name is {worst_case_len} chars (substr={substr_bound} + \
+             \"kv\" + {hex_len} hex chars), exceeding Azure's 24-char limit: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_sanitizes_names_consistently_via_shared_local() {
+        // Postgres Flexible Server and Redis Cache names must use the same
+        // sanitized local as ACR/Key Vault, not raw var.app_name — a Cargo
+        // package name may contain underscores/uppercase that are invalid
+        // in those resource names.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+
+        let postgres_block = content
+            .split("resource \"azurerm_postgresql_flexible_server\" \"this\"")
+            .nth(1)
+            .unwrap();
+        let postgres_name_line = postgres_block
+            .lines()
+            .find(|l| l.trim_start().starts_with("name"))
+            .unwrap();
+        assert!(
+            postgres_name_line.contains("local.app_name_alnum"),
+            "Postgres server name must use the sanitized local: {postgres_name_line}"
+        );
+
+        let redis_block = content
+            .split("resource \"azurerm_redis_cache\" \"this\"")
+            .nth(1)
+            .unwrap();
+        let redis_name_line = redis_block
+            .lines()
+            .find(|l| l.trim_start().starts_with("name"))
+            .unwrap();
+        assert!(
+            redis_name_line.contains("local.app_name_alnum"),
+            "Redis cache name must use the sanitized local: {redis_name_line}"
+        );
+    }
+
+    #[test]
+    fn main_tf_wires_redis_url_into_container_app_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_key_vault_secret\" \"redis_url\""),
+            "main.tf must store the Redis connection string in Key Vault: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_CACHE__REDIS_URL"),
+            "main.tf must wire AUTUMN_CACHE__REDIS_URL into the Container App \
+             when enable_redis_cache is true: {content}"
+        );
+    }
+
+    #[test]
     fn main_tf_has_optional_redis_cache_gated_by_variable() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -1514,6 +1665,62 @@ previous_secrets = []
         fs::write(dir.join(".github/workflows/azure-deploy.yml"), "existing").unwrap();
         let err = init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap_err();
         assert!(matches!(err, ReleaseError::FileExists(_)));
+    }
+
+    #[test]
+    fn azure_target_adds_terraform_gitignore_entries_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        for line in AZURE_GITIGNORE_ENTRIES {
+            assert!(
+                content.lines().any(|l| l.trim() == *line),
+                "azure target must add `{line}` to .gitignore: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_target_gitignore_merge_preserves_existing_lines_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), "/target\n.env\n").unwrap();
+
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let after_first = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(after_first.contains("/target"), "{after_first}");
+        assert!(after_first.contains(".env"), "{after_first}");
+        for line in AZURE_GITIGNORE_ENTRIES {
+            assert!(
+                after_first.lines().any(|l| l.trim() == *line),
+                "{after_first}"
+            );
+        }
+
+        // Re-running (e.g. under --force) must not duplicate entries.
+        init(&dir, "my-app", true, Target::AzureContainerApps, false).unwrap();
+        let after_second = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        for line in AZURE_GITIGNORE_ENTRIES {
+            let count = after_second.lines().filter(|l| l.trim() == *line).count();
+            assert_eq!(
+                count, 1,
+                "`{line}` must appear exactly once: {after_second}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_azure_targets_do_not_modify_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), "/target\n").unwrap();
+        init(&dir, "my-app", false, Target::DockerCompose, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(
+            content, "/target\n",
+            "non-azure targets must leave .gitignore untouched"
+        );
     }
 
     #[test]

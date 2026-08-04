@@ -40,7 +40,10 @@ resource "random_id" "suffix" {
 }
 
 locals {
-  app_name_alnum = replace(var.app_name, "-", "")
+  # Azure resource names (ACR, Key Vault, Postgres Flexible Server, Redis)
+  # only allow lowercase alphanumerics — strip everything else once here
+  # instead of re-deriving an ad-hoc sanitization per resource.
+  app_name_alnum = lower(replace(var.app_name, "/[^a-zA-Z0-9]/", ""))
 }
 
 resource "azurerm_resource_group" "this" {
@@ -86,12 +89,32 @@ resource "azurerm_role_assignment" "acr_pull" {
 }
 
 resource "azurerm_key_vault" "this" {
-  name                     = "${substr(local.app_name_alnum, 0, 15)}kv${random_id.suffix.hex}"
+  # Key Vault names are capped at 24 characters: 10 (app prefix) + 2 ("kv")
+  # + 8 (random_id.suffix.hex, byte_length = 4) = 20, with headroom.
+  name                     = "${substr(local.app_name_alnum, 0, 10)}kv${random_id.suffix.hex}"
   resource_group_name      = azurerm_resource_group.this.name
   location                 = azurerm_resource_group.this.location
   tenant_id                = data.azurerm_client_config.current.tenant_id
   sku_name                 = "standard"
+  # Scaffold default: lets `terraform destroy`/recreate cycles run without
+  # waiting out Key Vault's soft-delete retention. Set to `true` before
+  # production — with it `false`, a purged vault's secrets are gone for
+  # good, but so is any accidental `terraform destroy`'s recovery window.
   purge_protection_enabled = false
+}
+
+# Grants Terraform's own caller identity Key Vault access so `terraform
+# apply` can create the secrets below. Access-policy-model vaults (the
+# default here) grant NO data-plane access by default — subscription-level
+# Owner/Contributor does not imply Key Vault secret access — so without this,
+# `azurerm_key_vault_secret.database_url`/`signing_secret` fail at apply
+# time with a 403.
+resource "azurerm_key_vault_access_policy" "terraform" {
+  key_vault_id = azurerm_key_vault.this.id
+  tenant_id    = data.azurerm_client_config.current.tenant_id
+  object_id    = data.azurerm_client_config.current.object_id
+
+  secret_permissions = ["Get", "List", "Set", "Delete", "Purge"]
 }
 
 resource "azurerm_key_vault_access_policy" "container_app" {
@@ -109,7 +132,7 @@ resource "azurerm_key_vault_secret" "database_url" {
   name         = "AUTUMN-DATABASE-PRIMARY-URL"
   value        = var.database_url
   key_vault_id = azurerm_key_vault.this.id
-  depends_on   = [azurerm_key_vault_access_policy.container_app]
+  depends_on   = [azurerm_key_vault_access_policy.terraform]
 }
 
 # AUTUMN_SECURITY__SIGNING_SECRET — required in production; see
@@ -118,11 +141,11 @@ resource "azurerm_key_vault_secret" "signing_secret" {
   name         = "AUTUMN-SECURITY-SIGNING-SECRET"
   value        = var.signing_secret
   key_vault_id = azurerm_key_vault.this.id
-  depends_on   = [azurerm_key_vault_access_policy.container_app]
+  depends_on   = [azurerm_key_vault_access_policy.terraform]
 }
 
 resource "azurerm_postgresql_flexible_server" "this" {
-  name                          = "${var.app_name}-pg-${random_id.suffix.hex}"
+  name                          = "${local.app_name_alnum}-pg-${random_id.suffix.hex}"
   resource_group_name           = azurerm_resource_group.this.name
   location                      = azurerm_resource_group.this.location
   version                       = "16"
@@ -156,7 +179,7 @@ resource "azurerm_postgresql_flexible_server_firewall_rule" "azure_services" {
 # deploy incurs no extra cost.
 resource "azurerm_redis_cache" "this" {
   count                = var.enable_redis_cache ? 1 : 0
-  name                 = "${var.app_name}-redis-${random_id.suffix.hex}"
+  name                 = "${local.app_name_alnum}-redis-${random_id.suffix.hex}"
   resource_group_name  = azurerm_resource_group.this.name
   location             = azurerm_resource_group.this.location
   capacity             = 0
@@ -164,6 +187,17 @@ resource "azurerm_redis_cache" "this" {
   sku_name             = "Basic"
   non_ssl_port_enabled = false
   minimum_tls_version  = "1.2"
+}
+
+# Stored in Key Vault only when Redis is enabled — mirrors how the database
+# URL and signing secret are bound in as Container App secret refs, never as
+# plain env values.
+resource "azurerm_key_vault_secret" "redis_url" {
+  count        = var.enable_redis_cache ? 1 : 0
+  name         = "AUTUMN-CACHE-REDIS-URL"
+  value        = "rediss://:${azurerm_redis_cache.this[0].primary_access_key}@${azurerm_redis_cache.this[0].hostname}:${azurerm_redis_cache.this[0].ssl_port}"
+  key_vault_id = azurerm_key_vault.this.id
+  depends_on   = [azurerm_key_vault_access_policy.terraform]
 }
 
 resource "azurerm_container_app" "this" {
@@ -192,6 +226,15 @@ resource "azurerm_container_app" "this" {
     name                = "signing-secret"
     key_vault_secret_id = azurerm_key_vault_secret.signing_secret.id
     identity            = azurerm_user_assigned_identity.this.id
+  }
+
+  dynamic "secret" {
+    for_each = var.enable_redis_cache ? [1] : []
+    content {
+      name                = "redis-url"
+      key_vault_secret_id = azurerm_key_vault_secret.redis_url[0].id
+      identity            = azurerm_user_assigned_identity.this.id
+    }
   }
 
   ingress {
@@ -229,6 +272,14 @@ resource "azurerm_container_app" "this" {
         name        = "AUTUMN_SECURITY__SIGNING_SECRET"
         secret_name = "signing-secret"
       }
+
+      dynamic "env" {
+        for_each = var.enable_redis_cache ? [1] : []
+        content {
+          name        = "AUTUMN_CACHE__REDIS_URL"
+          secret_name = "redis-url"
+        }
+      }
     }
 
     # Scale-to-N on concurrent HTTP requests — see the "Scale config
@@ -239,5 +290,12 @@ resource "azurerm_container_app" "this" {
     }
   }
 
-  depends_on = [azurerm_role_assignment.acr_pull]
+  # Both must exist before Azure creates the app's first revision: ACR pull
+  # so the image can be pulled, and the Key Vault access policy so the
+  # secret refs above resolve (neither is otherwise referenced by attribute,
+  # so Terraform wouldn't infer the ordering on its own).
+  depends_on = [
+    azurerm_role_assignment.acr_pull,
+    azurerm_key_vault_access_policy.container_app,
+  ]
 }

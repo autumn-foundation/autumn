@@ -15,22 +15,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Registry, Log Analytics workspace, Container Apps environment + the app
   itself, Azure Database for PostgreSQL Flexible Server, a Key Vault that
   feeds `AUTUMN_DATABASE__PRIMARY_URL`/`AUTUMN_SECURITY__SIGNING_SECRET` into
-  the app as secret refs via a user-assigned managed identity, and an
-  optional Redis Cache gated behind `enable_redis_cache`), `variables.tf`
+  the app as secret refs via a user-assigned managed identity (with its own
+  Key Vault access policy granted to Terraform's caller identity, since
+  access-policy-model vaults grant no data-plane access by default), and an
+  optional Redis Cache gated behind `enable_redis_cache` and fully wired in
+  as `AUTUMN_CACHE__REDIS_URL` when enabled), `variables.tf`
   (`app_name`, `location`, `image_tag`, `db_sku`, `min_replicas`/
   `max_replicas` — defaulting to the 1/10 scale range — and
   `enable_redis_cache`, plus `sensitive`, no-default secret variables for
   `database_admin_password`/`database_url`/`signing_secret`),
-  `outputs.tf` (`app_fqdn`, `acr_login_server`), a `terraform.tfvars.example`
-  that documents non-secret defaults without ever committing a literal
-  secret, and `.github/workflows/azure-deploy.yml` — an opt-in workflow
-  (triggers only on a `v*` tag push or manual dispatch, and every credential
-  comes from GitHub secrets that don't exist until configured) that builds
-  the release image, pushes it to ACR, and runs `az containerapp update`.
+  `outputs.tf` (`app_fqdn`, `acr_login_server`, `resource_group_name`), a
+  `terraform.tfvars.example` that documents non-secret defaults without ever
+  committing a literal secret, and `.github/workflows/azure-deploy.yml` — an
+  opt-in OIDC-based workflow (triggers only on a `v*` tag push or manual
+  dispatch, and every credential comes from GitHub secrets that don't exist
+  until configured — no client secret needed) that builds the release
+  image, pushes it to ACR, and runs `az containerapp update`.
   `autumn release init`'s file-existence guard and directory creation are
   now generic over nested output paths, so `--force`/collision checks cover
   `.github/workflows/azure-deploy.yml` the same way they cover root-level
-  files.
+  files. It also merges Terraform's `.gitignore` entries
+  (`.terraform/`/`*.tfstate*`/`terraform.tfvars`) into the project's
+  `.gitignore` — idempotently, preserving unrelated lines — since Terraform
+  state holds every secret value in plaintext regardless of a variable's
+  `sensitive` flag.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

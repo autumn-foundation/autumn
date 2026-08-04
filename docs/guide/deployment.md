@@ -853,7 +853,7 @@ This generates:
 |---|---|
 | `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, Azure Database for PostgreSQL Flexible Server, and a Key Vault that feeds secrets into the app via a user-assigned managed identity. An optional Redis Cache is gated behind `enable_redis_cache`. |
 | `variables.tf` | `app_name`, `location`, `image_tag`, `db_sku`, `min_replicas`/`max_replicas` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `database_url`, `signing_secret`). |
-| `outputs.tf` | `app_fqdn` and `acr_login_server`. |
+| `outputs.tf` | `app_fqdn`, `acr_login_server`, and `resource_group_name`. |
 | `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
 | `.github/workflows/azure-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to ACR, and runs `az containerapp update` on a `v*` tag push (or manual dispatch). |
 
@@ -891,11 +891,33 @@ az containerapp update \
 ```
 
 **Automated deploys on tag push:** `.github/workflows/azure-deploy.yml` only
-runs once you add the required repository secrets it documents in its header
-comment (`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`/`AZURE_TENANT_ID`/
-`AZURE_SUBSCRIPTION_ID`, `ACR_LOGIN_SERVER`, `AZURE_RESOURCE_GROUP`) — until
-then it stays dormant. Once configured, pushing a `v*` tag builds, pushes to
-ACR, and runs `az containerapp update` automatically.
+runs once you add the required repository secrets and variables it documents
+in its header comment — secrets `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/
+`AZURE_SUBSCRIPTION_ID` for OIDC login (no client secret needed: the
+workflow's `id-token: write` permission plus a federated credential on the
+app registration is enough), and variables (not secrets — they're just
+config) `ACR_LOGIN_SERVER`/`AZURE_RESOURCE_GROUP` — until then it stays
+dormant. Once configured, pushing a `v*` tag builds, pushes to ACR, and runs
+`az containerapp update` automatically.
+
+**State file security.** `terraform apply` writes `database_admin_password`,
+`database_url`, and `signing_secret` into `terraform.tfstate` **in
+plaintext** — Terraform's `sensitive = true` only redacts CLI plan/apply
+output, never the state file itself. Add `*.tfstate*`, `.terraform/`, and
+`terraform.tfvars` to `.gitignore` before running `terraform init`
+(`autumn release init --target azure-container-apps` does this for you,
+merging into an existing `.gitignore` without touching unrelated lines), and
+use a remote backend (e.g. an Azure Storage container with encryption at
+rest) instead of local state for any real deployment.
+
+**Production hardening.** Two scaffold defaults trade convenience for
+recoverability and are worth revisiting before a real deploy: the Postgres
+firewall rule (`AllowAzureServices` — Azure's sentinel for "allow
+Azure-internal traffic", not the whole internet, but still broader than a
+VNet-scoped private endpoint) and the Key Vault's `purge_protection_enabled
+= false` (lets `terraform destroy` fully clean up during setup, but also
+means a purge is unrecoverable either way — flip to `true` once the vault
+holds real secrets).
 
 ---
 
