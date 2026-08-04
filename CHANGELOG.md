@@ -195,7 +195,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `azure-sys`, which sanitizes to the same underscored name) previously
   derived an identical database name, and `terraform apply` failed trying
   to create/manage a database a fresh server already owns; it now appends
-  a `_prod` suffix in that case, still within the 63-byte limit.
+  a `_prod` suffix in that case, still within the 63-byte limit. The
+  generated Azure Redis Cache disables its non-TLS port, so the app only
+  ever receives a `rediss://` URL, but the workspace `redis` dependency was
+  built with no TLS Cargo feature — `redis::Client::open` rejected that
+  scheme outright ("can't connect with TLS, the feature is not enabled"),
+  so the optional cache path was entirely unusable the moment
+  `enable_redis_cache` was turned on. The workspace `redis` dependency now
+  also enables `tokio-rustls-comp`, matching the rustls stack the rest of
+  the workspace already standardizes on.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via
