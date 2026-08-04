@@ -119,17 +119,21 @@ jobs:
       # increasing in trigger order for this workflow file regardless of
       # which ref triggered it — so check right before the point of no
       # return (migrating/deploying) whether any OTHER run of this workflow
-      # with a higher run_number is still queued or in progress. If one is,
-      # it (or one after it) supersedes this deploy.
-      - name: Abort if a newer run of this workflow is already pending
+      # with a higher run_number is either still active OR has *already
+      # completed successfully* (not just "queued"/"in_progress": if GitHub
+      # scheduled a higher-numbered run first and it already finished
+      # deploying by the time this older run gets here, this run must still
+      # be rejected — proceeding would migrate/deploy older code over a
+      # newer release that already went out).
+      - name: Abort if a newer run of this workflow has started or finished
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           NEWER=$(gh api "repos/${{ github.repository }}/actions/workflows/azure-deploy.yml/runs?per_page=50" \
-            --jq "[.workflow_runs[] | select((.status == \"in_progress\" or .status == \"queued\") and .run_number > ${{ github.run_number }})] | length")
+            --jq "[.workflow_runs[] | select(.run_number > ${{ github.run_number }} and ((.status == \"in_progress\") or (.status == \"queued\") or (.status == \"completed\" and .conclusion == \"success\")))] | length")
           if [ "$NEWER" -gt 0 ]; then
-            echo "::error::a newer run of this workflow (run_number > ${{ github.run_number }}) is already queued or in progress — this run is superseded, aborting before migrating/deploying out of order"
+            echo "::error::a newer run of this workflow (run_number > ${{ github.run_number }}) is already active or has already deployed successfully — this run is superseded, aborting before migrating/deploying out of order"
             exit 1
           fi
 

@@ -2365,6 +2365,16 @@ previous_secrets = []
             content.contains("\\\"in_progress\\\"") && content.contains("\\\"queued\\\""),
             "the guard must check both in-progress and queued runs: {content}"
         );
+        assert!(
+            // If GitHub scheduled a higher-numbered run first and it
+            // already finished deploying by the time this older run gets
+            // here, "queued"/"in_progress" alone won't see it — it must
+            // also reject a newer run that already completed successfully.
+            content.contains("\\\"completed\\\"")
+                && content.contains(".conclusion == \\\"success\\\""),
+            "the guard must also reject a newer run that has already completed \
+             successfully, not just ones still queued or in progress: {content}"
+        );
 
         let guard_pos = content
             .find("gh api")

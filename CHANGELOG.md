@@ -99,7 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their own never-moving ref, so a same-ref check alone can't see a newer
   release land under a different tag) rather than merely whether the
   triggering ref itself has moved, and aborts if a run with a higher
-  `run_number` is still queued or in progress. The computed image tag can
+  `run_number` is still queued/in progress OR has *already completed
+  successfully* — otherwise a run GitHub scheduled after this one but that
+  finishes deploying first would go undetected, and this older run would
+  migrate/deploy right over it. The computed image tag can
   no longer start with an invalid character either (Docker's tag grammar
   requires a leading word character; sanitizing e.g. a `+hotfix` ref could
   otherwise leave a leading `-`). `main.tf`
@@ -113,7 +116,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first real deploy. The same derived hostname (not
   `latest_revision_fqdn`, which names a specific revision rather than the
   stable ingress endpoint, and would go stale the moment CI creates a new
-  revision outside Terraform) is exposed as the `app_fqdn` output.
+  revision outside Terraform) is exposed as the `app_fqdn` output. The
+  manual deploy walkthrough in `docs/guide/deployment.md` now actually
+  blocks on migration success too — `az containerapp job start` only starts
+  an execution and returns immediately, so a bare shell comment telling the
+  reader to "wait for Succeeded" let the following `az containerapp update`
+  run before migrations had actually finished; it's now a real polling loop
+  mirroring the generated workflow's.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

@@ -926,13 +926,29 @@ docker push "$ACR/$APP_NAME:v1"
 
 # Run migrations to completion BEFORE updating the app — the generated
 # production config sets auto_migrate_in_production = false, so nothing
-# else does this for you.
-az containerapp job start \
-  --name "$(terraform output -raw migrate_job_name)" \
+# else does this for you. `az containerapp job start` only starts the
+# execution and returns immediately; it does NOT wait for it to finish, so
+# the loop below is required — proceeding straight to `az containerapp
+# update` after `job start` returns would update the app before migrations
+# have actually completed.
+MIGRATE_JOB="$(terraform output -raw migrate_job_name)"
+EXECUTION=$(az containerapp job start \
+  --name "$MIGRATE_JOB" \
   --resource-group "$RG" \
-  --image "$ACR/$APP_NAME:v1"
-# az containerapp job execution list --name ... --resource-group ... shows
-# the execution's status; wait for Succeeded before continuing.
+  --image "$ACR/$APP_NAME:v1" \
+  --query name -o tsv)
+for _ in $(seq 1 30); do
+  STATUS=$(az containerapp job execution list \
+    --name "$MIGRATE_JOB" \
+    --resource-group "$RG" \
+    --query "[?name=='$EXECUTION'].properties.status" -o tsv)
+  case "$STATUS" in
+    Succeeded) break ;;
+    Failed|Stopped) echo "migration failed: $STATUS" >&2; exit 1 ;;
+  esac
+  sleep 10
+done
+[ "$STATUS" = "Succeeded" ] || { echo "migration did not finish within the time budget" >&2; exit 1; }
 
 az containerapp update \
   --name "$APP_NAME" \
@@ -982,8 +998,11 @@ trigger their own run against their own ref, so a same-ref check alone can't
 see a newer release land under a different tag. The workflow instead checks
 — immediately before migrating, as late as practical — whether any other run
 of this same workflow with a higher `run_number` (GitHub's own counter,
-monotonic in trigger order regardless of which ref triggered it) is still
-queued or in progress, and aborts rather than deploy a superseded run out of
+monotonic in trigger order regardless of which ref triggered it) is either
+still active OR has *already completed successfully*: if GitHub scheduled
+the newer run first and it already finished deploying by the time this
+older run gets here, proceeding would migrate/deploy older code over a
+release that already went out, so both cases abort rather than deploy out of
 order.
 
 **The app's own hostname is a trusted host, automatically.** Autumn's
