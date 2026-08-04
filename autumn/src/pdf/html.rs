@@ -57,6 +57,21 @@ fn is_void_element(tag: &str) -> bool {
     )
 }
 
+/// Bound on how many frames back [`parse`]'s closing-tag matcher scans
+/// looking for the nearest open tag with a given name. Well-formed HTML
+/// (even deeply nested) closes tags in the order they were opened, so a
+/// match is almost always found in the last frame or two; scanning the
+/// *entire* stack on every close only matters for malformed input that
+/// closes an ancestor while many descendants are still open. Without a
+/// bound, a long run of opens followed by a long run of non-matching closes
+/// (e.g. `"<a>".repeat(n) + "</x>".repeat(n)`, where "x" never appears on
+/// the stack so no close ever pops it) costs O(n) per close for O(n^2)
+/// overall — the same shape of bug already fixed for `decode_entities` and
+/// `parse_open_tag`. A close whose matching opener is further back than
+/// this is treated the same as a close with no matching opener at all:
+/// ignored, rather than auto-closing a deep run of intervening tags.
+const MAX_CLOSE_SCAN: usize = 512;
+
 /// Parse `input` into a forest of top-level [`Node`]s.
 pub(super) fn parse(input: &str) -> Vec<Node> {
     let bytes = input.as_bytes();
@@ -86,15 +101,20 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                 pos += 2 + name_end + usize::from(name_end < rest.len());
 
                 // Close frames up to and including the matching open tag, if
-                // any exists on the stack. A stray/mismatched close tag with
-                // no matching opener is ignored rather than corrupting the
-                // tree. An empty tag name (`</>`) must never match: the
-                // implicit root frame is *also* keyed by an empty string
-                // (it has no tag), and popping it would leave `stack` empty.
+                // any exists within the last MAX_CLOSE_SCAN frames of the
+                // stack. A stray/mismatched close tag with no matching
+                // opener nearby is ignored rather than corrupting the tree.
+                // An empty tag name (`</>`) must never match: the implicit
+                // root frame is *also* keyed by an empty string (it has no
+                // tag), and popping it would leave `stack` empty.
                 let matching_depth = if name.is_empty() {
                     None
                 } else {
-                    stack.iter().rposition(|(tag, _)| *tag == name)
+                    let window_start = stack.len().saturating_sub(MAX_CLOSE_SCAN);
+                    stack[window_start..]
+                        .iter()
+                        .rposition(|(tag, _)| *tag == name)
+                        .map(|i| window_start + i)
                 };
                 if let Some(depth) = matching_depth {
                     while stack.len() > depth {
@@ -419,6 +439,49 @@ mod tests {
             "parse_open_tag took {:?} — looks quadratic again",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn long_run_of_unmatched_closing_tags_is_linear_not_quadratic() {
+        // Regression: the closing-tag matcher scanned the *entire* open-tag
+        // stack (`stack.iter().rposition(...)`) looking for a matching
+        // opener, on every `</tag>` encountered. For a deep run of opens
+        // followed by a long run of closes that never match anything on the
+        // stack (e.g. `"<a>".repeat(n) + "</x>".repeat(n)` — "x" never
+        // appears, so no close ever pops the stack), each of the n closes
+        // pays the full O(n) scan for O(n^2) overall.
+        let html = format!("{}{}", "<a>".repeat(50_000), "</x>".repeat(50_000));
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        // None of the "</x>" closes match anything, so they're all ignored
+        // — the tree is just 50,000 nested (empty) <a> elements.
+        assert_eq!(nodes.len(), 1);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "parse took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn closing_tag_deeper_than_the_scan_window_is_ignored_not_matched() {
+        // Documents the accepted precision loss from bounding the
+        // closing-tag scan (MAX_CLOSE_SCAN): a close whose matching opener
+        // sits further back than the window no longer auto-closes the many
+        // intervening tags — it's treated the same as a close with no
+        // matching opener at all (ignored), so trailing content ends up
+        // nested inside the still-open tags instead of becoming a sibling
+        // at the root. Real templates essentially never nest hundreds of
+        // levels deep, let alone rely on this specific deep-ancestor-close
+        // pattern, so this only affects pathological input.
+        let html = format!("<outer>{}</outer>tail", "<a>".repeat(600));
+        let nodes = parse(&html);
+        assert_eq!(
+            nodes.len(),
+            1,
+            "the out-of-window close must not split off a sibling at the root"
+        );
+        assert_eq!(text(&nodes), "tail");
     }
 
     #[test]
