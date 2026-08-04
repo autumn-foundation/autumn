@@ -2052,6 +2052,27 @@ pub async fn revoke_invitation(
                 return Err(AutumnError::forbidden_msg("insufficient permissions"));
             }
 
+            // Lock and re-check status inside the transaction: a stale
+            // revoke form submitted after the invitee already accepted — or
+            // an accept that commits while this transaction waits for the
+            // row lock above — must not stomp the terminal `accepted` row
+            // back to `revoked`. That would leave the granted membership in
+            // place while a later revisit of the (already-consumed) link
+            // reports "revoked" instead of following the accepted-token
+            // idempotency path, corrupting the invitation's audit trail
+            // (Codex review finding).
+            let current: Invitation = invitations::table
+                .filter(invitations::id.eq(invitation_id))
+                .for_update()
+                .select(Invitation::as_select())
+                .first(conn)
+                .await?;
+            if current.status != "pending" {
+                return Err(AutumnError::conflict_msg(
+                    "This invitation is no longer pending",
+                ));
+            }
+
             diesel::update(invitations::table.filter(invitations::id.eq(invitation_id)))
                 .set(invitations::status.eq("revoked"))
                 .execute(conn)
@@ -4007,6 +4028,39 @@ async fn main() {
         assert!(
             !revoke_body.contains("invitation_repo\n        .update("),
             "revoke must no longer use the non-transactional repository update: {revoke_body}"
+        );
+    }
+
+    /// `revoke_invitation` must lock and re-check the invitation's own
+    /// status before overwriting it — an admin's stale revoke form
+    /// submitted after the invitee already accepted (or an accept that
+    /// commits while this transaction waits for the lock) must not stomp
+    /// the terminal `accepted` row back to `revoked` (Codex review
+    /// finding).
+    #[test]
+    fn revoke_invitation_rejects_a_non_pending_invitation() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        let revoke_body = invitations
+            .split("pub async fn revoke_invitation(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn resend_invitation(").next())
+            .unwrap_or_else(|| panic!("missing revoke_invitation: {invitations}"));
+        assert!(
+            revoke_body.contains(
+                "let current: Invitation = invitations::table\n                .filter(invitations::id.eq(invitation_id))\n                .for_update()"
+            ),
+            "{revoke_body}"
+        );
+        assert!(
+            revoke_body.contains("if current.status != \"pending\""),
+            "{revoke_body}"
         );
     }
 }

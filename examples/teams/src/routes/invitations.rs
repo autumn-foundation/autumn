@@ -756,6 +756,27 @@ pub async fn revoke_invitation(
                 return Err(AutumnError::forbidden_msg("insufficient permissions"));
             }
 
+            // Lock and re-check status inside the transaction: a stale
+            // revoke form submitted after the invitee already accepted — or
+            // an accept that commits while this transaction waits for the
+            // row lock above — must not stomp the terminal `accepted` row
+            // back to `revoked`. That would leave the granted membership in
+            // place while a later revisit of the (already-consumed) link
+            // reports "revoked" instead of following the accepted-token
+            // idempotency path, corrupting the invitation's audit trail
+            // (Codex review finding).
+            let current: Invitation = invitations::table
+                .filter(invitations::id.eq(invitation_id))
+                .for_update()
+                .select(Invitation::as_select())
+                .first(conn)
+                .await?;
+            if current.status != "pending" {
+                return Err(AutumnError::conflict_msg(
+                    "This invitation is no longer pending",
+                ));
+            }
+
             diesel::update(invitations::table.filter(invitations::id.eq(invitation_id)))
                 .set(invitations::status.eq("revoked"))
                 .execute(conn)
