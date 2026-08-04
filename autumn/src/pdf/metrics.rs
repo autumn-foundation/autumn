@@ -61,14 +61,20 @@ pub(super) const fn char_width_1000em(ch: char, bold: bool) -> u16 {
 }
 
 /// Estimated width of `text` in points at `font_size_pt`.
-// `units` sums per-character 1/1000em widths (u16 each) — even a
-// pathologically long line stays many orders of magnitude below f32's
-// 24-bit mantissa, so the cast below can't meaningfully lose precision.
+// `units` sums per-character 1/1000em widths (u16 each) in a u64 — even a
+// single-token, multi-megabyte pasted value (a base64 blob, a log line
+// with no whitespace) stays nowhere near u64::MAX, unlike a u32
+// accumulator, which a large enough unbroken token could overflow
+// (panicking in debug builds, silently wrapping in release — letting an
+// oversized token look narrow enough to slip past the character-wrap
+// safety net in `layout::wrap`). For any realistic text, the final f32
+// cast stays many orders of magnitude below f32's 24-bit mantissa, so it
+// can't meaningfully lose precision either.
 #[allow(clippy::cast_precision_loss)]
 pub(super) fn text_width_pt(text: &str, font_size_pt: f32, bold: bool) -> f32 {
-    let units: u32 = text
+    let units: u64 = text
         .chars()
-        .map(|c| u32::from(char_width_1000em(c, bold)))
+        .map(|c| u64::from(char_width_1000em(c, bold)))
         .sum();
     (units as f32 / 1000.0) * font_size_pt
 }
@@ -103,6 +109,24 @@ mod tests {
         #[allow(clippy::float_cmp)]
         let is_zero = text_width_pt("", 12.0, false) == 0.0;
         assert!(is_zero);
+    }
+
+    #[test]
+    fn a_multi_million_character_token_does_not_overflow_the_accumulator() {
+        // Regression: `text_width_pt` used to sum per-character widths into
+        // a `u32`. A single unbroken token large enough (a pasted base64
+        // blob, a log line with no whitespace) could overflow it —
+        // panicking in a debug build, silently wrapping in release and
+        // making an oversized token look narrow enough to slip past the
+        // character-wrap safety net. 6 million 'M's (833/1000em each) sums
+        // to ~4.998 billion units, safely past u32::MAX (~4.295 billion).
+        let text = "M".repeat(6_000_000);
+        let width = text_width_pt(&text, 12.0, false);
+        let expected = 6_000_000.0 * 833.0 / 1000.0 * 12.0;
+        assert!(
+            width.is_finite() && (width - expected).abs() < 1.0,
+            "expected ~{expected}, got {width}"
+        );
     }
 
     #[test]
