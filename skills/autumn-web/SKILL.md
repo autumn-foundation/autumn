@@ -1725,6 +1725,7 @@ autumn serve --role worker       # run only workers + scheduler (web/worker spli
 autumn console                   # data playground: scaffolds src/bin/playground.rs (pre-wired config+pool), then builds and runs it; alias `autumn c`
 autumn console --force           # regenerate the playground from the template (never overwritten otherwise)
 autumn console --scaffold-only   # scaffold + wire Cargo.toml, then stop
+autumn release init --target azure-container-apps   # Terraform scaffold: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ACR, Container Apps, Postgres Flexible Server, Key Vault-backed secrets, opt-in Redis) + .github/workflows/azure-deploy.yml (#1278). Same --force/collision guard as the fly/docker-compose targets; see docs/guide/deployment.md.
 ```
 
 `autumn console` is Autumn's `rails console` equivalent. Rust has no stable
