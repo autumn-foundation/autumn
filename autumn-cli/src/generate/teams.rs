@@ -1170,9 +1170,18 @@ pub async fn remove_all_memberships_on_conn(
     // transaction just promoted to Owner moments earlier — leaving the
     // organization ownerless despite the successor logic below having
     // already run for it.
+    // Ordered deterministically: if two users being deleted concurrently
+    // share two or more organizations, and each transaction locked them in
+    // a different order, one could lock org A and wait for org B while the
+    // other locks org B and waits for org A — a real deadlock Postgres can
+    // only resolve by aborting one deletion (Codex review finding). Every
+    // caller of this function scans in the same order, so whichever
+    // transaction gets to the first shared organization first always
+    // proceeds to the next one uncontested.
     let member_tenant_ids: Vec<String> = memberships::table
         .filter(memberships::user_id.eq(user_id))
         .select(memberships::tenant_id)
+        .order(memberships::tenant_id.asc())
         .load(conn)
         .await?;
 
@@ -1416,7 +1425,7 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::teams::mailers::invitation_mailer::InvitationMailer;
-use crate::teams::models::{InviteForm, Invitation, Membership, Organization, UpdateInvitation};
+use crate::teams::models::{InviteForm, Invitation, Membership, Organization};
 use crate::teams::repositories::{
     InvitationRepository, OrganizationRepository, PgInvitationRepository, PgMembershipRepository,
     PgOrganizationRepository,
@@ -1996,20 +2005,57 @@ pub async fn accept_invitation(
 #[post("/invitations/{id}/revoke")]
 pub async fn revoke_invitation(
     session: Session,
+    mut db: Db,
     invitation_repo: PgInvitationRepository,
     membership_repo: PgMembershipRepository,
     Path(invitation_id): Path<i64>,
 ) -> AutumnResult<Response> {
     require_role(&session, &membership_repo, Role::Admin).await?;
-    invitation_repo
-        .update(
-            invitation_id,
-            &UpdateInvitation {
-                status: Patch::Set("revoked".to_owned()),
-                ..Default::default()
-            },
-        )
-        .await?;
+    let Some(caller_id) = session.get("user_id").await.and_then(|s| s.parse::<i64>().ok()) else {
+        return Err(AutumnError::unauthorized_msg("authentication required"));
+    };
+    // `find_by_id` is tenant-scoped, so this also proves `invitation_id`
+    // belongs to the caller's active organization before anything is written.
+    let Some(old) = invitation_repo.find_by_id(invitation_id).await? else {
+        return Err(AutumnError::not_found_msg("Invitation not found"));
+    };
+    let tenant_id = old.tenant_id.clone();
+
+    db.tx(move |conn| {
+        async move {
+            // Revalidate the caller's own membership inside the
+            // transaction, instead of trusting the pre-transaction
+            // `require_role` result — see `create_invitation`'s identical
+            // fix for the full rationale (Codex review finding).
+            let caller_membership: Option<Membership> = memberships::table
+                .filter(memberships::tenant_id.eq(&tenant_id))
+                .filter(memberships::user_id.eq(caller_id))
+                .select(Membership::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()?;
+            let Some(caller_membership) = caller_membership else {
+                return Err(AutumnError::unauthorized_msg("no active organization"));
+            };
+            let Some(current_caller_role) = Role::parse(&caller_membership.role) else {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            };
+            if !current_caller_role.at_least(Role::Admin) {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            }
+
+            diesel::update(invitations::table.filter(invitations::id.eq(invitation_id)))
+                .set(invitations::status.eq("revoked"))
+                .execute(conn)
+                .await?;
+
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
+
     Ok(Redirect::to("/members").into_response())
 }
 
@@ -2102,6 +2148,15 @@ pub async fn resend_invitation(
                 if current.status != "pending" {
                     return Err(AutumnError::conflict_msg(
                         "This invitation is no longer pending",
+                    ));
+                }
+                // Same rule `create_invitation` enforces for a fresh Owner
+                // invitation: resending must not become a back door for an
+                // Admin to indefinitely renew an Owner grant they could
+                // never have created themselves (Codex review finding).
+                if current.role == Role::Owner.as_str() && current_caller_role != Role::Owner {
+                    return Err(AutumnError::forbidden_msg(
+                        "Only an owner can resend an invitation to join as owner",
                     ));
                 }
 
@@ -3559,7 +3614,7 @@ async fn main() {
             fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
         assert!(
             organizations.contains(
-                "let member_tenant_ids: Vec<String> = memberships::table\n        .filter(memberships::user_id.eq(user_id))\n        .select(memberships::tenant_id)\n        .load(conn)\n        .await?;"
+                "let member_tenant_ids: Vec<String> = memberships::table\n        .filter(memberships::user_id.eq(user_id))\n        .select(memberships::tenant_id)\n        .order(memberships::tenant_id.asc())\n        .load(conn)\n        .await?;"
             ),
             "{organizations}"
         );
@@ -3799,7 +3854,7 @@ async fn main() {
             fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
         assert!(
             organizations.contains(
-                "let member_tenant_ids: Vec<String> = memberships::table\n        .filter(memberships::user_id.eq(user_id))\n        .select(memberships::tenant_id)\n        .load(conn)\n        .await?;"
+                "let member_tenant_ids: Vec<String> = memberships::table\n        .filter(memberships::user_id.eq(user_id))\n        .select(memberships::tenant_id)\n        .order(memberships::tenant_id.asc())\n        .load(conn)\n        .await?;"
             ),
             "the initial scan must not filter by role — a plain Admin/Member row must be \
              included too: {organizations}"
@@ -3817,6 +3872,88 @@ async fn main() {
                 "diesel::delete(memberships::table.filter(memberships::id.eq(own_membership.id)))"
             ),
             "{organizations}"
+        );
+    }
+
+    /// The initial, unlocked scan of which organizations to process must be
+    /// ordered deterministically — otherwise two users being deleted
+    /// concurrently who share two or more organizations could each lock
+    /// them in a different order (whatever order an unordered `SELECT`
+    /// happened to return), producing a real Postgres deadlock instead of
+    /// clean serialization (Codex review finding).
+    #[test]
+    fn remove_all_memberships_on_conn_orders_the_scan_deterministically() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
+        assert!(
+            organizations.contains(".order(memberships::tenant_id.asc())"),
+            "{organizations}"
+        );
+    }
+
+    /// Resending a pending Owner-role invitation must require the caller to
+    /// currently be an Owner, the same rule `create_invitation` enforces
+    /// for a fresh one — otherwise an Admin could keep an otherwise-expired
+    /// Owner grant alive indefinitely by repeatedly resending it, a back
+    /// door around "only an owner can invite someone as owner" (Codex
+    /// review finding).
+    #[test]
+    fn resend_invitation_requires_owner_to_resend_an_owner_invitation() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        let resend_body = invitations
+            .split("pub async fn resend_invitation(")
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing resend_invitation: {invitations}"));
+        assert!(
+            resend_body.contains(
+                "if current.role == Role::Owner.as_str() && current_caller_role != Role::Owner"
+            ),
+            "{resend_body}"
+        );
+    }
+
+    /// `revoke_invitation` must revalidate the caller's own membership
+    /// inside a transaction, the same as `create_invitation`/
+    /// `resend_invitation`/the member-mutation handlers — a separate,
+    /// non-transactional repository update after `require_role` could act
+    /// on a caller who was demoted or removed in the interim (Codex review
+    /// finding).
+    #[test]
+    fn revoke_invitation_revalidates_caller_transactionally() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        let revoke_body = invitations
+            .split("pub async fn revoke_invitation(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn resend_invitation(").next())
+            .unwrap_or_else(|| panic!("missing revoke_invitation: {invitations}"));
+        assert!(revoke_body.contains("db.tx(move |conn| {"), "{revoke_body}");
+        assert!(
+            revoke_body.contains("let caller_membership: Option<Membership> = memberships::table"),
+            "{revoke_body}"
+        );
+        assert!(
+            !revoke_body.contains("invitation_repo\n        .update("),
+            "revoke must no longer use the non-transactional repository update: {revoke_body}"
         );
     }
 }

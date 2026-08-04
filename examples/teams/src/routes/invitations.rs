@@ -35,7 +35,7 @@ use scoped_futures::ScopedFutureExt;
 use serde::Deserialize;
 
 use crate::mailers::invitation_mailer::InvitationMailer;
-use crate::models::{Invitation, InviteForm, Membership, NewUser, UpdateInvitation, User};
+use crate::models::{Invitation, InviteForm, Membership, NewUser, User};
 use crate::repositories::{
     InvitationRepository, OrganizationRepository, PgInvitationRepository, PgMembershipRepository,
     PgOrganizationRepository,
@@ -712,20 +712,61 @@ pub async fn accept_invitation(
 #[post("/invitations/{id}/revoke")]
 pub async fn revoke_invitation(
     session: Session,
+    mut db: Db,
     invitation_repo: PgInvitationRepository,
     membership_repo: PgMembershipRepository,
     Path(invitation_id): Path<i64>,
 ) -> AutumnResult<Response> {
     require_role(&session, &membership_repo, Role::Admin).await?;
-    invitation_repo
-        .update(
-            invitation_id,
-            &UpdateInvitation {
-                status: Patch::Set("revoked".to_owned()),
-                ..Default::default()
-            },
-        )
-        .await?;
+    let Some(caller_id) = session
+        .get("user_id")
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return Err(AutumnError::unauthorized_msg("authentication required"));
+    };
+    // `find_by_id` is tenant-scoped, so this also proves `invitation_id`
+    // belongs to the caller's active organization before anything is written.
+    let Some(old) = invitation_repo.find_by_id(invitation_id).await? else {
+        return Err(AutumnError::not_found_msg("Invitation not found"));
+    };
+    let tenant_id = old.tenant_id.clone();
+
+    db.tx(move |conn| {
+        async move {
+            // Revalidate the caller's own membership inside the
+            // transaction, instead of trusting the pre-transaction
+            // `require_role` result — see `create_invitation`'s identical
+            // fix for the full rationale (Codex review finding).
+            let caller_membership: Option<Membership> = memberships::table
+                .filter(memberships::tenant_id.eq(&tenant_id))
+                .filter(memberships::user_id.eq(caller_id))
+                .select(Membership::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()?;
+            let Some(caller_membership) = caller_membership else {
+                return Err(AutumnError::unauthorized_msg("no active organization"));
+            };
+            let Some(current_caller_role) = Role::parse(&caller_membership.role) else {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            };
+            if !current_caller_role.at_least(Role::Admin) {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            }
+
+            diesel::update(invitations::table.filter(invitations::id.eq(invitation_id)))
+                .set(invitations::status.eq("revoked"))
+                .execute(conn)
+                .await?;
+
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
+
     Ok(Redirect::to("/members").into_response())
 }
 
@@ -798,6 +839,15 @@ pub async fn resend_invitation(
                 if current.status != "pending" {
                     return Err(AutumnError::conflict_msg(
                         "This invitation is no longer pending",
+                    ));
+                }
+                // Same rule `create_invitation` enforces for a fresh Owner
+                // invitation: resending must not become a back door for an
+                // Admin to indefinitely renew an Owner grant they could
+                // never have created themselves (Codex review finding).
+                if current.role == Role::Owner.as_str() && current_caller_role != Role::Owner {
+                    return Err(AutumnError::forbidden_msg(
+                        "Only an owner can resend an invitation to join as owner",
                     ));
                 }
 
