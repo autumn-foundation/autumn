@@ -11,8 +11,6 @@ nav.greet = Greet
 nav.admin = Admin
 nav.new_post = New Post
 nav.locale.label = Language
-nav.locale.en = English
-nav.locale.es = Español
 
 footer.tagline = Built with Autumn
 
@@ -23,5 +21,5 @@ home.hero.subtitle = Thoughts, tutorials, and stories — powered by Autumn.
 # ── Greet page (demonstrates t! macro) ───────────────────────
 greet.title = Welcome to the Autumn Blog
 greet.greeting = Hello, { $name }! You are viewing this page in English.
-greet.switcher_help = Switch language using the links below — your choice is remembered via cookie.
-greet.try = Try appending ?locale=es to the URL to see the Spanish version.
+greet.switcher_help = Switch language using the links below — each one is a real, crawlable /{locale}/greet URL.
+greet.try = Try visiting /es/greet directly, or /greet to be redirected to your negotiated locale.

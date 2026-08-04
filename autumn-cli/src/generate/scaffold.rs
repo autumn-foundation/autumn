@@ -405,6 +405,44 @@ fn plan_scaffold_with_options_impl(
     if !options.api {
         validate_enum_field_names_against_routes_imports(&fields, &pascal(name))?;
     }
+    // Gate (issue #1260): a `slug` field reroutes the standard (non-`--api`)
+    // HTML `show`/`edit`/`update`/`delete` routes and their generated links to
+    // key off the slug instead of `id` (see `render_routes_file`'s
+    // `route_key`). That rekeying is only wired for the plain, non-`--live`,
+    // non-`--sharded`, non-attachment, non-state-machine path so far — refuse
+    // the unsupported combinations up front rather than emit routes that
+    // silently keep keying off `id` (or, worse, half-rekey and fail to
+    // compile).
+    if fields.iter().any(|f| f.kind.is_slug()) {
+        if options.live || options.live_validation {
+            return Err(GenerateError::Config(
+                "a `slug` field is not yet supported together with `--live`/`--live-validation`: \
+                 the SSE live-list scaffold still keys its routes off `id`."
+                    .to_owned(),
+            ));
+        }
+        if options.model.sharded {
+            return Err(GenerateError::Config(
+                "a `slug` field is not yet supported together with `--sharded`: the sharded \
+                 scaffold still keys its routes off `id`."
+                    .to_owned(),
+            ));
+        }
+        if has_attachment_fields(&fields) {
+            return Err(GenerateError::Config(
+                "a `slug` field is not yet supported alongside an `Attachment` field: the \
+                 multipart create/update handlers still key their routes off `id`."
+                    .to_owned(),
+            ));
+        }
+        if fields.iter().any(|f| f.state_machine.is_some()) {
+            return Err(GenerateError::Config(
+                "a `slug` field is not yet supported alongside a `:states(...)` field: the \
+                 transition handler still keys its route off `id`."
+                    .to_owned(),
+            ));
+        }
+    }
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
     let model_options_with_key = ModelOptions {
@@ -427,6 +465,23 @@ fn plan_scaffold_with_options_impl(
         &options_with_key.model,
     )?;
     let metadata = parse_model_metadata(&fields, &options_with_key.model)?;
+    // A `--default field=value` column is dropped from `form_fields` (see
+    // below) and therefore from the generated `New{Pascal}` insert struct
+    // entirely (it's set at the SQL `DEFAULT` level instead) — a slug can't
+    // derive `from:` it, since the create handler's `new.{from}` wouldn't
+    // exist to read. dsl.rs's `validate_slug_fields` can't catch this itself:
+    // `--default` metadata isn't visible until here.
+    if let Some(slug) = fields.iter().find(|f| f.kind.is_slug())
+        && let Some(from) = slug.constraints.from.as_deref()
+        && metadata.defaults().contains_key(from)
+    {
+        return Err(GenerateError::Config(format!(
+            "slug field '{}' derives `from:{from}`, but '{from}' has a `--default` value and \
+             is dropped from the generated New{{Pascal}} insert struct — slug can't read it \
+             at create time",
+            slug.name
+        )));
+    }
     let queries = parse_query_specs(&fields, &options_with_key.queries)?;
     let form_fields = fields
         .iter()
@@ -1957,6 +2012,17 @@ fn render_model_form(
     }
 }
 
+/// The extractor's LOCAL BINDING name for a slug-keyed route (issue #1260) —
+/// deliberately fixed and `__`-prefixed (matching this file's other
+/// internal-only identifiers, e.g. `__parse_result`), NOT the DSL field name.
+/// A field literally named `db`/`flash`/`body`/`csrf`/`session`/etc. is a
+/// valid declaration (`db:slug{from:title}`), and destructuring straight to
+/// that name would collide with the handler's own same-named extractor
+/// parameter — a real "duplicate binding" compile error a review caught. The
+/// actual field name is still used for the schema column and the URL
+/// placeholder segment — only the Rust-local binding is renamed.
+const ROUTE_KEY_BINDING: &str = "__route_key";
+
 #[allow(
     clippy::too_many_lines,
     reason = "This is a single template — splitting it produces less readable output, \
@@ -1982,6 +2048,57 @@ fn render_routes_file(
     searchable: &[String],
 ) -> String {
     let id_rust = id_type.rust_type();
+    // Issue #1260: a `slug` field reroutes `show`/`edit`/`update`/`delete` (and
+    // their generated links) to key off the slug instead of `id`. The
+    // `plan_scaffold_with_options_impl` gate above ensures a slug never
+    // coexists with `--live`/`--live-validation`/`--sharded`/an `Attachment`
+    // field/a `:states(...)` field, so every one of those branches below stays
+    // fully unreachable whenever `route_key_field` is `Some` — they need no
+    // changes. When `route_key_field` is `None` (the overwhelming common
+    // case: no slug field at all), every helper below reduces to exactly the
+    // pre-#1260 text, so a non-slug scaffold's output is byte-for-byte
+    // unchanged.
+    let slug_field: Option<&Field> = fields.iter().find(|f| f.kind.is_slug());
+    let route_key_field: Option<&str> = slug_field.map(|f| f.name.as_str());
+    // The `id`/`slug` parameter declaration for a `show`/`edit`/`update`/
+    // `delete` handler signature — substitutes in place of the pre-#1260
+    // literal `id: Path<{id_rust}>` text.
+    let id_param_decl: String = route_key_field.map_or_else(
+        || format!("id: Path<{id_rust}>"),
+        |_| format!("Path({ROUTE_KEY_BINDING}): Path<String>"),
+    );
+    // The URL path segment name for those same four routes.
+    let id_url_segment: &str = route_key_field.unwrap_or("id");
+    // The `{plural}::table` row lookup — substitutes in place of the
+    // pre-#1260 literal `.find(*id)` (dot kept in the surrounding template).
+    let find_expr: String = route_key_field.map_or_else(
+        || "find(*id)".to_owned(),
+        |f| format!("filter({plural}::{f}.eq(&{ROUTE_KEY_BINDING}))"),
+    );
+    // The value expression used everywhere a route handler builds a
+    // `paths::*`/error-message argument identifying the row it just loaded —
+    // substitutes in place of the pre-#1260 literal `*id`.
+    let id_value_expr: String =
+        route_key_field.map_or_else(|| "*id".to_owned(), |_| format!("&{ROUTE_KEY_BINDING}"));
+    // Same, but for a loaded `row: {pascal_name}` value rather than the path
+    // extractor local — substitutes in place of the pre-#1260 literal `row.id`
+    // wherever a view displays or links the record it just rendered. Borrows
+    // (`&row.{f}`) rather than reading `row.{f}` by value: unlike `row.id`
+    // (`i64`, `Copy`), a slug is a non-`Copy` `String` field, and every
+    // substitution site below already accepts `impl Display`/`Render` on a
+    // reference, so borrowing here avoids depending on happening to be the
+    // last use of `row` in the surrounding handler.
+    let route_key_display_expr: String =
+        route_key_field.map_or_else(|| "row.id".to_owned(), |f| format!("&row.{f}"));
+    // The value the `update` handler's SUCCESS redirect resolves the row
+    // by — unlike `id_value_expr` (the path extractor's PRE-update value,
+    // still correct for the not-found message above it), this must read the
+    // just-persisted `new.{f}` for a slug: if the user edited (or blanked,
+    // triggering re-derivation of) the slug, redirecting to the OLD path
+    // value 404s (issue #1260 review finding). `id` never changes on
+    // update, so the non-slug case stays the pre-#1260 `*id`.
+    let update_redirect_expr: String =
+        route_key_field.map_or_else(|| "*id".to_owned(), |f| format!("&new.{f}"));
     // Issue #1319: the full-text search box + results handler apply only to the
     // standard (non-live) HTML index. The `--live`/`--live-validation` list is a
     // `<ul>` with an SSE out-of-band swap contract that a `data_table` search
@@ -2154,13 +2271,13 @@ fn render_routes_file(
         // Filter on `deleted_at IS NULL` so deleting an already-soft-deleted row
         // affects zero rows and returns 404, matching the physical-delete path.
         format!(
-            "let deleted = diesel::update(\n        {plural}::table.find(*id).filter({plural}::deleted_at.is_null()),\n    )\n        \
+            "let deleted = diesel::update(\n        {plural}::table.{find_expr}.filter({plural}::deleted_at.is_null()),\n    )\n        \
                  .set({plural}::deleted_at.eq(Some(chrono::Utc::now().naive_utc())))\n        \
                  .execute(&mut *db)\n        .await?;"
         )
     } else {
         format!(
-            "let deleted = diesel::delete({plural}::table.find(*id))\n        \
+            "let deleted = diesel::delete({plural}::table.{find_expr})\n        \
                  .execute(&mut *db)\n        .await?;"
         )
     };
@@ -2200,7 +2317,7 @@ fn render_routes_file(
         }
     } else {
         format!(
-            "let updated = diesel::update({plural}::table.find(*id))\n        \
+            "let updated = diesel::update({plural}::table.{find_expr})\n        \
              .set(({update_columns}))\n        \
              .execute(&mut *db)\n        .await?;"
         )
@@ -2252,9 +2369,7 @@ fn render_routes_file(
                 "flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"
             )
         } else {
-            format!(
-                "flash: Flash,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"
-            )
+            format!("flash: Flash,\n    {id_param_decl},\n    mut db: {db_ty},\n    body: Bytes,")
         }
     };
 
@@ -2884,6 +2999,61 @@ mod attachment_read_back_tests {
     // Create: build `New{Pascal}` then bind each streamed blob (a `None` blob
     // means no file was submitted — the column stays NULL, satisfying the
     // optional-empty-as-NULL acceptance criterion).
+    // Issue #1260 AC4: on create, when the submitted slug is blank, derive it
+    // from the `from` source field via `autumn_web::slugify`, then probe for
+    // a collision and append a deterministic `-2`, `-3`, ... suffix until a
+    // free value is found — so two records deriving the same base slug (e.g.
+    // two posts both titled "Hello") get distinct URLs instead of a 422 on
+    // the `UNIQUE INDEX`. A non-blank submitted slug (the form exposes it as
+    // a plain text input) passes through untouched here; its own uniqueness
+    // is still enforced by the existing `unique`-field violation handling
+    // below, exactly like any other `unique` column.
+    //
+    // A derived value equal to a static sibling route segment is treated as
+    // taken even though it isn't in the table yet: axum's router (matchit)
+    // always prefers a static route over the `GET /{plural}/{slug}` capture,
+    // so a record whose slug were literally "new" (or "search", when
+    // `--searchable` emits `GET /{plural}/search`) would never be reachable
+    // at its own show page. This only guards the DERIVED path — an
+    // explicitly *submitted* slug of one of these isn't rejected here,
+    // matching this AC's blank-only scope (out of scope: general
+    // reserved-word validation on a hand-typed slug).
+    let reserved_segment_guard = if search_enabled {
+        "candidate != \"new\" && candidate != \"search\""
+    } else {
+        "candidate != \"new\""
+    };
+    #[allow(clippy::option_if_let_else)] // nested map_or_else closures read worse here
+    let slug_derive_block = if let Some(slug) = slug_field {
+        let field = &slug.name;
+        let from = slug
+            .constraints
+            .from
+            .as_deref()
+            .expect("parse_fields guarantees a slug field carries a `from` constraint");
+        format!(
+            "\n    if new.{field}.is_empty() {{\n        \
+             let base = autumn_web::slugify(&new.{from});\n        \
+             let mut candidate = base.clone();\n        \
+             let mut suffix: i64 = 2;\n        \
+             loop {{\n            \
+             let count: i64 = {plural}::table\n                \
+             .filter({plural}::{field}.eq(&candidate))\n                \
+             .count()\n                \
+             .get_result(&mut *db)\n                \
+             .await?;\n            \
+             if count == 0 && {reserved_segment_guard} {{\n                \
+             break;\n            \
+             }}\n            \
+             candidate = format!(\"{{base}}-{{suffix}}\");\n            \
+             suffix += 1;\n        \
+             }}\n        \
+             new.{field} = candidate;\n    \
+             }}"
+        )
+    } else {
+        String::new()
+    };
     let create_new_block = if has_attachments {
         let mut binds = String::new();
         for f in &attachment_fields {
@@ -2891,8 +3061,51 @@ mod attachment_read_back_tests {
             let _ = write!(binds, "\n    new.{name} = {name}_blob;");
         }
         format!("{into_new_bind}{binds}")
+    } else if slug_field.is_some() {
+        format!("let mut new = {into_new_call};{slug_derive_block}")
     } else {
         format!("let new = {into_new_call};")
+    };
+    // Issue #1260 review finding: `update` needs the SAME blank-derives-a-slug
+    // behavior `create` has — a submitted slug isn't required (AC4's "plain
+    // optional text input"), so clearing it on edit must re-derive rather
+    // than persist an empty string that breaks the record's own `/{slug}`
+    // route. Identical to `slug_derive_block` except the collision probe
+    // excludes the record's OWN current row via `{id_value_expr}` (the path
+    // extractor's still-old value) — otherwise re-deriving to the same slug
+    // a no-op edit would produce (title unchanged) would spuriously collide
+    // with itself and pick up an unwanted `-2` suffix.
+    #[allow(clippy::option_if_let_else)] // nested map_or_else closures read worse here
+    let update_slug_derive_block = if let Some(slug) = slug_field {
+        let field = &slug.name;
+        let from = slug
+            .constraints
+            .from
+            .as_deref()
+            .expect("parse_fields guarantees a slug field carries a `from` constraint");
+        format!(
+            "\n    if new.{field}.is_empty() {{\n        \
+             let base = autumn_web::slugify(&new.{from});\n        \
+             let mut candidate = base.clone();\n        \
+             let mut suffix: i64 = 2;\n        \
+             loop {{\n            \
+             let count: i64 = {plural}::table\n                \
+             .filter({plural}::{field}.eq(&candidate))\n                \
+             .filter({plural}::{field}.ne({id_value_expr}))\n                \
+             .count()\n                \
+             .get_result(&mut *db)\n                \
+             .await?;\n            \
+             if count == 0 && {reserved_segment_guard} {{\n                \
+             break;\n            \
+             }}\n            \
+             candidate = format!(\"{{base}}-{{suffix}}\");\n            \
+             suffix += 1;\n        \
+             }}\n        \
+             new.{field} = candidate;\n    \
+             }}"
+        )
+    } else {
+        String::new()
     };
     // Update: preserve the existing blob when no new file was uploaded
     // (`streamed.or(current)`), so an edit that doesn't touch the file leaves the
@@ -2961,6 +3174,11 @@ mod attachment_read_back_tests {
         (
             format!("{load_current}{authz_attachment_update}"),
             format!("{into_new_bind}{binds}"),
+        )
+    } else if slug_field.is_some() {
+        (
+            String::new(),
+            format!("let mut new = {into_new_call};{update_slug_derive_block}"),
         )
     } else {
         (String::new(), format!("let new = {into_new_call};"))
@@ -3079,11 +3297,11 @@ mod attachment_read_back_tests {
              }})"
         );
         let edit_form_layout = format!(
-            "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
-             h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
+            "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", {id_value_expr}), {cp_edit}{flash_arg}, html! {{\n        \
+             h1 {{ \"Edit {pascal_name} #\" ({id_value_expr}) }}\n        \
              {edit_current_attachment_markup}\
-             ({snake_name}_form_for(&changeset, paths::update(*id), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}))\n        \
-             form action=(paths::delete(*id)) method=\"post\" {{\n            \
+             ({snake_name}_form_for(&changeset, paths::update({id_value_expr}), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}))\n        \
+             form action=(paths::delete({id_value_expr})) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
              }}\n    \
@@ -3184,6 +3402,10 @@ mod attachment_read_back_tests {
          }}\n"
     );
 
+    // A slug field is always `unique` (issue #1260), so a slug scaffold
+    // always takes THIS branch — the `has_attachments`/plain branches below
+    // still hard-code the pre-#1260 `*id` literal, safe only because they're
+    // unreachable whenever a slug field is present.
     let update_apply_block = if !unique_fields.is_empty() {
         // Issue #1872: `{blob_cleanup}` (empty unless the scaffold has attachment
         // fields) best-effort deletes the just-saved blob(s) on the
@@ -3207,11 +3429,11 @@ mod attachment_read_back_tests {
              }};\n    \
              if updated == 0 {{\n        \
              {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", *id\n        \
+             \"{pascal_name} with id {{}} not found\", {id_value_expr}\n        \
              )));\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
+             Ok(autumn_web::Redirect::to(&paths::show({update_redirect_expr})).into_response())"
         )
     } else if has_attachments {
         // Issue #1872: no unique constraints, but the update write and the
@@ -3267,7 +3489,7 @@ mod attachment_read_back_tests {
         } else {
             format!(
                 "let {binding}: {pascal_name} = {plural}::table\n        \
-                 .find(*id)\n        \
+                 .{find_expr}\n        \
                  .select({pascal_name}::as_select())\n        \
                  .first(&mut *db)\n        \
                  .await\n        \
@@ -3307,12 +3529,12 @@ mod attachment_read_back_tests {
         String::new()
     };
     let update_fn = format!(
-        "/// `POST /{plural}/{{id}}/update` — validate and apply form data to a row,\n\
+        "/// `POST /{plural}/{{{id_url_segment}}}/update` — validate and apply form data to a row,\n\
          /// or re-render the edit form at 422 with inline errors and preserved input.\n\
          /// Uses column-by-column `diesel::update().set(...)` (same convention as\n\
          /// `examples/todo-app`) so we don't need `AsChangeset` on `New{pascal_name}`.\n\
          #[secured]\n\
-         #[post(\"/{plural}/{{id}}/update\")]\n\
+         #[post(\"/{plural}/{{{id_url_segment}}}/update\")]\n\
          pub async fn update(\n    \
          {update_signature}\n\
          ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
@@ -3397,7 +3619,13 @@ mod attachment_read_back_tests {
     let columns_let = if live {
         String::new()
     } else {
-        render_columns_vec(pascal_name, fields, &reference_displays, false)
+        render_columns_vec(
+            pascal_name,
+            fields,
+            &reference_displays,
+            false,
+            route_key_field,
+        )
     };
     let index_label_loads = if live {
         String::new()
@@ -3421,7 +3649,13 @@ mod attachment_read_back_tests {
     let index_columns_labeled = if index_label_loads.is_empty() {
         columns_let
     } else {
-        render_columns_vec(pascal_name, fields, &reference_displays, true)
+        render_columns_vec(
+            pascal_name,
+            fields,
+            &reference_displays,
+            true,
+            route_key_field,
+        )
     };
     // #1126: the data_table config is wired symmetrically with what the server
     // applies — `.query(..)` preserves the current filters on sort links,
@@ -4332,23 +4566,23 @@ pub async fn transition_{field}(
             format!(
                 r#"
 
-/// `GET /{plural}/{{id}}` — show one {snake_name}.
-#[get("/{plural}/{{id}}")]
-pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash{show_state_param}) -> AutumnResult<Markup> {{
+/// `GET /{plural}/{{{id_url_segment}}}` — show one {snake_name}.
+#[get("/{plural}/{{{id_url_segment}}}")]
+pub async fn show({id_param_decl}, mut db: {db_ty}, flash: Flash{show_state_param}) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
-        .find(*id)
+        .{find_expr}
         .select({pascal_name}::as_select())
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
 {show_authz_call}{show_label_loads}{show_attachment_url_binds}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
-    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
-        h1 {{ "{pascal_name} #" (row.id) }}
+    Ok({layout_fn}(&format!("{pascal_name} #{{}}", {route_key_display_expr}), {cp_show}{flash_arg}, html! {{
+        h1 {{ "{pascal_name} #" ({route_key_display_expr}) }}
         (autumn_web::widgets::property_list(&props))
         (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
         " "
-        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
+        (autumn_web::a11y::Link::new(paths::edit({route_key_display_expr}), "Edit"))
     }}))
 }}
 "#
@@ -4396,14 +4630,14 @@ pub async fn new_form(
 }}
 
 {unique_constraints_const}{create_fn}
-/// `GET /{plural}/{{id}}/edit` — render the edit form. Submission goes to
+/// `GET /{plural}/{{{id_url_segment}}}/edit` — render the edit form. Submission goes to
 /// the `update` handler below as a plain HTML POST (browsers can't submit
 /// PUT directly without JS); the auto-generated JSON `PUT /api/{plural}/{{id}}`
 /// remains available for API clients.
 #[secured]
-#[get("/{plural}/{{id}}/edit", name = "edit")]
+#[get("/{plural}/{{{id_url_segment}}}/edit", name = "edit")]
 pub async fn edit_form(
-    id: Path<{id_rust}>,
+    {id_param_decl},
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -4412,7 +4646,7 @@ pub async fn edit_form(
     submit_field: Option<SubmitFormField>,{edit_destroy_authz_params}{edit_form_state_param}
 ) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
-        .find(*id)
+        .{find_expr}
         .select({pascal_name}::as_select())
         .first(&mut *db)
         .await
@@ -4422,22 +4656,22 @@ pub async fn edit_form(
 }}
 
 {update_fn}
-/// `POST /{plural}/{{id}}/delete` — delete a row, then redirect to the list.
+/// `POST /{plural}/{{{id_url_segment}}}/delete` — delete a row, then redirect to the list.
 /// Browsers can't submit `DELETE` without JS, so the show page's delete button
 /// posts here; the JSON `DELETE /api/{plural}/{{id}}` stays available for API
 /// clients via the auto-generated repository handler. Honours the resource's
 /// soft-delete configuration (marks `deleted_at` when `--soft-delete` is set).
 #[secured]
-#[post("/{plural}/{{id}}/delete", name = "delete")]
+#[post("/{plural}/{{{id_url_segment}}}/delete", name = "delete")]
 pub async fn destroy(
-    id: Path<{id_rust}>,
+    {id_param_decl},
     {destroy_signature_arg},
     flash: Flash,
 ) -> AutumnResult<autumn_web::Redirect> {{
     {authz_destroy_preamble}{destroy_stmt}
     if deleted == 0 {{
         return Err(AutumnError::not_found_msg(format!(
-            "{pascal_name} with id {{}} not found", *id
+            "{pascal_name} with id {{}} not found", {id_value_expr}
         )));
     }}
     flash.success("{pascal_name} deleted").await;
@@ -4723,6 +4957,41 @@ fn render_form_for_helper(
                 let _ = write!(
                     builder_calls,
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Number {{ step: Some(\"{step}\".into()) }})"
+                );
+            }
+            // Issue #1260 AC4: a blank submission auto-derives the slug on
+            // create (see `create_new_block`'s `slug_derive_block`), so the
+            // control must NOT carry `required`/`aria-required` even though
+            // the column itself is `NOT NULL` — otherwise the browser blocks
+            // submission before that derivation logic ever runs. The derive's
+            // default `FormField.required` is driven by Rust-level
+            // nullability (always `true` here, since a slug field is never
+            // `Option<String>`), so this needs the same `.exclude()` +
+            // `.append()` escape hatch the other schema-specific overrides
+            // use, minus the `required_builders` those emit.
+            FieldKind::Slug => {
+                let label = humanize_label(name);
+                let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
+                let _ = write!(
+                    appends,
+                    "\n        .append(html! {{\n            \
+                     @let errors = changeset.errors_for(\"{name}\");\n            \
+                     div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+                     (autumn_web::a11y::TextField::new(\"{name}\")\n                    \
+                     .label(\"{label}\")\n                    \
+                     .label_class(\"autumn-field__label\")\n                    \
+                     .input_type(\"text\")\n                    \
+                     .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
+                     .class(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                     .aria_invalid(!errors.is_empty())\n                    \
+                     .described_by(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}))\n                \
+                     @if !errors.is_empty() {{\n                    \
+                     div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+                     @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+                     }}\n                \
+                     }}\n            \
+                     }}\n        \
+                     }})"
                 );
             }
             FieldKind::References => {
@@ -5705,6 +5974,7 @@ fn render_columns_vec(
     fields: &[Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
     use_label_maps: bool,
+    route_key_field: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 150 + 300);
@@ -5751,10 +6021,14 @@ fn render_columns_vec(
             "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
         );
     }
-    // Show link column
+    // Show link column. Keyed off the slug (issue #1260) when the model has
+    // one, matching `paths::show`'s rekeyed `Path<String>` route; a non-slug
+    // model keeps the pre-#1260 `row.id` byte-for-byte.
+    let show_link_arg =
+        route_key_field.map_or_else(|| "row.id".to_owned(), |field| format!("&row.{field}"));
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::a11y::Link::new(paths::show(row.id), \"Show\")) }}),"
+        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::a11y::Link::new(paths::show({show_link_arg}), \"Show\")) }}),"
     );
     let _ = writeln!(out, "    ];");
     out
@@ -7225,6 +7499,11 @@ fn sql_sample_literal(kind: FieldKind) -> String {
         FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Enum => {
             "'sample'".to_owned()
         }
+        // A unique sample literal, not `'sample'` — this helper fills every
+        // *other* `NOT NULL` column while testing one column in isolation, and
+        // a slug field's own `UNIQUE INDEX` would reject a second `'sample'`
+        // row alongside whatever `enum_rejection_insert_sql` inserts.
+        FieldKind::Slug => "'sample-slug'".to_owned(),
         FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1".to_owned(),
         FieldKind::Bool => "TRUE".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "1.0".to_owned(),
@@ -7263,7 +7542,11 @@ const API_SMOKE_TEST_SEED_ROWS: usize = 25;
 /// per row.
 fn sql_seed_value_expr(f: &Field) -> String {
     match f.kind {
-        FieldKind::String | FieldKind::Text | FieldKind::RichText => "'sample-' || g".to_owned(),
+        // A slug field is always `unique` (issue #1260) -- it MUST vary per
+        // row here, or the seeded rows collide on the very first re-insert.
+        FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Slug => {
+            "'sample-' || g".to_owned()
+        }
         FieldKind::I32 | FieldKind::I64 => "g".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "g::double precision".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime => {
@@ -7476,9 +7759,11 @@ fn render_enum_rejection_smoke_test(
 /// the duplicate-insert assertion would never trip.
 fn unique_sample_literal(kind: FieldKind) -> String {
     match kind {
-        FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Enum => {
-            "'dup_value'".to_owned()
-        }
+        FieldKind::String
+        | FieldKind::Text
+        | FieldKind::RichText
+        | FieldKind::Enum
+        | FieldKind::Slug => "'dup_value'".to_owned(),
         FieldKind::I32 | FieldKind::I64 => "424242".to_owned(),
         // Must be a real seeded row's id, not an arbitrary literal — a
         // `references` target column is FK-constrained against the stub
@@ -7511,9 +7796,11 @@ fn unique_sample_literal(kind: FieldKind) -> String {
 /// to decide which violation Postgres actually reports.
 fn unique_sample_literal_variant(kind: FieldKind) -> String {
     match kind {
-        FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Enum => {
-            "'dup_value_2'".to_owned()
-        }
+        FieldKind::String
+        | FieldKind::Text
+        | FieldKind::RichText
+        | FieldKind::Enum
+        | FieldKind::Slug => "'dup_value_2'".to_owned(),
         FieldKind::I32 | FieldKind::I64 => "424243".to_owned(),
         // The second stub row `render_reference_stub_tables_sql` seeds —
         // distinct from `unique_sample_literal`'s "1" for the same reason
@@ -7987,6 +8274,10 @@ pub(super) fn remove_submit_token_exempt_from_toml(
 }
 
 #[cfg(test)]
+// Test inputs like `"slug:slug{from:title}"` / `"post:references{label:title}"`
+// are literal DSL tokens, not format strings — the `{…}` is the scaffold's
+// own constraint-modifier syntax under test.
+#[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
     use crate::generate::Flags;
@@ -12893,6 +13184,512 @@ async fn main() {
             plan.warnings[1].contains("Generate the 'post' model first"),
             "warnings: {:?}",
             plan.warnings
+        );
+    }
+
+    // ── slug (issue #1260) ──────────────────────────────────────────────────
+
+    #[test]
+    fn scaffold_slug_field_migration_is_not_null_and_unique() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("slug TEXT NOT NULL"), "up.sql: {up}");
+        assert!(
+            up.contains("CREATE UNIQUE INDEX idx_posts_slug_unique ON posts (slug);"),
+            "up.sql: {up}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_adds_find_by_slug_to_repository_for_free() {
+        // A slug is implicitly `unique` (dsl.rs), so this falls into the
+        // existing issue #1032 "every unique field gets a `find_by_<field>`"
+        // machinery with zero new repository codegen.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
+        assert!(
+            repo.contains("fn find_by_slug(slug: String) -> Vec<Post>;"),
+            "repo: {repo}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_routes_key_off_slug_not_id() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains(r#"#[get("/posts/{slug}")]"#), "{routes}");
+        assert!(
+            routes.contains(r#"#[get("/posts/{slug}/edit", name = "edit")]"#),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(r#"#[post("/posts/{slug}/update")]"#),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(r#"#[post("/posts/{slug}/delete", name = "delete")]"#),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("Path(__route_key): Path<String>"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("posts::table\n        .filter(posts::slug.eq(&__route_key))"),
+            "{routes}"
+        );
+        // AC6, falsifiable check: zero `/{id}`-keyed HTML route ATTRIBUTES remain
+        // for a slug-bearing model (doc comments legitimately still mention the
+        // still-id-keyed JSON REST API, e.g. `PUT /api/posts/{id}` — that's the
+        // auto-generated `#[repository]` surface, out of scope here, so this
+        // checks the `#[get(...)]`/`#[post(...)]` attributes specifically, not
+        // the whole file).
+        assert!(!routes.contains(r#"#[get("/posts/{id}"#), "{routes}");
+        assert!(!routes.contains(r#"#[post("/posts/{id}"#), "{routes}");
+        assert!(!routes.contains("Path<i64>"), "{routes}");
+    }
+
+    #[test]
+    fn scaffold_slug_field_show_returns_404_on_miss() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "        .first(&mut *db)\n        .await\n        .map_err(AutumnError::not_found)?;"
+            ),
+            "show/edit must map a missing row to a 404 via AutumnError::not_found: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_create_auto_derives_when_blank_with_collision_suffix() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("let mut new = into_new(changeset.data())?;"),
+            "{routes}"
+        );
+        assert!(routes.contains("if new.slug.is_empty() {"), "{routes}");
+        assert!(
+            routes.contains("let base = autumn_web::slugify(&new.title);"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("candidate = format!(\"{base}-{suffix}\");"),
+            "{routes}"
+        );
+        assert!(routes.contains("new.slug = candidate;"), "{routes}");
+    }
+
+    #[test]
+    fn scaffold_slug_field_update_also_auto_derives_when_blank() {
+        // AC4's blank-derives-a-slug behavior isn't create-only: the form
+        // exposes the slug as a plain optional input on BOTH create and
+        // edit, so clearing it on edit must re-derive too, or the record's
+        // NOT NULL column ends up literally "" and its own `/{slug}` route
+        // becomes unreachable (issue #1260 review finding).
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // Both the `create` AND `update` handlers get a derive block — assert
+        // it appears twice, not just once (i.e. not only on create).
+        assert_eq!(
+            routes.matches("if new.slug.is_empty() {").count(),
+            2,
+            "expected a derive block in both create and update: {routes}"
+        );
+        // The update path's collision probe excludes the record's own
+        // current row (identified by the path extractor's old value),
+        // otherwise a no-op re-derivation of an unchanged title would
+        // spuriously collide with itself.
+        assert!(
+            routes.contains(
+                "posts::table\n                .filter(posts::slug.eq(&candidate))\n                \
+                 .filter(posts::slug.ne(&__route_key))"
+            ),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_update_redirects_to_the_persisted_slug_not_the_stale_path_value() {
+        // If the user changes (or blanks and re-derives) the slug on edit,
+        // the success redirect must resolve the JUST-PERSISTED value —
+        // redirecting to the old path-extractor value 404s (issue #1260
+        // review finding).
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "flash.success(\"Post updated\").await;\n    \
+                 Ok(autumn_web::Redirect::to(&paths::show(&new.slug)).into_response())"
+            ),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_named_like_an_extractor_param_does_not_collide() {
+        // Review finding: a slug field literally named `db` (a valid
+        // `snake_case` declaration, `db:slug{from:title}`) previously
+        // destructured straight to `Path(db): Path<String>`, colliding with
+        // the SAME handler's own `mut db: Db` extractor parameter — a
+        // duplicate-binding compile error. `flash`/`body`/`csrf`/`session`
+        // are the same class of bug. The extractor must bind to a fixed
+        // internal name regardless of the field's actual name.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "db:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // The extractor's local binding is the fixed internal name, not `db`.
+        assert!(
+            routes.contains("Path(__route_key): Path<String>"),
+            "{routes}"
+        );
+        assert!(!routes.contains("Path(db): Path<String>"), "{routes}");
+        // The URL placeholder and schema column still use the real field name.
+        assert!(routes.contains(r#"#[get("/posts/{db}")]"#), "{routes}");
+        assert!(
+            routes.contains("posts::table\n        .filter(posts::db.eq(&__route_key))"),
+            "{routes}"
+        );
+        // No handler signature now declares `db` twice (once as the route-key
+        // extractor, once as `mut db: Db`) — every `show`/`edit`/`update`/
+        // `destroy` still gets exactly one `db: Db`/`mut db: Db` parameter.
+        // Scan the parameter list between `fn <handler>(` and the matching
+        // `{` that opens the function body.
+        for handler in ["fn show(", "fn edit_form(", "fn update(", "fn destroy("] {
+            let start = routes.find(handler).unwrap_or_else(|| {
+                panic!("missing handler {handler} in generated routes: {routes}")
+            });
+            let body_start = routes[start..]
+                .find(" -> AutumnResult")
+                .unwrap_or_else(|| routes[start..].find('{').unwrap());
+            let sig = &routes[start..start + body_start];
+            assert_eq!(
+                sig.matches("db: ").count(),
+                1,
+                "handler signature declares `db` more than once: {sig}"
+            );
+        }
+    }
+
+    #[test]
+    fn scaffold_slug_field_collision_loop_never_settles_on_the_reserved_new_segment() {
+        // `GET /{plural}/new` is a static route; axum's router always prefers
+        // it over the `GET /{plural}/{slug}` capture, so a record whose slug
+        // were literally "new" would be permanently unreachable at its own
+        // show page. The derive loop must keep probing past it.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("if count == 0 && candidate != \"new\" {"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_collision_loop_also_reserves_search_when_searchable() {
+        // `--searchable` emits a second static sibling route, `GET
+        // /{plural}/search`, which the router would likewise prefer over
+        // `GET /{plural}/{slug}` for a record whose derived slug were
+        // literally "search".
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("if count == 0 && candidate != \"new\" && candidate != \"search\" {"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_form_input_is_not_required() {
+        // AC4's auto-derive-on-blank only ever runs if a blank submission can
+        // reach the server: a plain HTML5 `required` attribute on the slug
+        // input would have the browser block submission first. The DB column
+        // stays `NOT NULL` (AC3); only the form control must render as
+        // optional (the issue's own words: "the generated form may expose it
+        // as a plain optional text input").
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(".exclude(\"slug\")"),
+            "the slug field must be excluded from the derived (required-by-default) \
+             control so it can be re-appended as optional: {routes}"
+        );
+        assert!(
+            routes.contains("autumn_web::a11y::TextField::new(\"slug\")"),
+            "{routes}"
+        );
+        // The appended slug control must never carry `.required()` — grab the
+        // slice from its `TextField::new` call up to the next field's block
+        // (or the appends' end) and check `.required()` doesn't appear in it.
+        let start = routes
+            .find("autumn_web::a11y::TextField::new(\"slug\")")
+            .expect("slug TextField control");
+        let end = routes[start..]
+            .find("}})")
+            .map_or(routes.len(), |i| start + i);
+        let slug_control = &routes[start..end];
+        assert!(
+            !slug_control.contains(".required()"),
+            "slug control must not be required: {slug_control}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_index_and_show_links_use_slug_not_id() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("paths::show(&row.slug)"), "{routes}");
+        assert!(routes.contains("paths::edit(&row.slug)"), "{routes}");
+        assert!(!routes.contains("paths::show(row.id)"), "{routes}");
+        assert!(!routes.contains("paths::edit(row.id)"), "{routes}");
+    }
+
+    #[test]
+    fn scaffold_slug_requires_from_modifier() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("from"), "{err}");
+    }
+
+    #[test]
+    fn scaffold_slug_from_unknown_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["slug:slug{from:headline}".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("headline"), "{err}");
+    }
+
+    #[test]
+    fn scaffold_slug_with_live_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live: true,
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--live"),
+            "expected a `--live` rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_with_sharded_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    sharded: true,
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--sharded"),
+            "expected a `--sharded` rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_with_attachment_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "slug:slug{from:title}".into(),
+                "cover:Attachment".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Attachment"), "{err}");
+    }
+
+    #[test]
+    fn scaffold_slug_with_state_machine_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "slug:slug{from:title}".into(),
+                "status:String:states(draft -> published)".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("states"), "{err}");
+    }
+
+    #[test]
+    fn scaffold_slug_from_defaulted_field_is_rejected() {
+        // A `--default` column is dropped from the generated `New{Pascal}`
+        // insert struct entirely (issue #1260 review finding), so the create
+        // handler's `new.{from}` read would not compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["title=Untitled".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title") && msg.contains("default"),
+            "unexpected error: {msg}"
         );
     }
 

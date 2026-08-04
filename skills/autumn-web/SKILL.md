@@ -176,7 +176,7 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `markdown` | Markdown rendering with frontmatter and static-site support, plus the safe user-submitted rich-text path (`render_user_content`, `rich_text_area`) — see [rich text](../../docs/guide/rich-text.md) |
 | `telemetry-otlp` | OpenTelemetry OTLP export |
 | `test-support` | Testcontainers-backed `TestApp`, `TestClient`, and `TestDb` |
-| `i18n` | Locale extractor and compile-time checked translations |
+| `i18n` | Locale extractor, compile-time checked translations, and opt-in locale-prefixed routing |
 | `storage` | `BlobStore`, local storage, `Blob` columns, signed URLs |
 | `mail` | Transactional email, mailer macros, previews, deferred delivery |
 | `seed` | `SeedContext` for seed binaries |
@@ -316,6 +316,22 @@ accepts the same argument, so pre-rendered pages carry the tags. The extractor
 never fails — on a route without `seo(...)` it yields an empty builder. Note the
 attribute supplies *values*, not markup: the handler still emits them, normally
 via `seo.render()` inside the layout's `<head>`.
+
+**Locale-prefixed routing (issue #1251, unreleased — trunk-dev):** set
+`[i18n] locale_prefix_enabled = true` in `autumn.toml` (default `false`) and
+every route registered via `routes![...]` becomes reachable under
+`/{locale}/...` for each `supported_locales` entry — zero duplicated route
+definitions. An unknown `{locale}` 404s; a bare, non-prefixed path
+308-redirects to the negotiated locale's prefixed path, preserving the query
+string; the URL segment outranks cookie/session/`Accept-Language` for the
+existing `Locale` extractor (no handler changes). `[i18n]
+locale_prefix_exclude = ["/api", "/actuator"]` keeps machine routes
+unprefixed. Use `locale_switcher(path, locale.tag(), supported_locales)` (and
+the lower-level `localized_path(path, locale)`) from
+`autumn_web::widgets` to render a path-preserving language switcher, and
+`SeoMeta::hreflang_alternates(locale_alternates(base_url, path,
+default_locale, supported_locales))` to emit `hreflang` `<link>` tags for the
+current page's localized variants.
 
 **Duplicate-route preflight (issue #1012, unreleased — trunk-dev):** two
 handlers that resolve to the same `(method, path)` after `.scoped(...)` prefix

@@ -329,6 +329,17 @@ pub async fn extract_tenant_from_parts(
 /// framework (CSRF, CAPTCHA): `/login` matches `/login` and `/login/sso` but not
 /// `/login-admin`.
 fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
+    // When locale-prefix routing (issue #1251) is on, a public route like
+    // `/login` is actually reachable at `/en/login`, but every exemption
+    // below (`public_paths`, `login_redirect`, health probes, actuator) is
+    // configured as an unprefixed path. Strip a leading `/{locale}` segment
+    // first so tenancy sees the same logical path regardless of which locale
+    // prefix carried the request — otherwise the locale-prefixed request for
+    // an exempt page is never exempt, and its tenant-resolution failure
+    // redirects back to a bare `login_redirect` that immediately
+    // locale-redirects right back into the same failure (Codex review).
+    let path = strip_locale_prefix_for_tenancy(path, config);
+
     // Guard against empty prefixes: `path_matches_route_prefix(path, "")` is true
     // for every absolute path, so an empty entry — whether a stray `public_paths`
     // item or a misconfigured built-in like `health.path = ""` — would otherwise
@@ -397,6 +408,73 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
         || path == config.health.startup_path;
 
     user_paths_match || redirect_match || probe_match || actuator_match
+}
+
+/// Strips a leading `/{locale}` segment from `path` when locale-prefix
+/// routing (issue #1251) is enabled and that segment names a configured
+/// supported locale, so [`is_public_path`] evaluates the same logical path
+/// regardless of which locale prefix carried the request. Returns `path`
+/// unchanged otherwise (feature off, routing disabled, no matching locale
+/// segment, or `path` itself matches a configured locale-prefix exclusion).
+///
+/// That last case matters: a route excluded from locale-prefix routing
+/// (`[i18n] locale_prefix_exclude`/an auto-excluded `#[static_get]` route)
+/// was never actually nested under `/{locale}` — its first segment merely
+/// *resembles* a locale. E.g. locale `en`, exclusion `/en`, public path
+/// `/login`: `/en/login` is a real, still-tenant-scoped route (excluded from
+/// locale-prefixing), not the locale-prefixed `/login` — stripping it would
+/// wrongly exempt it from tenant resolution (Codex review).
+///
+/// **Known limitation** (Codex review): this heuristic can't see the actual
+/// route table — only `AutumnConfig` — so a raw/opaque route registered via
+/// `AppBuilder::scoped()`/`merge()`/`nest()` at a literal path that happens
+/// to start with a supported locale segment (e.g. a scoped `/en/login`, not
+/// tracked in either exclusion list because it was never part of the
+/// locale-prefix-eligible `routes![...]` table to begin with) is
+/// indistinguishable here from a genuinely locale-prefixed `/login`. Closing
+/// this gap for real would require tenancy to run *after* axum has already
+/// resolved routing (so it could see the nest-specific `UriPrefixedLocale`
+/// extension) rather than as an outer layer ahead of dispatch — a larger
+/// layering change out of scope for issue #1251. An app with this exact
+/// combination (tenancy + locale-prefix routing + an opaque route whose
+/// literal path shadows a locale segment) should rename the route or list
+/// it in `tenancy.public_paths`/handle tenancy explicitly for that path.
+#[cfg(feature = "i18n")]
+fn strip_locale_prefix_for_tenancy<'a>(
+    path: &'a str,
+    config: &crate::config::AutumnConfig,
+) -> &'a str {
+    if !config.i18n.locale_prefix_enabled {
+        return path;
+    }
+    if config
+        .i18n
+        .locale_prefix_exclude_exact
+        .iter()
+        .any(|p| p == path)
+        || crate::router::matches_locale_exclude_prefix(path, &config.i18n.locale_prefix_exclude)
+    {
+        return path;
+    }
+    let Some(rest) = path.strip_prefix('/') else {
+        return path;
+    };
+    let (segment, remainder) = rest
+        .find('/')
+        .map_or((rest, ""), |idx| (&rest[..idx], &rest[idx..]));
+    if config.i18n.supported_locales.iter().any(|l| l == segment) {
+        if remainder.is_empty() { "/" } else { remainder }
+    } else {
+        path
+    }
+}
+
+#[cfg(not(feature = "i18n"))]
+const fn strip_locale_prefix_for_tenancy<'a>(
+    path: &'a str,
+    _config: &crate::config::AutumnConfig,
+) -> &'a str {
+    path
 }
 
 // Tenancy middleware for Axum requests
@@ -744,6 +822,76 @@ mod tests {
         let c = public_paths_config(&["/login"]);
         assert!(!is_public_path("/login-admin", &c));
         assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// Codex review (P1): once locale-prefix routing (issue #1251) is on, a
+    /// public route like `/login` is actually reachable at `/en/login` — the
+    /// exemption must follow the locale prefix, or the locale-prefixed
+    /// request is never exempt and its failed tenant resolution redirects
+    /// back into a bare `login_redirect` that immediately locale-redirects
+    /// right back into the same failure (an infinite loop).
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn public_path_exemption_follows_the_locale_prefix() {
+        let mut c = public_paths_config(&["/login"]);
+        c.i18n.locale_prefix_enabled = true;
+        c.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+
+        assert!(is_public_path("/login", &c), "bare path must stay exempt");
+        assert!(is_public_path("/en/login", &c));
+        assert!(is_public_path("/es/login/sso", &c));
+        assert!(
+            !is_public_path("/en/dashboard", &c),
+            "the locale prefix must not exempt an otherwise non-public route"
+        );
+        assert!(
+            !is_public_path("/fr/login", &c),
+            "an unsupported locale segment must not be stripped"
+        );
+    }
+
+    /// Codex review (P1): a path that itself matches a configured
+    /// locale-prefix exclusion was never actually nested under `/{locale}` —
+    /// its first segment merely resembles a locale — so it must NOT be
+    /// stripped. Locale `en`, exclusion `/en`, public path `/login`: `/en/login`
+    /// is a real, still-tenant-scoped route (excluded from locale-prefixing),
+    /// not the locale-prefixed `/login`.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn locale_lookalike_prefix_is_not_stripped_when_it_matches_an_exclusion() {
+        let mut c = public_paths_config(&["/login"]);
+        c.i18n.locale_prefix_enabled = true;
+        c.i18n.supported_locales = vec!["en".to_owned()];
+        c.i18n.locale_prefix_exclude = vec!["/en".to_owned()];
+
+        assert!(
+            !is_public_path("/en/login", &c),
+            "/en/login matches the /en exclusion, so it must stay tenant-scoped, \
+             not be treated as the locale-prefixed /login"
+        );
+    }
+
+    /// The `login_redirect` auto-exemption (preventing an infinite redirect
+    /// loop) must also follow the locale prefix.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn login_redirect_exemption_follows_the_locale_prefix() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.login_redirect = Some("/login".to_owned());
+        c.i18n.locale_prefix_enabled = true;
+        c.i18n.supported_locales = vec!["en".to_owned()];
+
+        assert!(is_public_path("/en/login", &c));
+    }
+
+    /// Locale-prefix routing off (the default) must not strip anything —
+    /// `/en/login` stays tenant-scoped unless `/en/login` itself is listed.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn locale_prefix_stripping_is_a_noop_when_routing_disabled() {
+        let c = public_paths_config(&["/login"]);
+        assert!(!c.i18n.locale_prefix_enabled);
+        assert!(!is_public_path("/en/login", &c));
     }
 
     /// Health/liveness/readiness/startup probes are public without being listed.

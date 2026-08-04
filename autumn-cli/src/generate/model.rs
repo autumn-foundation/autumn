@@ -1924,7 +1924,10 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
         | FieldKind::DateTime
         | FieldKind::Bytea
         | FieldKind::Attachment
-        | FieldKind::References => Err(format!(
+        | FieldKind::References
+        // A slug's value is always auto-derived from its `from` field on
+        // create (issue #1260), never a static default.
+        | FieldKind::Slug => Err(format!(
             "defaults for {} fields are not supported by `autumn generate` yet",
             field.rust_type()
         )),

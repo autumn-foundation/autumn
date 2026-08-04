@@ -35,6 +35,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/guide/simulation-testing.md` walks through `#[sim_test]`, virtual
   time, deterministic entropy, chaos, `always!`/`sometimes!`, the seed-sweep
   runner, and this worked example end-to-end.
+- **i18n:** locale-prefixed routing and a path-preserving locale switcher
+  (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
+  behavior change for existing apps) makes every route registered via
+  `AppBuilder::routes` also reachable under `/{locale}/...` for each
+  configured `supported_locales`, with zero hand-duplicated route
+  definitions: the router builds the content router once and nests a cheap
+  clone under each locale prefix. An unknown `{locale}` segment (e.g.
+  `/zz/posts`) 404s rather than panicking, and a request to the bare,
+  non-prefixed path 308-redirects to the negotiated locale's prefixed path,
+  preserving the query string. Within a locale-prefixed request, the URL
+  segment now takes precedence over cookie/session/`Accept-Language` for the
+  existing `Locale` extractor — with no handler changes required. New
+  `[i18n] locale_prefix_exclude` config exempts route prefixes (e.g. `/api`,
+  `/actuator`) from both localization and the bare-path redirect, so machine
+  endpoints stay unprefixed. Two new view helpers,
+  `autumn_web::widgets::{localized_path, locale_switcher}`, render
+  path-and-query-preserving links to the current page in every supported
+  locale. The SEO toolkit gained `SeoMeta::hreflang_alternates` plus a
+  `seo::locale_alternates` helper that builds `<link rel="alternate"
+  hreflang="…">` tags (including `x-default`) for a page's localized
+  variants, and `sitemap.xml` now lists one entry per supported locale for
+  each eligible static route when locale-prefix routing is enabled. The
+  `examples/blog` i18n demo (`/greet`, plus the site-wide nav) was extended to
+  exercise all of the above end-to-end.
+- **slug:** a public `autumn_web::slugify(&str) -> String` helper (#1260) —
+  lowercases, best-effort ASCII-folds accented Latin characters
+  (`"café"` -> `"cafe"`), treats everything else as a separator, collapses
+  runs to a single `-`, and falls back to a stable non-empty token for input
+  that slugifies to nothing. `autumn generate scaffold`/`model` gain a
+  `slug:slug{from:col}` DSL token that composes with the existing `unique`
+  (#1032) and `references` (#1026) machinery rather than a parallel system: a
+  `NOT NULL` column with its own `UNIQUE INDEX`, a free `find_by_slug`
+  repository lookup, create-time auto-derivation from the named `from` field
+  with a deterministic `-2`/`-3` collision suffix on a blank submission, and
+  slug-keyed `show`/`edit`/`update`/`delete` HTML routes and generated links
+  (`GET /posts/{slug}` instead of `GET /posts/{id}`) with a 404 on miss. A
+  model supports at most one `slug` field; the combination with
+  `--live`/`--live-validation`/`--sharded`/an `Attachment` field/a
+  `:states(...)` field is rejected at generate time rather than silently
+  emitting `id`-keyed routes. A non-slug scaffold's generated output is
+  unaffected. `examples/blog`, `examples/wiki`, and `examples/reddit-clone`
+  now use the shared helper instead of their own hand-rolled duplicates.
 
 - **consent:** `autumn new` now scaffolds a cookie-consent banner and a real
   consent gate, so a fresh app is cookie-compliant by default (#1214). The new

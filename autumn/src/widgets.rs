@@ -18,6 +18,7 @@
 //! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
 //! | `tabs` | No-JS `tablist`/`tab`/`tabpanel` switcher with `:target` deep-linking |
 //! | `infinite_feed` | htmx infinite-scroll / "Load more" feed from a `CursorPage` |
+//! | `locale_switcher` | Path-preserving language switcher for locale-prefixed routing (issue #1251) |
 //!
 //! # Feedback widgets
 //!
@@ -1312,6 +1313,81 @@ fn nav_link_is_active(current_path: &str, href: &str, mode: NavLinkMatch) -> boo
                 href
             };
             !href.is_empty() && crate::router::path_matches_route_prefix(current_path, href)
+        }
+    }
+}
+
+// ── locale switcher (issue #1251) ─────────────────────────────────────────────
+
+/// Rewrite a path — optionally with a query string — to point at a
+/// different locale's prefixed URL (issue #1251).
+///
+/// `path` is the current page's locale-stripped path, exactly as returned by
+/// axum's `Uri` extractor inside a `/{locale}/...` nest (nesting strips the
+/// matched locale segment before extraction reaches the handler) — e.g.
+/// `"/posts"` or `"/posts?sort=asc"`. Any query string is preserved
+/// verbatim; only the locale segment changes.
+///
+/// The root path is a special case: axum's `nest("/{locale}", router)` makes
+/// the *bare* `/{locale}` (no trailing slash) match the inner router's own
+/// `"/"` route — `/{locale}/` 404s — so `localized_path("/", "es")` returns
+/// `"/es"`, not `"/es/"`.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::localized_path;
+///
+/// assert_eq!(localized_path("/posts", "es"), "/es/posts");
+/// assert_eq!(localized_path("/posts?sort=asc", "es"), "/es/posts?sort=asc");
+/// assert_eq!(localized_path("/", "es"), "/es");
+/// assert_eq!(localized_path("/?ref=newsletter", "es"), "/es?ref=newsletter");
+/// ```
+#[must_use]
+pub fn localized_path(path: &str, locale: &str) -> String {
+    let (before_query, query) = path.find('?').map_or((path, ""), |i| path.split_at(i));
+    let joined = if before_query == "/" || before_query.is_empty() {
+        format!("/{locale}")
+    } else {
+        let rest = before_query.strip_prefix('/').unwrap_or(before_query);
+        format!("/{locale}/{rest}")
+    };
+    format!("{joined}{query}")
+}
+
+/// Render links to the current page in each supported locale (issue #1251),
+/// preserving the current path and query — only the locale segment changes.
+///
+/// `path` is the current page's locale-stripped path (see [`localized_path`]).
+/// `current_locale`'s entry renders as inert text with `aria-current="true"`
+/// rather than a self-link.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::locale_switcher;
+///
+/// let html =
+///     locale_switcher("/posts", "en", &["en".to_owned(), "es".to_owned()]).into_string();
+/// assert!(html.contains(r#"href="/es/posts""#));
+/// assert!(!html.contains(r#"href="/en/posts""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn locale_switcher(
+    path: &str,
+    current_locale: &str,
+    supported_locales: &[String],
+) -> maud::Markup {
+    maud::html! {
+        nav class="autumn-locale-switcher" aria-label="Language" {
+            @for locale in supported_locales {
+                @if locale == current_locale {
+                    span class="autumn-locale-switcher__current" aria-current="true" { (locale) }
+                } @else {
+                    a href=(localized_path(path, locale)) { (locale) }
+                }
+            }
         }
     }
 }
@@ -5620,6 +5696,56 @@ mod tests {
         let html = nav_link("/somewhere/else", "/admin/posts", "Posts").into_string();
         assert!(html.contains(r#"href="/admin/posts""#), "{html}");
         assert!(html.contains(">Posts<"), "{html}");
+    }
+
+    // ── locale switcher (issue #1251) ─────────────────────────────────────
+
+    #[test]
+    fn localized_path_prepends_locale_segment() {
+        assert_eq!(localized_path("/posts", "es"), "/es/posts");
+    }
+
+    #[test]
+    fn localized_path_preserves_query_string() {
+        assert_eq!(
+            localized_path("/posts?sort=asc&page=2", "es"),
+            "/es/posts?sort=asc&page=2"
+        );
+    }
+
+    #[test]
+    fn localized_path_handles_root() {
+        // No trailing slash: axum's `nest("/es", router)` makes bare "/es"
+        // match the inner router's "/" route, while "/es/" 404s.
+        assert_eq!(localized_path("/", "es"), "/es");
+    }
+
+    #[test]
+    fn localized_path_handles_root_with_query() {
+        assert_eq!(
+            localized_path("/?ref=newsletter", "es"),
+            "/es?ref=newsletter"
+        );
+    }
+
+    #[test]
+    fn locale_switcher_links_every_locale_except_current() {
+        let supported = vec!["en".to_owned(), "es".to_owned(), "fr".to_owned()];
+        let html = locale_switcher("/posts", "es", &supported).into_string();
+        assert!(html.contains(r#"href="/en/posts""#), "{html}");
+        assert!(html.contains(r#"href="/fr/posts""#), "{html}");
+        assert!(
+            !html.contains(r#"href="/es/posts""#),
+            "current locale must not self-link: {html}"
+        );
+        assert!(html.contains(r#"aria-current="true""#), "{html}");
+    }
+
+    #[test]
+    fn locale_switcher_preserves_query_string_in_every_link() {
+        let supported = vec!["en".to_owned(), "es".to_owned()];
+        let html = locale_switcher("/posts?sort=asc", "en", &supported).into_string();
+        assert!(html.contains(r#"href="/es/posts?sort=asc""#), "{html}");
     }
 
     // ── nav_bar ──────────────────────────────────────────────────────────
