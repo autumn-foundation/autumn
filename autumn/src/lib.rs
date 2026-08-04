@@ -409,6 +409,10 @@ pub mod reporting;
 pub mod scheduler;
 pub mod security;
 pub mod session;
+/// URL-safe slug generation (`slugify`), shared by the scaffold generator's
+/// `slug:slug{from:...}` DSL token and any hand-written app.
+pub mod slug;
+pub use slug::slugify;
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 pub mod sse;

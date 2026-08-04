@@ -202,6 +202,28 @@ jobs:
             integration::console::console_run_surfaces_a_compile_error_in_the_playground \
             -- --ignored --exact
 
+      # ── zero-JS attachment uploads (#1236) ──────────────────────────────
+      #
+      # The machine proof that a scaffolded `Attachment` column actually
+      # works: the first compiles a fresh attachment scaffold with only the
+      # auto-enabled `storage` + `multipart` features (AC7), the second
+      # COMPILES AND RUNS that project's generated test binary, so the
+      # emitted multipart create / 413 / NULL-column tests (AC4, AC6) are
+      # proven to pass rather than only string-matched. Same `cli_tests`
+      # caveat as the console block above — named explicitly or they never
+      # execute anywhere.
+      - name: generated_attachment_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_form_for::generated_attachment_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: generated_attachment_scaffold_multipart_test_passes
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_form_for::generated_attachment_scaffold_multipart_test_passes \
+            -- --ignored --exact
+
   # ── Generated-app variant conformance matrix ────────────────────────────────
   #
   # One matrixed job that scaffolds a fresh project in a specific "variant"

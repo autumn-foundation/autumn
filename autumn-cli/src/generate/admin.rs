@@ -377,9 +377,11 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         // reintroduce the exact binary-float rounding this field type exists
         // to avoid. Routing it through `Text` leaves the raw decimal string
         // untouched for `rust_decimal`'s exact `FromStr`/`Deserialize`.
-        FieldKind::String | FieldKind::Uuid | FieldKind::Enum | FieldKind::Decimal { .. } => {
-            "AdminFieldKind::Text"
-        }
+        FieldKind::String
+        | FieldKind::Uuid
+        | FieldKind::Enum
+        | FieldKind::Decimal { .. }
+        | FieldKind::Slug => "AdminFieldKind::Text",
         // `RichText` (issue #1255) edits as a plain multi-line textarea in the
         // admin panel: the column holds Markdown source, and the admin's
         // record editor is a raw-value editor, not the app-facing form that

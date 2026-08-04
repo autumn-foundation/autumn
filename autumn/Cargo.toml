@@ -203,6 +203,10 @@ acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
 autumn-macros = { version = "0.6.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
+# Best-effort ASCII folding for `slug::slugify` (issue #1260, e.g. "café" ->
+# "cafe"). Already resolved transitively (via `stringprep`, the Postgres
+# SCRAM-auth crate), so this adds no new entry to the dependency graph.
+unicode-normalization = "0.1"
 http-body = "1"
 http-body-util = "0.1"
 # Both already resolved transitively via tower-http's compression-gzip/
@@ -386,6 +390,18 @@ harness = false
 [[bench]]
 name = "inspector"
 harness = false
+
+# W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
+# `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
+# guard, since a `[[bin]]` target — unlike a `[[test]]` — is simply skipped by
+# Cargo when its required feature is off, rather than needing to compile to an
+# empty stub) keeps it out of default builds: `cargo build`/`cargo run`
+# without `--features sim-testing` doesn't see this binary at all. Run:
+# `AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release --features sim-testing --bin sim-sweep`.
+[[bin]]
+name = "sim-sweep"
+path = "src/bin/sim_sweep.rs"
+required-features = ["sim-testing"]
 
 [[test]]
 name = "integration_tests"
@@ -731,6 +747,21 @@ path = "tests/sim_assert.rs"
 [[test]]
 name = "sim_op_driver"
 path = "tests/sim_op_driver.rs"
+
+# W6 PR3 seed-sweep DoD (issue #1797): `sim::sweep::sweep_proptest` against the
+# same small, self-contained, deliberately buggy account model `sim_op_driver`
+# uses — proves the sweep finds and shrinks an injected invariant break across
+# a batch of seeds, that the failing seed reported is deterministic across
+# repeated sweeps, and that the cross-seed `sometimes!` non-vacuity aggregate
+# (`SweepOutcome::Vacuous`) fires when a reachability label is observed but
+# never satisfied anywhere in the swept range. Isolated `[[test]]` binary for
+# the same reason as `sim_op_driver`: needs the `sim-testing` feature, so the
+# file is `#![cfg(feature = "sim-testing")]` and a default `cargo test`
+# compiles it to an empty (passing) binary. Runs without Docker. Run:
+# `cargo test -p autumn-web --features sim-testing --test sim_sweep_driver`.
+[[test]]
+name = "sim_sweep_driver"
+path = "tests/sim_sweep_driver.rs"
 
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the

@@ -3123,6 +3123,49 @@ fn generated_unique_scaffold_cargo_checks() {
     );
 }
 
+/// Slow end-to-end check (issue #1260): scaffold a `slug` field and `cargo
+/// check` the result. The rekeyed `show`/`edit`/`update`/`delete` handlers
+/// (`Path<String>` instead of `Path<i64>`, `.filter(...)` instead of
+/// `.find(*id)`, the create-time collision-suffix loop) are hand-templated
+/// string codegen with no compiler feedback at generation time — this is the
+/// one test that actually compiles that generated code, catching any
+/// template/escaping/borrow mistake a string-content assertion alone would
+/// miss.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+// `"slug:slug{from:title}"` is a literal DSL token passed to the CLI, not a
+// format string — the `{…}` is the scaffold's own constraint-modifier syntax.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn generated_slug_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("slug-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            r"slug:slug{from:title}",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated slug scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// `--live` (SSE-backed repository writes) routes the insert/update through
 /// `repo.save`/`repo.update` instead of a bare `diesel::insert_into` — a
 /// different error-propagation path into `unique_violation_field` (see its

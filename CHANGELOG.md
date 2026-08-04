@@ -33,6 +33,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each eligible static route when locale-prefix routing is enabled. The
   `examples/blog` i18n demo (`/greet`, plus the site-wide nav) was extended to
   exercise all of the above end-to-end.
+- **slug:** a public `autumn_web::slugify(&str) -> String` helper (#1260) —
+  lowercases, best-effort ASCII-folds accented Latin characters
+  (`"café"` -> `"cafe"`), treats everything else as a separator, collapses
+  runs to a single `-`, and falls back to a stable non-empty token for input
+  that slugifies to nothing. `autumn generate scaffold`/`model` gain a
+  `slug:slug{from:col}` DSL token that composes with the existing `unique`
+  (#1032) and `references` (#1026) machinery rather than a parallel system: a
+  `NOT NULL` column with its own `UNIQUE INDEX`, a free `find_by_slug`
+  repository lookup, create-time auto-derivation from the named `from` field
+  with a deterministic `-2`/`-3` collision suffix on a blank submission, and
+  slug-keyed `show`/`edit`/`update`/`delete` HTML routes and generated links
+  (`GET /posts/{slug}` instead of `GET /posts/{id}`) with a 404 on miss. A
+  model supports at most one `slug` field; the combination with
+  `--live`/`--live-validation`/`--sharded`/an `Attachment` field/a
+  `:states(...)` field is rejected at generate time rather than silently
+  emitting `id`-keyed routes. A non-slug scaffold's generated output is
+  unaffected. `examples/blog`, `examples/wiki`, and `examples/reddit-clone`
+  now use the shared helper instead of their own hand-rolled duplicates.
+
 - **consent:** `autumn new` now scaffolds a cookie-consent banner and a real
   consent gate, so a fresh app is cookie-compliant by default (#1214). The new
   `autumn_web::consent` module provides a `Consent` extractor
@@ -374,6 +393,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guides (#2099). Also corrects stale rustdoc that advertised a `/v3/api-docs`
   default (the served default is `/openapi.json`) and an "OpenAPI 3.0" document
   (the generator emits 3.1.0). [no-plugin]
+- **sim-testing:** add the **seed-sweep runner** (`sim::sweep`, W6 PR3,
+  #1797) and the CI-facing `sim-sweep` `[[bin]]`: `sweep_proptest(seeds,
+  &strategy, body)` runs `Sim::run_proptest` sequentially across a batch of
+  seeds, stopping at the first failing seed and reporting its shrunk
+  op-sequence. `SweepFailure`'s `Display` is caller-agnostic (it doesn't
+  prescribe a replay command, since `sweep_proptest` has no idea what test or
+  binary is calling it); the `sim-sweep` bin appends its own replay
+  suggestion when it prints a failure, since it knows its own invocation.
+  Folds every proptest case's `sometimes!` observations (not just the last of
+  up to 256 cases per seed — `Sim::run_proptest_with_case_hook` is a new
+  `pub(crate)` hook for this) into a cross-seed aggregate, so a fully-green
+  sweep is only reported as `Passed` when it is also non-vacuous (`Vacuous`
+  otherwise, if some label was observed but never satisfied anywhere in the
+  range). Deliberately sequential rather than parallel across a worker pool:
+  review of an earlier revision surfaced that `TestApp::build` (what a
+  `body` mounting a real app calls) unconditionally touches process-global
+  state (the cache, the event bus, and — when jobs are configured — a global
+  job client), which concurrent workers would race on, and that
+  `Sim::run_proptest`'s sync-only `body` signature can't `.await`
+  `Sim::run_to_idle` to drain spawned background work even with a runtime
+  entered — both architectural, not patchable within this sweep. Sequential
+  execution sidesteps both; sweep-level threading was orthogonal to the
+  harness's actual concurrency-bug-finding power anyway (that comes from
+  exploring seeds against W1's single-threaded deterministic executor, not
+  from how many OS threads process the outer seed range). An empty seed range
+  (`AUTUMN_SIM_SEEDS=0`, or any empty iterator passed to `sweep_proptest`)
+  reports the new `SweepOutcome::Empty` rather than silently falling through
+  to `Passed { seeds_run: 0 }` — the bin treats it as a failure (exit `1`) so
+  a misconfigured seed count can't quietly green the CI job without testing
+  anything. `embedded_config()` (the op-driver's internal proptest `Config`,
+  already forcing fork/timeout off regardless of ambient `PROPTEST_FORK`/
+  `PROPTEST_TIMEOUT`) now also pins the case count to a fixed 256, ignoring
+  `PROPTEST_CASES` entirely: `PROPTEST_CASES=0` would otherwise make a case
+  closure never run at all while still reporting success, and even a bare
+  "clamp to at least 1" would still collapse proptest's automatic shrink
+  budget (`cases × 4`) to 4 iterations, aborting shrinking early with a
+  far-from-minimal counterexample. `AUTUMN_SIM_SEEDS=1000 cargo run -p
+  autumn-web --release --features sim-testing --bin sim-sweep` sweeps seeds
+  `0..1000` against a built-in account demo scenario; a new standalone CI job
+  runs it at seed count 512 on every push/PR, structured like the `loom`
+  job. [no-plugin]
 - **sim-testing:** add a property-based **op-driver** (`sim::op`, W6 PR2,
   #1797) behind the new `sim-testing` feature: `Sim::gen_ops::<T>()` /
   `Sim::gen_ops_with(strategy)` deterministically draw an arbitrary `Vec<T>`
@@ -591,6 +651,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Changed
+
+- **generate:** finished the zero-JS file-upload slice (#1236) on the read-back
+  side. A scaffold with an `Attachment` column now *shows* what it stored: the
+  generated `show` and edit views resolve a signed, time-bounded URL through the
+  configured `BlobStore` (`attachment_url`) and render a download link
+  (`attachment_link`) instead of the literal word "attachment", degrading to the
+  stored file's name when no `[storage]` backend is configured. The edit form
+  additionally labels the currently stored file above the file input — a file
+  `<input>` can't be repopulated, so without it there was no way to tell an
+  empty column from one holding a blob you simply didn't replace — and it
+  renders identically on the 422 re-render, which is why `update` now loads the
+  current row *before* validating (that also runs the record policy before the
+  form is handed back, and the policy denial joins the #1872 blob-cleanup paths
+  so a forbidden update no longer orphans the just-uploaded file). The generated
+  write-path test grew the two AC4 cases — an upload over
+  `security.upload.max_file_size_bytes` is rejected with `413`, and a submit
+  with no file leaves the optional column `NULL` — and a new (`#[ignore]`d)
+  gate compiles *and runs* a freshly scaffolded project's test binary, so the
+  emitted tests are proven to pass rather than only string-matched. Finally, the
+  generated handler note dropped a false "~2 MiB CSRF size ceiling" warning that
+  pushed authors back onto the JavaScript presign path: `form_for` renders the
+  CSRF and submit-token hidden inputs as the form's *first* fields, so both land
+  inside `security.csrf.token_scan_bytes` however large the upload is. The note
+  now names the real limits (`max_file_size_bytes` → 413,
+  `max_request_size_bytes` → global body cap). The index list stays a cheap
+  presence marker (`widgets::Column`'s cell closure is synchronous and
+  `presigned_url` is async, so there is nowhere to await it).
+
+  Follow-ups from the review of that work, in the same slice: the `show` handler
+  now runs the record policy before it renders — the link it emits is a signed
+  bearer capability for the bytes, and the blob-serving route validates that
+  signature alone, so disclosing one from a handler that never consults
+  `can_show` would have made the generated policy's "tighten this if shows
+  should be gated" comment untrue (a no-op under the default policy, which
+  allows reads); the minted blob key now carries a sanitized extension derived
+  from the uploaded filename, so a download opens in the right application
+  instead of landing as an extensionless `1785…_5cf1a2be-…`; a failure to sign
+  logs a warning instead of silently degrading to a link-less name; and
+  generating an `Attachment` column now warns when `autumn.toml` has no
+  `[storage]` section, since `backend` defaults to `disabled` and the first
+  upload would otherwise answer `500 storage not configured`. The two
+  `#[ignore]`d gates that compile — and run — a freshly scaffolded project are
+  wired into `generator-conformance.yml`; the consolidated `cli_tests` binary's
+  only other CI `--ignored` sweep filters on `offsite`, so without that they
+  never executed anywhere. `autumn-field__current` / `autumn-attachment__meta`
+  are now real classes in `widgets.css` rather than invented ones, and
+  `docs/guide/storage.md` documents the scaffolded no-JS path and frames
+  presigned direct upload as the opt-in advanced alternative.
+
+  From the PR review: `attachment_url` refuses to issue a URL at all for content
+  a browser would execute as same-origin script. The local backend serves blobs
+  from the app's own origin, replaying the content type they were uploaded under
+  with no `Content-Disposition`, and the default CSP allows `script-src 'self'`
+  — so a stored `text/html` or `image/svg+xml` reached by direct *navigation*
+  would run with the visitor's cookies, and an anchor's `download` attribute
+  governs clicks on that anchor rather than navigation to the URL. The generated
+  `LINKABLE_CONTENT_TYPES` is fail-closed and covers the types a scaffold is
+  actually used for (images, PDF, plain text, media, archives, office
+  documents); anything else still renders on the page, just without a link. It
+  also compares `blob.provider_id` against the configured store before signing,
+  so a blob left over from a previous backend degrades to the no-link path
+  instead of linking to a nonexistent object — or to unrelated bytes that happen
+  to share its key.
+
+  Generator-only; no `autumn-web` API change.
 
 - **jobs:** routed the job runtime's recorded timestamps (enqueued_at/started_at/finished_at, due-at filtering, and the backoff-delay computation) through the injected `ClockSource` seam instead of reading `Utc::now()` directly, so recorded job timestamps are deterministic under the sim harness (production defaults to `SystemClock`, behavior unchanged). The in-memory/sim job path is now fully deterministic; the Postgres durable path still uses server-side SQL `NOW()` (#2111). [no-plugin]
 
