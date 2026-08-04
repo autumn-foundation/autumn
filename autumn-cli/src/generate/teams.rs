@@ -974,7 +974,7 @@ use diesel_async::RunQueryDsl;
 use crate::teams::models::{Membership, Organization};
 use crate::teams::repositories::{MembershipRepository, PgMembershipRepository};
 use crate::teams::role::{Role, establish_org_session};
-use crate::teams::schema::{memberships, organizations};
+use crate::teams::schema::{invitations, memberships, organizations};
 
 #[derive(diesel::Insertable)]
 #[diesel(table_name = organizations)]
@@ -1078,18 +1078,24 @@ pub async fn provision_default_organization_on_conn(
 /// exists, since it only re-checks the live `Membership` row, not the
 /// account itself).
 ///
-/// For every organization where `user_id` is currently the sole `Owner`,
+/// For every organization where `user_id` is currently the sole `Owner`
+/// (checked by first looking for another live `Owner` in that same
+/// organization — Codex review finding: an org that already has a second
+/// Owner must not have anyone else promoted into a redundant `Owner` role),
 /// promotes another existing member (preferring an `Admin`) to `Owner`
 /// first, before removing `user_id`'s own membership — bypassing this would
 /// silently defeat the same last-owner protection `remove_member`/
-/// `change_role` already enforce for interactive requests (Codex review
-/// finding): an organization stripped of its only Owner by account
-/// deletion would still have Admins/Members, but no one left able to ever
-/// grant a replacement Owner (`create_invitation`/`change_role` both
-/// require an existing Owner to grant the `Owner` role). If no other member
-/// exists in that organization, there is no one to promote — the
-/// organization is simply left with zero members, which is harmless (no
-/// `tenant_scoped` read/write can act on a membership-less tenant).
+/// `change_role` already enforce for interactive requests: an organization
+/// stripped of its only Owner by account deletion would still have Admins/
+/// Members, but no one left able to ever grant a replacement Owner
+/// (`create_invitation`/`change_role` both require an existing Owner to
+/// grant the `Owner` role).
+///
+/// If no other member exists in that organization at all, there is no one
+/// to promote — the organization is left with zero members, so its pending
+/// invitations are revoked too (Codex review finding): left live, one could
+/// later be accepted and repopulate a headless organization no one will
+/// ever be able to manage or promote a new Owner in.
 ///
 /// Runs across every organization in one transaction: not tenant-scoped, so
 /// raw queries against `db` rather than the generated `tenant_scoped`
@@ -1110,6 +1116,23 @@ pub async fn remove_all_memberships(user_id: i64, db: &mut Db) -> AutumnResult<(
                 .await?;
 
             for owner_membership in &owned {
+                // Only this organization's *sole* Owner needs a successor —
+                // if another live Owner remains, ownership doesn't need
+                // transferring, and promoting anyone else here would grant
+                // an unrequested second Owner (Codex review finding).
+                let other_owner: Option<Membership> = memberships::table
+                    .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
+                    .filter(memberships::user_id.ne(user_id))
+                    .filter(memberships::role.eq(Role::Owner.as_str()))
+                    .select(Membership::as_select())
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if other_owner.is_some() {
+                    continue;
+                }
+
                 let mut successor: Option<Membership> = memberships::table
                     .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
                     .filter(memberships::user_id.ne(user_id))
@@ -1136,6 +1159,21 @@ pub async fn remove_all_memberships(user_id: i64, db: &mut Db) -> AutumnResult<(
                         .set(memberships::role.eq(Role::Owner.as_str()))
                         .execute(conn)
                         .await?;
+                } else {
+                    // No other member exists at all: this organization is
+                    // about to be left with zero memberships, permanently —
+                    // revoke any pending invitations too, so a later accept
+                    // can't repopulate a headless organization no one will
+                    // ever be able to manage or promote a new Owner in
+                    // (Codex review finding).
+                    diesel::update(
+                        invitations::table
+                            .filter(invitations::tenant_id.eq(&owner_membership.tenant_id))
+                            .filter(invitations::status.eq("pending")),
+                    )
+                    .set(invitations::status.eq("revoked"))
+                    .execute(conn)
+                    .await?;
                 }
             }
 
@@ -2972,5 +3010,67 @@ async fn main() {
             .find("diesel::delete(memberships::table.filter(memberships::user_id.eq(user_id)))")
             .unwrap();
         assert!(promote_pos < delete_pos);
+    }
+
+    /// If the departing user shares an organization with another live
+    /// `Owner`, nobody should be promoted at all — the earlier fix's loop
+    /// picked a successor unconditionally, which would grant an unrequested
+    /// second `Owner` even when ownership didn't need transferring (Codex
+    /// review finding).
+    #[test]
+    fn remove_all_memberships_skips_promotion_when_another_owner_remains() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
+        let other_owner_pos = organizations
+            .find("let other_owner: Option<Membership> = memberships::table")
+            .unwrap_or_else(|| panic!("missing other-owner guard: {organizations}"));
+        assert!(
+            organizations.contains(
+                "if other_owner.is_some() {\n                    continue;\n                }"
+            ),
+            "{organizations}"
+        );
+        let admin_lookup_pos = organizations
+            .find(".filter(memberships::role.eq(Role::Admin.as_str()))")
+            .unwrap();
+        assert!(
+            other_owner_pos < admin_lookup_pos,
+            "the other-owner check must run before any successor is looked up"
+        );
+    }
+
+    /// When the departing user is the sole Owner AND the only member left,
+    /// the organization is about to have zero memberships permanently — its
+    /// pending invitations must be revoked too, or a later accept could
+    /// repopulate a headless organization no one can ever manage or promote
+    /// a new Owner in (Codex review finding).
+    #[test]
+    fn remove_all_memberships_revokes_pending_invitations_when_no_successor_exists() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
+        assert!(
+            organizations
+                .contains("use crate::teams::schema::{invitations, memberships, organizations};"),
+            "{organizations}"
+        );
+        assert!(
+            organizations
+                .contains(".filter(invitations::tenant_id.eq(&owner_membership.tenant_id))")
+                && organizations.contains(".filter(invitations::status.eq(\"pending\"))")
+                && organizations.contains(".set(invitations::status.eq(\"revoked\"))"),
+            "{organizations}"
+        );
     }
 }
