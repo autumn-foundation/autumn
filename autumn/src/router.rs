@@ -1876,7 +1876,12 @@ fn mount_user_routes(
     ))
 }
 
+// This variant never actually returns `Err` (only the `i18n`-enabled sibling
+// above can, on a locale-prefix path collision) — but it must keep the same
+// `Result` signature so the single call site doesn't need its own
+// `#[cfg(feature = "i18n")]` branch.
 #[cfg(not(feature = "i18n"))]
+#[allow(clippy::unnecessary_wraps)]
 fn mount_user_routes(
     route_list: Vec<Route>,
     _scoped_groups: &[ScopedGroup],
@@ -2297,7 +2302,7 @@ fn apply_locale_prefix_routing(
 /// this far outside any locale nest) so the redirect target matches exactly
 /// what the request would have resolved to anyway.
 ///
-/// **Known limitation** (Codex review): a mutating form POSTing directly to
+/// **Known limitation** (Codex review): a mutating form `POSTing` directly to
 /// its bare, unprefixed path with a `[SubmitTokenLayer](crate::security::SubmitTokenLayer)`-protected
 /// `_submit_token` hits this 308 *before* reaching the real handler.
 /// `SubmitTokenLayer` caches 3xx responses so a replayed submit returns the

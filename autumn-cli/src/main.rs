@@ -2213,6 +2213,40 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate team membership: organizations, roles (Owner/Admin/Member),
+    /// and email invitations (issue #1261).
+    ///
+    /// Composes already-stable primitives — `#[repository(tenant_scoped)]`
+    /// (issue #695), the session `"role"` key (issue #496), and the Mail
+    /// stack (`#[mailer]`) — rather than introducing a new authorization
+    /// mechanism. Takes no name: it always emits the same fixed
+    /// `Organization`/`Membership`/`Invitation` set.
+    ///
+    /// Creates:
+    ///   - `src/teams/`              — models, schema, repositories, role
+    ///     guard, invitation mailer, and route handlers
+    ///   - `migrations/<timestamp>_create_teams/` — organizations,
+    ///     memberships, invitations tables
+    ///   - `src/main.rs`             — `mod teams;` + routes wired into the
+    ///     app builder
+    ///   - `Cargo.toml`              — `"mail"` feature added to `autumn-web`
+    ///
+    /// Does NOT generate `routes/auth.rs` — your app's own login/signup
+    /// already exists. See `docs/generate-teams.md` for the two-line
+    /// integration seam, or `examples/teams` for a fully-wired reference app.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate teams
+    #[command(verbatim_doc_comment)]
+    Teams {
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Scaffold a real-time channel: a pub/sub handler over the built-in
     /// `Channels` API, an htmx SSE live view (default) or a raw `#[ws]`
     /// socket handler, `main.rs` route wiring, and an in-process smoke test.
@@ -3845,6 +3879,14 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let plan =
                 generate::policy::plan_policy(&resolve_cwd(), &name, mode == ApplyMode::Destroy);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Teams { dry_run, force } => {
+            let plan = generate::teams::plan_teams(
+                &resolve_cwd(),
+                &generate::timestamp_now(),
+                mode == ApplyMode::Destroy,
+            );
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Channel {

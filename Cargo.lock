@@ -7518,6 +7518,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
 
 [[package]]
+name = "teams"
+version = "0.1.0"
+dependencies = [
+ "autumn-web",
+ "chrono",
+ "diesel",
+ "diesel-async",
+ "diesel_migrations",
+ "example-e2e",
+ "maud",
+ "pq-sys",
+ "scoped-futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "validator",
+]
+
+[[package]]
 name = "temp-env"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

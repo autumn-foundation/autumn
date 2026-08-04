@@ -179,6 +179,21 @@ The committed tree here is the rendered form of the embedded starter; the
 
 ---
 
+### `examples/teams` — Organization Membership & Email Invitations
+
+<!-- catalog:example name=teams tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building a multi-user B2B SaaS who needs teammates, roles, and email invitations without hand-rolling the join table, token record, and accept route |
+| **Journey** | Team membership: sign up → get a personal organization as `Owner` → invite a teammate by email and role → they accept (signup-then-join or direct join) → a role-gated member-management screen |
+| **Key capabilities** | Row-level multi-tenancy with the active organization as tenant (`#[repository(tenant_scoped)]`, issue #695), a closed `Role` enum + hierarchy-aware `require_role` guard layered on the existing session/Policy role plumbing (issue #496), `#[mailer]` invitation email, idempotent invite-accept, last-`Owner` protection |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Run command** | `cargo run -p teams` |
+| **Success proof** | After signing up in the browser, `GET /members` returns `200 OK` showing the signer as `owner`; inviting a teammate and following the accept link in the dev mailbox creates exactly one `Membership` row even on a double-click |
+
+---
+
 ### `examples/media-room` — Live Mesh Rooms
 
 <!-- catalog:example name=media-room tier=supported -->

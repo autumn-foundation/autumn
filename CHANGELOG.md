@@ -649,6 +649,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deploy but silently ignored at runtime under `AUTUMN_ENV=prod`. The existing
   single-file `from_autumn_toml` / `from_toml_str_with_env` entry points are
   unchanged.
+- **teams:** a new `autumn generate teams` subcommand (#1261) scaffolds team
+  membership for an existing app — organizations (tenants), a closed
+  `Owner`/`Admin`/`Member` role per membership, and email invitations —
+  entirely by composing already-stable primitives rather than introducing a
+  new authorization mechanism: `#[repository(..., tenant_scoped)]` (#695)
+  filters/stamps every `Membership`/`Invitation` read and write by the
+  active organization, the session `"role"` key (#496, the same one
+  `#[secured("...")]`/`PolicyContext::has_role` already read) backs the new
+  `require_role` guard, and the Mail stack's `#[mailer]` sends the invite
+  email. Unlike every other generator here it takes no name — it always
+  emits the fixed `Organization`/`Membership`/`Invitation` set under
+  `src/teams/`, plus a `migrations/<timestamp>_create_teams/` migration and
+  the `mail` Cargo feature on `autumn-web`, wiring ten routes into
+  `src/main.rs`'s `routes![...]`. It deliberately does not generate its own
+  login/signup — your app's already exists — so the integration surface is
+  two lines of hand-written code: call the new
+  `teams::routes::organizations::provision_default_organization` at the end
+  of your signup handler, and `teams::role::establish_org_session` after
+  resolving the caller's active membership at login (see
+  `docs/generate-teams.md`). A new `examples/teams` reference app (owning
+  its own `users` table end to end, so it inlines both integration points
+  directly into `routes/auth.rs`) is the fully-wired ground truth this
+  generator adapts from.
 
 ### Changed
 
