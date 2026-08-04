@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `always!`; restoring the fix passes it again. New guide
   `docs/guide/simulation-testing.md` walks through `#[sim_test]`, virtual
   time, deterministic entropy, chaos, `always!`/`sometimes!`, the seed-sweep
-  runner, and this worked example end-to-end.
+  runner, and this worked example end-to-end. [no-plugin]
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via
