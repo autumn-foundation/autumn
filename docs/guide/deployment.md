@@ -40,11 +40,15 @@ a reverse proxy, migrates before cutover, health-gates on `/ready`, and flips
 traffic atomically. Re-running it is a zero-downtime redeploy; one command rolls
 back.
 
-This is the **primary** deployment path. Two alternatives remain documented
+This is the **primary** deployment path. A few alternatives remain documented
 below and are better fits in specific cases:
 
 - **[Deploy to fly.io](#deploy-to-flyio)** — a managed platform (machines,
   built-in metrics scraping, `fly deploy`).
+- **[Deploy to Azure Container Apps](#deploy-to-azure-container-apps)** —
+  Terraform-provisioned Container Apps, ACR, Postgres Flexible Server, and
+  Key Vault for Azure-heavy shops that already have the IAM/RBAC patterns in
+  place.
 - **The container path** ([Step 1](#step-1--create-the-project) through
   [How the production image works](#how-the-production-image-works)) — a
   portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
@@ -832,6 +836,66 @@ which would fail the first deploy of a database-free app.
 
 If you add a read replica, set `AUTUMN_DATABASE__REPLICA_URL` as a secret and
 Autumn gates `/ready` until the replica has replayed the latest migration.
+
+---
+
+## Deploy to Azure Container Apps
+
+Scaffold a Terraform configuration alongside the production Dockerfile:
+
+```bash
+autumn release init --force --target azure-container-apps
+```
+
+This generates:
+
+| File | Purpose |
+|---|---|
+| `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, Azure Database for PostgreSQL Flexible Server, and a Key Vault that feeds secrets into the app via a user-assigned managed identity. An optional Redis Cache is gated behind `enable_redis_cache`. |
+| `variables.tf` | `app_name`, `location`, `image_tag`, `db_sku`, `min_replicas`/`max_replicas` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `database_url`, `signing_secret`). |
+| `outputs.tf` | `app_fqdn` and `acr_login_server`. |
+| `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
+| `.github/workflows/azure-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to ACR, and runs `az containerapp update` on a `v*` tag push (or manual dispatch). |
+
+Why Container Apps and not App Service or AKS: it is the closest managed
+analog to Fly.io — scale-to-zero capable, managed ingress with automatic TLS,
+and no cluster to operate — while Azure-heavy shops already have the
+IAM/RBAC patterns in place.
+
+Provision the infrastructure and set secrets via Terraform variables (never
+as literals in `terraform.tfvars`):
+
+```bash
+cp terraform.tfvars.example terraform.tfvars   # edit the non-secret values
+export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
+export TF_VAR_signing_secret="$(openssl rand -hex 32)"
+# TF_VAR_database_url is derived from the server Terraform is about to create;
+# apply once to provision it, then set TF_VAR_database_url and re-apply so the
+# Key Vault secret (and the app's AUTUMN_DATABASE__PRIMARY_URL) point at it.
+
+terraform init
+terraform apply
+```
+
+Build and push the first image, then let the workflow take over for
+subsequent releases:
+
+```bash
+az acr login --name "$(terraform output -raw acr_login_server | cut -d. -f1)"
+docker build -t "$(terraform output -raw acr_login_server)/myapp:v1" .
+docker push "$(terraform output -raw acr_login_server)/myapp:v1"
+az containerapp update \
+  --name myapp \
+  --resource-group "$(terraform output -raw resource_group_name)" \
+  --image "$(terraform output -raw acr_login_server)/myapp:v1"
+```
+
+**Automated deploys on tag push:** `.github/workflows/azure-deploy.yml` only
+runs once you add the required repository secrets it documents in its header
+comment (`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`/`AZURE_TENANT_ID`/
+`AZURE_SUBSCRIPTION_ID`, `ACR_LOGIN_SERVER`, `AZURE_RESOURCE_GROUP`) — until
+then it stays dormant. Once configured, pushing a `v*` tag builds, pushes to
+ACR, and runs `az containerapp update` automatically.
 
 ---
 

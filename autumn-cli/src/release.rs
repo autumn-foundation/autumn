@@ -13,6 +13,12 @@ mod templates {
         include_str!("templates/release/autumn.production.toml.example.tmpl");
     pub const FLY_TOML: &str = include_str!("templates/release/fly.toml.tmpl");
     pub const DOCKER_COMPOSE: &str = include_str!("templates/release/docker-compose.yml.tmpl");
+    pub const AZURE_MAIN_TF: &str = include_str!("templates/release/main.tf.tmpl");
+    pub const AZURE_VARIABLES_TF: &str = include_str!("templates/release/variables.tf.tmpl");
+    pub const AZURE_OUTPUTS_TF: &str = include_str!("templates/release/outputs.tf.tmpl");
+    pub const AZURE_TFVARS_EXAMPLE: &str =
+        include_str!("templates/release/terraform.tfvars.example.tmpl");
+    pub const AZURE_DEPLOY_WORKFLOW: &str = include_str!("templates/release/azure-deploy.yml.tmpl");
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +38,7 @@ pub enum Target {
     Default,
     Fly,
     DockerCompose,
+    AzureContainerApps,
 }
 
 impl std::str::FromStr for Target {
@@ -40,8 +47,10 @@ impl std::str::FromStr for Target {
         match s {
             "fly" => Ok(Self::Fly),
             "docker-compose" => Ok(Self::DockerCompose),
+            "azure-container-apps" => Ok(Self::AzureContainerApps),
             other => Err(format!(
-                "unknown target '{other}'; expected 'fly' or 'docker-compose'"
+                "unknown target '{other}'; expected 'fly', 'docker-compose', or \
+                 'azure-container-apps'"
             )),
         }
     }
@@ -227,10 +236,14 @@ pub fn init(
 
     let mut created = Vec::new();
     for (name, template) in files {
-        fs::write(
-            dir.join(name),
-            render(template, project_name, embed, split_workers),
-        )?;
+        let path = dir.join(name);
+        // Most planned files sit at the project root, but some targets (e.g.
+        // azure-container-apps' `.github/workflows/...`) nest under a
+        // subdirectory that a fresh project won't have yet.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, render(template, project_name, embed, split_workers))?;
         created.push(name.to_string());
     }
     Ok(created)
@@ -330,6 +343,16 @@ fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
     match target {
         Target::Fly => files.push(("fly.toml", templates::FLY_TOML)),
         Target::DockerCompose => files.push(("docker-compose.yml", templates::DOCKER_COMPOSE)),
+        Target::AzureContainerApps => {
+            files.push(("main.tf", templates::AZURE_MAIN_TF));
+            files.push(("variables.tf", templates::AZURE_VARIABLES_TF));
+            files.push(("outputs.tf", templates::AZURE_OUTPUTS_TF));
+            files.push(("terraform.tfvars.example", templates::AZURE_TFVARS_EXAMPLE));
+            files.push((
+                ".github/workflows/azure-deploy.yml",
+                templates::AZURE_DEPLOY_WORKFLOW,
+            ));
+        }
         Target::Default => {}
     }
     files
@@ -1158,6 +1181,356 @@ previous_secrets = []
         );
     }
 
+    // ── --target=azure-container-apps ─────────────────────────────────────────
+
+    #[test]
+    fn azure_target_creates_all_expected_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        for name in [
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+            ".github/workflows/azure-deploy.yml",
+        ] {
+            assert!(
+                dir.join(name).is_file(),
+                "{name} must be created for --target=azure-container-apps"
+            );
+        }
+        // Base scaffolding is still emitted alongside the Azure-specific files.
+        assert!(dir.join("Dockerfile").is_file());
+        assert!(dir.join(".dockerignore").is_file());
+        assert!(dir.join("autumn.production.toml.example").is_file());
+    }
+
+    #[test]
+    fn azure_target_returns_nested_workflow_path_in_created_list() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        let files = init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|f| f == ".github/workflows/azure-deploy.yml"),
+            "created-files list must include the nested workflow path: {files:?}"
+        );
+    }
+
+    #[test]
+    fn default_target_does_not_create_azure_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        for name in [
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+            ".github/workflows/azure-deploy.yml",
+        ] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must NOT be created for the default target"
+            );
+        }
+    }
+
+    #[test]
+    fn main_tf_has_resource_group_and_registry() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_resource_group"),
+            "main.tf must provision a resource group: {content}"
+        );
+        assert!(
+            content.contains("azurerm_container_registry"),
+            "main.tf must provision an Azure Container Registry: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_has_container_app_environment_and_service() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_container_app_environment"),
+            "main.tf must provision a Container Apps environment: {content}"
+        );
+        assert!(
+            content.contains("resource \"azurerm_container_app\""),
+            "main.tf must provision the Container App service: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_has_postgres_flexible_server() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_postgresql_flexible_server"),
+            "main.tf must provision Azure Database for PostgreSQL Flexible Server: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_has_key_vault_with_database_and_signing_secrets() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_key_vault"),
+            "main.tf must provision a Key Vault secrets store: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_DATABASE__PRIMARY_URL"),
+            "main.tf must wire the primary DB URL env var from Key Vault: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_SECURITY__SIGNING_SECRET"),
+            "main.tf must wire the signing secret env var from Key Vault: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_has_optional_redis_cache_gated_by_variable() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_redis_cache"),
+            "main.tf must optionally provision a Redis Cache: {content}"
+        );
+        assert!(
+            content.contains("enable_redis_cache"),
+            "the Redis Cache must be gated by an opt-in feature-flag variable: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_never_contains_secret_literals() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+            assert!(
+                !lower.contains("password = \"") && !lower.contains("password=\""),
+                "main.tf must never assign a literal secret value (only var./data. \
+                 references are allowed): {trimmed}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_tf_substitutes_project_name() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-blog");
+        init(&dir, "my-blog", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("my-blog"),
+            "main.tf must substitute the project name: {content}"
+        );
+        assert!(
+            !content.contains("{{"),
+            "main.tf must not contain unsubstituted template placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn variables_tf_declares_expected_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        for var in [
+            "variable \"app_name\"",
+            "variable \"location\"",
+            "variable \"image_tag\"",
+            "variable \"db_sku\"",
+            "variable \"min_replicas\"",
+            "variable \"max_replicas\"",
+            "variable \"enable_redis_cache\"",
+        ] {
+            assert!(
+                content.contains(var),
+                "variables.tf must declare {var}: {content}"
+            );
+        }
+        assert!(
+            !content.contains("{{"),
+            "variables.tf must not contain unsubstituted template placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn variables_tf_marks_secret_inputs_sensitive_with_no_default() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            content.contains("variable \"database_url\""),
+            "variables.tf must declare a database_url secret variable: {content}"
+        );
+        assert!(
+            content.contains("variable \"signing_secret\""),
+            "variables.tf must declare a signing_secret secret variable: {content}"
+        );
+        assert!(
+            content.contains("sensitive   = true") || content.contains("sensitive = true"),
+            "secret variables must be marked sensitive so Terraform redacts them in \
+             plan/apply output: {content}"
+        );
+        assert!(
+            !content.to_lowercase().contains("default     = \"postgres")
+                && !content.contains("default = \"CHANGE_ME\""),
+            "secret variables must not ship a literal default value: {content}"
+        );
+    }
+
+    #[test]
+    fn outputs_tf_has_app_fqdn_and_acr_login_server() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        assert!(
+            content.contains("output \"app_fqdn\""),
+            "outputs.tf must expose the app's FQDN: {content}"
+        );
+        assert!(
+            content.contains("output \"acr_login_server\""),
+            "outputs.tf must expose the ACR login server: {content}"
+        );
+        assert!(
+            !content.contains("{{"),
+            "outputs.tf must not contain unsubstituted template placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn tfvars_example_documents_non_secret_defaults_without_committing_secrets() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-blog");
+        init(&dir, "my-blog", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
+        assert!(
+            content.contains("my-blog"),
+            "terraform.tfvars.example must substitute the project name: {content}"
+        );
+        assert!(
+            content.contains("app_name"),
+            "terraform.tfvars.example must document app_name: {content}"
+        );
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                continue;
+            }
+            assert!(
+                !trimmed.starts_with("database_url") && !trimmed.starts_with("signing_secret"),
+                "terraform.tfvars.example must never assign a literal secret value: {trimmed}"
+            );
+        }
+        assert!(
+            !content.contains("{{"),
+            "terraform.tfvars.example must not contain unsubstituted placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_triggers_on_tag_push_and_manual_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("tags:"),
+            "azure-deploy.yml must trigger on tag push: {content}"
+        );
+        assert!(
+            content.contains("workflow_dispatch:"),
+            "azure-deploy.yml must also support manual dispatch: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_builds_pushes_to_acr_and_deploys() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("docker build") || content.contains("docker/build-push-action"),
+            "azure-deploy.yml must build the release image: {content}"
+        );
+        assert!(
+            content.contains("azurecr.io"),
+            "azure-deploy.yml must push to the Azure Container Registry: {content}"
+        );
+        assert!(
+            content.contains("az containerapp update")
+                || content.contains("containerapps-deploy-action"),
+            "azure-deploy.yml must deploy the new image to the Container App: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_never_hardcodes_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("secrets."),
+            "azure-deploy.yml must source credentials from GitHub Actions secrets, \
+             never hardcode them: {content}"
+        );
+    }
+
+    #[test]
+    fn init_without_force_errors_if_azure_workflow_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        fs::write(dir.join(".github/workflows/azure-deploy.yml"), "existing").unwrap();
+        let err = init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap_err();
+        assert!(matches!(err, ReleaseError::FileExists(_)));
+    }
+
+    #[test]
+    fn init_with_force_overwrites_nested_azure_workflow_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        fs::write(
+            dir.join(".github/workflows/azure-deploy.yml"),
+            "old content",
+        )
+        .unwrap();
+        init(&dir, "my-app", true, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert_ne!(content, "old content");
+    }
+
     // ── --split-workers (opt-in split topology) ───────────────────────────────
 
     #[test]
@@ -1303,6 +1676,14 @@ previous_secrets = []
         assert_eq!(
             "docker-compose".parse::<Target>().unwrap(),
             Target::DockerCompose
+        );
+    }
+
+    #[test]
+    fn parse_target_azure_container_apps() {
+        assert_eq!(
+            "azure-container-apps".parse::<Target>().unwrap(),
+            Target::AzureContainerApps
         );
     }
 
