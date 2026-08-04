@@ -57,19 +57,32 @@ locals {
   app_name_alnum = lower(replace(var.app_name, "/[^a-zA-Z0-9]/", ""))
 
   # Container Apps-family resources (the environment, the app, the migration
-  # job, and Log Analytics) allow lowercase alphanumerics AND hyphens, but
-  # must not contain consecutive hyphens and must end in an alphanumeric
-  # character. `var.app_name` comes straight from the Cargo package name by
-  # default, which — unlike these Azure names — may legally contain
-  # underscores or uppercase letters, or its own hyphens adjacent to one
-  # mapped from an underscore (e.g. "my_app" and "my-app" both risk
-  # producing "my--app" if invalid characters are merely swapped for a
-  # hyphen one-for-one). So: map anything else to a hyphen, collapse any
-  # resulting run of hyphens to one, then trim a leading/trailing hyphen.
-  app_name_safe = trim(
+  # job, and Log Analytics) allow lowercase alphanumerics AND hyphens, must
+  # be 2-32 characters, must not contain consecutive hyphens, and must end
+  # in an alphanumeric character. `var.app_name` comes straight from the
+  # Cargo package name by default, which — unlike these Azure names — may
+  # legally contain underscores or uppercase letters, or its own hyphens
+  # adjacent to one mapped from an underscore (e.g. "my_app" and "my-app"
+  # both risk producing "my--app" if invalid characters are merely swapped
+  # for a hyphen one-for-one), and may be as short as one character or
+  # longer than 32. So: map anything else to a hyphen, collapse any
+  # resulting run of hyphens to one, trim a leading/trailing hyphen, pad a
+  # too-short result up to Azure's 2-character minimum, then cap the base at
+  # 24 characters — leaving headroom for the longest suffix appended to any
+  # of these resources ("-migrate", 8 characters) so the full name never
+  # exceeds Azure's 32-character maximum — and trim once more in case
+  # truncation happened to land on a hyphen.
+  app_name_hyphenated = trim(
     replace(
       lower(replace(var.app_name, "/[^a-zA-Z0-9-]/", "-")),
       "/-+/", "-"
+    ),
+    "-"
+  )
+  app_name_safe = trim(
+    substr(
+      length(local.app_name_hyphenated) < 2 ? "${local.app_name_hyphenated}00" : local.app_name_hyphenated,
+      0, 24
     ),
     "-"
   )
@@ -206,9 +219,20 @@ resource "azurerm_postgresql_flexible_server_firewall_rule" "azure_services" {
   end_ip_address   = "0.0.0.0"
 }
 
-# Optional Redis Cache, gated behind the `enable_redis_cache` flag (mirrors
-# the app-level `autumn-cache-redis` feature) — off by default so a plain
-# deploy incurs no extra cost.
+# Optional Redis Cache, gated behind the `enable_redis_cache` flag — off by
+# default so a plain deploy incurs no extra cost.
+#
+# This provisions the infrastructure and wires AUTUMN_CACHE__BACKEND /
+# AUTUMN_CACHE__REDIS__URL into the Container App, but that alone does NOT
+# make the app use it: Autumn's cache subsystem has no built-in Redis
+# implementation (unlike sessions/channels/jobs, which activate from config
+# alone once compiled with the `redis` Cargo feature). Your application must
+# ALSO depend on the separate `autumn-cache-redis` crate and register
+# `.plugin(RedisCachePlugin::new())` in main.rs — without that, these env
+# vars are parsed into config and never read by anything, the app silently
+# keeps its default in-process cache, and you pay for an Azure Redis
+# instance that does nothing. See the "Shared Cache" section of
+# docs/guide/cloud-native.md for the exact three steps.
 resource "azurerm_redis_cache" "this" {
   count                = var.enable_redis_cache ? 1 : 0
   name                 = "${local.app_name_alnum}-redis-${random_id.suffix.hex}"
@@ -227,7 +251,12 @@ resource "azurerm_redis_cache" "this" {
 resource "azurerm_key_vault_secret" "redis_url" {
   count        = var.enable_redis_cache ? 1 : 0
   name         = "AUTUMN-CACHE-REDIS-URL"
-  value        = "rediss://:${azurerm_redis_cache.this[0].primary_access_key}@${azurerm_redis_cache.this[0].hostname}:${azurerm_redis_cache.this[0].ssl_port}"
+  # Azure Redis access keys are base64-like and may contain "/" — raw in a
+  # URL's userinfo segment, a "/" would terminate the authority before
+  # "@hostname" and produce a malformed URL depending on the randomly issued
+  # key. urlencode() avoids that the same way database_admin_password is
+  # encoded in the derived database_url secret above.
+  value        = "rediss://:${urlencode(azurerm_redis_cache.this[0].primary_access_key)}@${azurerm_redis_cache.this[0].hostname}:${azurerm_redis_cache.this[0].ssl_port}"
   key_vault_id = azurerm_key_vault.this.id
   depends_on   = [azurerm_key_vault_access_policy.terraform]
 }

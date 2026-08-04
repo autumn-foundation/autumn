@@ -46,14 +46,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # On a `v*` tag push, GITHUB_REF_NAME is the tag itself (no slashes).
-      # On workflow_dispatch, an operator can pick any branch — including
-      # one with a "/" in its name (e.g. "feature/login") — and Docker tags
-      # don't allow "/"; a raw ref there would produce an invalid image
-      # reference and fail the build before anything is pushed.
+      # A `v*` push tag or a workflow_dispatch branch name may legally
+      # contain characters Docker tags reject — not just "/" (branches like
+      # "feature/login"), but also e.g. "+" (a valid SemVer tag like
+      # "v1.2.3+build") and anything else outside Docker's
+      # [A-Za-z0-9_.-]{1,128} tag charset. Map every other character to "-"
+      # and cap the length rather than special-casing "/" alone.
       - name: Compute a Docker-safe image tag
         id: image_tag
-        run: echo "value=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "value=$(echo -n "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-128)" >> "$GITHUB_OUTPUT"
 
       - name: Azure login
         uses: azure/login@v2

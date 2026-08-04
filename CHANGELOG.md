@@ -19,9 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   app as secret refs via a user-assigned managed identity (with its own Key
   Vault access policy granted to Terraform's caller identity, since
   access-policy-model vaults grant no data-plane access by default), and an
-  optional Redis Cache gated behind `enable_redis_cache` and fully wired in
-  as `AUTUMN_CACHE__BACKEND=redis` / `AUTUMN_CACHE__REDIS__URL` — Autumn's
-  actual config path — when enabled), `variables.tf`
+  optional Redis Cache gated behind `enable_redis_cache`, wired in as
+  `AUTUMN_CACHE__BACKEND=redis` / `AUTUMN_CACHE__REDIS__URL` (Autumn's
+  actual config path) with its access key `urlencode()`'d before being
+  written into Key Vault — infrastructure only, though: the app must
+  separately depend on `autumn-cache-redis` and register `RedisCachePlugin`
+  in `main.rs` for these env vars to take effect, which the generated
+  `main.tf`/`variables.tf` now say explicitly), `variables.tf`
   (`app_name`, `location`, `image_tag`, `db_sku`, `bootstrap_image`,
   `min_replicas`/`max_replicas` — defaulting to the 1/10 scale range — and
   `enable_redis_cache`, plus `sensitive`, no-default secret variables for
@@ -39,16 +43,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than taken as an input variable, so a single `terraform apply` is
   enough. Every Container Apps-family resource name (the app, its
   environment, Log Analytics, the migration job) is sanitized to lowercase
-  alphanumerics-and-hyphens, with hyphen runs collapsed and a leading/
-  trailing hyphen trimmed — a Cargo package name may legally contain
-  underscores, uppercase letters, or its own hyphens adjacent to a mapped
-  one, all invalid or malformed there — computed once in Terraform
+  alphanumerics-and-hyphens, with hyphen runs collapsed, a leading/trailing
+  hyphen trimmed, a too-short result padded to Azure's 2-character minimum,
+  and the base capped at 24 characters (headroom for the longest suffix,
+  `-migrate`, so the full name never exceeds Azure's 32-character maximum)
+  — a Cargo package name may legally be as short as one character, longer
+  than 32, contain underscores/uppercase, or produce adjacent hyphens when
+  mapped, all invalid or malformed there — computed once in Terraform
   (`local.app_name_safe`) and exposed as the `app_name` output; the
   generated workflow reads it back as a variable rather than ever hardcoding
   a name, so editing `app_name` in `terraform.tfvars` after scaffolding is
-  picked up automatically. The workflow also sanitizes `GITHUB_REF_NAME` for
-  use as a Docker tag (a `workflow_dispatch` branch may contain `/`, invalid
-  there) and documents that its service principal needs Contributor at the
+  picked up automatically. The workflow also maps every character outside
+  Docker's `[A-Za-z0-9_.-]` tag charset in `GITHUB_REF_NAME` to `-` and caps
+  it at 128 characters before using it as an image tag (a `workflow_dispatch`
+  branch may contain `/`, and a SemVer tag like `v1.2.3+build` contains `+`,
+  both invalid in a Docker tag) and documents that its service principal
+  needs Contributor at the
   resource-group scope, not just on the Container App — RBAC on the app
   doesn't inherit to the sibling migration job. The app and migration job
   both start from a public placeholder image (`bootstrap_image`) since

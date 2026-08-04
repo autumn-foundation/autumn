@@ -851,11 +851,22 @@ This generates:
 
 | File | Purpose |
 |---|---|
-| `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, a one-shot migration job, Azure Database for PostgreSQL Flexible Server, and a Key Vault that feeds secrets into the app via a user-assigned managed identity. An optional Redis Cache is gated behind `enable_redis_cache`. |
+| `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, a one-shot migration job, Azure Database for PostgreSQL Flexible Server, and a Key Vault that feeds secrets into the app via a user-assigned managed identity. An optional Redis Cache is gated behind `enable_redis_cache` — **infrastructure only**, see the callout below. |
 | `variables.tf` | `app_name`, `location`, `image_tag`, `db_sku`, `bootstrap_image`, `min_replicas`/`max_replicas` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
 | `outputs.tf` | `app_fqdn`, `acr_login_server`, `resource_group_name`, `migrate_job_name`, and `app_name`. |
 | `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
 | `.github/workflows/azure-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to ACR, runs the migration job to completion, and runs `az containerapp update` on a `v*` tag push (or manual dispatch). |
+
+**Redis cache is infrastructure only.** `enable_redis_cache = true`
+provisions an Azure Redis Cache and wires `AUTUMN_CACHE__BACKEND=redis` /
+`AUTUMN_CACHE__REDIS__URL` into the Container App, but Autumn's cache
+subsystem has no built-in Redis implementation — unlike sessions, channels,
+and jobs, which activate purely from config once compiled with the `redis`
+Cargo feature. Setting these env vars alone does nothing: your application
+must *also* depend on the `autumn-cache-redis` crate and register
+`.plugin(RedisCachePlugin::new())` in `main.rs`, or the config is parsed and
+silently never read — you'd pay for a Redis instance the app never talks to.
+See [Shared Cache](cloud-native.md#shared-cache) for the three steps.
 
 **Resource names are sanitized, not verbatim.** A Cargo package name may
 contain underscores or uppercase letters (both invalid in Container App
@@ -863,12 +874,16 @@ names), so every Container Apps-family resource name (the app, its
 environment, Log Analytics, the migration job) is lowercased, any other
 character is mapped to a hyphen, runs of hyphens are collapsed to one, and a
 leading/trailing hyphen is trimmed — `my_app`/`My App`/`my--app` all become
-`my-app`. ACR, Key Vault, Postgres, and Redis use a stricter sanitization (no
-hyphens at all, since ACR forbids them). Sanitization happens once, in
-Terraform (`local.app_name_safe`) — the generated workflow never hardcodes a
-name; it reads the result back via `terraform output app_name` (as the
-`AZURE_APP_NAME` repository variable), so editing `app_name` in
-`terraform.tfvars` after scaffolding is picked up automatically instead of
+`my-app`. The base name is also padded up to Azure's 2-character minimum and
+capped at 24 characters, leaving headroom for the longest suffix appended to
+any of these resources (`-migrate`, 8 characters) so the full name never
+exceeds Azure's 32-character maximum. ACR, Key Vault, Postgres, and Redis use
+a stricter sanitization (no hyphens at all, since ACR forbids them).
+Sanitization happens once, in Terraform (`local.app_name_safe`) — the
+generated workflow never hardcodes a name; it reads the result back via
+`terraform output app_name` (as the `AZURE_APP_NAME` repository variable),
+so editing `app_name` in `terraform.tfvars` after scaffolding is picked up
+automatically instead of
 silently deploying under a stale name.
 
 Why Container Apps and not App Service or AKS: it is the closest managed

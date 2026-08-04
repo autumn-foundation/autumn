@@ -54,7 +54,7 @@ variable "max_replicas" {
 }
 
 variable "enable_redis_cache" {
-  description = "Provision an optional Azure Redis Cache (mirrors the app's autumn-cache-redis feature flag). Off by default to avoid the extra cost."
+  description = "Provision an optional Azure Redis Cache and wire its URL into the app. Infrastructure only: your app must ALSO depend on the autumn-cache-redis crate and register RedisCachePlugin in main.rs for this to take effect — see docs/guide/cloud-native.md. Off by default to avoid the extra cost."
   type        = bool
   default     = false
 }

@@ -1508,25 +1508,53 @@ previous_secrets = []
         // Naively mapping every invalid character to "-" turns "my__app"
         // into "my--app" (consecutive hyphens, invalid) and "my-" into a
         // name with a trailing hyphen (also invalid — Container App names
-        // must end in an alphanumeric character). The local must collapse
+        // must end in an alphanumeric character). The locals must collapse
         // hyphen runs and trim leading/trailing hyphens after substitution.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join("main.tf")).unwrap();
         let locals_block = content
-            .split("app_name_safe = ")
+            .split("locals {")
             .nth(1)
             .and_then(|rest| rest.split("\n}").next())
-            .expect("main.tf must declare local.app_name_safe");
+            .expect("main.tf must declare a locals block");
         assert!(
             locals_block.contains("\"/-+/\""),
-            "app_name_safe must collapse runs of hyphens to one via a regex like /-+/: \
+            "app_name derivation must collapse runs of hyphens to one via a regex like \
+             /-+/: {locals_block}"
+        );
+        assert!(
+            locals_block.matches("trim(").count() >= 2,
+            "app_name derivation must trim leading/trailing hyphens both after collapsing \
+             and after any length truncation: {locals_block}"
+        );
+    }
+
+    #[test]
+    fn main_tf_app_name_safe_is_length_bounded() {
+        // Azure Container Apps-family names must be 2-32 characters. A
+        // 1-character Cargo package name (valid) would produce a
+        // below-minimum app name; a >24-character one would push
+        // "${app_name_safe}-migrate" (8-char suffix) past the 32-char cap.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let locals_block = content
+            .split("locals {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare a locals block");
+        assert!(
+            locals_block.contains("substr("),
+            "app_name_safe must truncate to leave headroom for the longest suffix \
+             (-migrate, 8 chars) appended to any Container Apps-family resource: \
              {locals_block}"
         );
         assert!(
-            locals_block.trim_start().starts_with("trim("),
-            "app_name_safe must trim leading/trailing hyphens after substitution: \
+            locals_block.contains("length(local.app_name_hyphenated) < 2"),
+            "app_name_safe must pad a too-short base up to Azure's 2-character minimum: \
              {locals_block}"
         );
     }
@@ -1618,6 +1646,47 @@ previous_secrets = []
         assert!(
             content.contains("value = \"redis\""),
             "AUTUMN_CACHE__BACKEND must be set to \"redis\": {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_urlencodes_redis_access_key() {
+        // Azure Redis access keys are base64-like and may contain "/" — raw
+        // in a URL's userinfo segment, that would terminate the authority
+        // before "@hostname" and produce a malformed URL depending on the
+        // randomly issued key.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("urlencode(azurerm_redis_cache.this[0].primary_access_key)"),
+            "the Redis access key must be urlencode()'d before being interpolated into \
+             the rediss:// URL, the same way database_admin_password already is: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_documents_redis_cache_requires_app_level_plugin() {
+        // Provisioning the cache and wiring its env vars is infrastructure
+        // only — Autumn's cache subsystem has no built-in Redis
+        // implementation (unlike sessions/channels/jobs), so the app must
+        // ALSO depend on autumn-cache-redis and register RedisCachePlugin,
+        // or the env vars are silently never read.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            main_tf.contains("RedisCachePlugin"),
+            "main.tf must document that the app needs RedisCachePlugin registered, not \
+             just the env vars set: {main_tf}"
+        );
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            variables_tf.to_lowercase().contains("infrastructure only"),
+            "variables.tf's enable_redis_cache description must warn this is \
+             infrastructure-only: {variables_tf}"
         );
     }
 
@@ -1987,18 +2056,25 @@ previous_secrets = []
 
     #[test]
     fn azure_workflow_sanitizes_ref_name_for_docker_tag() {
-        // On workflow_dispatch an operator can pick any branch, including
-        // one with a "/" (e.g. "feature/login") — invalid in a Docker tag.
-        // A `v*` tag push never contains "/", but the workflow can't tell
-        // which trigger fired it, so it must sanitize unconditionally.
+        // A `v*` push tag or a workflow_dispatch branch name may contain
+        // characters Docker tags reject beyond just "/" (a branch like
+        // "feature/login") — e.g. "+" (a valid SemVer tag like
+        // "v1.2.3+build"). Docker tags only allow [A-Za-z0-9_.-], up to 128
+        // characters, so every other character must be sanitized, not just
+        // "/" special-cased.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
         assert!(
-            content.contains("GITHUB_REF_NAME//"),
-            "azure-deploy.yml must replace \"/\" in GITHUB_REF_NAME before using it as a \
-             Docker tag: {content}"
+            content.contains("tr -c 'A-Za-z0-9_.-' '-'"),
+            "azure-deploy.yml must map every character outside Docker's tag charset \
+             (not just \"/\") to \"-\": {content}"
+        );
+        assert!(
+            content.contains("cut -c1-128"),
+            "azure-deploy.yml must cap the computed tag at Docker's 128-character limit: \
+             {content}"
         );
         assert!(
             !content.contains(":${GITHUB_REF_NAME}") && !content.contains(":$GITHUB_REF_NAME"),
