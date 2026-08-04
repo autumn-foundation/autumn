@@ -232,6 +232,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "data-table",
     "hero",
     "infinite-feed",
+    "locale-switcher",
     "modal",
     "nav-bar",
     "nav-link",

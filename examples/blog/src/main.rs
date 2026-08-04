@@ -18,15 +18,26 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 /// In a real app this would query the database; here we return a
 /// representative static list so `autumn build` and the running server
 /// produce a valid `/sitemap.xml` without requiring a live database.
+///
+/// Only `/` is listed here — `/about` is a `#[static_get]` route, so it's
+/// already covered automatically from the static-route table (issue #1251).
+/// `#[static_get]` pre-rendering requests each route's single, unprefixed
+/// path and isn't locale-aware, so the framework automatically excludes
+/// static routes from locale-prefix routing — `/about` stays a single
+/// unprefixed URL in the sitemap too, matching the router. A `SitemapSource`'s
+/// entries are explicit, app-authored URLs the framework never rewrites, so
+/// `/` — a dynamic (`#[get]`) route with no static-route metadata to derive
+/// locale alternates from — is localized by hand here.
 struct BlogSitemapSource;
 
 impl SitemapSource for BlogSitemapSource {
     fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send + '_>> {
         Box::pin(async {
             vec![
-                SitemapEntry::new("https://autumn-demo.example.com/")
+                SitemapEntry::new("https://autumn-demo.example.com/en")
                     .changefreq(autumn_web::seo::SitemapChangefreq::Weekly),
-                SitemapEntry::new("https://autumn-demo.example.com/about"),
+                SitemapEntry::new("https://autumn-demo.example.com/es")
+                    .changefreq(autumn_web::seo::SitemapChangefreq::Weekly),
             ]
         })
     }
@@ -53,7 +64,8 @@ async fn main() {
                 .register(admin::PostAdmin),
         )
         // Register the sitemap source: mounts /robots.txt and /sitemap.xml.
-        // Configure [seo] base_url in autumn.toml for canonical URL injection.
+        // `[seo] base_url` in autumn.toml drives canonical URL injection and,
+        // with locale-prefixed routing on, locale-prefixed sitemap entries.
         .seo_source(BlogSitemapSource)
         .routes(routes![
             // Public routes

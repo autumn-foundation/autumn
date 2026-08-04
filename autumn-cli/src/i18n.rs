@@ -1192,6 +1192,9 @@ mod tests {
             supported_locales: vec![default.to_owned()],
             fallback_chain: chain.iter().map(|s| (*s).to_owned()).collect(),
             dir: "i18n".to_owned(),
+            locale_prefix_enabled: false,
+            locale_prefix_exclude: vec![],
+            locale_prefix_exclude_exact: vec![],
         }
     }
 
@@ -2131,6 +2134,9 @@ mod tests {
             supported_locales: vec!["en".to_owned(), "es".to_owned()],
             fallback_chain: Vec::new(),
             dir: "i18n".to_owned(),
+            locale_prefix_enabled: false,
+            locale_prefix_exclude: vec![],
+            locale_prefix_exclude_exact: vec![],
         };
         let report = build_report(&scan, &config, &per_locale);
 

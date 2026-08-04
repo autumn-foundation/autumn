@@ -17,6 +17,13 @@ use super::posts::layout_with_seo;
 /// static page needs no hand-built builder at all. `#[static_get]` honours the
 /// argument like any other route macro, so the pre-rendered HTML carries the
 /// tags.
+///
+/// Not locale-prefixed (issue #1251): `#[static_get]` pre-rendering requests
+/// this route's single, unprefixed path and isn't locale-aware, so the
+/// framework automatically excludes static routes from locale-prefix
+/// routing — see `exclude_static_routes_from_locale_prefix` in `app.rs`.
+/// `/about` therefore has no `/en/about` or `/es/about` alternates to
+/// advertise; see `routes::posts::show` for the hreflang demo.
 #[static_get(
     "/about",
     seo(
@@ -28,6 +35,11 @@ use super::posts::layout_with_seo;
 pub async fn about(locale: Locale, seo: SeoMeta) -> Markup {
     layout_with_seo(
         &locale,
+        // `/about` is excluded from locale-prefix routing (see the doc
+        // comment above), so the switcher must not link to a nonexistent
+        // `/{locale}/about` — pass `None`, per `layout_with_seo`'s contract
+        // for excluded pages (Codex review).
+        None,
         seo,
         html! {
             article {
