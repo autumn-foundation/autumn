@@ -12,7 +12,7 @@ use printpdf::{
 };
 
 use super::html::Node;
-use super::metrics::text_width_pt;
+use super::metrics::{char_width_1000em, text_width_pt};
 
 /// Recursion depth cap for walking the parsed node tree — defense in depth
 /// against pathologically deep (adversarial or accidental) nesting; the
@@ -386,6 +386,39 @@ fn words_of(spans: &[Span]) -> Vec<Word> {
 /// [`Word::Text::glue`].
 type StyledWord = (String, bool, bool, bool);
 
+/// Split `text` into the fewest possible chunks that each fit within
+/// `max_width_pt`, breaking at character boundaries (not word boundaries —
+/// this is only used for a single token that's already too wide to fit on a
+/// line by itself, e.g. a long URL/hash/identifier with no internal
+/// whitespace to break at).
+///
+/// Always makes progress: a chunk always gets at least one character even if
+/// that character alone exceeds `max_width_pt`, so this can't loop forever
+/// on a pathologically narrow `max_width_pt`.
+fn split_into_fitting_chunks(
+    text: &str,
+    font_size_pt: f32,
+    bold: bool,
+    max_width_pt: f32,
+) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0.0f32;
+    for ch in text.chars() {
+        let ch_width = f32::from(char_width_1000em(ch, bold)) / 1000.0 * font_size_pt;
+        if !current.is_empty() && current_width + ch_width > max_width_pt {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0.0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// Greedily word-wrap `words` to `max_width_pt`, honoring explicit
 /// [`Word::Break`]s. Each returned line is a list of [`StyledWord`]s in
 /// left-to-right order; the caller positions each word itself rather than
@@ -394,6 +427,11 @@ type StyledWord = (String, bool, bool, bool);
 /// word before it, even if that overflows `max_width_pt` slightly —
 /// splitting a short glued run (e.g. a "$" bolded separately from its
 /// amount) across two lines would look worse than a minor overflow.
+///
+/// A single word wider than `max_width_pt` on its own (a long URL, hash, or
+/// identifier with nowhere to break) is character-wrapped via
+/// [`split_into_fitting_chunks`] instead of being left to overflow the page
+/// or table-cell boundary.
 fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledWord>> {
     let space_w = text_width_pt(" ", font_size_pt, false);
     let mut lines = Vec::new();
@@ -413,6 +451,24 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
                 glue,
             } => {
                 let w = text_width_pt(text, font_size_pt, *bold);
+                if w > max_width_pt && !text.is_empty() {
+                    if !current.is_empty() {
+                        lines.push(std::mem::take(&mut current));
+                        current_width = 0.0;
+                    }
+                    let chunks = split_into_fitting_chunks(text, font_size_pt, *bold, max_width_pt);
+                    let last = chunks.len().saturating_sub(1);
+                    for (i, chunk) in chunks.into_iter().enumerate() {
+                        let chunk_w = text_width_pt(&chunk, font_size_pt, *bold);
+                        if i == last {
+                            current_width = chunk_w;
+                            current = vec![(chunk, *bold, *italic, false)];
+                        } else {
+                            lines.push(vec![(chunk, *bold, *italic, false)]);
+                        }
+                    }
+                    continue;
+                }
                 let glued = *glue && !current.is_empty();
                 if !glued {
                     let needed = if current.is_empty() { w } else { w + space_w };
@@ -713,6 +769,55 @@ mod tests {
                 .sum();
             assert!(width <= 80.0 + 1.0, "line exceeds max width: {width}");
         }
+    }
+
+    #[test]
+    fn oversized_single_token_is_character_wrapped_not_overflowed() {
+        // Regression: a single word wider than the whole column/page (a long
+        // URL, hash, or identifier with no whitespace to break at) used to
+        // be placed on its own line unsplit, overflowing past the boundary.
+        let words = words_of(&[Span::Run {
+            text: "https://example.com/a/very/long/path/that/has/no/spaces/anywhere/at/all"
+                .to_owned(),
+            bold: false,
+            italic: false,
+        }]);
+        let lines = wrap(&words, 80.0, 12.0);
+        assert!(
+            lines.len() > 1,
+            "expected the token to be split across lines"
+        );
+        for line in &lines {
+            let width: f32 = line
+                .iter()
+                .map(|(t, b, _, _)| text_width_pt(t, 12.0, *b))
+                .sum();
+            assert!(width <= 80.0 + 1.0, "line exceeds max width: {width}");
+        }
+        let reassembled: String = lines
+            .iter()
+            .flat_map(|line| line.iter().map(|(t, ..)| t.as_str()))
+            .collect();
+        assert_eq!(
+            reassembled, "https://example.com/a/very/long/path/that/has/no/spaces/anywhere/at/all",
+            "splitting must not drop or reorder any characters"
+        );
+    }
+
+    #[test]
+    fn oversized_token_narrower_than_max_width_is_left_whole() {
+        // A word that fits on its own line (even if it wouldn't fit
+        // alongside other content already on the current line) must not be
+        // needlessly split.
+        let words = words_of(&[Span::Run {
+            text: "short".to_owned(),
+            bold: false,
+            italic: false,
+        }]);
+        let lines = wrap(&words, 80.0, 12.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), 1);
+        assert_eq!(lines[0][0].0, "short");
     }
 
     #[test]
