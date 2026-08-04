@@ -1839,6 +1839,7 @@ fn mount_user_routes(
     let included_path_methods = route_list_path_methods(&included);
     let excluded_path_methods = route_list_path_methods(&excluded);
     let scoped_path_methods = scoped_group_path_methods(scoped_groups);
+    let framework_path_methods = framework_probe_path_methods(config);
 
     let valid_locales = validated_locale_prefix_locales(&config.i18n);
 
@@ -1846,6 +1847,7 @@ fn mount_user_routes(
         &included_path_methods,
         &excluded_path_methods,
         &scoped_path_methods,
+        &framework_path_methods,
         &valid_locales,
     ) {
         return Err(err);
@@ -1954,17 +1956,25 @@ pub fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
 }
 
 /// `true` when `locale` is safe to use as a literal [`Router::nest`](axum::Router::nest)
-/// segment: non-empty (an empty string would nest at `"/"`, which axum
-/// panics on — nesting at the root isn't supported) and free of characters
-/// axum's route syntax interprets specially — `/` (would silently nest an
-/// extra sub-path instead of one opaque segment), `{`/`}` (path-parameter
-/// capture syntax), `*` (wildcard capture), and a leading `:` (axum 0.7
-/// capture syntax — axum 0.8's `Router::route` panics on it during
-/// assembly via `validate_v07_paths`, the same restriction `InvalidMcpPath`
-/// above already guards against) (Codex review).
+/// segment AND as a literal path segment in the generated redirect target
+/// (`/{locale}{path}`): non-empty (an empty string would nest at `"/"`,
+/// which axum panics on — nesting at the root isn't supported) and free of
+/// characters axum's route syntax interprets specially — `/` (would
+/// silently nest an extra sub-path instead of one opaque segment), `{`/`}`
+/// (path-parameter capture syntax), `*` (wildcard capture), and a leading
+/// `:` (axum 0.7 capture syntax — axum 0.8's `Router::route` panics on it
+/// during assembly via `validate_v07_paths`, the same restriction
+/// `InvalidMcpPath` above already guards against) — plus `?`/`#` and
+/// whitespace, which axum accepts as a literal nest string but which a
+/// client parses as a query/fragment delimiter, silently truncating the
+/// redirect target (`/en?x/foo` parses as path `/en` + query `x/foo`)
+/// (Codex review).
 #[cfg(feature = "i18n")]
 fn is_valid_locale_segment(locale: &str) -> bool {
-    !locale.is_empty() && !locale.starts_with(':') && !locale.contains(['/', '{', '}', '*'])
+    !locale.is_empty()
+        && !locale.starts_with(':')
+        && !locale.contains(['/', '{', '}', '*', '?', '#'])
+        && !locale.chars().any(char::is_whitespace)
 }
 
 /// The subset of `i18n.supported_locales` that's actually valid and unique —
@@ -2060,6 +2070,42 @@ fn scoped_group_path_methods(
     map
 }
 
+/// Health/liveness/readiness/startup probe paths reserved by the framework
+/// (`mount_probe_endpoints`, mounted well after this module returns) — all
+/// `GET` (+`HEAD`), and only when `config.health.enabled` (matching
+/// `mount_probe_endpoints`'s own off-switch: when probes are disabled, none
+/// of these paths are reserved). Included in locale-prefix collision
+/// detection so a probe path that happens to equal a generated locale path
+/// is caught before axum panics on the later overlapping mount (Codex
+/// review).
+///
+/// Actuator/OpenAPI/MCP mount paths are a similar, currently-undetected risk
+/// (see the reply on this finding), but aren't included here: unlike the
+/// probe paths, threading `OpenApiConfig`/the MCP mount path into this
+/// function requires plumbing well beyond `AutumnConfig` alone.
+#[cfg(feature = "i18n")]
+fn framework_probe_path_methods(
+    config: &AutumnConfig,
+) -> std::collections::HashMap<String, Vec<http::Method>> {
+    let mut map = std::collections::HashMap::new();
+    if !config.health.enabled {
+        return map;
+    }
+    for path in [
+        &config.health.path,
+        &config.health.live_path,
+        &config.health.ready_path,
+        &config.health.startup_path,
+    ] {
+        if path.is_empty() {
+            continue;
+        }
+        map.entry(path.clone())
+            .or_insert_with(|| vec![http::Method::GET, http::Method::HEAD]);
+    }
+    map
+}
+
 /// Combines a path's registered methods into the single [`axum::routing::MethodFilter`]
 /// the bare-path redirect must claim there.
 #[cfg(feature = "i18n")]
@@ -2101,9 +2147,11 @@ fn path_method_filters(
 /// at `/en/foo`, so nesting `/foo`'s content under `/en` collides if those
 /// methods overlap, and axum panics on the overlapping route at
 /// router-construction time. Checked against `included`, `excluded`
-/// (mounted verbatim at the top level), and `scoped` (mounted later via
-/// `mount_scoped_groups`, but onto the same router) so any pre-existing
-/// route is caught regardless of how it was registered (Codex review).
+/// (mounted verbatim at the top level), `scoped` (mounted later via
+/// `mount_scoped_groups`, but onto the same router), and `framework` (the
+/// health/live/ready/startup probes, mounted later still via
+/// `mount_probe_endpoints`) so any pre-existing route is caught regardless
+/// of how it was registered (Codex review).
 ///
 /// Two DIFFERENT kinds of collision are distinguished, matching
 /// `reject_duplicate_user_routes`'s established model:
@@ -2122,11 +2170,13 @@ fn detect_locale_prefix_path_collision(
     included: &std::collections::HashMap<String, Vec<http::Method>>,
     excluded: &std::collections::HashMap<String, Vec<http::Method>>,
     scoped: &std::collections::HashMap<String, Vec<http::Method>>,
+    framework: &std::collections::HashMap<String, Vec<http::Method>>,
     valid_locales: &[String],
 ) -> Option<RouterBuildError> {
     let all_other_paths: Vec<&String> = excluded
         .keys()
         .chain(scoped.keys())
+        .chain(framework.keys())
         .chain(included.keys())
         .collect();
 
@@ -2142,6 +2192,7 @@ fn detect_locale_prefix_path_collision(
                 .get(&generated)
                 .into_iter()
                 .chain(scoped.get(&generated))
+                .chain(framework.get(&generated))
                 .chain(included.get(&generated))
                 .any(|other_methods| methods.iter().any(|m| other_methods.contains(m)));
 
@@ -2245,6 +2296,22 @@ fn apply_locale_prefix_routing(
 /// extractor (no [`UriPrefixedLocale`](crate::i18n::UriPrefixedLocale) is set
 /// this far outside any locale nest) so the redirect target matches exactly
 /// what the request would have resolved to anyway.
+///
+/// **Known limitation** (Codex review): a mutating form POSTing directly to
+/// its bare, unprefixed path with a `[SubmitTokenLayer](crate::security::SubmitTokenLayer)`-protected
+/// `_submit_token` hits this 308 *before* reaching the real handler.
+/// `SubmitTokenLayer` caches 3xx responses so a replayed submit returns the
+/// first response verbatim — it has no way to distinguish this redirect
+/// from a handler-issued one it's deliberately designed to cache, so it
+/// records this 308 against the token. The browser then re-POSTs the same
+/// body (with the same token) to the now-current, already-prefixed URL,
+/// where the token replays the *cached 308* instead of reaching the
+/// handler. Closing this fully would mean teaching `SubmitTokenLayer` to
+/// recognize and skip caching this specific redirect — out of scope here.
+/// Forms should POST to the current (already locale-prefixed) path — e.g.
+/// via [`widgets::localized_path`](crate::widgets::localized_path) or a
+/// relative `action` — rather than a hardcoded bare path, which this
+/// framework's own `locale_switcher` already does for links.
 #[cfg(feature = "i18n")]
 async fn locale_prefix_redirect_handler(
     locale: crate::i18n::Locale,
@@ -6713,6 +6780,26 @@ mod tests {
             );
         }
 
+        /// Codex review (P1): a generated locale path can collide with a
+        /// framework-owned path — the health probes, mounted later via
+        /// `mount_probe_endpoints`, are invisible to `collect_user_get_paths`
+        /// (which only sees the raw, pre-locale-prefix `route_list`) and so
+        /// weren't previously checked here either.
+        #[tokio::test]
+        async fn generated_locale_path_colliding_with_a_health_probe_is_a_build_error() {
+            let mut config = config(&["en"], &[]);
+            config.health.path = "/en/foo".to_owned();
+            let foo = simple_route("/foo", "foo", false);
+
+            let err = try_build_router(vec![foo], &config, test_state()).expect_err(
+                "a health probe colliding with a generated locale path must be a build error",
+            );
+            assert!(
+                matches!(err, RouterBuildError::LocalePrefixPathCollision { .. }),
+                "expected LocalePrefixPathCollision, got {err:?}"
+            );
+        }
+
         /// Codex review (P2): a locale segment beginning with `:` (axum 0.7
         /// capture syntax) must not panic at router-construction time — axum
         /// 0.8's `Router::route` rejects it during assembly (the same
@@ -6720,6 +6807,25 @@ mod tests {
         #[tokio::test]
         async fn colon_prefixed_locale_segment_does_not_panic() {
             let config = config(&["en", ":en"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en"])));
+
+            let en = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en.status(), StatusCode::OK);
+            assert_eq!(body_string(en).await, "en");
+        }
+
+        /// Codex review (P2): a locale segment containing a query/fragment
+        /// delimiter or whitespace (e.g. `"en?x"`, `"en#x"`, `"en y"`) must
+        /// be skipped rather than nested — axum accepts it as a literal
+        /// nest string, but a client parses `/en?x/foo` as path `/en` plus
+        /// query `x/foo`, silently truncating the redirect target. Router
+        /// construction must not panic, and the other, valid locale must
+        /// still route normally.
+        #[tokio::test]
+        async fn locale_segment_with_uri_delimiter_does_not_panic_and_valid_locale_still_routes() {
+            let config = config(&["en", "en?x", "en#x", "en y"], &[]);
             let route = simple_route("/posts", "posts", true);
             let app = build_router(vec![route], &config, test_state())
                 .layer(axum::Extension(bundle(&["en"])));

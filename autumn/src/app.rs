@@ -3356,6 +3356,14 @@ impl AppBuilder {
         // Must run before both the sitemap generation below and the router
         // build further down, so the two agree on which paths are excluded.
         exclude_static_routes_from_locale_prefix(&mut config, &static_metas);
+        // `state` already holds an `AutumnConfig` snapshot cloned inside
+        // `build_state` above — captured BEFORE this mutation. Refresh it, or
+        // `tenancy_middleware` (which reads config via
+        // `state.extension::<AutumnConfig>()`) would see a stale copy missing
+        // these auto-excluded static routes and could misjudge whether a
+        // `/{locale}`-look-alike path was ever actually locale-prefixed
+        // (Codex review).
+        state.insert_extension(config.clone());
 
         // Register SEO routes (/robots.txt and /sitemap.xml) when any SEO
         // configuration is present or dynamic sources are registered.
@@ -4711,6 +4719,9 @@ impl AppBuilder {
         // unprefixed path — never locale-aware — so they must stay excluded
         // from locale-prefix routing even when it's enabled (issue #1251).
         exclude_static_routes_from_locale_prefix(&mut config, &static_metas);
+        // Refresh the AppState-stored config snapshot — see the matching
+        // comment in `run()` (Codex review).
+        state.insert_extension(config.clone());
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -10915,6 +10926,39 @@ mod tests {
         assert_eq!(
             config.i18n.locale_prefix_exclude_exact,
             vec!["/".to_owned()]
+        );
+    }
+
+    /// Codex review (P1): `AppState` caches an `AutumnConfig` snapshot
+    /// (`build_state` clones it in before `exclude_static_routes_from_locale_prefix`
+    /// runs) — `run()`/`run_build_mode()` must re-`insert_extension` the
+    /// mutated config afterward, or `tenancy_middleware` (which reads config
+    /// via `state.extension::<AutumnConfig>()`) would keep seeing the stale,
+    /// pre-exclusion copy and could misjudge whether a `/{locale}`-look-alike
+    /// path was ever actually locale-prefixed.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn appstate_config_extension_reflects_static_route_exclusions_after_refresh() {
+        let mut config = AutumnConfig::default();
+        config.i18n.locale_prefix_enabled = true;
+        let state = crate::state::AppState::for_test();
+        // Simulates `build_state`'s clone, captured BEFORE the exclusion.
+        state.insert_extension(config.clone());
+
+        let metas = vec![static_meta("/about")];
+        exclude_static_routes_from_locale_prefix(&mut config, &metas);
+        // The fix: re-insert the mutated config so the stored snapshot
+        // matches what the router was actually built with.
+        state.insert_extension(config.clone());
+
+        let stored = state
+            .extension::<AutumnConfig>()
+            .expect("config extension must be installed");
+        assert_eq!(
+            stored.i18n.locale_prefix_exclude_exact,
+            vec!["/about".to_owned()],
+            "AppState's config snapshot must reflect the static-route exclusion, \
+             not the stale pre-mutation copy"
         );
     }
 
