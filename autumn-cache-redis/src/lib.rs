@@ -417,6 +417,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn rediss_scheme_is_usable_without_a_tls_cargo_feature_error() {
+        // The azure-container-apps release target's generated Redis Cache
+        // disables the non-TLS port (main.tf: non_ssl_port_enabled = false),
+        // so it only ever hands the app a `rediss://` URL. Without a TLS
+        // Cargo feature compiled in, `redis::Client::open` rejects that
+        // scheme immediately at URL-parse time (before any network I/O) with
+        // "can't connect with TLS, the feature is not enabled" — invisible
+        // until a real Azure deploy, since no local test exercised it. This
+        // needs no Docker/testcontainer TLS-capable Redis: with the
+        // tls-rustls feature compiled in (workspace Cargo.toml), parsing
+        // succeeds and the failure that follows (a closed loopback port) is
+        // a genuine network error instead.
+        let result = RedisCache::connect("rediss://127.0.0.1:1/", "test").await;
+        let Err(err) = result else {
+            panic!("connecting to a closed port must fail");
+        };
+        let message = err.to_string();
+        assert!(
+            !message.contains("feature is not enabled") && !message.contains("without the tls"),
+            "the `redis` crate must be built with a TLS feature (tokio-rustls-comp) \
+             so `rediss://` URLs actually connect: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires Docker (testcontainers)"]
     async fn redis_cache_insert_get_invalidate() {
         let container = RedisImage::default().start().await.unwrap();

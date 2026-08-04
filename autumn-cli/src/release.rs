@@ -4,7 +4,7 @@
 //! and optional target-specific scaffolds) at the project root.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod templates {
     pub const DOCKERFILE: &str = include_str!("templates/release/Dockerfile.tmpl");
@@ -13,6 +13,12 @@ mod templates {
         include_str!("templates/release/autumn.production.toml.example.tmpl");
     pub const FLY_TOML: &str = include_str!("templates/release/fly.toml.tmpl");
     pub const DOCKER_COMPOSE: &str = include_str!("templates/release/docker-compose.yml.tmpl");
+    pub const AZURE_MAIN_TF: &str = include_str!("templates/release/main.tf.tmpl");
+    pub const AZURE_VARIABLES_TF: &str = include_str!("templates/release/variables.tf.tmpl");
+    pub const AZURE_OUTPUTS_TF: &str = include_str!("templates/release/outputs.tf.tmpl");
+    pub const AZURE_TFVARS_EXAMPLE: &str =
+        include_str!("templates/release/terraform.tfvars.example.tmpl");
+    pub const AZURE_DEPLOY_WORKFLOW: &str = include_str!("templates/release/azure-deploy.yml.tmpl");
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +38,7 @@ pub enum Target {
     Default,
     Fly,
     DockerCompose,
+    AzureContainerApps,
 }
 
 impl std::str::FromStr for Target {
@@ -40,8 +47,10 @@ impl std::str::FromStr for Target {
         match s {
             "fly" => Ok(Self::Fly),
             "docker-compose" => Ok(Self::DockerCompose),
+            "azure-container-apps" => Ok(Self::AzureContainerApps),
             other => Err(format!(
-                "unknown target '{other}'; expected 'fly' or 'docker-compose'"
+                "unknown target '{other}'; expected 'fly', 'docker-compose', or \
+                 'azure-container-apps'"
             )),
         }
     }
@@ -81,6 +90,12 @@ pub fn run(action: ReleaseAction) {
                 Ok(files) => {
                     for f in &files {
                         println!("  Created {f}");
+                    }
+
+                    if matches!(target, Target::AzureContainerApps)
+                        && let Some(warning) = azure_workflow_relocation_warning(&cwd)
+                    {
+                        eprintln!("\n{warning}");
                     }
 
                     // Smoke gate: verify the generated production config does
@@ -198,6 +213,55 @@ pub fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
         .ok_or_else(|| ReleaseError::CargoToml("missing [package] name".into()))
 }
 
+/// Locate the nearest ancestor of `dir` (inclusive) containing a `.git`
+/// entry. A worktree or submodule uses a `.git` FILE rather than a
+/// directory, so this checks existence generally rather than requiring a
+/// directory. Returns `None` if no ancestor up to the filesystem root has
+/// one (`dir` isn't inside a git repository at all).
+fn find_git_root(dir: &Path) -> Option<PathBuf> {
+    let mut current = dir;
+    loop {
+        if current.join(".git").exists() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+/// For the azure-container-apps target, `.github/workflows/azure-deploy.yml`
+/// is written under `dir` — but GitHub Actions only discovers workflow
+/// files under the git repository ROOT's `.github/workflows/`, never an
+/// arbitrary subdirectory's (see
+/// <https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows>).
+/// `autumn release init` explicitly supports running from a Cargo workspace
+/// member directory (`read_project_name` rejects only the workspace root
+/// itself), so a scaffold run from `examples/blog/` writes a workflow that
+/// would silently never fire. Returns an actionable warning to print in
+/// that case; `None` when `dir` IS the git root (the common, correct case)
+/// or isn't inside a git repository at all (nothing more specific to say).
+fn azure_workflow_relocation_warning(dir: &Path) -> Option<String> {
+    let git_root = find_git_root(dir)?;
+    if git_root == dir {
+        return None;
+    }
+    let rel = dir.strip_prefix(&git_root).ok()?;
+    Some(format!(
+        "Warning: this project lives inside a Git repository whose root is\n\
+         {}, but `.github/workflows/azure-deploy.yml` was written under\n\
+         {} — GitHub Actions only discovers workflow files under the\n\
+         repository ROOT's `.github/workflows/`, so this workflow will never\n\
+         run as-is. Move it to {}/.github/workflows/azure-deploy.yml and add\n\
+         the following so its `docker build` step still finds this crate's\n\
+         Dockerfile:\n\
+         \n\
+         defaults:\n  run:\n    working-directory: {}\n",
+        git_root.display(),
+        dir.display(),
+        git_root.display(),
+        rel.display(),
+    ))
+}
+
 /// Emit release scaffolding files into `dir` for the given `project_name`.
 ///
 /// Returns the list of file names written. Returns [`ReleaseError::FileExists`]
@@ -219,6 +283,15 @@ pub fn init(
         }
     }
 
+    // Validate/merge .gitignore BEFORE writing any scaffold file below, not
+    // after: this can fail (an existing .gitignore that isn't valid UTF-8,
+    // say), and failing after the other files are already on disk would
+    // leave a partial, complete-looking scaffold that then blocks a retry
+    // without --force on the very files this call just created.
+    if matches!(target, Target::AzureContainerApps) {
+        ensure_azure_gitignore_entries(dir)?;
+    }
+
     // Embed assets into the binary only when the project opts in via the
     // `embed-assets` feature (as `autumn new` generates). Pre-existing apps
     // without that feature get the disk-based build (`cargo build --release`
@@ -227,13 +300,102 @@ pub fn init(
 
     let mut created = Vec::new();
     for (name, template) in files {
-        fs::write(
-            dir.join(name),
-            render(template, project_name, embed, split_workers),
-        )?;
+        let path = dir.join(name);
+        // Most planned files sit at the project root, but some targets (e.g.
+        // azure-container-apps' `.github/workflows/...`) nest under a
+        // subdirectory that a fresh project won't have yet.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, render(template, project_name, embed, split_workers))?;
         created.push(name.to_string());
     }
+
     Ok(created)
+}
+
+/// Terraform state (`*.tfstate*`) holds every secret value in plaintext —
+/// `sensitive = true` on a variable only redacts CLI plan/apply output, never
+/// the state file — and a real `terraform.tfvars` holds the operator's own
+/// secret values. None of that may ever land in version control.
+const AZURE_GITIGNORE_ENTRIES: &[&str] = &[
+    "# Terraform (autumn release init --target azure-container-apps)",
+    ".terraform/",
+    "*.tfstate",
+    "*.tfstate.*",
+    "terraform.tfvars",
+];
+
+/// Whether `pattern` is still in effect by the end of `existing`, applying
+/// git's own "last matching rule wins" semantics. Deliberately conservative
+/// rather than a full gitignore glob engine (`*`, `**`, `?`, character
+/// classes, directory-anchoring rules): once `pattern` has appeared, ANY
+/// later negation line — not just an exact `!pattern` match — is treated
+/// as potentially un-ignoring it again, since a broader wildcard like
+/// `!*.tfvars` or a blanket `!*` also defeats it and being unable to prove
+/// a negation doesn't apply must never be mistaken for proof that it
+/// doesn't. The cost of this conservatism is, at worst, an unrelated
+/// negation elsewhere in the file causing a harmless re-append (a
+/// duplicate line) on the next run — never a false "already protected".
+fn gitignore_pattern_still_effective(existing: &str, pattern: &str) -> bool {
+    let mut effective = false;
+    for line in existing.lines() {
+        let line = line.trim();
+        if line == pattern {
+            effective = true;
+        } else if effective && line.starts_with('!') {
+            effective = false;
+        }
+    }
+    effective
+}
+
+/// Ensure `dir/.gitignore` excludes Terraform state and the operator's real
+/// `terraform.tfvars`, merging into an existing file (creating one if
+/// missing) without touching unrelated lines. Idempotent: a re-run (e.g.
+/// under `--force`) never duplicates entries whose protection still holds —
+/// but does re-append one whose earlier occurrence has since been negated,
+/// since re-asserting it after the negation is the only way to make it the
+/// final (and therefore effective) matching rule again.
+fn ensure_azure_gitignore_entries(dir: &Path) -> std::io::Result<()> {
+    let path = dir.join(".gitignore");
+    // Only a missing file is safe to default to empty. Any other read
+    // failure (invalid UTF-8, permission denied, ...) must propagate —
+    // silently treating it as "no file" would make the fs::write below
+    // replace the operator's existing (unreadable-by-us, but still real)
+    // content with just the Terraform entries.
+    let existing = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let missing: Vec<&str> = AZURE_GITIGNORE_ENTRIES
+        .iter()
+        .copied()
+        .filter(|line| {
+            if line.starts_with('#') {
+                !existing.lines().any(|l| l.trim() == *line)
+            } else {
+                !gitignore_pattern_still_effective(&existing, line)
+            }
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push('\n');
+    }
+    for line in missing {
+        updated.push_str(line);
+        updated.push('\n');
+    }
+    fs::write(path, updated)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -330,6 +492,16 @@ fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
     match target {
         Target::Fly => files.push(("fly.toml", templates::FLY_TOML)),
         Target::DockerCompose => files.push(("docker-compose.yml", templates::DOCKER_COMPOSE)),
+        Target::AzureContainerApps => {
+            files.push(("main.tf", templates::AZURE_MAIN_TF));
+            files.push(("variables.tf", templates::AZURE_VARIABLES_TF));
+            files.push(("outputs.tf", templates::AZURE_OUTPUTS_TF));
+            files.push(("terraform.tfvars.example", templates::AZURE_TFVARS_EXAMPLE));
+            files.push((
+                ".github/workflows/azure-deploy.yml",
+                templates::AZURE_DEPLOY_WORKFLOW,
+            ));
+        }
         Target::Default => {}
     }
     files
@@ -742,6 +914,29 @@ mod tests {
             content.contains("/config/master.key") || content.contains("config/master.key"),
             ".dockerignore must exclude config/master.key"
         );
+    }
+
+    #[test]
+    fn dockerignore_excludes_terraform_state() {
+        // The azure-container-apps target scaffolds main.tf/terraform.tfvars
+        // directly alongside the Dockerfile in the same directory. Docker's
+        // build context is whatever the positional path argument points at
+        // (`docker build .`), so running that from this directory AFTER
+        // `terraform apply` would otherwise upload the plaintext
+        // terraform.tfstate — every secret value, `sensitive` flag or not —
+        // into the builder/build cache even though no stage ever COPYs it
+        // into the final image.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
+        for pattern in [".terraform/", "*.tfstate", "terraform.tfvars"] {
+            assert!(
+                content.contains(pattern),
+                ".dockerignore must exclude {pattern:?} so terraform.tfstate is never sent \
+                 to the Docker build context: {content}"
+            );
+        }
     }
 
     // ── signing-secret smoke gate ─────────────────────────────────────────────
@@ -1158,6 +1353,1686 @@ previous_secrets = []
         );
     }
 
+    // ── --target=azure-container-apps ─────────────────────────────────────────
+
+    #[test]
+    fn azure_target_creates_all_expected_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        for name in [
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+            ".github/workflows/azure-deploy.yml",
+        ] {
+            assert!(
+                dir.join(name).is_file(),
+                "{name} must be created for --target=azure-container-apps"
+            );
+        }
+        // Base scaffolding is still emitted alongside the Azure-specific files.
+        assert!(dir.join("Dockerfile").is_file());
+        assert!(dir.join(".dockerignore").is_file());
+        assert!(dir.join("autumn.production.toml.example").is_file());
+    }
+
+    #[test]
+    fn azure_target_returns_nested_workflow_path_in_created_list() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        let files = init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|f| f == ".github/workflows/azure-deploy.yml"),
+            "created-files list must include the nested workflow path: {files:?}"
+        );
+    }
+
+    #[test]
+    fn default_target_does_not_create_azure_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        for name in [
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+            ".github/workflows/azure-deploy.yml",
+        ] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must NOT be created for the default target"
+            );
+        }
+    }
+
+    #[test]
+    fn main_tf_has_resource_group_and_registry() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_resource_group"),
+            "main.tf must provision a resource group: {content}"
+        );
+        assert!(
+            content.contains("azurerm_container_registry"),
+            "main.tf must provision an Azure Container Registry: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_has_container_app_environment_and_service() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_container_app_environment"),
+            "main.tf must provision a Container Apps environment: {content}"
+        );
+        assert!(
+            content.contains("resource \"azurerm_container_app\""),
+            "main.tf must provision the Container App service: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_has_postgres_flexible_server() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_postgresql_flexible_server"),
+            "main.tf must provision Azure Database for PostgreSQL Flexible Server: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_postgres_server_does_not_hardcode_availability_zone() {
+        // Not every Container Apps region offers Postgres Flexible Server
+        // availability zone 1 — a hardcoded `zone = "1"` fails
+        // `terraform apply` in those regions even though an unzoned server
+        // would succeed. Omitting `zone` lets Azure pick a placement itself.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let server_block = content
+            .split("resource \"azurerm_postgresql_flexible_server\" \"this\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the postgresql_flexible_server resource");
+        // Check for an actual `zone = ...` attribute assignment, not just
+        // the substring "zone" — the resource's own explanatory comment
+        // about why zone is omitted legitimately mentions the word.
+        assert!(
+            !server_block.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with('#') && t.starts_with("zone ")
+            }),
+            "the Postgres Flexible Server must not pin an availability zone: {server_block}"
+        );
+    }
+
+    #[test]
+    fn main_tf_postgres_database_name_is_length_bounded() {
+        // Postgres database identifiers are capped at 63 bytes; a 64
+        // -character Cargo package name (valid) would otherwise overflow
+        // it since the name was previously passed through unbounded.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let db_block = content
+            .split("resource \"azurerm_postgresql_flexible_server_database\" \"this\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the postgresql_flexible_server_database resource");
+        let name_line = db_block
+            .lines()
+            .find(|l| l.trim_start().starts_with("name"))
+            .expect("the database resource must set a name");
+        assert!(
+            name_line.contains("local.postgres_database_name"),
+            "the database resource must use the bounded/reserved-name-guarded local: {name_line}"
+        );
+        let raw_local_line = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("postgres_database_name_raw"))
+            .expect("main.tf must declare a postgres_database_name_raw local");
+        assert!(
+            raw_local_line.contains("substr(") && raw_local_line.contains(", 63)"),
+            "the Postgres database name must be truncated to 63 characters: {raw_local_line}"
+        );
+    }
+
+    #[test]
+    fn main_tf_postgres_database_name_avoids_reserved_names() {
+        // A fresh Flexible Server already owns "postgres", "azure_maintenance",
+        // and "azure_sys" as Azure-specific system databases, plus
+        // "template0"/"template1" — every Postgres cluster, on any host, is
+        // initialized with those two as its own templates. A Cargo package
+        // literally named one of those (or "azure-sys"/"template0", which
+        // sanitize to the same underscored form) must not collide with them,
+        // or `terraform apply` fails trying to create/manage a database that
+        // already exists.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        for reserved in [
+            "postgres",
+            "azure_maintenance",
+            "azure_sys",
+            "template0",
+            "template1",
+        ] {
+            assert!(
+                content.contains(&format!("\"{reserved}\"")),
+                "the reserved-name guard must list {reserved:?}: {content}"
+            );
+        }
+        let database_name_local = content
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("postgres_database_name ="))
+            .take_while(|l| !l.trim_start().starts_with('}'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            database_name_local.contains("contains(") && database_name_local.contains("_prod"),
+            "postgres_database_name must fall back to a suffixed name when the \
+             sanitized value collides with a reserved database name: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_has_key_vault_with_database_and_signing_secrets() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_key_vault"),
+            "main.tf must provision a Key Vault secrets store: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_DATABASE__PRIMARY_URL"),
+            "main.tf must wire the primary DB URL env var from Key Vault: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_SECURITY__SIGNING_SECRET"),
+            "main.tf must wire the signing secret env var from Key Vault: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_wires_trusted_hosts_so_prod_actually_binds() {
+        // AUTUMN_PROFILE=prod makes fail_fast_on_invalid_trusted_hosts exit
+        // the process immediately when security.trusted_hosts.hosts is
+        // empty (see docs/guide/deployment.md's "Trusted hosts" section).
+        // Without this, the container never binds after the first real
+        // deploy — it would crash-loop instead of serving traffic.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS"),
+            "main.tf must set AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS on the Container \
+             App: {content}"
+        );
+        assert!(
+            content.contains("azurerm_container_app_environment.this.default_domain"),
+            "the trusted host must be derived from the environment's default_domain \
+             (known before the app is created), not the app's own \
+             latest_revision_fqdn (which would be a circular self-reference): {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_grants_key_vault_access_to_terraform_identity() {
+        // Access-policy-model Key Vaults grant NO data-plane access by
+        // default (subscription-level Owner/Contributor does not imply Key
+        // Vault secret access), so without a policy for Terraform's own
+        // caller identity, `terraform apply` fails at the
+        // azurerm_key_vault_secret resources with a 403.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("data.azurerm_client_config.current.object_id"),
+            "main.tf must grant Key Vault access to Terraform's own caller \
+             identity (data.azurerm_client_config.current.object_id), not \
+             just the container app's identity: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_acr_pull_role_assignment_skips_aad_check() {
+        // The AcrPull grant targets the identity the SAME apply just
+        // created above it — Entra ID replication lag can make the role
+        // assignment fail with PrincipalNotFound before that object has
+        // propagated, even though the identity itself was created
+        // successfully. skip_service_principal_aad_check exists for
+        // exactly this "newly provisioned principal" case; a user-assigned
+        // identity's principal_id IS backed by a Service Principal object
+        // in Entra ID, so it applies here.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let role_assignment = content
+            .split("resource \"azurerm_role_assignment\" \"acr_pull\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the acr_pull role assignment");
+        assert!(
+            role_assignment.contains("skip_service_principal_aad_check = true"),
+            "the AcrPull role assignment on the freshly-created identity must set \
+             skip_service_principal_aad_check to avoid an intermittent \
+             PrincipalNotFound failure from AAD replication lag: {role_assignment}"
+        );
+    }
+
+    #[test]
+    fn main_tf_key_vault_name_never_exceeds_azure_length_limit() {
+        // Azure Key Vault names are capped at 24 characters. Extract the
+        // substr() bound and random_id byte_length from the template and
+        // verify the worst-case rendered name (prefix + "kv" + hex suffix)
+        // fits, so a future edit to either constant can't silently regress
+        // past the limit.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+
+        let substr_bound: usize = content
+            .split("substr(local.app_name_alnum, 0, ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("main.tf must call substr(local.app_name_alnum, 0, N) for the vault name");
+        let byte_length: usize = content
+            .split("byte_length = ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("main.tf must declare random_id.suffix's byte_length");
+        let hex_len = byte_length * 2;
+        let worst_case_len = substr_bound + "kv".len() + hex_len;
+        assert!(
+            worst_case_len <= 24,
+            "worst-case Key Vault name is {worst_case_len} chars (substr={substr_bound} + \
+             \"kv\" + {hex_len} hex chars), exceeding Azure's 24-char limit: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_sanitizes_names_consistently_via_shared_local() {
+        // Postgres Flexible Server and Redis Cache names must use the same
+        // sanitized local as ACR/Key Vault, not raw var.app_name — a Cargo
+        // package name may contain underscores/uppercase that are invalid
+        // in those resource names.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+
+        let postgres_block = content
+            .split("resource \"azurerm_postgresql_flexible_server\" \"this\"")
+            .nth(1)
+            .unwrap();
+        let postgres_name_line = postgres_block
+            .lines()
+            .find(|l| l.trim_start().starts_with("name"))
+            .unwrap();
+        assert!(
+            postgres_name_line.contains("local.app_name_alnum"),
+            "Postgres server name must use the sanitized local: {postgres_name_line}"
+        );
+
+        let redis_block = content
+            .split("resource \"azurerm_redis_cache\" \"this\"")
+            .nth(1)
+            .unwrap();
+        let redis_name_line = redis_block
+            .lines()
+            .find(|l| l.trim_start().starts_with("name"))
+            .unwrap();
+        assert!(
+            redis_name_line.contains("local.app_name_alnum"),
+            "Redis cache name must use the sanitized local: {redis_name_line}"
+        );
+    }
+
+    #[test]
+    fn main_tf_derives_database_url_from_created_postgres_server() {
+        // A single `terraform apply` must be enough: the connection string
+        // is computed from the Postgres server this same apply creates
+        // (its FQDN + the admin password variable), never taken as a
+        // separate pre-computed `var.database_url` input.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_postgresql_flexible_server.this.fqdn"),
+            "main.tf must derive the database URL from the Postgres server's own FQDN: {content}"
+        );
+        assert!(
+            !content.contains("var.database_url"),
+            "main.tf must not reference a database_url variable: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_postgres_admin_login_is_alphanumeric() {
+        // Azure Database for PostgreSQL Flexible Server rejects
+        // administrator_login values containing anything but letters and
+        // digits (no underscore, no hyphen) — `terraform apply` fails
+        // while creating the server otherwise. Also assert the server
+        // resource and the derived database_url secret share a single
+        // local so they can't drift out of sync with each other.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+
+        let login_local_line = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("postgres_admin_login"))
+            .expect("main.tf must declare a postgres_admin_login local");
+        let login_value = login_local_line
+            .split('=')
+            .nth(1)
+            .unwrap()
+            .trim()
+            .trim_matches('"');
+        assert!(
+            !login_value.is_empty() && login_value.chars().all(|c| c.is_ascii_alphanumeric()),
+            "postgres_admin_login must be alphanumeric-only, got {login_value:?}: \
+             {login_local_line}"
+        );
+
+        let admin_login_attr = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("administrator_login"))
+            .expect("main.tf must set administrator_login on the Postgres server");
+        assert!(
+            admin_login_attr.contains("local.postgres_admin_login"),
+            "the Postgres server resource must set administrator_login from \
+             local.postgres_admin_login: {admin_login_attr}"
+        );
+        assert!(
+            content.contains("postgres://${local.postgres_admin_login}:"),
+            "the database_url secret must reuse the same admin-login local as the \
+             server resource, not a separately hardcoded username: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_container_apps_family_resources_use_sanitized_name() {
+        // Log Analytics, the Container Apps environment, the app, its
+        // container, and the migration job all require lowercase
+        // alphanumerics-and-hyphens — unlike ACR/Key Vault/Postgres/Redis,
+        // they DO allow hyphens, so they share `local.app_name_safe` (not
+        // `app_name_alnum`, which strips hyphens too) rather than raw
+        // `var.app_name`, which may contain underscores/uppercase from a
+        // Cargo package name.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+
+        for resource in [
+            "azurerm_log_analytics_workspace\" \"this",
+            "azurerm_container_app_environment\" \"this",
+            "azurerm_container_app\" \"this",
+            "azurerm_container_app_job\" \"migrate",
+        ] {
+            let block = content
+                .split(&format!("resource \"{resource}\""))
+                .nth(1)
+                .unwrap_or_else(|| {
+                    panic!("main.tf must declare resource \"{resource}\": {content}")
+                });
+            let name_line = block
+                .lines()
+                .find(|l| l.trim_start().starts_with("name"))
+                .unwrap_or_else(|| panic!("{resource} must set a name: {block}"));
+            assert!(
+                name_line.contains("local.app_name_safe"),
+                "{resource} must use the sanitized local.app_name_safe, not raw \
+                 var.app_name or a literal project name: {name_line}"
+            );
+        }
+
+        assert!(
+            !content.contains("\"{{project_name}}\""),
+            "main.tf must not hardcode the raw (unsanitized) project name as a \
+             resource identifier: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_app_name_safe_collapses_and_trims_hyphens() {
+        // Naively mapping every invalid character to "-" turns "my__app"
+        // into "my--app" (consecutive hyphens, invalid) and "my-" into a
+        // name with a trailing hyphen (also invalid — Container App names
+        // must end in an alphanumeric character). The locals must collapse
+        // hyphen runs and trim leading/trailing hyphens after substitution.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let locals_block = content
+            .split("locals {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare a locals block");
+        assert!(
+            locals_block.contains("\"/-+/\""),
+            "app_name derivation must collapse runs of hyphens to one via a regex like \
+             /-+/: {locals_block}"
+        );
+        assert!(
+            locals_block.matches("trim(").count() >= 2,
+            "app_name derivation must trim leading/trailing hyphens both after collapsing \
+             and after any length truncation: {locals_block}"
+        );
+    }
+
+    #[test]
+    fn main_tf_app_name_safe_is_length_bounded() {
+        // Azure Container Apps-family names must be 2-32 characters. A
+        // 1-character Cargo package name (valid) would produce a
+        // below-minimum app name; a >24-character one would push
+        // "${app_name_safe}-migrate" (8-char suffix) past the 32-char cap.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let locals_block = content
+            .split("locals {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare a locals block");
+        assert!(
+            locals_block.contains("substr("),
+            "app_name_safe must truncate to leave headroom for the longest suffix \
+             (-migrate, 8 chars) appended to any Container Apps-family resource: \
+             {locals_block}"
+        );
+        assert!(
+            locals_block.contains("length(local.app_name_hyphenated) < 2"),
+            "app_name_safe must pad a too-short base up to Azure's 2-character minimum: \
+             {locals_block}"
+        );
+    }
+
+    #[test]
+    fn main_tf_sanitized_locals_fall_back_when_input_sanitizes_to_nothing_or_a_digit() {
+        // A Cargo package name made entirely of characters sanitization
+        // strips (e.g. the legal-but-unusual name "_") sanitizes to an
+        // empty string, which would otherwise produce a Postgres server
+        // name starting with "-" (the "${app_name_alnum}-pg-..." pattern),
+        // an empty Postgres database name, and violate resource types that
+        // require a letter-led name (Key Vault) rather than just
+        // alphanumeric (ACR). Both base locals must fall back to a fixed
+        // alphabetic prefix whenever sanitization leaves nothing, or
+        // leaves a value not starting with a letter (a leading digit
+        // survives sanitization but several consumers don't accept it).
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let locals_block = content
+            .split("locals {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare a locals block");
+
+        assert!(
+            locals_block.contains("app_name_alnum_raw == \"\" ? \"app\"")
+                && locals_block.contains("app_name_hyphenated_raw == \"\" ? \"app\""),
+            "both base locals must fall back to a non-empty alphabetic value when \
+             sanitization leaves nothing: {locals_block}"
+        );
+        assert!(
+            locals_block.matches("regex(\"^[a-z]\"").count() >= 2,
+            "both base locals must check for (and fall back on) a non-letter-leading \
+             sanitized value, not just an empty one: {locals_block}"
+        );
+    }
+
+    #[test]
+    fn main_tf_app_name_alnum_is_length_bounded() {
+        // ACR names are capped at 50 characters; "${app_name_alnum}acr" +
+        // an 8-hex-char suffix reserves 11, so an unbounded app_name_alnum
+        // (Cargo package names may be much longer than 39 characters)
+        // overflows it. Postgres (63) and Redis (63) are more permissive
+        // but derive from the same local, so bounding it once covers all
+        // three rather than truncating per-resource.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let locals_block = content
+            .split("locals {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare a locals block");
+        let alnum_line = locals_block
+            .lines()
+            .find(|l| l.trim_start().starts_with("app_name_alnum ="))
+            .expect("locals must declare app_name_alnum");
+        assert!(
+            alnum_line.contains("substr("),
+            "app_name_alnum must be length-bounded so ACR's 50-character limit (after \
+             the fixed \"acr\" + 8-hex-char suffix) can never be exceeded: {alnum_line}"
+        );
+    }
+
+    #[test]
+    fn main_tf_resource_group_and_identity_use_bounded_name() {
+        // Resource groups (90-char limit) and the user-assigned identity
+        // (128-char limit) are far more permissive than Container
+        // Apps-family resources, but a Cargo package name is unbounded —
+        // one longer than 87 characters overflows the resource group's own
+        // limit once "-rg" is appended. Both must use the already
+        // length-safe local.app_name_safe, not raw var.app_name.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+
+        for resource in [
+            "azurerm_resource_group\" \"this",
+            "azurerm_user_assigned_identity\" \"this",
+        ] {
+            let block = content
+                .split(&format!("resource \"{resource}\""))
+                .nth(1)
+                .unwrap_or_else(|| {
+                    panic!("main.tf must declare resource \"{resource}\": {content}")
+                });
+            let name_line = block
+                .lines()
+                .find(|l| l.trim_start().starts_with("name"))
+                .unwrap_or_else(|| panic!("{resource} must set a name: {block}"));
+            assert!(
+                name_line.contains("local.app_name_safe"),
+                "{resource} must use the length-bounded local.app_name_safe, not raw \
+                 var.app_name (unbounded — a long Cargo package name would overflow \
+                 this resource's own name-length limit): {name_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_tf_uses_bootstrap_image_and_ignores_later_image_drift() {
+        // Container Apps must pull an image to create the app's/job's first
+        // revision, but a brand-new ACR has none yet, so Terraform points
+        // both at a public placeholder and then ignores further image
+        // changes so a later `terraform apply` doesn't revert a live
+        // `az containerapp update`/job deploy back to the placeholder.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("image  = var.bootstrap_image")
+                || content.contains("image = var.bootstrap_image"),
+            "main.tf must set the container image to var.bootstrap_image: {content}"
+        );
+        assert_eq!(
+            content
+                .matches("ignore_changes = [template[0].container[0].image]")
+                .count(),
+            2,
+            "both the app and the migration job must ignore image drift after bootstrap: {content}"
+        );
+        assert!(
+            !content.contains("${var.image_tag}"),
+            "main.tf must not build the Terraform-managed image from var.image_tag — \
+             CI manages the real image out-of-band after bootstrap: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_has_migration_job() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_container_app_job\" \"migrate\""),
+            "main.tf must provision a one-shot migration Container Apps Job: {content}"
+        );
+        assert!(
+            content.contains("manual_trigger_config"),
+            "the migration job must only run when CI explicitly starts it: {content}"
+        );
+        assert!(
+            content.contains("autumn migrate"),
+            "the migration job must run `autumn migrate`: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_DATABASE__PRIMARY_URL"),
+            "the migration job must be wired to the same database secret as the app: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_wires_redis_url_into_container_app_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_key_vault_secret\" \"redis_url\""),
+            "main.tf must store the Redis connection string in Key Vault: {content}"
+        );
+        // Autumn's actual config path is `[cache.redis] url` (env:
+        // AUTUMN_CACHE__REDIS__URL, double underscore before URL) — not
+        // AUTUMN_CACHE__REDIS_URL, which Autumn never reads.
+        assert!(
+            content.contains("AUTUMN_CACHE__REDIS__URL"),
+            "main.tf must wire AUTUMN_CACHE__REDIS__URL into the Container App \
+             when enable_redis_cache is true: {content}"
+        );
+        assert!(
+            !content.contains("AUTUMN_CACHE__REDIS_URL\""),
+            "main.tf must not use the single-underscore variant, which Autumn ignores: {content}"
+        );
+        // Without selecting the backend, Autumn stays on its default
+        // in-memory cache and never reads the URL at all.
+        assert!(
+            content.contains("name  = \"AUTUMN_CACHE__BACKEND\"")
+                || content.contains("name = \"AUTUMN_CACHE__BACKEND\""),
+            "main.tf must set AUTUMN_CACHE__BACKEND=redis so Autumn actually selects the \
+             Redis cache backend: {content}"
+        );
+        assert!(
+            content.contains("value = \"redis\""),
+            "AUTUMN_CACHE__BACKEND must be set to \"redis\": {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_urlencodes_redis_access_key() {
+        // Azure Redis access keys are base64-like and may contain "/" — raw
+        // in a URL's userinfo segment, that would terminate the authority
+        // before "@hostname" and produce a malformed URL depending on the
+        // randomly issued key.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("urlencode(azurerm_redis_cache.this[0].primary_access_key)"),
+            "the Redis access key must be urlencode()'d before being interpolated into \
+             the rediss:// URL, the same way database_admin_password already is: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_documents_redis_cache_requires_app_level_plugin() {
+        // Provisioning the cache and wiring its env vars is infrastructure
+        // only — Autumn's cache subsystem has no built-in Redis
+        // implementation (unlike sessions/channels/jobs), so the app must
+        // ALSO depend on autumn-cache-redis and register RedisCachePlugin,
+        // or the env vars are silently never read.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            main_tf.contains("RedisCachePlugin"),
+            "main.tf must document that the app needs RedisCachePlugin registered, not \
+             just the env vars set: {main_tf}"
+        );
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            variables_tf.to_lowercase().contains("infrastructure only"),
+            "variables.tf's enable_redis_cache description must warn this is \
+             infrastructure-only: {variables_tf}"
+        );
+    }
+
+    #[test]
+    fn main_tf_has_optional_redis_cache_gated_by_variable() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("azurerm_redis_cache"),
+            "main.tf must optionally provision a Redis Cache: {content}"
+        );
+        assert!(
+            content.contains("enable_redis_cache"),
+            "the Redis Cache must be gated by an opt-in feature-flag variable: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_never_contains_secret_literals() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+            assert!(
+                !lower.contains("password = \"") && !lower.contains("password=\""),
+                "main.tf must never assign a literal secret value (only var./data. \
+                 references are allowed): {trimmed}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_tf_substitutes_project_name() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-blog");
+        init(&dir, "my-blog", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("my-blog"),
+            "main.tf must substitute the project name: {content}"
+        );
+        assert!(
+            !content.contains("{{"),
+            "main.tf must not contain unsubstituted template placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn variables_tf_declares_expected_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        for var in [
+            "variable \"app_name\"",
+            "variable \"location\"",
+            "variable \"image_tag\"",
+            "variable \"db_sku\"",
+            "variable \"min_replicas\"",
+            "variable \"max_replicas\"",
+            "variable \"enable_redis_cache\"",
+        ] {
+            assert!(
+                content.contains(var),
+                "variables.tf must declare {var}: {content}"
+            );
+        }
+        assert!(
+            !content.contains("{{"),
+            "variables.tf must not contain unsubstituted template placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn variables_tf_marks_secret_inputs_sensitive_with_no_default() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            content.contains("variable \"database_admin_password\""),
+            "variables.tf must declare a database_admin_password secret variable: {content}"
+        );
+        assert!(
+            content.contains("variable \"signing_secret\""),
+            "variables.tf must declare a signing_secret secret variable: {content}"
+        );
+        assert!(
+            content.contains("sensitive   = true") || content.contains("sensitive = true"),
+            "secret variables must be marked sensitive so Terraform redacts them in \
+             plan/apply output: {content}"
+        );
+        assert!(
+            !content.to_lowercase().contains("default     = \"postgres")
+                && !content.contains("default = \"CHANGE_ME\""),
+            "secret variables must not ship a literal default value: {content}"
+        );
+    }
+
+    #[test]
+    fn variables_tf_does_not_declare_database_url() {
+        // A single `terraform apply` must succeed without a second, targeted
+        // apply to fill in a value that depends on a resource the same apply
+        // is about to create. main.tf derives the connection string from the
+        // Postgres server it creates instead of requiring this as an input —
+        // regression guard against reintroducing that two-apply footgun.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            !content.contains("variable \"database_url\""),
+            "variables.tf must NOT declare a database_url variable — it must be derived \
+             in main.tf from the Postgres server the same apply creates: {content}"
+        );
+    }
+
+    #[test]
+    fn variables_tf_declares_bootstrap_image() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            content.contains("variable \"bootstrap_image\""),
+            "variables.tf must declare bootstrap_image, the placeholder image Terraform \
+             uses before any real image has been pushed to ACR: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_provider_sets_subscription_id() {
+        // AzureRM v4 made subscription_id mandatory for plan/apply, even
+        // under `az login` CLI auth — without it, `terraform apply` fails
+        // before provisioning anything.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let provider_block = main_tf
+            .split("provider \"azurerm\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the azurerm provider block");
+        assert!(
+            provider_block.contains("subscription_id = var.subscription_id"),
+            "the azurerm provider block must set subscription_id: {provider_block}"
+        );
+
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            variables_tf.contains("variable \"subscription_id\""),
+            "variables.tf must declare subscription_id: {variables_tf}"
+        );
+
+        let tfvars = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
+        assert!(
+            tfvars.contains("subscription_id"),
+            "terraform.tfvars.example must mention subscription_id so operators don't \
+             discover the AzureRM v4 requirement only after `terraform apply` fails: {tfvars}"
+        );
+    }
+
+    #[test]
+    fn tfvars_example_generates_postgres_compliant_admin_password() {
+        // Azure Postgres Flexible Server requires the admin password to use
+        // characters from at least 3 of {uppercase, lowercase, digit,
+        // symbol}. `openssl rand -hex` only ever produces lowercase hex
+        // digits (2 of 4 categories); even `-base64` alone only samples its
+        // alphabet randomly and could still land on just 2 categories. The
+        // command must deterministically guarantee coverage, not rely on
+        // probability, by appending a fixed suffix containing all 4.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
+        assert!(
+            content.contains("TF_VAR_database_admin_password=\"$(openssl rand -base64 18)Aa1!\""),
+            "the documented database_admin_password generator must append a fixed \
+             upper/lower/digit/symbol suffix so all 4 character classes are guaranteed, \
+             not merely probable: {content}"
+        );
+    }
+
+    #[test]
+    fn outputs_tf_has_app_fqdn_and_acr_login_server() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        assert!(
+            content.contains("output \"app_fqdn\""),
+            "outputs.tf must expose the app's FQDN: {content}"
+        );
+        assert!(
+            content.contains("output \"acr_login_server\""),
+            "outputs.tf must expose the ACR login server: {content}"
+        );
+        assert!(
+            content.contains("output \"migrate_job_name\""),
+            "outputs.tf must expose the migration job's name so CI can start it: {content}"
+        );
+        assert!(
+            content.contains("output \"app_name\""),
+            "outputs.tf must expose the sanitized Container App name so CI never has to \
+             hardcode it: {content}"
+        );
+        assert!(
+            !content.contains("{{"),
+            "outputs.tf must not contain unsubstituted template placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn outputs_tf_app_fqdn_is_the_stable_ingress_hostname_not_revision_specific() {
+        // azurerm_container_app.this.latest_revision_fqdn names a specific
+        // *revision*, not the app's stable ingress hostname — visiting it
+        // sends a different Host header than AUTUMN_SECURITY__
+        // TRUSTED_HOSTS__HOSTS allows (400), and it would go stale as soon
+        // as CI creates a new revision outside Terraform. Must use the same
+        // local.app_fqdn already wired into the trusted-hosts env var.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        let app_fqdn_block = content
+            .split("output \"app_fqdn\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("outputs.tf must declare the app_fqdn output");
+        assert!(
+            app_fqdn_block.contains("local.app_fqdn"),
+            "app_fqdn must be local.app_fqdn, not a revision-specific attribute: \
+             {app_fqdn_block}"
+        );
+        assert!(
+            !app_fqdn_block.contains("latest_revision_fqdn"),
+            "app_fqdn must not use latest_revision_fqdn, which names a specific \
+             revision rather than the stable ingress hostname: {app_fqdn_block}"
+        );
+    }
+
+    #[test]
+    fn tfvars_example_documents_non_secret_defaults_without_committing_secrets() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-blog");
+        init(&dir, "my-blog", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
+        assert!(
+            content.contains("my-blog"),
+            "terraform.tfvars.example must substitute the project name: {content}"
+        );
+        assert!(
+            content.contains("app_name"),
+            "terraform.tfvars.example must document app_name: {content}"
+        );
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                continue;
+            }
+            assert!(
+                !trimmed.starts_with("database_url") && !trimmed.starts_with("signing_secret"),
+                "terraform.tfvars.example must never assign a literal secret value: {trimmed}"
+            );
+        }
+        assert!(
+            !content.contains("{{"),
+            "terraform.tfvars.example must not contain unsubstituted placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_triggers_on_tag_push_and_manual_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("tags:"),
+            "azure-deploy.yml must trigger on tag push: {content}"
+        );
+        assert!(
+            content.contains("workflow_dispatch:"),
+            "azure-deploy.yml must also support manual dispatch: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_documents_resource_group_scope_rbac() {
+        // RBAC granted on the Container App does not inherit to the
+        // sibling migration Container Apps Job — a service principal with
+        // Contributor scoped only to the app would 403 when the migration
+        // step tries to start the job. The header must say resource-group
+        // scope, not "on the Container App".
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        // Scope to the header comment (before the workflow body) — the body
+        // legitimately contains `--resource-group` CLI flags, which would
+        // make a bare substring check pass regardless of whether the header
+        // actually documents the RBAC scoping requirement.
+        let header = content
+            .split("\nname: azure-deploy")
+            .next()
+            .expect("azure-deploy.yml must have a header comment before `name:`");
+        let header_lower = header.to_lowercase();
+        assert!(
+            header_lower.contains("resource-group") || header_lower.contains("resource group"),
+            "azure-deploy.yml's header must document resource-group-scoped Contributor \
+             access, covering both the app and the migration job: {header}"
+        );
+        assert!(
+            header_lower.contains("contributor"),
+            "azure-deploy.yml's header must mention the Contributor role: {header}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_builds_pushes_to_acr_and_deploys() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("docker build") || content.contains("docker/build-push-action"),
+            "azure-deploy.yml must build the release image: {content}"
+        );
+        assert!(
+            content.contains("azurecr.io"),
+            "azure-deploy.yml must push to the Azure Container Registry: {content}"
+        );
+        assert!(
+            content.contains("az containerapp update")
+                || content.contains("containerapps-deploy-action"),
+            "azure-deploy.yml must deploy the new image to the Container App: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_passes_git_provenance_build_args_to_docker() {
+        // The Dockerfile's AUTUMN_BUILD_* ARGs default to empty unless
+        // passed at `docker build` time, and .dockerignore excludes .git
+        // from the build context — so without these, every image this
+        // workflow builds reports null git provenance at /actuator/info.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        for arg in [
+            "AUTUMN_BUILD_GIT_SHA",
+            "AUTUMN_BUILD_GIT_SHA_SHORT",
+            "AUTUMN_BUILD_GIT_BRANCH",
+            "AUTUMN_BUILD_GIT_DIRTY",
+            "AUTUMN_BUILD_TIMESTAMP",
+        ] {
+            assert!(
+                content.contains(&format!("--build-arg {arg}=")),
+                "azure-deploy.yml's docker build must pass --build-arg {arg}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_workflow_updates_migration_job_image_before_starting_it() {
+        // `az containerapp job start --image ...` sends an execution-TEMPLATE
+        // OVERRIDE, which Azure treats as a full replacement, not a merge —
+        // an override containing only --image drops the Terraform-configured
+        // `command` (autumn migrate) and the AUTUMN_DATABASE__PRIMARY_URL
+        // secret env, so the execution would run the container's default
+        // command with no DB URL instead of applying migrations. The image
+        // must instead be persisted onto the job's stored template via
+        // `job update --image` BEFORE a bare `job start` (no --image) runs
+        // that complete, up-to-date template.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+
+        let migration_step = content
+            .split("Run database migrations")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("a 'Run database migrations' step must exist");
+
+        let update_pos = migration_step
+            .find("az containerapp job update \\")
+            .expect("the migration job's image must be persisted via `job update` first");
+        let start_pos = migration_step
+            .find("az containerapp job start \\")
+            .expect("`job start` must follow to actually run the now-updated template");
+        assert!(
+            update_pos < start_pos,
+            "the job's image must be updated BEFORE it's started: {migration_step}"
+        );
+
+        let update_block = &migration_step[update_pos..start_pos];
+        assert!(
+            update_block.contains("--image"),
+            "`job update` must be the one that carries --image: {update_block}"
+        );
+
+        // `job start`'s own invocation (up to its `EXECUTION=$(...)` closing
+        // paren) must be bare — no --image — since sending one there would
+        // reintroduce the template-override bug this test guards against.
+        let start_block_end = migration_step[start_pos..]
+            .find("--query name -o tsv)")
+            .map(|i| start_pos + i)
+            .expect("job start must capture the execution name via --query");
+        let start_block = &migration_step[start_pos..start_block_end];
+        assert!(
+            !start_block.contains("--image"),
+            "`job start` must not carry --image — that overrides (not merges) the \
+             execution template, dropping the command/secret env `job update` just set: \
+             {start_block}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_migration_poll_budget_exceeds_job_timeout() {
+        // main.tf sets replica_timeout_in_seconds = 600 on the migration
+        // job; Azure self-terminates the execution at that point
+        // regardless. Polling for any less risks reporting "timed out" on
+        // a migration that's still validly running (and would have
+        // succeeded), while leaving it to keep mutating the schema in the
+        // background after this workflow has already given up.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let job_timeout: u64 = main_tf
+            .split("replica_timeout_in_seconds = ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("main.tf must declare the migration job's replica_timeout_in_seconds");
+
+        let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        let iterations: u64 = workflow
+            .split("seq 1 ")
+            .nth(1)
+            .and_then(|rest| rest.split([')', ' ']).next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("the migration poll loop must use `seq 1 N`");
+        let sleep_secs: u64 = workflow
+            .split("sleep ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .and_then(|s| s.trim().parse().ok())
+            .expect("the migration poll loop must sleep a fixed number of seconds per iteration");
+        let poll_budget = iterations * sleep_secs;
+
+        assert!(
+            poll_budget > job_timeout,
+            "the poll budget ({poll_budget}s = {iterations} x {sleep_secs}s) must exceed \
+             the migration job's own replica_timeout_in_seconds ({job_timeout}s), or a \
+             still-valid migration can be falsely reported as timed out: {workflow}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_never_hardcodes_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("secrets."),
+            "azure-deploy.yml must source credentials from GitHub Actions secrets, \
+             never hardcode them: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_runs_migrations_before_updating_the_app() {
+        // The generated production config sets auto_migrate_in_production =
+        // false, so nothing else runs migrations; without this step, new
+        // replicas would start against an unmigrated schema on any release
+        // that includes a migration.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("az containerapp job start"),
+            "azure-deploy.yml must start the one-shot migration job: {content}"
+        );
+        assert!(
+            content.contains("AZURE_MIGRATE_JOB_NAME"),
+            "azure-deploy.yml must reference the migration job by its Terraform output: {content}"
+        );
+
+        // Match the actual invocations (with their line-continuation
+        // backslash), not just the bare phrase — an explanatory comment
+        // elsewhere (e.g. about concurrency) may legitimately mention
+        // "az containerapp update" in prose without a trailing "\".
+        let job_pos = content
+            .find("az containerapp job start \\")
+            .expect("migration job start must be present");
+        let deploy_pos = content
+            .find("az containerapp update \\")
+            .expect("deploy step must be present");
+        assert!(
+            job_pos < deploy_pos,
+            "the migration job must run BEFORE the app is updated to the new image: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_aborts_deploy_on_migration_failure() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        let migration_step = content
+            .split("Run database migrations")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("a 'Run database migrations' step must exist");
+        assert!(
+            migration_step.contains("set -euo pipefail") || migration_step.contains("exit 1"),
+            "the migration step must fail the job (and therefore never reach the deploy \
+             step) when the job execution doesn't succeed: {migration_step}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_sources_app_name_from_terraform_not_hardcoded() {
+        // If an operator edits `app_name` in terraform.tfvars after
+        // scaffolding, Terraform renames the Container App to match — the
+        // workflow must follow that rename, not target whatever the Cargo
+        // package was called when `autumn release init` ran. So it reads
+        // AZURE_APP_NAME from `terraform output app_name` (like
+        // AZURE_RESOURCE_GROUP/AZURE_MIGRATE_JOB_NAME) rather than having
+        // any project-derived name baked in at scaffold time.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "My_Test_App");
+        init(
+            &dir,
+            "My_Test_App",
+            false,
+            Target::AzureContainerApps,
+            false,
+        )
+        .unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("AZURE_APP_NAME"),
+            "azure-deploy.yml must reference AZURE_APP_NAME: {content}"
+        );
+        assert!(
+            content.contains("vars.AZURE_APP_NAME"),
+            "AZURE_APP_NAME must be sourced from a repository variable \
+             (terraform output app_name), not hardcoded: {content}"
+        );
+        assert!(
+            !content.contains("My_Test_App") && !content.contains("my-test-app"),
+            "azure-deploy.yml must not bake in any form of the project name as an \
+             Azure resource identifier: {content}"
+        );
+        assert!(
+            !content.contains("{{azure_app_name}}") && !content.contains("{{project_name}}"),
+            "azure-deploy.yml must not contain unsubstituted placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_sanitizes_ref_name_for_docker_tag() {
+        // A `v*` push tag or a workflow_dispatch branch name may contain
+        // characters Docker tags reject beyond just "/" (a branch like
+        // "feature/login") — e.g. "+" (a valid SemVer tag like
+        // "v1.2.3+build"). Docker tags only allow [A-Za-z0-9_.-], so every
+        // other character must be sanitized, not just "/" special-cased.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("tr -c 'A-Za-z0-9_.-' '-'"),
+            "azure-deploy.yml must map every character outside Docker's tag charset \
+             (not just \"/\") to \"-\": {content}"
+        );
+        assert!(
+            !content.contains(":${GITHUB_REF_NAME}") && !content.contains(":$GITHUB_REF_NAME"),
+            "no docker/az command may use the raw, unsanitized ref as an image tag: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_image_tag_never_starts_with_invalid_character() {
+        // Docker's tag grammar requires the first character to be a word
+        // character ([A-Za-z0-9_]) — "." and "-" are valid elsewhere but
+        // not at position zero. `tr` mapping invalid characters to "-" can
+        // leave one at the start (e.g. a ref beginning with "+"), which
+        // `docker build` rejects.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("sed -E 's/^[.-]+//'"),
+            "azure-deploy.yml must strip a leading \".\"/\"-\" left by sanitization: {content}"
+        );
+        assert!(
+            content.contains("[ -z \"$SAFE_REF\" ] && SAFE_REF=\"build\""),
+            "azure-deploy.yml must fall back to a valid literal if stripping leaves an \
+             empty ref (a ref made entirely of invalid characters): {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_image_tag_is_unique_per_execution() {
+        // Two workflow_dispatch runs on the same branch would otherwise
+        // compute the identical tag despite different commits — the commit
+        // SHA guards against that. But re-running workflow_dispatch on the
+        // same branch, or clicking "Re-run jobs" on an existing run, reuses
+        // the identical ref AND commit while still producing a genuinely
+        // different build (a fresh AUTUMN_BUILD_TIMESTAMP, possibly
+        // different base-image bytes) — so the tag must also include
+        // GITHUB_RUN_ID (unique per trigger) and GITHUB_RUN_ATTEMPT
+        // (disambiguates re-runs of that same trigger) to be unique per
+        // actual execution, not just per commit. Re-pushing bytes under a
+        // tag Azure already has configured on the Container App isn't
+        // guaranteed to register as a revision-scope change, so the old
+        // binary could keep serving against a newly migrated schema.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("${GITHUB_SHA:0:12}"),
+            "the computed image tag must include the commit SHA: {content}"
+        );
+        assert!(
+            content.contains("${GITHUB_RUN_ID}") && content.contains("${GITHUB_RUN_ATTEMPT}"),
+            "the computed image tag must also include the run ID and run attempt, so \
+             a re-run of the same trigger (same ref, same commit) never collides with \
+             the original run's tag: {content}"
+        );
+        // Docker tags cap at 128 characters; reserve room for the
+        // SHA/run-id/run-attempt suffix rather than letting the sanitized
+        // ref alone consume it.
+        assert!(
+            content.contains("cut -c1-80"),
+            "the sanitized ref portion must leave headroom for the rest of the tag \
+             within Docker's 128-character limit: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_serializes_overlapping_runs() {
+        // Two overlapping runs (e.g. two rapid tag pushes, or a tag push
+        // racing a manual dispatch) must not interleave: the older run's
+        // later `az containerapp update` could execute after the newer one
+        // and roll production back.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("concurrency:"),
+            "azure-deploy.yml must define a concurrency group so overlapping runs \
+             queue instead of racing: {content}"
+        );
+        assert!(
+            content.contains("cancel-in-progress: false"),
+            "cancel-in-progress must be false — killing a run mid-migration or \
+             mid-cutover is worse than making the next run wait: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_guards_against_superseded_run_before_migrating() {
+        // GitHub does not document strict FIFO ordering for which queued
+        // run in a concurrency group goes next. A same-ref check isn't
+        // enough either: two DIFFERENT immutable tags (e.g. v1 then v2)
+        // each trigger their own run against their own never-moving ref,
+        // so the guard must be ref-agnostic — comparing run_number (GitHub's
+        // own monotonic-in-trigger-order counter) against other runs of
+        // this workflow, not "has my own ref moved".
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("actions: read"),
+            "azure-deploy.yml must grant actions: read to query other workflow runs: {content}"
+        );
+        assert!(
+            content.contains("run_number > ${{ github.run_number }}"),
+            "the guard must compare against other runs' run_number, not just whether \
+             this run's own ref has moved: {content}"
+        );
+        // The guard must NOT filter by status/conclusion (e.g. only
+        // "in_progress"/"queued", or "completed" + conclusion == "success")
+        // — a newer run can migrate (the actual point of no return, since
+        // the schema is advanced at that point) and then fail on a LATER
+        // step, reporting an overall conclusion of "failure". There's no
+        // cheap way to tell "failed before migrating" apart from "failed
+        // after migrating" from a run's top-level status, so the mere
+        // existence of any newer run must be disqualifying, full stop.
+        let guard_step = content
+            .split("Abort if a newer run of this workflow exists")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("the run_number staleness guard step must be present");
+        assert!(
+            !guard_step.contains("in_progress")
+                && !guard_step.contains("queued")
+                && !guard_step.contains("conclusion"),
+            "the guard must not filter by status or conclusion — any newer run_number \
+             must disqualify this run regardless of outcome: {guard_step}"
+        );
+
+        let guard_pos = content
+            .find("gh api")
+            .expect("the run_number staleness guard must be present");
+        let job_pos = content
+            .find("az containerapp job start \\")
+            .expect("migration job start must be present");
+        let deploy_pos = content
+            .find("az containerapp update \\")
+            .expect("deploy step must be present");
+        assert!(
+            guard_pos < job_pos && job_pos < deploy_pos,
+            "the staleness guard must run BEFORE migration, which must run BEFORE \
+             deploy: {content}"
+        );
+    }
+
+    #[test]
+    fn init_without_force_errors_if_azure_workflow_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        fs::write(dir.join(".github/workflows/azure-deploy.yml"), "existing").unwrap();
+        let err = init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap_err();
+        assert!(matches!(err, ReleaseError::FileExists(_)));
+    }
+
+    #[test]
+    fn azure_target_adds_terraform_gitignore_entries_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        for line in AZURE_GITIGNORE_ENTRIES {
+            assert!(
+                content.lines().any(|l| l.trim() == *line),
+                "azure target must add `{line}` to .gitignore: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_target_gitignore_merge_preserves_existing_lines_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), "/target\n.env\n").unwrap();
+
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let after_first = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(after_first.contains("/target"), "{after_first}");
+        assert!(after_first.contains(".env"), "{after_first}");
+        for line in AZURE_GITIGNORE_ENTRIES {
+            assert!(
+                after_first.lines().any(|l| l.trim() == *line),
+                "{after_first}"
+            );
+        }
+
+        // Re-running (e.g. under --force) must not duplicate entries.
+        init(&dir, "my-app", true, Target::AzureContainerApps, false).unwrap();
+        let after_second = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        for line in AZURE_GITIGNORE_ENTRIES {
+            let count = after_second.lines().filter(|l| l.trim() == *line).count();
+            assert_eq!(
+                count, 1,
+                "`{line}` must appear exactly once: {after_second}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_target_reasserts_a_gitignore_entry_negated_after_its_earlier_occurrence() {
+        // Git applies the LAST matching rule: an existing .gitignore with
+        // "terraform.tfvars" followed later by "!terraform.tfvars" makes
+        // the file trackable, even though the literal pattern is present.
+        // A naive "is this line already there" check would wrongly treat
+        // it as already protected and add nothing, letting an operator
+        // commit the plaintext secrets this scaffold exists to keep out.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(
+            dir.join(".gitignore"),
+            "terraform.tfvars\nsome-other-line\n!terraform.tfvars\n",
+        )
+        .unwrap();
+
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+
+        // The negation must not have been touched (still there, doing its
+        // job for whatever the operator originally wanted un-ignored)...
+        assert!(content.contains("!terraform.tfvars"), "{content}");
+        // ...but "terraform.tfvars" must be re-asserted AFTER it (not just
+        // matched as a substring of "!terraform.tfvars" itself), since
+        // that's the only way to make it the final (and therefore
+        // effective) matching rule again.
+        let after_negation = content.find("!terraform.tfvars").unwrap() + "!terraform.tfvars".len();
+        assert!(
+            content[after_negation..].contains("terraform.tfvars"),
+            "terraform.tfvars must be re-added after the negation that defeated it: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_target_reasserts_entry_after_a_broader_wildcard_negation() {
+        // A wildcard negation like "!*.tfvars" or a blanket "!*" also
+        // un-ignores "terraform.tfvars" under git's own semantics, not
+        // just an exact "!terraform.tfvars" match. Matching gitignore's
+        // full glob syntax is out of scope, so any negation line
+        // appearing after the pattern must conservatively be treated as
+        // potentially applying to it.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), "terraform.tfvars\n!*.tfvars\n").unwrap();
+
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+
+        let after_negation = content.find("!*.tfvars").unwrap() + "!*.tfvars".len();
+        assert!(
+            content[after_negation..].contains("terraform.tfvars"),
+            "terraform.tfvars must be re-added after a broader wildcard negation too: \
+             {content}"
+        );
+    }
+
+    #[test]
+    fn azure_target_propagates_gitignore_read_errors_instead_of_clobbering_it() {
+        // A read failure that ISN'T "file doesn't exist" (invalid UTF-8,
+        // permission denied, ...) must not be silently treated as "no
+        // file" — doing so would make the merge overwrite the operator's
+        // real (if unreadable-by-us) .gitignore with just the Terraform
+        // entries, destroying whatever rules were already there.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+
+        let err = init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap_err();
+        assert!(
+            matches!(err, ReleaseError::Io(_)),
+            "an unreadable .gitignore must surface as an I/O error, not be silently \
+             replaced: {err}"
+        );
+        // The original (if unreadable) content must be left untouched.
+        let raw = fs::read(dir.join(".gitignore")).unwrap();
+        assert_eq!(raw, vec![0xFF, 0xFE, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn azure_target_gitignore_failure_leaves_no_partial_scaffold() {
+        // The .gitignore merge must be validated BEFORE any scaffold file
+        // is written — otherwise a read failure here leaves a partial,
+        // complete-looking scaffold on disk, and a retry without --force
+        // immediately fails on the files this very call just created.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap_err();
+
+        for name in [
+            "Dockerfile",
+            ".dockerignore",
+            "autumn.production.toml.example",
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+            ".github/workflows/azure-deploy.yml",
+        ] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must not exist after init() fails on the .gitignore merge \
+                 (found a partial scaffold, which blocks retrying without --force)"
+            );
+        }
+    }
+
+    #[test]
+    fn non_azure_targets_do_not_modify_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), "/target\n").unwrap();
+        init(&dir, "my-app", false, Target::DockerCompose, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(
+            content, "/target\n",
+            "non-azure targets must leave .gitignore untouched"
+        );
+    }
+
+    #[test]
+    fn init_with_force_overwrites_nested_azure_workflow_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        fs::write(
+            dir.join(".github/workflows/azure-deploy.yml"),
+            "old content",
+        )
+        .unwrap();
+        init(&dir, "my-app", true, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert_ne!(content, "old content");
+    }
+
     // ── --split-workers (opt-in split topology) ───────────────────────────────
 
     #[test]
@@ -1269,6 +3144,48 @@ previous_secrets = []
         );
     }
 
+    // ── azure workflow discoverability (git root vs. workspace member) ────────
+
+    #[test]
+    fn azure_workflow_relocation_warning_is_silent_at_the_git_root() {
+        // The common case: `dir` IS the git repository root (a single-crate
+        // repo, or a workspace member the user happens to be running from
+        // the top of anyway). `.github/workflows/azure-deploy.yml` lands
+        // exactly where GitHub looks for it — nothing to warn about.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        assert_eq!(azure_workflow_relocation_warning(&dir), None);
+    }
+
+    #[test]
+    fn azure_workflow_relocation_warning_flags_a_nested_workspace_member() {
+        // `autumn release init` explicitly supports running from a Cargo
+        // workspace member directory (read_project_name only rejects the
+        // workspace root itself) — but GitHub Actions only discovers
+        // workflows under the git repository ROOT's .github/workflows/, so
+        // a workflow written under a member subdirectory would silently
+        // never fire. This must be flagged, not silently mis-scaffolded.
+        let tmp = TempDir::new().unwrap();
+        let git_root = tmp.path().to_path_buf();
+        fs::create_dir_all(git_root.join(".git")).unwrap();
+        let member_dir = git_root.join("examples").join("blog");
+        fs::create_dir_all(&member_dir).unwrap();
+
+        let warning = azure_workflow_relocation_warning(&member_dir)
+            .expect("a workflow nested under a workspace member must be flagged");
+        assert!(
+            warning.contains(&git_root.display().to_string()),
+            "the warning must name the actual git root: {warning}"
+        );
+        assert!(
+            warning.contains("working-directory: examples/blog"),
+            "the warning must give the exact working-directory override needed so \
+             the relocated workflow's docker build step still finds this crate's \
+             Dockerfile: {warning}"
+        );
+    }
+
     // ── auto-migration config ─────────────────────────────────────────────────
 
     #[test]
@@ -1303,6 +3220,14 @@ previous_secrets = []
         assert_eq!(
             "docker-compose".parse::<Target>().unwrap(),
             Target::DockerCompose
+        );
+    }
+
+    #[test]
+    fn parse_target_azure_container_apps() {
+        assert_eq!(
+            "azure-container-apps".parse::<Target>().unwrap(),
+            Target::AzureContainerApps
         );
     }
 

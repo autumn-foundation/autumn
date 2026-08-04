@@ -661,6 +661,7 @@ enum Commands {
     ///   autumn release init --force
     ///   autumn release init --target fly
     ///   autumn release init --target docker-compose
+    ///   autumn release init --target azure-container-apps
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
@@ -1956,13 +1957,17 @@ enum ReleaseCommands {
     /// Emit production-ready deployment files at the project root.
     ///
     /// Default (no --target): Dockerfile + .dockerignore + autumn.production.toml.example.
-    /// --target fly        : also emits fly.toml.
-    /// --target docker-compose : also emits docker-compose.yml with app + Postgres.
+    /// --target fly                    : also emits fly.toml.
+    /// --target docker-compose         : also emits docker-compose.yml with app + Postgres.
+    /// --target azure-container-apps   : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/azure-deploy.yml.
     Init {
         /// Overwrite existing files instead of erroring on collision.
         #[arg(long)]
         force: bool,
-        /// Deployment target: fly | docker-compose (omit for bare Dockerfile).
+        /// Deployment target: fly | docker-compose | azure-container-apps (omit for bare
+        /// Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
         /// Scaffold a separate worker-role service in the generated
@@ -6108,6 +6113,22 @@ mod tests {
             panic!("expected release init");
         };
         assert_eq!(target.as_deref(), Some("docker-compose"));
+    }
+
+    #[test]
+    fn parse_release_init_with_azure_container_apps_target() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "release",
+            "init",
+            "--target",
+            "azure-container-apps",
+        ])
+        .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("azure-container-apps"));
     }
 
     #[test]

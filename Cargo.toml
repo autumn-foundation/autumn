@@ -81,7 +81,13 @@ tracing-opentelemetry = "0.33.0"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "grpc-tonic", "tls-aws-lc", "tls-roots", "http-proto", "reqwest-client", "reqwest-rustls"] }
-redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script"] }
+# tokio-rustls-comp (not tokio-native-tls-comp): the workspace already
+# standardizes on rustls elsewhere (instant-acme, opentelemetry-otlp).
+# Required for `rediss://` URLs — e.g. the azure-container-apps release
+# target's generated Redis Cache, which disables the non-TLS port — since
+# `redis::Client::open` otherwise errors immediately on that scheme with no
+# TLS feature compiled in.
+redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
 tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
 validator = { version = "0.20", features = ["derive"] }
