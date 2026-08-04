@@ -180,9 +180,19 @@ struct InsertMembership {
 
 /// Only ever redirect to a same-origin path after login — an unvalidated
 /// `next` would be an open-redirect vector.
+///
+/// Rejects a leading `//` (a protocol-relative URL browsers resolve against
+/// the current scheme but an arbitrary host) *and* any backslash anywhere in
+/// the path: browsers parsing an HTTP(S) URL treat `\` the same as `/`, so
+/// `/\evil.com` (which this app never legitimately needs — no route here
+/// uses one) would otherwise slip past the `//` check while still resolving
+/// as `//evil.com` in the browser, redirecting off-site (Codex review
+/// finding).
 fn safe_next(next: Option<&str>) -> &str {
     match next {
-        Some(path) if path.starts_with('/') && !path.starts_with("//") => path,
+        Some(path) if path.starts_with('/') && !path.starts_with("//") && !path.contains('\\') => {
+            path
+        }
         _ => "/members",
     }
 }
@@ -299,4 +309,45 @@ pub async fn establish_session(session: &Session, user_id: i64, tenant_id: &str,
     session.insert("user_id", user_id.to_string()).await;
     session.insert("organization_id", tenant_id).await;
     session.insert("role", role.as_str()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_next;
+
+    #[test]
+    fn accepts_a_same_origin_path() {
+        assert_eq!(safe_next(Some("/members")), "/members");
+    }
+
+    #[test]
+    fn rejects_missing_or_empty_next() {
+        assert_eq!(safe_next(None), "/members");
+        assert_eq!(safe_next(Some("")), "/members");
+    }
+
+    #[test]
+    fn rejects_a_protocol_relative_url() {
+        assert_eq!(safe_next(Some("//evil.test")), "/members");
+    }
+
+    #[test]
+    fn rejects_a_scheme_qualified_url() {
+        assert_eq!(safe_next(Some("https://evil.test")), "/members");
+    }
+
+    /// Browsers parsing an HTTP(S) URL treat `\` the same as `/`, so a path
+    /// starting with a single `/` followed by `\` resolves as a
+    /// protocol-relative URL in the browser even though it isn't literally
+    /// `//`-prefixed (Codex review finding).
+    #[test]
+    fn rejects_a_backslash_disguised_protocol_relative_url() {
+        assert_eq!(safe_next(Some("/\\evil.test")), "/members");
+        assert_eq!(safe_next(Some("/\\/evil.test")), "/members");
+    }
+
+    #[test]
+    fn rejects_a_backslash_anywhere_in_the_path() {
+        assert_eq!(safe_next(Some("/members\\..\\evil")), "/members");
+    }
 }

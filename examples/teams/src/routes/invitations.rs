@@ -26,7 +26,7 @@
 //! too — this split keeps the public surface exactly as small as it needs to
 //! be instead of relying on a fragile allowlist.
 
-use autumn_web::auth::{generate_raw_token, hash_api_token, hash_password};
+use autumn_web::auth::{generate_raw_token, hash_api_token, hash_password, verify_password};
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
 use diesel::prelude::*;
@@ -241,6 +241,11 @@ enum Joiner {
     Existing(i64),
     New {
         email: String,
+        /// The plaintext password, kept alongside `password_hash` so a
+        /// concurrently-created account (see `accept_invitation`) can be
+        /// verified against the *submitted* password rather than blindly
+        /// adopted.
+        password: String,
         password_hash: String,
     },
 }
@@ -485,6 +490,7 @@ pub async fn accept_invitation(
                 let password_hash = hash_password(password).await?;
                 Joiner::New {
                     email,
+                    password: password.to_owned(),
                     password_hash,
                 }
             }
@@ -524,6 +530,7 @@ pub async fn accept_invitation(
                     Joiner::Existing(uid) => uid,
                     Joiner::New {
                         email,
+                        password,
                         password_hash,
                     } => {
                         // Now that concurrent accepts are serialized on the
@@ -540,6 +547,23 @@ pub async fn accept_invitation(
                             .await
                             .optional()?;
                         if let Some(user) = existing_user {
+                            // Security-critical: this account may have just
+                            // been created a moment ago by an unrelated
+                            // request racing the *same* invitation link
+                            // (e.g. an attacker who obtained a forwarded or
+                            // leaked token) with a *different* password.
+                            // Blindly adopting it here without checking
+                            // would authenticate this caller into an
+                            // account whose credentials they never actually
+                            // supplied — verify the submitted password
+                            // against the stored hash first, exactly like
+                            // `login` does, and reject rather than log in
+                            // on a mismatch (Codex review finding).
+                            if !verify_password(&password, &user.password_hash).await? {
+                                return Err(AutumnError::unauthorized_msg(
+                                    "An account already exists for this email — log in to accept",
+                                ));
+                            }
                             user.id
                         } else {
                             let user: User = diesel::insert_into(users::table)

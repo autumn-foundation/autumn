@@ -291,6 +291,69 @@ async fn concurrent_signup_and_accept_for_the_same_new_email_both_succeed() {
     );
 }
 
+/// Security regression: two *different* requests racing the same unused
+/// invitation link with different passwords must not both succeed — the
+/// loser must never be silently logged in to the account the winner just
+/// created, since that account's password is the winner's, not theirs. This
+/// would let anyone who obtains a not-yet-accepted invitation token (a
+/// forwarded link, a mail-scanner fetch, a shared clipboard) race the real
+/// invitee's legitimate accept and get authenticated into their brand-new
+/// account without ever knowing its password (Codex review finding).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_accept_with_different_passwords_does_not_authenticate_the_loser() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    let token = latest_invite_token(dir.path());
+
+    let (first, second) = tokio::join!(
+        client
+            .post(&format!("/invite/{token}/accept"))
+            .form("password=First-Str0ng-Pa55word")
+            .send(),
+        client
+            .post(&format!("/invite/{token}/accept"))
+            .form("password=Second-Different-Pa55word")
+            .send(),
+    );
+
+    let statuses = [first.status.as_u16(), second.status.as_u16()];
+    assert!(
+        statuses.contains(&303) && statuses.contains(&401),
+        "exactly one request (whichever wins the account-creation race) \
+         should succeed (303); the other, submitting a password that \
+         doesn't match the account just created, must be rejected (401) \
+         rather than silently authenticated into it — got {statuses:?}"
+    );
+
+    // Only one membership/account exists either way.
+    let winner_cookie = if first.status.as_u16() == 303 {
+        session_cookie(&first)
+    } else {
+        session_cookie(&second)
+    };
+    let members_body = client
+        .get("/members")
+        .header("cookie", &winner_cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert_eq!(
+        members_body.matches("newbie@acme.test").count(),
+        1,
+        "{members_body}"
+    );
+}
+
 /// AC5(b): an already-authenticated user accepting an invite joins directly,
 /// no signup step.
 #[tokio::test]
@@ -509,6 +572,73 @@ async fn admin_cannot_demote_or_remove_an_owner_even_with_multiple_owners() {
         .send()
         .await;
     remove_resp.assert_status(403);
+}
+
+/// Two Owners concurrently demoting *each other* must not both succeed —
+/// each request's last-owner check ("is this the only Owner left?") has to
+/// run atomically with its own demotion, or both requests can read the same
+/// two-owner snapshot, both pass, and leave the organization with zero
+/// Owners (Codex review finding: the last-owner check and the mutation were
+/// previously a read-then-write race, not one locked transaction).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_mutual_demotion_of_the_last_two_owners_does_not_leave_zero_owners() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+
+    // A second Owner (member id 2).
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=co-owner@acme.test&role=owner")
+        .send()
+        .await
+        .assert_status(303);
+    let co_owner_token = latest_invite_token(dir.path());
+    let co_owner_accept = client
+        .post(&format!("/invite/{co_owner_token}/accept"))
+        .form("password=An0ther-Str0ng-Pa55word")
+        .send()
+        .await;
+    let co_owner_cookie = session_cookie(&co_owner_accept);
+
+    // Owner (id 1) demotes co-owner (id 2), and co-owner (id 2) demotes
+    // owner (id 1), at the same time.
+    let (first, second) = tokio::join!(
+        client
+            .post("/members/2/role")
+            .header("cookie", &owner_cookie)
+            .form("role=member")
+            .send(),
+        client
+            .post("/members/1/role")
+            .header("cookie", &co_owner_cookie)
+            .form("role=member")
+            .send(),
+    );
+
+    let statuses = [first.status.as_u16(), second.status.as_u16()];
+    assert!(
+        statuses.contains(&303) && statuses.contains(&409),
+        "exactly one concurrent mutual demotion should succeed (303) and \
+         the other should be rejected as the last owner (409), got {statuses:?}"
+    );
+
+    let members_body = client
+        .get("/members")
+        .header("cookie", &owner_cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert_eq!(
+        members_body
+            .matches("text-xs uppercase text-gray-400\">owner<")
+            .count(),
+        1,
+        "exactly one owner must remain after the race: {members_body}"
+    );
 }
 
 /// AC5: a double-clicked accept link is a no-op, not a duplicate membership

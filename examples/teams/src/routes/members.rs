@@ -14,24 +14,29 @@
 //! Admin promote themselves (or an ally) to `Owner` and from there demote/
 //! remove the organization's real owners.
 //!
-//! The last-owner check reads `find_all()` then acts without a row lock, so
-//! two concurrent requests demoting/removing each of exactly two remaining
-//! owners could in principle both pass the check. A production app should
-//! close that window with a `SELECT ... FOR UPDATE` transaction (mirroring
-//! `routes::invitations::accept_invitation`'s row-locked pattern); left as a
-//! narrow, documented gap here rather than duplicating that machinery for a
-//! race that only costs the ability to grant a *new* Owner, not any existing
-//! capability.
+//! `change_role`/`remove_member` read every membership row in the active
+//! organization with `SELECT ... FOR UPDATE` and perform the last-owner
+//! count check and the mutation inside that same locked transaction
+//! (mirroring `routes::invitations::accept_invitation`'s row-locked
+//! pattern) — without that, two concurrent requests demoting/removing each
+//! of exactly two remaining owners could both read the same two-owner
+//! snapshot, both pass the check, and leave the organization with none
+//! (Codex review finding; previously a documented gap here, on the mistaken
+//! assumption it could only cost the ability to grant a *new* Owner rather
+//! than leave zero).
 
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
+use scoped_futures::ScopedFutureExt;
 
 use crate::models::{ChangeRoleForm, Invitation, Membership};
 use crate::repositories::{
     InvitationRepository, MembershipRepository, PgInvitationRepository, PgMembershipRepository,
 };
 use crate::role::{Role, require_role};
-use crate::schema::users;
+use crate::schema::{memberships, users};
 
 use super::layout::{csrf_value, layout};
 
@@ -203,6 +208,8 @@ async fn load_emails(
 #[post("/members/{id}/role")]
 pub async fn change_role(
     session: Session,
+    mut db: Db,
+    Tenant(tenant_id): Tenant,
     membership_repo: PgMembershipRepository,
     Path(membership_id): Path<i64>,
     Form(form): Form<ChangeRoleForm>,
@@ -217,36 +224,54 @@ pub async fn change_role(
         ));
     }
 
-    let memberships = membership_repo.find_all().await?;
-    let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
-        return Err(AutumnError::not_found_msg("Member not found"));
-    };
-    // The `Owner > Admin` hierarchy must hold regardless of how many owners
-    // exist: an Admin changing an Owner's role — even with other owners
-    // still in place — is a demotion of a higher role by a lower one.
-    if target.role == Role::Owner.as_str() && caller_role != Role::Owner {
-        return Err(AutumnError::forbidden_msg(
-            "Only an owner can change another owner's role",
-        ));
-    }
-    if target.role == Role::Owner.as_str()
-        && new_role != Role::Owner
-        && owner_count(&memberships) <= 1
-    {
-        return Err(AutumnError::conflict_msg(
-            "Cannot demote the last owner of an organization",
-        ));
-    }
+    // Raw query (not the `tenant_scoped` repository's plain `find_all()`)
+    // inside one locked transaction: reading the owner count and demoting
+    // the target must be atomic, or two concurrent requests each demoting a
+    // *different* one of exactly two remaining owners could both read the
+    // same two-owner snapshot, both pass the last-owner check below, and
+    // leave the organization with none (Codex review finding — this was
+    // previously a documented, accepted gap, but it can leave zero owners
+    // outright, not merely block granting a *new* one).
+    db.tx(move |conn| {
+        async move {
+            let memberships: Vec<Membership> = memberships::table
+                .filter(memberships::tenant_id.eq(&tenant_id))
+                .for_update()
+                .select(Membership::as_select())
+                .load(conn)
+                .await?;
+            let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
+                return Err(AutumnError::not_found_msg("Member not found"));
+            };
+            // The `Owner > Admin` hierarchy must hold regardless of how many
+            // owners exist: an Admin changing an Owner's role — even with
+            // other owners still in place — is a demotion of a higher role
+            // by a lower one.
+            if target.role == Role::Owner.as_str() && caller_role != Role::Owner {
+                return Err(AutumnError::forbidden_msg(
+                    "Only an owner can change another owner's role",
+                ));
+            }
+            if target.role == Role::Owner.as_str()
+                && new_role != Role::Owner
+                && owner_count(&memberships) <= 1
+            {
+                return Err(AutumnError::conflict_msg(
+                    "Cannot demote the last owner of an organization",
+                ));
+            }
 
-    membership_repo
-        .update(
-            membership_id,
-            &crate::models::UpdateMembership {
-                role: Patch::Set(new_role.as_str().to_owned()),
-                ..Default::default()
-            },
-        )
-        .await?;
+            diesel::update(memberships::table.filter(memberships::id.eq(membership_id)))
+                .set(memberships::role.eq(new_role.as_str()))
+                .execute(conn)
+                .await?;
+
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
+
     Ok(Redirect::to("/members").into_response())
 }
 
@@ -257,26 +282,49 @@ pub async fn change_role(
 #[post("/members/{id}/remove")]
 pub async fn remove_member(
     session: Session,
+    mut db: Db,
+    Tenant(tenant_id): Tenant,
     membership_repo: PgMembershipRepository,
     Path(membership_id): Path<i64>,
 ) -> AutumnResult<Response> {
     let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
 
-    let memberships = membership_repo.find_all().await?;
-    let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
-        return Err(AutumnError::not_found_msg("Member not found"));
-    };
-    if target.role == Role::Owner.as_str() && caller_role != Role::Owner {
-        return Err(AutumnError::forbidden_msg(
-            "Only an owner can remove another owner",
-        ));
-    }
-    if target.role == Role::Owner.as_str() && owner_count(&memberships) <= 1 {
-        return Err(AutumnError::conflict_msg(
-            "Cannot remove the last owner of an organization",
-        ));
-    }
+    // Same race as `change_role` (see its comment): the owner-count check
+    // and the removal must run inside one locked transaction, or two
+    // concurrent requests removing two different owners could both pass
+    // the last-owner check and leave the organization with none (Codex
+    // review finding).
+    db.tx(move |conn| {
+        async move {
+            let memberships: Vec<Membership> = memberships::table
+                .filter(memberships::tenant_id.eq(&tenant_id))
+                .for_update()
+                .select(Membership::as_select())
+                .load(conn)
+                .await?;
+            let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
+                return Err(AutumnError::not_found_msg("Member not found"));
+            };
+            if target.role == Role::Owner.as_str() && caller_role != Role::Owner {
+                return Err(AutumnError::forbidden_msg(
+                    "Only an owner can remove another owner",
+                ));
+            }
+            if target.role == Role::Owner.as_str() && owner_count(&memberships) <= 1 {
+                return Err(AutumnError::conflict_msg(
+                    "Cannot remove the last owner of an organization",
+                ));
+            }
 
-    membership_repo.delete_by_id(membership_id).await?;
+            diesel::delete(memberships::table.filter(memberships::id.eq(membership_id)))
+                .execute(conn)
+                .await?;
+
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
+
     Ok(Redirect::to("/members").into_response())
 }
