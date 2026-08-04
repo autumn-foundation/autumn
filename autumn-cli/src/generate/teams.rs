@@ -392,18 +392,23 @@ const MOD_RS: &str = r#"//! Team membership, roles, and email invitations (issue
 //! your existing auth flow (see `docs/generate-teams.md` for the full
 //! walkthrough):
 //!
-//! 1. **At signup**, after your handler establishes the base session, call
+//! 1. **At signup**, right after your handler creates the account row, call
 //!    [`routes::organizations::provision_default_organization`] to create
-//!    the new user's personal organization and make them its `Owner`:
+//!    the new user's personal organization and make them its `Owner`. This
+//!    only writes the organization/membership rows — it deliberately does
+//!    NOT touch the session (see its own doc comment for why: signup and
+//!    "authenticated" aren't the same event once email confirmation is
+//!    involved, e.g. with `autumn generate auth`'s scaffolded `signup`):
 //!
 //!    ```ignore
 //!    teams::routes::organizations::provision_default_organization(
-//!        &session, user.id, &mut db,
+//!        user.id, &mut db,
 //!    ).await?;
 //!    ```
 //!
 //! 2. **At login**, after your handler authenticates the user, resolve their
-//!    active organization/role and set it on the session:
+//!    active organization/role and set it on the session — this is what
+//!    actually establishes the org session, on the user's first real login:
 //!
 //!    ```ignore
 //!    let memberships = membership_repo.across_tenants().find_by_user_id(user.id).await?;
@@ -694,9 +699,12 @@ pub async fn require_role(
 }
 
 /// Record the active organization + role on the session — e.g. after login,
-/// after signup (via
-/// [`super::routes::organizations::provision_default_organization`]), after
-/// switching organizations, or after accepting an invitation.
+/// after switching organizations, or after accepting an invitation. Not
+/// called by
+/// [`super::routes::organizations::provision_default_organization`] itself
+/// (see that function's doc comment for why signup and "authenticated"
+/// aren't always the same event) — the first login after signup is what
+/// establishes the org session for a newly-provisioned organization.
 ///
 /// `tenant_id` is the active `Organization.id` in its string form — the same
 /// value the `tenant_scoped` `Membership`/`Invitation` repositories filter by
@@ -885,6 +893,7 @@ pub mod members;
 pub mod organizations;
 
 use autumn_web::prelude::*;
+use autumn_web::security::CsrfToken;
 
 /// A minimal, dependency-free HTML wrapper for this module's own pages.
 ///
@@ -906,6 +915,20 @@ pub(super) fn minimal_page(title: &str, content: Markup) -> Markup {
             }
         }
     }
+}
+
+/// The CSRF token to embed in a form's hidden `_csrf` field, or `""` when
+/// `CsrfLayer` isn't mounted (e.g. `[security.csrf] enabled = false`).
+///
+/// Handlers extract `Option<CsrfToken>` (not the bare, non-optional
+/// `CsrfToken`) specifically so they degrade gracefully rather than 500ing
+/// when CSRF is disabled — every generated form embeds this in a hidden
+/// `_csrf` field, since `CsrfLayer` is on by default (including Autumn's
+/// production-profile smart default) and would otherwise reject every POST
+/// this module's forms submit. Mirrors `examples/teams`'s `layout.rs`
+/// helper of the same name.
+pub(super) fn csrf_value(csrf: &Option<CsrfToken>) -> &str {
+    csrf.as_ref().map_or("", CsrfToken::token)
 }
 "#;
 
@@ -942,9 +965,23 @@ struct InsertMembership {
 }
 
 /// Create a personal organization for a brand-new user and make them its
-/// `Owner` — call this as the last line of your own signup handler, right
-/// after it establishes the base session (issue #1261 AC3; see
-/// `crate::teams`'s module doc for the full two-step integration).
+/// `Owner` — call this as the last line of your own signup handler (issue
+/// #1261 AC3; see `crate::teams`'s module doc for the full two-step
+/// integration).
+///
+/// Deliberately does NOT call [`establish_org_session`] or otherwise touch
+/// the session: signup and "the user is authenticated" are not the same
+/// event for every app. `autumn generate auth`'s own scaffolded `signup`
+/// creates the account but does not log it in — it's gated on email
+/// confirmation, and only starts a session once the user actually confirms
+/// and logs in. If this function established the org session here, calling
+/// it from that handler (the most natural place to call it, and the one
+/// this crate's own docs point at) would silently authenticate an
+/// unconfirmed account, bypassing the confirmation gate entirely. Creating
+/// the organization/membership rows is safe unconditionally — resolving
+/// the active org and calling `establish_org_session` is the *login*
+/// flow's job (step 2 of the two-step integration), which naturally picks
+/// this membership up the first time the user actually logs in.
 ///
 /// `db` is your own signup handler's `Db` extractor: the organization and
 /// membership inserts run in one transaction on it, so a failure between
@@ -953,38 +990,31 @@ struct InsertMembership {
 /// has no way to join an arbitrary caller's already-open transaction) —
 /// if you need that too, run this function's two inserts inline inside
 /// your own `db.tx(...)` block instead of calling it separately.
-pub async fn provision_default_organization(
-    session: &Session,
-    user_id: i64,
-    db: &mut Db,
-) -> AutumnResult<()> {
-    let org: Organization = db
-        .tx(move |conn| {
-            async move {
-                let org: Organization = diesel::insert_into(organizations::table)
-                    .values(&InsertOrganization {
-                        name: format!("User {user_id}'s Organization"),
-                    })
-                    .returning(Organization::as_returning())
-                    .get_result(conn)
-                    .await?;
+pub async fn provision_default_organization(user_id: i64, db: &mut Db) -> AutumnResult<()> {
+    db.tx(move |conn| {
+        async move {
+            let org: Organization = diesel::insert_into(organizations::table)
+                .values(&InsertOrganization {
+                    name: format!("User {user_id}'s Organization"),
+                })
+                .returning(Organization::as_returning())
+                .get_result(conn)
+                .await?;
 
-                diesel::insert_into(memberships::table)
-                    .values(&InsertMembership {
-                        tenant_id: org.id.to_string(),
-                        user_id,
-                        role: Role::Owner.as_str().to_owned(),
-                    })
-                    .execute(conn)
-                    .await?;
+            diesel::insert_into(memberships::table)
+                .values(&InsertMembership {
+                    tenant_id: org.id.to_string(),
+                    user_id,
+                    role: Role::Owner.as_str().to_owned(),
+                })
+                .execute(conn)
+                .await?;
 
-                Ok::<_, AutumnError>(org)
-            }
-            .scope_boxed()
-        })
-        .await?;
-    establish_org_session(session, user_id, &org.id.to_string(), Role::Owner).await;
-    Ok(())
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await
 }
 
 /// Create a new organization; the caller becomes its `Owner` and it becomes
@@ -1104,13 +1134,12 @@ use autumn_web::auth::{generate_raw_token, hash_api_token};
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
 use autumn_web::reexports::scoped_futures::ScopedFutureExt;
+use autumn_web::security::CsrfToken;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::teams::mailers::invitation_mailer::InvitationMailer;
-use crate::teams::models::{
-    InviteForm, Invitation, Membership, NewInvitation, UpdateInvitation,
-};
+use crate::teams::models::{InviteForm, Invitation, Membership, UpdateInvitation};
 use crate::teams::repositories::{
     InvitationRepository, OrganizationRepository, PgInvitationRepository, PgMembershipRepository,
     PgOrganizationRepository,
@@ -1118,7 +1147,7 @@ use crate::teams::repositories::{
 use crate::teams::role::{Role, establish_org_session, require_role};
 use crate::teams::schema::{invitations, memberships};
 
-use super::minimal_page;
+use super::{csrf_value, minimal_page};
 
 const INVITATION_TTL_DAYS: i64 = 7;
 
@@ -1171,9 +1200,9 @@ fn app_base_url() -> String {
 #[post("/invitations")]
 pub async fn create_invitation(
     session: Session,
-    Tenant(org_id): Tenant,
+    Tenant(tenant_id): Tenant,
+    mut db: Db,
     org_repo: PgOrganizationRepository,
-    invitation_repo: PgInvitationRepository,
     membership_repo: PgMembershipRepository,
     mailer: Mailer,
     Form(form): Form<InviteForm>,
@@ -1196,7 +1225,7 @@ pub async fn create_invitation(
         ));
     }
 
-    let org_id: i64 = org_id.parse().map_err(|_| {
+    let org_id: i64 = tenant_id.parse().map_err(|_| {
         AutumnError::internal_server_error_msg("Corrupt organization id in session")
     })?;
     let Some(organization) = org_repo.find_by_id(org_id).await? else {
@@ -1204,16 +1233,47 @@ pub async fn create_invitation(
     };
 
     let raw_token = generate_raw_token();
-    invitation_repo
-        .save(&NewInvitation {
-            email: email.clone(),
-            role: role.as_str().to_owned(),
-            token_hash: hash_api_token(&raw_token),
-            status: "pending".to_owned(),
-            invited_by_user_id: inviter_id,
-            expires_at: chrono::Utc::now().naive_utc() + chrono::Duration::days(INVITATION_TTL_DAYS),
-        })
-        .await?;
+    let token_hash = hash_api_token(&raw_token);
+    let insert_email = email.clone();
+    let insert_role = role.as_str().to_owned();
+    db.tx(move |conn| {
+        async move {
+            // Revoke any other still-pending invitation to this email in
+            // this organization before creating the new one — otherwise
+            // both tokens would stay independently valid, and accepting
+            // one would leave the other pending indefinitely (the same
+            // lingering-token issue `accept_invitation` guards against for
+            // an already-a-member accept, but here at creation time for
+            // two never-yet-accepted invitations to the same address).
+            diesel::update(
+                invitations::table
+                    .filter(invitations::tenant_id.eq(&tenant_id))
+                    .filter(invitations::email.eq(&insert_email))
+                    .filter(invitations::status.eq("pending")),
+            )
+            .set(invitations::status.eq("revoked"))
+            .execute(conn)
+            .await?;
+
+            diesel::insert_into(invitations::table)
+                .values(&InsertInvitation {
+                    tenant_id,
+                    email: insert_email,
+                    role: insert_role,
+                    token_hash,
+                    status: "pending".to_owned(),
+                    invited_by_user_id: inviter_id,
+                    expires_at: chrono::Utc::now().naive_utc()
+                        + chrono::Duration::days(INVITATION_TTL_DAYS),
+                })
+                .execute(conn)
+                .await?;
+
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
 
     let accept_url = format!("{}/invite/{raw_token}", app_base_url());
     // Sent synchronously (not `deliver_later_invite`): the success metric is
@@ -1281,6 +1341,7 @@ pub async fn show_invitation(
     session: Session,
     invitation_repo: PgInvitationRepository,
     org_repo: PgOrganizationRepository,
+    csrf: Option<CsrfToken>,
     Path(raw_token): Path<String>,
 ) -> AutumnResult<Response> {
     let Some(invitation) = load_pending_invitation(&invitation_repo, &raw_token).await? else {
@@ -1311,6 +1372,7 @@ pub async fn show_invitation(
                 h1 { "Join " (organization.name) }
                 p { "You've been invited as " (invitation.role) "." }
                 form action={"/invite/" (raw_token) "/accept"} method="post" {
+                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                     button type="submit" { "Accept invitation" }
                 }
             },
@@ -1612,6 +1674,7 @@ const ROUTES_MEMBERS_RS: &str = r#"//! Member-management surface: list members +
 
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
+use autumn_web::security::CsrfToken;
 
 use crate::teams::models::{ChangeRoleForm, Invitation, Membership, UpdateMembership};
 use crate::teams::repositories::{
@@ -1619,7 +1682,7 @@ use crate::teams::repositories::{
 };
 use crate::teams::role::{Role, require_role};
 
-use super::minimal_page;
+use super::{csrf_value, minimal_page};
 
 /// Count how many `owner` members remain in the active organization. Used to
 /// block demoting/removing the last one.
@@ -1635,6 +1698,7 @@ pub async fn list_members(
     session: Session,
     membership_repo: PgMembershipRepository,
     invitation_repo: PgInvitationRepository,
+    csrf: Option<CsrfToken>,
 ) -> AutumnResult<Response> {
     // Any member (not just Admin+) can view the roster; only Admin+ sees the
     // management controls below.
@@ -1658,6 +1722,7 @@ pub async fn list_members(
 
             @if can_manage {
                 form action="/invitations" method="post" {
+                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                     input name="email" type="email" required placeholder="teammate@example.com"
                           aria-label="Email to invite";
                     select name="role" aria-label="Role" {
@@ -1684,6 +1749,7 @@ pub async fn list_members(
                             @let locked = membership.role == Role::Owner.as_str()
                                 && (caller_role != Role::Owner || owners <= 1);
                             form action={"/members/" (membership.id) "/role"} method="post" {
+                                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                                 select name="role" aria-label="Change role" disabled[locked] {
                                     option value="member" selected[membership.role == "member"] { "Member" }
                                     option value="admin" selected[membership.role == "admin"] { "Admin" }
@@ -1692,6 +1758,7 @@ pub async fn list_members(
                                 button type="submit" disabled[locked] { "Update" }
                             }
                             form action={"/members/" (membership.id) "/remove"} method="post" {
+                                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                                 button type="submit" disabled[locked] { "Remove" }
                             }
                         }
@@ -1707,9 +1774,11 @@ pub async fn list_members(
                             span { (invitation.email) }
                             span { " (" (invitation.role) ")" }
                             form action={"/invitations/" (invitation.id) "/resend"} method="post" {
+                                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                                 button type="submit" { "Resend" }
                             }
                             form action={"/invitations/" (invitation.id) "/revoke"} method="post" {
+                                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
                                 button type="submit" { "Revoke" }
                             }
                         }
@@ -1977,6 +2046,46 @@ async fn main() {
         assert!(
             down.contains("DROP TABLE IF EXISTS organizations"),
             "{down}"
+        );
+    }
+
+    /// Every generated mutating form must embed a CSRF hidden field —
+    /// otherwise `CsrfLayer` (on by default, including Autumn's
+    /// production-profile smart default) rejects every one of these POSTs
+    /// before the handler runs (Codex review finding).
+    #[test]
+    fn generated_forms_embed_csrf_token() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        let members = fs::read_to_string(tmp.path().join("src/teams/routes/members.rs")).unwrap();
+
+        let csrf_field_count = invitations
+            .matches("input type=\"hidden\" name=\"_csrf\" value=(csrf_value(&csrf));")
+            .count()
+            + members
+                .matches("input type=\"hidden\" name=\"_csrf\" value=(csrf_value(&csrf));")
+                .count();
+        assert_eq!(
+            csrf_field_count,
+            6,
+            "expected one CSRF field per generated form (accept, invite, role, remove, \
+             resend, revoke): invitations.rs has {}, members.rs has {}",
+            invitations.matches("form action=").count(),
+            members.matches("form action=").count()
+        );
+        assert!(
+            invitations.contains("csrf: Option<CsrfToken>"),
+            "show_invitation must extract Option<CsrfToken>: {invitations}"
+        );
+        assert!(
+            members.contains("csrf: Option<CsrfToken>"),
+            "list_members must extract Option<CsrfToken>: {members}"
         );
     }
 
@@ -2432,6 +2541,61 @@ async fn main() {
         assert!(
             invitations.contains("if invitation.status == \"pending\""),
             "{invitations}"
+        );
+    }
+
+    /// A second `create_invitation` call for the same organization/email
+    /// while an earlier one is still pending must not leave two live
+    /// tokens — the older one must be revoked in the same transaction as
+    /// the new one is inserted (Codex review finding).
+    #[test]
+    fn create_invitation_revokes_prior_pending_invitation_for_same_email() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        assert!(
+            invitations.contains(".filter(invitations::status.eq(\"pending\"))")
+                && invitations.contains(".set(invitations::status.eq(\"revoked\"))"),
+            "{invitations}"
+        );
+    }
+
+    /// `provision_default_organization` must never establish the org
+    /// session itself: `autumn generate auth`'s scaffolded `signup` creates
+    /// an account without logging it in (gated on email confirmation), and
+    /// this is the natural place a caller would append the call — doing so
+    /// would silently authenticate an unconfirmed account (Codex review
+    /// finding).
+    #[test]
+    fn provision_default_organization_does_not_establish_session() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
+        assert!(
+            organizations
+                .contains("pub async fn provision_default_organization(user_id: i64, db: &mut Db)"),
+            "{organizations}"
+        );
+        let body_start = organizations
+            .find("pub async fn provision_default_organization")
+            .unwrap();
+        let body_end = organizations
+            .find("pub async fn create_organization")
+            .unwrap();
+        let body = &organizations[body_start..body_end];
+        assert!(
+            !body.contains("establish_org_session"),
+            "provision_default_organization must not establish a session: {body}"
         );
     }
 

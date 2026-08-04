@@ -54,19 +54,30 @@ no foreign-key coupling to your schema.
 Two lines of integration code — the issue's ≤ 3 commands / ≤ 20 lines
 success metric — are all that's needed:
 
-**1. At signup**, after your handler establishes the base session, call
+**1. At signup**, right after your handler creates the account row, call
 `provision_default_organization` to create the new user's personal
 organization and make them its `Owner`:
 
 ```rust
 teams::routes::organizations::provision_default_organization(
-    &session, user.id, &mut db,
+    user.id, &mut db,
 ).await?;
 ```
 
 `db` is your own signup handler's `Db` extractor — the organization and
 membership inserts run in one transaction on it, so a failure between the
 two can never leave an orphaned organization with no members.
+
+This deliberately does **not** touch the session — signup and "the user is
+authenticated" aren't the same event for every app. `autumn generate auth`'s
+own scaffolded `signup` creates the account but doesn't log it in: it's
+gated on email confirmation, and only starts a session once the user
+actually confirms and logs in. If this call established the org session
+here, appending it to that handler — the most natural place to call it —
+would silently authenticate an unconfirmed account, bypassing the
+confirmation gate. Establishing the session for the newly-provisioned
+organization is step 2's job, below, which picks it up the first time the
+user actually logs in.
 
 **2. At login**, after your handler authenticates the user, resolve their
 active organization/role and set it on the session:

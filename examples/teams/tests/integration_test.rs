@@ -655,6 +655,65 @@ async fn double_resend_does_not_create_two_pending_invitations() {
     );
 }
 
+/// A second `create_invitation` for the same organization/email while an
+/// earlier one is still pending must revoke the older one instead of
+/// leaving two independently valid tokens live — otherwise accepting one
+/// would leave the other pending indefinitely (redeemable even after the
+/// member is later removed).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn second_invite_to_same_email_revokes_the_first() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    let first_token = latest_invite_token(dir.path());
+
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    let second_token = latest_invite_token(dir.path());
+
+    let members_body = client
+        .get("/members")
+        .header("cookie", &owner_cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert_eq!(
+        members_body.matches("newbie@acme.test").count(),
+        1,
+        "a second invite to the same email must revoke the first, not leave two pending: {members_body}"
+    );
+
+    // The first (now-revoked) token no longer works...
+    client
+        .get(&format!("/invite/{first_token}"))
+        .send()
+        .await
+        .assert_status(410);
+
+    // ...but the second (current) token does.
+    client
+        .post(&format!("/invite/{second_token}/accept"))
+        .form("password=An0ther-Str0ng-Pa55word")
+        .send()
+        .await
+        .assert_status(303);
+}
+
 /// AC7: the last Owner cannot be removed.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]

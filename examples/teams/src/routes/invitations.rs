@@ -35,9 +35,7 @@ use scoped_futures::ScopedFutureExt;
 use serde::Deserialize;
 
 use crate::mailers::invitation_mailer::InvitationMailer;
-use crate::models::{
-    Invitation, InviteForm, Membership, NewInvitation, NewUser, UpdateInvitation, User,
-};
+use crate::models::{Invitation, InviteForm, Membership, NewUser, UpdateInvitation, User};
 use crate::repositories::{
     InvitationRepository, OrganizationRepository, PgInvitationRepository, PgMembershipRepository,
     PgOrganizationRepository,
@@ -91,9 +89,9 @@ fn app_base_url() -> String {
 #[post("/invitations")]
 pub async fn create_invitation(
     session: Session,
-    Tenant(org_id): Tenant,
+    Tenant(tenant_id): Tenant,
+    mut db: Db,
     org_repo: PgOrganizationRepository,
-    invitation_repo: PgInvitationRepository,
     membership_repo: PgMembershipRepository,
     mailer: Mailer,
     Form(form): Form<InviteForm>,
@@ -118,7 +116,7 @@ pub async fn create_invitation(
         ));
     }
 
-    let org_id: i64 = org_id.parse().map_err(|_| {
+    let org_id: i64 = tenant_id.parse().map_err(|_| {
         AutumnError::internal_server_error_msg("Corrupt organization id in session")
     })?;
     let Some(organization) = org_repo.find_by_id(org_id).await? else {
@@ -126,17 +124,47 @@ pub async fn create_invitation(
     };
 
     let raw_token = generate_raw_token();
-    invitation_repo
-        .save(&NewInvitation {
-            email: email.clone(),
-            role: role.as_str().to_owned(),
-            token_hash: hash_api_token(&raw_token),
-            status: "pending".to_owned(),
-            invited_by_user_id: inviter_id,
-            expires_at: chrono::Utc::now().naive_utc()
-                + chrono::Duration::days(INVITATION_TTL_DAYS),
-        })
-        .await?;
+    let token_hash = hash_api_token(&raw_token);
+    let insert_email = email.clone();
+    let insert_role = role.as_str().to_owned();
+    db.tx(move |conn| {
+        async move {
+            // Revoke any other still-pending invitation to this email in
+            // this organization before creating the new one — otherwise
+            // both tokens would stay independently valid, and accepting
+            // one would leave the other pending indefinitely (the same
+            // lingering-token issue `accept_invitation` guards against for
+            // an already-a-member accept, but here at creation time for
+            // two never-yet-accepted invitations to the same address).
+            diesel::update(
+                invitations::table
+                    .filter(invitations::tenant_id.eq(&tenant_id))
+                    .filter(invitations::email.eq(&insert_email))
+                    .filter(invitations::status.eq("pending")),
+            )
+            .set(invitations::status.eq("revoked"))
+            .execute(conn)
+            .await?;
+
+            diesel::insert_into(invitations::table)
+                .values(&InsertInvitation {
+                    tenant_id,
+                    email: insert_email,
+                    role: insert_role,
+                    token_hash,
+                    status: "pending".to_owned(),
+                    invited_by_user_id: inviter_id,
+                    expires_at: chrono::Utc::now().naive_utc()
+                        + chrono::Duration::days(INVITATION_TTL_DAYS),
+                })
+                .execute(conn)
+                .await?;
+
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
 
     let accept_url = format!("{}/invite/{raw_token}", app_base_url());
     // Sent synchronously (not `deliver_later_invite`): the success metric is
