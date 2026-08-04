@@ -183,7 +183,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run of the workflow with a higher `run_number` exists, regardless of
   outcome: a newer run can migrate (the actual point of no return) and
   then fail on a later step, reporting an overall conclusion of `failure`
-  that a status-filtered check would have missed entirely.
+  that a status-filtered check would have missed entirely. The Postgres
+  Flexible Server's `administrator_login` is no longer `autumn_admin` —
+  Azure only allows alphanumeric characters there, so the underscore made
+  `terraform apply` fail while creating the server — it's now a single
+  `local.postgres_admin_login` shared by the server resource and the
+  derived `database_url` secret, so the two can't drift out of sync.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

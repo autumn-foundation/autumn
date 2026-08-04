@@ -1582,6 +1582,51 @@ previous_secrets = []
     }
 
     #[test]
+    fn main_tf_postgres_admin_login_is_alphanumeric() {
+        // Azure Database for PostgreSQL Flexible Server rejects
+        // administrator_login values containing anything but letters and
+        // digits (no underscore, no hyphen) — `terraform apply` fails
+        // while creating the server otherwise. Also assert the server
+        // resource and the derived database_url secret share a single
+        // local so they can't drift out of sync with each other.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+
+        let login_local_line = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("postgres_admin_login"))
+            .expect("main.tf must declare a postgres_admin_login local");
+        let login_value = login_local_line
+            .split('=')
+            .nth(1)
+            .unwrap()
+            .trim()
+            .trim_matches('"');
+        assert!(
+            !login_value.is_empty() && login_value.chars().all(|c| c.is_ascii_alphanumeric()),
+            "postgres_admin_login must be alphanumeric-only, got {login_value:?}: \
+             {login_local_line}"
+        );
+
+        let admin_login_attr = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("administrator_login"))
+            .expect("main.tf must set administrator_login on the Postgres server");
+        assert!(
+            admin_login_attr.contains("local.postgres_admin_login"),
+            "the Postgres server resource must set administrator_login from \
+             local.postgres_admin_login: {admin_login_attr}"
+        );
+        assert!(
+            content.contains("postgres://${local.postgres_admin_login}:"),
+            "the database_url secret must reuse the same admin-login local as the \
+             server resource, not a separately hardcoded username: {content}"
+        );
+    }
+
+    #[test]
     fn main_tf_container_apps_family_resources_use_sanitized_name() {
         // Log Analytics, the Container Apps environment, the app, its
         // container, and the migration job all require lowercase

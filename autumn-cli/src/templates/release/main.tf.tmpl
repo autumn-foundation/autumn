@@ -130,6 +130,12 @@ locals {
 # resolves to the same hostname a real client's Host header carries.
 locals {
   app_fqdn = "${local.app_name_safe}.${azurerm_container_app_environment.this.default_domain}"
+
+  # Azure Database for PostgreSQL Flexible Server rejects non-alphanumeric
+  # characters in administrator_login (no underscore/hyphen) — a fixed,
+  # single source used by both the server resource and the derived
+  # database_url below, so they can't drift out of sync.
+  postgres_admin_login = "autumnadmin"
 }
 
 resource "azurerm_resource_group" "this" {
@@ -225,7 +231,7 @@ resource "azurerm_key_vault_access_policy" "container_app" {
 # that only exists once the first apply finishes.
 resource "azurerm_key_vault_secret" "database_url" {
   name = "AUTUMN-DATABASE-PRIMARY-URL"
-  value = "postgres://autumn_admin:${urlencode(var.database_admin_password)}@${azurerm_postgresql_flexible_server.this.fqdn}:5432/${azurerm_postgresql_flexible_server_database.this.name}?sslmode=require"
+  value = "postgres://${local.postgres_admin_login}:${urlencode(var.database_admin_password)}@${azurerm_postgresql_flexible_server.this.fqdn}:5432/${azurerm_postgresql_flexible_server_database.this.name}?sslmode=require"
   key_vault_id = azurerm_key_vault.this.id
   depends_on   = [azurerm_key_vault_access_policy.terraform]
 }
@@ -244,7 +250,7 @@ resource "azurerm_postgresql_flexible_server" "this" {
   resource_group_name     = azurerm_resource_group.this.name
   location                = azurerm_resource_group.this.location
   version                 = "16"
-  administrator_login     = "autumn_admin"
+  administrator_login     = local.postgres_admin_login
   administrator_password  = var.database_admin_password
   storage_mb              = 32768
   sku_name                = var.db_sku
