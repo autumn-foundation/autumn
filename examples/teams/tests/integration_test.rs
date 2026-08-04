@@ -714,6 +714,116 @@ async fn second_invite_to_same_email_revokes_the_first() {
         .assert_status(303);
 }
 
+/// Two concurrent `create_invitation` requests for the same organization and
+/// email must not both leave a live pending token: each request's
+/// revoke-then-insert transaction sees no prior pending row to lock (there
+/// isn't one yet), so the transaction alone can't serialize them.
+/// `idx_invitations_pending_email` (a partial unique index on
+/// `(tenant_id, email) WHERE status = 'pending'`) is the real backstop —
+/// exercised here via genuinely concurrent requests against a real Postgres
+/// instance, not just sequential calls (Codex review finding).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_invites_to_the_same_email_do_not_both_stay_pending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+
+    let (first, second) = tokio::join!(
+        client
+            .post("/invitations")
+            .header("cookie", &owner_cookie)
+            .form("email=newbie@acme.test&role=member")
+            .send(),
+        client
+            .post("/invitations")
+            .header("cookie", &owner_cookie)
+            .form("email=newbie@acme.test&role=member")
+            .send(),
+    );
+
+    let statuses = [first.status.as_u16(), second.status.as_u16()];
+    assert!(
+        statuses.contains(&303) && statuses.contains(&409),
+        "exactly one concurrent invite should succeed (303) and the other \
+         should be rejected as a conflict (409), got {statuses:?}"
+    );
+
+    let members_body = client
+        .get("/members")
+        .header("cookie", &owner_cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert_eq!(
+        members_body.matches("newbie@acme.test").count(),
+        1,
+        "only one pending invitation should survive two concurrent creates \
+         for the same email: {members_body}"
+    );
+}
+
+/// Posting a *revoked* invitation token must still be rejected with the
+/// documented "no longer available" error even when the caller already
+/// belongs to that organization through some other (later, still-valid)
+/// invitation — the existing-membership shortcut must not let a dead token
+/// silently succeed and switch the caller's active organization (Codex
+/// review finding).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn accepting_a_revoked_token_is_rejected_even_for_an_existing_member() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+
+    // First invite to newbie@acme.test — revoke it before it's ever used.
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    let revoked_token = latest_invite_token(dir.path());
+    client
+        .post("/invitations/1/revoke")
+        .header("cookie", &owner_cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    // A second, later invite to the same email is accepted for real —
+    // newbie is now a genuine member of the organization.
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+    let live_token = latest_invite_token(dir.path());
+    let accept = client
+        .post(&format!("/invite/{live_token}/accept"))
+        .form("password=An0ther-Str0ng-Pa55word")
+        .send()
+        .await;
+    accept.assert_status(303);
+    let newbie_cookie = session_cookie(&accept);
+
+    // The first invitation's token is dead (revoked), even though newbie is
+    // now a member of this exact organization — POSTing it must not be
+    // silently treated as a successful (re)join via the existing-membership
+    // shortcut inside `accept_invitation`'s transaction.
+    client
+        .post(&format!("/invite/{revoked_token}/accept"))
+        .header("cookie", &newbie_cookie)
+        .send()
+        .await
+        .assert_status(410)
+        .assert_body_contains("no longer available");
+}
+
 /// AC7: the last Owner cannot be removed.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]

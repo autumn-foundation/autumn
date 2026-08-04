@@ -428,6 +428,19 @@ const MOD_RS: &str = r#"//! Team membership, roles, and email invitations (issue
 //!    }
 //!    ```
 //!
+//! 3. **At account deletion**, before (or as part of) your handler deletes
+//!    the account row, call
+//!    [`routes::organizations::remove_all_memberships`] — `Membership` has
+//!    no FK to your `users` table (see above), so nothing else notices the
+//!    account is gone. Skipping this step leaves a deleted user's team
+//!    access live on any device with a still-valid session cookie, since
+//!    [`role::require_role`] only re-checks the `Membership` row, not the
+//!    account itself:
+//!
+//!    ```ignore
+//!    teams::routes::organizations::remove_all_memberships(user.id, &membership_repo).await?;
+//!    ```
+//!
 //! Gate any admin-only handler with
 //! `teams::role::require_role(&session, &membership_repo, teams::role::Role::Admin).await?;`
 //! (taking `membership_repo: teams::repositories::PgMembershipRepository` as
@@ -435,8 +448,11 @@ const MOD_RS: &str = r#"//! Team membership, roles, and email invitations (issue
 //!
 //! See `examples/teams` in the Autumn repository for a fully-wired reference
 //! application — it owns its whole app (including the `users` table), so it
-//! inlines both steps above directly into its own `routes/auth.rs` rather
-//! than exposing them as a separate seam.
+//! inlines steps 1-2 above directly into its own `routes/auth.rs` rather than
+//! exposing them as a separate seam, and step 3 is unnecessary there:
+//! `examples/teams`'s own `memberships.user_id` is a real
+//! `REFERENCES users (id) ON DELETE CASCADE` FK, since that app owns its
+//! `users` table and can afford the coupling this generator can't.
 
 pub mod mailers;
 pub mod models;
@@ -809,6 +825,15 @@ pub trait MembershipRepository {
     /// via `.across_tenants()` — resolving which organizations a user
     /// belongs to has to run before any one of them is "the" active tenant.
     fn find_by_user_id(user_id: i64) -> Vec<Membership>;
+
+    /// Bulk-remove every membership `user_id` holds, across every
+    /// organization. Always called via `.across_tenants()` — see
+    /// `routes::organizations::remove_all_memberships`, the account-deletion
+    /// half of the auth integration seam (Codex review finding: without
+    /// this, deleting a user's account through `autumn generate auth`
+    /// leaves their memberships behind, so a stale session cookie can keep
+    /// using team routes after the account no longer exists).
+    fn delete_by_user_id(user_id: i64);
 }
 
 #[autumn_web::repository(Invitation, table = "invitations", tenant_scoped)]
@@ -1049,6 +1074,31 @@ pub async fn provision_default_organization_on_conn(
         .await?;
 
     Ok(())
+}
+
+/// Remove every membership `user_id` holds, across every organization —
+/// call this from your own account-deletion handler, before (or as part of)
+/// deleting the account row itself (Codex review finding: `Membership`
+/// deliberately has no FK to your `users` table — see `crate::teams`'s
+/// module doc — so deleting a user through e.g. `autumn generate auth`'s
+/// scaffolded `account_destroy` does not touch these rows on its own; a
+/// stale session cookie on another device would otherwise keep
+/// `require_role` passing indefinitely for a user whose account no longer
+/// exists, since it only re-checks the live `Membership` row, not the
+/// account itself).
+///
+/// Uses `.across_tenants()`: an account being deleted has no single active
+/// organization to scope this to — every membership the user holds, in
+/// every organization, must go.
+///
+/// ```ignore
+/// teams::routes::organizations::remove_all_memberships(user_id, &membership_repo).await?;
+/// ```
+pub async fn remove_all_memberships(
+    user_id: i64,
+    membership_repo: &PgMembershipRepository,
+) -> AutumnResult<()> {
+    membership_repo.across_tenants().delete_by_user_id(user_id).await
 }
 
 /// Create a new organization; the caller becomes its `Owner` and it becomes
@@ -1307,7 +1357,33 @@ pub async fn create_invitation(
         }
         .scope_boxed()
     })
-    .await?;
+    .await
+    .map_err(|err| {
+        // Two concurrent requests for the same (tenant_id, email) can both
+        // pass the revoke step (a no-op when no prior pending row exists)
+        // and then race to insert here — the transaction alone doesn't
+        // serialize them, since there's no existing row for either to lock.
+        // `idx_invitations_pending_email` (a partial unique index on
+        // `(tenant_id, email) WHERE status = 'pending'`, see MIGRATION_UP)
+        // is the backstop: the loser's INSERT fails closed instead of
+        // leaving two live pending tokens for the same invitee.
+        if autumn_web::error::unique_violation_field(
+            &err,
+            &[(
+                "idx_invitations_pending_email",
+                "email",
+                "An invitation to this email is already pending",
+            )],
+        )
+        .is_some()
+        {
+            AutumnError::conflict_msg(
+                "An invitation to this email is already pending for this organization",
+            )
+        } else {
+            err
+        }
+    })?;
 
     let accept_url = format!("{}/invite/{raw_token}", app_base_url());
     // Sent synchronously (not `deliver_later_invite`): the success metric is
@@ -1494,6 +1570,26 @@ pub async fn accept_invitation(
                     .first(conn)
                     .await?;
 
+                // Reject a revoked, or expired-while-still-pending, token
+                // up front — before the existing-membership shortcut below.
+                // This check must NOT run for an already-`accepted` token:
+                // that's the idempotent double-click case, whose
+                // `expires_at` (fixed at creation) may well have passed by
+                // now without that being a problem, since no new grant is
+                // happening. Checked before the `existing` lookup so a
+                // revoked/expired-pending invitation can never silently
+                // reuse someone's unrelated existing membership to switch
+                // their active organization and return success (Codex
+                // review finding).
+                if invitation.status == "revoked"
+                    || (invitation.status == "pending"
+                        && invitation.expires_at <= chrono::Utc::now().naive_utc())
+                {
+                    return Err(AutumnError::gone_msg(
+                        "This invitation is no longer available",
+                    ));
+                }
+
                 let existing: Option<Membership> = memberships::table
                     .filter(memberships::tenant_id.eq(&tenant_id))
                     .filter(memberships::user_id.eq(user_id))
@@ -1506,12 +1602,13 @@ pub async fn accept_invitation(
                     // this exact token was already redeemed (idempotent
                     // double-click: `invitation.status` is already
                     // "accepted"), or they joined some other way while this
-                    // invitation sat pending. Either way there's no new
-                    // membership to insert, but a still-pending invitation
-                    // must be consumed here too — otherwise its token stays
-                    // valid indefinitely and, if this membership is later
-                    // removed, redeeming the lingering token again would
-                    // silently regrant it.
+                    // invitation sat pending (and, per the check above, not
+                    // expired). Either way there's no new membership to
+                    // insert, but a still-pending invitation must be
+                    // consumed here too — otherwise its token stays valid
+                    // indefinitely and, if this membership is later removed,
+                    // redeeming the lingering token again would silently
+                    // regrant it.
                     if invitation.status == "pending" {
                         diesel::update(invitations::table.filter(invitations::id.eq(invitation_id)))
                             .set(invitations::status.eq("accepted"))
@@ -1521,9 +1618,11 @@ pub async fn accept_invitation(
                     return Ok::<_, AutumnError>(existing);
                 }
 
-                if invitation.status != "pending"
-                    || invitation.expires_at <= chrono::Utc::now().naive_utc()
-                {
+                if invitation.status != "pending" {
+                    // Already "accepted" (checked for "revoked"/expired
+                    // above) but no existing membership: the token was
+                    // consumed by an earlier accept whose membership has
+                    // since been removed. Nothing left to (re)grant.
                     return Err(AutumnError::gone_msg(
                         "This invitation is no longer available",
                     ));
@@ -1967,7 +2066,13 @@ CREATE INDEX idx_memberships_user ON memberships (user_id);
 -- it to `revoked`. Both are terminal: the accept handler checks
 -- `status = 'pending'` AND `expires_at > now()` before creating a
 -- membership, so an expired/revoked/already-accepted token renders a clear
--- error instead of a second membership row or a panic.
+-- error instead of a second membership row or a panic. The partial unique
+-- index below is the concurrency backstop for `create_invitation`: two
+-- concurrent requests for the same (tenant_id, email) each revoke-then-insert
+-- in their own transaction, so a `SELECT ... WHERE status = 'pending'` alone
+-- cannot serialize them (no prior row to lock when none exists yet) — the
+-- second transaction's INSERT fails closed against this index instead of
+-- leaving two live pending tokens for the same invitee.
 CREATE TABLE invitations (
     id                 BIGSERIAL PRIMARY KEY,
     tenant_id          TEXT      NOT NULL,
@@ -1981,6 +2086,7 @@ CREATE TABLE invitations (
 );
 CREATE INDEX idx_invitations_tenant ON invitations (tenant_id);
 CREATE INDEX idx_invitations_email ON invitations (email);
+CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';
 ";
 
 const MIGRATION_DOWN: &str = "DROP TABLE IF EXISTS invitations;\nDROP TABLE IF EXISTS memberships;\nDROP TABLE IF EXISTS organizations;\n";
@@ -2681,5 +2787,103 @@ async fn main() {
         assert!(!tmp.path().join("src/teams").exists());
         assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
         assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    // ── seventh round of Codex review findings ──────────────────────────
+
+    /// `accept_invitation`'s existing-membership shortcut must not run
+    /// before a revoked/expired-pending invitation is rejected — otherwise
+    /// posting a dead token for an org the caller already belongs to some
+    /// other way would silently succeed and switch their active
+    /// organization instead of surfacing the documented gone error (Codex
+    /// review finding).
+    #[test]
+    fn accept_invitation_rejects_revoked_or_expired_before_existing_member_shortcut() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        let reject_pos = invitations
+            .find("invitation.status == \"revoked\"")
+            .unwrap_or_else(|| panic!("missing revoked/expired guard: {invitations}"));
+        let existing_pos = invitations
+            .find("let existing: Option<Membership> = memberships::table")
+            .unwrap_or_else(|| panic!("missing existing-membership lookup: {invitations}"));
+        assert!(
+            reject_pos < existing_pos,
+            "revoked/expired check must run before the existing-membership shortcut"
+        );
+    }
+
+    /// Two concurrent `create_invitation` calls for the same tenant/email
+    /// must not both leave a live pending token: the transaction's
+    /// revoke-then-insert alone can't serialize two requests that both see
+    /// no prior pending row, so a partial unique index is the backstop —
+    /// and the generated handler must translate that constraint's
+    /// violation into a friendly conflict rather than a raw 500 (Codex
+    /// review finding).
+    #[test]
+    fn migration_has_partial_unique_index_for_pending_invitation_email() {
+        assert!(
+            MIGRATION_UP.contains(
+                "CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';"
+            ),
+            "{MIGRATION_UP}"
+        );
+    }
+
+    #[test]
+    fn create_invitation_translates_pending_email_unique_violation_to_conflict() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        assert!(
+            invitations.contains("autumn_web::error::unique_violation_field")
+                && invitations.contains("\"idx_invitations_pending_email\""),
+            "{invitations}"
+        );
+    }
+
+    /// Deleting an account through `autumn generate auth` doesn't cascade
+    /// into `teams`' unrelated `memberships` table (no FK — see
+    /// `schema.rs`'s doc comment), so a stale session cookie on another
+    /// device could otherwise keep passing `require_role` for a
+    /// now-deleted account indefinitely. `remove_all_memberships` is the
+    /// account-deletion half of the integration seam that closes this gap
+    /// (Codex review finding).
+    #[test]
+    fn remove_all_memberships_exists_for_account_deletion_integration() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
+        assert!(
+            organizations.contains("pub async fn remove_all_memberships("),
+            "{organizations}"
+        );
+        assert!(
+            organizations.contains("membership_repo.across_tenants().delete_by_user_id(user_id)"),
+            "{organizations}"
+        );
+
+        let repositories =
+            fs::read_to_string(tmp.path().join("src/teams/repositories.rs")).unwrap();
+        assert!(
+            repositories.contains("fn delete_by_user_id(user_id: i64);"),
+            "{repositories}"
+        );
     }
 }

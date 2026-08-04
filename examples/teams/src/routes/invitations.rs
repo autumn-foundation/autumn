@@ -164,7 +164,33 @@ pub async fn create_invitation(
         }
         .scope_boxed()
     })
-    .await?;
+    .await
+    .map_err(|err| {
+        // Two concurrent requests for the same (tenant_id, email) can both
+        // pass the revoke step (a no-op when no prior pending row exists)
+        // and then race to insert here — the transaction alone doesn't
+        // serialize them, since there's no existing row for either to lock.
+        // `idx_invitations_pending_email` (a partial unique index on
+        // `(tenant_id, email) WHERE status = 'pending'`, see the migration)
+        // is the backstop: the loser's INSERT fails closed instead of
+        // leaving two live pending tokens for the same invitee.
+        if autumn_web::error::unique_violation_field(
+            &err,
+            &[(
+                "idx_invitations_pending_email",
+                "email",
+                "An invitation to this email is already pending",
+            )],
+        )
+        .is_some()
+        {
+            AutumnError::conflict_msg(
+                "An invitation to this email is already pending for this organization",
+            )
+        } else {
+            err
+        }
+    })?;
 
     let accept_url = format!("{}/invite/{raw_token}", app_base_url());
     // Sent synchronously (not `deliver_later_invite`): the success metric is
@@ -515,6 +541,26 @@ pub async fn accept_invitation(
                     .first(conn)
                     .await?;
 
+                // Reject a revoked, or expired-while-still-pending, token up
+                // front — before the existing-membership shortcut below.
+                // This check must NOT run for an already-`accepted` token:
+                // that's the idempotent double-click case, whose
+                // `expires_at` (fixed at creation) may well have passed by
+                // now without that being a problem, since no new grant is
+                // happening. Checked before the `existing` lookup so a
+                // revoked/expired-pending invitation can never silently
+                // reuse someone's unrelated existing membership to switch
+                // their active organization and return success (Codex
+                // review finding).
+                if invitation.status == "revoked"
+                    || (invitation.status == "pending"
+                        && invitation.expires_at <= chrono::Utc::now().naive_utc())
+                {
+                    return Err(AutumnError::gone_msg(
+                        "This invitation is no longer available",
+                    ));
+                }
+
                 let existing: Option<Membership> = memberships::table
                     .filter(memberships::tenant_id.eq(&tenant_id))
                     .filter(memberships::user_id.eq(target_user_id))
@@ -527,12 +573,13 @@ pub async fn accept_invitation(
                     // this exact token was already redeemed (idempotent
                     // double-click: `invitation.status` is already
                     // "accepted"), or they joined some other way while this
-                    // invitation sat pending. Either way there's no new
-                    // membership to insert, but a still-pending invitation
-                    // must be consumed here too — otherwise its token stays
-                    // valid indefinitely and, if this membership is later
-                    // removed, redeeming the lingering token again would
-                    // silently regrant it.
+                    // invitation sat pending (and, per the check above, not
+                    // expired). Either way there's no new membership to
+                    // insert, but a still-pending invitation must be
+                    // consumed here too — otherwise its token stays valid
+                    // indefinitely and, if this membership is later removed,
+                    // redeeming the lingering token again would silently
+                    // regrant it.
                     if invitation.status == "pending" {
                         diesel::update(
                             invitations::table.filter(invitations::id.eq(invitation_id)),
@@ -544,9 +591,11 @@ pub async fn accept_invitation(
                     return Ok::<_, AutumnError>((existing, target_user_id));
                 }
 
-                if invitation.status != "pending"
-                    || invitation.expires_at <= chrono::Utc::now().naive_utc()
-                {
+                if invitation.status != "pending" {
+                    // Already "accepted" (checked for "revoked"/expired
+                    // above) but no existing membership: the token was
+                    // consumed by an earlier accept whose membership has
+                    // since been removed. Nothing left to (re)grant.
                     return Err(AutumnError::gone_msg(
                         "This invitation is no longer available",
                     ));

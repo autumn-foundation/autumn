@@ -50,7 +50,13 @@ CREATE INDEX idx_memberships_user ON memberships (user_id);
 -- Both are terminal: the accept handler checks `status = 'pending'` AND
 -- `expires_at > now()` before creating a membership, so an
 -- expired/revoked/already-accepted token renders a clear error instead of a
--- second membership row or a panic.
+-- second membership row or a panic. The partial unique index below is the
+-- concurrency backstop for `create_invitation`: two concurrent requests for
+-- the same (tenant_id, email) each revoke-then-insert in their own
+-- transaction, so a `SELECT ... WHERE status = 'pending'` alone cannot
+-- serialize them (no prior row to lock when none exists yet) — the second
+-- transaction's INSERT fails closed against this index instead of leaving
+-- two live pending tokens for the same invitee.
 CREATE TABLE invitations (
     id                 BIGSERIAL PRIMARY KEY,
     tenant_id          TEXT      NOT NULL,
@@ -64,3 +70,4 @@ CREATE TABLE invitations (
 );
 CREATE INDEX idx_invitations_tenant ON invitations (tenant_id);
 CREATE INDEX idx_invitations_email ON invitations (email);
+CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';

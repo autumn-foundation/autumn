@@ -136,6 +136,25 @@ if let Some(active) = memberships.into_iter().min_by_key(|m| m.id) {
 that stays your login/signup handler's own responsibility, once per
 authentication event.
 
+**3. At account deletion**, before (or as part of) your handler deletes the
+account row, remove that user's team memberships too:
+
+```rust
+teams::routes::organizations::remove_all_memberships(user.id, &membership_repo).await?;
+```
+
+`Membership::user_id` has no foreign key back to your `users` table (see
+above) — a generated app's `autumn generate auth` `account_destroy` handler
+deletes the account row and cascades to its own tracked-session table, but
+has no idea `memberships` exists, so those rows are left behind untouched.
+Skipping this step means a deleted user's session cookie on another
+still-logged-in device keeps working against every team route: `require_role`
+only re-checks the live `Membership` row (issue #1261's own
+stale-cache-safety guarantee), not whether the account it belongs to still
+exists. `remove_all_memberships` calls `.across_tenants()` internally —
+account deletion has no single active organization to scope the removal to,
+every membership the user holds anywhere must go.
+
 ## Guarding routes by role
 
 Gate any admin-only handler the same way `require_role` is used throughout
