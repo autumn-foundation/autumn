@@ -266,17 +266,46 @@ const AZURE_GITIGNORE_ENTRIES: &[&str] = &[
     "terraform.tfvars",
 ];
 
+/// Whether `pattern` is still in effect by the end of `existing`, applying
+/// git's own "last matching rule wins" semantics: an exact `!pattern` line
+/// anywhere after a `pattern` line un-ignores it again, even though the
+/// (now-superseded) earlier line is still textually present. A naive
+/// presence check would treat that file as already protected and add
+/// nothing — exactly backwards, since the file is actually trackable.
+fn gitignore_pattern_still_effective(existing: &str, pattern: &str) -> bool {
+    let negated = format!("!{pattern}");
+    let mut effective = false;
+    for line in existing.lines() {
+        let line = line.trim();
+        if line == pattern {
+            effective = true;
+        } else if line == negated {
+            effective = false;
+        }
+    }
+    effective
+}
+
 /// Ensure `dir/.gitignore` excludes Terraform state and the operator's real
 /// `terraform.tfvars`, merging into an existing file (creating one if
 /// missing) without touching unrelated lines. Idempotent: a re-run (e.g.
-/// under `--force`) never duplicates entries already present.
+/// under `--force`) never duplicates entries whose protection still holds —
+/// but does re-append one whose earlier occurrence has since been negated,
+/// since re-asserting it after the negation is the only way to make it the
+/// final (and therefore effective) matching rule again.
 fn ensure_azure_gitignore_entries(dir: &Path) -> std::io::Result<()> {
     let path = dir.join(".gitignore");
     let existing = fs::read_to_string(&path).unwrap_or_default();
     let missing: Vec<&str> = AZURE_GITIGNORE_ENTRIES
         .iter()
         .copied()
-        .filter(|line| !existing.lines().any(|l| l.trim() == *line))
+        .filter(|line| {
+            if line.starts_with('#') {
+                !existing.lines().any(|l| l.trim() == *line)
+            } else {
+                !gitignore_pattern_still_effective(&existing, line)
+            }
+        })
         .collect();
     if missing.is_empty() {
         return Ok(());
@@ -2443,6 +2472,39 @@ previous_secrets = []
                 "`{line}` must appear exactly once: {after_second}"
             );
         }
+    }
+
+    #[test]
+    fn azure_target_reasserts_a_gitignore_entry_negated_after_its_earlier_occurrence() {
+        // Git applies the LAST matching rule: an existing .gitignore with
+        // "terraform.tfvars" followed later by "!terraform.tfvars" makes
+        // the file trackable, even though the literal pattern is present.
+        // A naive "is this line already there" check would wrongly treat
+        // it as already protected and add nothing, letting an operator
+        // commit the plaintext secrets this scaffold exists to keep out.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(
+            dir.join(".gitignore"),
+            "terraform.tfvars\nsome-other-line\n!terraform.tfvars\n",
+        )
+        .unwrap();
+
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+
+        // The negation must not have been touched (still there, doing its
+        // job for whatever the operator originally wanted un-ignored)...
+        assert!(content.contains("!terraform.tfvars"), "{content}");
+        // ...but "terraform.tfvars" must be re-asserted AFTER it (not just
+        // matched as a substring of "!terraform.tfvars" itself), since
+        // that's the only way to make it the final (and therefore
+        // effective) matching rule again.
+        let after_negation = content.find("!terraform.tfvars").unwrap() + "!terraform.tfvars".len();
+        assert!(
+            content[after_negation..].contains("terraform.tfvars"),
+            "terraform.tfvars must be re-added after the negation that defeated it: {content}"
+        );
     }
 
     #[test]

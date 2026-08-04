@@ -122,7 +122,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an execution and returns immediately, so a bare shell comment telling the
   reader to "wait for Succeeded" let the following `az containerapp update`
   run before migrations had actually finished; it's now a real polling loop
-  mirroring the generated workflow's.
+  mirroring the generated workflow's. The `.gitignore` merge
+  (`ensure_azure_gitignore_entries`) now applies git's own "last matching
+  rule wins" semantics instead of a naive exact-line presence check: an
+  existing `.gitignore` with `terraform.tfvars` followed later by
+  `!terraform.tfvars` actually leaves the file trackable despite the
+  earlier line being present, so that case now re-appends the entry after
+  the negation rather than wrongly treating it as already protected.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via
