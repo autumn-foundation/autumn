@@ -69,6 +69,16 @@ fn is_raw_text_element(tag: &str) -> bool {
     matches!(tag, "script" | "style")
 }
 
+/// Bound on how far [`consume_raw_text`] scans past a candidate
+/// `</script`/`</style` prefix looking for the closing `>` — the same
+/// defense as [`MAX_TAG_SCAN`] for the same reason: a legitimate closing
+/// tag has no attributes and essentially no whitespace before `>`, but an
+/// unbounded `after_tag.find('>')` would cost O(remaining input) on every
+/// failed candidate — a raw-text body containing many `"</script "`
+/// fragments with no `>` anywhere would make this O(n^2) overall, the same
+/// shape of bug [`MAX_TAG_SCAN`]/[`MAX_CLOSE_SCAN`] were fixed for.
+const MAX_RAW_CLOSE_SCAN: usize = 64;
+
 /// Scan `input[pos..]` for the literal, case-insensitive closing tag for a
 /// [raw text element](is_raw_text_element) (e.g. `</script>`, allowing
 /// whitespace before the `>`), returning the text before it and the
@@ -97,7 +107,7 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
         if !is_boundary {
             continue;
         }
-        let Some(gt) = after_tag.find('>') else {
+        let Some(gt) = bounded_prefix(after_tag, MAX_RAW_CLOSE_SCAN).find('>') else {
             continue;
         };
         let consumed = i + 2 + tag.len() + gt + 1;
@@ -280,6 +290,21 @@ fn push_text(stack: &mut [(String, Vec<Node>)], text: &str) {
 /// instead of being rejected and leaked into the PDF as literal text.
 const MAX_TAG_SCAN: usize = 4096;
 
+/// Take a byte-length-bounded, UTF-8-safe prefix of `s` — cheap regardless
+/// of `max_len`'s size (no per-char iterator overhead, unlike walking
+/// `s.char_indices()` up to the bound), nudged back to the nearest char
+/// boundary so the result can't split a multi-byte character. Used to cap
+/// a scan for a delimiter (`>`) at a fixed cost instead of the full
+/// remaining input length — see [`MAX_TAG_SCAN`] and
+/// [`MAX_RAW_CLOSE_SCAN`] for why that bound matters.
+fn bounded_prefix(s: &str, max_len: usize) -> &str {
+    let mut end = s.len().min(max_len);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn parse_open_tag(s: &str) -> Option<(String, bool, usize)> {
     debug_assert!(s.starts_with('<'));
     let rest = &s[1..];
@@ -288,15 +313,7 @@ fn parse_open_tag(s: &str) -> Option<(String, bool, usize)> {
         return None;
     }
 
-    // Find the window boundary by byte length, not by walking `char_indices`
-    // (cheap regardless of `MAX_TAG_SCAN`'s size — no per-char iterator
-    // overhead — unlike scanning every char up to the bound), then nudge it
-    // back to a char boundary so the slice below can't panic.
-    let mut window_end = rest.len().min(MAX_TAG_SCAN);
-    while window_end > 0 && !rest.is_char_boundary(window_end) {
-        window_end -= 1;
-    }
-    let window = &rest[..window_end];
+    let window = bounded_prefix(rest, MAX_TAG_SCAN);
 
     // Find `>` first and bail before doing any allocation if it's not in the
     // window — the common failure case (a malformed/unterminated `<`) then
@@ -559,6 +576,28 @@ mod tests {
         // None of the "</x>" closes match anything, so they're all ignored
         // — the tree is just 50,000 nested (empty) <a> elements.
         assert_eq!(nodes.len(), 1);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "parse took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_run_of_unterminated_raw_text_closes_is_linear_not_quadratic() {
+        // Regression: `consume_raw_text`'s search for the closing `>` past
+        // a candidate `</script`/`</style` prefix scanned the *entire*
+        // remaining suffix on every failed candidate. A `<script>` body
+        // containing many `"</script "` fragments with no `>` anywhere
+        // (each one looks like it could be the real closing tag, right up
+        // until the bound where a `>` should be) pays that full scan once
+        // per candidate — O(n^2) overall, the same shape of bug
+        // `MAX_TAG_SCAN`/`MAX_CLOSE_SCAN` were fixed for.
+        let html = format!("<script>{}", "</script ".repeat(50_000));
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(nodes.len(), 1);
+        assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "script"));
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "parse took {:?} — looks quadratic again",
