@@ -9,6 +9,234 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **release:** `autumn release init --target azure-container-apps` (#1278)
+  scaffolds a production-ready Azure deployment alongside the existing `fly`
+  and `docker-compose` targets: `main.tf` (resource group, Azure Container
+  Registry, Log Analytics workspace, Container Apps environment + the app
+  itself, a one-shot migration job, Azure Database for PostgreSQL Flexible
+  Server, and a Key Vault that feeds
+  `AUTUMN_DATABASE__PRIMARY_URL`/`AUTUMN_SECURITY__SIGNING_SECRET` into the
+  app as secret refs via a user-assigned managed identity (with its own Key
+  Vault access policy granted to Terraform's caller identity, since
+  access-policy-model vaults grant no data-plane access by default), and an
+  optional Redis Cache gated behind `enable_redis_cache`, wired in as
+  `AUTUMN_CACHE__BACKEND=redis` / `AUTUMN_CACHE__REDIS__URL` (Autumn's
+  actual config path) with its access key `urlencode()`'d before being
+  written into Key Vault — infrastructure only, though: the app must
+  separately depend on `autumn-cache-redis` and register `RedisCachePlugin`
+  in `main.rs` for these env vars to take effect, which the generated
+  `main.tf`/`variables.tf` now say explicitly), `variables.tf`
+  (`app_name`, `location`, `image_tag`, `db_sku`, `bootstrap_image`,
+  `min_replicas`/`max_replicas` — defaulting to the 1/10 scale range — and
+  `enable_redis_cache`, plus `sensitive`, no-default secret variables for
+  `database_admin_password`/`signing_secret`),
+  `outputs.tf` (`app_fqdn`, `acr_login_server`, `resource_group_name`,
+  `migrate_job_name`, `app_name`), a `terraform.tfvars.example` that
+  documents non-secret defaults without ever committing a literal secret,
+  and `.github/workflows/azure-deploy.yml` — an opt-in OIDC-based workflow
+  (triggers only on a `v*` tag push or manual dispatch, and every credential
+  comes from GitHub secrets/variables that don't exist until configured — no
+  client secret needed) that builds the release image, pushes it to ACR,
+  runs the migration job to completion (aborting the deploy if it fails),
+  and runs `az containerapp update`. The database connection string is
+  derived inside Terraform from the Postgres server the same apply creates
+  rather than taken as an input variable, so a single `terraform apply` is
+  enough. Every Container Apps-family resource name (the app, its
+  environment, Log Analytics, the migration job) is sanitized to lowercase
+  alphanumerics-and-hyphens, with hyphen runs collapsed, a leading/trailing
+  hyphen trimmed, a too-short result padded to Azure's 2-character minimum,
+  and the base capped at 24 characters (headroom for the longest suffix,
+  `-migrate`, so the full name never exceeds Azure's 32-character maximum)
+  — a Cargo package name may legally be as short as one character, longer
+  than 32, contain underscores/uppercase, or produce adjacent hyphens when
+  mapped, all invalid or malformed there — computed once in Terraform
+  (`local.app_name_safe`) and exposed as the `app_name` output; the
+  generated workflow reads it back as a variable rather than ever hardcoding
+  a name, so editing `app_name` in `terraform.tfvars` after scaffolding is
+  picked up automatically. The workflow also maps every character outside
+  Docker's `[A-Za-z0-9_.-]` tag charset in `GITHUB_REF_NAME` to `-` and caps
+  it at 128 characters before using it as an image tag (a `workflow_dispatch`
+  branch may contain `/`, and a SemVer tag like `v1.2.3+build` contains `+`,
+  both invalid in a Docker tag) and documents that its service principal
+  needs Contributor at the
+  resource-group scope, not just on the Container App — RBAC on the app
+  doesn't inherit to the sibling migration job. The app and migration job
+  both start from a public placeholder image (`bootstrap_image`) since
+  Container Apps must pull an image to create a first revision and a
+  brand-new ACR has none yet; Terraform ignores further image drift once CI
+  takes over.
+  `autumn release init`'s file-existence guard and directory creation are
+  now generic over nested output paths, so `--force`/collision checks cover
+  `.github/workflows/azure-deploy.yml` the same way they cover root-level
+  files. It also merges Terraform's `.gitignore` entries
+  (`.terraform/`/`*.tfstate*`/`terraform.tfvars`) into the project's
+  `.gitignore` — idempotently, preserving unrelated lines — since Terraform
+  state holds every secret value in plaintext regardless of a variable's
+  `sensitive` flag. `main.tf` also sets a new required `subscription_id`
+  variable on the provider (AzureRM v4 made it mandatory even under `az
+  login` CLI auth), bounds `local.app_name_alnum` (ACR/Postgres/Redis) to 30
+  characters so a long Cargo package name can't overflow ACR's 50-character
+  limit, bounds the Postgres database name to 63 characters for the same
+  reason, and no longer pins the Postgres Flexible Server to availability
+  zone 1 (not every Container Apps region offers it, and a hardcoded zone
+  fails `terraform apply` in those regions even though an unzoned server
+  would succeed). `terraform.tfvars.example` generates
+  `database_admin_password` as `openssl rand -base64` plus a fixed
+  upper/lower/digit/symbol suffix — Azure's Postgres complexity policy
+  needs 3 of those 4 categories, `-hex` output is lowercase-only, and even
+  `-base64` alone only samples its alphabet randomly rather than
+  guaranteeing coverage. The generated workflow's image tag now always
+  includes the commit SHA (not just the sanitized ref) so two
+  `workflow_dispatch` runs on the same branch can never collide on an
+  identical tag — re-pushing bytes under a tag the Container App already
+  has configured isn't guaranteed to register as a revision-scope change —
+  and the job sets a per-repository `concurrency` group with
+  `cancel-in-progress: false` so overlapping runs queue instead of racing
+  each other's migration/cutover ordering, plus an explicit staleness guard
+  immediately before migrating — compared against GitHub's own `run_number`
+  (monotonic in trigger order regardless of which ref triggered a run,
+  since two *different* immutable tags each trigger their own run against
+  their own never-moving ref, so a same-ref check alone can't see a newer
+  release land under a different tag) rather than merely whether the
+  triggering ref itself has moved, and aborts if a run with a higher
+  `run_number` is still queued/in progress OR has *already completed
+  successfully* — otherwise a run GitHub scheduled after this one but that
+  finishes deploying first would go undetected, and this older run would
+  migrate/deploy right over it. The computed image tag can
+  no longer start with an invalid character either (Docker's tag grammar
+  requires a leading word character; sanitizing e.g. a `+hotfix` ref could
+  otherwise leave a leading `-`). `main.tf`
+  also derives the Container App's default-ingress hostname from its
+  environment (`azurerm_container_app_environment.this.default_domain`,
+  computable before the app itself exists — referencing the app's own
+  only-known-after-create FQDN would be circular) and sets it as
+  `AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS`: `AUTUMN_PROFILE=prod` makes
+  Autumn's `fail_fast_on_invalid_trusted_hosts` exit immediately when that
+  list is empty, so without this the container would never bind after the
+  first real deploy. The same derived hostname (not
+  `latest_revision_fqdn`, which names a specific revision rather than the
+  stable ingress endpoint, and would go stale the moment CI creates a new
+  revision outside Terraform) is exposed as the `app_fqdn` output. The
+  manual deploy walkthrough in `docs/guide/deployment.md` now actually
+  blocks on migration success too — `az containerapp job start` only starts
+  an execution and returns immediately, so a bare shell comment telling the
+  reader to "wait for Succeeded" let the following `az containerapp update`
+  run before migrations had actually finished; it's now a real polling loop
+  mirroring the generated workflow's. The `.gitignore` merge
+  (`ensure_azure_gitignore_entries`) now applies git's own "last matching
+  rule wins" semantics instead of a naive exact-line presence check: an
+  existing `.gitignore` with `terraform.tfvars` followed later by any
+  negation — an exact `!terraform.tfvars`, or a broader wildcard like
+  `!*.tfvars`/`!*` — actually leaves the file trackable despite the
+  earlier line being present, so any of those cases now re-append the
+  entry after the negation rather than wrongly treating it as already
+  protected (matching gitignore's full glob syntax is out of scope, so any
+  negation line is conservatively treated as potentially applying, at
+  worst causing a harmless extra re-append rather than a false sense of
+  protection). Reading an existing `.gitignore` that fails for a reason
+  other than not existing (invalid UTF-8, a permission error) now
+  propagates that error instead of silently treating it as empty and
+  overwriting the file's real content with just the Terraform entries —
+  and does so BEFORE any scaffold file is written, so that failure never
+  leaves a partial, complete-looking scaffold on disk that then blocks a
+  retry without `--force` on files this same call just created. The
+  migration poll budget in both the generated workflow and the manual
+  walkthrough is now 660s, comfortably past the migration job's own
+  `replica_timeout_in_seconds` (600s) — polling any shorter risked
+  reporting "timed out" on a migration that was still validly running (and
+  would have succeeded) while leaving it to keep mutating the schema in
+  the background after the deploy had already been abandoned. `docker
+  build` (both the generated workflow and the manual walkthrough) now
+  passes the `AUTUMN_BUILD_*` `--build-arg`s the Dockerfile declares —
+  without them every Azure-deployed image reported null git provenance at
+  `/actuator/info`, since those ARGs default to empty and `.dockerignore`
+  excludes `.git` from the build context. The resource group and
+  user-assigned identity now use the same length-bounded
+  `local.app_name_safe` as every other Container Apps-family resource
+  instead of raw `var.app_name`, which — unlike the character-set
+  sanitization those two already got — was still unbounded in length: a
+  Cargo package name longer than 87 characters overflowed the resource
+  group's own 90-character limit once `-rg` was appended. Both base
+  sanitization locals (`app_name_alnum`, `app_name_hyphenated`) now fall
+  back to a fixed `app` prefix whenever the input sanitizes to nothing or
+  to a value not starting with a letter — a legal-but-unusual Cargo
+  package name like `_` previously sanitized to an empty string, producing
+  a Postgres server name starting with `-`, an empty Postgres database
+  name, and violating resource types (Key Vault) that require a
+  letter-led name rather than just an alphanumeric one. The manual deploy
+  walkthrough's image tag is no longer a fixed `v1` either — like the
+  generated workflow, it now derives a unique tag so a second manual
+  deploy can't reuse a tag the app already has configured and risk not
+  registering as a new revision; the commit SHA alone still wasn't enough
+  (re-running the walkthrough at the same `HEAD` — uncommitted local
+  changes, or merely a fresh `AUTUMN_BUILD_TIMESTAMP` — pushes different
+  bytes under the same tag), so it now also folds in a UTC timestamp,
+  unique per build rather than per commit. The generated
+  workflow's own image tag now also folds in `GITHUB_RUN_ID`/
+  `GITHUB_RUN_ATTEMPT`, not just the ref and commit SHA — re-running
+  `workflow_dispatch`, or clicking "Re-run jobs" on an existing run, reuses
+  the identical ref and commit while still producing a genuinely different
+  build (a fresh `AUTUMN_BUILD_TIMESTAMP`, possibly different base-image
+  bytes), so a tag built only from ref+SHA could still collide with a
+  previous run's. The run-ordering staleness guard no longer filters by
+  status or conclusion either — it now rejects a run the moment ANY other
+  run of the workflow with a higher `run_number` exists, regardless of
+  outcome: a newer run can migrate (the actual point of no return) and
+  then fail on a later step, reporting an overall conclusion of `failure`
+  that a status-filtered check would have missed entirely. The Postgres
+  Flexible Server's `administrator_login` is no longer `autumn_admin` —
+  Azure only allows alphanumeric characters there, so the underscore made
+  `terraform apply` fail while creating the server — it's now a single
+  `local.postgres_admin_login` shared by the server resource and the
+  derived `database_url` secret, so the two can't drift out of sync. The
+  Postgres database name now also guards against Azure Flexible Server's
+  reserved system database names (`postgres`, `azure_maintenance`,
+  `azure_sys`) — a Cargo package literally named one of those (or e.g.
+  `azure-sys`, which sanitizes to the same underscored name) previously
+  derived an identical database name, and `terraform apply` failed trying
+  to create/manage a database a fresh server already owns; it now appends
+  a `_prod` suffix in that case, still within the 63-byte limit. The
+  generated Azure Redis Cache disables its non-TLS port, so the app only
+  ever receives a `rediss://` URL, but the workspace `redis` dependency was
+  built with no TLS Cargo feature — `redis::Client::open` rejected that
+  scheme outright ("can't connect with TLS, the feature is not enabled"),
+  so the optional cache path was entirely unusable the moment
+  `enable_redis_cache` was turned on. The workspace `redis` dependency now
+  also enables `tokio-rustls-comp`, matching the rustls stack the rest of
+  the workspace already standardizes on. Both the generated workflow and
+  the manual deploy walkthrough now update the migration job's image via
+  `az containerapp job update --image ...` before starting it, instead of
+  passing `--image` straight to `az containerapp job start`: the latter
+  sends an execution-template *override*, which Azure treats as a full
+  replacement rather than a merge, silently dropping the Terraform-
+  configured `command` (`autumn migrate`) and the
+  `AUTUMN_DATABASE__PRIMARY_URL` secret env — the execution would run the
+  container's default command with no DB URL instead of applying
+  migrations. `autumn release init --target azure-container-apps` also now
+  warns when run from a Cargo workspace member directory whose git
+  repository root differs from the current directory: GitHub Actions only
+  discovers workflow files under the repository ROOT's
+  `.github/workflows/`, so the generated `azure-deploy.yml` would
+  otherwise sit somewhere it can never fire from, with no indication why
+  tag pushes and manual dispatches never trigger it. The warning names the
+  actual git root and the exact `working-directory:` override needed if
+  the file is moved there by hand. The `AcrPull` role assignment on the
+  freshly-created user-assigned identity now sets
+  `skip_service_principal_aad_check = true`: without it, Entra ID
+  replication lag can make `terraform apply` intermittently fail with
+  `PrincipalNotFound` on a fresh apply, even though the identity it's
+  granting the role to was just created successfully by that same apply.
+  The Postgres reserved-database-name guard now also covers `template0`
+  and `template1` — every Postgres cluster, on any host, is initialized
+  with those two as its own templates, not just the three Azure-specific
+  system databases the guard already listed; an app literally named either
+  one previously collided the same way. The generated `.dockerignore` now
+  also excludes `.terraform/`/`*.tfstate*`/`terraform.tfvars`: without
+  those, running `docker build .` from the crate directory (where
+  `autumn release init --target azure-container-apps` scaffolds Terraform
+  files) after `terraform apply` uploaded the plaintext state file — every
+  secret value, `sensitive` flag or not — into the build context/cache
+  even though no stage ever copies it into the final image.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via
