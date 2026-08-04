@@ -140,7 +140,7 @@ authentication event.
 account row, remove that user's team memberships too:
 
 ```rust
-teams::routes::organizations::remove_all_memberships(user.id, &membership_repo).await?;
+teams::routes::organizations::remove_all_memberships(user.id, &mut db).await?;
 ```
 
 `Membership::user_id` has no foreign key back to your `users` table (see
@@ -151,9 +151,27 @@ Skipping this step means a deleted user's session cookie on another
 still-logged-in device keeps working against every team route: `require_role`
 only re-checks the live `Membership` row (issue #1261's own
 stale-cache-safety guarantee), not whether the account it belongs to still
-exists. `remove_all_memberships` calls `.across_tenants()` internally —
-account deletion has no single active organization to scope the removal to,
-every membership the user holds anywhere must go.
+exists. `remove_all_memberships` runs across every organization the user
+belongs to in one transaction — account deletion has no single active
+organization to scope the removal to — and, for any organization where the
+user is the sole `Owner`, promotes another existing member (preferring an
+`Admin`) to `Owner` first, so the same last-owner protection
+`change_role`/`remove_member` enforce for interactive requests isn't
+silently bypassed by this bulk removal.
+
+Make sure your account-deletion flow also invalidates every *session* for
+the deleted user, not just the current device's — `remove_all_memberships`
+only removes `memberships` rows. A handler that trusts a bare
+`session.get("user_id")` (as every `teams` route does — see above) has no
+way to independently tell a still-signed-in session on another device apart
+from a live account, since it doesn't know your session/tracked-session
+scheme. If your account-deletion handler doesn't already revoke every
+device's session for that user (most session backends support "invalidate
+all sessions for this user"; a single `session.destroy()` only clears the
+*current* request's cookie), a stale session on another device could still
+call `POST /organizations` and mint a brand-new organization — that route
+has no existing membership to check against, so removing this user's old
+memberships doesn't prevent it from creating new ones.
 
 ## Guarding routes by role
 
@@ -206,13 +224,16 @@ tenant context was established".
 
 ## CSRF
 
-Generated forms (`create_invitation`, `change_role`, `remove_member`, etc.)
-do **not** carry a CSRF token — this module renders through its own minimal,
+Generated forms (`create_invitation`, `change_role`, `remove_member`,
+`show_invitation`'s accept form, etc.) embed a hidden `_csrf` field, sourced
+from an `Option<CsrfToken>` extractor that degrades to an empty value when
+`CsrfLayer` isn't mounted (e.g. `[security.csrf] enabled = false`). This
+works even though the module renders through its own minimal,
 dependency-free page wrapper (`minimal_page`) rather than your app's own
-layout, so it has no shared place to thread one through. If your app has
-`[security.csrf]` enabled (the framework default), add a hidden `_csrf`
-field to each generated `<form>` yourself once you've wired the handlers
-through your own layout.
+layout — no further wiring is needed here. If you swap these handlers to
+render through your own `crate::layout` instead, carry the same
+`csrf_value(&csrf)` pattern (or your layout's equivalent) into every form
+you keep.
 
 ## Known simplifications versus `examples/teams`
 
@@ -235,6 +256,16 @@ generator cannot:
   generator doesn't assume anything about that function's signature or
   branding. Swap the handlers in `src/teams/routes/` to use your own layout
   once the integration seam above is wired.
+- **`teams` trusts `session.get("user_id")` on its own, the same as any
+  ordinary `#[secured]` route** — it has no way to additionally verify the
+  account still exists or that the session was re-validated against your
+  app's own tracked-session table (see the account-deletion note above).
+  This isn't unique to `teams`: it's true of any handler in your app that
+  only checks session presence rather than explicitly calling something
+  like a generated `require_tracked_session`. If your app's account
+  deletion doesn't revoke every device's session for that user, a stale
+  session survives account deletion the same way it would on any other
+  route, generated or hand-written.
 
 For the fully-wired version of all three flows (including inline
 account-creation-on-accept and email-labeled member rows), read

@@ -438,7 +438,7 @@ const MOD_RS: &str = r#"//! Team membership, roles, and email invitations (issue
 //!    account itself:
 //!
 //!    ```ignore
-//!    teams::routes::organizations::remove_all_memberships(user.id, &membership_repo).await?;
+//!    teams::routes::organizations::remove_all_memberships(user.id, &mut db).await?;
 //!    ```
 //!
 //! Gate any admin-only handler with
@@ -825,15 +825,6 @@ pub trait MembershipRepository {
     /// via `.across_tenants()` — resolving which organizations a user
     /// belongs to has to run before any one of them is "the" active tenant.
     fn find_by_user_id(user_id: i64) -> Vec<Membership>;
-
-    /// Bulk-remove every membership `user_id` holds, across every
-    /// organization. Always called via `.across_tenants()` — see
-    /// `routes::organizations::remove_all_memberships`, the account-deletion
-    /// half of the auth integration seam (Codex review finding: without
-    /// this, deleting a user's account through `autumn generate auth`
-    /// leaves their memberships behind, so a stale session cookie can keep
-    /// using team routes after the account no longer exists).
-    fn delete_by_user_id(user_id: i64);
 }
 
 #[autumn_web::repository(Invitation, table = "invitations", tenant_scoped)]
@@ -1087,18 +1078,76 @@ pub async fn provision_default_organization_on_conn(
 /// exists, since it only re-checks the live `Membership` row, not the
 /// account itself).
 ///
-/// Uses `.across_tenants()`: an account being deleted has no single active
-/// organization to scope this to — every membership the user holds, in
-/// every organization, must go.
+/// For every organization where `user_id` is currently the sole `Owner`,
+/// promotes another existing member (preferring an `Admin`) to `Owner`
+/// first, before removing `user_id`'s own membership — bypassing this would
+/// silently defeat the same last-owner protection `remove_member`/
+/// `change_role` already enforce for interactive requests (Codex review
+/// finding): an organization stripped of its only Owner by account
+/// deletion would still have Admins/Members, but no one left able to ever
+/// grant a replacement Owner (`create_invitation`/`change_role` both
+/// require an existing Owner to grant the `Owner` role). If no other member
+/// exists in that organization, there is no one to promote — the
+/// organization is simply left with zero members, which is harmless (no
+/// `tenant_scoped` read/write can act on a membership-less tenant).
+///
+/// Runs across every organization in one transaction: not tenant-scoped, so
+/// raw queries against `db` rather than the generated `tenant_scoped`
+/// repository, which can only ever see the caller's single active tenant.
 ///
 /// ```ignore
-/// teams::routes::organizations::remove_all_memberships(user_id, &membership_repo).await?;
+/// teams::routes::organizations::remove_all_memberships(user_id, &mut db).await?;
 /// ```
-pub async fn remove_all_memberships(
-    user_id: i64,
-    membership_repo: &PgMembershipRepository,
-) -> AutumnResult<()> {
-    membership_repo.across_tenants().delete_by_user_id(user_id).await
+pub async fn remove_all_memberships(user_id: i64, db: &mut Db) -> AutumnResult<()> {
+    db.tx(move |conn| {
+        async move {
+            let owned: Vec<Membership> = memberships::table
+                .filter(memberships::user_id.eq(user_id))
+                .filter(memberships::role.eq(Role::Owner.as_str()))
+                .select(Membership::as_select())
+                .for_update()
+                .load(conn)
+                .await?;
+
+            for owner_membership in &owned {
+                let mut successor: Option<Membership> = memberships::table
+                    .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
+                    .filter(memberships::user_id.ne(user_id))
+                    .filter(memberships::role.eq(Role::Admin.as_str()))
+                    .select(Membership::as_select())
+                    .order(memberships::id.asc())
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if successor.is_none() {
+                    successor = memberships::table
+                        .filter(memberships::tenant_id.eq(&owner_membership.tenant_id))
+                        .filter(memberships::user_id.ne(user_id))
+                        .select(Membership::as_select())
+                        .order(memberships::id.asc())
+                        .for_update()
+                        .first(conn)
+                        .await
+                        .optional()?;
+                }
+                if let Some(successor) = successor {
+                    diesel::update(memberships::table.filter(memberships::id.eq(successor.id)))
+                        .set(memberships::role.eq(Role::Owner.as_str()))
+                        .execute(conn)
+                        .await?;
+                }
+            }
+
+            diesel::delete(memberships::table.filter(memberships::user_id.eq(user_id)))
+                .execute(conn)
+                .await?;
+
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await
 }
 
 /// Create a new organization; the caller becomes its `Owner` and it becomes
@@ -2871,19 +2920,57 @@ async fn main() {
         let organizations =
             fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
         assert!(
-            organizations.contains("pub async fn remove_all_memberships("),
+            organizations
+                .contains("pub async fn remove_all_memberships(user_id: i64, db: &mut Db)"),
             "{organizations}"
         );
         assert!(
-            organizations.contains("membership_repo.across_tenants().delete_by_user_id(user_id)"),
+            organizations.contains(
+                "diesel::delete(memberships::table.filter(memberships::user_id.eq(user_id)))"
+            ),
             "{organizations}"
         );
+    }
 
-        let repositories =
-            fs::read_to_string(tmp.path().join("src/teams/repositories.rs")).unwrap();
+    /// `remove_all_memberships` bulk-deletes every membership a user holds —
+    /// if that user is the sole `Owner` of an organization with other
+    /// members still in it, deleting the membership outright (without first
+    /// promoting a successor) would silently bypass the exact same
+    /// last-owner protection `change_role`/`remove_member` already enforce
+    /// for interactive requests, leaving the organization with Admins/
+    /// Members but no one who can ever grant a replacement Owner (Codex
+    /// review finding).
+    #[test]
+    fn remove_all_memberships_promotes_a_successor_before_dropping_the_last_owner() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let organizations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
         assert!(
-            repositories.contains("fn delete_by_user_id(user_id: i64);"),
-            "{repositories}"
+            organizations.contains(".filter(memberships::role.eq(Role::Owner.as_str()))"),
+            "{organizations}"
         );
+        assert!(
+            organizations.contains(".filter(memberships::role.eq(Role::Admin.as_str()))"),
+            "{organizations}"
+        );
+        assert!(
+            organizations.contains(".set(memberships::role.eq(Role::Owner.as_str()))"),
+            "{organizations}"
+        );
+        // The promotion query (successor lookup) must run, and complete,
+        // before the bulk delete — verified by source order, since the
+        // delete would otherwise remove the very row being promoted.
+        let promote_pos = organizations
+            .find(".filter(memberships::role.eq(Role::Admin.as_str()))")
+            .unwrap();
+        let delete_pos = organizations
+            .find("diesel::delete(memberships::table.filter(memberships::user_id.eq(user_id)))")
+            .unwrap();
+        assert!(promote_pos < delete_pos);
     }
 }
