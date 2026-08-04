@@ -35,6 +35,7 @@ them; on 0.5.0 fall back to the documented manual alternative.
 | `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth); **(trunk-dev)** also scaffolds a configurable password policy and persistent "remember me" login by default, authenticated change-password/change-email flows, and `--magic-link` passwordless login |
 | `admin` | `admin Post title:String body:Text` | Admin plugin resource page — fields must be supplied explicitly; generator does not read the model |
 | `policy` **(trunk-dev)** | `policy Post` | Scaffolds `<Pascal>Policy`/`<Pascal>Scope` for an EXISTING model — owner-or-admin `update`/`delete` plus an owner-scoped `list`. When no owner column (`user_id`/`author_id`/`owner_id`) is found, emits a default-deny TODO stub instead (issue #1125) |
+| `teams` **(trunk-dev)** | `teams` | Organization membership + email invitations (issue #1261): `Organization`/`Membership`/`Invitation` models + migrations, a closed `Owner`/`Admin`/`Member` role + `require_role` guard, an `InvitationMailer`, and member-management routes under `src/teams/`. Takes **no name argument** — always emits this fixed set. Composes `#[repository(tenant_scoped)]` (#695) and the session `"role"` key (#496); does not scaffold its own login/signup — see "teams" below. |
 | `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
 | `pwa` | `pwa` | PWA scaffolding — manifest, service worker, offline shell, icons, route handlers, smoke test |
 | `wizard` | `wizard checkout shipping payment review` | Session-backed multi-step form — step structs, GET/POST handlers, confirm/commit/cancel, and ignored integration test skeletons |
@@ -420,6 +421,35 @@ concurrent-lock TOCTOU. It sits before the TOTP branch, so it covers both
 `--magic-link` and `--magic-link --totp`; a locked account renders the same
 generic failure page as an expired/consumed/unknown token, so there is no
 oracle.
+
+### teams (trunk-dev)
+```
+Next steps:
+1. `autumn generate teams` takes no name/model argument — it always emits the
+   fixed Organization/Membership/Invitation set under src/teams/. Requires an
+   existing `users` table (e.g. from `autumn generate auth`); it does not
+   scaffold login/signup itself.
+2. Wire the two-line auth-integration seam by hand (see docs/generate-teams.md):
+   - After your own signup handler creates the user, call
+     `teams::routes::organizations::provision_default_organization(...)` to
+     make them the Owner of a personal organization.
+   - After your own login handler resolves the session, call
+     `teams::role::establish_org_session(...)` to set the active
+     organization + role in the session.
+3. Set `[tenancy]` in autumn.toml: `source = "session"`,
+   `session_key = "organization_id"`, and list `/invite` (NOT `/invitations`)
+   in `public_paths` — `/invite/{token}` is the invitee-facing accept flow;
+   `/invitations` is the Admin-only create/revoke/resend surface and must
+   stay tenant-gated.
+4. Run: autumn migrate   (applies the organizations/memberships/invitations
+   migration)
+5. Generated forms don't carry CSRF tokens — add them by hand (or set
+   `[security.csrf] enabled = false`, not recommended) if your app leaves
+   the framework's on-by-default CSRF protection on.
+6. `examples/teams` is the fully-wired reference this generator adapts
+   from — it owns its own `users` table end to end, so both integration
+   points from step 2 are inlined directly into its `routes/auth.rs`.
+```
 
 ## Flags
 
