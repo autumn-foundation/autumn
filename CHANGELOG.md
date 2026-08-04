@@ -220,7 +220,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   otherwise sit somewhere it can never fire from, with no indication why
   tag pushes and manual dispatches never trigger it. The warning names the
   actual git root and the exact `working-directory:` override needed if
-  the file is moved there by hand.
+  the file is moved there by hand. The `AcrPull` role assignment on the
+  freshly-created user-assigned identity now sets
+  `skip_service_principal_aad_check = true`: without it, Entra ID
+  replication lag can make `terraform apply` intermittently fail with
+  `PrincipalNotFound` on a fresh apply, even though the identity it's
+  granting the role to was just created successfully by that same apply.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

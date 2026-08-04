@@ -1584,6 +1584,33 @@ previous_secrets = []
     }
 
     #[test]
+    fn main_tf_acr_pull_role_assignment_skips_aad_check() {
+        // The AcrPull grant targets the identity the SAME apply just
+        // created above it — Entra ID replication lag can make the role
+        // assignment fail with PrincipalNotFound before that object has
+        // propagated, even though the identity itself was created
+        // successfully. skip_service_principal_aad_check exists for
+        // exactly this "newly provisioned principal" case; a user-assigned
+        // identity's principal_id IS backed by a Service Principal object
+        // in Entra ID, so it applies here.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let role_assignment = content
+            .split("resource \"azurerm_role_assignment\" \"acr_pull\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the acr_pull role assignment");
+        assert!(
+            role_assignment.contains("skip_service_principal_aad_check = true"),
+            "the AcrPull role assignment on the freshly-created identity must set \
+             skip_service_principal_aad_check to avoid an intermittent \
+             PrincipalNotFound failure from AAD replication lag: {role_assignment}"
+        );
+    }
+
+    #[test]
     fn main_tf_key_vault_name_never_exceeds_azure_length_limit() {
         // Azure Key Vault names are capped at 24 characters. Extract the
         // substr() bound and random_id byte_length from the template and

@@ -198,6 +198,13 @@ resource "azurerm_role_assignment" "acr_pull" {
   scope                = azurerm_container_registry.this.id
   role_definition_name = "AcrPull"
   principal_id         = azurerm_user_assigned_identity.this.principal_id
+  # This grant targets the identity the same apply just created above — a
+  # user-assigned identity IS backed by a Service Principal object in Entra
+  # ID under the hood, so on a fresh apply, AAD replication lag can make
+  # this role assignment fail with PrincipalNotFound before the object has
+  # propagated, even though the identity was just created successfully.
+  # skip_service_principal_aad_check exists for exactly this case.
+  skip_service_principal_aad_check = true
 }
 
 resource "azurerm_key_vault" "this" {
