@@ -1401,6 +1401,30 @@ previous_secrets = []
     }
 
     #[test]
+    fn main_tf_wires_trusted_hosts_so_prod_actually_binds() {
+        // AUTUMN_PROFILE=prod makes fail_fast_on_invalid_trusted_hosts exit
+        // the process immediately when security.trusted_hosts.hosts is
+        // empty (see docs/guide/deployment.md's "Trusted hosts" section).
+        // Without this, the container never binds after the first real
+        // deploy — it would crash-loop instead of serving traffic.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS"),
+            "main.tf must set AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS on the Container \
+             App: {content}"
+        );
+        assert!(
+            content.contains("azurerm_container_app_environment.this.default_domain"),
+            "the trusted host must be derived from the environment's default_domain \
+             (known before the app is created), not the app's own \
+             latest_revision_fqdn (which would be a circular self-reference): {content}"
+        );
+    }
+
+    #[test]
     fn main_tf_grants_key_vault_access_to_terraform_identity() {
         // Access-policy-model Key Vaults grant NO data-plane access by
         // default (subscription-level Owner/Contributor does not imply Key
@@ -2258,6 +2282,39 @@ previous_secrets = []
             content.contains("cancel-in-progress: false"),
             "cancel-in-progress must be false — killing a run mid-migration or \
              mid-cutover is worse than making the next run wait: {content}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_guards_against_superseded_commit_before_migrating() {
+        // GitHub does not document strict FIFO ordering for which queued
+        // run in a concurrency group goes next, so a run that started
+        // against an older commit could still reach the migration/deploy
+        // steps after a newer commit has since been pushed to the same
+        // ref. Must abort rather than deploy out of order.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        assert!(
+            content.contains("git ls-remote origin \"$GITHUB_REF\""),
+            "azure-deploy.yml must check the ref's current remote HEAD before \
+             migrating: {content}"
+        );
+
+        let guard_pos = content
+            .find("git ls-remote origin")
+            .expect("the staleness guard must be present");
+        let job_pos = content
+            .find("az containerapp job start \\")
+            .expect("migration job start must be present");
+        let deploy_pos = content
+            .find("az containerapp update \\")
+            .expect("deploy step must be present");
+        assert!(
+            guard_pos < job_pos && job_pos < deploy_pos,
+            "the staleness guard must run BEFORE migration, which must run BEFORE \
+             deploy: {content}"
         );
     }
 

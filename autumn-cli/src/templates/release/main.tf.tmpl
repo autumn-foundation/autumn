@@ -97,6 +97,17 @@ locals {
   )
 }
 
+# Azure Container Apps' default ingress hostname is deterministic:
+# "<app-name>.<environment's default domain>". Computed from the
+# environment (created before the app) rather than from
+# azurerm_container_app.this.latest_revision_fqdn — referencing the app's
+# own only-known-after-create output as one of its own env values would be
+# a circular self-reference Terraform can't resolve. In practice this
+# resolves to the same hostname a real client's Host header carries.
+locals {
+  app_fqdn = "${local.app_name_safe}.${azurerm_container_app_environment.this.default_domain}"
+}
+
 resource "azurerm_resource_group" "this" {
   name     = "${var.app_name}-rg"
   location = var.location
@@ -345,6 +356,17 @@ resource "azurerm_container_app" "this" {
       env {
         name  = "AUTUMN_PROFILE"
         value = "prod"
+      }
+
+      # Required: the prod profile fails fast at startup — the process
+      # never binds — when security.trusted_hosts.hosts is empty (host-
+      # header allow-list, see docs/guide/deployment.md#trusted-hosts-host-
+      # header-allow-list). Comma-separate additional entries here (e.g. a
+      # custom domain once one is bound) — the config parser reads this as
+      # a CSV list.
+      env {
+        name  = "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS"
+        value = local.app_fqdn
       }
 
       env {

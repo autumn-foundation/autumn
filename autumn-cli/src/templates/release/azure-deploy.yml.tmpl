@@ -102,6 +102,21 @@ jobs:
           AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
           IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
 
+      # The concurrency group above prevents two runs from executing at the
+      # same time, but GitHub does not document strict FIFO ordering for
+      # which queued run goes next — so a run that started against an
+      # older commit could still reach this point after a newer commit has
+      # since been pushed to the same ref. Check right before the
+      # point-of-no-return (migrating/deploying): if the ref has moved,
+      # this run is superseded and must not migrate or deploy over it.
+      - name: Abort if a newer commit has since been pushed to this ref
+        run: |
+          LATEST_SHA=$(git ls-remote origin "$GITHUB_REF" | cut -f1)
+          if [ -n "$LATEST_SHA" ] && [ "$LATEST_SHA" != "$GITHUB_SHA" ]; then
+            echo "::error::a newer commit ($LATEST_SHA) has been pushed to $GITHUB_REF since this run ($GITHUB_SHA) started — a newer workflow run supersedes this one, aborting before migrating/deploying out of order"
+            exit 1
+          fi
+
       # Runs `autumn migrate` to completion in a one-shot Container Apps Job
       # BEFORE the app is updated, so new replicas never start against an
       # unmigrated schema (production config disables startup migrations —
