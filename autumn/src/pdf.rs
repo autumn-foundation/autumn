@@ -85,6 +85,7 @@ mod metrics;
 /// / [`inline`](Pdf::inline) and return it — it implements [`IntoResponse`].
 ///
 /// See the [module docs](crate::pdf) for what HTML is supported.
+#[derive(Debug, Clone)]
 #[must_use = "a Pdf does nothing unless returned from a handler or converted with `into_response`"]
 pub struct Pdf {
     html: String,
@@ -163,6 +164,11 @@ impl IntoResponse for Pdf {
     }
 }
 
+/// [`extract_text`] could not read `bytes` back as a PDF.
+#[derive(Debug, thiserror::Error)]
+#[error("not a parseable PDF: {0}")]
+pub struct PdfParseError(String);
+
 /// Extract the visible text of a rendered PDF as one space-joined string —
 /// enough to assert on with a plain substring check.
 ///
@@ -176,15 +182,21 @@ impl IntoResponse for Pdf {
 /// single space rather than trying to reconstruct line/page boundaries.
 /// That means a phrase that happens to wrap across two lines is still found
 /// as one contiguous substring, at the cost of not distinguishing "same
-/// line" from "next line" in the returned string.
+/// line" from "next line" in the returned string. It also means that two
+/// *differently styled* words with no whitespace between them in the source
+/// HTML (e.g. `$<strong>42.00</strong>`) render visually adjacent, with no
+/// gap, but still come back from this function as two separate
+/// space-joined chunks (`"$ 42.00"`) — match on the two pieces separately
+/// (or drop styling at the boundary) rather than the single glued string.
 ///
 /// # Errors
 ///
-/// Returns `Err` with a description if `bytes` is not a parseable PDF.
-pub fn extract_text(bytes: &[u8]) -> Result<String, String> {
+/// Returns [`PdfParseError`] if `bytes` is not a parseable PDF.
+pub fn extract_text(bytes: &[u8]) -> Result<String, PdfParseError> {
     let mut warnings = Vec::new();
     let doc =
-        printpdf::PdfDocument::parse(bytes, &printpdf::PdfParseOptions::default(), &mut warnings)?;
+        printpdf::PdfDocument::parse(bytes, &printpdf::PdfParseOptions::default(), &mut warnings)
+            .map_err(PdfParseError)?;
     let mut out = String::new();
     for page in doc.extract_text() {
         for chunk in page {
@@ -195,96 +207,4 @@ pub fn extract_text(bytes: &[u8]) -> Result<String, String> {
         }
     }
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn text(pdf: &Pdf) -> String {
-        extract_text(&pdf.render()).expect("valid PDF")
-    }
-
-    #[test]
-    fn renders_plain_paragraph_text() {
-        let pdf = Pdf::from_html("<p>Total: $42.00</p>");
-        assert!(text(&pdf).contains("Total: $42.00"));
-    }
-
-    #[test]
-    fn renders_heading_and_table_content() {
-        let pdf = Pdf::from_html(
-            "<h1>Invoice #42</h1><table><tr><th>Item</th><th>Amount</th></tr><tr><td>Widget</td><td>$42.00</td></tr></table>",
-        );
-        let extracted = text(&pdf);
-        assert!(extracted.contains("Invoice"));
-        assert!(extracted.contains("42"));
-        assert!(extracted.contains("Widget"));
-        assert!(extracted.contains("42.00"));
-    }
-
-    #[test]
-    fn unknown_wrapper_tags_still_render_their_text() {
-        let pdf = Pdf::from_html(r#"<div class="card"><span>Total: $42.00</span></div>"#);
-        assert!(text(&pdf).contains("Total: $42.00"));
-    }
-
-    #[test]
-    fn rendering_is_deterministic_for_identical_input() {
-        let html = "<h1>Invoice</h1><p>Total: $42.00</p>";
-        let a = extract_text(&Pdf::from_html(html).render()).expect("valid PDF");
-        let b = extract_text(&Pdf::from_html(html).render()).expect("valid PDF");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn default_response_is_attachment_pdf_named_document() {
-        let resp = Pdf::from_html("<p>hi</p>").into_response();
-        assert_eq!(
-            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
-            "application/pdf"
-        );
-        assert_eq!(
-            resp.headers()
-                .get(http::header::CONTENT_DISPOSITION)
-                .unwrap(),
-            "attachment; filename=\"document.pdf\""
-        );
-    }
-
-    #[test]
-    fn filename_and_inline_builders_are_honored() {
-        let resp = Pdf::from_html("<p>hi</p>")
-            .filename("invoice.pdf")
-            .inline()
-            .into_response();
-        assert_eq!(
-            resp.headers()
-                .get(http::header::CONTENT_DISPOSITION)
-                .unwrap(),
-            "inline; filename=\"invoice.pdf\""
-        );
-    }
-
-    #[test]
-    fn output_starts_with_the_pdf_magic_bytes() {
-        let bytes = Pdf::from_html("<p>hi</p>").render();
-        assert!(bytes.starts_with(b"%PDF-"));
-    }
-
-    #[cfg(feature = "maud")]
-    #[test]
-    fn from_markup_renders_maud_views() {
-        let markup = maud::html! {
-            h1 { "Invoice" }
-            p { "Total: $42.00" }
-        };
-        let pdf = Pdf::from_markup(markup);
-        assert!(text(&pdf).contains("Total: $42.00"));
-    }
-
-    #[test]
-    fn extract_text_rejects_non_pdf_bytes() {
-        assert!(extract_text(b"not a pdf").is_err());
-    }
 }

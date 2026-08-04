@@ -53,6 +53,12 @@ enum Word {
         text: String,
         bold: bool,
         italic: bool,
+        /// No whitespace separated this word from the previous one in the
+        /// source HTML (e.g. `$<strong>42.00</strong>`, where "$" and
+        /// "42.00" are adjacent spans with nothing between them) — render
+        /// with no space before it, and never break a line between it and
+        /// the previous word.
+        glue: bool,
     },
     Break,
 }
@@ -139,7 +145,9 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
                     let is_header = cell_tag == "th";
                     if is_header || cell_tag == "td" {
                         let mut spans = Vec::new();
-                        inline_spans(cell_children, is_header, false, depth + 1, &mut spans);
+                        // `cell_children` is two levels below `tr`'s `depth`
+                        // (tr -> td/th -> cell_children).
+                        inline_spans(cell_children, is_header, false, depth + 2, &mut spans);
                         cells.push((spans, is_header));
                     }
                 }
@@ -148,7 +156,21 @@ fn extract_table_rows(nodes: &[Node], depth: u32, out: &mut Vec<TableRow>) {
             // Structural wrappers (thead/tbody/tfoot) — descend without
             // emitting a row themselves.
             "thead" | "tbody" | "tfoot" => extract_table_rows(children, depth + 1, out),
-            _ => {}
+            // Anything else inside a <table> (most commonly <caption>, or a
+            // stray text-bearing tag) isn't a row — but its text must still
+            // render somewhere, matching this renderer's "unknown tags pass
+            // their text through transparently" contract (see module docs).
+            // A single-cell row is the simplest way to surface it without a
+            // dedicated non-tabular-content block type.
+            _ => {
+                let mut spans = Vec::new();
+                inline_spans(children, false, false, depth + 1, &mut spans);
+                if !spans.is_empty() {
+                    out.push(TableRow {
+                        cells: vec![(spans, false)],
+                    });
+                }
+            }
         }
     }
 }
@@ -296,34 +318,57 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
     }
 }
 
+/// Flatten `spans` into words, splitting each run's text on whitespace and
+/// tracking, per word, whether it was directly adjacent (no whitespace) to
+/// the previous span's text — see [`Word::Text::glue`]. A span whose text is
+/// entirely whitespace (or empty) breaks any glue run without itself
+/// emitting a word.
 fn words_of(spans: &[Span]) -> Vec<Word> {
     let mut words = Vec::new();
+    let mut glue_next = false;
     for span in spans {
         match span {
-            Span::Break => words.push(Word::Break),
+            Span::Break => {
+                words.push(Word::Break);
+                glue_next = false;
+            }
             Span::Run { text, bold, italic } => {
-                for w in text.split_whitespace() {
+                let starts_with_ws = text.starts_with(char::is_whitespace);
+                let ends_with_ws = text.ends_with(char::is_whitespace);
+                let mut emitted_any = false;
+                for (i, w) in text.split_whitespace().enumerate() {
                     words.push(Word::Text {
                         text: w.to_owned(),
                         bold: *bold,
                         italic: *italic,
+                        glue: i == 0 && glue_next && !starts_with_ws,
                     });
+                    emitted_any = true;
                 }
+                glue_next = emitted_any && !ends_with_ws;
             }
         }
     }
     words
 }
 
+/// A word already positioned within a wrapped line: `(text, bold, italic,
+/// glue)`, where `glue` means "no space before this word" — see
+/// [`Word::Text::glue`].
+type StyledWord = (String, bool, bool, bool);
+
 /// Greedily word-wrap `words` to `max_width_pt`, honoring explicit
-/// [`Word::Break`]s. Each returned line is a list of `(text, bold, italic)`
-/// words in left-to-right order; the caller positions each word itself
-/// rather than this function merging same-style runs, keeping the wrapping
-/// logic simple and easy to verify.
-fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<(String, bool, bool)>> {
+/// [`Word::Break`]s. Each returned line is a list of [`StyledWord`]s in
+/// left-to-right order; the caller positions each word itself rather than
+/// this function merging same-style runs, keeping the wrapping logic simple
+/// and easy to verify. A glued word is always kept on the same line as the
+/// word before it, even if that overflows `max_width_pt` slightly —
+/// splitting a short glued run (e.g. a "$" bolded separately from its
+/// amount) across two lines would look worse than a minor overflow.
+fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledWord>> {
     let space_w = text_width_pt(" ", font_size_pt, false);
     let mut lines = Vec::new();
-    let mut current: Vec<(String, bool, bool)> = Vec::new();
+    let mut current: Vec<StyledWord> = Vec::new();
     let mut current_width = 0.0f32;
 
     for word in words {
@@ -332,15 +377,27 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<(String
                 lines.push(std::mem::take(&mut current));
                 current_width = 0.0;
             }
-            Word::Text { text, bold, italic } => {
+            Word::Text {
+                text,
+                bold,
+                italic,
+                glue,
+            } => {
                 let w = text_width_pt(text, font_size_pt, *bold);
-                let needed = if current.is_empty() { w } else { w + space_w };
-                if !current.is_empty() && current_width + needed > max_width_pt {
-                    lines.push(std::mem::take(&mut current));
-                    current_width = 0.0;
+                let glued = *glue && !current.is_empty();
+                if !glued {
+                    let needed = if current.is_empty() { w } else { w + space_w };
+                    if !current.is_empty() && current_width + needed > max_width_pt {
+                        lines.push(std::mem::take(&mut current));
+                        current_width = 0.0;
+                    }
                 }
-                current_width += if current.is_empty() { w } else { w + space_w };
-                current.push((text.clone(), *bold, *italic));
+                current_width += if current.is_empty() || glued {
+                    w
+                } else {
+                    w + space_w
+                };
+                current.push((text.clone(), *bold, *italic, glued));
             }
         }
     }
@@ -423,25 +480,45 @@ impl Writer {
 
     /// Render `lines` (as produced by [`wrap`]) starting at `x_offset` from
     /// the left margin, within `width`, advancing the cursor by one
-    /// `line_height` per line. Returns the number of lines rendered.
+    /// `line_height` per line.
+    ///
+    /// `break_pages` controls whether this may itself trigger a page break
+    /// per line: pass `true` for ordinary top-level flow (paragraphs,
+    /// headings, list items), and `false` when called once per *column*
+    /// from [`draw_table`](Self::draw_table) — there, the row as a whole
+    /// already had its space reserved up front (see that method), and a
+    /// page break triggered by one column midway through would flush the
+    /// page and reset the cursor to the top of the new one, but the caller's
+    /// saved `y_from_top` for the *next* column would then be stale (from
+    /// the old, already-flushed page), corrupting that column's vertical
+    /// position. Not breaking here just lets a single row that's taller
+    /// than a whole page overflow past the bottom margin instead — visually
+    /// imperfect, but not a page-break/coordinate-corrupting bug.
     fn draw_lines(
         &mut self,
-        lines: &[Vec<(String, bool, bool)>],
+        lines: &[Vec<StyledWord>],
         x_offset: f32,
         font_size: f32,
         line_height: f32,
-    ) -> usize {
+        break_pages: bool,
+    ) {
         let space_w = text_width_pt(" ", font_size, false);
         for line in lines {
-            self.ensure_space(line_height);
+            if break_pages {
+                self.ensure_space(line_height);
+            }
             let mut x = x_offset;
-            for (text, bold, italic) in line {
+            let mut first = true;
+            for (text, bold, italic, glue) in line {
+                if !first && !glue {
+                    x += space_w;
+                }
                 self.draw_word(x, text, *bold, *italic, font_size);
-                x += text_width_pt(text, font_size, *bold) + space_w;
+                x += text_width_pt(text, font_size, *bold);
+                first = false;
             }
             self.y_from_top += line_height;
         }
-        lines.len()
     }
 
     fn draw_spans(&mut self, spans: &[Span], font_size: f32, line_height: f32, space_after: f32) {
@@ -450,7 +527,7 @@ impl Writer {
             return;
         }
         let lines = wrap(&words, self.content_width, font_size);
-        self.draw_lines(&lines, 0.0, font_size, line_height);
+        self.draw_lines(&lines, 0.0, font_size, line_height, true);
         self.y_from_top += space_after;
     }
 
@@ -499,7 +576,7 @@ impl Writer {
         let col_width = self.content_width / n_cols as f32;
 
         for row in rows {
-            let wrapped: Vec<Vec<Vec<(String, bool, bool)>>> = row
+            let wrapped: Vec<Vec<Vec<StyledWord>>> = row
                 .cells
                 .iter()
                 .map(|(spans, _)| wrap(&words_of(spans), col_width - CELL_PADDING, FONT_SIZE))
@@ -510,7 +587,7 @@ impl Writer {
             for (col, lines) in wrapped.iter().enumerate() {
                 let x_offset = col as f32 * col_width;
                 let saved_y = self.y_from_top;
-                self.draw_lines(lines, x_offset, FONT_SIZE, LINE_HEIGHT);
+                self.draw_lines(lines, x_offset, FONT_SIZE, LINE_HEIGHT, false);
                 self.y_from_top = saved_y;
             }
             self.y_from_top += row_height;
@@ -540,7 +617,7 @@ impl Writer {
                 self.draw_word(0.0, marker, false, false, 11.0);
                 let words = words_of(spans);
                 let lines = wrap(&words, self.content_width - INDENT, 11.0);
-                self.draw_lines(&lines, INDENT, 11.0, 14.5);
+                self.draw_lines(&lines, INDENT, 11.0, 14.5, true);
                 self.y_from_top += 4.0;
             }
             Block::Rule => self.draw_rule(),
@@ -586,7 +663,7 @@ mod tests {
         for line in &lines {
             let width: f32 = line
                 .iter()
-                .map(|(t, b, _)| text_width_pt(t, 12.0, *b))
+                .map(|(t, b, _, _)| text_width_pt(t, 12.0, *b))
                 .sum();
             assert!(width <= 80.0 + 1.0, "line exceeds max width: {width}");
         }
@@ -599,16 +676,76 @@ mod tests {
                 text: "a".to_owned(),
                 bold: false,
                 italic: false,
+                glue: false,
             },
             Word::Break,
             Word::Text {
                 text: "b".to_owned(),
                 bold: false,
                 italic: false,
+                glue: false,
             },
         ];
         let lines = wrap(&words, 1000.0, 12.0);
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn adjacent_spans_with_no_whitespace_render_with_no_space_between() {
+        // Regression: "$" and a separately-styled "42.00" right next to it
+        // (e.g. `$<strong>42.00</strong>`, this feature's own flagship
+        // money-formatting example) used to always get a space inserted
+        // between them by word-based layout, rendering "$ 42.00".
+        let words = words_of(&[
+            Span::Run {
+                text: "$".to_owned(),
+                bold: false,
+                italic: false,
+            },
+            Span::Run {
+                text: "42.00".to_owned(),
+                bold: true,
+                italic: false,
+            },
+        ]);
+        let lines = wrap(&words, 1000.0, 12.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            vec![
+                ("$".to_owned(), false, false, false),
+                ("42.00".to_owned(), true, false, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn spans_separated_by_whitespace_still_get_a_space() {
+        let words = words_of(&[
+            Span::Run {
+                text: "Total:".to_owned(),
+                bold: false,
+                italic: false,
+            },
+            Span::Run {
+                text: " ".to_owned(),
+                bold: false,
+                italic: false,
+            },
+            Span::Run {
+                text: "$42.00".to_owned(),
+                bold: true,
+                italic: false,
+            },
+        ]);
+        let lines = wrap(&words, 1000.0, 12.0);
+        assert_eq!(
+            lines[0],
+            vec![
+                ("Total:".to_owned(), false, false, false),
+                ("$42.00".to_owned(), true, false, false),
+            ]
+        );
     }
 
     #[test]
@@ -631,6 +768,33 @@ mod tests {
         assert!(matches!(&blocks[0], Block::Heading(1, _)));
         assert!(matches!(&blocks[1], Block::Paragraph(_)));
         assert!(matches!(&blocks[2], Block::Table(rows) if rows.len() == 2));
+    }
+
+    #[test]
+    fn table_caption_text_is_not_silently_dropped() {
+        // Regression: `<caption>` (or any non-row table child) matched the
+        // `extract_table_rows` catch-all with no fallback, discarding its
+        // text — contradicting this renderer's "unknown tags still render
+        // their text" contract.
+        let nodes = super::super::html::parse(
+            "<table><caption>Grand Total</caption><tr><td>1</td></tr></table>",
+        );
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        let Block::Table(rows) = &blocks[0] else {
+            panic!("expected a table block")
+        };
+        assert_eq!(rows.len(), 2, "caption becomes an extra row, not lost");
+        let caption_text: String = rows[0]
+            .cells
+            .iter()
+            .flat_map(|(spans, _)| spans)
+            .map(|s| match s {
+                Span::Run { text, .. } => text.clone(),
+                Span::Break => String::new(),
+            })
+            .collect();
+        assert_eq!(caption_text, "Grand Total");
     }
 
     #[test]

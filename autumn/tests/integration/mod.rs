@@ -143,6 +143,8 @@ mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;
 mod payload_version_integration;
+#[cfg(feature = "pdf")]
+mod pdf;
 #[cfg(feature = "db")]
 mod pg_tls;
 #[cfg(feature = "db")]

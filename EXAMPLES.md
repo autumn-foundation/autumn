@@ -212,6 +212,23 @@ Boots with no database or `MediaMTX` server; the companion narrative is
 
 ---
 
+### `examples/invoice` — PDF Downloads
+
+<!-- catalog:example name=invoice tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building billing/reporting features who needs a downloadable PDF |
+| **Journey** | Render one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` |
+| **Key capabilities** | `autumn_web::pdf::Pdf::from_markup`, `.filename(...)`, the `Clock` extractor for deterministic rendering, `TestResponse::assert_pdf_contains` |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p invoice` |
+| **Success proof** | `curl -OJ http://localhost:3000/invoices/42/pdf` downloads `invoice-42.pdf` |
+
+Boots with no database; the companion narrative is `docs/guide/pdf-downloads.md`.
+
+---
+
 ## Excluded Examples
 
 Excluded examples are intentionally kept out of the workspace and the normal
@@ -255,6 +272,7 @@ can pick the closest starting point without overlap.
 | Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
+| PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf` |
 
 ---
 

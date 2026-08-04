@@ -527,6 +527,38 @@ building, wired into `Download` and the embedded static-asset path.
   (`LocalBlobStore` seeks + takes off disk; other backends inherit a buffering
   default) — a seek in a large video never buffers the whole object.
 
+## PDF generation (unreleased)
+
+`autumn_web::pdf::Pdf` (`pdf` Cargo feature, off by default) — renders an
+HTML string, typically a `maud::Markup` view you already render on-screen,
+to a downloadable PDF `IntoResponse` built on `Download`.
+
+- Constructors: `Pdf::from_html(impl Into<String>)`, and (with the `maud`
+  feature) `Pdf::from_markup(maud::Markup)`.
+- Setters (chained, `#[must_use]`): `.filename(name)` (defaults to
+  `document.pdf`, RFC 6266-safe via the same sanitization as
+  `Download::filename`), `.inline()` (defaults to `attachment`).
+- `.render() -> Vec<u8>` renders to raw bytes without building a response —
+  for emailing an invoice attachment, writing to a `Blob` store, or a test.
+- Supported HTML subset: `h1`-`h6`, `p`, `table`/`tr`/`th`/`td`,
+  `ul`/`ol`/`li`, `strong`/`b`, `em`/`i`, `br`, `hr` — flowed top-to-bottom in
+  a single column with the PDF base-14 fonts (no CSS box model, not
+  pixel-perfect by design). Any other tag (`div`, `span`, `a`, widget
+  markup, ...) passes its text through transparently instead of being
+  dropped or erroring.
+- No system-installed browser/renderer and no embedded font files at
+  runtime — keeps the single-binary story intact (issue #1004).
+- Determinism: identical HTML input always produces identical extracted
+  text (nothing reads the wall clock internally — feed a timestamp through
+  the `Clock` extractor into the HTML yourself if you need one). Raw bytes
+  are not guaranteed byte-identical (`printpdf` assigns a random trailer
+  `/ID` per the PDF spec, not configurable).
+- `autumn_web::pdf::extract_text(&[u8]) -> Result<String, String>` reads a
+  PDF's visible text back out via `printpdf`'s own parser.
+- `TestResponse::assert_pdf_contains(&self, substring: &str) -> &Self` — test
+  helper built on `extract_text`, alongside `assert_body_contains`.
+- See `docs/guide/pdf-downloads.md` and the `examples/invoice` worked example.
+
 ## Jobs additions
 
 - Published 0.5.0 `#[job]` keys: `name`, `max_attempts`, `backoff_ms`,

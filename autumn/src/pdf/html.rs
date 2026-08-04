@@ -88,8 +88,15 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                 // Close frames up to and including the matching open tag, if
                 // any exists on the stack. A stray/mismatched close tag with
                 // no matching opener is ignored rather than corrupting the
-                // tree.
-                if let Some(depth) = stack.iter().rposition(|(tag, _)| *tag == name) {
+                // tree. An empty tag name (`</>`) must never match: the
+                // implicit root frame is *also* keyed by an empty string
+                // (it has no tag), and popping it would leave `stack` empty.
+                let matching_depth = if name.is_empty() {
+                    None
+                } else {
+                    stack.iter().rposition(|(tag, _)| *tag == name)
+                };
+                if let Some(depth) = matching_depth {
                     while stack.len() > depth {
                         let (tag, children) = stack.pop().expect("depth <= stack.len()");
                         stack
@@ -200,7 +207,19 @@ fn decode_entities(raw: &str) -> String {
             continue;
         }
         let rest = &raw[i..];
-        let Some(semi) = rest.find(';').filter(|&p| p <= 10) else {
+        // Bound the semicolon search to a small *character* window before
+        // scanning, not after: searching the unbounded remainder for a `;`
+        // and only checking the offset afterward means a long run of `&`
+        // with no nearby `;` rescans the whole rest of `raw` for every `&`
+        // — O(n^2) on adversarial input (e.g. thousands of bare `&`
+        // characters). All supported entity names are ASCII and at most 6
+        // characters, so an 11-character window (`&` + up to 10 name chars)
+        // is ample headroom while keeping each `&` O(1) to resolve.
+        let window_end = rest
+            .char_indices()
+            .nth(11)
+            .map_or(rest.len(), |(off, _)| off);
+        let Some(semi) = rest[..window_end].find(';') else {
             out.push('&');
             continue;
         };
@@ -306,11 +325,43 @@ mod tests {
     }
 
     #[test]
+    fn empty_closing_tag_does_not_panic() {
+        // Regression: `</>` has an empty tag name, which used to collide
+        // with the implicit root frame's own empty-string sentinel and pop
+        // it, panicking on the next `stack.last_mut()`.
+        assert_eq!(text(&parse("hello</>world")), "helloworld");
+        assert_eq!(text(&parse("<div></></div>")), "");
+        assert_eq!(text(&parse("</>")), "");
+    }
+
+    #[test]
     fn entities_are_decoded() {
         let nodes = parse("Fish &amp; Chips &mdash; &pound;5 &#65;&#x42;");
         // `&pound;` is not in the supported set, so it (and its `&`) survives
         // literally rather than being dropped.
         assert_eq!(text(&nodes), "Fish & Chips — &pound;5 AB");
+    }
+
+    #[test]
+    fn long_run_of_unterminated_ampersands_is_linear_not_quadratic() {
+        // Regression: the semicolon search used to scan the *entire*
+        // remainder of the string per `&` before checking how far away it
+        // was, making a long run of unterminated `&` (no nearby `;`) O(n^2).
+        // 200k chars comfortably reproduced multi-second blowups before the
+        // fix; this should now complete near-instantly.
+        let html = "&".repeat(200_000);
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(
+            text(&nodes),
+            html,
+            "unterminated `&` passes through unchanged"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "decode_entities took {:?} — looks quadratic again",
+            start.elapsed()
+        );
     }
 
     #[test]
