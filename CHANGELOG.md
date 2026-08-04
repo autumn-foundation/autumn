@@ -203,7 +203,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the optional cache path was entirely unusable the moment
   `enable_redis_cache` was turned on. The workspace `redis` dependency now
   also enables `tokio-rustls-comp`, matching the rustls stack the rest of
-  the workspace already standardizes on.
+  the workspace already standardizes on. Both the generated workflow and
+  the manual deploy walkthrough now update the migration job's image via
+  `az containerapp job update --image ...` before starting it, instead of
+  passing `--image` straight to `az containerapp job start`: the latter
+  sends an execution-template *override*, which Azure treats as a full
+  replacement rather than a merge, silently dropping the Terraform-
+  configured `command` (`autumn migrate`) and the
+  `AUTUMN_DATABASE__PRIMARY_URL` secret env — the execution would run the
+  container's default command with no DB URL instead of applying
+  migrations. `autumn release init --target azure-container-apps` also now
+  warns when run from a Cargo workspace member directory whose git
+  repository root differs from the current directory: GitHub Actions only
+  discovers workflow files under the repository ROOT's
+  `.github/workflows/`, so the generated `azure-deploy.yml` would
+  otherwise sit somewhere it can never fire from, with no indication why
+  tag pushes and manual dispatches never trigger it. The warning names the
+  actual git root and the exact `working-directory:` override needed if
+  the file is moved there by hand.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

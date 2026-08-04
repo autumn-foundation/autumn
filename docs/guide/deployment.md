@@ -950,11 +950,25 @@ docker push "$ACR/$APP_NAME:$TAG"
 # the loop below is required — proceeding straight to `az containerapp
 # update` after `job start` returns would update the app before migrations
 # have actually completed.
+#
+# `job start --image` sends an execution-TEMPLATE OVERRIDE, which Azure
+# treats as a full replacement rather than a merge: an override containing
+# only --image drops the `command` (autumn migrate) and the
+# AUTUMN_DATABASE__PRIMARY_URL secret env Terraform configured on the job,
+# so the execution would run the container's default command with no DB URL
+# instead of applying migrations. `job update --image` persists just the
+# image onto the job's STORED template, leaving command/env untouched; the
+# bare `job start` that follows then runs that complete, up-to-date
+# template.
 MIGRATE_JOB="$(terraform output -raw migrate_job_name)"
-EXECUTION=$(az containerapp job start \
+az containerapp job update \
   --name "$MIGRATE_JOB" \
   --resource-group "$RG" \
   --image "$ACR/$APP_NAME:$TAG" \
+  --output none
+EXECUTION=$(az containerapp job start \
+  --name "$MIGRATE_JOB" \
+  --resource-group "$RG" \
   --query name -o tsv)
 for _ in $(seq 1 66); do   # 660s — must exceed the job's own 600s replica_timeout_in_seconds
   STATUS=$(az containerapp job execution list \

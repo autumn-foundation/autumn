@@ -4,7 +4,7 @@
 //! and optional target-specific scaffolds) at the project root.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod templates {
     pub const DOCKERFILE: &str = include_str!("templates/release/Dockerfile.tmpl");
@@ -90,6 +90,12 @@ pub fn run(action: ReleaseAction) {
                 Ok(files) => {
                     for f in &files {
                         println!("  Created {f}");
+                    }
+
+                    if matches!(target, Target::AzureContainerApps)
+                        && let Some(warning) = azure_workflow_relocation_warning(&cwd)
+                    {
+                        eprintln!("\n{warning}");
                     }
 
                     // Smoke gate: verify the generated production config does
@@ -205,6 +211,55 @@ pub fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
         .and_then(|n| n.as_str())
         .map(str::to_owned)
         .ok_or_else(|| ReleaseError::CargoToml("missing [package] name".into()))
+}
+
+/// Locate the nearest ancestor of `dir` (inclusive) containing a `.git`
+/// entry. A worktree or submodule uses a `.git` FILE rather than a
+/// directory, so this checks existence generally rather than requiring a
+/// directory. Returns `None` if no ancestor up to the filesystem root has
+/// one (`dir` isn't inside a git repository at all).
+fn find_git_root(dir: &Path) -> Option<PathBuf> {
+    let mut current = dir;
+    loop {
+        if current.join(".git").exists() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+/// For the azure-container-apps target, `.github/workflows/azure-deploy.yml`
+/// is written under `dir` — but GitHub Actions only discovers workflow
+/// files under the git repository ROOT's `.github/workflows/`, never an
+/// arbitrary subdirectory's (see
+/// <https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows>).
+/// `autumn release init` explicitly supports running from a Cargo workspace
+/// member directory (`read_project_name` rejects only the workspace root
+/// itself), so a scaffold run from `examples/blog/` writes a workflow that
+/// would silently never fire. Returns an actionable warning to print in
+/// that case; `None` when `dir` IS the git root (the common, correct case)
+/// or isn't inside a git repository at all (nothing more specific to say).
+fn azure_workflow_relocation_warning(dir: &Path) -> Option<String> {
+    let git_root = find_git_root(dir)?;
+    if git_root == dir {
+        return None;
+    }
+    let rel = dir.strip_prefix(&git_root).ok()?;
+    Some(format!(
+        "Warning: this project lives inside a Git repository whose root is\n\
+         {}, but `.github/workflows/azure-deploy.yml` was written under\n\
+         {} — GitHub Actions only discovers workflow files under the\n\
+         repository ROOT's `.github/workflows/`, so this workflow will never\n\
+         run as-is. Move it to {}/.github/workflows/azure-deploy.yml and add\n\
+         the following so its `docker build` step still finds this crate's\n\
+         Dockerfile:\n\
+         \n\
+         defaults:\n  run:\n    working-directory: {}\n",
+        git_root.display(),
+        dir.display(),
+        git_root.display(),
+        rel.display(),
+    ))
 }
 
 /// Emit release scaffolding files into `dir` for the given `project_name`.
@@ -2364,6 +2419,61 @@ previous_secrets = []
     }
 
     #[test]
+    fn azure_workflow_updates_migration_job_image_before_starting_it() {
+        // `az containerapp job start --image ...` sends an execution-TEMPLATE
+        // OVERRIDE, which Azure treats as a full replacement, not a merge —
+        // an override containing only --image drops the Terraform-configured
+        // `command` (autumn migrate) and the AUTUMN_DATABASE__PRIMARY_URL
+        // secret env, so the execution would run the container's default
+        // command with no DB URL instead of applying migrations. The image
+        // must instead be persisted onto the job's stored template via
+        // `job update --image` BEFORE a bare `job start` (no --image) runs
+        // that complete, up-to-date template.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+
+        let migration_step = content
+            .split("Run database migrations")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("a 'Run database migrations' step must exist");
+
+        let update_pos = migration_step
+            .find("az containerapp job update \\")
+            .expect("the migration job's image must be persisted via `job update` first");
+        let start_pos = migration_step
+            .find("az containerapp job start \\")
+            .expect("`job start` must follow to actually run the now-updated template");
+        assert!(
+            update_pos < start_pos,
+            "the job's image must be updated BEFORE it's started: {migration_step}"
+        );
+
+        let update_block = &migration_step[update_pos..start_pos];
+        assert!(
+            update_block.contains("--image"),
+            "`job update` must be the one that carries --image: {update_block}"
+        );
+
+        // `job start`'s own invocation (up to its `EXECUTION=$(...)` closing
+        // paren) must be bare — no --image — since sending one there would
+        // reintroduce the template-override bug this test guards against.
+        let start_block_end = migration_step[start_pos..]
+            .find("--query name -o tsv)")
+            .map(|i| start_pos + i)
+            .expect("job start must capture the execution name via --query");
+        let start_block = &migration_step[start_pos..start_block_end];
+        assert!(
+            !start_block.contains("--image"),
+            "`job start` must not carry --image — that overrides (not merges) the \
+             execution template, dropping the command/secret env `job update` just set: \
+             {start_block}"
+        );
+    }
+
+    #[test]
     fn azure_workflow_migration_poll_budget_exceeds_job_timeout() {
         // main.tf sets replica_timeout_in_seconds = 600 on the migration
         // job; Azure self-terminates the execution at that point
@@ -2972,6 +3082,48 @@ previous_secrets = []
         assert!(
             msg.contains("member"),
             "error must hint to run from a member directory: {msg}"
+        );
+    }
+
+    // ── azure workflow discoverability (git root vs. workspace member) ────────
+
+    #[test]
+    fn azure_workflow_relocation_warning_is_silent_at_the_git_root() {
+        // The common case: `dir` IS the git repository root (a single-crate
+        // repo, or a workspace member the user happens to be running from
+        // the top of anyway). `.github/workflows/azure-deploy.yml` lands
+        // exactly where GitHub looks for it — nothing to warn about.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        assert_eq!(azure_workflow_relocation_warning(&dir), None);
+    }
+
+    #[test]
+    fn azure_workflow_relocation_warning_flags_a_nested_workspace_member() {
+        // `autumn release init` explicitly supports running from a Cargo
+        // workspace member directory (read_project_name only rejects the
+        // workspace root itself) — but GitHub Actions only discovers
+        // workflows under the git repository ROOT's .github/workflows/, so
+        // a workflow written under a member subdirectory would silently
+        // never fire. This must be flagged, not silently mis-scaffolded.
+        let tmp = TempDir::new().unwrap();
+        let git_root = tmp.path().to_path_buf();
+        fs::create_dir_all(git_root.join(".git")).unwrap();
+        let member_dir = git_root.join("examples").join("blog");
+        fs::create_dir_all(&member_dir).unwrap();
+
+        let warning = azure_workflow_relocation_warning(&member_dir)
+            .expect("a workflow nested under a workspace member must be flagged");
+        assert!(
+            warning.contains(&git_root.display().to_string()),
+            "the warning must name the actual git root: {warning}"
+        );
+        assert!(
+            warning.contains("working-directory: examples/blog"),
+            "the warning must give the exact working-directory override needed so \
+             the relocated workflow's docker build step still finds this crate's \
+             Dockerfile: {warning}"
         );
     }
 

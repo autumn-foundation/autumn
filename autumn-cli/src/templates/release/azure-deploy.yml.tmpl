@@ -176,10 +176,23 @@ jobs:
       - name: Run database migrations
         run: |
           set -euo pipefail
-          EXECUTION=$(az containerapp job start \
+          # `job start --image` sends an execution-TEMPLATE OVERRIDE, which
+          # Azure treats as a full replacement, not a merge — an override
+          # containing only --image drops the command (`autumn migrate`) and
+          # the AUTUMN_DATABASE__PRIMARY_URL secret env Terraform configured
+          # on the job, so the execution would run the container's default
+          # command with no DB URL instead of applying migrations. `job
+          # update --image` persists just the image onto the job's STORED
+          # template, leaving command/env untouched; the bare `job start`
+          # that follows then runs that complete, up-to-date template.
+          az containerapp job update \
             --name "$AZURE_MIGRATE_JOB_NAME" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --image "$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG" \
+            --output none
+          EXECUTION=$(az containerapp job start \
+            --name "$AZURE_MIGRATE_JOB_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
             --query name -o tsv)
 
           # Poll for completion — `az containerapp job execution list` is the
