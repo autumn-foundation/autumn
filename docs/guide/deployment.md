@@ -852,7 +852,7 @@ This generates:
 | File | Purpose |
 |---|---|
 | `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, a one-shot migration job, Azure Database for PostgreSQL Flexible Server, and a Key Vault that feeds secrets into the app via a user-assigned managed identity. An optional Redis Cache is gated behind `enable_redis_cache` — **infrastructure only**, see the callout below. |
-| `variables.tf` | `app_name`, `location`, `image_tag`, `db_sku`, `bootstrap_image`, `min_replicas`/`max_replicas` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
+| `variables.tf` | `app_name`, `subscription_id` (required — AzureRM v4 needs it explicitly, even under `az login`), `location`, `image_tag`, `db_sku`, `bootstrap_image`, `min_replicas`/`max_replicas` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
 | `outputs.tf` | `app_fqdn`, `acr_login_server`, `resource_group_name`, `migrate_job_name`, and `app_name`. |
 | `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
 | `.github/workflows/azure-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to ACR, runs the migration job to completion, and runs `az containerapp update` on a `v*` tag push (or manual dispatch). |
@@ -898,8 +898,11 @@ string from the Postgres server this same apply creates, from its FQDN plus
 `database_admin_password`.
 
 ```bash
-cp terraform.tfvars.example terraform.tfvars   # edit the non-secret values
-export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
+cp terraform.tfvars.example terraform.tfvars   # edit app_name/location/subscription_id/etc.
+# Azure's Postgres complexity policy needs 3 of {upper, lower, digit,
+# symbol} — `openssl rand -hex` is lowercase-only and Azure rejects it;
+# -base64 reliably mixes upper/lower/digit.
+export TF_VAR_database_admin_password="$(openssl rand -base64 24)"
 export TF_VAR_signing_secret="$(openssl rand -hex 32)"
 
 terraform init

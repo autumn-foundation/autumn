@@ -1560,6 +1560,34 @@ previous_secrets = []
     }
 
     #[test]
+    fn main_tf_app_name_alnum_is_length_bounded() {
+        // ACR names are capped at 50 characters; "${app_name_alnum}acr" +
+        // an 8-hex-char suffix reserves 11, so an unbounded app_name_alnum
+        // (Cargo package names may be much longer than 39 characters)
+        // overflows it. Postgres (63) and Redis (63) are more permissive
+        // but derive from the same local, so bounding it once covers all
+        // three rather than truncating per-resource.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let locals_block = content
+            .split("locals {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare a locals block");
+        let alnum_line = locals_block
+            .lines()
+            .find(|l| l.trim_start().starts_with("app_name_alnum ="))
+            .expect("locals must declare app_name_alnum");
+        assert!(
+            alnum_line.contains("substr("),
+            "app_name_alnum must be length-bounded so ACR's 50-character limit (after \
+             the fixed \"acr\" + 8-hex-char suffix) can never be exceeded: {alnum_line}"
+        );
+    }
+
+    #[test]
     fn main_tf_uses_bootstrap_image_and_ignores_later_image_drift() {
         // Container Apps must pull an image to create the app's/job's first
         // revision, but a brand-new ACR has none yet, so Terraform points
@@ -1822,6 +1850,56 @@ previous_secrets = []
             content.contains("variable \"bootstrap_image\""),
             "variables.tf must declare bootstrap_image, the placeholder image Terraform \
              uses before any real image has been pushed to ACR: {content}"
+        );
+    }
+
+    #[test]
+    fn main_tf_provider_sets_subscription_id() {
+        // AzureRM v4 made subscription_id mandatory for plan/apply, even
+        // under `az login` CLI auth — without it, `terraform apply` fails
+        // before provisioning anything.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let provider_block = main_tf
+            .split("provider \"azurerm\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the azurerm provider block");
+        assert!(
+            provider_block.contains("subscription_id = var.subscription_id"),
+            "the azurerm provider block must set subscription_id: {provider_block}"
+        );
+
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            variables_tf.contains("variable \"subscription_id\""),
+            "variables.tf must declare subscription_id: {variables_tf}"
+        );
+
+        let tfvars = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
+        assert!(
+            tfvars.contains("subscription_id"),
+            "terraform.tfvars.example must mention subscription_id so operators don't \
+             discover the AzureRM v4 requirement only after `terraform apply` fails: {tfvars}"
+        );
+    }
+
+    #[test]
+    fn tfvars_example_generates_postgres_compliant_admin_password() {
+        // Azure Postgres Flexible Server requires the admin password to use
+        // characters from at least 3 of {uppercase, lowercase, digit,
+        // symbol}. `openssl rand -hex` only ever produces lowercase hex
+        // digits (2 of 4 categories) — Azure rejects it at server creation.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
+        assert!(
+            content.contains("TF_VAR_database_admin_password=\"$(openssl rand -base64 24)\""),
+            "the documented database_admin_password generator must use -base64, not \
+             -hex, so it satisfies Azure's Postgres password complexity policy: {content}"
         );
     }
 

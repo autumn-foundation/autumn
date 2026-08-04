@@ -72,7 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`.terraform/`/`*.tfstate*`/`terraform.tfvars`) into the project's
   `.gitignore` — idempotently, preserving unrelated lines — since Terraform
   state holds every secret value in plaintext regardless of a variable's
-  `sensitive` flag.
+  `sensitive` flag. `main.tf` also sets a new required `subscription_id`
+  variable on the provider (AzureRM v4 made it mandatory even under `az
+  login` CLI auth), bounds `local.app_name_alnum` (ACR/Postgres/Redis) to 30
+  characters so a long Cargo package name can't overflow ACR's 50-character
+  limit, and `terraform.tfvars.example` generates
+  `database_admin_password` with `openssl rand -base64` instead of `-hex` —
+  hex-only output can't satisfy Azure Postgres's password-complexity policy
+  (3 of uppercase/lowercase/digit/symbol).
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

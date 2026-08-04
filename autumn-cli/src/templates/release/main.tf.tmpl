@@ -40,6 +40,10 @@ terraform {
 
 provider "azurerm" {
   features {}
+  # AzureRM v4 made subscription_id mandatory for plan/apply — even under
+  # `az login` CLI auth — see the 4.0 upgrade guide:
+  # https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/guides/4.0-upgrade-guide#specifying-subscription-id-is-now-mandatory
+  subscription_id = var.subscription_id
 }
 
 data "azurerm_client_config" "current" {}
@@ -53,8 +57,13 @@ resource "random_id" "suffix" {
 
 locals {
   # ACR names allow lowercase alphanumerics only (no hyphens) — strip
-  # everything else once here instead of re-deriving it per resource.
-  app_name_alnum = lower(replace(var.app_name, "/[^a-zA-Z0-9]/", ""))
+  # everything else once here instead of re-deriving it per resource, and
+  # cap at 30 characters. ACR is the tightest consumer: its 50-character
+  # limit minus the fixed "acr" + 8-hex-char suffix appended below leaves
+  # room for at most 39; 30 leaves comfortable margin and is also safely
+  # under Postgres/Redis's own 63-character limits after their longer fixed
+  # suffixes. (Key Vault truncates independently, tighter still, below.)
+  app_name_alnum = substr(lower(replace(var.app_name, "/[^a-zA-Z0-9]/", "")), 0, 30)
 
   # Container Apps-family resources (the environment, the app, the migration
   # job, and Log Analytics) allow lowercase alphanumerics AND hyphens, must

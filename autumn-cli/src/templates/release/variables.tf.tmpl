@@ -6,6 +6,11 @@ variable "app_name" {
   default     = "{{project_name}}"
 }
 
+variable "subscription_id" {
+  description = "Azure subscription ID to deploy into — required by AzureRM v4 even under `az login` CLI auth. Find yours with `az account show --query id -o tsv`."
+  type        = string
+}
+
 variable "location" {
   description = "Azure region for all resources."
   type        = string

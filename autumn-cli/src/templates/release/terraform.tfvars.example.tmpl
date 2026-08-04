@@ -3,10 +3,13 @@
 # WARNING: Never commit real credentials — pass secrets as TF_VAR_* env vars
 # or through your CI's secret store instead of writing them into this file.
 
-app_name  = "{{project_name}}"
-location  = "eastus"
-image_tag = "latest"
-db_sku    = "B_Standard_B1ms"
+app_name        = "{{project_name}}"
+location        = "eastus"
+image_tag       = "latest"
+db_sku          = "B_Standard_B1ms"
+# subscription_id required by AzureRM v4 — find yours:
+#   az account show --query id -o tsv
+subscription_id = "00000000-0000-0000-0000-000000000000"
 
 # bootstrap_image = "mcr.microsoft.com/k8se/quickstart:latest"  # rarely needs to change
 
@@ -18,8 +21,14 @@ enable_redis_cache  = false
 # There is no database_url variable to set: main.tf derives the connection
 # string from the Postgres server this same apply creates.
 #
-#   export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
+#   export TF_VAR_database_admin_password="$(openssl rand -base64 24)"
 #   export TF_VAR_signing_secret="$(openssl rand -hex 32)"
+#
+# database_admin_password must satisfy Azure's Postgres complexity policy —
+# 3 of {uppercase, lowercase, digit, symbol}. `openssl rand -hex` only ever
+# produces lowercase hex digits (2 of 4 categories) and Azure will reject
+# server creation; `-base64` reliably mixes upper/lower/digit.
+# signing_secret has no such constraint — hex is fine there.
 #
 # database_admin_password = (set via TF_VAR_database_admin_password)
 # signing_secret          = (set via TF_VAR_signing_secret)
