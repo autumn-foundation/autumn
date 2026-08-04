@@ -1422,8 +1422,46 @@ previous_secrets = []
             .find(|l| l.trim_start().starts_with("name"))
             .expect("the database resource must set a name");
         assert!(
-            name_line.contains("substr(") && name_line.contains(", 63)"),
-            "the Postgres database name must be truncated to 63 characters: {name_line}"
+            name_line.contains("local.postgres_database_name"),
+            "the database resource must use the bounded/reserved-name-guarded local: {name_line}"
+        );
+        let raw_local_line = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("postgres_database_name_raw"))
+            .expect("main.tf must declare a postgres_database_name_raw local");
+        assert!(
+            raw_local_line.contains("substr(") && raw_local_line.contains(", 63)"),
+            "the Postgres database name must be truncated to 63 characters: {raw_local_line}"
+        );
+    }
+
+    #[test]
+    fn main_tf_postgres_database_name_avoids_reserved_names() {
+        // A fresh Flexible Server already owns "postgres", "azure_maintenance",
+        // and "azure_sys" as system databases — a Cargo package literally named
+        // one of those (or "azure-sys", which sanitizes to the same underscored
+        // form) must not collide with them, or `terraform apply` fails trying
+        // to create/manage a database Azure already has.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        for reserved in ["postgres", "azure_maintenance", "azure_sys"] {
+            assert!(
+                content.contains(&format!("\"{reserved}\"")),
+                "the reserved-name guard must list {reserved:?}: {content}"
+            );
+        }
+        let database_name_local = content
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("postgres_database_name ="))
+            .take_while(|l| !l.trim_start().starts_with('}'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            database_name_local.contains("contains(") && database_name_local.contains("_prod"),
+            "postgres_database_name must fall back to a suffixed name when the \
+             sanitized value collides with a reserved database name: {content}"
         );
     }
 

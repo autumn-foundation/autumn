@@ -136,6 +136,20 @@ locals {
   # single source used by both the server resource and the derived
   # database_url below, so they can't drift out of sync.
   postgres_admin_login = "autumnadmin"
+
+  # A fresh Flexible Server already contains "postgres", "azure_maintenance",
+  # and "azure_sys" as system databases — a Cargo package literally named one
+  # of those (or e.g. "azure-sys", which sanitizes to the same underscored
+  # name) would derive an identical database name here, and `terraform
+  # apply` fails trying to create/manage a database Azure already owns.
+  # Append a suffix in that case; re-truncate first so the suffixed name
+  # still respects the 63-byte limit even though every reserved name is far
+  # short of it today.
+  postgres_database_name_raw = substr(replace(local.app_name_hyphenated, "-", "_"), 0, 63)
+  postgres_database_name = contains(
+    ["postgres", "azure_maintenance", "azure_sys"],
+    local.postgres_database_name_raw
+    ) ? "${substr(local.postgres_database_name_raw, 0, 58)}_prod" : local.postgres_database_name_raw
 }
 
 resource "azurerm_resource_group" "this" {
@@ -263,12 +277,14 @@ resource "azurerm_postgresql_flexible_server" "this" {
 
 resource "azurerm_postgresql_flexible_server_database" "this" {
   # Postgres database identifiers are capped at 63 bytes; a long Cargo
-  # package name (up to 64 characters) would otherwise overflow it. Reuses
-  # the already-sanitized (lowercase, alphanumeric-and-hyphens,
-  # collapsed/trimmed) app_name_hyphenated local rather than re-deriving
-  # sanitization here, swapping hyphens for underscores since Postgres
-  # identifiers conventionally use those as the word separator.
-  name      = substr(replace(local.app_name_hyphenated, "-", "_"), 0, 63)
+  # package name (up to 64 characters) would otherwise overflow it.
+  # local.postgres_database_name reuses the already-sanitized (lowercase,
+  # alphanumeric-and-hyphens, collapsed/trimmed) app_name_hyphenated local
+  # rather than re-deriving sanitization here, swapping hyphens for
+  # underscores since Postgres identifiers conventionally use those as the
+  # word separator, and guards against the handful of names Azure reserves
+  # for its own system databases.
+  name      = local.postgres_database_name
   server_id = azurerm_postgresql_flexible_server.this.id
   collation = "en_US.utf8"
   charset   = "UTF8"

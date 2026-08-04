@@ -188,7 +188,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Azure only allows alphanumeric characters there, so the underscore made
   `terraform apply` fail while creating the server — it's now a single
   `local.postgres_admin_login` shared by the server resource and the
-  derived `database_url` secret, so the two can't drift out of sync.
+  derived `database_url` secret, so the two can't drift out of sync. The
+  Postgres database name now also guards against Azure Flexible Server's
+  reserved system database names (`postgres`, `azure_maintenance`,
+  `azure_sys`) — a Cargo package literally named one of those (or e.g.
+  `azure-sys`, which sanitizes to the same underscored name) previously
+  derived an identical database name, and `terraform apply` failed trying
+  to create/manage a database a fresh server already owns; it now appends
+  a `_prod` suffix in that case, still within the 63-byte limit.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via
