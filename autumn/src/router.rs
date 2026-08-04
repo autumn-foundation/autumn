@@ -1876,7 +1876,12 @@ fn mount_user_routes(
     ))
 }
 
+// This fallback never actually errors, but it must keep the same signature
+// as the `feature = "i18n"` variant above (which can), since the single
+// call site invokes whichever cfg variant is compiled in without its own
+// branching.
 #[cfg(not(feature = "i18n"))]
+#[allow(clippy::unnecessary_wraps)]
 fn mount_user_routes(
     route_list: Vec<Route>,
     _scoped_groups: &[ScopedGroup],
@@ -2297,7 +2302,7 @@ fn apply_locale_prefix_routing(
 /// this far outside any locale nest) so the redirect target matches exactly
 /// what the request would have resolved to anyway.
 ///
-/// **Known limitation** (Codex review): a mutating form POSTing directly to
+/// **Known limitation** (Codex review): a mutating form `POSTing` directly to
 /// its bare, unprefixed path with a `[SubmitTokenLayer](crate::security::SubmitTokenLayer)`-protected
 /// `_submit_token` hits this 308 *before* reaching the real handler.
 /// `SubmitTokenLayer` caches 3xx responses so a replayed submit returns the
