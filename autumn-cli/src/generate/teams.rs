@@ -1522,6 +1522,35 @@ pub async fn create_invitation(
                 .await
                 .optional()?;
 
+            // Revalidate the inviter's own membership now that the
+            // organization lock is held — the pre-transaction `require_role`
+            // result could be stale: another request (a demotion, a
+            // removal, or this same user's account being deleted) may have
+            // committed while this request waited for the lock above
+            // (Codex review finding).
+            let inviter_membership: Option<Membership> = memberships::table
+                .filter(memberships::tenant_id.eq(&tenant_id))
+                .filter(memberships::user_id.eq(inviter_id))
+                .select(Membership::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()?;
+            let Some(inviter_membership) = inviter_membership else {
+                return Err(AutumnError::unauthorized_msg("no active organization"));
+            };
+            let Some(current_caller_role) = Role::parse(&inviter_membership.role) else {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            };
+            if !current_caller_role.at_least(Role::Admin) {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            }
+            if role == Role::Owner && current_caller_role != Role::Owner {
+                return Err(AutumnError::forbidden_msg(
+                    "Only an owner can invite someone as owner",
+                ));
+            }
+
             // Revoke any other still-pending invitation to this email in
             // this organization before creating the new one — otherwise
             // both tokens would stay independently valid, and accepting
@@ -1814,6 +1843,32 @@ pub async fn accept_invitation(
                     ));
                 }
 
+                // Re-lock and revalidate the caller's own account row now
+                // that the organization lock is held, through the
+                // membership insert below. The email-match check earlier in
+                // this handler ran on a standalone, unlocked connection
+                // before this transaction even started — if the account is
+                // deleted in the gap between that check and this
+                // transaction actually acquiring the lock above (e.g. an
+                // account-deletion request racing this same accept),
+                // nothing else would notice: `Membership.user_id` has no FK
+                // to your `users` table, so the insert below would
+                // otherwise happily create a membership — and this handler
+                // would establish a session — for an account that no
+                // longer exists (Codex review finding).
+                let live_caller: Option<i64> = caller_users::table
+                    .filter(caller_users::id.eq(user_id))
+                    .select(caller_users::id)
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if live_caller.is_none() {
+                    return Err(AutumnError::unauthorized_msg(
+                        "log in or sign up first, then revisit this invitation link",
+                    ));
+                }
+
                 let existing: Option<Membership> = memberships::table
                     .filter(memberships::tenant_id.eq(&tenant_id))
                     .filter(memberships::user_id.eq(user_id))
@@ -1963,6 +2018,28 @@ pub async fn resend_invitation(
                     .first(conn)
                     .await
                     .optional()?;
+
+                // Revalidate the caller's own membership now that the
+                // organization lock is held — see `create_invitation`'s
+                // identical fix for the full rationale (Codex review
+                // finding).
+                let inviter_membership: Option<Membership> = memberships::table
+                    .filter(memberships::tenant_id.eq(&tenant_id))
+                    .filter(memberships::user_id.eq(inviter_id))
+                    .select(Membership::as_select())
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()?;
+                let Some(inviter_membership) = inviter_membership else {
+                    return Err(AutumnError::unauthorized_msg("no active organization"));
+                };
+                let Some(current_caller_role) = Role::parse(&inviter_membership.role) else {
+                    return Err(AutumnError::forbidden_msg("insufficient permissions"));
+                };
+                if !current_caller_role.at_least(Role::Admin) {
+                    return Err(AutumnError::forbidden_msg("insufficient permissions"));
+                }
 
                 // Lock and re-check status inside the transaction: a
                 // double-clicked resend (or two concurrent ones) must not
@@ -2187,15 +2264,13 @@ pub async fn change_role(
     Path(membership_id): Path<i64>,
     Form(form): Form<ChangeRoleForm>,
 ) -> AutumnResult<Response> {
-    let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
+    require_role(&session, &membership_repo, Role::Admin).await?;
+    let Some(caller_id) = session.get("user_id").await.and_then(|s| s.parse::<i64>().ok()) else {
+        return Err(AutumnError::unauthorized_msg("authentication required"));
+    };
     let Some(new_role) = Role::parse(&form.role) else {
         return Err(AutumnError::unprocessable_msg("Unknown role"));
     };
-    if new_role == Role::Owner && caller_role != Role::Owner {
-        return Err(AutumnError::forbidden_msg(
-            "Only an owner can grant the owner role",
-        ));
-    }
 
     // Raw query (not the `tenant_scoped` repository's plain `find_all()`)
     // inside one locked transaction: reading the owner count and mutating
@@ -2212,6 +2287,29 @@ pub async fn change_role(
                 .select(Membership::as_select())
                 .load(conn)
                 .await?;
+
+            // Revalidate the caller's own role from this same locked
+            // snapshot instead of the `require_role` result computed
+            // before the transaction — another request could have
+            // demoted or removed the caller while this one waited to
+            // acquire the lock above, and the pre-lock `caller_role`
+            // would otherwise still be trusted (Codex review finding).
+            let Some(caller_membership) = memberships.iter().find(|m| m.user_id == caller_id)
+            else {
+                return Err(AutumnError::unauthorized_msg("no active organization"));
+            };
+            let Some(caller_role) = Role::parse(&caller_membership.role) else {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            };
+            if !caller_role.at_least(Role::Admin) {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            }
+            if new_role == Role::Owner && caller_role != Role::Owner {
+                return Err(AutumnError::forbidden_msg(
+                    "Only an owner can grant the owner role",
+                ));
+            }
+
             let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
                 return Err(AutumnError::not_found_msg("Member not found"));
             };
@@ -2259,7 +2357,10 @@ pub async fn remove_member(
     membership_repo: PgMembershipRepository,
     Path(membership_id): Path<i64>,
 ) -> AutumnResult<Response> {
-    let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
+    require_role(&session, &membership_repo, Role::Admin).await?;
+    let Some(caller_id) = session.get("user_id").await.and_then(|s| s.parse::<i64>().ok()) else {
+        return Err(AutumnError::unauthorized_msg("authentication required"));
+    };
 
     // Same race as `change_role` (see its comment): the owner-count check
     // and the removal must run inside one locked transaction, or two
@@ -2274,6 +2375,22 @@ pub async fn remove_member(
                 .select(Membership::as_select())
                 .load(conn)
                 .await?;
+
+            // Revalidate the caller's own role from this same locked
+            // snapshot instead of the `require_role` result computed
+            // before the transaction (Codex review finding — see
+            // `change_role`'s identical fix for the full rationale).
+            let Some(caller_membership) = memberships.iter().find(|m| m.user_id == caller_id)
+            else {
+                return Err(AutumnError::unauthorized_msg("no active organization"));
+            };
+            let Some(caller_role) = Role::parse(&caller_membership.role) else {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            };
+            if !caller_role.at_least(Role::Admin) {
+                return Err(AutumnError::forbidden_msg("insufficient permissions"));
+            }
+
             let Some(target) = memberships.iter().find(|m| m.id == membership_id) else {
                 return Err(AutumnError::not_found_msg("Member not found"));
             };
@@ -2917,9 +3034,7 @@ async fn main() {
 
         let members = fs::read_to_string(tmp.path().join("src/teams/routes/members.rs")).unwrap();
         assert!(
-            members.contains(
-                "let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;"
-            ),
+            members.contains("require_role(&session, &membership_repo, Role::Admin).await?;"),
             "{members}"
         );
         assert!(
@@ -3493,5 +3608,109 @@ async fn main() {
             2,
             "both handlers must lock every membership row in the active organization: {members}"
         );
+    }
+
+    /// `change_role`/`remove_member` must derive the caller's role from the
+    /// *locked* membership snapshot taken inside the transaction, not the
+    /// `require_role` result computed before it — another request could
+    /// demote or remove the caller while this one waited to acquire the
+    /// lock (Codex review finding).
+    #[test]
+    fn change_role_and_remove_member_revalidate_caller_from_locked_snapshot() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let members = fs::read_to_string(tmp.path().join("src/teams/routes/members.rs")).unwrap();
+        assert_eq!(
+            members
+                .matches("memberships.iter().find(|m| m.user_id == caller_id)")
+                .count(),
+            2,
+            "both handlers must re-derive the caller's membership from the locked snapshot: {members}"
+        );
+        assert!(
+            members.matches("caller_role.at_least(Role::Admin)").count() >= 2,
+            "{members}"
+        );
+    }
+
+    /// `create_invitation` and `resend_invitation` must revalidate the
+    /// inviter's own live membership after acquiring the organization lock
+    /// — the pre-transaction `require_role` result could be stale by the
+    /// time the lock is actually granted (Codex review finding).
+    #[test]
+    fn create_and_resend_invitation_revalidate_inviter_after_organization_lock() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        assert_eq!(
+            invitations
+                .matches("let inviter_membership: Option<Membership> = memberships::table")
+                .count(),
+            2,
+            "both create_invitation and resend_invitation must re-lock and revalidate the \
+             inviter's membership: {invitations}"
+        );
+
+        // In create_invitation specifically, the revalidated role (not the
+        // stale pre-transaction one) must gate granting Owner.
+        let create_org_lock_pos = invitations
+            .find("organizations::table\n                .find(org_id)\n                .for_update()")
+            .unwrap();
+        let create_revalidate_pos = invitations
+            .find("let inviter_membership: Option<Membership> = memberships::table")
+            .unwrap();
+        let create_owner_grant_check_pos = invitations
+            .find("if role == Role::Owner && current_caller_role != Role::Owner")
+            .unwrap_or_else(|| panic!("missing revalidated owner-grant check: {invitations}"));
+        assert!(create_org_lock_pos < create_revalidate_pos);
+        assert!(create_revalidate_pos < create_owner_grant_check_pos);
+    }
+
+    /// `accept_invitation` must re-lock and revalidate the caller's own
+    /// account row (via the same `caller_email_lookup` peek table used for
+    /// the earlier email-match check) after acquiring the organization
+    /// lock, before inserting a membership — otherwise a concurrent account
+    /// deletion could commit in the gap between the standalone pre-
+    /// transaction email check and this transaction actually acquiring its
+    /// lock, letting this handler create a membership (and a session) for
+    /// an account that no longer exists (`Membership.user_id` has no FK to
+    /// catch this — Codex review finding).
+    #[test]
+    fn accept_invitation_relocks_the_caller_account_row() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        let org_lock_pos = invitations
+            .find("organizations::table\n                    .find(org_id)\n                    .for_update()")
+            .unwrap();
+        let account_relock_pos = invitations
+            .find("let live_caller: Option<i64> = caller_users::table")
+            .unwrap_or_else(|| panic!("missing account-row relock: {invitations}"));
+        let insert_pos = invitations
+            .find("let membership: Membership = diesel::insert_into(memberships::table)")
+            .unwrap();
+        assert!(
+            org_lock_pos < account_relock_pos,
+            "account row must be relocked after the organization lock"
+        );
+        assert!(
+            account_relock_pos < insert_pos,
+            "account row must be revalidated before the membership insert"
+        );
+        assert!(invitations.contains(".filter(caller_users::id.eq(user_id))\n                    .select(caller_users::id)\n                    .for_update()"), "{invitations}");
     }
 }
