@@ -602,6 +602,24 @@ pub async fn resend_invitation(
     let new: Invitation = db
         .tx(move |conn| {
             async move {
+                // Lock and re-check status inside the transaction: a
+                // double-clicked resend (or two concurrent ones) must not
+                // both pass a stale "it's pending" read from before the
+                // transaction and each mint their own replacement, which
+                // would leave two live pending invitations instead of the
+                // single refreshed one this endpoint promises.
+                let current: Invitation = invitations::table
+                    .filter(invitations::id.eq(invitation_id))
+                    .for_update()
+                    .select(Invitation::as_select())
+                    .first(conn)
+                    .await?;
+                if current.status != "pending" {
+                    return Err(AutumnError::conflict_msg(
+                        "This invitation is no longer pending",
+                    ));
+                }
+
                 diesel::update(invitations::table.filter(invitations::id.eq(invitation_id)))
                     .set(invitations::status.eq("revoked"))
                     .execute(conn)

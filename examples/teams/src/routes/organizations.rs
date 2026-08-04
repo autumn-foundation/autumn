@@ -6,23 +6,37 @@
 
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
-use autumn_web::tenancy::with_tenant;
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
+use scoped_futures::ScopedFutureExt;
 
-use crate::models::{Membership, NewMembership, NewOrganization};
-use crate::repositories::{
-    MembershipRepository, OrganizationRepository, PgMembershipRepository, PgOrganizationRepository,
-};
+use crate::models::{Membership, Organization};
+use crate::repositories::{MembershipRepository, PgMembershipRepository};
 use crate::role::Role;
+use crate::schema::{memberships, organizations};
 
 use super::auth::establish_session;
+
+#[derive(diesel::Insertable)]
+#[diesel(table_name = organizations)]
+struct InsertOrganization {
+    name: String,
+}
+
+#[derive(diesel::Insertable)]
+#[diesel(table_name = memberships)]
+struct InsertMembership {
+    tenant_id: String,
+    user_id: i64,
+    role: String,
+}
 
 /// Create a new organization; the caller becomes its `Owner` and it becomes
 /// the active organization (same rule as signup — issue #1261 AC3).
 #[post("/organizations")]
 pub async fn create_organization(
     session: Session,
-    org_repo: PgOrganizationRepository,
-    membership_repo: PgMembershipRepository,
+    mut db: Db,
     Form(form): Form<crate::models::NewOrganizationForm>,
 ) -> AutumnResult<Response> {
     let Some(user_id) = session.get("user_id").await.and_then(|s| s.parse().ok()) else {
@@ -36,16 +50,32 @@ pub async fn create_organization(
         ));
     }
 
-    let org = org_repo.save(&NewOrganization { name }).await?;
-    with_tenant(org.id.to_string(), async {
-        membership_repo
-            .save(&NewMembership {
-                user_id,
-                role: Role::Owner.as_str().to_owned(),
-            })
-            .await
-    })
-    .await?;
+    // One transaction: without it, a failure between the org insert and the
+    // owner-membership insert would leave an orphaned `Organization` row no
+    // one is a member of — inaccessible and un-deletable through the app.
+    let org: Organization = db
+        .tx(move |conn| {
+            async move {
+                let org: Organization = diesel::insert_into(organizations::table)
+                    .values(&InsertOrganization { name })
+                    .returning(Organization::as_returning())
+                    .get_result(conn)
+                    .await?;
+
+                diesel::insert_into(memberships::table)
+                    .values(&InsertMembership {
+                        tenant_id: org.id.to_string(),
+                        user_id,
+                        role: Role::Owner.as_str().to_owned(),
+                    })
+                    .execute(conn)
+                    .await?;
+
+                Ok::<_, AutumnError>(org)
+            }
+            .scope_boxed()
+        })
+        .await?;
 
     establish_session(&session, user_id, &org.id.to_string(), Role::Owner).await;
     Ok(Redirect::to("/members").into_response())

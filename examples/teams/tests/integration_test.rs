@@ -485,6 +485,55 @@ async fn revoked_invitation_shows_clear_error() {
         .assert_body_contains("revoked");
 }
 
+/// A double-clicked (or concurrent) resend must not mint two live pending
+/// invitations for the same original one — the second resend of an
+/// already-resent (now revoked) invitation is rejected, not silently
+/// treated as still pending.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn double_resend_does_not_create_two_pending_invitations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    let owner_cookie = signup(&client, "owner@acme.test").await;
+    client
+        .post("/invitations")
+        .header("cookie", &owner_cookie)
+        .form("email=newbie@acme.test&role=member")
+        .send()
+        .await
+        .assert_status(303);
+
+    // Only one invitation exists yet, so its id is deterministically 1.
+    let first = client
+        .post("/invitations/1/resend")
+        .header("cookie", &owner_cookie)
+        .send()
+        .await;
+    first.assert_status(303);
+
+    // A second resend of the same (now-revoked) original invitation must be
+    // rejected, not silently mint a second live pending replacement.
+    let second = client
+        .post("/invitations/1/resend")
+        .header("cookie", &owner_cookie)
+        .send()
+        .await;
+    second.assert_status(409);
+
+    let members_body = client
+        .get("/members")
+        .header("cookie", &owner_cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert_eq!(
+        members_body.matches("newbie@acme.test").count(),
+        1,
+        "a rejected double-resend must not leave two pending invitations for the same invitee"
+    );
+}
+
 /// AC7: the last Owner cannot be removed.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]

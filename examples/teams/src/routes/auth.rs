@@ -18,18 +18,14 @@
 use autumn_web::auth::{hash_password, verify_password};
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
-use autumn_web::tenancy::with_tenant;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use scoped_futures::ScopedFutureExt;
 
-use crate::models::{
-    LoginForm, Membership, NewMembership, NewOrganization, NewUser, SignupForm, User,
-};
-use crate::repositories::{
-    MembershipRepository, OrganizationRepository, PgMembershipRepository, PgOrganizationRepository,
-};
+use crate::models::{LoginForm, Membership, NewUser, Organization, SignupForm, User};
+use crate::repositories::{MembershipRepository, PgMembershipRepository};
 use crate::role::Role;
-use crate::schema::users;
+use crate::schema::{memberships, organizations, users};
 
 use super::layout::{csrf_value, layout};
 
@@ -85,8 +81,6 @@ pub async fn signup(
     State(state): State<AppState>,
     session: Session,
     mut db: Db,
-    org_repo: PgOrganizationRepository,
-    membership_repo: PgMembershipRepository,
     csrf: Option<CsrfToken>,
     Form(form): Form<SignupForm>,
 ) -> AutumnResult<Response> {
@@ -119,44 +113,69 @@ pub async fn signup(
 
     let password_hash = hash_password(&form.password).await?;
 
-    let user: User = diesel::insert_into(users::table)
-        .values(&NewUser {
-            email: email.clone(),
-            password_hash,
-        })
-        .returning(User::as_returning())
-        .get_result(&mut *db)
-        .await
-        .map_err(|_| AutumnError::unprocessable_msg("Could not create account"))?;
-
     // No invite in play: give the new user their own organization as Owner
     // (issue #1261 AC3 — "creating an organization makes the creator an
-    // Owner member"). `Organization` is not tenant-scoped (it *is* the
-    // tenant), so this insert needs no tenant context.
+    // Owner member"). All three inserts run in one transaction: the
+    // generated `tenant_scoped` repositories each acquire their own pooled
+    // connection (which can't share this one), and raw queries on a single
+    // `conn` are what make this atomic — otherwise a failure between the
+    // user insert and the org/membership inserts would strand a
+    // zero-membership account that can never log in (login rejects those)
+    // and can never retry signup (`users.email` is `UNIQUE`).
     let organization_name = format!("{email}'s Organization");
-    let org = org_repo
-        .save(&NewOrganization {
-            name: organization_name,
+    let role = Role::Owner;
+    let (user, org): (User, Organization) = db
+        .tx(move |conn| {
+            async move {
+                let user: User = diesel::insert_into(users::table)
+                    .values(&NewUser {
+                        email: email.clone(),
+                        password_hash,
+                    })
+                    .returning(User::as_returning())
+                    .get_result(conn)
+                    .await
+                    .map_err(|_| AutumnError::unprocessable_msg("Could not create account"))?;
+
+                let org: Organization = diesel::insert_into(organizations::table)
+                    .values(&InsertOrganization {
+                        name: organization_name,
+                    })
+                    .returning(Organization::as_returning())
+                    .get_result(conn)
+                    .await?;
+
+                diesel::insert_into(memberships::table)
+                    .values(&InsertMembership {
+                        tenant_id: org.id.to_string(),
+                        user_id: user.id,
+                        role: role.as_str().to_owned(),
+                    })
+                    .execute(conn)
+                    .await?;
+
+                Ok::<_, AutumnError>((user, org))
+            }
+            .scope_boxed()
         })
         .await?;
-    let role = Role::Owner;
-
-    // The membership row is tenant-scoped by `organization_id`, but no
-    // organization is active in this (pre-login) session yet — supply the
-    // brand-new org explicitly via `with_tenant` rather than relying on the
-    // session/middleware-derived ambient tenant.
-    with_tenant(org.id.to_string(), async {
-        membership_repo
-            .save(&NewMembership {
-                user_id: user.id,
-                role: role.as_str().to_owned(),
-            })
-            .await
-    })
-    .await?;
 
     establish_session(&session, user.id, &org.id.to_string(), role).await;
     Ok(Redirect::to("/members").into_response())
+}
+
+#[derive(diesel::Insertable)]
+#[diesel(table_name = organizations)]
+struct InsertOrganization {
+    name: String,
+}
+
+#[derive(diesel::Insertable)]
+#[diesel(table_name = memberships)]
+struct InsertMembership {
+    tenant_id: String,
+    user_id: i64,
+    role: String,
 }
 
 /// Only ever redirect to a same-origin path after login — an unvalidated

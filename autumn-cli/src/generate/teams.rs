@@ -45,20 +45,23 @@
 //! Modifies:
 //! - `src/main.rs` — `mod teams;` declaration and the ten generated routes
 //!   wired into `routes![...]`.
-//! - `Cargo.toml` — ensures the `mail` Cargo feature is enabled on the
-//!   `autumn-web` dependency (needed for `InvitationMailer`'s `#[mailer]`),
-//!   and ensures the generated code's own direct dependencies (`diesel`,
-//!   `diesel-async`, `pq-sys`, `chrono`, `serde`, `serde_json`, `validator`)
-//!   are present.
+//! - `Cargo.toml` — ensures the `mail` and `maud` Cargo features are enabled
+//!   on the `autumn-web` dependency (needed for `InvitationMailer`'s
+//!   `#[mailer]` and the generated routes' `Markup`/`html!` respectively —
+//!   `maud` matters even on non-`--api` projects, which already have it, but
+//!   is required for `--api` projects, whose starter strips it), and ensures
+//!   the generated code's own direct dependencies (`diesel`, `diesel-async`,
+//!   `pq-sys`, `chrono`, `serde`, `serde_json`, `validator`, `maud`) are
+//!   present. Requires the Postgres backend — see `sqlite_teams_unsupported_error`.
 //!
 //! Warns (does not auto-edit `autumn.toml` — too many possible existing
 //! shapes/profiles to safely text-patch) that `[tenancy]` needs
 //! `session_key = "organization_id"`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::emit::{Plan, Revert};
-use super::model::{TEMPLATE_SHIPPED_CARGO_DEPS, ensure_cargo_dependencies};
+use super::model::ensure_cargo_dependencies;
 use super::schema_edit::{ensure_autumn_web_feature, update_main_rs};
 use super::{GenerateError, ensure_project_root, read_or_empty};
 
@@ -100,6 +103,14 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
         "validator",
         "{ version = \"0.20\", features = [\"derive\"] }",
     ),
+    // `minimal_page`/`routes::organizations::*`/etc. all render `Markup`
+    // via `html!`/`maud::DOCTYPE`. A default `autumn new` project already
+    // has `maud` as a direct dependency and enables autumn-web's default
+    // `maud` feature, but an `--api` project strips both (see
+    // `new.rs`'s JSON-only starter) — matching `channel.rs`'s SSE
+    // transport, which enables the same pair when its own generated views
+    // need them.
+    ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
 ];
 
 /// Compute the file actions for `autumn generate teams`.
@@ -121,9 +132,22 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
 pub fn plan_teams(
     project_root: &Path,
     timestamp: &str,
-    _for_destroy: bool,
+    for_destroy: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+
+    // `teams`' migration and model/repository templates are fixed Postgres
+    // DDL/Diesel code with no SQLite-aware rendering path (see
+    // `sqlite_teams_unsupported_error`'s doc comment) — reject up front
+    // rather than emit a migration `autumn migrate` would fail to apply.
+    // Skipped on the destroy path so a project that somehow already has
+    // `teams` generated (e.g. from before this backend check existed) can
+    // still be cleaned up.
+    if !for_destroy
+        && super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite
+    {
+        return Err(super::sqlite_teams_unsupported_error());
+    }
 
     let mut plan = Plan::new(project_root);
 
@@ -182,43 +206,7 @@ pub fn plan_teams(
         entries: route_entries,
     });
 
-    // ── Cargo.toml: "mail" feature + the generated code's direct deps ─────
-    // Both edits land in a single `plan.modify()` call: `ensure_*` helpers
-    // are pure string transforms over an in-memory `String`, not aware of
-    // each other's pending edits, so chaining them here (rather than two
-    // separate `read_or_empty` + `plan.modify` round trips against the same
-    // path) is what stops the second edit from being computed against
-    // pre-first-edit disk content and clobbering it when `Plan::execute`
-    // applies both `Action::Modify`s in order (mirrors `channel.rs`'s
-    // combined feature+deps Cargo.toml edit).
-    let cargo_path = project_root.join("Cargo.toml");
-    let cargo_existing = read_or_empty(&cargo_path);
-    let mut updated_cargo = ensure_autumn_web_feature(&cargo_existing, "mail");
-    updated_cargo = ensure_cargo_dependencies(&updated_cargo, TEAMS_DEPS);
-    if updated_cargo != cargo_existing {
-        plan.modify(cargo_path.clone(), updated_cargo);
-    }
-    plan.push_revert(Revert::CargoAutumnWebFeature {
-        path: cargo_path.clone(),
-        feature: "mail".to_owned(),
-        owner_dir: Some(teams_dir.clone()),
-    });
-    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
-    // model.rs: destroy recomputes this plan against the already-generated
-    // Cargo.toml, where these entries are by definition already present.
-    let dep_names: Vec<String> = TEAMS_DEPS
-        .iter()
-        .map(|(name, _)| *name)
-        .filter(|name| !TEMPLATE_SHIPPED_CARGO_DEPS.contains(name))
-        .map(str::to_owned)
-        .collect();
-    if !dep_names.is_empty() {
-        plan.push_revert(Revert::CargoDeps {
-            path: cargo_path,
-            names: dep_names,
-            owner_dir: teams_dir,
-        });
-    }
+    plan_teams_cargo_toml(&mut plan, project_root, teams_dir);
 
     // ── [tenancy] config reminder ────────────────────────────────────────
     // Never auto-edited (too many possible existing shapes/profiles to
@@ -238,6 +226,71 @@ pub fn plan_teams(
     );
 
     Ok(plan)
+}
+
+/// Ensures `Cargo.toml` has the `mail`/`maud` autumn-web features and the
+/// generated code's direct dependencies (see [`TEAMS_DEPS`]), and pushes
+/// their matching `autumn destroy` reverts.
+fn plan_teams_cargo_toml(plan: &mut Plan, project_root: &Path, teams_dir: PathBuf) {
+    // All edits land in a single `plan.modify()` call: `ensure_*` helpers
+    // are pure string transforms over an in-memory `String`, not aware of
+    // each other's pending edits, so chaining them here (rather than
+    // separate `read_or_empty` + `plan.modify` round trips against the same
+    // path) is what stops a later edit from being computed against
+    // pre-earlier-edit disk content and clobbering it when `Plan::execute`
+    // applies each `Action::Modify` in order (mirrors `channel.rs`'s
+    // combined feature+deps Cargo.toml edit). "maud" is needed even though
+    // a default `autumn new` project already has it: an `--api` project's
+    // starter strips both the direct `maud` dependency and autumn-web's
+    // `maud` feature (see `TEAMS_DEPS`'s doc comment on the `maud` entry).
+    const AUTUMN_WEB_FEATURES: &[&str] = &["mail", "maud"];
+
+    let cargo_path = project_root.join("Cargo.toml");
+    let cargo_existing = read_or_empty(&cargo_path);
+    let mut updated_cargo = cargo_existing.clone();
+    for feature in AUTUMN_WEB_FEATURES {
+        updated_cargo = ensure_autumn_web_feature(&updated_cargo, feature);
+    }
+    updated_cargo = ensure_cargo_dependencies(&updated_cargo, TEAMS_DEPS);
+    if updated_cargo != cargo_existing {
+        plan.modify(cargo_path.clone(), updated_cargo);
+    }
+    for feature in AUTUMN_WEB_FEATURES {
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path.clone(),
+            feature: (*feature).to_owned(),
+            owner_dir: Some(teams_dir.clone()),
+        });
+    }
+    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
+    // model.rs: destroy recomputes this plan against the already-generated
+    // Cargo.toml, where these entries are by definition already present.
+    //
+    // Unlike `plan_cargo_deps`, this doesn't exclude every
+    // `TEMPLATE_SHIPPED_CARGO_DEPS` name — only `autumn-web` (every Autumn
+    // app unconditionally needs it) and `diesel_migrations` (every
+    // `autumn new` template ships it regardless of `teams`). `maud` stays
+    // revertible: a default project already has it (so `Revert::CargoDeps`'s
+    // own whole-project reference check — see `emit.rs` — finds it still
+    // used by the app's own `maud::`-qualified `src/main.rs` layout and
+    // leaves it alone), but an `--api` project has no other use for it once
+    // `teams` is destroyed, and *did* get it added solely by `teams` (see
+    // `TEAMS_DEPS`'s doc comment on the `maud` entry) — excluding it the
+    // same way `autumn-web` is excluded would wrongly treat it as always
+    // pre-existing.
+    let dep_names: Vec<String> = TEAMS_DEPS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| *name != "autumn-web" && *name != "diesel_migrations")
+        .map(str::to_owned)
+        .collect();
+    if !dep_names.is_empty() {
+        plan.push_revert(Revert::CargoDeps {
+            path: cargo_path,
+            names: dep_names,
+            owner_dir: teams_dir,
+        });
+    }
 }
 
 /// The ten generated route handlers, in the fully-qualified
@@ -1374,6 +1427,24 @@ pub async fn resend_invitation(
     let new: Invitation = db
         .tx(move |conn| {
             async move {
+                // Lock and re-check status inside the transaction: a
+                // double-clicked resend (or two concurrent ones) must not
+                // both pass a stale "it's pending" read from before the
+                // transaction and each mint their own replacement, which
+                // would leave two live pending invitations instead of the
+                // single refreshed one this endpoint promises.
+                let current: Invitation = invitations::table
+                    .filter(invitations::id.eq(invitation_id))
+                    .for_update()
+                    .select(Invitation::as_select())
+                    .first(conn)
+                    .await?;
+                if current.status != "pending" {
+                    return Err(AutumnError::conflict_msg(
+                        "This invitation is no longer pending",
+                    ));
+                }
+
                 diesel::update(invitations::table.filter(invitations::id.eq(invitation_id)))
                     .set(invitations::status.eq("revoked"))
                     .execute(conn)
@@ -1863,6 +1934,93 @@ async fn main() {
         assert!(cargo.contains("\"mail\""), "{cargo}");
     }
 
+    /// The generated routes render `Markup` via `html!`/`maud::DOCTYPE`
+    /// (`minimal_page`), so the `maud` Cargo feature/dependency must be
+    /// ensured too — not just `mail` — even on a project shaped like
+    /// `autumn new --api`, whose starter strips both (Codex review finding).
+    #[test]
+    fn cargo_toml_gets_maud_feature_and_dependency_for_api_style_project() {
+        let tmp = TempDir::new().unwrap();
+        // Mirrors `--api`'s starter: no direct `maud` dependency, no `maud`
+        // autumn-web feature (see `new.rs`'s `DEFAULT_MINUS_HTML_VIEW_STACK`).
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.6\", default-features = false }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), default_main()).unwrap();
+
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("\"maud\""), "{cargo}");
+        assert!(cargo.contains("maud ="), "{cargo}");
+    }
+
+    /// `teams`' migration/model templates are fixed Postgres DDL with no
+    /// SQLite-aware rendering path — a SQLite-backed project must be
+    /// rejected at generate time with an actionable error, not emit a
+    /// migration `autumn migrate` would fail to apply (Codex review finding).
+    #[test]
+    fn plan_rejects_sqlite_backend() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                fs::write(
+                    tmp.path().join("autumn.toml"),
+                    "[database]\nprimary_url = \"sqlite://app.db\"\n",
+                )
+                .unwrap();
+
+                let err = plan_teams(tmp.path(), "20260101000000", false).unwrap_err();
+                assert!(matches!(err, GenerateError::Config(_)), "{err:?}");
+                assert!(err.to_string().contains("Postgres"), "{err}");
+                assert!(!tmp.path().join("src/teams").exists());
+            },
+        );
+    }
+
+    /// The `SQLite` rejection must not block `autumn destroy teams` cleaning
+    /// up a project that somehow already has `teams` generated (e.g. from
+    /// before this backend check existed).
+    #[test]
+    fn destroy_is_not_blocked_by_sqlite_rejection() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                plan_teams(tmp.path(), "20260101000000", false)
+                    .unwrap()
+                    .execute(Flags::default())
+                    .unwrap();
+
+                fs::write(
+                    tmp.path().join("autumn.toml"),
+                    "[database]\nprimary_url = \"sqlite://app.db\"\n",
+                )
+                .unwrap();
+
+                plan_teams(tmp.path(), "20260101000000", true)
+                    .unwrap()
+                    .revert(Flags::default())
+                    .unwrap();
+                assert!(!tmp.path().join("src/teams").exists());
+            },
+        );
+    }
+
     // ── (f) main.rs wiring is idempotent across two --force runs ────────
 
     #[test]
@@ -1983,6 +2141,28 @@ async fn main() {
         assert!(invitations.contains(".send_invite("), "{invitations}");
         assert!(
             !invitations.contains(".deliver_later_invite("),
+            "{invitations}"
+        );
+    }
+
+    /// `resend_invitation` must lock and re-check the source row's status
+    /// inside its transaction before minting a replacement — otherwise a
+    /// double-clicked (or concurrent) resend can create two live pending
+    /// invitations instead of the single refreshed one it promises (Codex
+    /// review finding).
+    #[test]
+    fn resend_invitation_locks_and_rechecks_pending_status() {
+        let tmp = project();
+        plan_teams(tmp.path(), "20260101000000", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let invitations =
+            fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
+        assert!(invitations.contains(".for_update()"), "{invitations}");
+        assert!(
+            invitations.contains("This invitation is no longer pending"),
             "{invitations}"
         );
     }
