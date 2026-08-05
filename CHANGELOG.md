@@ -17,10 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   several jobs in the same queue fail at the same instant (a downstream
   dependency blip), every one of them retried at the *exact same* instant,
   immediately re-flooding the dependency it just backed off from. The new
-  `jittered_retry_delay_ms` draws an equal-jitter spread (`[base/2, base]`,
-  never *longer* than the un-jittered delay) from the framework's injected
-  `Entropy` seam (`state.entropy()`) — real OS entropy in production, seeded
-  and bit-for-bit reproducible under a `#[sim_test]` seed. A real-clock
+  `jittered_retry_delay_ms` draws an equal-jitter spread
+  (`[base.div_ceil(2), base]`, never *longer* than the un-jittered delay) from
+  the framework's injected `Entropy` seam (`state.entropy()`) — real OS
+  entropy in production, seeded and bit-for-bit reproducible under a
+  `#[sim_test]` seed; the ceiling (not plain integer division) keeps a small
+  configured `backoff_ms` (e.g. `1`) from rounding its floor down to an
+  immediate 0ms retry (Codex review). A real-clock
   integration test cannot deliberately reproduce this bug (it would need N
   real jobs to fail within the same millisecond); the new worked-example test
   (`tests/integration/sim_retry_storm.rs`) builds the adversarial condition

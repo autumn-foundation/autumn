@@ -3989,13 +3989,19 @@ impl LocalQueueBuffer {
 /// used over "full jitter" (`rand(0, base)`) so a retry can never fire
 /// near-instantly under heavy jitter — see
 /// <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>.
+///
+/// `half` rounds *up* (`div_ceil`, not plain integer division) so a small
+/// configured backoff is still honored: at `base_delay_ms = 1`, plain
+/// `1 / 2 == 0` would let the retry fire immediately (`0ms`) instead of
+/// preserving the configured 1ms floor, and would do so on *every* attempt of
+/// a job configured with a tiny backoff — silently turning it into a tight
+/// retry loop (Codex review). `spread` is sized so `half + (0..spread)` covers
+/// exactly `[half, base_delay_ms]` inclusive, so the delay is never less than
+/// half the base and never more than the base itself.
 fn jittered_retry_delay_ms(entropy: &dyn crate::entropy::Entropy, base_delay_ms: u64) -> u64 {
-    let half = base_delay_ms / 2;
-    let spread = base_delay_ms - half;
-    if spread == 0 {
-        return base_delay_ms;
-    }
-    half.saturating_add(entropy.next_u64() % spread)
+    let half = base_delay_ms.div_ceil(2);
+    let spread = base_delay_ms - half + 1;
+    half + entropy.next_u64() % spread
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9065,6 +9071,18 @@ mod tests {
                 > 1,
             "a real spread of draws should not collapse to a single delay value: {delays_a:?}"
         );
+    }
+
+    #[test]
+    fn jittered_retry_delay_preserves_a_one_millisecond_backoff() {
+        // A job configured with `backoff_ms = 1` must still wait ~1ms, not
+        // retry immediately: plain integer division (`1 / 2 == 0`) would let
+        // every attempt draw a 0ms delay, silently turning a tiny configured
+        // backoff into a tight retry loop (Codex review).
+        let entropy = crate::entropy::SeededEntropy::new(3);
+        for _ in 0..256 {
+            assert_eq!(jittered_retry_delay_ms(&entropy, 1), 1);
+        }
     }
 
     #[test]

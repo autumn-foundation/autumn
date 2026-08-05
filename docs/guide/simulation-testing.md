@@ -207,23 +207,39 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
     for id in 0..STORM_SIZE {
         StormProbeJob::enqueue(StormArgs { id }).await.unwrap();
     }
-    sim.run_to_idle().await;                                  // every job fails, "at once"
-    sim.advance(Duration::from_millis(1_500)).await;
-    sim.run_to_idle().await;                                  // drain the retries
+    sim.run_to_idle().await;                    // every job fails, "at once"
 
-    let distinct_retry_instants = /* … collected from the drained retries … */;
+    // Step through the backoff window in bounded checkpoints, recording
+    // which checkpoint each retry lands in as it drains. A single big
+    // `sim.advance(Duration::from_millis(1_500))` looks tempting here, but
+    // both the injected `ClockSource` and Tokio's own paused clock jump
+    // straight to their target instant in one step *before* any timer
+    // fires — so every retry woken by that one big advance would read the
+    // *same* post-advance `now()` regardless of its individual delay,
+    // silently hiding a real spread (or a real herd) behind a single
+    // observed instant. Checkpointing avoids that: each drain only sees
+    // the retries whose delay fell inside that specific step.
+    for step_ms in [550, 100, 100, 100, 100, 550] {
+        sim.advance(Duration::from_millis(step_ms)).await;
+        checkpoint += 1;
+        sim.run_to_idle().await;                // records `checkpoint` on each retry that lands here
+    }
+
+    let distinct_checkpoints = /* … collected from the drained retries … */;
     always!(
-        distinct_retry_instants > 1,
-        "all retries landed on the exact same virtual instant — a thundering herd"
+        distinct_checkpoints > 1,
+        "all retries landed in the same checkpoint of the backoff window — a thundering herd"
     );
 }
 ```
 
-Before the fix, this `always!` fired on every seed: every retry landed on the
-same virtual millisecond. The fix draws an *equal-jitter* spread —
-`base_delay / 2 + random(0, base_delay / 2)` — from the framework's injected
-`Entropy` seam, so the herd spreads out using real OS entropy in production
-while staying bit-for-bit reproducible under a fixed sim seed. See
+Before the fix, this `always!` fired on every seed: every retry landed in the
+same checkpoint. The fix draws an *equal-jitter* spread — a random delay in
+`[ceil(base_delay / 2), base_delay]` — from the framework's injected `Entropy`
+seam, so the herd spreads out using real OS entropy in production while
+staying bit-for-bit reproducible under a fixed sim seed (the ceiling keeps a
+small configured backoff, like `backoff_ms = 1`, from rounding down to an
+immediate 0ms retry). See
 `autumn/tests/integration/sim_retry_storm.rs` for the full test and
 `jittered_retry_delay_ms` in `autumn/src/job.rs` for the fix.
 
