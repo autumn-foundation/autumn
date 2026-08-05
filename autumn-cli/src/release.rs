@@ -19,6 +19,23 @@ mod templates {
     pub const AZURE_TFVARS_EXAMPLE: &str =
         include_str!("templates/release/terraform.tfvars.example.tmpl");
     pub const AZURE_DEPLOY_WORKFLOW: &str = include_str!("templates/release/azure-deploy.yml.tmpl");
+
+    pub const AWS_APP_RUNNER_MAIN_TF: &str =
+        include_str!("templates/release/aws-app-runner-main.tf.tmpl");
+    pub const AWS_APP_RUNNER_VARIABLES_TF: &str =
+        include_str!("templates/release/aws-app-runner-variables.tf.tmpl");
+    pub const AWS_APP_RUNNER_OUTPUTS_TF: &str =
+        include_str!("templates/release/aws-app-runner-outputs.tf.tmpl");
+    pub const AWS_APP_RUNNER_TFVARS_EXAMPLE: &str =
+        include_str!("templates/release/aws-app-runner-terraform.tfvars.example.tmpl");
+
+    pub const AWS_ECS_MAIN_TF: &str = include_str!("templates/release/aws-ecs-main.tf.tmpl");
+    pub const AWS_ECS_VARIABLES_TF: &str =
+        include_str!("templates/release/aws-ecs-variables.tf.tmpl");
+    pub const AWS_ECS_OUTPUTS_TF: &str = include_str!("templates/release/aws-ecs-outputs.tf.tmpl");
+    pub const AWS_ECS_TFVARS_EXAMPLE: &str =
+        include_str!("templates/release/aws-ecs-terraform.tfvars.example.tmpl");
+    pub const AWS_DEPLOY_WORKFLOW: &str = include_str!("templates/release/aws-deploy.yml.tmpl");
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +56,8 @@ pub enum Target {
     Fly,
     DockerCompose,
     AzureContainerApps,
+    AwsAppRunner,
+    AwsEcs,
 }
 
 impl std::str::FromStr for Target {
@@ -48,12 +67,26 @@ impl std::str::FromStr for Target {
             "fly" => Ok(Self::Fly),
             "docker-compose" => Ok(Self::DockerCompose),
             "azure-container-apps" => Ok(Self::AzureContainerApps),
+            "aws-app-runner" => Ok(Self::AwsAppRunner),
+            "aws-ecs" => Ok(Self::AwsEcs),
             other => Err(format!(
-                "unknown target '{other}'; expected 'fly', 'docker-compose', or \
-                 'azure-container-apps'"
+                "unknown target '{other}'; expected 'fly', 'docker-compose', \
+                 'azure-container-apps', 'aws-app-runner', or 'aws-ecs'"
             )),
         }
     }
+}
+
+/// Whether `target` scaffolds a Terraform-based deployment (as opposed to
+/// `fly`/`docker-compose`'s plain config files). Terraform targets share two
+/// behaviors: a merged `.gitignore` (state files hold every secret in
+/// plaintext) and, when their workflow lands under a nested Cargo workspace
+/// member, the same GitHub Actions discoverability warning.
+const fn is_terraform_target(target: Target) -> bool {
+    matches!(
+        target,
+        Target::AzureContainerApps | Target::AwsAppRunner | Target::AwsEcs
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -92,8 +125,13 @@ pub fn run(action: ReleaseAction) {
                         println!("  Created {f}");
                     }
 
-                    if matches!(target, Target::AzureContainerApps)
-                        && let Some(warning) = azure_workflow_relocation_warning(&cwd)
+                    let workflow_file = planned_files(target)
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .find(|name| name.starts_with(".github/workflows/"));
+                    if let Some(workflow_file) = workflow_file
+                        && let Some(warning) =
+                            nested_workflow_relocation_warning(&cwd, workflow_file)
                     {
                         eprintln!("\n{warning}");
                     }
@@ -228,10 +266,11 @@ fn find_git_root(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// For the azure-container-apps target, `.github/workflows/azure-deploy.yml`
-/// is written under `dir` — but GitHub Actions only discovers workflow
-/// files under the git repository ROOT's `.github/workflows/`, never an
-/// arbitrary subdirectory's (see
+/// For targets that scaffold a nested workflow file (currently
+/// `.github/workflows/azure-deploy.yml` and `.github/workflows/aws-deploy.yml`),
+/// `workflow_rel_path` is written under `dir` — but GitHub Actions only
+/// discovers workflow files under the git repository ROOT's
+/// `.github/workflows/`, never an arbitrary subdirectory's (see
 /// <https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows>).
 /// `autumn release init` explicitly supports running from a Cargo workspace
 /// member directory (`read_project_name` rejects only the workspace root
@@ -239,7 +278,7 @@ fn find_git_root(dir: &Path) -> Option<PathBuf> {
 /// would silently never fire. Returns an actionable warning to print in
 /// that case; `None` when `dir` IS the git root (the common, correct case)
 /// or isn't inside a git repository at all (nothing more specific to say).
-fn azure_workflow_relocation_warning(dir: &Path) -> Option<String> {
+fn nested_workflow_relocation_warning(dir: &Path, workflow_rel_path: &str) -> Option<String> {
     let git_root = find_git_root(dir)?;
     if git_root == dir {
         return None;
@@ -247,10 +286,10 @@ fn azure_workflow_relocation_warning(dir: &Path) -> Option<String> {
     let rel = dir.strip_prefix(&git_root).ok()?;
     Some(format!(
         "Warning: this project lives inside a Git repository whose root is\n\
-         {}, but `.github/workflows/azure-deploy.yml` was written under\n\
+         {}, but `{workflow_rel_path}` was written under\n\
          {} — GitHub Actions only discovers workflow files under the\n\
          repository ROOT's `.github/workflows/`, so this workflow will never\n\
-         run as-is. Move it to {}/.github/workflows/azure-deploy.yml and add\n\
+         run as-is. Move it to {}/{workflow_rel_path} and add\n\
          the following so its `docker build` step still finds this crate's\n\
          Dockerfile:\n\
          \n\
@@ -288,8 +327,8 @@ pub fn init(
     // say), and failing after the other files are already on disk would
     // leave a partial, complete-looking scaffold that then blocks a retry
     // without --force on the very files this call just created.
-    if matches!(target, Target::AzureContainerApps) {
-        ensure_azure_gitignore_entries(dir)?;
+    if is_terraform_target(target) {
+        ensure_terraform_gitignore_entries(dir)?;
     }
 
     // Embed assets into the binary only when the project opts in via the
@@ -317,9 +356,12 @@ pub fn init(
 /// Terraform state (`*.tfstate*`) holds every secret value in plaintext —
 /// `sensitive = true` on a variable only redacts CLI plan/apply output, never
 /// the state file — and a real `terraform.tfvars` holds the operator's own
-/// secret values. None of that may ever land in version control.
-const AZURE_GITIGNORE_ENTRIES: &[&str] = &[
-    "# Terraform (autumn release init --target azure-container-apps)",
+/// secret values. None of that may ever land in version control. Shared by
+/// every Terraform-based target (`azure-container-apps`, `aws-app-runner`,
+/// `aws-ecs`) — the comment names all three so it stays legible however the
+/// project got its `.gitignore` merged.
+const TERRAFORM_GITIGNORE_ENTRIES: &[&str] = &[
+    "# Terraform (autumn release init --target azure-container-apps / aws-app-runner / aws-ecs)",
     ".terraform/",
     "*.tfstate",
     "*.tfstate.*",
@@ -357,7 +399,7 @@ fn gitignore_pattern_still_effective(existing: &str, pattern: &str) -> bool {
 /// but does re-append one whose earlier occurrence has since been negated,
 /// since re-asserting it after the negation is the only way to make it the
 /// final (and therefore effective) matching rule again.
-fn ensure_azure_gitignore_entries(dir: &Path) -> std::io::Result<()> {
+fn ensure_terraform_gitignore_entries(dir: &Path) -> std::io::Result<()> {
     let path = dir.join(".gitignore");
     // Only a missing file is safe to default to empty. Any other read
     // failure (invalid UTF-8, permission denied, ...) must propagate —
@@ -369,7 +411,7 @@ fn ensure_azure_gitignore_entries(dir: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
-    let missing: Vec<&str> = AZURE_GITIGNORE_ENTRIES
+    let missing: Vec<&str> = TERRAFORM_GITIGNORE_ENTRIES
         .iter()
         .copied()
         .filter(|line| {
@@ -500,6 +542,28 @@ fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
             files.push((
                 ".github/workflows/azure-deploy.yml",
                 templates::AZURE_DEPLOY_WORKFLOW,
+            ));
+        }
+        Target::AwsAppRunner => {
+            files.push(("main.tf", templates::AWS_APP_RUNNER_MAIN_TF));
+            files.push(("variables.tf", templates::AWS_APP_RUNNER_VARIABLES_TF));
+            files.push(("outputs.tf", templates::AWS_APP_RUNNER_OUTPUTS_TF));
+            files.push((
+                "terraform.tfvars.example",
+                templates::AWS_APP_RUNNER_TFVARS_EXAMPLE,
+            ));
+        }
+        Target::AwsEcs => {
+            files.push(("main.tf", templates::AWS_ECS_MAIN_TF));
+            files.push(("variables.tf", templates::AWS_ECS_VARIABLES_TF));
+            files.push(("outputs.tf", templates::AWS_ECS_OUTPUTS_TF));
+            files.push((
+                "terraform.tfvars.example",
+                templates::AWS_ECS_TFVARS_EXAMPLE,
+            ));
+            files.push((
+                ".github/workflows/aws-deploy.yml",
+                templates::AWS_DEPLOY_WORKFLOW,
             ));
         }
         Target::Default => {}
@@ -2860,7 +2924,7 @@ previous_secrets = []
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
-        for line in AZURE_GITIGNORE_ENTRIES {
+        for line in TERRAFORM_GITIGNORE_ENTRIES {
             assert!(
                 content.lines().any(|l| l.trim() == *line),
                 "azure target must add `{line}` to .gitignore: {content}"
@@ -2878,7 +2942,7 @@ previous_secrets = []
         let after_first = fs::read_to_string(dir.join(".gitignore")).unwrap();
         assert!(after_first.contains("/target"), "{after_first}");
         assert!(after_first.contains(".env"), "{after_first}");
-        for line in AZURE_GITIGNORE_ENTRIES {
+        for line in TERRAFORM_GITIGNORE_ENTRIES {
             assert!(
                 after_first.lines().any(|l| l.trim() == *line),
                 "{after_first}"
@@ -2888,7 +2952,7 @@ previous_secrets = []
         // Re-running (e.g. under --force) must not duplicate entries.
         init(&dir, "my-app", true, Target::AzureContainerApps, false).unwrap();
         let after_second = fs::read_to_string(dir.join(".gitignore")).unwrap();
-        for line in AZURE_GITIGNORE_ENTRIES {
+        for line in TERRAFORM_GITIGNORE_ENTRIES {
             let count = after_second.lines().filter(|l| l.trim() == *line).count();
             assert_eq!(
                 count, 1,
@@ -3155,7 +3219,10 @@ previous_secrets = []
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join(".git")).unwrap();
-        assert_eq!(azure_workflow_relocation_warning(&dir), None);
+        assert_eq!(
+            nested_workflow_relocation_warning(&dir, ".github/workflows/azure-deploy.yml"),
+            None
+        );
     }
 
     #[test]
@@ -3172,8 +3239,9 @@ previous_secrets = []
         let member_dir = git_root.join("examples").join("blog");
         fs::create_dir_all(&member_dir).unwrap();
 
-        let warning = azure_workflow_relocation_warning(&member_dir)
-            .expect("a workflow nested under a workspace member must be flagged");
+        let warning =
+            nested_workflow_relocation_warning(&member_dir, ".github/workflows/azure-deploy.yml")
+                .expect("a workflow nested under a workspace member must be flagged");
         assert!(
             warning.contains(&git_root.display().to_string()),
             "the warning must name the actual git root: {warning}"
@@ -3232,7 +3300,921 @@ previous_secrets = []
     }
 
     #[test]
+    fn parse_target_aws_app_runner() {
+        assert_eq!(
+            "aws-app-runner".parse::<Target>().unwrap(),
+            Target::AwsAppRunner
+        );
+    }
+
+    #[test]
+    fn parse_target_aws_ecs() {
+        assert_eq!("aws-ecs".parse::<Target>().unwrap(), Target::AwsEcs);
+    }
+
+    #[test]
     fn parse_target_unknown_is_error() {
         assert!("kubernetes".parse::<Target>().is_err());
+    }
+
+    #[test]
+    fn parse_target_unknown_error_mentions_all_targets() {
+        let err = "kubernetes".parse::<Target>().unwrap_err();
+        for name in [
+            "fly",
+            "docker-compose",
+            "azure-container-apps",
+            "aws-app-runner",
+            "aws-ecs",
+        ] {
+            assert!(err.contains(name), "error must mention '{name}': {err}");
+        }
+    }
+
+    // ── --target=aws-app-runner ─────────────────────────────────────────────────
+
+    #[test]
+    fn aws_app_runner_target_creates_all_expected_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        for name in [
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+        ] {
+            assert!(
+                dir.join(name).is_file(),
+                "{name} must be created for --target=aws-app-runner"
+            );
+        }
+        assert!(dir.join("Dockerfile").is_file());
+        assert!(dir.join(".dockerignore").is_file());
+        assert!(dir.join("autumn.production.toml.example").is_file());
+    }
+
+    #[test]
+    fn aws_app_runner_target_does_not_create_a_workflow() {
+        // Per the issue: aws-app-runner is the fast/minimal path with no CI
+        // workflow (unlike azure-container-apps and aws-ecs).
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        let files = init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        assert!(
+            !files.iter().any(|f| f.contains(".github/workflows")),
+            "aws-app-runner must not emit a CI workflow: {files:?}"
+        );
+        assert!(!dir.join(".github").exists());
+    }
+
+    #[test]
+    fn default_target_does_not_create_aws_app_runner_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        for name in [
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+        ] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must NOT be created for the default target"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_app_runner_main_tf_has_ecr_and_app_runner_service() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("aws_ecr_repository"),
+            "main.tf must provision an ECR repository: {content}"
+        );
+        assert!(
+            content.contains("resource \"aws_apprunner_service\""),
+            "main.tf must provision the App Runner service: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_main_tf_has_vpc_and_vpc_connector() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("resource \"aws_vpc\""),
+            "main.tf must provision a VPC: {content}"
+        );
+        assert!(
+            content.contains("aws_apprunner_vpc_connector"),
+            "main.tf must provision an App Runner VPC connector so App Runner can reach RDS \
+             privately: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_main_tf_has_nat_gateway_for_general_egress() {
+        // network_configuration.egress_configuration.egress_type = "VPC"
+        // routes ALL of the app's own outbound traffic through the private
+        // subnets, not just RDS-bound traffic — without a NAT gateway, any
+        // outbound call the app itself makes would silently hang or fail.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("aws_nat_gateway"),
+            "main.tf must provision a NAT gateway so the app's own outbound traffic \
+             (not just RDS-bound traffic) keeps working once egress_type = \"VPC\": {content}"
+        );
+        assert!(
+            content.contains("egress_type       = \"VPC\"")
+                || content.contains("egress_type = \"VPC\""),
+            "main.tf must route App Runner egress through the VPC connector: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_main_tf_has_rds_postgres() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("resource \"aws_db_instance\""),
+            "main.tf must provision an RDS Postgres instance: {content}"
+        );
+        assert!(
+            content.contains("engine         = \"postgres\"")
+                || content.contains("engine = \"postgres\""),
+            "the RDS instance must use the postgres engine: {content}"
+        );
+        assert!(
+            content.contains("publicly_accessible    = false")
+                || content.contains("publicly_accessible = false"),
+            "RDS must not be publicly accessible: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_main_tf_derives_database_url_not_a_variable() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            main_tf.contains("AUTUMN_DATABASE__PRIMARY_URL"),
+            "main.tf must wire the primary DB URL: {main_tf}"
+        );
+        assert!(
+            main_tf.contains("aws_db_instance.this.address"),
+            "the database URL must be derived from the RDS instance this apply creates, \
+             not pre-computed: {main_tf}"
+        );
+        assert!(
+            !variables_tf.contains("variable \"database_url\""),
+            "there must be no database_url variable — a single apply must be able to \
+             derive it end-to-end: {variables_tf}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_secrets_have_no_default_and_are_sensitive() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        for var in ["database_admin_password", "signing_secret"] {
+            let block = content
+                .split(&format!("variable \"{var}\""))
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| {
+                    panic!("variables.tf must declare variable \"{var}\": {content}")
+                });
+            assert!(
+                block.contains("sensitive   = true") || block.contains("sensitive = true"),
+                "{var} must be sensitive: {block}"
+            );
+            assert!(
+                !block.contains("default"),
+                "{var} must not have a default (never commit a real secret value): {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_app_runner_no_committed_secret_literals() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        for name in ["main.tf", "variables.tf", "terraform.tfvars.example"] {
+            let content = fs::read_to_string(dir.join(name)).unwrap();
+            assert!(
+                !content.to_lowercase().contains("password =\""),
+                "{name} must not contain a literal password assignment: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_app_runner_service_bootstraps_from_public_placeholder_and_ignores_drift() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let service_block = content
+            .split("resource \"aws_apprunner_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare the App Runner service");
+        assert!(
+            service_block.contains("var.bootstrap_image"),
+            "the App Runner service must start from the bootstrap placeholder image: {service_block}"
+        );
+        assert!(
+            service_block.contains("ignore_changes = [source_configuration]"),
+            "the App Runner service must ignore source_configuration drift once CI/the manual \
+             walkthrough deploys the real image: {service_block}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_instance_role_secrets_policy_is_scoped_not_wildcard() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let policy_block = content
+            .split("data \"aws_iam_policy_document\" \"apprunner_instance_secrets\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("main.tf must declare the instance role's secrets policy document");
+        assert!(
+            !policy_block.contains("resources = [\"*\"]") && !policy_block.contains("\"*\""),
+            "the instance role's secrets access must be scoped to specific secret ARNs, \
+             never a wildcard: {policy_block}"
+        );
+        assert!(
+            policy_block.contains("aws_secretsmanager_secret.database_url.arn"),
+            "the secrets policy must reference the database_url secret ARN: {policy_block}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_names_are_sanitized_for_underscored_uppercase_project_name() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "My_Test_App");
+        init(&dir, "My_Test_App", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("lower(replace(var.app_name"),
+            "main.tf must lowercase and sanitize app_name for AWS resource names: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_postgres_database_name_avoids_reserved_names() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        for reserved in ["postgres", "rdsadmin", "template0", "template1"] {
+            assert!(
+                content.contains(&format!("\"{reserved}\"")),
+                "the reserved-name guard must list {reserved:?}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_app_runner_target_adds_terraform_gitignore_entries() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        for line in TERRAFORM_GITIGNORE_ENTRIES {
+            assert!(content.lines().any(|l| l.trim() == *line), "{content}");
+        }
+    }
+
+    #[test]
+    fn aws_app_runner_dockerignore_excludes_terraform_state() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
+        for pattern in [".terraform/", "*.tfstate", "terraform.tfvars"] {
+            assert!(content.contains(pattern), "{content}");
+        }
+    }
+
+    // ── --target=aws-ecs ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn aws_ecs_target_creates_all_expected_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        for name in [
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+            ".github/workflows/aws-deploy.yml",
+        ] {
+            assert!(
+                dir.join(name).is_file(),
+                "{name} must be created for --target=aws-ecs"
+            );
+        }
+        assert!(dir.join("Dockerfile").is_file());
+        assert!(dir.join(".dockerignore").is_file());
+        assert!(dir.join("autumn.production.toml.example").is_file());
+    }
+
+    #[test]
+    fn aws_ecs_target_returns_nested_workflow_path_in_created_list() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        let files = init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|f| f == ".github/workflows/aws-deploy.yml"),
+            "created-files list must include the nested workflow path: {files:?}"
+        );
+    }
+
+    #[test]
+    fn default_target_does_not_create_aws_ecs_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        for name in [
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+            ".github/workflows/aws-deploy.yml",
+        ] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must NOT be created for the default target"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_ecs_main_tf_has_vpc_with_public_and_private_subnets_across_two_azs() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(content.contains("resource \"aws_vpc\""), "{content}");
+        assert!(
+            content.contains("resource \"aws_subnet\" \"public\"")
+                && content.contains("count                   = 2"),
+            "main.tf must provision 2 public subnets: {content}"
+        );
+        assert!(
+            content.contains("resource \"aws_subnet\" \"private\"")
+                && content.contains("count             = 2"),
+            "main.tf must provision 2 private subnets: {content}"
+        );
+        assert!(
+            content.contains("data \"aws_availability_zones\""),
+            "subnets must be spread across AZs discovered at apply time, not hardcoded: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_main_tf_has_alb_with_https_redirect_and_dns_validated_cert() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("resource \"aws_lb\" \"this\""),
+            "main.tf must provision an ALB: {content}"
+        );
+        assert!(
+            content.contains("resource \"aws_acm_certificate\""),
+            "main.tf must provision an ACM certificate: {content}"
+        );
+        assert!(
+            content.contains("validation_method = \"DNS\""),
+            "the ACM certificate must use DNS validation: {content}"
+        );
+        assert!(
+            content.contains("aws_acm_certificate_validation"),
+            "main.tf must wait for certificate validation before wiring the HTTPS listener: {content}"
+        );
+        let http_listener = content
+            .split("resource \"aws_lb_listener\" \"http\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\nresource").next())
+            .expect("main.tf must declare the HTTP listener");
+        assert!(
+            http_listener.contains("HTTP_301") && http_listener.contains("HTTPS"),
+            "the HTTP listener must redirect to HTTPS: {http_listener}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_alb_and_target_group_names_never_exceed_32_char_limit() {
+        // ALB and target group names are capped at 32 characters by AWS.
+        // Extract the substr() bound in the sanitization local and verify
+        // the worst-case rendered name (base + longest suffix) fits.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let base_cap_line = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("app_name_safe = trim(substr("))
+            .expect("main.tf must declare app_name_safe via a bounded substr()");
+        assert!(
+            base_cap_line.contains(", 20)"),
+            "expected a 20-char base cap: {base_cap_line}"
+        );
+        // 20 (base) + "-migrate-tg" (11) = 31 <= 32.
+        assert!(20 + "-migrate-tg".len() <= 32);
+        assert!(
+            content.contains("\"${local.app_name_safe}-alb\""),
+            "the ALB must be named from the sanitized/capped local: {content}"
+        );
+        assert!(
+            content.contains("\"${local.app_name_safe}-tg\""),
+            "the target group must be named from the sanitized/capped local: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_main_tf_has_ecs_fargate_cluster_task_and_service_with_circuit_breaker() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("resource \"aws_ecs_cluster\""),
+            "{content}"
+        );
+        assert!(
+            content.contains("resource \"aws_ecs_task_definition\" \"app\"")
+                && content.contains("FARGATE"),
+            "{content}"
+        );
+        assert!(
+            content.contains("resource \"aws_ecs_service\" \"this\""),
+            "{content}"
+        );
+        let service_block = content
+            .split("resource \"aws_ecs_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare the ECS service");
+        assert!(
+            service_block.contains("deployment_circuit_breaker")
+                && service_block.contains("rollback = true"),
+            "the ECS service must enable circuit-breaker rollback: {service_block}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_task_definitions_bootstrap_from_placeholder_and_ignore_drift() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        for family in ["app", "migrate"] {
+            let block = content
+                .split(&format!(
+                    "resource \"aws_ecs_task_definition\" \"{family}\""
+                ))
+                .nth(1)
+                .and_then(|rest| rest.split("\nresource").next())
+                .unwrap_or_else(|| panic!("main.tf must declare the {family} task definition"));
+            assert!(
+                block.contains("var.bootstrap_image"),
+                "{family} task must use the bootstrap image: {block}"
+            );
+            assert!(
+                block.contains("ignore_changes = [container_definitions]"),
+                "{family} task definition must ignore container_definitions drift once CI \
+                 registers real revisions: {block}"
+            );
+        }
+        let service_block = content
+            .split("resource \"aws_ecs_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare the ECS service");
+        assert!(
+            service_block.contains("ignore_changes = [task_definition]"),
+            "the ECS service must ignore task_definition drift so CI-registered revisions \
+             aren't reverted by a later `terraform apply`: {service_block}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_main_tf_derives_database_url_not_a_variable() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            main_tf.contains("AUTUMN_DATABASE__PRIMARY_URL"),
+            "{main_tf}"
+        );
+        assert!(
+            main_tf.contains("aws_db_instance.this.address"),
+            "{main_tf}"
+        );
+        assert!(
+            !variables_tf.contains("variable \"database_url\""),
+            "there must be no database_url variable: {variables_tf}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_trusted_hosts_uses_the_required_domain_name_variable() {
+        // Unlike App Runner (whose subdomain is only known after the
+        // service is created), ECS's ALB serves under the operator-supplied
+        // domain_name, known before the apply even starts — so trusted
+        // hosts can be set correctly on the very first apply.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS")
+                && content.contains("var.domain_name"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_execution_role_secrets_policy_is_scoped_not_wildcard() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let policy_block = content
+            .split("data \"aws_iam_policy_document\" \"execution_secrets\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("main.tf must declare the execution role's secrets policy document");
+        assert!(
+            !policy_block.contains("\"*\""),
+            "the execution role's secrets access must be scoped, never a wildcard: {policy_block}"
+        );
+        assert!(
+            policy_block.contains("local.secrets_manager_arns"),
+            "{policy_block}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_task_role_and_execution_role_are_distinct() {
+        // Least privilege: the execution role (ECS agent — image pull, logs,
+        // secrets injection) must be a different principal from the task
+        // role (the running app container's own AWS permissions).
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("resource \"aws_iam_role\" \"execution\""),
+            "{content}"
+        );
+        assert!(
+            content.contains("resource \"aws_iam_role\" \"task\""),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_redis_is_off_by_default_and_gated() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            variables_tf.contains("enable_redis_cache")
+                && variables_tf.contains("default     = false"),
+            "{variables_tf}"
+        );
+        assert!(
+            main_tf.contains("count                       = var.enable_redis_cache ? 1 : 0")
+                || main_tf.contains("count = var.enable_redis_cache ? 1 : 0"),
+            "ElastiCache resources must be gated behind enable_redis_cache: {main_tf}"
+        );
+        assert!(
+            main_tf.contains("autumn-cache-redis"),
+            "main.tf must document that Redis wiring alone isn't enough — the app must \
+             also depend on autumn-cache-redis: {main_tf}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_scale_defaults_match_the_issue() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        let defaults = [
+            ("desired_count", "2"),
+            ("min_count", "1"),
+            ("max_count", "10"),
+        ];
+        for (var, expected) in defaults {
+            let block = content
+                .split(&format!("variable \"{var}\""))
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| {
+                    panic!("variables.tf must declare variable \"{var}\": {content}")
+                });
+            assert!(
+                block.contains(&format!("default     = {expected}")),
+                "{var} must default to {expected}: {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_ecs_secrets_have_no_default_and_are_sensitive() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        for var in ["database_admin_password", "signing_secret"] {
+            let block = content
+                .split(&format!("variable \"{var}\""))
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| {
+                    panic!("variables.tf must declare variable \"{var}\": {content}")
+                });
+            assert!(
+                block.contains("sensitive   = true") || block.contains("sensitive = true"),
+                "{block}"
+            );
+            assert!(
+                !block.contains("default"),
+                "{var} must not have a default: {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_ecs_no_committed_secret_literals() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        for name in ["main.tf", "variables.tf", "terraform.tfvars.example"] {
+            let content = fs::read_to_string(dir.join(name)).unwrap();
+            assert!(
+                !content.to_lowercase().contains("password =\""),
+                "{name} must not contain a literal password assignment: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_ecs_target_adds_terraform_gitignore_entries() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        for line in TERRAFORM_GITIGNORE_ENTRIES {
+            assert!(content.lines().any(|l| l.trim() == *line), "{content}");
+        }
+    }
+
+    #[test]
+    fn aws_ecs_dockerignore_excludes_terraform_state() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
+        for pattern in [".terraform/", "*.tfstate", "terraform.tfvars"] {
+            assert!(content.contains(pattern), "{content}");
+        }
+    }
+
+    #[test]
+    fn init_without_force_errors_if_aws_workflow_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        fs::write(dir.join(".github/workflows/aws-deploy.yml"), "existing").unwrap();
+        let err = init(&dir, "my-app", false, Target::AwsEcs, false).unwrap_err();
+        assert!(matches!(err, ReleaseError::FileExists(_)));
+    }
+
+    #[test]
+    fn init_with_force_overwrites_nested_aws_workflow_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        fs::write(dir.join(".github/workflows/aws-deploy.yml"), "old content").unwrap();
+        init(&dir, "my-app", true, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert_ne!(content, "old content");
+    }
+
+    // ── aws-deploy.yml workflow ───────────────────────────────────────────────
+
+    #[test]
+    fn aws_workflow_triggers_on_tag_push_and_manual_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert!(
+            content.contains("tags:") && content.contains("\"v*\""),
+            "{content}"
+        );
+        assert!(content.contains("workflow_dispatch"), "{content}");
+    }
+
+    #[test]
+    fn aws_workflow_never_hardcodes_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert!(
+            content.contains("secrets.AWS_ROLE_ARN"),
+            "the workflow must source the deploy role from a repository secret: {content}"
+        );
+        assert!(
+            content.contains("id-token: write"),
+            "the workflow must request OIDC token permission for AWS login: {content}"
+        );
+        assert!(
+            !content.to_lowercase().contains("aws_secret_access_key"),
+            "the workflow must not use long-lived AWS access keys: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_workflow_runs_migrations_before_updating_the_service() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        let migrate_pos = content
+            .find("Run database migrations")
+            .expect("workflow must run migrations");
+        let deploy_pos = content
+            .find("Deploy new image to the ECS service")
+            .expect("workflow must deploy to ECS");
+        assert!(
+            migrate_pos < deploy_pos,
+            "migrations must run BEFORE the ECS service is updated: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_workflow_aborts_deploy_on_migration_failure() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        let migrate_step = content
+            .split("Run database migrations")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("must find the migration step");
+        assert!(
+            migrate_step.contains("exit 1"),
+            "the migration step must exit non-zero on failure so the job (and therefore \
+             the deploy step after it) aborts: {migrate_step}"
+        );
+    }
+
+    #[test]
+    fn aws_workflow_serializes_overlapping_runs() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert!(content.contains("concurrency:"), "{content}");
+        assert!(content.contains("cancel-in-progress: false"), "{content}");
+    }
+
+    #[test]
+    fn aws_workflow_guards_against_superseded_run_before_migrating() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        let guard_pos = content
+            .find("Abort if a newer run of this workflow exists")
+            .expect("workflow must guard against superseded runs");
+        let migrate_pos = content.find("Run database migrations").unwrap();
+        assert!(
+            guard_pos < migrate_pos,
+            "the staleness guard must run BEFORE migrating: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_workflow_image_tag_is_unique_per_execution() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert!(content.contains("GITHUB_RUN_ID"), "{content}");
+        assert!(content.contains("GITHUB_RUN_ATTEMPT"), "{content}");
+    }
+
+    #[test]
+    fn aws_workflow_passes_git_provenance_build_args_to_docker() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        for arg in [
+            "AUTUMN_BUILD_GIT_SHA",
+            "AUTUMN_BUILD_GIT_SHA_SHORT",
+            "AUTUMN_BUILD_GIT_BRANCH",
+            "AUTUMN_BUILD_GIT_DIRTY",
+            "AUTUMN_BUILD_TIMESTAMP",
+        ] {
+            assert!(content.contains(arg), "{content}");
+        }
+    }
+
+    #[test]
+    fn aws_workflow_registers_new_task_definitions_before_running_or_deploying() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        let register_app_pos = content
+            .find("register_app")
+            .expect("must register the app task def");
+        let register_migrate_pos = content
+            .find("register_migrate")
+            .expect("must register the migrate task def");
+        let migrate_pos = content.find("Run database migrations").unwrap();
+        let deploy_pos = content.find("Deploy new image to the ECS service").unwrap();
+        assert!(register_migrate_pos < migrate_pos, "{content}");
+        assert!(register_app_pos < deploy_pos, "{content}");
+    }
+
+    #[test]
+    fn aws_workflow_waits_for_service_stability_after_deploying() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert!(
+            content.contains("aws ecs wait services-stable"),
+            "the workflow must wait for the new deployment to stabilize (so the circuit \
+             breaker's rollback has a chance to be observed) rather than exiting immediately \
+             after force-new-deployment: {content}"
+        );
+    }
+
+    // ── aws-ecs workflow discoverability (git root vs. workspace member) ──────
+
+    #[test]
+    fn aws_ecs_workflow_relocation_warning_flags_a_nested_workspace_member() {
+        let tmp = TempDir::new().unwrap();
+        let git_root = tmp.path().to_path_buf();
+        fs::create_dir_all(git_root.join(".git")).unwrap();
+        let member_dir = git_root.join("examples").join("blog");
+        fs::create_dir_all(&member_dir).unwrap();
+
+        let warning =
+            nested_workflow_relocation_warning(&member_dir, ".github/workflows/aws-deploy.yml")
+                .expect("a workflow nested under a workspace member must be flagged");
+        assert!(warning.contains("aws-deploy.yml"), "{warning}");
+        assert!(
+            warning.contains("working-directory: examples/blog"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn is_terraform_target_covers_all_three_terraform_targets() {
+        assert!(is_terraform_target(Target::AzureContainerApps));
+        assert!(is_terraform_target(Target::AwsAppRunner));
+        assert!(is_terraform_target(Target::AwsEcs));
+        assert!(!is_terraform_target(Target::Default));
+        assert!(!is_terraform_target(Target::Fly));
+        assert!(!is_terraform_target(Target::DockerCompose));
     }
 }

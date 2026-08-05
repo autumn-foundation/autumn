@@ -1962,12 +1962,19 @@ enum ReleaseCommands {
     /// --target azure-container-apps   : also emits main.tf, variables.tf, outputs.tf,
     ///                                   terraform.tfvars.example, and
     ///                                   .github/workflows/azure-deploy.yml.
+    /// --target aws-app-runner         : also emits main.tf, variables.tf, outputs.tf, and
+    ///                                   terraform.tfvars.example (ECR + App Runner + RDS,
+    ///                                   no CI workflow — fast/minimal path).
+    /// --target aws-ecs                : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/aws-deploy.yml (VPC/ALB/ECS
+    ///                                   Fargate/RDS — production path).
     Init {
         /// Overwrite existing files instead of erroring on collision.
         #[arg(long)]
         force: bool,
-        /// Deployment target: fly | docker-compose | azure-container-apps (omit for bare
-        /// Dockerfile).
+        /// Deployment target: fly | docker-compose | azure-container-apps | aws-app-runner |
+        /// aws-ecs (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
         /// Scaffold a separate worker-role service in the generated
@@ -6129,6 +6136,26 @@ mod tests {
             panic!("expected release init");
         };
         assert_eq!(target.as_deref(), Some("azure-container-apps"));
+    }
+
+    #[test]
+    fn parse_release_init_with_aws_app_runner_target() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "aws-app-runner"])
+            .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("aws-app-runner"));
+    }
+
+    #[test]
+    fn parse_release_init_with_aws_ecs_target() {
+        let cli =
+            Cli::try_parse_from(["autumn", "release", "init", "--target", "aws-ecs"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("aws-ecs"));
     }
 
     #[test]
