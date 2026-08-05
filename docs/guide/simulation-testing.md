@@ -79,8 +79,10 @@ async fn app_boots_under_the_sim(mut sim: Sim) {
 ```
 
 `sim.build` mounts an [`autumn_web::app::AppBuilder`]-configured app on the
-sim's paused runtime, wired to the virtual clock, seeded entropy, and (if
-configured) the fault-injection hooks below.
+sim's paused runtime, wired to the virtual clock and (if configured) the
+fault-injection hooks below. **Seeded entropy is not automatic** — see
+"Deterministic identifiers" below for how (and why) to wire it in
+explicitly.
 
 ### Virtual time
 
