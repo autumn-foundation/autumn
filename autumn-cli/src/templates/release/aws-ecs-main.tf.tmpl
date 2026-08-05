@@ -81,8 +81,10 @@ locals {
     )
   )
   # Capped at 20 characters — headroom under the ALB/target-group 32-
-  # character ceiling for the longest suffix appended below ("-migrate-tg",
-  # 11 characters), and comfortably under RDS's own 63-character one.
+  # character ceiling (the tightest limit this scaffold touches; the
+  # longest single-resource suffix appended below is "-alb", 4 characters)
+  # and comfortably under RDS's own 63-character identifier ceiling and
+  # IAM's more generous 64-character role-name limit.
   app_name_safe = trim(substr(local.app_name_hyphenated, 0, 20), "-")
 
   # Postgres database identifiers (the RDS `db_name` parameter) allow only

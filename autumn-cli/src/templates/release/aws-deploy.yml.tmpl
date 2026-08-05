@@ -8,12 +8,22 @@
 # Required repository secrets (Settings -> Secrets and variables -> Actions):
 #   AWS_ROLE_ARN — an IAM role with a trust policy for GitHub's OIDC
 #     provider (see aws-actions/configure-aws-credentials' OIDC guide),
-#     granted ecr:*, ecs:RegisterTaskDefinition/RunTask/DescribeTasks/
-#     UpdateService/DescribeServices, and iam:PassRole for the execution/
-#     task roles `terraform output` prints. No long-lived AWS access keys
-#     are needed: `permissions.id-token: write` below plus
-#     aws-actions/configure-aws-credentials' role-to-assume input is enough
-#     for OIDC login.
+#     granted:
+#       - ecr:GetAuthorizationToken (account-wide — the API requires it) plus
+#         ecr:BatchCheckLayerAvailability/PutImage/InitiateLayerUpload/
+#         UploadLayerPart/CompleteLayerUpload/BatchGetImage/DescribeImages
+#         scoped to `terraform output ecr_repository_url`'s repository ARN
+#         — never account-wide `ecr:*`.
+#       - ecs:RegisterTaskDefinition/DescribeTaskDefinition/RunTask/
+#         DescribeTasks/UpdateService/DescribeServices (the task-definition
+#         re-registration steps below call DescribeTaskDefinition before
+#         RegisterTaskDefinition — both are required, not just the latter).
+#       - iam:PassRole for `terraform output execution_role_arn` and
+#         `terraform output task_role_arn` (RunTask/RegisterTaskDefinition
+#         need to pass both roles to ECS).
+#     No long-lived AWS access keys are needed: `permissions.id-token:
+#     write` below plus aws-actions/configure-aws-credentials'
+#     role-to-assume input is enough for OIDC login.
 #
 # Required repository variables (same Settings page, "Variables" tab — not
 # secret, just config the job needs), all `terraform output` values — never
@@ -25,7 +35,12 @@
 #   APP_TASK_FAMILY             — output of `terraform output app_task_family`.
 #   MIGRATE_TASK_FAMILY         — output of `terraform output migrate_task_family`.
 #   ECS_TASKS_SECURITY_GROUP_ID — output of `terraform output ecs_tasks_security_group_id`.
-#   ECS_PRIVATE_SUBNET_IDS      — comma-separated `terraform output -json private_subnet_ids`.
+#   ECS_PRIVATE_SUBNET_IDS      — the compact JSON array
+#     `terraform output -json private_subnet_ids | jq -c .` prints (e.g.
+#     `["subnet-0abc123","subnet-0def456"]`) — set verbatim, do NOT reformat
+#     into a comma-separated list; the migration step below embeds this
+#     value directly into an `aws ecs run-task --network-configuration`
+#     JSON payload as-is.
 
 name: aws-deploy
 
@@ -48,9 +63,16 @@ jobs:
     concurrency:
       group: aws-deploy-${{ github.repository }}
       cancel-in-progress: false
+    # Declaring `permissions` at all switches GITHUB_TOKEN from its default
+    # repo scopes to exactly this allow-list — anything not listed here is
+    # `none`. `actions: read` is required by the "Abort if a newer run"
+    # step's `gh api .../actions/workflows/.../runs` call below; without it
+    # that step 403s on every single run, after the image has already built
+    # and pushed, aborting before migration/deploy ever runs.
     permissions:
       contents: read
       id-token: write
+      actions: read
 
     steps:
       - uses: actions/checkout@v4
@@ -206,7 +228,14 @@ jobs:
       - name: Run database migrations
         run: |
           set -euo pipefail
-          SUBNETS=$(echo "$ECS_PRIVATE_SUBNET_IDS" | tr ',' '\n' | jq -R . | jq -s -c .)
+          # ECS_PRIVATE_SUBNET_IDS is already the compact JSON array
+          # `terraform output -json private_subnet_ids | jq -c .` produces
+          # (see the header comment) — `jq -c .` here just re-compacts it
+          # defensively (e.g. if it was pasted with pretty-printed
+          # whitespace/newlines) and fails loudly on genuinely malformed
+          # input rather than silently building a broken
+          # --network-configuration payload.
+          SUBNETS=$(echo "$ECS_PRIVATE_SUBNET_IDS" | jq -c .)
           TASK_ARN=$(aws ecs run-task \
             --cluster "$ECS_CLUSTER_NAME" \
             --task-definition "$MIGRATE_TASK_DEF_ARN" \

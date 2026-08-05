@@ -44,3 +44,13 @@ output "ecs_tasks_security_group_id" {
   description = "Security group ID shared by the app service and migration task — required by `aws ecs run-task --network-configuration`."
   value       = aws_security_group.ecs_tasks.id
 }
+
+output "execution_role_arn" {
+  description = "ARN of the ECS task execution role (image pull, logs, secrets injection) — grant the CI deploy role `iam:PassRole` on this ARN, per aws-deploy.yml's header comment."
+  value       = aws_iam_role.execution.arn
+}
+
+output "task_role_arn" {
+  description = "ARN of the ECS task role (the running app container's own AWS permissions) — grant the CI deploy role `iam:PassRole` on this ARN, per aws-deploy.yml's header comment."
+  value       = aws_iam_role.task.arn
+}

@@ -3208,10 +3208,10 @@ previous_secrets = []
         );
     }
 
-    // ── azure workflow discoverability (git root vs. workspace member) ────────
+    // ── nested workflow discoverability (git root vs. workspace member) ───────
 
     #[test]
-    fn azure_workflow_relocation_warning_is_silent_at_the_git_root() {
+    fn nested_workflow_relocation_warning_is_silent_at_the_git_root() {
         // The common case: `dir` IS the git repository root (a single-crate
         // repo, or a workspace member the user happens to be running from
         // the top of anyway). `.github/workflows/azure-deploy.yml` lands
@@ -3226,7 +3226,7 @@ previous_secrets = []
     }
 
     #[test]
-    fn azure_workflow_relocation_warning_flags_a_nested_workspace_member() {
+    fn nested_workflow_relocation_warning_flags_a_nested_workspace_member() {
         // `autumn release init` explicitly supports running from a Cargo
         // workspace member directory (read_project_name only rejects the
         // workspace root itself) — but GitHub Actions only discovers
@@ -3616,6 +3616,54 @@ previous_secrets = []
         }
     }
 
+    #[test]
+    fn aws_app_runner_outputs_tf_declares_expected_outputs_with_no_unsubstituted_placeholders() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        for name in [
+            "app_url",
+            "service_arn",
+            "service_name",
+            "ecr_repository_url",
+            "apprunner_access_role_arn",
+        ] {
+            assert!(
+                content.contains(&format!("output \"{name}\"")),
+                "outputs.tf must declare output \"{name}\": {content}"
+            );
+        }
+        assert!(
+            !content.contains("{{"),
+            "outputs.tf must not contain any unsubstituted template placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_gitignore_merge_is_idempotent_on_repeat_init() {
+        // The merge function itself is exhaustively tested against the
+        // shared azure-container-apps target (idempotency, negation
+        // re-assertion, I/O-failure propagation); this pins that the
+        // aws-app-runner call site is actually wired to it under --force,
+        // not just on a fresh project.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), "/target\n.env\n").unwrap();
+
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        init(&dir, "my-app", true, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(
+            content.contains("/target") && content.contains(".env"),
+            "{content}"
+        );
+        for line in TERRAFORM_GITIGNORE_ENTRIES {
+            let count = content.lines().filter(|l| l.trim() == *line).count();
+            assert_eq!(count, 1, "`{line}` must appear exactly once: {content}");
+        }
+    }
+
     // ── --target=aws-ecs ─────────────────────────────────────────────────────────
 
     #[test]
@@ -3907,10 +3955,14 @@ previous_secrets = []
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
         let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
         let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let redis_var_block = variables_tf
+            .split("variable \"enable_redis_cache\"")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("variables.tf must declare variable \"enable_redis_cache\"");
         assert!(
-            variables_tf.contains("enable_redis_cache")
-                && variables_tf.contains("default     = false"),
-            "{variables_tf}"
+            redis_var_block.contains("default     = false"),
+            "enable_redis_cache must default to false: {redis_var_block}"
         );
         assert!(
             main_tf.contains("count                       = var.enable_redis_cache ? 1 : 0")
@@ -4008,6 +4060,73 @@ previous_secrets = []
         let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
         for pattern in [".terraform/", "*.tfstate", "terraform.tfvars"] {
             assert!(content.contains(pattern), "{content}");
+        }
+    }
+
+    #[test]
+    fn aws_ecs_outputs_tf_declares_expected_outputs_with_no_unsubstituted_placeholders() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        for name in [
+            "app_url",
+            "alb_dns_name",
+            "ecr_repository_url",
+            "ecs_cluster_name",
+            "ecs_service_name",
+            "app_task_family",
+            "migrate_task_family",
+            "private_subnet_ids",
+            "ecs_tasks_security_group_id",
+            "execution_role_arn",
+            "task_role_arn",
+        ] {
+            assert!(
+                content.contains(&format!("output \"{name}\"")),
+                "outputs.tf must declare output \"{name}\" — aws-deploy.yml's header \
+                 comment tells operators to source CI config/IAM grants from it: {content}"
+            );
+        }
+        assert!(
+            !content.contains("{{"),
+            "outputs.tf must not contain any unsubstituted template placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_execution_and_task_role_arns_are_both_exported_for_ci_pass_role_grants() {
+        // aws-deploy.yml's header comment tells operators to grant the CI
+        // deploy role iam:PassRole on both roles' ARNs "terraform output
+        // prints" — that promise is only true if both are actually
+        // exported outputs, not just Terraform-internal resources.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let outputs_tf = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        assert!(
+            outputs_tf.contains("aws_iam_role.execution.arn"),
+            "{outputs_tf}"
+        );
+        assert!(outputs_tf.contains("aws_iam_role.task.arn"), "{outputs_tf}");
+    }
+
+    #[test]
+    fn aws_ecs_gitignore_merge_is_idempotent_on_repeat_init() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::write(dir.join(".gitignore"), "/target\n.env\n").unwrap();
+
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        init(&dir, "my-app", true, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(
+            content.contains("/target") && content.contains(".env"),
+            "{content}"
+        );
+        for line in TERRAFORM_GITIGNORE_ENTRIES {
+            let count = content.lines().filter(|l| l.trim() == *line).count();
+            assert_eq!(count, 1, "`{line}` must appear exactly once: {content}");
         }
     }
 
@@ -4137,6 +4256,101 @@ previous_secrets = []
         let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
         assert!(content.contains("GITHUB_RUN_ID"), "{content}");
         assert!(content.contains("GITHUB_RUN_ATTEMPT"), "{content}");
+    }
+
+    #[test]
+    fn aws_workflow_sanitizes_ref_name_for_docker_tag() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert!(
+            content.contains("tr -c 'A-Za-z0-9_.-' '-'"),
+            "the workflow must map every character outside Docker's tag charset to '-': {content}"
+        );
+    }
+
+    #[test]
+    fn aws_workflow_image_tag_never_starts_with_invalid_character() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert!(
+            content.contains("sed -E 's/^[.-]+//'"),
+            "the workflow must strip a leading '.'/'-' left over from ref sanitization — \
+             Docker's tag grammar requires the first character to be a word character: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_workflow_grants_actions_read_for_the_staleness_guard() {
+        // Declaring `permissions:` at all switches GITHUB_TOKEN from its
+        // default repo scopes to exactly the listed allow-list. The
+        // "Abort if a newer run" step calls the Actions API via `gh api`,
+        // which needs `actions: read` — without it that step 403s on every
+        // single run, after the image has already built and pushed.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        let permissions_block = content
+            .split("permissions:")
+            .nth(1)
+            .and_then(|rest| rest.split("\n\n").next())
+            .expect("workflow must declare a permissions block");
+        assert!(
+            permissions_block.contains("actions: read"),
+            "the permissions block must grant actions: read for the staleness-guard \
+             step's `gh api .../actions/workflows/.../runs` call: {permissions_block}"
+        );
+    }
+
+    #[test]
+    fn aws_workflow_documents_describe_task_definition_permission() {
+        // The task-definition re-registration steps call
+        // `aws ecs describe-task-definition` before `register-task-definition`
+        // — a distinct IAM action the documented CI role policy must list,
+        // or the very first deploy 403s before ever reaching migration.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        let header = content
+            .split("\nname: aws-deploy")
+            .next()
+            .expect("workflow must have a header comment before `name:`");
+        assert!(
+            header.contains("DescribeTaskDefinition"),
+            "the header's documented IAM policy must include ecs:DescribeTaskDefinition: {header}"
+        );
+        assert!(
+            !header.contains("granted ecr:*"),
+            "the header must not recommend granting account-wide ecr:* — scope ECR access \
+             to the repository ARN instead: {header}"
+        );
+    }
+
+    #[test]
+    fn aws_workflow_subnet_ids_env_is_used_as_json_directly_not_reparsed_from_csv() {
+        // ECS_PRIVATE_SUBNET_IDS is documented as the compact JSON array
+        // `terraform output -json private_subnet_ids | jq -c .` prints. The
+        // migration step must consume it as JSON directly (a bare
+        // `tr ',' '\n' | jq -R . | jq -s -c .` reconstruction would mangle
+        // a real JSON array like ["subnet-1","subnet-2"] into garbage).
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert!(
+            content.contains("SUBNETS=$(echo \"$ECS_PRIVATE_SUBNET_IDS\" | jq -c .)"),
+            "the migration step must treat ECS_PRIVATE_SUBNET_IDS as JSON already, not \
+             reconstruct it from a comma-separated split: {content}"
+        );
+        assert!(
+            !content.contains("tr ',' '\\n' | jq -R ."),
+            "the migration step must not reconstruct a JSON array via comma-split: {content}"
+        );
     }
 
     #[test]
