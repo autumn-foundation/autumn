@@ -47,12 +47,27 @@
 //! same checkpoint bucket — and the `always!` invariant below fails, printing
 //! the deterministic `AUTUMN_SIM_SEED=…` replay line. With the fix in place the
 //! same seed passes.
+//!
+//! # Wiring seeded entropy explicitly (Codex review)
+//!
+//! `Sim::build` wires the virtual clock into a mounted app automatically, but
+//! entropy injection is opt-in (see [`Sim::seeded_entropy`]'s own docs). The
+//! first draft of `run_storm` below omitted `.with_entropy(...)`, so the
+//! jitter this test exists to demonstrate was drawn from real `OsEntropy`
+//! rather than the sim's seed — the test still passed (a real random spread
+//! still satisfies "more than one checkpoint"), but a failure would **not**
+//! have reproduced from the printed `AUTUMN_SIM_SEED` replay line, quietly
+//! defeating the whole point of the harness. Fixed by mounting with
+//! `.with_entropy(SeededEntropy::new(sim.seed))`, and proved by
+//! `retry_checkpoints_replay_deterministically_from_the_seed` below, which
+//! runs the same seed twice and asserts on the identical outcome.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_web::app::AppBuilder;
+use autumn_web::entropy::SeededEntropy;
 use autumn_web::job;
 use autumn_web::plugin::Plugin;
 use autumn_web::prelude::*;
@@ -140,16 +155,33 @@ impl Plugin for StormProbeJobPlugin {
     }
 }
 
-#[sim_test]
-async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
-    // This job path uses the process-global job client, so serialize on the
-    // shared runtime lock and start from a clean client, matching every other
-    // job-backed sim test in this suite.
+/// Runs the storm scenario against `sim` and returns the checkpoint each
+/// job's retry landed in, in enqueue order. Shared by the main `#[sim_test]`
+/// (which asserts on the outcome) and
+/// `retry_checkpoints_replay_deterministically_from_the_seed` (which proves
+/// two independent runs of the same seed produce the identical sequence).
+///
+/// This job path uses the process-global job client, so callers must already
+/// hold `job::global_job_runtime_test_lock()` — acquired here so every caller
+/// gets it, matching every other job-backed sim test in this suite.
+async fn run_storm(sim: &mut Sim) -> Vec<u32> {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
     reset_probe_state();
 
-    sim.build(TestApp::new().plugin(StormProbeJobPlugin));
+    // `Sim::build` wires the virtual clock automatically but, unlike the
+    // clock, entropy injection is opt-in (`Sim::seeded_entropy`'s own docs:
+    // "ready to inject ... via `AppState::with_entropy`") — omitting this
+    // call is exactly the gap Codex review caught: `jittered_retry_delay_ms`
+    // draws from `state.entropy()`, so without a seeded source here the
+    // retry jitter comes from real `OsEntropy`, not `AUTUMN_SIM_SEED`, and
+    // the whole point of this test (a seed replaying deterministically) is
+    // lost.
+    sim.build(
+        TestApp::new()
+            .plugin(StormProbeJobPlugin)
+            .with_entropy(SeededEntropy::new(sim.seed)),
+    );
 
     // Enqueue every job before draining anything: on the paused runtime no
     // real time passes between these calls, so all `STORM_SIZE` first
@@ -176,6 +208,13 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
     }
 
     let retry_checkpoints = RETRY_CHECKPOINTS.lock().unwrap().clone();
+    job::clear_global_job_client();
+    retry_checkpoints
+}
+
+#[sim_test]
+async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
+    let retry_checkpoints = run_storm(&mut sim).await;
     assert_eq!(
         retry_checkpoints.len(),
         STORM_SIZE as usize,
@@ -201,6 +240,33 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
     // Single-run non-vacuity check: the `sometimes!` target above must have
     // actually fired in this run, not merely be theoretically reachable.
     autumn_web::sim::assert_all_sometimes_satisfied();
+}
 
-    job::clear_global_job_client();
+/// Proves the claim `run_storm`'s doc comment (and this module's docs) make:
+/// the same seed reproduces the identical retry-checkpoint sequence. This is
+/// what the missing `with_entropy` wiring above would have broken silently —
+/// the herd-detection assertions alone can't tell "properly seeded" apart
+/// from "spread by real OS randomness that happens to differ every run,"
+/// since both look like a passing, non-vacuous test. Builds its own paused
+/// runtime and `Sim` twice (mirroring what `#[sim_test]` expands to) rather
+/// than using the attribute, since a single `#[sim_test]` run only ever
+/// constructs one `Sim`.
+#[test]
+fn retry_checkpoints_replay_deterministically_from_the_seed() {
+    fn run_once(seed: u64) -> Vec<u32> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("failed to build paused sim runtime");
+        let mut sim = Sim::from_seed(seed);
+        runtime.block_on(run_storm(&mut sim))
+    }
+
+    let a = run_once(0);
+    let b = run_once(0);
+    assert_eq!(
+        a, b,
+        "the same seed must reproduce the identical retry-checkpoint sequence"
+    );
 }

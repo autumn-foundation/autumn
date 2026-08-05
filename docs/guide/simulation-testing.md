@@ -105,10 +105,30 @@ sim.run_to_idle().await; // drain everything the advance released
 ### Deterministic identifiers
 
 Framework-minted IDs (job IDs, request IDs, idempotency keys, session tokens)
-draw from a seeded [`autumn_web::entropy::Entropy`] source under the sim
-instead of the OS CSPRNG, so the same seed replays the same identifier stream.
-Reach it from a handler via the [`autumn_web::entropy::Rng`] extractor, or from
-the sim directly via `sim.rng()`.
+draw from an injected [`autumn_web::entropy::Entropy`] source. Reach a seeded
+one from a handler via the [`autumn_web::entropy::Rng`] extractor, or from the
+sim directly via `sim.rng()`.
+
+**Unlike the clock, entropy injection is opt-in** — `Sim::build` does not wire
+it into the mounted app automatically. If any code path your test exercises
+(a job's retry jitter, a minted UUID, anything reading `state.entropy()`)
+needs to be reproducible from the seed, mount with it explicitly:
+
+```rust
+use autumn_web::entropy::SeededEntropy;
+
+sim.build(
+    TestApp::new()
+        .routes(routes![index])
+        .with_entropy(SeededEntropy::new(sim.seed)),
+);
+```
+
+Skipping this is easy to miss and easy to get wrong silently: the app still
+runs, the handler still reads *some* entropy source, and a test that only
+asserts non-vacuity (e.g. "outcomes vary across N draws") still passes — it
+just isn't actually replaying from `AUTUMN_SIM_SEED` anymore, so a failure
+downstream of that draw won't reproduce from the printed seed (Codex review).
 
 ### Fault injection
 
@@ -202,7 +222,15 @@ enqueuing them.
 ```rust
 #[sim_test]
 async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
-    sim.build(TestApp::new().plugin(StormProbeJobPlugin));
+    // The retry jitter reads `state.entropy()` (see "Deterministic
+    // identifiers" above), so it needs a seeded source explicitly wired in
+    // to actually replay from `AUTUMN_SIM_SEED` — omitting this is a real
+    // gap Codex review caught in this test's first draft.
+    sim.build(
+        TestApp::new()
+            .plugin(StormProbeJobPlugin)
+            .with_entropy(SeededEntropy::new(sim.seed)),
+    );
 
     for id in 0..STORM_SIZE {
         StormProbeJob::enqueue(StormArgs { id }).await.unwrap();

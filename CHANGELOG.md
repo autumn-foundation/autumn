@@ -34,7 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Verified the test actually catches the regression: temporarily reverting
   `jittered_retry_delay_ms` to the old un-jittered formula reproduces the
   herd (all 12 retries land in the final checkpoint bucket) and fails the
-  `always!`; restoring the fix passes it again. New guide
+  `always!`; restoring the fix passes it again. Entropy injection is opt-in
+  under the sim (`Sim::build` wires the virtual clock automatically but not
+  entropy), and the test's first draft missed wiring it, so its jitter
+  silently drew from real OS randomness rather than `AUTUMN_SIM_SEED` (Codex
+  review) — fixed by mounting with `.with_entropy(SeededEntropy::new(sim.seed))`,
+  proved by a new `retry_checkpoints_replay_deterministically_from_the_seed`
+  test that runs the same seed twice and asserts on the identical outcome.
+  New guide
   `docs/guide/simulation-testing.md` walks through `#[sim_test]`, virtual
   time, deterministic entropy, chaos, `always!`/`sometimes!`, the seed-sweep
   runner, and this worked example end-to-end. [no-plugin]
