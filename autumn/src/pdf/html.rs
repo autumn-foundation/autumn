@@ -285,10 +285,10 @@ fn push_text(stack: &mut [(String, Vec<Node>)], text: &str) {
 /// doesn't start with a well-formed tag (e.g. `< foo>` with a space, or an
 /// unterminated `<foo`).
 ///
-/// Attributes are ignored entirely (no CSS support), including their
-/// contents — so a literal `>` inside a quoted attribute value is not
-/// specially handled and will end the tag early. Developer-authored template
-/// markup essentially never does this in practice; see the module docs.
+/// Attributes are ignored entirely (no CSS support), but a literal `>`
+/// inside a quoted attribute value is still handled correctly — see
+/// [`find_tag_end`] — rather than being mistaken for the tag's own closing
+/// delimiter.
 /// Bound on how far [`parse_open_tag`] scans looking for the closing `>`. A
 /// long run of unterminated `<tag` fragments with no `>` anywhere
 /// (adversarial or just malformed input, e.g. `"<a".repeat(n)`) would
