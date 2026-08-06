@@ -473,15 +473,34 @@ const MAX_CLOSE_SCAN: usize = 512;
 /// empty. Returns the new `pos`, past the closing tag. Extracted out of
 /// [`parse`] purely to keep that function's line count down — this has no
 /// state of its own beyond `stack`.
+///
+/// The tag name is the text up to the first real tag-name boundary
+/// (whitespace, `/`, or `>`) — *not* everything up to the first `>`, and
+/// the `>` search itself is the same quote-aware [`find_tag_end`] an
+/// opening tag's own `>` uses, bounded to [`MAX_TAG_SCAN`] to stay cheap
+/// on every single `</`, not just oversized ones. Real browsers *do*
+/// enter a quote-aware, attribute-value-like state for a closing tag once
+/// whitespace follows the tag name (see [`raw_close_tag_end`]'s docs for
+/// the same rule applied to a raw-text closing tag) — without both fixes,
+/// a browser-tolerated attribute on an ordinary end tag broke this two
+/// ways: `</div data-x="...">` took the whole `div data-x="` blob as the
+/// "name" (never matching the real open `div`), and if that attribute
+/// value itself contained a literal `>` (e.g. `</div data-x=">secret">`),
+/// the naive un-quote-aware search stopped there and leaked
+/// `secret">` — plus everything after — as visible text instead of the
+/// genuine content following the real closing `>`.
 fn handle_closing_tag(
     stack: &mut Vec<(String, Vec<Node>, usize)>,
     input: &str,
     pos: usize,
 ) -> usize {
     let rest = &input[pos + 2..];
-    let name_end = rest.find('>').unwrap_or(rest.len());
-    let name = rest[..name_end].trim().to_ascii_lowercase();
-    let new_pos = pos + 2 + name_end + usize::from(name_end < rest.len());
+    let name_end = rest
+        .find(|c: char| c == '>' || c == '/' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let name = rest[..name_end].to_ascii_lowercase();
+    let new_pos =
+        pos + 2 + find_tag_end(bounded_prefix(rest, MAX_TAG_SCAN)).map_or(rest.len(), |i| i + 1);
 
     let matching_depth = if name.is_empty() {
         None
@@ -1940,6 +1959,45 @@ mod tests {
         assert_eq!(text(&parse("hello</>world")), "helloworld");
         assert_eq!(text(&parse("<div></></div>")), "");
         assert_eq!(text(&parse("</>")), "");
+    }
+
+    #[test]
+    fn ordinary_closing_tag_with_a_browser_tolerated_attribute_still_matches_its_opener() {
+        // Regression: `handle_closing_tag` took *everything* before the
+        // first `>` as the tag name (only trimmed, never split at
+        // whitespace) — so `</div data-x="...">` took the whole
+        // `"div data-x=\""`-shaped blob as the "name", which never matches
+        // the real open `div`, leaving it (and everything after) nested
+        // inside the still-open element instead of closing it. Worse, if
+        // that stray attribute value itself contained a literal `>` (real
+        // browsers *do* enter a quote-aware state here, same as for a
+        // raw-text closing tag), the naive un-quote-aware `>` search
+        // stopped at the quoted one and leaked the rest of the attribute
+        // value plus genuine subsequent content as visible text — the
+        // reported repro: `<div>One</div data-x=">secret">Two`.
+        let nodes = parse(r#"<div>One</div data-x=">secret">Two"#);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "expected the closed <div> and the genuine trailing text as separate top-level \
+             nodes, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected the first node to be an element")
+        };
+        assert_eq!(tag, "div");
+        assert_eq!(
+            text(children),
+            "One",
+            "the div's own content must not include anything from its closing tag's \
+             attribute soup"
+        );
+        assert_eq!(
+            nodes[1],
+            Node::Text("Two".to_owned()),
+            "only the genuine trailing text may appear as a sibling — the quoted attribute \
+             value must not leak, got {nodes:?}"
+        );
     }
 
     #[test]

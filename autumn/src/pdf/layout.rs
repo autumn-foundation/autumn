@@ -677,10 +677,23 @@ type StyledWord = (String, bool, bool, bool);
 /// point to relocate to, which is left overflowing rather than split
 /// mid-chain, the same as an entire line that's one unbreakable run in
 /// [`wrap`].
+///
+/// `first_chunk_max_width_pt` is the width budget for *only* the first
+/// produced chunk; every later chunk uses `max_width_pt`. The plain
+/// oversized-token case in [`wrap`] (and every direct caller below) passes
+/// the same value for both — a fresh line has the full column width
+/// available. [`split_oversized_glued_word`] passes a *narrower* value for
+/// the first chunk specifically: that chunk is appended to a line that
+/// already has other content on it, so sizing it against the full column
+/// width the way the rest of this function already does would produce a
+/// first chunk that, combined with what's already on the line, still
+/// overflows well past the column — not the character-level wrapping this
+/// function exists to provide.
 fn split_into_fitting_chunks(
     text: &str,
     font_size_pt: f32,
     bold: bool,
+    first_chunk_max_width_pt: f32,
     max_width_pt: f32,
 ) -> Vec<String> {
     let mut chunks = Vec::new();
@@ -694,7 +707,12 @@ fn split_into_fitting_chunks(
     for ch in text.chars() {
         let ch_width = f32::from(char_width_1000em(ch, bold)) / 1000.0 * font_size_pt;
         let connected = ch == '\u{00A0}' || current.ends_with('\u{00A0}');
-        if !current.is_empty() && current_width + ch_width > max_width_pt {
+        let limit = if chunks.is_empty() {
+            first_chunk_max_width_pt
+        } else {
+            max_width_pt
+        };
+        if !current.is_empty() && current_width + ch_width > limit {
             if connected {
                 if run_start > 0 {
                     let tail = current.split_off(run_start);
@@ -755,9 +773,17 @@ fn split_into_fitting_chunks(
 /// [`wrap`] calls this to character-split it while keeping the first chunk
 /// glued to whatever `current` already holds — `w` is that word's own
 /// (already-known-oversized) width, counted into `*current_width` before
-/// this runs. Returns `true` and leaves `current`/`current_width`/`lines`
-/// updated (first chunk appended and flushed, remaining chunks distributed,
-/// last one left as the new `current`) if splitting actually produced more
+/// this runs, so `*current_width - w` is the width of whatever's already
+/// on the line the first chunk must still fit alongside. That's the width
+/// budget passed to [`split_into_fitting_chunks`] for its first chunk
+/// specifically (see that function's `first_chunk_max_width_pt` docs) —
+/// without it, the first chunk was sized against the *full* column width
+/// the same as every later chunk, so appending it to an already-nonempty
+/// line could still send the combined line well past `max_width_pt`,
+/// defeating the character-wrapping this function exists to provide.
+/// Returns `true` and leaves `current`/`current_width`/`lines` updated
+/// (first chunk appended and flushed, remaining chunks distributed, last
+/// one left as the new `current`) if splitting actually produced more
 /// than one chunk; returns `false` with nothing touched if
 /// [`split_into_fitting_chunks`] returned only one chunk (nothing left to
 /// split — e.g. the whole word is one NBSP-connected chain with no earlier
@@ -777,7 +803,15 @@ fn split_oversized_glued_word(
     current_width: &mut f32,
     lines: &mut Vec<Vec<StyledWord>>,
 ) -> bool {
-    let mut chunks = split_into_fitting_chunks(text, font_size_pt, bold, max_width_pt).into_iter();
+    let existing_width = (*current_width - w).max(0.0);
+    let mut chunks = split_into_fitting_chunks(
+        text,
+        font_size_pt,
+        bold,
+        (max_width_pt - existing_width).max(0.0),
+        max_width_pt,
+    )
+    .into_iter();
     let first = chunks
         .next()
         .expect("split_into_fitting_chunks never returns empty chunks for non-empty text");
@@ -932,7 +966,13 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
                         lines.push(std::mem::take(&mut current));
                         current_width = 0.0;
                     }
-                    let chunks = split_into_fitting_chunks(text, font_size_pt, *bold, max_width_pt);
+                    let chunks = split_into_fitting_chunks(
+                        text,
+                        font_size_pt,
+                        *bold,
+                        max_width_pt,
+                        max_width_pt,
+                    );
                     let last = chunks.len().saturating_sub(1);
                     for (i, chunk) in chunks.into_iter().enumerate() {
                         let chunk_w = text_width_pt(&chunk, font_size_pt, *bold);
@@ -1336,7 +1376,8 @@ mod tests {
         let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
             + text_width_pt("\u{00A0}", font_size_pt, false)
             + 0.5;
-        let chunks = split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt);
+        let chunks =
+            split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt, max_width_pt);
         assert!(
             chunks
                 .iter()
@@ -1367,7 +1408,8 @@ mod tests {
         let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
             + text_width_pt("i", font_size_pt, false)
             + 0.5;
-        let chunks = split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt);
+        let chunks =
+            split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt, max_width_pt);
         assert!(
             chunks
                 .iter()
@@ -1398,7 +1440,8 @@ mod tests {
         let max_width_pt = text_width_pt(&"A".repeat(66), font_size_pt, false)
             + text_width_pt("\u{00A0}B", font_size_pt, false)
             + 0.5;
-        let chunks = split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt);
+        let chunks =
+            split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt, max_width_pt);
         assert!(
             chunks
                 .iter()
@@ -1701,11 +1744,11 @@ mod tests {
             "the first chunk of the NBSP-led word must still render glued (no rendered \
              space before it)"
         );
-        // Every line after the first is a fresh chunk with no NBSP
-        // involved, so `split_into_fitting_chunks` guarantees each one
-        // actually fits (only an all-NBSP-connected chain with nowhere
-        // earlier to split is allowed to overflow, which none of these are).
-        for (i, line) in lines.iter().enumerate().skip(1) {
+        // Every line, including the first (whose first chunk is sized
+        // against the space actually remaining after "Hello", not the
+        // full column — see `oversized_glued_word_first_chunk_is_sized_to_the_remaining_line_width`
+        // for the regression this guards), must actually fit.
+        for (i, line) in lines.iter().enumerate() {
             let line_width: f32 = line
                 .iter()
                 .map(|(text, bold, _, _)| text_width_pt(text, 11.0, *bold))
@@ -1722,6 +1765,57 @@ mod tests {
         assert_eq!(
             rejoined,
             format!("Hello\u{00A0}{}", "A".repeat(100)),
+            "splitting into chunks must not drop or duplicate any characters"
+        );
+    }
+
+    #[test]
+    fn oversized_glued_word_first_chunk_is_sized_to_the_remaining_line_width() {
+        // Regression: the character-split fix above sized the *first*
+        // chunk against the full `max_width_pt`, the same as every later
+        // chunk — but the first chunk is appended to a line that already
+        // has other content on it, so sizing it against the full column
+        // still overflowed by roughly however wide that existing content
+        // was. 40 "A"s (~294pt at this font size) followed by an
+        // NBSP-glued run of "<strong>&nbsp;" + 100 more "A"s used to
+        // produce a first chunk sized to ~489pt — combined with the
+        // 40-"A" prefix, well past the 495pt column, with only later
+        // chunks actually respecting `max_width_pt`.
+        let words = vec![
+            Word::Text {
+                text: "A".repeat(40),
+                bold: false,
+                italic: false,
+                glue: false,
+                unbreakable: false,
+            },
+            Word::Text {
+                text: format!("\u{00A0}{}", "A".repeat(100)),
+                bold: true,
+                italic: false,
+                glue: true,
+                unbreakable: true,
+            },
+        ];
+        let max_width_pt = 495.0;
+        let lines = wrap(&words, max_width_pt, 11.0);
+        for (i, line) in lines.iter().enumerate() {
+            let line_width: f32 = line
+                .iter()
+                .map(|(text, bold, _, _)| text_width_pt(text, 11.0, *bold))
+                .sum();
+            assert!(
+                line_width <= max_width_pt,
+                "line {i} exceeds max_width_pt ({line_width} > {max_width_pt}): {line:?}"
+            );
+        }
+        let rejoined: String = lines
+            .iter()
+            .flat_map(|line| line.iter().map(|(text, ..)| text.as_str()))
+            .collect();
+        assert_eq!(
+            rejoined,
+            format!("{}\u{00A0}{}", "A".repeat(40), "A".repeat(100)),
             "splitting into chunks must not drop or duplicate any characters"
         );
     }
