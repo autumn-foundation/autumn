@@ -100,7 +100,13 @@ const fn base_width_1000em(ch: char) -> u16 {
         // both the same way. A repro matching the reported one: 80 `ß`s at
         // 11pt used to estimate ~489pt (fits a 495pt content area) while
         // Helvetica actually renders them at ~538pt (doesn't).
-        '\u{017D}' | '\u{00DF}' | '\u{00F8}' => 611,
+        // `¿` (U+00BF, questiondown) shares ß/ø's real width (611) but
+        // isn't an accented letter, so it fell through to the generic 556
+        // fallback below via a different gap — same underestimation risk.
+        // A repro matching the reported one: 80 `¿`s at 11pt used to
+        // estimate ~489pt (fits a 495pt content area) while Helvetica
+        // actually renders them at ~538pt (doesn't).
+        '\u{017D}' | '\u{00DF}' | '\u{00F8}' | '\u{00BF}' => 611,
         // `Æ`/`Œ` (and their lowercase forms `æ`/`œ`, merged into the `%`/`W`
         // arms above to avoid duplicate match bodies) are representable
         // WinAnsi ligatures, not accented letters — the Latin-1 range below
@@ -126,8 +132,14 @@ const fn base_width_1000em(ch: char) -> u16 {
         // `×`/`÷` (U+00D7/U+00F7) share the same real width (584) but are
         // excluded from the Latin-1 ranges above/below (they aren't
         // accented letters) — same underestimation gap as the ASCII
-        // operators, just reached via a different fallthrough path.
-        '+' | '<' | '=' | '>' | '~' | '\u{00D7}' | '\u{00F7}' => 584,
+        // operators, just reached via a different fallthrough path. `±`/`¬`
+        // (U+00B1/U+00AC, plusminus/logicalnot) share that same real width
+        // for the same reason — representable WinAnsi symbols, not accented
+        // letters, that fell through to the generic 556 fallback below. A
+        // repro matching the reported one: 80 `±`s at 11pt used to estimate
+        // ~489pt (fits a 495pt content area) while Helvetica actually
+        // renders them at ~514pt (doesn't).
+        '+' | '<' | '=' | '>' | '~' | '\u{00D7}' | '\u{00F7}' | '\u{00B1}' | '\u{00AC}' => 584,
         // `¼`/`½`/`¾` (U+00BC-00BE) are representable WinAnsi fraction
         // glyphs, not ASCII and outside the Latin-1 accented-letter range
         // below — they fell all the way through to the generic 556
@@ -491,6 +503,27 @@ mod tests {
         assert!(
             eighty_times > content_area_pt,
             "80 ×s at 11pt ({eighty_times}pt) must be estimated wider than a 495pt content \
+             area, matching Helvetica's real ~514pt rendering, not the old ~489pt underestimate"
+        );
+    }
+
+    #[test]
+    fn remaining_wide_latin1_symbols_are_not_underestimated() {
+        // Regression: `±`/`¬` (U+00B1/U+00AC) share the math operators'
+        // real width (584) and `¿` (U+00BF) shares ß/ø's real width (611),
+        // but none of the three are accented letters, so all three fell
+        // through to the generic 556 fallback. A repro matching the
+        // reported one: 80 `±`s at 11pt used to estimate ~489pt (fits a
+        // 495pt content area) while Helvetica actually renders them at
+        // ~514pt (doesn't).
+        assert_eq!(char_width_1000em('\u{00B1}', false), 584); // ±
+        assert_eq!(char_width_1000em('\u{00AC}', false), 584); // ¬
+        assert_eq!(char_width_1000em('\u{00BF}', false), 611); // ¿
+        let eighty_plusminus = text_width_pt(&"\u{00B1}".repeat(80), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            eighty_plusminus > content_area_pt,
+            "80 ±s at 11pt ({eighty_plusminus}pt) must be estimated wider than a 495pt content \
              area, matching Helvetica's real ~514pt rendering, not the old ~489pt underestimate"
         );
     }
