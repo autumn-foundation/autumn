@@ -66,17 +66,21 @@ fn is_void_element(tag: &str) -> bool {
 /// (and, since `is_non_rendered` in `layout.rs` skips its subtree, hiding)
 /// everything that follows.
 ///
-/// `title` is technically an RCDATA element (character references still
-/// decode, unlike true raw text), not a raw-text one — but its content is
-/// always discarded by `is_non_rendered` in `layout.rs` regardless, so that
-/// distinction is moot here. What matters is that `title`, like
-/// `script`/`style`, must not have its content tokenized as markup: a
-/// tag-looking sequence such as `<title>a<b</title>` would otherwise let
-/// `<b` consume the real `</title>` the same way an unhandled `<script>`
-/// body could, leaving everything after it nested (and hidden) inside an
-/// unclosed `title`.
+/// `title` and `textarea` are technically RCDATA elements (character
+/// references still decode, unlike true raw text such as `script`/`style`)
+/// rather than raw-text ones, but both are scanned the same way here: the
+/// caller in [`parse`] runs [`decode_entities`] over whatever text this
+/// returns, which is a no-op for `script`/`style` (their content is
+/// discarded wholesale by `is_non_rendered` in `layout.rs` regardless) and
+/// correct for `title`/`textarea` (real content that still needs its
+/// entities decoded). What matters for all four is that their content must
+/// not be tokenized as markup: a tag-looking sequence such as
+/// `<title>a<b</title>` or `<textarea>a<b</textarea>` would otherwise let
+/// `<b` consume the real closing tag the same way an unhandled `<script>`
+/// body could, leaving everything after it nested (and, for `title`,
+/// hidden) inside an unclosed element — or, for `textarea`, simply lost.
 fn is_raw_text_element(tag: &str) -> bool {
-    matches!(tag, "script" | "style" | "title")
+    matches!(tag, "script" | "style" | "title" | "textarea")
 }
 
 /// Bound on how far [`consume_raw_text`] scans past a candidate
@@ -200,16 +204,20 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             if let Some((tag, self_closing, tag_end)) = parse_open_tag(&input[pos..]) {
                 pos += tag_end;
                 if !self_closing && is_raw_text_element(&tag) {
-                    // `<script>`/`<style>` content is never tokenized as
-                    // markup — see `consume_raw_text` — so a `<` that
-                    // merely *looks* like the start of a tag (a JS
-                    // comparison, a CSS selector combinator) can't swallow
-                    // the real closing tag.
+                    // `<script>`/`<style>`/`<title>`/`<textarea>` content is
+                    // never tokenized as markup — see `consume_raw_text` —
+                    // so a `<` that merely *looks* like the start of a tag
+                    // (a JS comparison, a CSS selector combinator, a `<`
+                    // typed into a textarea's default value) can't swallow
+                    // the real closing tag. Entities are still decoded
+                    // (matching the normal text-node path below) — a no-op
+                    // for the two tags whose content is discarded anyway,
+                    // and required for `title`/`textarea`'s real content.
                     let (text, new_pos) = consume_raw_text(input, pos, &tag);
                     pos = new_pos;
                     let mut children = Vec::new();
                     if !text.is_empty() {
-                        children.push(Node::Text(text.to_owned()));
+                        children.push(Node::Text(decode_entities(text)));
                     }
                     stack
                         .last_mut()
@@ -498,6 +506,48 @@ mod tests {
         };
         assert_eq!(tag, "p");
         assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn textarea_content_with_a_stray_angle_bracket_is_not_dropped() {
+        // Regression: same shape of bug as `title`/`script`/`style` above,
+        // but for a tag whose content is real, rendered text (a form
+        // default value) rather than something `is_non_rendered` discards —
+        // so the failure mode is losing that text rather than hiding
+        // unrelated siblings after it.
+        let nodes = parse("<textarea>a<b</textarea><p>Visible</p>");
+        assert_eq!(
+            nodes.len(),
+            2,
+            "the <p> must be a sibling of <textarea>, not swallowed into it"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected the first top-level node to be an element")
+        };
+        assert_eq!(tag, "textarea");
+        assert_eq!(
+            text(children),
+            "a<b",
+            "the textarea's literal content must survive, not be dropped"
+        );
+        let Node::Element { tag, children } = &nodes[1] else {
+            panic!("expected the second top-level node to be an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn textarea_content_still_decodes_entities() {
+        // `textarea`'s content is meant to render, unlike `title`/`script`/
+        // `style`'s — so unlike those, it must still decode entities rather
+        // than passing them through as literal `&amp;` text.
+        let nodes = parse("<textarea>Ben &amp; Jerry</textarea>");
+        assert_eq!(nodes.len(), 1);
+        let Node::Element { children, .. } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(text(children), "Ben & Jerry");
     }
 
     #[test]

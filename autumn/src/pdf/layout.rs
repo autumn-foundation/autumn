@@ -118,7 +118,20 @@ fn is_non_rendered(tag: &str) -> bool {
 /// `<li><p>First</p><p>Second</p></li>` from rendering as "`FirstSecond`".
 fn is_block_boundary_in_inline_context(tag: &str) -> bool {
     heading_level(tag).is_some()
-        || matches!(tag, "p" | "div" | "blockquote" | "li" | "dl" | "dt" | "dd")
+        || matches!(
+            tag,
+            "p" | "div"
+                | "blockquote"
+                | "li"
+                | "dl"
+                | "dt"
+                | "dd"
+                | "section"
+                | "article"
+                | "main"
+                | "header"
+                | "footer"
+        )
 }
 
 /// Push a line break unless `out` is empty or already ends with one —
@@ -385,8 +398,16 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     // purely inline (e.g. `<div><span>hi</span></div>`),
                     // `flatten_blocks`'s own pending/flush accumulator
                     // produces exactly the same single implicit paragraph
-                    // this used to build directly.
-                    "div" | "blockquote" | "dl" => {
+                    // this used to build directly. HTML5's semantic
+                    // sectioning elements (`section`/`article`/`main`/
+                    // `header`/`footer`) commonly wrap block content the
+                    // same way a `<div>` does — without them here, adjacent
+                    // `<section>`s of loose text (`<main><section>Summary</section><section>Details</section></main>`)
+                    // fell through to the generic transparent-passthrough
+                    // arm and accumulated into one pending paragraph with no
+                    // separator (`SummaryDetails`).
+                    "div" | "blockquote" | "dl" | "section" | "article" | "main" | "header"
+                    | "footer" => {
                         flush(&mut pending, out);
                         flatten_blocks(children, depth + 1, out);
                     }
@@ -462,6 +483,11 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
                             | "dl"
                             | "dt"
                             | "dd"
+                            | "section"
+                            | "article"
+                            | "main"
+                            | "header"
+                            | "footer"
                     )
                 {
                     if !pending.is_empty() {
@@ -883,11 +909,23 @@ impl Writer {
             }
             Block::ListItem { marker, spans } => {
                 const INDENT: f32 = 16.0;
-                self.ensure_space(14.5);
+                const LINE_HEIGHT: f32 = 14.5;
+                self.ensure_space(LINE_HEIGHT);
                 self.draw_word(0.0, marker, false, false, 11.0);
                 let words = words_of(spans);
                 let lines = wrap(&words, self.content_width - INDENT, 11.0);
-                self.draw_lines(&lines, INDENT, 11.0, 14.5, true);
+                if lines.is_empty() {
+                    // An empty item (`<li></li>`, or one whose only content
+                    // was skipped, e.g. `<li><script>...</script></li>`)
+                    // has no lines for `draw_lines` to advance `y_from_top`
+                    // by — it only adds `line_height` per *line drawn*, and
+                    // there are none — so without this, only the fixed 4pt
+                    // spacer below would separate this marker from the next
+                    // item's, landing them almost on top of each other.
+                    self.y_from_top += LINE_HEIGHT;
+                } else {
+                    self.draw_lines(&lines, INDENT, 11.0, LINE_HEIGHT, true);
+                }
                 self.y_from_top += 4.0;
             }
             Block::Rule => self.draw_rule(),
@@ -1296,6 +1334,35 @@ mod tests {
     }
 
     #[test]
+    fn semantic_sectioning_elements_keep_adjacent_blocks_separate() {
+        // Regression: `section`/`article`/`main`/`header`/`footer` weren't
+        // in the "wraps other block elements" arm alongside `div`, so they
+        // fell through to the generic transparent-passthrough case — two
+        // adjacent `<section>`s of loose text accumulated into the same
+        // pending paragraph with no separator at all.
+        let nodes = super::super::html::parse(
+            "<main><section>Summary</section><section>Details</section></main>",
+        );
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected 2 separate paragraphs, got {blocks:?}"
+        );
+        assert!(
+            matches!(&blocks[0], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "Summary".to_owned(), bold: false, italic: false,
+            }])
+        );
+        assert!(
+            matches!(&blocks[1], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "Details".to_owned(), bold: false, italic: false,
+            }])
+        );
+    }
+
+    #[test]
     fn list_item_with_nested_paragraphs_keeps_them_separate() {
         // Regression: `<li>`'s content goes through `inline_spans`, which
         // had no notion of a block boundary — `<li><p>First</p><p>Second</p></li>`
@@ -1536,6 +1603,26 @@ mod tests {
         // asserts it completes and still produces at least one page.
         let pages = render_pages(&html);
         assert!(!pages.is_empty());
+    }
+
+    #[test]
+    fn empty_list_item_still_reserves_a_full_line() {
+        // Regression: `draw_lines` only advances `y_from_top` per *line it
+        // draws* — an empty item (`<li></li>`, or one whose only content was
+        // skipped) produces zero wrapped lines, so only the fixed 4pt
+        // spacer after it separated its marker from the next item's,
+        // placing the two markers almost on top of each other instead of on
+        // their own lines.
+        let mut writer = Writer::new();
+        writer.draw_block(&Block::ListItem {
+            marker: "\u{2022}".to_owned(),
+            spans: vec![],
+        });
+        let advance = writer.y_from_top;
+        assert!(
+            advance >= 14.5,
+            "an empty list item must still advance a full line's height, got {advance}"
+        );
     }
 
     #[test]

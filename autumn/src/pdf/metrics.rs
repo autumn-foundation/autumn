@@ -24,7 +24,18 @@ const fn base_width_1000em(ch: char) -> u16 {
         '(' | ')' | '[' | ']' | '"' | '-' | 'f' | 'r' | 't' | '/' | '\\' | '\u{201C}'
         | '\u{201D}' | '\u{201E}' => 333,
         '0'..='9' | '\u{2013}' /* – en dash */ | '\u{20AC}' /* € euro */ => 556,
-        'm' | 'M' | 'w' | 'W' | '@' | '%' => 833,
+        'm' | 'M' => 833,
+        // These four used to share the 833 bucket above with m/M, but their
+        // real Helvetica AFM widths vary enough to matter: `W` in particular
+        // was underestimated (833 vs its actual 944), which could let a run
+        // of wide glyphs be judged narrow enough to fit a line it actually
+        // overflows — the exact overflow-past-the-boundary failure mode the
+        // character-wrap safety net exists to prevent (see `wrap` in
+        // `layout.rs`).
+        'W' => 944,
+        'w' => 722,
+        '@' => 1015,
+        '%' => 889,
         'A'..='Z' => 667,
         '\u{00C0}'..='\u{00DE}' if ch != '\u{00D7}' => 667, // Latin-1 uppercase accented (approx like A-Z)
         '\u{2014}' | '\u{2026}' | '\u{2030}' | '\u{2122}' => 1000, // — em dash, … ellipsis, ‰, ™
@@ -144,6 +155,27 @@ mod tests {
         assert!(
             em_dash > narrow * 3,
             "em dash ({em_dash}) must be estimated much wider than narrow punctuation ({narrow})"
+        );
+    }
+
+    #[test]
+    fn wide_glyphs_that_used_to_share_ms_width_are_not_underestimated() {
+        // Regression: `W`/`w`/`@`/`%` used to share the same 833/1000em
+        // bucket as `M`/`m`, but Helvetica's real AFM widths for them
+        // diverge enough to matter — `W` in particular (944, not 833) could
+        // let a `W`-heavy token be judged narrow enough to fit a line it
+        // actually overflows once rendered. A real repro: 50 `W`s at 11pt
+        // used to estimate ~458pt (fits a 495pt content area) while
+        // Helvetica actually renders them at ~519pt (doesn't).
+        assert_eq!(char_width_1000em('W', false), 944);
+        assert_eq!(char_width_1000em('@', false), 1015);
+        assert_eq!(char_width_1000em('%', false), 889);
+        let fifty_ws = text_width_pt(&"W".repeat(50), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            fifty_ws > content_area_pt,
+            "50 Ws at 11pt ({fifty_ws}pt) must be estimated wider than a 495pt content area, \
+             matching Helvetica's real ~519pt rendering, not the old ~458pt underestimate"
         );
     }
 
