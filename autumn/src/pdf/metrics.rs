@@ -148,16 +148,23 @@ const fn base_width_1000em(ch: char) -> u16 {
 pub(super) const fn char_width_1000em(ch: char, bold: bool) -> u16 {
     let w = base_width_1000em(ch);
     if bold {
-        // +40/1000em (~7% at typical text sizes) mirrors the modest widening
-        // seen between Helvetica and Helvetica-Bold AFM widths for most
-        // glyphs; deliberately approximate, see module docs. The straight
-        // double quote is a real exception, not just approximation noise:
-        // Helvetica-Bold's quotedbl (474) is far wider than a flat +40
-        // over the regular width (333 + 40 = 373) would give it. A repro
-        // matching the reported one: 120 `"`s at 11pt used to estimate
-        // ~492pt (fits a 495pt content area) while Helvetica-Bold actually
-        // renders them at ~626pt (doesn't).
-        if ch == '"' { 474 } else { w.saturating_add(40) }
+        // +56/1000em mirrors the modest widening seen between Helvetica and
+        // Helvetica-Bold AFM widths for most glyphs; deliberately
+        // approximate, see module docs. Was originally +40, but that
+        // underestimated lowercase `i` (222 regular, but Helvetica-Bold's
+        // real 278-unit width needs +56, not +40) — bumped to the proven
+        // minimum needed for that case rather than guessing further. A
+        // repro matching the reported one: 171 `i`s at 11pt used to
+        // estimate ~493pt (fits a 495pt content area) while Helvetica-Bold
+        // actually renders them at ~523pt (doesn't).
+        //
+        // The straight double quote is a real exception, not just
+        // approximation noise: Helvetica-Bold's quotedbl (474) is far
+        // wider than a flat offset over the regular width (333 + 56 = 389)
+        // would give it. A repro matching the reported one: 120 `"`s at
+        // 11pt used to estimate ~492pt (fits a 495pt content area) while
+        // Helvetica-Bold actually renders them at ~626pt (doesn't).
+        if ch == '"' { 474 } else { w.saturating_add(56) }
     } else {
         w
     }
@@ -199,10 +206,30 @@ mod tests {
     }
 
     #[test]
+    fn bold_lowercase_i_is_not_underestimated_by_the_flat_bold_offset() {
+        // Regression: the flat bold offset used to be +40, but
+        // Helvetica-Bold's lowercase `i` (278) needs +56 over its regular
+        // width (222) — the same underestimation risk as the quotedbl
+        // special case, just needing a bump to the general offset instead
+        // of its own arm. A repro matching the reported one: 171 `i`s at
+        // 11pt bold used to estimate ~493pt (fits a 495pt content area)
+        // while Helvetica-Bold actually renders them at ~523pt (doesn't).
+        assert_eq!(char_width_1000em('i', true), 278);
+        let hundred_seventy_one_is = text_width_pt(&"i".repeat(171), 11.0, true);
+        let content_area_pt = 495.0;
+        assert!(
+            hundred_seventy_one_is > content_area_pt,
+            "171 is at 11pt bold ({hundred_seventy_one_is}pt) must be estimated wider than a \
+             495pt content area, matching Helvetica-Bold's real ~523pt rendering, not the old \
+             ~493pt underestimate"
+        );
+    }
+
+    #[test]
     fn bold_double_quotes_are_not_underestimated_by_the_flat_bold_offset() {
-        // Regression: bold widths are normally estimated as regular + 40,
+        // Regression: bold widths are normally estimated as regular + 56,
         // but Helvetica-Bold's quotedbl (474) is far wider than that flat
-        // offset gives it (333 regular + 40 = 373) — same underestimation
+        // offset gives it (333 regular + 56 = 389) — same underestimation
         // risk as the other wide-glyph fixes. A repro matching the
         // reported one: 120 `"`s at 11pt used to estimate ~492pt (fits a
         // 495pt content area) while Helvetica-Bold actually renders them

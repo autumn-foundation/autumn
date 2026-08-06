@@ -640,11 +640,15 @@ type StyledWord = (String, bool, bool, bool);
 ///
 /// An embedded NBSP (`&nbsp;`, kept inside the token by `words_of` — see
 /// [`Word::Text::unbreakable`] for the same rule at a *span* boundary) must
-/// never end up as the last character of a chunk: that would isolate
-/// whatever follows it onto the next chunk, indistinguishable from an
-/// ordinary space wrapping there — exactly what the NBSP forbids. When the
-/// natural per-character boundary would do that, the trailing NBSP moves to
-/// the *next* chunk instead, staying paired with what follows it.
+/// never sit at a chunk boundary on *either* side: as the last character of
+/// one chunk, it isolates whatever follows onto the next; as the first
+/// character of a chunk, it isolates whatever precedes it onto the
+/// previous *and* leaves a rendered leading space at the start of the new
+/// line — both indistinguishable from an ordinary space wrapping there,
+/// exactly what the NBSP forbids. When the natural per-character boundary
+/// would land on either side of an NBSP, the character before it, the NBSP
+/// itself, and the incoming character all move to the *next* chunk
+/// together, so the boundary lands on an ordinary character instead.
 ///
 /// Always makes progress: a chunk always gets at least one character even if
 /// that character alone exceeds `max_width_pt`, so this can't loop forever
@@ -661,12 +665,20 @@ fn split_into_fitting_chunks(
     for ch in text.chars() {
         let ch_width = f32::from(char_width_1000em(ch, bold)) / 1000.0 * font_size_pt;
         if !current.is_empty() && current_width + ch_width > max_width_pt {
-            if current.ends_with('\u{00A0}') && current.chars().count() > 1 {
-                current.pop();
-                chunks.push(std::mem::take(&mut current));
-                current.push('\u{00A0}');
-                current_width =
-                    f32::from(char_width_1000em('\u{00A0}', bold)) / 1000.0 * font_size_pt;
+            if current.ends_with('\u{00A0}') {
+                let nbsp = current.pop().expect("just checked ends_with");
+                let prev = current.pop();
+                if !current.is_empty() {
+                    chunks.push(std::mem::take(&mut current));
+                }
+                if let Some(prev) = prev {
+                    current.push(prev);
+                }
+                current.push(nbsp);
+                current_width = current
+                    .chars()
+                    .map(|c| f32::from(char_width_1000em(c, bold)) / 1000.0 * font_size_pt)
+                    .sum();
             } else {
                 chunks.push(std::mem::take(&mut current));
                 current_width = 0.0;
@@ -1147,17 +1159,22 @@ mod tests {
     }
 
     #[test]
-    fn oversized_token_does_not_split_immediately_after_an_embedded_nbsp() {
+    fn oversized_token_does_not_split_immediately_adjacent_to_an_embedded_nbsp() {
         // Regression: an oversized token (already too wide for one line, so
         // it goes through `split_into_fitting_chunks`'s plain character
         // splitter) that happens to contain an embedded NBSP had no NBSP
         // awareness — if the natural per-character width boundary fell
         // right after the NBSP, it ended up as the last character of one
         // chunk and whatever followed it started the next, breaking
-        // exactly the boundary NBSP forbids. A repro matching the reported
-        // one: 67 `A`s followed by `&nbsp;B` — the 67 As plus the NBSP fit
-        // within the content width, but adding `B` doesn't, so the naive
-        // split lands right after the NBSP.
+        // exactly the boundary NBSP forbids. A first fix moved the NBSP
+        // itself to the next chunk instead, which merely relocated the
+        // forbidden break to *before* the NBSP (leaving a rendered leading
+        // space at the start of the next line, and still splitting the
+        // pair) — the character before the NBSP must move along with it.
+        // A repro matching the reported one: 67 `A`s followed by `&nbsp;B`
+        // — the 67 As plus the NBSP fit within the content width, but
+        // adding `B` doesn't, so the naive split lands right after the
+        // NBSP.
         let text = format!("{}\u{00A0}B", "A".repeat(67));
         let font_size_pt = 11.0;
         let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
@@ -1165,8 +1182,10 @@ mod tests {
             + 0.5;
         let chunks = split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt);
         assert!(
-            chunks.iter().all(|c| !c.ends_with('\u{00A0}')),
-            "no chunk may end with a trailing NBSP, got {chunks:?}"
+            chunks
+                .iter()
+                .all(|c| !c.starts_with('\u{00A0}') && !c.ends_with('\u{00A0}')),
+            "no chunk boundary may sit immediately before or after an NBSP, got {chunks:?}"
         );
         let reassembled: String = chunks.concat();
         assert_eq!(
