@@ -1155,7 +1155,11 @@ same follow-up call, not on the first `terraform apply`:
 ```bash
 # Every `aws` call below must target the same region `terraform apply` used
 # — not whatever the operator's ambient AWS CLI config happens to point at.
-export AWS_DEFAULT_REGION="$(terraform output -raw region)"
+# AWS_REGION (not AWS_DEFAULT_REGION) is the one to set: the AWS CLI
+# documents AWS_REGION as taking precedence over AWS_DEFAULT_REGION when
+# both are set, so an operator with AWS_REGION already exported would
+# otherwise still have their ambient region win.
+export AWS_REGION="$(terraform output -raw region)"
 
 ECR="$(terraform output -raw ecr_repository_url)"
 SERVICE_ARN="$(terraform output -raw service_arn)"
@@ -1361,7 +1365,11 @@ long-lived access keys) and variables (all `terraform output` values —
 ```bash
 # Every `aws` call below must target the same region `terraform apply` used
 # — not whatever the operator's ambient AWS CLI config happens to point at.
-export AWS_DEFAULT_REGION="$(terraform output -raw region)"
+# AWS_REGION (not AWS_DEFAULT_REGION) is the one to set: the AWS CLI
+# documents AWS_REGION as taking precedence over AWS_DEFAULT_REGION when
+# both are set, so an operator with AWS_REGION already exported would
+# otherwise still have their ambient region win.
+export AWS_REGION="$(terraform output -raw region)"
 
 ECR="$(terraform output -raw ecr_repository_url)"
 CLUSTER="$(terraform output -raw ecs_cluster_name)"

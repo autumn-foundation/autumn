@@ -3794,8 +3794,8 @@ previous_secrets = []
 
     #[test]
     fn aws_app_runner_region_output_reflects_the_configured_region_variable() {
-        // The deploy walkthrough sources AWS_DEFAULT_REGION from this
-        // output so every `aws` CLI call targets the same region Terraform
+        // The deploy walkthrough sources AWS_REGION from this output so
+        // every `aws` CLI call targets the same region Terraform
         // provisioned into, regardless of the operator's ambient CLI
         // config — it must echo var.region, not a hardcoded default.
         let tmp = TempDir::new().unwrap();
@@ -4407,7 +4407,7 @@ previous_secrets = []
 
     #[test]
     fn aws_ecs_region_output_reflects_the_configured_region_variable() {
-        // Both the deploy walkthrough (AWS_DEFAULT_REGION) and
+        // Both the deploy walkthrough's exported AWS_REGION env var and
         // aws-deploy.yml's documented AWS_REGION repo variable are meant to
         // be sourced from this output, so it must echo var.region, not a
         // hardcoded default.
