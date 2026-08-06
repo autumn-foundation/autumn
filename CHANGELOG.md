@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **pdf:** render server-side templates to downloadable PDF documents
+  (#1317). A new opt-in `pdf` Cargo feature adds `autumn_web::pdf::Pdf`, an
+  `IntoResponse` built on the existing `Download` responder — `Pdf::from_html`
+  or (with the `maud` feature) `Pdf::from_markup` renders an HTML string into
+  a PDF with `Content-Type: application/pdf` and an RFC 6266-safe
+  `Content-Disposition` (`.filename(...)`, `.inline()`). Rendering uses a
+  deliberately small HTML subset (headings, paragraphs, tables, lists,
+  bold/italic, `br`/`hr`) with the PDF base-14 fonts — no system-installed
+  browser and no embedded font files, keeping PDF generation compatible with
+  the single-binary story (#1004); any other tag passes its text through
+  transparently instead of being dropped. Rendering the same input always
+  produces the same visible text (no wall-clock or other hidden state is
+  read), verified via a new `TestResponse::assert_pdf_contains` test helper
+  backed by `autumn_web::pdf::extract_text`. A new `examples/invoice` app
+  demonstrates rendering the same Maud view for both an on-screen detail page
+  and its PDF export, and the "Generating PDFs" guide
+  (`docs/guide/pdf-downloads.md`) covers the supported HTML subset and the
+  determinism/testing story.
 - **release:** `autumn release init --target azure-container-apps` (#1278)
   scaffolds a production-ready Azure deployment alongside the existing `fly`
   and `docker-compose` targets: `main.tf` (resource group, Azure Container

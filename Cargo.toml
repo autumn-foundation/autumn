@@ -1,5 +1,5 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "autumn-search", "examples/hello", "examples/flock", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/teams", "examples/media-room", "benchmarks/runtime/gate", "example-e2e"]
+members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "autumn-search", "examples/hello", "examples/flock", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/teams", "examples/media-room", "examples/invoice", "benchmarks/runtime/gate", "example-e2e"]
 # The cargo-fuzz crate builds only under nightly with sanitizers and pulls
 # `autumn` in as a path dependency. Excluding it keeps `cargo build/test
 # --workspace` (and the publish gate) untouched; `fuzz/Cargo.toml` is also its
@@ -110,6 +110,11 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 # by autumn-web's `markdown` feature; see `autumn/src/markdown/user_content.rs`.
 ammonia = "4.1"
 chromiumoxide = { version = "0.9", default-features = false }
+# Pure-Rust PDF writer (issue #1317). `default-features = false` excludes the
+# `html` feature (azul CSS layout + rust-fontconfig system-font scanning) —
+# only the core PDF object/page writer and the base-14 built-in fonts are
+# used. See `autumn/src/pdf.rs`.
+printpdf = { version = "0.12", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # Proc macro
