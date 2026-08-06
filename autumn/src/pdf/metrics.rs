@@ -56,6 +56,15 @@ const fn base_width_1000em(ch: char) -> u16 {
         // used to estimate ~428pt (fits a 495pt content area) while
         // Helvetica renders it at ~514pt (doesn't).
         '&' | 'A'..='Z' => 667,
+        // `Æ`/`æ` fall inside the Latin-1 accented ranges below, which
+        // approximate most of that range at the plain-letter width — but
+        // Helvetica renders these ligatures markedly wider than a single
+        // letter (1000/889 vs the 667/556 the ranges below would give them),
+        // same underestimation risk as the other wide-glyph fixes above. A
+        // repro matching the reported one: 50 `Æ`s at 11pt used to estimate
+        // ~367pt (fits a 495pt content area) while Helvetica actually
+        // renders them at ~550pt (doesn't).
+        '\u{00C6}' => 1000, // Æ Latin capital ligature AE
         '\u{00C0}'..='\u{00DE}' if ch != '\u{00D7}' => 667, // Latin-1 uppercase accented (approx like A-Z)
         '\u{2014}' | '\u{2026}' | '\u{2030}' | '\u{2122}' => 1000, // — em dash, … ellipsis, ‰, ™
         '\u{00A9}' | '\u{00AE}' => 737,                     // © copyright, ® registered
@@ -63,6 +72,7 @@ const fn base_width_1000em(ch: char) -> u16 {
         '\u{2020}' | '\u{2021}' => 500,                     // † dagger, ‡ double dagger
         '\u{00B0}' => 400,                                  // ° degree
         _ if ch.is_ascii() => 556,
+        '\u{00E6}' => 889, // æ Latin small ligature ae — see `Æ` above
         '\u{00DF}'..='\u{00FF}' if ch != '\u{00F7}' => 556, // Latin-1 lowercase accented (approx default)
         // Everything else that WinAnsi (`printpdf`'s built-in-font encoding,
         // effectively CP1252) *can* represent renders as its actual glyph,
@@ -267,6 +277,26 @@ mod tests {
             "70 &s at 11pt ({seventy_ampersands}pt) must be estimated wider than a 495pt \
              content area, matching Helvetica's real ~514pt rendering, not the old ~428pt \
              underestimate"
+        );
+    }
+
+    #[test]
+    fn ae_ligatures_are_not_underestimated_as_ordinary_accented_letters() {
+        // Regression: `Æ`/`æ` used to fall into the generic Latin-1
+        // accented-letter ranges (667/556), but Helvetica renders these
+        // ligatures markedly wider (1000/889) — same underestimation risk
+        // as the earlier wide-glyph fixes. A repro matching the reported
+        // one: 50 `Æ`s at 11pt used to estimate ~367pt (fits a 495pt
+        // content area) while Helvetica actually renders them at ~550pt
+        // (doesn't).
+        assert_eq!(char_width_1000em('\u{00C6}', false), 1000);
+        assert_eq!(char_width_1000em('\u{00E6}', false), 889);
+        let fifty_aes = text_width_pt(&"\u{00C6}".repeat(50), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            fifty_aes > content_area_pt,
+            "50 Æs at 11pt ({fifty_aes}pt) must be estimated wider than a 495pt content area, \
+             matching Helvetica's real ~550pt rendering, not the old ~367pt underestimate"
         );
     }
 
