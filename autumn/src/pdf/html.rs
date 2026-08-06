@@ -180,6 +180,41 @@ fn is_raw_text_element(tag: &str) -> bool {
     matches!(tag, "script" | "style" | "title" | "textarea")
 }
 
+/// If `s` (starting with `<`) looks like the start of a `<script` or
+/// `<style` opening tag — case-insensitively, and only when the tag name is
+/// immediately followed by a real tag-name boundary (whitespace, `/`, or
+/// `>`), not merely a shared prefix (`<scripted>` doesn't count) — returns
+/// its canonical lowercase tag name.
+///
+/// Used only as a fallback once [`parse_open_tag`] has already failed (its
+/// bounded search found no `>` within [`MAX_TAG_SCAN`]) — e.g. a `<script>`
+/// carrying an attribute long enough to push the tag's own `>` past that
+/// bound. Without this, [`parse`]'s normal "unrecognized tag" fallback
+/// treats the lone `<` as literal text and re-parses everything after it
+/// one byte at a time — which, for `<script`/`<style` specifically, means
+/// their raw JS/CSS source (never meant to be tokenized as markup at all,
+/// see [`is_raw_text_element`]) leaks into the visible document instead of
+/// staying non-rendered.
+fn oversized_raw_text_tag_name(s: &str) -> Option<&'static str> {
+    debug_assert!(s.starts_with('<'));
+    let rest = &s[1..];
+    for name in ["script", "style"] {
+        if rest.len() < name.len()
+            || !rest.as_bytes()[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+        {
+            continue;
+        }
+        let is_boundary = rest[name.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| c == '>' || c == '/' || c.is_whitespace());
+        if is_boundary {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Bound on how far [`consume_raw_text`] scans past a candidate
 /// `</script`/`</style` prefix looking for the closing `>` — the same
 /// defense as [`MAX_TAG_SCAN`] for the same reason: a legitimate closing
@@ -340,6 +375,21 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                     let structural_idx = nearest_structural_idx(&stack, &tag);
                     stack.push((tag, Vec::new(), structural_idx));
                 }
+                continue;
+            }
+            // `parse_open_tag` found no `>` within `MAX_TAG_SCAN` — normally
+            // that just means an unterminated/malformed tag, handled below
+            // by falling back to literal text one byte at a time. But for
+            // `<script`/`<style` specifically (their own `>` pushed past
+            // the bound by e.g. an oversized attribute), that fallback
+            // would leak raw JS/CSS source into the visible document — see
+            // `oversized_raw_text_tag_name`. Discard straight through to
+            // the closing tag (or EOF) via the same raw-text scan a
+            // normally-parsed `<script>`/`<style>` already uses, without
+            // emitting any node for the (unparseable) opening tag itself.
+            if let Some(name) = oversized_raw_text_tag_name(&input[pos..]) {
+                let (_, new_pos) = consume_raw_text(input, pos + 1 + name.len(), name);
+                pos = new_pos;
                 continue;
             }
             // A lone '<' that isn't a recognizable tag: treat as literal text.
@@ -1158,6 +1208,38 @@ mod tests {
         };
         assert_eq!(tag, "p");
         assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn oversized_script_tag_does_not_leak_its_source_as_visible_text() {
+        // Regression: `parse_open_tag`'s search for a tag's own `>` is
+        // bounded by `MAX_TAG_SCAN` (4 KiB) — a `<script>` carrying an
+        // attribute longer than that pushes its own `>` past the bound, so
+        // `parse_open_tag` failed and the parser fell back to treating the
+        // lone `<` as literal text, re-tokenizing everything after it
+        // (the oversized attribute value *and* the real JS source) as
+        // ordinary markup/text instead of staying non-rendered.
+        let oversized_attr = "Q".repeat(5000);
+        let html = format!(
+            r#"<script data-x="{oversized_attr}">var secret = "should never render";</script><p>Visible</p>"#
+        );
+        let nodes = parse(&html);
+        assert_eq!(
+            nodes.len(),
+            1,
+            "the oversized <script> must not leak any node into the tree, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "p");
+        let rendered = text(children);
+        assert_eq!(rendered, "Visible");
+        assert!(
+            !rendered.contains("secret") && !rendered.contains('Q'),
+            "the script's source and its oversized attribute value must never appear as \
+             visible text, got {rendered:?}"
+        );
     }
 
     #[test]
