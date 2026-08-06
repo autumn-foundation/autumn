@@ -237,6 +237,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   files) after `terraform apply` uploaded the plaintext state file — every
   secret value, `sensitive` flag or not — into the build context/cache
   even though no stage ever copies it into the final image.
+- **release:** `autumn release init --target aws-app-runner` and `--target
+  aws-ecs` (#1279) — two AWS deployment targets, meeting teams where they
+  are the same way `fly`/`azure-container-apps` do. `aws-app-runner` is the
+  fast/minimal path: an ECR repository, a VPC (private subnets for RDS + an
+  App Runner VPC connector, plus a NAT gateway so the app's own outbound
+  traffic keeps working once App Runner routes ALL egress through the
+  connector), RDS PostgreSQL, Secrets Manager entries for the database URL
+  and signing secret, and the App Runner service itself — no CI workflow,
+  wire up your own once you outgrow it. `aws-ecs` is the production path: a
+  VPC with public/private subnets across 2 AZs, an internet-facing ALB
+  (HTTP→HTTPS redirect, an ACM certificate via Route 53 DNS validation), an
+  ECR repository, an ECS Fargate cluster/task definition/service (deployment
+  circuit breaker with automatic rollback), Application Auto Scaling on
+  CPU/memory (desired 2, min 1, max 10), RDS PostgreSQL, Secrets Manager, a
+  one-shot migration task definition, an optional ElastiCache Redis
+  replication group gated behind `enable_redis_cache` (same
+  infrastructure-only caveat as Azure's Redis Cache — the app must also
+  depend on `autumn-cache-redis` and register `RedisCachePlugin`), and
+  `.github/workflows/aws-deploy.yml` — an opt-in OIDC-based workflow
+  (`AWS_ROLE_ARN`, no long-lived access keys) that builds the release image,
+  pushes it to ECR, registers new "app" and "migrate" task definition
+  revisions (task definitions are immutable per revision — this describes
+  the current one, swaps in the new image via `jq`, and re-registers it,
+  leaving every other Terraform-declared setting untouched), runs the
+  migration task to completion via `run-task` + a poll loop (aborting the
+  deploy if it fails or the container exits non-zero), then updates the ECS
+  service and waits for `services-stable`. Both targets derive the database
+  connection string inside Terraform from the RDS instance the same apply
+  creates rather than taking it as an input variable, so a single `terraform
+  apply` is enough. Both start their bootstrap resources (the App Runner
+  service; the "app" and "migrate" ECS task definitions) from a public
+  placeholder image — App Runner/Fargate must pull *some* image to create a
+  first revision, and a brand-new ECR repository has none yet — and
+  `lifecycle.ignore_changes` stops a later `terraform apply` from reverting
+  a live deploy back to it. AWS resource names (ECR, RDS identifiers, the
+  ALB/target group — the tightest, at a 32-character AWS limit — App
+  Runner, the VPC connector) are sanitized the same way as Azure's Container
+  Apps-family names: lowercased, mapped to alphanumerics-and-hyphens,
+  hyphen runs collapsed, a leading/trailing hyphen trimmed, capped at 20
+  characters for headroom, with a fixed "app" fallback when that leaves
+  nothing or a non-letter-leading value (RDS identifiers must start with a
+  letter). Unlike App Runner's own assigned subdomain (only known after the
+  service is created, so `AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS` is set on
+  the same follow-up CLI call that deploys the real image, not the first
+  `terraform apply`), ECS's ALB serves under an operator-supplied
+  `domain_name`/`route53_zone_id` pair, known before the apply even starts,
+  so trusted hosts are set correctly from the first apply. IAM is scoped to
+  least privilege throughout: the App Runner instance role and the ECS
+  execution role can each only `secretsmanager:GetSecretValue` the specific
+  secret ARNs this app uses, never a wildcard, and ECS's execution role
+  (image pull/logs/secrets injection) and task role (the running
+  container's own AWS permissions) are separate principals. `autumn release
+  init`'s Terraform `.gitignore` merge (`.terraform/`/`*.tfstate*`/
+  `terraform.tfvars`) and its nested-workflow-relocation warning (GitHub
+  Actions only discovers `.github/workflows/` at the git repository root,
+  not a Cargo workspace member subdirectory) — both previously
+  Azure-specific — now cover all three Terraform targets generically.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

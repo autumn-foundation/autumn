@@ -49,6 +49,12 @@ below and are better fits in specific cases:
   Terraform-provisioned Container Apps, ACR, Postgres Flexible Server, and
   Key Vault for Azure-heavy shops that already have the IAM/RBAC patterns in
   place.
+- **[Deploy to AWS App Runner](#deploy-to-aws-app-runner)** — the fast,
+  minimal-Terraform AWS path: ECR, App Runner, and RDS behind a VPC
+  connector, closest AWS analog to Fly.io.
+- **[Deploy to AWS ECS Fargate](#deploy-to-aws-ecs-fargate)** — the
+  production AWS path: VPC/ALB/ECS Fargate/RDS, for AWS-experienced infra
+  teams who already have runbooks for this shape.
 - **The container path** ([Step 1](#step-1--create-the-project) through
   [How the production image works](#how-the-production-image-works)) — a
   portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
@@ -1083,6 +1089,443 @@ VNet-scoped private endpoint) and the Key Vault's `purge_protection_enabled
 = false` (lets `terraform destroy` fully clean up during setup, but also
 means a purge is unrecoverable either way — flip to `true` once the vault
 holds real secrets).
+
+---
+
+## Deploy to AWS App Runner
+
+Scaffold a Terraform configuration alongside the production Dockerfile:
+
+```bash
+autumn release init --force --target aws-app-runner
+```
+
+This generates:
+
+| File | Purpose |
+|---|---|
+| `main.tf` | A VPC (private subnets for RDS + the App Runner VPC connector, one public subnet + NAT gateway for the app's own outbound traffic), an ECR repository, RDS PostgreSQL, Secrets Manager entries for the database URL and signing secret, the App Runner service itself, and a minimal one-shot ECS Fargate task+cluster whose only job is running `autumn migrate` against private RDS (App Runner has no release-phase hook of its own). |
+| `variables.tf` | `app_name`, `region`, `image_tag`, `bootstrap_image`, `instance_cpu`/`instance_memory`, `db_instance_class`, `vpc_cidr`, `min_size`/`max_size` (default 1/10), and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
+| `outputs.tf` | `app_url`, `service_arn`, `service_name`, `ecr_repository_url`, `apprunner_access_role_arn`, plus `migrate_cluster_name`/`migrate_task_family`/`private_subnet_ids`/`vpc_connector_security_group_id` for the one-shot migration task. |
+| `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
+
+There is no CI workflow for this target — it's the fast/minimal path; wire
+up your own deploy automation once you outgrow the manual walkthrough
+below, or move to [`--target aws-ecs`](#deploy-to-aws-ecs-fargate).
+
+**Why App Runner and not ECS/EKS**: it is the closest managed analog to
+Fly.io — auto-TLS, auto-scale, no ALB or app-hosting cluster to manage
+(the one-shot migration task above is deliberately minimal — no service, no
+ALB, no autoscaling — and isn't in the way day to day) — good for teams
+new to AWS or doing a quick migration.
+
+**Egress routes through the VPC.** Setting
+`network_configuration.egress_configuration.egress_type = "VPC"` (required
+so the app can reach RDS privately through the VPC connector) routes ALL of
+the app's own outbound traffic through the private subnets, not just
+RDS-bound traffic — `main.tf` provisions a NAT gateway so the app still has
+general internet egress (a third-party API call, outbound mail, a webhook)
+rather than silently hanging.
+
+**Resource names are sanitized, not verbatim** — the same lowercasing/
+hyphen-collapsing scheme as Azure Container Apps (see the callout in that
+section above), capped at 20 characters here to leave headroom under the
+tightest limit this scaffold touches.
+
+Provision the infrastructure and set secrets via Terraform variables:
+
+```bash
+cp terraform.tfvars.example terraform.tfvars   # edit app_name/region/etc.
+export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
+export TF_VAR_signing_secret="$(openssl rand -hex 32)"
+
+terraform init
+terraform apply
+```
+
+**Generate these two values once, then persist and reuse them** — save
+them in a password manager or your CI's secret store the same way you
+would any other production secret, rather than regenerating fresh values
+on every `terraform apply`. Re-running these `openssl rand` commands in a
+later shell session and re-applying changes the live RDS password and
+Secrets Manager signing secret in place, but the App Runner service's
+`source_configuration` is `lifecycle`-ignored (see `main.tf`) — it never
+redeploys to pick up the change, so already-running containers keep using
+the OLD values and lose database access as connections recycle.
+
+The App Runner service starts from a public ECR Public Gallery placeholder
+image (`bootstrap_image`) — App Runner must pull *some* image to create a
+first revision, and a brand-new private ECR repository has none yet. Build
+and push your real image, then cut the service over. Unlike Azure Container
+Apps (whose ingress hostname is derivable before the app exists) or ECS
+behind your own domain, **App Runner assigns its subdomain only after the
+service is created**, so the trusted-hosts env var can only be set on this
+same follow-up call, not on the first `terraform apply`:
+
+```bash
+# Every `aws` call below must target the same region `terraform apply` used
+# — not whatever the operator's ambient AWS CLI config happens to point at.
+# AWS_REGION (not AWS_DEFAULT_REGION) is the one to set: the AWS CLI
+# documents AWS_REGION as taking precedence over AWS_DEFAULT_REGION when
+# both are set, so an operator with AWS_REGION already exported would
+# otherwise still have their ambient region win.
+export AWS_REGION="$(terraform output -raw region)"
+
+ECR="$(terraform output -raw ecr_repository_url)"
+SERVICE_ARN="$(terraform output -raw service_arn)"
+ACCESS_ROLE="$(terraform output -raw apprunner_access_role_arn)"
+DATABASE_URL_ARN="$(terraform output -raw database_url_secret_arn)"
+SIGNING_SECRET_ARN="$(terraform output -raw signing_secret_secret_arn)"
+TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
+
+# docker login takes a registry hostname, not a repository path — $ECR
+# includes the repository suffix (e.g. "<account>.dkr.ecr.<region>.amazonaws.com/my-app"),
+# so strip everything from the first "/" onward.
+aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR%%/*}"
+docker build \
+  --build-arg AUTUMN_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="$(git rev-parse --short HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_DIRTY="$([ -z "$(git status --porcelain)" ] && echo false || echo true)" \
+  --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t "$ECR:$TAG" .
+docker push "$ECR:$TAG"
+```
+
+**Run `autumn migrate` against the database now, before the cutover below** — the generated production config sets `auto_migrate_in_production = false`, so nothing else runs it, and App Runner has no separate release-phase hook the way ECS's one-shot migration task or Azure's migration job does. RDS is private (not publicly accessible), so `main.tf` provisions a dedicated one-shot ECS Fargate task purely to reach it — using the same private subnets and VPC-connector security group App Runner's own traffic already uses, so there's no second security group or RDS rule to keep in sync. Only proceed to the `update-service` call below once migrations have actually completed; running it first serves the new, schema-dependent code against the old schema.
+
+```bash
+MIGRATE_CLUSTER="$(terraform output -raw migrate_cluster_name)"
+MIGRATE_FAMILY="$(terraform output -raw migrate_task_family)"
+SUBNETS="$(terraform output -json private_subnet_ids | jq -c .)"
+SG="$(terraform output -raw vpc_connector_security_group_id)"
+
+# Task definitions are immutable per revision — register a new one with the
+# real image, keeping every other setting Terraform declared (env, secrets,
+# logging) untouched.
+NEW_DEF=$(aws ecs describe-task-definition --task-definition "$MIGRATE_FAMILY" --query 'taskDefinition' | \
+  jq --arg IMAGE "$ECR:$TAG" ".containerDefinitions[0].image = \$IMAGE | \
+    del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, \
+        .registeredAt, .registeredBy, .deregisteredAt)")
+MIGRATE_ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition --cli-input-json file:///dev/stdin \
+  --query 'taskDefinition.taskDefinitionArn' --output text)
+
+# run-task only starts the task and returns immediately, so poll for it to
+# stop, then check its exit code. `aws ecs wait tasks-stopped` has its own
+# fixed ~10-minute budget and exits nonzero once exhausted regardless of
+# whether the task is still running — and ECS tasks have no runtime limit of
+# their own — so poll manually and explicitly stop the task on timeout
+# rather than leaving it running in the background.
+TASK_ARN=$(aws ecs run-task --cluster "$MIGRATE_CLUSTER" --task-definition "$MIGRATE_ARN" \
+  --launch-type FARGATE \
+  --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":$SUBNETS,\"securityGroups\":[\"$SG\"],\"assignPublicIp\":\"DISABLED\"}}" \
+  --query 'tasks[0].taskArn' --output text)
+[ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ] || { echo "failed to start the migration task"; exit 1; }
+
+EXIT_CODE=""
+for _ in $(seq 1 60); do   # 10 minutes (60 x 10s)
+  STATUS=$(aws ecs describe-tasks --cluster "$MIGRATE_CLUSTER" --tasks "$TASK_ARN" \
+    --query 'tasks[0].lastStatus' --output text)
+  if [ "$STATUS" = "STOPPED" ]; then
+    EXIT_CODE=$(aws ecs describe-tasks --cluster "$MIGRATE_CLUSTER" --tasks "$TASK_ARN" \
+      --query 'tasks[0].containers[0].exitCode' --output text)
+    break
+  fi
+  sleep 10
+done
+if [ -z "$EXIT_CODE" ]; then
+  echo "migration did not finish within the time budget — stopping it"
+  aws ecs stop-task --cluster "$MIGRATE_CLUSTER" --task "$TASK_ARN" \
+    --reason "manual deploy: migration exceeded its polling budget" >/dev/null
+  aws ecs wait tasks-stopped --cluster "$MIGRATE_CLUSTER" --tasks "$TASK_ARN"
+  exit 1
+fi
+[ "$EXIT_CODE" = "0" ] || { echo "migration failed"; exit 1; }
+```
+
+```bash
+APP_URL="$(terraform output -raw app_url)"   # known only after the FIRST apply created the service
+# --source-configuration REPLACES the image configuration wholesale, not
+# merges it — RuntimeEnvironmentSecrets must be re-supplied here alongside
+# the real image, or the cutover silently drops
+# AUTUMN_DATABASE__PRIMARY_URL/AUTUMN_SECURITY__SIGNING_SECRET and the real
+# app can't boot. HealthCheckConfiguration restores the real "/health" path
+# — main.tf's bootstrap revision used "/" (nginx's own default response)
+# since the bootstrap placeholder doesn't serve /health.
+OPERATION_ID=$(aws apprunner update-service --service-arn "$SERVICE_ARN" \
+  --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/health\"}" \
+  --source-configuration "{
+  \"ImageRepository\": {
+    \"ImageIdentifier\": \"$ECR:$TAG\",
+    \"ImageRepositoryType\": \"ECR\",
+    \"ImageConfiguration\": {
+      \"Port\": \"3000\",
+      \"RuntimeEnvironmentVariables\": {
+        \"AUTUMN_PROFILE\": \"prod\",
+        \"AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS\": \"${APP_URL#https://}\"
+      },
+      \"RuntimeEnvironmentSecrets\": {
+        \"AUTUMN_DATABASE__PRIMARY_URL\": \"$DATABASE_URL_ARN\",
+        \"AUTUMN_SECURITY__SIGNING_SECRET\": \"$SIGNING_SECRET_ARN\"
+      }
+    }
+  },
+  \"AuthenticationConfiguration\": { \"AccessRoleArn\": \"$ACCESS_ROLE\" },
+  \"AutoDeploymentsEnabled\": false
+}" --query 'OperationId' --output text)
+
+# update-service only STARTS an asynchronous operation — a bare successful
+# exit here just means App Runner accepted the request, not that the real
+# image actually booted. If it fails health checks, App Runner rolls the
+# service back on its own; poll list-operations for this specific
+# OperationId's terminal status rather than trusting the call's exit code.
+OP_STATUS=""
+for _ in $(seq 1 60); do   # 10 minutes (60 x 10s)
+  OP_STATUS=$(aws apprunner list-operations --service-arn "$SERVICE_ARN" \
+    --query "OperationSummaryList[?Id=='$OPERATION_ID'].Status | [0]" --output text)
+  [ "$OP_STATUS" = "SUCCEEDED" ] && break
+  case "$OP_STATUS" in
+    FAILED|ROLLBACK_FAILED|ROLLBACK_SUCCEEDED)
+      echo "cutover failed (status=$OP_STATUS) — App Runner may have rolled back to the bootstrap image"
+      exit 1
+      ;;
+  esac
+  sleep 10
+done
+[ "$OP_STATUS" = "SUCCEEDED" ] || { echo "cutover did not complete within the time budget (status=$OP_STATUS)"; exit 1; }
+```
+
+**State file security and `.gitignore`.** Same caveats as Azure: Terraform
+state holds every secret in plaintext regardless of `sensitive = true`;
+`autumn release init --target aws-app-runner` merges `.gitignore` entries
+for `.terraform/`, `*.tfstate*`, and `terraform.tfvars` for you.
+
+---
+
+## Deploy to AWS ECS Fargate
+
+Scaffold a Terraform configuration alongside the production Dockerfile:
+
+```bash
+autumn release init --force --target aws-ecs
+```
+
+This generates:
+
+| File | Purpose |
+|---|---|
+| `main.tf` | A VPC with public/private subnets across 2 AZs, an internet-facing ALB (HTTP→HTTPS redirect, ACM certificate via Route 53 DNS validation), an ECR repository, an ECS cluster + Fargate task definition + service (deployment circuit breaker with automatic rollback), Application Auto Scaling on CPU/memory, RDS PostgreSQL in private subnets, Secrets Manager entries for the database URL and signing secret, and a one-shot migration task definition. An optional ElastiCache Redis replication group is gated behind `enable_redis_cache` — **infrastructure only**, see the callout below. |
+| `variables.tf` | `app_name`, `region`, `vpc_cidr`, `domain_name`, `route53_zone_id`, `image_tag`, `bootstrap_image`, `cpu`/`memory`, `db_instance_class`, `desired_count`/`min_count`/`max_count` (default 2/1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
+| `outputs.tf` | `app_url`, `alb_dns_name`, `ecr_repository_url`, `ecs_cluster_name`, `ecs_service_name`, `app_task_family`, `migrate_task_family`, `private_subnet_ids`, `ecs_tasks_security_group_id`. |
+| `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
+| `.github/workflows/aws-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to ECR, registers new "app" and "migrate" task definition revisions, runs the migration task to completion, then updates the ECS service and waits for it to stabilize — on a `v*` tag push (or manual dispatch). |
+
+**Why ECS Fargate and not App Runner/EKS**: it maps to patterns
+AWS-experienced infra teams already have runbooks for, with full control
+over networking, scaling, and rollout behavior — the production path once
+you outgrow [`--target aws-app-runner`](#deploy-to-aws-app-runner)'s
+minimal footprint.
+
+**A domain and an existing Route 53 hosted zone are prerequisites**, not
+optional — `domain_name`/`route53_zone_id` are required variables with no
+default. The zone must already be the domain's live DNS (delegated at your
+registrar) *before* `terraform apply`, or ACM's DNS certificate validation
+will hang until Terraform's apply times out. Unlike App Runner (whose
+subdomain is only assigned once the service exists), ECS's trusted-hosts
+env var is set correctly from the very first apply, since the ALB serves
+under a domain you already own.
+
+**Redis cache is infrastructure only** — same caveat as Azure's Redis Cache
+and for the same reason: Autumn's cache subsystem has no built-in Redis
+implementation. Setting `enable_redis_cache = true` provisions ElastiCache
+and wires `AUTUMN_CACHE__BACKEND=redis`/`AUTUMN_CACHE__REDIS__URL` into the
+task, but your application must *also* depend on the `autumn-cache-redis`
+crate and register `.plugin(RedisCachePlugin::new())` in `main.rs`, or
+you'd pay for a Redis instance the app never talks to. See
+[Shared Cache](cloud-native.md#shared-cache) for the three steps.
+
+**Resource names are sanitized, not verbatim** — the same scheme as Azure
+and App Runner, capped at 20 characters here so the longest suffixed name
+(the `-migrate-tg`-style target group name, if it existed) would still fit
+under the ALB/target-group family's 32-character AWS limit — the tightest
+this scaffold touches.
+
+Provision the infrastructure and set secrets via Terraform variables:
+
+```bash
+cp terraform.tfvars.example terraform.tfvars   # edit app_name/domain_name/route53_zone_id/etc.
+export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
+export TF_VAR_signing_secret="$(openssl rand -hex 32)"
+
+terraform init
+terraform apply
+```
+
+**Generate these two values once, then persist and reuse them** — save
+them in a password manager or your CI's secret store the same way you
+would any other production secret, rather than regenerating fresh values
+on every `terraform apply`. Re-running these `openssl rand` commands in a
+later shell session and re-applying changes the live RDS password and
+Secrets Manager signing secret in place, but the ECS service's
+`task_definition` is `lifecycle`-ignored (see `main.tf`) — it never
+redeploys to pick up the change, so already-running tasks keep using the
+OLD values and lose database access as connections recycle.
+
+The "app" and "migrate" ECS task definitions both start from a public
+placeholder image (`bootstrap_image`) — Fargate must pull *some* image to
+register a task definition's first revision, and a brand-new ECR repository
+has none yet. Push your real image, migrate, then cut over — this is
+exactly what `.github/workflows/aws-deploy.yml` automates once you add its
+required repository secret (`AWS_ROLE_ARN`, an OIDC-federated IAM role — no
+long-lived access keys) and variables (all `terraform output` values —
+`AWS_REGION`, `ECR_REPOSITORY_URL`, `ECS_CLUSTER_NAME`, `ECS_SERVICE_NAME`,
+`APP_TASK_FAMILY`, `MIGRATE_TASK_FAMILY`, `ECS_TASKS_SECURITY_GROUP_ID`,
+`ECS_PRIVATE_SUBNET_IDS`). Manually, the same sequence looks like:
+
+```bash
+# Every `aws` call below must target the same region `terraform apply` used
+# — not whatever the operator's ambient AWS CLI config happens to point at.
+# AWS_REGION (not AWS_DEFAULT_REGION) is the one to set: the AWS CLI
+# documents AWS_REGION as taking precedence over AWS_DEFAULT_REGION when
+# both are set, so an operator with AWS_REGION already exported would
+# otherwise still have their ambient region win.
+export AWS_REGION="$(terraform output -raw region)"
+
+ECR="$(terraform output -raw ecr_repository_url)"
+CLUSTER="$(terraform output -raw ecs_cluster_name)"
+SERVICE="$(terraform output -raw ecs_service_name)"
+SUBNETS="$(terraform output -json private_subnet_ids | jq -c .)"
+SG="$(terraform output -raw ecs_tasks_security_group_id)"
+TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
+
+# docker login takes a registry hostname, not a repository path — $ECR
+# includes the repository suffix (e.g. "<account>.dkr.ecr.<region>.amazonaws.com/my-app"),
+# so strip everything from the first "/" onward.
+aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR%%/*}"
+docker build \
+  --build-arg AUTUMN_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="$(git rev-parse --short HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_DIRTY="$([ -z "$(git status --porcelain)" ] && echo false || echo true)" \
+  --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t "$ECR:$TAG" .
+docker push "$ECR:$TAG"
+
+# Task definitions are immutable per revision — register a NEW one for each
+# family with the real image, keeping every other setting Terraform
+# declared (env, secrets, logging) untouched. The "app" family also strips
+# entryPoint/command: Terraform's bootstrap revision overrides both to make
+# the placeholder nginx image satisfy the ALB health check before any real
+# image exists (main.tf) — carrying that override onto the REAL image would
+# make it try to run the bootstrap's nginx script instead of its own
+# Dockerfile ENTRYPOINT/CMD (tini + the compiled binary), and the container
+# would exit immediately. The "migrate" family's own command (`autumn
+# migrate`) is intentional and permanent, not bootstrap-specific, so it's
+# left untouched.
+for FAMILY_OUT in app_task_family:APP migrate_task_family:MIGRATE; do
+  FAMILY="$(terraform output -raw "${FAMILY_OUT%%:*}")"
+  STRIP_ENTRYPOINT="del(.containerDefinitions[0].entryPoint, .containerDefinitions[0].command) | "
+  [ "${FAMILY_OUT##*:}" = "MIGRATE" ] && STRIP_ENTRYPOINT=""
+  NEW_DEF=$(aws ecs describe-task-definition --task-definition "$FAMILY" --query 'taskDefinition' | \
+    jq --arg IMAGE "$ECR:$TAG" ".containerDefinitions[0].image = \$IMAGE | ${STRIP_ENTRYPOINT}
+      del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
+          .registeredAt, .registeredBy, .deregisteredAt)")
+  ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition --cli-input-json file:///dev/stdin \
+    --query 'taskDefinition.taskDefinitionArn' --output text)
+  eval "${FAMILY_OUT##*:}_ARN=$ARN"
+done
+
+# Run migrations to completion BEFORE updating the service — the generated
+# production config sets auto_migrate_in_production = false, so nothing
+# else does this for you. run-task only starts the task and returns
+# immediately, so poll for it to stop, then check its exit code.
+#
+# `aws ecs wait tasks-stopped` has its own fixed ~10-minute budget (100
+# checks x 6s) and exits nonzero once that's exhausted regardless of
+# whether the task is still running — and ECS tasks have no runtime limit
+# of their own, so a migration that blows this budget keeps running in the
+# background even after this script gives up. Poll manually instead so a
+# timeout can explicitly stop the task before failing; otherwise retrying
+# this walkthrough could start a second migration while the first is still
+# mutating the schema.
+TASK_ARN=$(aws ecs run-task --cluster "$CLUSTER" --task-definition "$MIGRATE_ARN" \
+  --launch-type FARGATE \
+  --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":$SUBNETS,\"securityGroups\":[\"$SG\"],\"assignPublicIp\":\"DISABLED\"}}" \
+  --query 'tasks[0].taskArn' --output text)
+[ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ] || { echo "failed to start the migration task"; exit 1; }
+
+EXIT_CODE=""
+for _ in $(seq 1 60); do   # 10 minutes (60 x 10s)
+  STATUS=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+    --query 'tasks[0].lastStatus' --output text)
+  if [ "$STATUS" = "STOPPED" ]; then
+    EXIT_CODE=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+      --query 'tasks[0].containers[0].exitCode' --output text)
+    break
+  fi
+  sleep 10
+done
+if [ -z "$EXIT_CODE" ]; then
+  echo "migration did not finish within the time budget — stopping it"
+  aws ecs stop-task --cluster "$CLUSTER" --task "$TASK_ARN" \
+    --reason "manual deploy: migration exceeded its polling budget" >/dev/null
+  aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+  exit 1
+fi
+[ "$EXIT_CODE" = "0" ] || { echo "migration failed"; exit 1; }
+
+aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+  --task-definition "$APP_ARN" --force-new-deployment >/dev/null
+
+# services-stable exits 255 once its own ~10-minute polling budget (100
+# checks x 6s) is exhausted, regardless of whether the deployment is still
+# genuinely in progress — without checking that explicitly, the script
+# would fall through to the PRIMARY-deployment comparison below, which can
+# still match $APP_ARN mid-rollout and report false success.
+aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE" || {
+  echo "deployment did not stabilize within the waiter's time budget"
+  exit 1
+}
+
+# services-stable's predicate only requires ONE deployment to have
+# runningCount == desiredCount — if the new revision failed its health
+# checks, the deployment circuit breaker rolls the service back to the
+# PREVIOUS revision, and that older deployment satisfies the waiter just as
+# well. Without this check you could see "success" even though $APP_ARN
+# was never actually running.
+DEPLOYED_TASK_DEF=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+  --query "services[0].deployments[?status=='PRIMARY'].taskDefinition | [0]" --output text)
+[ "$DEPLOYED_TASK_DEF" = "$APP_ARN" ] || { echo "deployment rolled back to $DEPLOYED_TASK_DEF"; exit 1; }
+```
+
+Terraform is told to ignore both the service's `task_definition` and each
+task definition's `container_definitions` afterward
+(`lifecycle.ignore_changes`), so a later `terraform apply` won't revert a
+live deploy back to the bootstrap placeholder.
+
+**Automated deploys on tag push**, **overlapping-run serialization**, and
+**the unique-per-execution image tag** all follow the identical reasoning
+documented for [Azure's workflow](#deploy-to-azure-container-apps) above —
+`aws-deploy.yml` checks for a newer superseding run before migrating, uses
+a repository-scoped `concurrency` group, and folds `GITHUB_RUN_ID`/
+`GITHUB_RUN_ATTEMPT` into the image tag for the same re-run-collision
+reasons.
+
+**State file security and `.gitignore`.** Same caveats as Azure: Terraform
+state holds `database_admin_password`, the derived database connection
+string, and `signing_secret` in plaintext regardless of `sensitive = true`
+— `autumn release init --target aws-ecs` merges `.gitignore` entries for
+`.terraform/`, `*.tfstate*`, and `terraform.tfvars` for you. Use a remote
+backend (e.g. an S3 bucket with a DynamoDB lock table, or S3-native
+locking) instead of local state for any real deployment.
+
+**Production hardening.** One scaffold default trades cost for
+availability and is worth revisiting before a real deploy: `main.tf`
+provisions a single NAT gateway rather than one per AZ, so an AZ outage
+taking that gateway's own AZ down with it can interrupt egress for tasks
+in the *other* AZ too. Add a second NAT gateway (one per AZ, each private
+route table pointed at the one in its own AZ) before a real multi-AZ
+production cutover.
 
 ---
 
