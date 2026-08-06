@@ -359,10 +359,16 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
 /// `</script`). Two passes, both bounded overall — never reintroducing the
 /// O(n^2) risk [`MAX_RAW_CLOSE_SCAN`] exists to prevent:
 ///
-/// 1. A cheap bounded search within [`MAX_RAW_CLOSE_SCAN`] bytes, matching
-///    real browsers' end-tag tokenizer leniency toward stray non-whitespace
-///    content before `>` (e.g. `</script foo="bar">`) as long as it's close
-///    by — covers the overwhelmingly common case.
+/// 1. A cheap bounded search within [`MAX_RAW_CLOSE_SCAN`] bytes, using the
+///    same quote-aware [`find_tag_end`] an opening tag's own `>` search
+///    uses — real browsers' end-tag tokenizer *does* enter a quote-aware,
+///    attribute-value-like state once whitespace follows the tag name (by
+///    which point [`consume_raw_text`]'s `is_boundary` check has already
+///    confirmed we're here), so e.g. `</script data-x=">secret">` must
+///    skip the quoted `>` and end at the real one after it, not treat the
+///    quoted `>` as the close and leak `secret">` as visible text. Covers
+///    the overwhelmingly common case, including stray non-whitespace
+///    content before `>` as long as it's close by.
 /// 2. If that fails, a fallback that walks through a *pure* run of ASCII
 ///    whitespace immediately following (unbounded in length, but legal per
 ///    the HTML5 end-tag grammar's "closing tag, arbitrary whitespace, then
@@ -372,22 +378,26 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
 ///    [`consume_raw_text`]'s outer `match_indices('<')` loop never
 ///    revisits any of it while looking for the *next* candidate. Total
 ///    work across every failed candidate in one call stays O(`rest.len()`),
-///    same as the `match_indices` scan it's riding along with.
+///    same as the `match_indices` scan it's riding along with. A pure
+///    whitespace run never contains a quote, so this pass needs no
+///    quote-awareness of its own.
 ///
-/// Without this fallback, a legitimate closing tag with 64+ bytes of
-/// whitespace before `>` (rare, but valid HTML) was rejected outright,
-/// making [`consume_raw_text`] scan through to EOF instead — hiding all
-/// following visible content for `script`/`style`, or rendering the
-/// literal (unclosed-looking) tag text for `title`/`textarea`.
+/// Without pass 1's quote-awareness, a quoted attribute value in the
+/// closing tag containing a literal `>` was mistaken for the real one,
+/// leaking the rest of the attribute value and the genuine subsequent
+/// content as visible text. Without pass 2, a legitimate closing tag with
+/// 64+ bytes of whitespace before `>` (rare, but valid HTML) was rejected
+/// outright, making [`consume_raw_text`] scan through to EOF instead —
+/// hiding all following visible content for `script`/`style`, or
+/// rendering the literal (unclosed-looking) tag text for
+/// `title`/`textarea`.
 fn raw_close_tag_end(after_tag: &str) -> Option<usize> {
-    bounded_prefix(after_tag, MAX_RAW_CLOSE_SCAN)
-        .find('>')
-        .or_else(|| {
-            let ws_len = after_tag
-                .find(|c: char| !c.is_whitespace())
-                .unwrap_or(after_tag.len());
-            after_tag[ws_len..].starts_with('>').then_some(ws_len)
-        })
+    find_tag_end(bounded_prefix(after_tag, MAX_RAW_CLOSE_SCAN)).or_else(|| {
+        let ws_len = after_tag
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(after_tag.len());
+        after_tag[ws_len..].starts_with('>').then_some(ws_len)
+    })
 }
 
 /// Bound on how many frames back [`parse`]'s closing-tag matcher scans
@@ -590,39 +600,66 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
     stack.pop().expect("root frame always present").1
 }
 
-/// Tags this parser gives real block/list/table/head structure to.
-/// Everything *not* listed here is an inline-formatting (or otherwise
-/// unrecognized) tag treated as a transparent wrapper around its content by
-/// `layout.rs`'s `inline_spans` (its generic passthrough case recurses
-/// straight through any tag it doesn't specially recognize, tracking
-/// bold/italic). Unlike a genuine block container (`ul`, `table`, `div`,
-/// ...), a transparent frame sitting directly above a still-open frame
-/// doesn't change *what* new content belongs to — so [`close_implied_tags`]
-/// may look straight through a run of them when deciding whether
-/// `new_tag`'s opening should close something further down, the same way
-/// real HTML5 closes enclosing formatting elements along with whatever
-/// they're inside when that container closes.
+/// Tags [`close_implied_tags`] must never search *past* when deciding
+/// whether `new_tag`'s opening should reach down and close something
+/// further below on `stack`. Two different reasons a tag ends up in this
+/// set:
 ///
-/// Framed as this closed structural set rather than its complement's own
-/// allowlist: an allowlist of "known transparent tags" needed a new entry
-/// every time a commonly-used one (`span`, then `small`/`code`/`abbr`/
-/// `label`, then `mark`/`time`/`cite`, ...) turned up unlisted, always one
-/// step behind `inline_spans`'s own genuinely-exhaustive "anything
-/// unrecognized is transparent" rule. Checking against the much shorter,
-/// closed set of tags the renderer actually special-cases tracks that rule
-/// exactly, with no allowlist left to fall behind it. Reported repro:
-/// `<ul><li><mark>One<li>Two</ul>` left the second `<li>` nested under the
-/// first (stopping at the wrapper) instead of closing it, so
-/// `extract_list_items` emitted only one marker and flattened "Two" as
-/// unmarked text — `mark` (like `time`/`cite`, or any other tag `layout.rs`
-/// doesn't specially recognize) is transparent to `inline_spans`, so it
-/// should have been searched past the same as `span`.
+/// - It's itself a possible `open_tag` in [`implicitly_closes`] (`p`,
+///   `head`, `li`, `dt`, `dd`, `tr`, `td`, `th`, `thead`, `tbody`,
+///   `tfoot`) — the search has to be *able* to stop exactly there for a
+///   match to ever fire.
+/// - It's a genuine HTML5 scope boundary (`ul`, `ol`, `table`, and `html`/
+///   `body` at the root) that must block the search even when it doesn't
+///   match anything itself — `<ul><li>Parent<ul><li>Child` must leave the
+///   inner `<li>` inside the inner `<ul>` rather than reaching past it to
+///   close the outer `<li>` two levels up.
+///
+/// Everything else — including tags `layout.rs` gives real block-level
+/// *rendering* treatment to, like `div`/headings/`section`/`blockquote`
+/// (see `is_block_boundary_in_inline_context`) — is transparent here, the
+/// same as a plain inline-formatting tag (`span`, `mark`, ...): a
+/// still-open `<li>`/`<td>`/`<p>` beneath one of these doesn't stop being
+/// reachable just because an ordinary block wrapper sits in between, the
+/// same way real HTML5 closes enclosing elements along with whatever
+/// they're inside when an ancestor implicitly closes. Rendering-level
+/// block-boundary-ness and parsing-level scope-boundary-ness are different
+/// questions with different answers for these tags — conflating them was
+/// itself a bug (see below).
+///
+/// Regression: this used to be `closes_open_paragraph(tag) || ...`, reusing
+/// that function's tag list as a shortcut on the (incorrect) assumption
+/// that "closes an open `<p>`" and "is a scope boundary" were the same
+/// set. They're not — `div` (among others in that list) closes an open
+/// `<p>` but was never meant to block this search. Reported repro:
+/// `<ul><li><div>One<li>Two</ul>` — the ordinary (not oversized) `<div>`
+/// wrapper (wrongly treated as structural via the old
+/// `closes_open_paragraph` shortcut) blocked `close_implied_tags` from
+/// ever reaching the enclosing `<li>`, so the second `<li>` nested inside
+/// the first instead of closing it and `extract_list_items` emitted only
+/// one marker. An earlier fix already made purely inline-formatting tags
+/// (`mark`, `time`, `cite`, ...) transparent here — this extends the same
+/// treatment to `div`-shaped block tags that, like those, have no implied-
+/// close semantics of their own and aren't a real HTML5 scope boundary.
 fn is_structural_tag(tag: &str) -> bool {
-    closes_open_paragraph(tag)
-        || is_valid_in_head(tag)
+    is_valid_in_head(tag)
         || matches!(
             tag,
-            "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "html" | "body"
+            "thead"
+                | "tbody"
+                | "tfoot"
+                | "tr"
+                | "td"
+                | "th"
+                | "html"
+                | "body"
+                | "p"
+                | "li"
+                | "dt"
+                | "dd"
+                | "ul"
+                | "ol"
+                | "table"
         )
 }
 
@@ -1101,6 +1138,119 @@ mod tests {
             };
             assert_eq!(tag, "li", "wrapper {wrapper:?}");
         }
+    }
+
+    #[test]
+    fn an_omitted_li_closing_tag_is_implied_through_an_ordinary_block_wrapper() {
+        // Regression: `is_structural_tag` used to reuse `closes_open_paragraph`'s
+        // tag list wholesale, wrongly treating `div` (and other ordinary
+        // block tags with no implied-close semantics of their own, like
+        // headings/`section`/`blockquote`) as a scope *barrier* the same
+        // way genuine ones (`ul`/`table`) are — so `<ul><li><div>One<li>Two</ul>`
+        // left the second `<li>` nested inside the `<div>` inside the
+        // first `<li>` instead of closing it, and `extract_list_items`
+        // emitted only one marker. `div` gets real block-level rendering
+        // treatment from `layout.rs` (see `is_block_boundary_in_inline_context`),
+        // but that's an orthogonal concern from parsing-level scope —
+        // a still-open `<li>` beneath it must stay reachable, the same as
+        // through a purely inline wrapper like `<mark>`.
+        for wrapper in ["div", "h2", "section", "blockquote", "header"] {
+            let html = format!("<ul><li><{wrapper}>One<li>Two</ul>");
+            let nodes = parse(&html);
+            assert_eq!(nodes.len(), 1, "wrapper {wrapper:?}");
+            let Node::Element { tag, children } = &nodes[0] else {
+                panic!("expected an element ({wrapper:?})")
+            };
+            assert_eq!(tag, "ul");
+            assert_eq!(
+                children.len(),
+                2,
+                "expected two sibling <li>s for wrapper {wrapper:?}, got {children:?}"
+            );
+            let Node::Element {
+                tag,
+                children: first_li,
+            } = &children[0]
+            else {
+                panic!("expected an element ({wrapper:?})")
+            };
+            assert_eq!(tag, "li", "wrapper {wrapper:?}");
+            assert_eq!(
+                first_li.len(),
+                1,
+                "expected one wrapper child ({wrapper:?})"
+            );
+            assert!(
+                matches!(&first_li[0], Node::Element { tag, .. } if tag == wrapper),
+                "wrapper {wrapper:?}: expected the first <li> to still contain its wrapper, \
+                 got {first_li:?}"
+            );
+            assert_eq!(text(first_li), "One", "wrapper {wrapper:?}");
+            let Node::Element { tag, children } = &children[1] else {
+                panic!("expected an element ({wrapper:?})")
+            };
+            assert_eq!(tag, "li", "wrapper {wrapper:?}");
+            assert_eq!(text(children), "Two", "wrapper {wrapper:?}");
+        }
+    }
+
+    #[test]
+    fn nested_list_scope_barrier_survives_the_ordinary_block_wrapper_fix() {
+        // Guard against overcorrecting the fix above: `ul`/`ol`/`table`
+        // must remain genuine scope barriers — a `<div>` no longer
+        // blocking `close_implied_tags`' search must not somehow let it
+        // reach *past* a nested `<ul>` too. `<ul><li>Parent<div><ul><li>Child</ul></div></li></ul>`
+        // must still leave "Child" as its own nested list, not merge it
+        // into the outer list's second item.
+        let nodes = parse("<ul><li>Parent<div><ul><li>Child</ul></div><li>Sibling</ul>");
+        assert_eq!(nodes.len(), 1);
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "ul");
+        assert_eq!(
+            children.len(),
+            2,
+            "expected two sibling top-level <li>s, got {children:?}"
+        );
+        let Node::Element {
+            tag,
+            children: first_li,
+        } = &children[0]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "li");
+        assert_eq!(first_li.len(), 2, "expected text then <div>: {first_li:?}");
+        assert!(matches!(&first_li[0], Node::Text(t) if t == "Parent"));
+        let Node::Element {
+            tag,
+            children: div_children,
+        } = &first_li[1]
+        else {
+            panic!("expected the <div>")
+        };
+        assert_eq!(tag, "div");
+        assert_eq!(div_children.len(), 1, "expected the nested <ul>");
+        let Node::Element {
+            tag,
+            children: inner_ul,
+        } = &div_children[0]
+        else {
+            panic!("expected the nested <ul>")
+        };
+        assert_eq!(tag, "ul");
+        assert_eq!(inner_ul.len(), 1, "expected the inner <li>");
+        assert_eq!(text(inner_ul), "Child");
+        let Node::Element {
+            tag,
+            children: second_li,
+        } = &children[1]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "li");
+        assert_eq!(text(second_li), "Sibling");
     }
 
     #[test]
@@ -1843,6 +1993,42 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(2),
             "parse took {:?} — looks quadratic again",
             start.elapsed()
+        );
+    }
+
+    #[test]
+    fn raw_text_closing_tag_skips_a_quoted_bracket_look_alike() {
+        // Regression: `raw_close_tag_end`'s bounded search used a plain
+        // `.find('>')`, so a closing tag with a quoted attribute-like
+        // value containing a literal `>` (real browsers *do* enter a
+        // quote-aware, attribute-value-like state for a closing tag once
+        // whitespace follows the tag name) was mistaken for the tag's own
+        // end — `<script>hidden</script data-x=">secret">Visible` matched
+        // the quoted `>` right after `data-x="` as the close, resuming
+        // normal parsing at `secret">Visible` and leaking `secret">` as
+        // visible text instead of staying inside the (still hidden)
+        // script element up through the real closing `>`.
+        let html = r#"<script>hidden</script data-x=">secret">Visible"#;
+        let nodes = parse(html);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "expected the script element and the trailing text, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected the first node to be an element")
+        };
+        assert_eq!(tag, "script");
+        assert_eq!(
+            text(children),
+            "hidden",
+            "the script's own content must stay hidden inside it"
+        );
+        assert_eq!(
+            nodes[1],
+            Node::Text("Visible".to_owned()),
+            "only the genuine trailing text must appear as a sibling — the quoted attribute \
+             value must not leak, got {nodes:?}"
         );
     }
 

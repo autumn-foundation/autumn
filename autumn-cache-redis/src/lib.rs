@@ -99,13 +99,17 @@ fn ttl_millis_for_redis(ttl: std::time::Duration) -> u64 {
 }
 
 /// Whether `url` needs the `rustls` `CryptoProvider` installed to connect —
-/// true only for the TLS (`rediss://`) scheme. A plain `redis://` URL never
-/// touches TLS, so it must not claim the process-wide default: doing so
-/// could pre-empt a later, unrelated attempt elsewhere in the process to
-/// install a different provider (e.g. `aws-lc-rs`) for something that
-/// actually needs one.
+/// true only for the two TLS schemes `redis::Client::open` itself
+/// recognizes (`rediss://` and Valkey's `valkeys://`), matched
+/// case-insensitively the same way `redis`'s own URL parsing (via the
+/// `url` crate, which lowercases the scheme while parsing) does. A plain
+/// `redis://`/`valkey://` URL never touches TLS, so it must not claim the
+/// process-wide default: doing so could pre-empt a later, unrelated
+/// attempt elsewhere in the process to install a different provider (e.g.
+/// `aws-lc-rs`) for something that actually needs one.
 fn needs_tls_crypto_provider(url: &str) -> bool {
-    url.starts_with("rediss://")
+    let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+    scheme.eq_ignore_ascii_case("rediss") || scheme.eq_ignore_ascii_case("valkeys")
 }
 
 impl RedisCache {
@@ -449,11 +453,35 @@ mod tests {
     fn plain_redis_urls_do_not_claim_the_process_wide_tls_provider() {
         assert!(!needs_tls_crypto_provider("redis://127.0.0.1:6379/"));
         assert!(!needs_tls_crypto_provider("redis://user:pass@host:6379/0"));
+        assert!(!needs_tls_crypto_provider("valkey://127.0.0.1:6379/"));
     }
 
     #[test]
     fn rediss_urls_still_claim_the_tls_provider() {
         assert!(needs_tls_crypto_provider("rediss://127.0.0.1:6380/"));
+    }
+
+    #[test]
+    fn valkeys_urls_also_claim_the_tls_provider() {
+        // Regression: `redis::Client::open` (via the `url` crate, which
+        // lowercases the scheme while parsing) treats both `rediss://` and
+        // Valkey's `valkeys://` as TLS — a literal `starts_with("rediss://")`
+        // check missed `valkeys://` entirely, so a `valkeys://` connection
+        // could reach `ClientConfig::builder()` with no provider ever
+        // installed (if nothing else in the process had installed one
+        // first) and panic instead of returning a connection error.
+        assert!(needs_tls_crypto_provider("valkeys://127.0.0.1:6380/"));
+    }
+
+    #[test]
+    fn tls_scheme_matching_is_case_insensitive() {
+        // Regression: a literal `starts_with("rediss://")` also missed a
+        // case-variant scheme such as `REDISS://` — valid per URL parsing
+        // (schemes are normalized to lowercase), and accepted the same way
+        // by `redis::Client::open`, but invisible to a case-sensitive
+        // prefix check.
+        assert!(needs_tls_crypto_provider("REDISS://127.0.0.1:6380/"));
+        assert!(needs_tls_crypto_provider("Valkeys://127.0.0.1:6380/"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
