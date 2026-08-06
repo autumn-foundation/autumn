@@ -665,8 +665,17 @@ fn split_into_fitting_chunks(
     for ch in text.chars() {
         let ch_width = f32::from(char_width_1000em(ch, bold)) / 1000.0 * font_size_pt;
         if !current.is_empty() && current_width + ch_width > max_width_pt {
-            if current.ends_with('\u{00A0}') {
-                let nbsp = current.pop().expect("just checked ends_with");
+            // Overflow can be triggered by the NBSP *arriving* as `ch`
+            // (`current` doesn't yet end with one) just as much as by it
+            // already sitting at the end of `current` — both need the same
+            // "pull the preceding character along" treatment, just applied
+            // from opposite sides of the boundary.
+            if ch == '\u{00A0}' || current.ends_with('\u{00A0}') {
+                let nbsp = if current.ends_with('\u{00A0}') {
+                    current.pop()
+                } else {
+                    None
+                };
                 let prev = current.pop();
                 if !current.is_empty() {
                     chunks.push(std::mem::take(&mut current));
@@ -674,7 +683,9 @@ fn split_into_fitting_chunks(
                 if let Some(prev) = prev {
                     current.push(prev);
                 }
-                current.push(nbsp);
+                if let Some(nbsp) = nbsp {
+                    current.push(nbsp);
+                }
                 current_width = current
                     .chars()
                     .map(|c| f32::from(char_width_1000em(c, bold)) / 1000.0 * font_size_pt)
@@ -745,26 +756,19 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
                 unbreakable,
             } => {
                 let w = text_width_pt(text, font_size_pt, *bold);
-                if w > max_width_pt && !text.is_empty() {
-                    if !current.is_empty() {
-                        lines.push(std::mem::take(&mut current));
-                        current_width = 0.0;
-                    }
-                    let chunks = split_into_fitting_chunks(text, font_size_pt, *bold, max_width_pt);
-                    let last = chunks.len().saturating_sub(1);
-                    for (i, chunk) in chunks.into_iter().enumerate() {
-                        let chunk_w = text_width_pt(&chunk, font_size_pt, *bold);
-                        if i == last {
-                            current_width = chunk_w;
-                            current = vec![(chunk, *bold, *italic, false)];
-                        } else {
-                            lines.push(vec![(chunk, *bold, *italic, false)]);
-                        }
-                    }
-                    run_start = 0;
-                    run_width = current_width;
-                    continue;
-                }
+                // Checked *before* the oversized-token branch below: an
+                // unbreakable (NBSP-glued) word must never be split away
+                // from whatever it's glued to just because it also happens
+                // to be individually too wide for one line on its own — a
+                // still-open <strong> run glued to preceding text via
+                // &nbsp; used to hit the oversized branch first, which
+                // unconditionally flushed `current` as its own line (losing
+                // the glue) and then character-split the word with no
+                // notion of the NBSP boundary at all. This reuses the same
+                // relocate-or-accept-overflow logic already used for a run
+                // that doesn't fit for non-oversized reasons — an
+                // unbreakable word that's oversized on its own is just the
+                // most extreme case of "doesn't fit", same fallback.
                 if *unbreakable && !current.is_empty() {
                     let new_run_width = run_width + w;
                     let prefix_width = current_width - run_width;
@@ -789,6 +793,26 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
                     }
                     current.push((text.clone(), *bold, *italic, true));
                     run_width = new_run_width;
+                    continue;
+                }
+                if w > max_width_pt && !text.is_empty() {
+                    if !current.is_empty() {
+                        lines.push(std::mem::take(&mut current));
+                        current_width = 0.0;
+                    }
+                    let chunks = split_into_fitting_chunks(text, font_size_pt, *bold, max_width_pt);
+                    let last = chunks.len().saturating_sub(1);
+                    for (i, chunk) in chunks.into_iter().enumerate() {
+                        let chunk_w = text_width_pt(&chunk, font_size_pt, *bold);
+                        if i == last {
+                            current_width = chunk_w;
+                            current = vec![(chunk, *bold, *italic, false)];
+                        } else {
+                            lines.push(vec![(chunk, *bold, *italic, false)]);
+                        }
+                    }
+                    run_start = 0;
+                    run_width = current_width;
                     continue;
                 }
                 let mut glued = *glue && !current.is_empty();
@@ -1195,6 +1219,37 @@ mod tests {
     }
 
     #[test]
+    fn oversized_token_does_not_split_when_the_incoming_character_is_the_nbsp() {
+        // Regression: overflow can be triggered by the NBSP *arriving* as
+        // the current character, not just by it already sitting at the end
+        // of the accumulated chunk — `current` doesn't yet end with an
+        // NBSP at that point, so the existing NBSP-adjacency guard (keyed
+        // off `current.ends_with(NBSP)`) never fired, and the boundary
+        // landed right before the NBSP the same way it used to land right
+        // after one. A repro matching the reported one: 67 `A`s followed
+        // by `i&nbsp;B` — the As plus `i` fit within the content width,
+        // but adding the NBSP doesn't, so the naive split lands right
+        // before it.
+        let text = format!("{}i\u{00A0}B", "A".repeat(67));
+        let font_size_pt = 11.0;
+        let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
+            + text_width_pt("i", font_size_pt, false)
+            + 0.5;
+        let chunks = split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt);
+        assert!(
+            chunks
+                .iter()
+                .all(|c| !c.starts_with('\u{00A0}') && !c.ends_with('\u{00A0}')),
+            "no chunk boundary may sit immediately before or after an NBSP, got {chunks:?}"
+        );
+        let reassembled: String = chunks.concat();
+        assert_eq!(
+            reassembled, text,
+            "splitting must not drop or reorder any characters"
+        );
+    }
+
+    #[test]
     fn oversized_token_narrower_than_max_width_is_left_whole() {
         // A word that fits on its own line (even if it wouldn't fit
         // alongside other content already on the current line) must not be
@@ -1416,6 +1471,61 @@ mod tests {
                 ("WWWW".to_owned(), false, false, true),
             ],
             "the NBSP-glued pair must move together onto the second line"
+        );
+    }
+
+    #[test]
+    fn unbreakable_word_that_is_individually_oversized_stays_glued_to_its_predecessor() {
+        // Regression: `Hello<strong>&nbsp;` followed by a long unbroken run
+        // of characters is individually wider than a whole line on its
+        // own — the oversized-token branch used to run *before* the
+        // unbreakable check, so it unconditionally flushed `current`
+        // ("Hello") as its own finished line (losing the glue to the
+        // NBSP-led word) and then character-split the oversized word with
+        // no notion of the NBSP boundary at all. The unbreakable check now
+        // runs first and reuses the same relocate-or-accept-overflow
+        // fallback already used for a run that doesn't fit for ordinary
+        // (non-oversized) reasons.
+        let words = vec![
+            Word::Text {
+                text: "Hello".to_owned(),
+                bold: false,
+                italic: false,
+                glue: false,
+                unbreakable: false,
+            },
+            Word::Text {
+                text: format!("\u{00A0}{}", "A".repeat(100)),
+                bold: true,
+                italic: false,
+                glue: true,
+                unbreakable: true,
+            },
+        ];
+        let max_width_pt = 495.0; // a typical paragraph content width
+        let word_width = text_width_pt(&format!("\u{00A0}{}", "A".repeat(100)), 11.0, true);
+        assert!(
+            word_width > max_width_pt,
+            "fixture word must be individually oversized"
+        );
+        let lines = wrap(&words, max_width_pt, 11.0);
+        assert_eq!(
+            lines.len(),
+            1,
+            "\"Hello\" and its NBSP-glued word must stay on the same line, not split apart"
+        );
+        assert_eq!(
+            lines[0][0],
+            ("Hello".to_owned(), false, false, false),
+            "\"Hello\" must not be flushed onto its own line ahead of the glued word"
+        );
+        assert!(
+            lines[0][1].0.starts_with('\u{00A0}'),
+            "the NBSP-led word must stay glued (with its NBSP intact) right after \"Hello\""
+        );
+        assert!(
+            lines[0][1].3,
+            "the NBSP-led word must still render glued (no rendered space before it)"
         );
     }
 
