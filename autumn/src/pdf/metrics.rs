@@ -107,7 +107,12 @@ const fn base_width_1000em(ch: char) -> u16 {
         '\u{00C0}'..='\u{00DE}' if ch != '\u{00D7}' => 667, // Latin-1 uppercase accented (approx like A-Z)
         '\u{00A9}' | '\u{00AE}' => 737,                     // © copyright, ® registered
         '\u{2022}' => 350,                                  // • bullet
-        '\u{2020}' | '\u{2021}' => 500,                     // † dagger, ‡ double dagger
+        // † and ‡ used to sit at 500, but Helvetica renders both at 556 —
+        // same underestimation risk as the other wide-glyph fixes above. A
+        // repro matching the reported one: 90 `†`s at 11pt used to estimate
+        // ~495pt (fits a 495.28pt content area) while Helvetica actually
+        // renders them at ~550pt (doesn't).
+        '\u{2020}' | '\u{2021}' => 556,                     // † dagger, ‡ double dagger
         '\u{00B0}' => 400,                                  // ° degree
         // Math/comparison operators used to fall into the generic ASCII
         // fallback (556) below, but Helvetica renders them wider (584) —
@@ -466,6 +471,24 @@ mod tests {
             eighty_times > content_area_pt,
             "80 ×s at 11pt ({eighty_times}pt) must be estimated wider than a 495pt content \
              area, matching Helvetica's real ~514pt rendering, not the old ~489pt underestimate"
+        );
+    }
+
+    #[test]
+    fn dagger_glyphs_are_not_underestimated() {
+        // Regression: `†`/`‡` (U+2020/U+2021) used to sit at 500, but
+        // Helvetica renders both at 556. A repro matching the reported one:
+        // 90 `†`s at 11pt used to estimate ~495pt (fits a 495.28pt content
+        // area) while Helvetica actually renders them at ~550pt (doesn't).
+        assert_eq!(char_width_1000em('\u{2020}', false), 556); // †
+        assert_eq!(char_width_1000em('\u{2021}', false), 556); // ‡
+        let ninety_daggers = text_width_pt(&"\u{2020}".repeat(90), 11.0, false);
+        let content_area_pt = 495.28;
+        assert!(
+            ninety_daggers > content_area_pt,
+            "90 †s at 11pt ({ninety_daggers}pt) must be estimated wider than a 495.28pt \
+             content area, matching Helvetica's real ~550pt rendering, not the old ~495pt \
+             underestimate"
         );
     }
 

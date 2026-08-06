@@ -248,9 +248,11 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
     let len = bytes.len();
     let mut pos = 0usize;
 
-    // Stack of (tag_name, children-so-far). The implicit root is index 0 with
-    // an empty tag name; it is never popped.
-    let mut stack: Vec<(String, Vec<Node>)> = vec![(String::new(), Vec::new())];
+    // Stack of (tag_name, children-so-far, nearest_structural_idx — see
+    // that function's docs). The implicit root is index 0 with an empty tag
+    // name; it is never popped, and its own nearest_structural_idx is
+    // itself (0), same as any other structural frame.
+    let mut stack: Vec<(String, Vec<Node>, usize)> = vec![(String::new(), Vec::new(), 0)];
 
     while pos < len {
         if bytes[pos] == b'<' {
@@ -283,12 +285,12 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                     let window_start = stack.len().saturating_sub(MAX_CLOSE_SCAN);
                     stack[window_start..]
                         .iter()
-                        .rposition(|(tag, _)| *tag == name)
+                        .rposition(|(tag, _, _)| *tag == name)
                         .map(|i| window_start + i)
                 };
                 if let Some(depth) = matching_depth {
                     while stack.len() > depth {
-                        let (tag, children) = stack.pop().expect("depth <= stack.len()");
+                        let (tag, children, _) = stack.pop().expect("depth <= stack.len()");
                         stack
                             .last_mut()
                             .expect("root frame is never popped")
@@ -335,7 +337,8 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                             children: Vec::new(),
                         });
                 } else {
-                    stack.push((tag, Vec::new()));
+                    let structural_idx = nearest_structural_idx(&stack, &tag);
+                    stack.push((tag, Vec::new(), structural_idx));
                 }
                 continue;
             }
@@ -355,7 +358,7 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
 
     // Auto-close any still-open tags at end of input.
     while stack.len() > 1 {
-        let (tag, children) = stack.pop().expect("stack.len() > 1");
+        let (tag, children, _) = stack.pop().expect("stack.len() > 1");
         stack
             .last_mut()
             .expect("root frame is never popped")
@@ -366,32 +369,67 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
     stack.pop().expect("root frame always present").1
 }
 
-/// Inline-formatting tags this parser treats as transparent wrappers around
-/// their content (`layout.rs`'s `inline_spans` recurses straight through
-/// them, tracking bold/italic). Unlike a genuine block container (`ul`,
-/// `table`, `div`, ...), one of these sitting directly above a still-open
-/// frame doesn't change *what* new content belongs to — so
-/// [`close_implied_tags`] may look straight through a run of them when
-/// deciding whether `new_tag`'s opening should close something further
-/// down, the same way real HTML5 closes enclosing formatting elements
-/// along with whatever they're inside when that container closes.
-fn is_phrasing_wrapper(tag: &str) -> bool {
-    // None of these carry styling meaning of their own here, but
-    // `inline_spans`'s generic transparent-passthrough case treats *any*
-    // tag it doesn't specially recognize this same way — recursing
-    // straight through to its content — so any such tag is safe to search
-    // past. This list only needs to cover commonly-used ones as they turn
-    // up; it isn't (and can't cheaply be) exhaustive, since `inline_spans`
-    // treats literally every unrecognized tag transparently. Reported
-    // repro: `<ul><li><span>One<li>Two</ul>` (and similarly `<small>`,
-    // `<code>`, `<abbr>`, `<label>`) left the second `<li>` nested under
-    // the first (stopping at the wrapper) instead of closing it, so
-    // `extract_list_items` emitted only one marker and flattened "Two" as
-    // unmarked text.
-    matches!(
-        tag,
-        "strong" | "b" | "em" | "i" | "span" | "a" | "small" | "code" | "abbr" | "label"
-    )
+/// Tags this parser gives real block/list/table/head structure to.
+/// Everything *not* listed here is an inline-formatting (or otherwise
+/// unrecognized) tag treated as a transparent wrapper around its content by
+/// `layout.rs`'s `inline_spans` (its generic passthrough case recurses
+/// straight through any tag it doesn't specially recognize, tracking
+/// bold/italic). Unlike a genuine block container (`ul`, `table`, `div`,
+/// ...), a transparent frame sitting directly above a still-open frame
+/// doesn't change *what* new content belongs to — so [`close_implied_tags`]
+/// may look straight through a run of them when deciding whether
+/// `new_tag`'s opening should close something further down, the same way
+/// real HTML5 closes enclosing formatting elements along with whatever
+/// they're inside when that container closes.
+///
+/// Framed as this closed structural set rather than its complement's own
+/// allowlist: an allowlist of "known transparent tags" needed a new entry
+/// every time a commonly-used one (`span`, then `small`/`code`/`abbr`/
+/// `label`, then `mark`/`time`/`cite`, ...) turned up unlisted, always one
+/// step behind `inline_spans`'s own genuinely-exhaustive "anything
+/// unrecognized is transparent" rule. Checking against the much shorter,
+/// closed set of tags the renderer actually special-cases tracks that rule
+/// exactly, with no allowlist left to fall behind it. Reported repro:
+/// `<ul><li><mark>One<li>Two</ul>` left the second `<li>` nested under the
+/// first (stopping at the wrapper) instead of closing it, so
+/// `extract_list_items` emitted only one marker and flattened "Two" as
+/// unmarked text — `mark` (like `time`/`cite`, or any other tag `layout.rs`
+/// doesn't specially recognize) is transparent to `inline_spans`, so it
+/// should have been searched past the same as `span`.
+fn is_structural_tag(tag: &str) -> bool {
+    closes_open_paragraph(tag)
+        || is_valid_in_head(tag)
+        || matches!(
+            tag,
+            "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "html" | "body"
+        )
+}
+
+/// The index (within `stack`, *before* the new frame for `tag` is pushed)
+/// that [`close_implied_tags`] should treat as this new frame's search
+/// target once it becomes the top of the stack: `stack.len()` (i.e. its own
+/// eventual index) if `tag` is a [structural tag](is_structural_tag) —
+/// searching should stop here — otherwise whatever the *current* top
+/// already resolves to, inherited unchanged since a transparent frame
+/// doesn't change what's searchable beneath it.
+///
+/// Computed once here and cached in the pushed frame's third tuple field
+/// for the rest of its life (see [`close_implied_tags`]) rather than
+/// re-walked on every call: `is_structural_tag` inverting a short
+/// "known-transparent" allowlist into its much longer closed complement
+/// made a per-call *search* back through a run of transparent frames
+/// (even one bounded via `MAX_CLOSE_SCAN` to stay linear) measurably
+/// costlier — a stack of nothing-but-`<a>` tags pays that walk, and the
+/// larger tag-classification check inside it, on every single tag open.
+/// Caching removes the walk (and its bound) entirely: each frame already
+/// knows its own answer the instant it's pushed, so `close_implied_tags`
+/// never inspects more than the current top frame plus its cached target.
+fn nearest_structural_idx(stack: &[(String, Vec<Node>, usize)], tag: &str) -> usize {
+    if is_structural_tag(tag) {
+        stack.len()
+    } else {
+        stack.last().map_or(0, |frame| frame.2)
+    }
 }
 
 /// Cascades [`implicitly_closes`] up `stack`: repeatedly finds the closest
@@ -402,45 +440,38 @@ fn is_phrasing_wrapper(tag: &str) -> bool {
 /// function's line count down — this has no state of its own beyond
 /// `stack`.
 ///
-/// Looks *past* a run of [`is_phrasing_wrapper`] frames at the top, not
-/// just at the top itself: `<p><strong>Intro<table>` has `strong` sitting
-/// directly above the still-open `p` when `<table>` opens, and `strong`
-/// has no implied-close rule of its own against `table` — checking only
-/// `stack.last()` would stop right there and never see the `p` beneath,
-/// leaving the table nested inside it (and flattened through
+/// Looks *past* a run of non-[structural](is_structural_tag) frames at the
+/// top, not just at the top itself: `<p><strong>Intro<table>` has `strong`
+/// sitting directly above the still-open `p` when `<table>` opens, and
+/// `strong` has no implied-close rule of its own against `table` —
+/// checking only `stack.last()` would stop right there and never see the
+/// `p` beneath, leaving the table nested inside it (and flattened through
 /// `inline_spans`, which has no notion of a table, instead of becoming a
-/// real `Block::Table`). Only phrasing wrappers are skipped this way — a
-/// genuine block container (`ul`, `table`, ...) sitting at the top always
+/// real `Block::Table`). Only non-structural frames are skipped this way —
+/// a genuine block container (`ul`, `table`, ...) sitting at the top always
 /// stops the search at that frame, matching or not, so e.g.
 /// `<ul><li>Parent<ul><li>Child` correctly leaves the inner `<li>` opening
 /// *inside* the inner `<ul>` rather than reaching past it to close the
 /// outer `<li>` two levels up.
-fn close_implied_tags(stack: &mut Vec<(String, Vec<Node>)>, new_tag: &str) {
+///
+/// This "look past" costs nothing at call time: the top frame's third
+/// tuple field is the [`nearest_structural_idx`] computed (and cached) when
+/// that frame was pushed, so finding the target is one index lookup rather
+/// than a walk back through `stack` — see that function's docs for why a
+/// per-call search (even one bounded to stay linear) stopped being cheap
+/// enough once [`is_structural_tag`] grew from a short "known-transparent"
+/// allowlist's negation into its own much larger closed set.
+fn close_implied_tags(stack: &mut Vec<(String, Vec<Node>, usize)>, new_tag: &str) {
     loop {
         if stack.len() <= 1 {
             break;
         }
-        // Bounded the same way the closing-tag matcher in `parse` bounds
-        // its scan (`MAX_CLOSE_SCAN`) and for the same reason: this now
-        // runs on *every* opening tag, so an unbounded walk through a
-        // stack that's nothing but phrasing wrappers (e.g. `n` unclosed
-        // `<strong>`s, which never stop the walk early) would be an O(n)
-        // scan repeated n times — O(n²) overall, the same blowup already
-        // fixed elsewhere in this parser for a pathologically deep
-        // (adversarial or accidental) stack. A stack of anything *else*
-        // that never closes (e.g. `n` unclosed `<span>`s) stops the walk
-        // on its very first frame, so this bound only matters for the
-        // phrasing-wrapper case.
-        let floor = stack.len().saturating_sub(MAX_CLOSE_SCAN).max(1);
-        let mut target = stack.len() - 1;
-        while target > floor && is_phrasing_wrapper(&stack[target].0) {
-            target -= 1;
-        }
+        let target = stack[stack.len() - 1].2;
         if !implicitly_closes(&stack[target].0, new_tag) {
             break;
         }
         while stack.len() > target {
-            let (closed_tag, children) = stack.pop().expect("stack.len() > target >= 1");
+            let (closed_tag, children, _) = stack.pop().expect("stack.len() > target >= 1");
             stack
                 .last_mut()
                 .expect("root frame is never popped")
@@ -453,7 +484,7 @@ fn close_implied_tags(stack: &mut Vec<(String, Vec<Node>)>, new_tag: &str) {
     }
 }
 
-fn push_text(stack: &mut Vec<(String, Vec<Node>)>, text: &str) {
+fn push_text(stack: &mut Vec<(String, Vec<Node>, usize)>, text: &str) {
     if text.is_empty() {
         return;
     }
@@ -463,10 +494,10 @@ fn push_text(stack: &mut Vec<(String, Vec<Node>)>, text: &str) {
     // `<head><title>X</title>Visible</head>`, or the same with no closing
     // tag at all). Whitespace-only text (formatting indentation between
     // tags) doesn't count — it's not real content.
-    if stack.last().is_some_and(|(tag, _)| tag == "head")
+    if stack.last().is_some_and(|(tag, _, _)| tag == "head")
         && text.contains(|c: char| !c.is_whitespace())
     {
-        let (closed_tag, children) = stack.pop().expect("just checked stack.last() above");
+        let (closed_tag, children, _) = stack.pop().expect("just checked stack.last() above");
         stack
             .last_mut()
             .expect("root frame is never popped")
@@ -800,6 +831,38 @@ mod tests {
         // `code`, `abbr`, `label`, ...) still stopped the implied-close
         // search — same bug, different tag.
         for wrapper in ["small", "code", "abbr", "label"] {
+            let html = format!("<ul><li><{wrapper}>One<li>Two</ul>");
+            let nodes = parse(&html);
+            assert_eq!(nodes.len(), 1, "wrapper {wrapper:?}");
+            let Node::Element { tag, children } = &nodes[0] else {
+                panic!("expected an element ({wrapper:?})")
+            };
+            assert_eq!(tag, "ul");
+            assert_eq!(
+                children.len(),
+                2,
+                "expected two sibling <li>s for wrapper {wrapper:?}, got {children:?}"
+            );
+            let Node::Element { tag, .. } = &children[1] else {
+                panic!("expected an element ({wrapper:?})")
+            };
+            assert_eq!(tag, "li", "wrapper {wrapper:?}");
+        }
+    }
+
+    #[test]
+    fn an_omitted_li_closing_tag_is_implied_through_any_unrecognized_wrapper_tag() {
+        // Regression: `is_phrasing_wrapper` used to be its own allowlist of
+        // "known transparent tags", one step behind `inline_spans`'s
+        // actually-exhaustive "anything unrecognized is transparent" rule —
+        // `mark`/`time`/`cite` (and any other tag `layout.rs` doesn't
+        // specially recognize) are just as transparent as `span`, but
+        // weren't in the allowlist, so `<ul><li><mark>One<li>Two</ul>` left
+        // the second `<li>` nested under the first instead of closing it.
+        // Now that the check is inverted against the closed set of tags the
+        // renderer *does* special-case, an arbitrary never-listed tag
+        // (`made-up-tag`) is covered too, not just these three.
+        for wrapper in ["mark", "time", "cite", "made-up-tag"] {
             let html = format!("<ul><li><{wrapper}>One<li>Two</ul>");
             let nodes = parse(&html);
             assert_eq!(nodes.len(), 1, "wrapper {wrapper:?}");
