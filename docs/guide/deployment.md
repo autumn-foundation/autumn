@@ -1151,6 +1151,10 @@ service is created**, so the trusted-hosts env var can only be set on this
 same follow-up call, not on the first `terraform apply`:
 
 ```bash
+# Every `aws` call below must target the same region `terraform apply` used
+# — not whatever the operator's ambient AWS CLI config happens to point at.
+export AWS_DEFAULT_REGION="$(terraform output -raw region)"
+
 ECR="$(terraform output -raw ecr_repository_url)"
 SERVICE_ARN="$(terraform output -raw service_arn)"
 ACCESS_ROLE="$(terraform output -raw apprunner_access_role_arn)"
@@ -1284,6 +1288,10 @@ long-lived access keys) and variables (all `terraform output` values —
 `ECS_PRIVATE_SUBNET_IDS`). Manually, the same sequence looks like:
 
 ```bash
+# Every `aws` call below must target the same region `terraform apply` used
+# — not whatever the operator's ambient AWS CLI config happens to point at.
+export AWS_DEFAULT_REGION="$(terraform output -raw region)"
+
 ECR="$(terraform output -raw ecr_repository_url)"
 CLUSTER="$(terraform output -raw ecs_cluster_name)"
 SERVICE="$(terraform output -raw ecs_service_name)"

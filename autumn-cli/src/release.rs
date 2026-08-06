@@ -3678,6 +3678,7 @@ previous_secrets = []
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
         let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
         for name in [
+            "region",
             "app_url",
             "service_arn",
             "service_name",
@@ -3695,6 +3696,19 @@ previous_secrets = []
             !content.contains("{{"),
             "outputs.tf must not contain any unsubstituted template placeholders: {content}"
         );
+    }
+
+    #[test]
+    fn aws_app_runner_region_output_reflects_the_configured_region_variable() {
+        // The deploy walkthrough sources AWS_DEFAULT_REGION from this
+        // output so every `aws` CLI call targets the same region Terraform
+        // provisioned into, regardless of the operator's ambient CLI
+        // config — it must echo var.region, not a hardcoded default.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        assert!(content.contains("value       = var.region"), "{content}");
     }
 
     #[test]
@@ -4214,6 +4228,7 @@ previous_secrets = []
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
         let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
         for name in [
+            "region",
             "app_url",
             "alb_dns_name",
             "ecr_repository_url",
@@ -4236,6 +4251,19 @@ previous_secrets = []
             !content.contains("{{"),
             "outputs.tf must not contain any unsubstituted template placeholders: {content}"
         );
+    }
+
+    #[test]
+    fn aws_ecs_region_output_reflects_the_configured_region_variable() {
+        // Both the deploy walkthrough (AWS_DEFAULT_REGION) and
+        // aws-deploy.yml's documented AWS_REGION repo variable are meant to
+        // be sourced from this output, so it must echo var.region, not a
+        // hardcoded default.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        assert!(content.contains("value       = var.region"), "{content}");
     }
 
     #[test]
