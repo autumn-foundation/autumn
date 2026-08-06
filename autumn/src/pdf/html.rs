@@ -345,13 +345,49 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
         if !is_boundary {
             continue;
         }
-        let Some(gt) = bounded_prefix(after_tag, MAX_RAW_CLOSE_SCAN).find('>') else {
+        let Some(gt) = raw_close_tag_end(after_tag) else {
             continue;
         };
         let consumed = i + 2 + tag.len() + gt + 1;
         return (&rest[..i], pos + consumed);
     }
     (rest, input.len())
+}
+
+/// Locates the `>` that ends a raw-text closing tag candidate, given
+/// `after_tag` (the text right after the tag name, e.g. right after
+/// `</script`). Two passes, both bounded overall — never reintroducing the
+/// O(n^2) risk [`MAX_RAW_CLOSE_SCAN`] exists to prevent:
+///
+/// 1. A cheap bounded search within [`MAX_RAW_CLOSE_SCAN`] bytes, matching
+///    real browsers' end-tag tokenizer leniency toward stray non-whitespace
+///    content before `>` (e.g. `</script foo="bar">`) as long as it's close
+///    by — covers the overwhelmingly common case.
+/// 2. If that fails, a fallback that walks through a *pure* run of ASCII
+///    whitespace immediately following (unbounded in length, but legal per
+///    the HTML5 end-tag grammar's "closing tag, arbitrary whitespace, then
+///    `>`"), succeeding only if `>` immediately follows it. This can't
+///    blow up quadratically even though it's unbounded: every byte it
+///    walks is whitespace, which can never itself be a `<` — so
+///    [`consume_raw_text`]'s outer `match_indices('<')` loop never
+///    revisits any of it while looking for the *next* candidate. Total
+///    work across every failed candidate in one call stays O(`rest.len()`),
+///    same as the `match_indices` scan it's riding along with.
+///
+/// Without this fallback, a legitimate closing tag with 64+ bytes of
+/// whitespace before `>` (rare, but valid HTML) was rejected outright,
+/// making [`consume_raw_text`] scan through to EOF instead — hiding all
+/// following visible content for `script`/`style`, or rendering the
+/// literal (unclosed-looking) tag text for `title`/`textarea`.
+fn raw_close_tag_end(after_tag: &str) -> Option<usize> {
+    bounded_prefix(after_tag, MAX_RAW_CLOSE_SCAN)
+        .find('>')
+        .or_else(|| {
+            let ws_len = after_tag
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(after_tag.len());
+            after_tag[ws_len..].starts_with('>').then_some(ws_len)
+        })
 }
 
 /// Bound on how many frames back [`parse`]'s closing-tag matcher scans
@@ -445,7 +481,7 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                 pos += tag_end;
                 close_implied_tags(&mut stack, &tag);
 
-                if !self_closing && is_raw_text_element(&tag) {
+                if is_raw_text_element(&tag) {
                     // `<script>`/`<style>`/`<title>`/`<textarea>` content is
                     // never tokenized as markup — see `consume_raw_text` —
                     // so a `<` that merely *looks* like the start of a tag
@@ -455,6 +491,20 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                     // (matching the normal text-node path below) — a no-op
                     // for the two tags whose content is discarded anyway,
                     // and required for `title`/`textarea`'s real content.
+                    //
+                    // `self_closing` is deliberately ignored here (unlike
+                    // the generic `self_closing || is_void_element` case
+                    // below): these four are non-void HTML elements, and
+                    // real browsers ignore a stray XHTML-style `/>` on a
+                    // non-void, non-foreign element entirely — `<script
+                    // src="x" />alert(1)</script>` still parses exactly
+                    // like `<script src="x">`, with `alert(1)` as its raw
+                    // content, not as sibling markup. Treating
+                    // `self_closing` as authoritative here would resume
+                    // *normal* parsing right after the `/>`, letting the
+                    // real script/style source (or title/textarea markup)
+                    // be tokenized and rendered as visible document
+                    // content instead of staying raw/hidden.
                     let (text, new_pos) = consume_raw_text(input, pos, &tag);
                     pos = new_pos;
                     let mut children = Vec::new();
@@ -1794,6 +1844,87 @@ mod tests {
             "parse took {:?} — looks quadratic again",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn raw_text_closing_tag_accepts_arbitrary_whitespace_before_the_bracket() {
+        // Regression: `MAX_RAW_CLOSE_SCAN` (64 bytes) bounded the search
+        // for `>` after a candidate `</script`/`</style` prefix — but
+        // HTML5's end-tag grammar allows *arbitrary* whitespace between
+        // the tag name and `>`. A real (if unusually padded) closing tag
+        // with 64+ whitespace bytes before `>` used to fall outside that
+        // bound entirely, so `consume_raw_text` never recognized it and
+        // scanned through to EOF instead — hiding everything after it.
+        let padding = " ".repeat(200);
+        let html = format!("<script>alert(1)</script{padding}><p>Visible</p>");
+        let nodes = parse(&html);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "expected the script element and its sibling <p>, got {nodes:?}"
+        );
+        assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "script"));
+        let Node::Element { tag, children } = &nodes[1] else {
+            panic!("expected the second top-level node to be an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn long_run_of_raw_text_closes_padded_with_whitespace_is_linear_not_quadratic() {
+        // Regression guard for `raw_close_tag_end`'s arbitrary-whitespace
+        // fallback: unlike the bounded search it falls back from, its
+        // whitespace-skip is not itself length-bounded — verify a
+        // candidate-heavy adversarial input (many `</script` fragments,
+        // each followed by a long run of whitespace but never a `>`)
+        // still parses in linear, not quadratic, time.
+        let candidate = format!("</script{}", " ".repeat(200));
+        let html = format!("<script>{}", candidate.repeat(2_000));
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(nodes.len(), 1);
+        assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "script"));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "parse took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn self_closing_syntax_on_a_raw_text_element_is_ignored_like_a_real_browser() {
+        // Regression: `<script>`/`<style>`/`<title>`/`<textarea>` are
+        // non-void HTML elements — real browsers ignore a stray
+        // XHTML-style `/>` on them entirely, still treating everything up
+        // to the next real closing tag as raw content. This parser used
+        // to gate the raw-text branch on `!self_closing`, so
+        // `<script src="x" />alert(1)</script>` skipped straight to the
+        // generic self-closing/void-element case, emitting an empty
+        // `script` element and then parsing `alert(1)` as ordinary
+        // sibling markup — real script source rendered as visible text
+        // instead of staying hidden.
+        let html = r#"<script src="x" />alert(1)</script><p>Visible</p>"#;
+        let nodes = parse(html);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "expected the script element and its sibling <p>, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected the first node to be an element")
+        };
+        assert_eq!(tag, "script");
+        assert_eq!(
+            text(children),
+            "alert(1)",
+            "the script source must stay inside the script element as raw content"
+        );
+        let Node::Element { tag, children } = &nodes[1] else {
+            panic!("expected the second top-level node to be an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "Visible");
     }
 
     #[test]

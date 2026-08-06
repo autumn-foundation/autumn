@@ -214,12 +214,12 @@ fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut 
                 _ if is_non_rendered(tag) => {}
                 "ul" => {
                     push_block_break(out);
-                    inline_list_items(children, false, depth + 1, out);
+                    inline_list_items(children, false, bold, italic, depth + 1, out);
                     push_block_break(out);
                 }
                 "ol" => {
                     push_block_break(out);
-                    inline_list_items(children, true, depth + 1, out);
+                    inline_list_items(children, true, bold, italic, depth + 1, out);
                     push_block_break(out);
                 }
                 _ if is_block_boundary_in_inline_context(tag) => {
@@ -245,7 +245,21 @@ fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut 
 /// all. Not real nested-list layout (no indentation), but keeps each item's
 /// bullet/number instead of losing it — same degrade philosophy as
 /// `inline_spans`'s other block-boundary handling.
-fn inline_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Span>) {
+///
+/// `bold`/`italic` are the ambient style `inline_spans` was already
+/// carrying at the point it found this `<ul>`/`<ol>` (e.g. `true` for a
+/// list nested inside a `<th>`, which `inline_spans` starts bold) — applied
+/// to both the marker and, via a plain pass-through to the recursive
+/// `inline_spans` call below, each item's own content, exactly like
+/// `inline_spans` already threads it through every other nested tag.
+fn inline_list_items(
+    nodes: &[Node],
+    ordered: bool,
+    bold: bool,
+    italic: bool,
+    depth: u32,
+    out: &mut Vec<Span>,
+) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -268,8 +282,8 @@ fn inline_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Sp
         };
         out.push(Span::Run {
             text: marker,
-            bold: false,
-            italic: false,
+            bold,
+            italic,
         });
         // If this item's content starts with a block boundary (e.g.
         // `<li><p>Child</p></li>`), `inline_spans` pushes a break *before*
@@ -281,7 +295,7 @@ fn inline_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Sp
         // break (never more — anything after it is legitimate inter-block
         // spacing within the item's own content).
         let content_start = out.len();
-        inline_spans(children, false, false, depth + 1, out);
+        inline_spans(children, bold, italic, depth + 1, out);
         if out.get(content_start) == Some(&Span::Break) {
             out.remove(content_start);
         }
@@ -1890,6 +1904,45 @@ mod tests {
                 },
             ],
             "the nested item must keep its own bullet marker instead of losing all list semantics"
+        );
+    }
+
+    #[test]
+    fn list_nested_inside_a_table_header_cell_stays_bold() {
+        // Regression: `inline_spans`'s `"ul"`/`"ol"` branch called
+        // `inline_list_items` without passing through the ambient
+        // `bold`/`italic` it had just been called with — so
+        // `<th><ul><li>Header</li></ul></th>`, where `extract_table_rows`
+        // starts `inline_spans` with `bold: true` for a `<th>` cell, lost
+        // that bold styling for both the list's marker and its item text,
+        // even though the same content would stay bold if it weren't
+        // wrapped in a list.
+        let nodes =
+            super::super::html::parse("<table><tr><th><ul><li>Header</li></ul></th></tr></table>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(blocks.len(), 1);
+        let Block::Table(rows) = &blocks[0] else {
+            panic!("expected a table block");
+        };
+        assert_eq!(rows.len(), 1);
+        let (spans, is_header) = &rows[0].cells[0];
+        assert!(is_header);
+        assert_eq!(
+            spans,
+            &[
+                Span::Run {
+                    text: "\u{2022} ".to_owned(),
+                    bold: true,
+                    italic: false,
+                },
+                Span::Run {
+                    text: "Header".to_owned(),
+                    bold: true,
+                    italic: false,
+                },
+            ],
+            "both the list marker and its item content must stay bold inside a <th>, got {spans:?}"
         );
     }
 
