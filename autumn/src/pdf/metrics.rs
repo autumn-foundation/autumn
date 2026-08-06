@@ -54,8 +54,22 @@ const fn base_width_1000em(ch: char) -> u16 {
         // letters share below — e.g. 60 `G`s at 11pt used to estimate
         // ~440pt (fits a 495pt content area) while Helvetica renders them
         // at ~513pt (doesn't).
-        'w' | 'C' | 'D' | 'H' | 'N' | 'R' | 'U' => 722,
-        'G' | 'O' | 'Q' => 778,
+        // Accented Latin-1 forms of these same wide base letters (Ç is a
+        // cedilla'd C, Ñ an N, Ù/Ú/Û/Ü a U, Ð a D-shaped Eth) inherit the
+        // same real Helvetica width as their base letter — the blanket
+        // Latin-1-uppercase-accented range further below approximates the
+        // *whole* C0-DE block at the plain-A-Z width (667), which
+        // underestimates these exactly like the unaccented letters above
+        // did before that fix. A repro matching the reported one: 60 `Ö`s
+        // at 11pt used to estimate ~440pt (fits a 495pt content area) while
+        // Helvetica's real 778-unit `O` width renders them at ~513pt
+        // (doesn't) — `Ö` falls in the 778 arm just below, not here, but
+        // the same underestimation shape applies to `Ç`/`Ñ`/`Ù`-`Ü`/`Ð`.
+        'w' | 'C' | 'D' | 'H' | 'N' | 'R' | 'U' | '\u{00C7}' | '\u{00D0}' | '\u{00D1}'
+        | '\u{00D9}' | '\u{00DA}' | '\u{00DB}' | '\u{00DC}' => 722,
+        // Accented Latin-1 forms of O — see the Ç/Ñ/Ù-Ü/Ð comment above.
+        'G' | 'O' | 'Q' | '\u{00D2}' | '\u{00D3}' | '\u{00D4}' | '\u{00D5}' | '\u{00D6}'
+        | '\u{00D8}' => 778,
         // `&` used to fall into the generic ASCII fallback (556) below, but
         // its real Helvetica width (667) is wider — same underestimation
         // risk as the letters above: a 70-character run of `&`s at 11pt
@@ -349,6 +363,34 @@ mod tests {
             eighty_pluses > content_area_pt,
             "80 +s at 11pt ({eighty_pluses}pt) must be estimated wider than a 495pt content \
              area, matching Helvetica's real ~514pt rendering, not the old ~489pt underestimate"
+        );
+    }
+
+    #[test]
+    fn accented_letters_inherit_their_base_letters_real_width() {
+        // Regression: the blanket Latin-1-uppercase-accented range
+        // approximated the *whole* C0-DE block at the plain-A-Z width
+        // (667), which safely overestimates most base letters (e.g. À/È/Ì,
+        // whose base A/E/I are genuinely 667) but underestimates accented
+        // forms of the letters already known to be wider than 667 (Ç/Ñ/
+        // Ò-Ö/Ø/Ù-Ü). A repro matching the reported one: 60 `Ö`s at 11pt
+        // used to estimate ~440pt (fits a 495pt content area) while
+        // Helvetica's real 778-unit `O` width renders them at ~513pt
+        // (doesn't).
+        assert_eq!(char_width_1000em('\u{00C7}', false), 722); // Ç, like C
+        assert_eq!(char_width_1000em('\u{00D1}', false), 722); // Ñ, like N
+        assert_eq!(char_width_1000em('\u{00D9}', false), 722); // Ù, like U
+        assert_eq!(char_width_1000em('\u{00D6}', false), 778); // Ö, like O
+        assert_eq!(char_width_1000em('\u{00D8}', false), 778); // Ø, like O
+        // Unaccented-equivalent letters that were already correctly (or
+        // safely-over-) estimated stay exactly as before.
+        assert_eq!(char_width_1000em('\u{00C0}', false), 667); // À, like A
+        let sixty_odiaereses = text_width_pt(&"\u{00D6}".repeat(60), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            sixty_odiaereses > content_area_pt,
+            "60 Ös at 11pt ({sixty_odiaereses}pt) must be estimated wider than a 495pt content \
+             area, matching Helvetica's real ~513pt rendering, not the old ~440pt underestimate"
         );
     }
 

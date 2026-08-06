@@ -158,6 +158,13 @@ fn is_block_boundary_in_inline_context(tag: &str) -> bool {
                 | "tr"
                 | "td"
                 | "th"
+                // `<hr>` (e.g. `<li>Before<hr>After</li>`) is a void
+                // element (no children to recurse into), and this context
+                // has no `Block::Rule` to give it the way `flatten_blocks`
+                // does for a top-level `<hr>` — but it still needs to keep
+                // "Before" and "After" from gluing into "BeforeAfter". A
+                // line break is the closest flat-span equivalent of a rule.
+                | "hr"
         )
 }
 
@@ -998,12 +1005,22 @@ impl Writer {
                 self.draw_spans(spans, 11.0, 14.5, 10.0);
             }
             Block::ListItem { marker, spans } => {
-                const INDENT: f32 = 16.0;
+                // A fixed 16pt indent fits every bullet/low-numbered marker
+                // this renderer draws ("•", "1." .. "9.") comfortably, but
+                // an ordered list's marker keeps growing with its index —
+                // "100." alone is already ~21pt at 11pt Helvetica, wider
+                // than the indent, so content wrapped at a fixed 16pt
+                // overlapped the marker instead of starting after it. Grow
+                // the indent (and thus the content's wrap width) to fit
+                // whichever marker this specific item actually has.
+                const MIN_INDENT: f32 = 16.0;
+                const MARKER_GAP: f32 = 4.0;
                 const LINE_HEIGHT: f32 = 14.5;
                 self.ensure_space(LINE_HEIGHT);
                 self.draw_word(0.0, marker, false, false, 11.0);
+                let indent = (text_width_pt(marker, 11.0, false) + MARKER_GAP).max(MIN_INDENT);
                 let words = words_of(spans);
-                let lines = wrap(&words, self.content_width - INDENT, 11.0);
+                let lines = wrap(&words, self.content_width - indent, 11.0);
                 if lines.is_empty() {
                     // An empty item (`<li></li>`, or one whose only content
                     // was skipped, e.g. `<li><script>...</script></li>`)
@@ -1014,7 +1031,7 @@ impl Writer {
                     // item's, landing them almost on top of each other.
                     self.y_from_top += LINE_HEIGHT;
                 } else {
-                    self.draw_lines(&lines, INDENT, 11.0, LINE_HEIGHT, true);
+                    self.draw_lines(&lines, indent, 11.0, LINE_HEIGHT, true);
                 }
                 self.y_from_top += 4.0;
             }
@@ -1576,6 +1593,40 @@ mod tests {
     }
 
     #[test]
+    fn hr_inside_a_list_item_still_separates_adjacent_text() {
+        // Regression: `<hr>` is a void element (no children), so it wasn't
+        // in `is_block_boundary_in_inline_context` and fell through to the
+        // generic transparent-wrapper case in `inline_spans` — recursing
+        // into its (empty) children produced nothing, and no break was
+        // inserted either, so `<li>Before<hr>After</li>` rendered
+        // "BeforeAfter" with the rule silently vanishing.
+        let nodes = super::super::html::parse("<ul><li>Before<hr>After</li></ul>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(blocks.len(), 1);
+        let Block::ListItem { spans, .. } = &blocks[0] else {
+            panic!("expected a list item block");
+        };
+        assert_eq!(
+            spans,
+            &[
+                Span::Run {
+                    text: "Before".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+                Span::Break,
+                Span::Run {
+                    text: "After".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+            ],
+            "hr must still separate the text around it, not vanish and glue them together"
+        );
+    }
+
+    #[test]
     fn nested_list_inside_a_list_item_keeps_its_markers() {
         // Regression: `<li>`'s content goes through `inline_spans`, which had
         // no explicit handling for a nested `<ul>`/`<ol>` — it fell through
@@ -1883,6 +1934,47 @@ mod tests {
         // asserts it completes and still produces at least one page.
         let pages = render_pages(&html);
         assert!(!pages.is_empty());
+    }
+
+    #[test]
+    fn ordered_list_marker_wide_enough_to_overlap_the_fixed_indent_gets_more_room() {
+        // Regression: the indent between a list marker and its item's
+        // content was a fixed 16pt, which fits every bullet/low-numbered
+        // marker comfortably ("•", "1." .. "9.") but not an ordered list
+        // marker whose digits keep growing — "100." alone is already
+        // ~21pt at 11pt Helvetica, wider than the indent, so content wrapped
+        // at a fixed 16pt started underneath the marker's own text instead
+        // of after it.
+        let mut writer = Writer::new();
+        let marker = "100.".to_owned();
+        writer.draw_block(&Block::ListItem {
+            marker: marker.clone(),
+            spans: vec![Span::Run {
+                text: "Item".to_owned(),
+                bold: false,
+                italic: false,
+            }],
+        });
+        let cursor_xs: Vec<f32> = writer
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::SetTextCursor { pos } => Some(pos.x.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cursor_xs.len(),
+            2,
+            "expected one cursor position for the marker and one for the item's text"
+        );
+        let (marker_x, content_x) = (cursor_xs[0], cursor_xs[1]);
+        let marker_width = text_width_pt(&marker, 11.0, false);
+        assert!(
+            content_x - marker_x >= marker_width,
+            "content (x={content_x}) must start at or past the end of the marker \
+             (x={marker_x} + width={marker_width}), not overlap it"
+        );
     }
 
     #[test]

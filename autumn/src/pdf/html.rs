@@ -75,24 +75,38 @@ fn is_void_element(tag: &str) -> bool {
 /// its own top-level [`Block`](super::layout) — `<p>Intro<table>...</table>`
 /// flattens the table's rows/cells into bare inline text (`IntroAB`
 /// instead of a real table) since `inline_spans` has no notion of a table.
-/// For `head`/`body`, the failure mode is the most severe of all: `head`
-/// is in `is_non_rendered` (in `layout.rs`), so nesting `body` under a
-/// still-open `head` — a valid, common HTML5 document with an omitted
-/// `</head>` — discards the *entire visible document* wholesale, not just
-/// one element's structure.
+/// For `head`, the failure mode is the most severe of all: `head` is in
+/// `is_non_rendered` (in `layout.rs`), so nesting anything under a
+/// still-open `head` discards the *entire visible document* wholesale, not
+/// just one element's structure. HTML5 permits omitting *both* `</head>`
+/// (`<head><title>X</title><body>...`) *and* the `<body>` start tag itself
+/// (`<head><title>X</title><p>...`, or even bare text with no wrapper tag
+/// at all) — either way, the first tag or non-whitespace text that isn't
+/// valid content for `<head>` (see [`is_valid_in_head`]) implicitly closes
+/// it, matching the "in head" insertion mode's behavior for any
+/// unexpected token, not only an explicit `<body>`.
 ///
 /// Doesn't need to cover every HTML5 optional-end-tag rule, only the ones
 /// for tags this renderer actually gives that special treatment to.
 fn implicitly_closes(open_tag: &str, new_tag: &str) -> bool {
     (open_tag == "p" && closes_open_paragraph(new_tag))
+        || (open_tag == "head" && !is_valid_in_head(new_tag))
         || matches!(
             (open_tag, new_tag),
             ("li", "li")
                 | ("dt" | "dd", "dt" | "dd")
                 | ("tr", "tr")
                 | ("td" | "th", "td" | "th" | "tr")
-                | ("head", "body")
         )
+}
+
+/// Tags HTML5 permits directly inside `<head>` — anything else implies
+/// `</head>` before it opens; see [`implicitly_closes`].
+fn is_valid_in_head(tag: &str) -> bool {
+    matches!(
+        tag,
+        "head" | "title" | "base" | "link" | "meta" | "style" | "script" | "noscript" | "template"
+    )
 }
 
 /// Tags that, per HTML5's `<p>` implied-end-tag rule, close an open `<p>`
@@ -367,9 +381,28 @@ fn close_implied_tags(stack: &mut Vec<(String, Vec<Node>)>, new_tag: &str) {
     }
 }
 
-fn push_text(stack: &mut [(String, Vec<Node>)], text: &str) {
+fn push_text(stack: &mut Vec<(String, Vec<Node>)>, text: &str) {
     if text.is_empty() {
         return;
+    }
+    // Non-whitespace text is just as invalid inside `<head>` as an
+    // unexpected tag — same implied close as `implicitly_closes`'s `head`
+    // case, just triggered by content instead of a new element (e.g.
+    // `<head><title>X</title>Visible</head>`, or the same with no closing
+    // tag at all). Whitespace-only text (formatting indentation between
+    // tags) doesn't count — it's not real content.
+    if stack.last().is_some_and(|(tag, _)| tag == "head")
+        && text.contains(|c: char| !c.is_whitespace())
+    {
+        let (closed_tag, children) = stack.pop().expect("just checked stack.last() above");
+        stack
+            .last_mut()
+            .expect("root frame is never popped")
+            .1
+            .push(Node::Element {
+                tag: closed_tag,
+                children,
+            });
     }
     let top = stack.last_mut().expect("root frame is never popped");
     if let Some(Node::Text(prev)) = top.1.last_mut() {
@@ -740,6 +773,87 @@ mod tests {
         };
         assert_eq!(tag, "body");
         assert_eq!(text(body_children), "Visible");
+    }
+
+    #[test]
+    fn an_omitted_body_start_tag_also_implies_a_head_close() {
+        // Regression: HTML5 permits omitting the `<body>` *start* tag
+        // itself, not just `</head>` — `<head><title>X</title><p>...`
+        // (or even bare text with no wrapper tag at all) is equally valid.
+        // The previous fix only matched an explicit `("head", "body")`
+        // transition, so `<p>` opening while `<head>` was still open didn't
+        // close it — `<p>` (and its "Visible" text) nested inside `<head>`
+        // and, since `head` is in `is_non_rendered` (`layout.rs`), vanished
+        // along with the rest of the document.
+        let nodes = parse("<html><head><title>X</title><p>Visible</p></html>");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "html");
+        assert_eq!(
+            children.len(),
+            2,
+            "expected <head> and <p> as siblings, got {children:?}"
+        );
+        assert!(matches!(&children[0], Node::Element { tag, .. } if tag == "head"));
+        let Node::Element {
+            tag,
+            children: p_children,
+        } = &children[1]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(p_children), "Visible");
+    }
+
+    #[test]
+    fn non_whitespace_text_also_implies_a_head_close() {
+        // Regression: bare text with no wrapper tag at all is just as valid
+        // body content as `<p>...` — `<head><title>X</title>Visible` (a
+        // still-open `<head>`, no `<body>`/`<p>` element at all) used to
+        // leave "Visible" nested inside (and, being non-rendered, hidden
+        // by) `<head>` since `implicitly_closes` only fires on a new tag,
+        // never on a text node.
+        let nodes = parse("<html><head><title>X</title>Visible</html>");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "html");
+        assert_eq!(
+            children.len(),
+            2,
+            "expected <head> and the bare text as siblings, got {children:?}"
+        );
+        assert!(matches!(&children[0], Node::Element { tag, .. } if tag == "head"));
+        assert_eq!(children[1], Node::Text("Visible".to_owned()));
+    }
+
+    #[test]
+    fn whitespace_only_text_does_not_close_an_open_head() {
+        // Formatting whitespace (indentation/newlines between tags) between
+        // `<head>`'s children must not trigger the same-as-text implied
+        // close — only genuine non-whitespace content should.
+        let nodes =
+            parse("<html><head>\n  <title>X</title>\n</head><body><p>Visible</p></body></html>");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "html");
+        let Node::Element {
+            tag: head_tag,
+            children: head_children,
+        } = &children[0]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(head_tag, "head");
+        assert!(
+            head_children
+                .iter()
+                .any(|n| matches!(n, Node::Element { tag, .. } if tag == "title")),
+            "the <title> must still be a child of <head>, not hoisted out by whitespace"
+        );
     }
 
     #[test]
