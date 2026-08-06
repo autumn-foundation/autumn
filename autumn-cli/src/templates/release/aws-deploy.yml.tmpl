@@ -15,9 +15,11 @@
 #         scoped to `terraform output ecr_repository_url`'s repository ARN
 #         — never account-wide `ecr:*`.
 #       - ecs:RegisterTaskDefinition/DescribeTaskDefinition/RunTask/
-#         DescribeTasks/UpdateService/DescribeServices (the task-definition
-#         re-registration steps below call DescribeTaskDefinition before
-#         RegisterTaskDefinition — both are required, not just the latter).
+#         DescribeTasks/StopTask/UpdateService/DescribeServices (the
+#         task-definition re-registration steps below call
+#         DescribeTaskDefinition before RegisterTaskDefinition — both are
+#         required, not just the latter; StopTask is used to kill a
+#         migration task that exceeds its polling budget).
 #       - iam:PassRole for `terraform output execution_role_arn` and
 #         `terraform output task_role_arn` (RunTask/RegisterTaskDefinition
 #         need to pass both roles to ECS).
@@ -276,7 +278,17 @@ jobs:
             fi
             sleep 10
           done
-          echo "::error::migration task did not finish within the time budget" >&2
+          # ECS tasks have no runtime limit of their own — stopTimeout only
+          # bounds the grace period AFTER a stop is requested. Without
+          # explicitly stopping it here, a migration that blows the polling
+          # budget keeps running in the background even after this job
+          # gives up; the concurrency group is released the moment this job
+          # fails, so a LATER deploy could start a second migration task
+          # while this one is still mutating the schema.
+          echo "::error::migration task did not finish within the time budget — stopping it" >&2
+          aws ecs stop-task --cluster "$ECS_CLUSTER_NAME" --task "$TASK_ARN" \
+            --reason "aws-deploy.yml: migration exceeded its polling budget" --output none
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER_NAME" --tasks "$TASK_ARN"
           exit 1
         env:
           ECS_CLUSTER_NAME: ${{ vars.ECS_CLUSTER_NAME }}
@@ -286,6 +298,7 @@ jobs:
 
       - name: Deploy new image to the ECS service
         run: |
+          set -euo pipefail
           aws ecs update-service \
             --cluster "$ECS_CLUSTER_NAME" \
             --service "$ECS_SERVICE_NAME" \
@@ -295,6 +308,23 @@ jobs:
           aws ecs wait services-stable \
             --cluster "$ECS_CLUSTER_NAME" \
             --services "$ECS_SERVICE_NAME"
+
+          # `services-stable`'s predicate only requires ONE deployment to
+          # have runningCount == desiredCount — if the new revision failed
+          # its health checks, the deployment circuit breaker
+          # (aws_ecs_service.deployment_circuit_breaker, main.tf) rolls the
+          # service back to the PREVIOUS revision automatically, and that
+          # older deployment satisfies the waiter's predicate just as well.
+          # Without this check, this step would report success even though
+          # $APP_TASK_DEF_ARN was never actually running.
+          DEPLOYED_TASK_DEF=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER_NAME" --services "$ECS_SERVICE_NAME" \
+            --query "services[0].deployments[?status=='PRIMARY'].taskDefinition | [0]" \
+            --output text)
+          if [ "$DEPLOYED_TASK_DEF" != "$APP_TASK_DEF_ARN" ]; then
+            echo "::error::deployment rolled back — the PRIMARY deployment is running $DEPLOYED_TASK_DEF, not the requested $APP_TASK_DEF_ARN (the circuit breaker likely reverted a failing health check)" >&2
+            exit 1
+          fi
         env:
           ECS_CLUSTER_NAME: ${{ vars.ECS_CLUSTER_NAME }}
           ECS_SERVICE_NAME: ${{ vars.ECS_SERVICE_NAME }}

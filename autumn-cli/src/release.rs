@@ -4585,6 +4585,87 @@ previous_secrets = []
         );
     }
 
+    #[test]
+    fn aws_workflow_detects_circuit_breaker_rollback_after_stabilizing() {
+        // `services-stable`'s predicate only requires ONE deployment to
+        // have runningCount == desiredCount — if the new revision failed
+        // its health checks, the circuit breaker rolls the service back to
+        // the PREVIOUS revision, and that older deployment satisfies the
+        // waiter just as well. Without an explicit check, this step would
+        // report success even though the requested task definition was
+        // never actually running.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        let deploy_step = content
+            .split("Deploy new image to the ECS service")
+            .nth(1)
+            .and_then(|rest| rest.split("env:").next())
+            .expect("must find the deploy step");
+        assert!(
+            deploy_step.contains("deployments[?status=='PRIMARY']")
+                || deploy_step.contains("deployments[?status==`PRIMARY`]"),
+            "the deploy step must inspect the PRIMARY deployment's task definition after \
+             waiting: {deploy_step}"
+        );
+        assert!(
+            deploy_step.contains("DEPLOYED_TASK_DEF") && deploy_step.contains("APP_TASK_DEF_ARN"),
+            "the deploy step must compare the deployed task definition against the requested \
+             one and fail if they differ: {deploy_step}"
+        );
+    }
+
+    #[test]
+    fn aws_workflow_stops_migration_task_on_timeout() {
+        // ECS tasks have no runtime limit of their own; without an
+        // explicit stop-task call, a migration that exceeds its polling
+        // budget keeps running in the background after this job gives up
+        // and releases the concurrency group — letting a later deploy
+        // start a second migration while the timed-out one is still
+        // mutating the schema.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        let migrate_step = content
+            .split("Run database migrations")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("must find the migration step");
+        let timeout_block = migrate_step
+            .split("did not finish within the time budget")
+            .nth(1)
+            .expect("must find the timeout-budget-exceeded branch");
+        assert!(
+            timeout_block.contains("aws ecs stop-task"),
+            "the timeout branch must explicitly stop the migration task, not just exit: \
+             {timeout_block}"
+        );
+        assert!(
+            timeout_block.contains("wait tasks-stopped"),
+            "the timeout branch must wait for the stop to actually take effect before this \
+             job (and its concurrency group) releases: {timeout_block}"
+        );
+    }
+
+    #[test]
+    fn aws_workflow_documents_stop_task_permission() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        let header = content
+            .split("\nname: aws-deploy")
+            .next()
+            .expect("workflow must have a header comment before `name:`");
+        assert!(
+            header.contains("StopTask"),
+            "the header's documented IAM policy must include ecs:StopTask, used to kill a \
+             timed-out migration task: {header}"
+        );
+    }
+
     // ── aws-ecs workflow discoverability (git root vs. workspace member) ──────
 
     #[test]
