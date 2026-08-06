@@ -487,12 +487,13 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
 
 /// Locates the `>` that ends a raw-text closing tag candidate, given
 /// `after_tag` (the text right after the tag name, e.g. right after
-/// `</script`). A single quote-aware forward scan for `>`, `<`, or a quote
-/// character (`is_attr_value_quote`-gated exactly like [`find_tag_end`]),
-/// stopping at whichever comes first — an unquoted `<` ends the scan with
-/// `None` (this candidate never closes; some other tag starts here
-/// instead), a genuinely quoted span is skipped over via its matching
-/// close quote, and `>` outside any quoted span is the real answer.
+/// `</script`). A forward scan that tracks HTML5 attribute-value tokenizer
+/// state via [`consume_attr_value`] (see its docs for why this needs to be
+/// real forward state, not a backward-looking heuristic), stopping at the
+/// first `>` or unquoted `<` — an unquoted `<` ends the scan with `None`
+/// (this candidate never closes; some other tag starts here instead), a
+/// genuinely quoted value's contents are skipped over regardless of what
+/// they contain, and `>` outside any value is the real answer.
 ///
 /// Unbounded by any fixed byte count — unlike a fixed window, this can
 /// never reject a genuine closing tag just because its attribute list (or
@@ -508,7 +509,7 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
 /// make a search that ignored `<` entirely pay a full remaining-input scan
 /// on every single failed candidate, genuinely O(n^2). Stopping at the
 /// first *unquoted* `<` instead makes each candidate's own share of the
-/// work bounded by the gap up to that `<` (or, if a genuinely quoted span
+/// work bounded by the gap up to that `<` (or, if a genuinely quoted value
 /// is open, by the gap to its matching close quote) — every such gap is
 /// disjoint from every other candidate's, so the total across every
 /// candidate in one [`consume_raw_text`] call stays O(`rest.len()`), not
@@ -531,23 +532,32 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
 /// result.
 fn raw_close_tag_end(after_tag: &str) -> Option<usize> {
     let bytes = after_tag.as_bytes();
-    let mut pos = 0;
+    let mut i = 0;
+    let mut in_unquoted_value = false;
     loop {
-        let rel = bytes[pos..]
+        let rel = bytes
+            .get(i..)?
             .iter()
-            .position(|&b| matches!(b, b'>' | b'<' | b'"' | b'\''))?;
-        let idx = pos + rel;
+            .position(|&b| b == b'>' || b == b'<' || b == b'=' || b.is_ascii_whitespace())?;
+        let idx = i + rel;
         match bytes[idx] {
             b'>' => return Some(idx),
-            b'<' => return None,
-            quote => {
-                if !is_attr_value_quote(bytes, idx) {
-                    pos = idx + 1;
-                    continue;
-                }
-                let after_quote = idx + 1;
-                let close_off = after_tag.get(after_quote..)?.find(quote as char)?;
-                pos = after_quote + close_off + 1;
+            b'<' if !in_unquoted_value => return None,
+            b'=' if !in_unquoted_value => {
+                let (next_i, quoted) = consume_attr_value(bytes, idx)?;
+                in_unquoted_value = !quoted;
+                i = next_i;
+            }
+            b if b.is_ascii_whitespace() => {
+                in_unquoted_value = false;
+                i = idx + 1;
+            }
+            _ => {
+                // '<' or '=' encountered while already inside an unquoted
+                // value — literal content of that value (HTML5 tolerates
+                // both inside an unquoted value the same way it tolerates
+                // them inside a quoted one), not a fresh stop condition.
+                i = idx + 1;
             }
         }
     }
@@ -1038,160 +1048,126 @@ fn bounded_prefix(s: &str, max_len: usize) -> &str {
     &s[..end]
 }
 
-/// Whether the quote byte at `bytes[quote_idx]` is a genuine attribute-value
-/// opener — i.e. preceded by `=` (skipping any whitespace in between, since
-/// HTML5's attribute syntax permits it: `title = "x"` is valid, not just
-/// `title="x"`) *and* that `=` is itself a fresh, freshly-started
-/// name-then-`=` boundary — rather than a literal quote character sitting
-/// inside an *unquoted* attribute value. Two distinct shapes of "not
-/// genuine" both fall out of a stray quote/`=` character inside an already-
-/// started unquoted value (a parse-error condition real browsers still
-/// tolerate — the whole thing is just literal value content, and the tag
-/// still ends at the next real `>`, not at a delimiter this value's own
-/// text happens to resemble):
+/// Given `bytes[eq_idx] == b'='`, consumes what follows per HTML5's "before
+/// attribute value state": skips whitespace (permitted between `=` and the
+/// value — `title = "x"` is valid, not just `title="x"`), then either
+/// enters a quoted value if the next byte is `"`/`'` — skipping to its
+/// matching close quote, wherever it is, regardless of what it contains —
+/// or starts an unquoted value otherwise (any other byte, including EOF/`>`
+/// immediately, i.e. an empty value). Returns the byte offset to resume
+/// scanning from, and whether the value was quoted.
 ///
-/// 1. No `=` immediately precedes the quote at all (e.g. `it's` in
-///    `title=it's` — the apostrophe isn't preceded by `=`).
-/// 2. An `=` *does* immediately precede it, but that `=` isn't itself a
-///    fresh value-starter — it's a second, later `=` (or another quote)
-///    inside a value that already started earlier without ever being
-///    quoted (e.g. `title=x=">` — the value starts unquoted at `x`, so the
-///    later `=` and `"` are just more of that same literal value, not a
-///    new attribute).
+/// Determining "is this quote/`=` genuine" by looking only at what
+/// *immediately precedes* it (a byte or two of backward lookback) cannot
+/// work in general — a stray `=` or quote character inside an already-
+/// active *unquoted* value (`title=x=">`, a parse-error condition real
+/// browsers still tolerate as literal content) is byte-for-byte
+/// indistinguishable, looking only backward from that point, from the
+/// closing quote of a *properly completed* adjacent quoted attribute with
+/// no separating whitespace (`a="x"b="y"` — also valid, unremarkable HTML,
+/// since ending a quoted value returns the tokenizer straight to
+/// "before attribute name state" with no whitespace required). Both are a
+/// quote character immediately followed by more name-like bytes then `=`.
+/// The only way to tell them apart is genuine forward state: did the
+/// scanner reach this point by properly finishing a quoted value (real
+/// name=value boundary, safe to start fresh), or by drifting through an
+/// unquoted value that never terminated (not safe — everything in it,
+/// `=`/quotes included, is just literal content)? [`find_tag_end`] and
+/// [`raw_close_tag_end`] each track this themselves as `in_unquoted_value`
+/// state while scanning forward, and only call this function when that
+/// state is `false` — i.e. only at a position forward-scanning has already
+/// established is a genuine value start.
 ///
-/// Both would otherwise make [`find_tag_end`]/[`raw_close_tag_end`] wrongly
-/// swallow the rest of the tag (and, if no matching quote ever appears, the
-/// rest of the document) looking for a close that was never a real
-/// attribute value to begin with.
-///
-/// Case 2 is detected by walking backward from that `=` through what a
-/// genuine attribute name would be: reaching whitespace (or the start of
-/// `bytes`) first means it really is a fresh `name=`; reaching *another*
-/// `=` or quote character first means this `=` is itself buried inside
-/// value content, not a name.
-///
-/// Neither backward walk (the whitespace-skip, or this name-boundary walk)
-/// can reopen the O(n^2) risk this module's quote-tracking guards against.
-/// Each only continues while it keeps seeing "plausible" bytes (whitespace,
-/// or name-like characters respectively) and stops the moment it sees
-/// something else — for a chain of quote/`=` characters each separated by
-/// a run of such bytes, that's the exact same run [`find_tag_end`]'s/
-/// [`raw_close_tag_end`]'s own forward scan already paid to reach this
-/// quote in the first place, not some unboundedly larger distance. Total
-/// backward-walk cost across every quote candidate in one call stays O(the
-/// forward scan's own total), i.e. still linear in the input.
-fn is_attr_value_quote(bytes: &[u8], quote_idx: usize) -> bool {
-    let mut i = quote_idx;
-    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
-        i -= 1;
+/// Returns `None` only if a quoted value's matching close quote is never
+/// found (the whole tag never closes — matches this parser's usual
+/// auto-close-at-EOF tolerance for a genuinely unterminated quoted
+/// attribute); an unquoted value can't fail to "close" here since the
+/// caller keeps scanning through its content until real termination
+/// (whitespace or `>`/`<`) on its own.
+fn consume_attr_value(bytes: &[u8], eq_idx: usize) -> Option<(usize, bool)> {
+    let mut j = eq_idx + 1;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
     }
-    if i == 0 || bytes[i - 1] != b'=' {
-        return false;
-    }
-    let mut j = i - 1;
-    while j > 0 {
-        match bytes[j - 1] {
-            b if b.is_ascii_whitespace() => return true,
-            b'=' | b'"' | b'\'' => return false,
-            _ => j -= 1,
+    match bytes.get(j) {
+        Some(&quote @ (b'"' | b'\'')) => {
+            let after_quote = j + 1;
+            let close_off = bytes.get(after_quote..)?.iter().position(|&b| b == quote)?;
+            Some((after_quote + close_off + 1, true))
         }
+        _ => Some((j, false)),
     }
-    true
 }
 
 /// Find the byte offset of the `>` that ends an opening tag within `window`,
-/// skipping any `>` that appears inside a *genuinely quoted* attribute value
-/// (e.g. `<div title="Balance > 100">`) — otherwise that quoted `>` is
-/// mistaken for the tag's real closing delimiter, truncating the tag early
-/// and leaking the rest of the attribute value into the document as literal
-/// text. See [`is_attr_value_quote`] for what makes a quote "genuine".
+/// skipping any `>` that appears inside a *genuinely quoted or unquoted*
+/// attribute value (e.g. `<div title="Balance > 100">` or, per HTML5's
+/// parse-error-tolerant unquoted-value handling, `<div title=x=">`) —
+/// otherwise such a `>` is mistaken for the tag's real closing delimiter,
+/// truncating the tag early and leaking the rest of the attribute value
+/// into the document as literal text.
 ///
-/// Every check here is bounded by [`str::find`]'s own cost of locating `>`
-/// (i.e. O(distance to the real `>`, or to EOF if there is none), not
-/// O(`window.len()`) — essential now that this is called both on a
-/// [`MAX_TAG_SCAN`]-bounded `window` (cheap either way) *and* unbounded,
-/// straight from [`oversized_tag_body_start`]/[`push_oversized_generic_tag`]
-/// on the entire remaining document. An earlier version instead began with
-/// `!window.contains('"') && !window.contains('\'')` as a fast pre-check —
-/// safe (and a real speedup) when `window` was always bounded, but once
-/// called unbounded it silently reintroduced the same O(n^2) shape this
-/// module's other bounds guard against: proving a quote style is *absent*
-/// throughout a huge `window` costs a full scan of it regardless of the
-/// eventual answer, and for many single-quote-only oversized tags in a row
-/// (no `"` anywhere in the rest of the document), `contains('"')` alone
-/// paid that full remaining-document scan on every single one — confirmed
-/// by timing (16,000 such tags took over two minutes). `window.find('>')`
-/// below doesn't have this problem: unlike `contains`, it doesn't need to
-/// prove anything about the *rest* of `window` once it finds a match.
+/// Two tiers. First, the fast, heavily-optimized [`str::find`] path: locate
+/// the naive first `>`, and if no quote character appears anywhere before
+/// it, that naive `>` genuinely is the answer — an unquoted value can't
+/// hide a `>` from a naive scan the way a quoted one can, since (per
+/// HTML5's own tokenizer) an unquoted value terminates *at* the first `>`
+/// it meets, exactly where the naive scan would already stop. This covers
+/// the overwhelmingly common case (no attributes, or attributes with no
+/// quote character at all) in O(distance to the real `>`, or to EOF if
+/// there is none) — essential since `window` is sometimes
+/// [`MAX_TAG_SCAN`]-bounded (cheap either way) and sometimes unbounded,
+/// straight from
+/// [`oversized_tag_body_start`]/[`push_oversized_generic_tag`] on the
+/// entire remaining document, where a slower per-byte scan would cost far
+/// more (confirmed by timing: this tier alone, not the second, is what
+/// keeps `"<a".repeat(100_000)` linear — a manual byte-by-byte scan here
+/// instead measured over 3s for that input, an easy trap since it's still
+/// O(n) asymptotically, just with a much larger constant).
+///
+/// Second, only once a quote is confirmed present before the naive `>`: a
+/// forward scan tracking real HTML5 attribute-value tokenizer state via
+/// [`consume_attr_value`] — see its docs for why this needs to be genuine
+/// forward state, not a backward-looking heuristic, to correctly
+/// distinguish a quote that's a genuine value opener from one that isn't.
+/// Bounded the same way the pre-check above already established a quote
+/// exists before some point — this tier existing at all is gated on that,
+/// so it doesn't reopen the "prove a quote style is absent over a huge
+/// span" O(n^2) shape a previous version of this pre-check had (confirmed
+/// by timing: 16,000 single-quoted 5 KiB tags took over two minutes before
+/// *that* fix) — the gate here checks presence within a bounded prefix
+/// (`window[..naive_gt]`), not the whole window.
 fn find_tag_end(window: &str) -> Option<usize> {
     let naive_gt = window.find('>')?;
     if !window[..naive_gt].contains('"') && !window[..naive_gt].contains('\'') {
         return Some(naive_gt);
     }
-    // A quote precedes the naive `>`, so it might be hiding the real one
-    // (e.g. `title="Balance > 100"`). Walk forward, jumping over each
-    // *genuinely* quoted span (see [`is_attr_value_quote`]) via a single
-    // fast `find` for its matching close quote, until reaching a `>` with
-    // no unclosed quote before it. A quote character that isn't a genuine
-    // opener (not preceded by `=`) is just literal content — skip past it
-    // and keep looking, rather than trying (and likely failing, if no
-    // matching quote of that style exists later) to pair it with one.
-    //
-    // Regression: an earlier version of this loop re-derived `gt` via a
-    // fresh `rest.find('>')` on *every* iteration, scanning from the
-    // (advancing) `pos` all the way back out to the same absolute `>`
-    // position each time — for a long chain of *short* quote pairs all
-    // closing well before the eventual real `>` (e.g.
-    // `data-x="a""a""a"...">`), that `>` never moves, so every one of
-    // those re-scans pays the same long distance again: O(pairs *
-    // distance-to-`>`), the same O(n^2) shape `MAX_TAG_SCAN`/
-    // `MAX_CLOSE_SCAN` were fixed for elsewhere in this module (confirmed
-    // by timing it, not just complexity-class reasoning: doubling the
-    // input roughly quadrupled the time). `gt` only genuinely needs
-    // re-deriving when the quote just skipped turns out to have closed
-    // *past* it — meaning that old `gt` was actually inside the quote and
-    // was never real to begin with; otherwise it's unchanged from the
-    // last time it was found, so reusing it is correct, not just faster.
-    //
-    // Skipping a non-genuine quote (`pos = quote_idx + 1`, loop again)
-    // doesn't reopen that same O(n^2) shape either: `rest.bytes().position`
-    // always finds the *next* quote character regardless of whether it
-    // turns out to be genuine, so a long run of stray quote characters
-    // (e.g. `it's don't can't...`) still only costs the gap between
-    // consecutive quotes each time, not a rescan of the whole remaining
-    // span.
-    let mut pos = 0;
-    let mut gt = naive_gt;
+    let bytes = window.as_bytes();
+    let mut i = 0;
+    let mut in_unquoted_value = false;
     loop {
-        if gt < pos {
-            gt = pos + window.get(pos..)?.find('>')?;
+        let rel = bytes
+            .get(i..)?
+            .iter()
+            .position(|&b| b == b'>' || b == b'=' || b.is_ascii_whitespace())?;
+        let idx = i + rel;
+        match bytes[idx] {
+            b'>' => return Some(idx),
+            b'=' if !in_unquoted_value => {
+                let (next_i, quoted) = consume_attr_value(bytes, idx)?;
+                in_unquoted_value = !quoted;
+                i = next_i;
+            }
+            b if b.is_ascii_whitespace() => {
+                in_unquoted_value = false;
+                i = idx + 1;
+            }
+            _ => {
+                // '=' encountered while already inside an unquoted value —
+                // literal content of that value, not a fresh value-starter.
+                i = idx + 1;
+            }
         }
-        let rest = window.get(pos..gt)?;
-        // A single forward byte-scan for *either* quote character, not
-        // `rest.find('"')` and `rest.find('\'')` as two separate calls: if
-        // only one quote style is ever used (overwhelmingly the common
-        // case), the *other* character never appears anywhere in `rest`,
-        // and confirming that absence costs `find` a full scan of `rest`
-        // every time — with `rest` shrinking only a few bytes per
-        // iteration for a long chain of short quote pairs, that's another
-        // O(pairs * distance-to-`>`) cost, the same shape this loop's
-        // `gt`-reuse fix above already eliminated for the `>` search.
-        // `bytes()`/`position()` (not `char_indices()`) since both quote
-        // characters are single ASCII bytes — no UTF-8 decoding needed to
-        // compare against them.
-        let quote_before_gt = rest.bytes().position(|b| b == b'"' || b == b'\'');
-        let Some(quote_off) = quote_before_gt else {
-            return Some(gt);
-        };
-        let quote_idx = pos + quote_off;
-        if !is_attr_value_quote(window.as_bytes(), quote_idx) {
-            pos = quote_idx + 1;
-            continue;
-        }
-        let quote = window.as_bytes()[quote_idx];
-        let after_quote = quote_idx + 1;
-        let close_off = window.get(after_quote..)?.find(quote as char)?;
-        pos = after_quote + close_off + 1;
     }
 }
 
@@ -2851,16 +2827,41 @@ mod tests {
 
     #[test]
     fn stray_equals_and_quote_inside_an_already_started_unquoted_value_does_not_swallow_the_tag() {
-        // Regression: `is_attr_value_quote` treated *any* quote preceded
-        // by `=` as a genuine opener, but a second `=` (or quote) can
-        // legally occur inside a value that already started *unquoted* —
-        // `title=x="` means the value starts unquoted at `x`, and the
-        // following `=`/`"` are just more literal (parse-error-tolerant)
-        // value content, not a fresh attribute. Without distinguishing
-        // this, the `"` was mistaken for a real opener, found no matching
-        // close, and the oversized-tag fallback discarded the rest of the
-        // document looking for one that was never real.
+        // Regression: an earlier version tried to answer "is this quote a
+        // genuine attribute-value opener" by looking only backward from
+        // it, but a second `=` (or quote) can legally occur inside a value
+        // that already started *unquoted* — `title=x="` means the value
+        // starts unquoted at `x`, and the following `=`/`"` are just more
+        // literal (parse-error-tolerant) value content, not a fresh
+        // attribute. Without distinguishing this, the `"` was mistaken
+        // for a real opener, found no matching close, and the
+        // oversized-tag fallback discarded the rest of the document
+        // looking for one that was never real.
         let nodes = parse(r#"<div title=x=">Visible</div>"#);
+        assert_eq!(nodes.len(), 1, "expected a single <div>, got {nodes:?}");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "div");
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn adjacent_quoted_attributes_with_no_separating_whitespace_are_both_recognized() {
+        // Regression: a backward-only heuristic for "is this quote a
+        // genuine opener" can't distinguish a stray quote/`=` inside an
+        // already-open *unquoted* value (the case above) from the
+        // *closing* quote of a properly-completed, immediately-adjacent
+        // quoted attribute — `a="x"b="y"` is valid HTML (ending a quoted
+        // value returns straight to "before attribute name state," no
+        // whitespace required), but both look identical from a purely
+        // backward-looking check: a quote character immediately followed
+        // by more name-like bytes then `=`. `b`'s opening quote was
+        // wrongly rejected, so its quoted `>` was mistaken for the tag's
+        // real delimiter, leaking `secret">` into the visible text. Only
+        // genuine forward tokenizer state (tracking whether the previous
+        // value was properly closed) can tell these apart correctly.
+        let nodes = parse(r#"<div a="x"b=">secret">Visible</div>"#);
         assert_eq!(nodes.len(), 1, "expected a single <div>, got {nodes:?}");
         let Node::Element { tag, children } = &nodes[0] else {
             panic!("expected an element")
