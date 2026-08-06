@@ -1041,31 +1041,62 @@ fn bounded_prefix(s: &str, max_len: usize) -> &str {
 /// Whether the quote byte at `bytes[quote_idx]` is a genuine attribute-value
 /// opener — i.e. preceded by `=` (skipping any whitespace in between, since
 /// HTML5's attribute syntax permits it: `title = "x"` is valid, not just
-/// `title="x"`) — rather than a literal quote character sitting inside an
-/// *unquoted* attribute value (e.g. `it's` in `title=it's`, a parse-error
-/// condition real browsers still tolerate: the tag still ends at the next
-/// real `>`, not at a second apostrophe that may not even exist). Treating
-/// every quote character as toggling a quoted span — regardless of what
-/// precedes it — makes such a value's stray quote wrongly swallow the rest
-/// of the tag (and, if no matching quote ever appears, the rest of the
-/// document) looking for a close that was never a real attribute value to
-/// begin with.
+/// `title="x"`) *and* that `=` is itself a fresh, freshly-started
+/// name-then-`=` boundary — rather than a literal quote character sitting
+/// inside an *unquoted* attribute value. Two distinct shapes of "not
+/// genuine" both fall out of a stray quote/`=` character inside an already-
+/// started unquoted value (a parse-error condition real browsers still
+/// tolerate — the whole thing is just literal value content, and the tag
+/// still ends at the next real `>`, not at a delimiter this value's own
+/// text happens to resemble):
 ///
-/// The backward whitespace walk can't reopen the O(n^2) risk this module's
-/// quote-tracking guards against: it only ever continues through whitespace
-/// bytes, stopping at the first non-whitespace one behind it — for a chain
-/// of quote characters each separated by a whitespace run, that's the exact
-/// same run [`find_tag_end`]'s/[`raw_close_tag_end`]'s own forward scan
-/// already paid to reach this quote in the first place, not some
-/// unboundedly larger distance. Total backward-walk cost across every quote
-/// candidate in one call stays O(the forward scan's own total), i.e. still
-/// linear in the input.
+/// 1. No `=` immediately precedes the quote at all (e.g. `it's` in
+///    `title=it's` — the apostrophe isn't preceded by `=`).
+/// 2. An `=` *does* immediately precede it, but that `=` isn't itself a
+///    fresh value-starter — it's a second, later `=` (or another quote)
+///    inside a value that already started earlier without ever being
+///    quoted (e.g. `title=x=">` — the value starts unquoted at `x`, so the
+///    later `=` and `"` are just more of that same literal value, not a
+///    new attribute).
+///
+/// Both would otherwise make [`find_tag_end`]/[`raw_close_tag_end`] wrongly
+/// swallow the rest of the tag (and, if no matching quote ever appears, the
+/// rest of the document) looking for a close that was never a real
+/// attribute value to begin with.
+///
+/// Case 2 is detected by walking backward from that `=` through what a
+/// genuine attribute name would be: reaching whitespace (or the start of
+/// `bytes`) first means it really is a fresh `name=`; reaching *another*
+/// `=` or quote character first means this `=` is itself buried inside
+/// value content, not a name.
+///
+/// Neither backward walk (the whitespace-skip, or this name-boundary walk)
+/// can reopen the O(n^2) risk this module's quote-tracking guards against.
+/// Each only continues while it keeps seeing "plausible" bytes (whitespace,
+/// or name-like characters respectively) and stops the moment it sees
+/// something else — for a chain of quote/`=` characters each separated by
+/// a run of such bytes, that's the exact same run [`find_tag_end`]'s/
+/// [`raw_close_tag_end`]'s own forward scan already paid to reach this
+/// quote in the first place, not some unboundedly larger distance. Total
+/// backward-walk cost across every quote candidate in one call stays O(the
+/// forward scan's own total), i.e. still linear in the input.
 fn is_attr_value_quote(bytes: &[u8], quote_idx: usize) -> bool {
     let mut i = quote_idx;
     while i > 0 && bytes[i - 1].is_ascii_whitespace() {
         i -= 1;
     }
-    i > 0 && bytes[i - 1] == b'='
+    if i == 0 || bytes[i - 1] != b'=' {
+        return false;
+    }
+    let mut j = i - 1;
+    while j > 0 {
+        match bytes[j - 1] {
+            b if b.is_ascii_whitespace() => return true,
+            b'=' | b'"' | b'\'' => return false,
+            _ => j -= 1,
+        }
+    }
+    true
 }
 
 /// Find the byte offset of the `>` that ends an opening tag within `window`,
@@ -1075,37 +1106,24 @@ fn is_attr_value_quote(bytes: &[u8], quote_idx: usize) -> bool {
 /// and leaking the rest of the attribute value into the document as literal
 /// text. See [`is_attr_value_quote`] for what makes a quote "genuine".
 ///
-/// Takes the fast, heavily-optimized [`str::find`] path whenever `window`
-/// contains no quote character at all — the overwhelmingly common case, and
-/// exactly what the existing quadratic-scan regression tests exercise (long
-/// runs of unterminated tags with no attributes) — so this doesn't reopen
-/// the O(n^2) cost [`MAX_TAG_SCAN`] exists to bound. Only pays for the
-/// slower quote-tracking scan when a `"`/`'` is actually present, still
-/// bounded by the same `window` (already capped to [`MAX_TAG_SCAN`] bytes
-/// by the caller) either way.
+/// Every check here is bounded by [`str::find`]'s own cost of locating `>`
+/// (i.e. O(distance to the real `>`, or to EOF if there is none), not
+/// O(`window.len()`) — essential now that this is called both on a
+/// [`MAX_TAG_SCAN`]-bounded `window` (cheap either way) *and* unbounded,
+/// straight from [`oversized_tag_body_start`]/[`push_oversized_generic_tag`]
+/// on the entire remaining document. An earlier version instead began with
+/// `!window.contains('"') && !window.contains('\'')` as a fast pre-check —
+/// safe (and a real speedup) when `window` was always bounded, but once
+/// called unbounded it silently reintroduced the same O(n^2) shape this
+/// module's other bounds guard against: proving a quote style is *absent*
+/// throughout a huge `window` costs a full scan of it regardless of the
+/// eventual answer, and for many single-quote-only oversized tags in a row
+/// (no `"` anywhere in the rest of the document), `contains('"')` alone
+/// paid that full remaining-document scan on every single one — confirmed
+/// by timing (16,000 such tags took over two minutes). `window.find('>')`
+/// below doesn't have this problem: unlike `contains`, it doesn't need to
+/// prove anything about the *rest* of `window` once it finds a match.
 fn find_tag_end(window: &str) -> Option<usize> {
-    // Two single-char `contains` calls, not one `contains(['"', '\''])` —
-    // `str`'s multi-char-pattern search isn't memchr-accelerated the way a
-    // single literal `char` pattern is, and using it here regressed the
-    // quadratic-scan timing tests by roughly 10x despite being only a
-    // pre-check (verified by actually timing it, not just complexity-class
-    // reasoning — see the module's other `MAX_TAG_SCAN`-adjacent history).
-    if !window.contains('"') && !window.contains('\'') {
-        return window.find('>');
-    }
-    // A quote is present *somewhere* in the window, but that doesn't mean
-    // one hides the tag's actual closing `>` — check for a `>` at all
-    // first (a single fast scan, identical cost to the no-quote fast path
-    // above), and only fall into the quote-tracking walk below when a
-    // quote appears *before* that naive position. This matters for the
-    // "genuinely unterminated tag" case (no `>` anywhere in the window):
-    // an earlier version of this function skipped straight to the
-    // quote-tracking loop whenever any quote was present, which kept
-    // re-scanning the *entire* remaining window for a `>` that was never
-    // going to be found, once per quote encountered — quadratic-shaped
-    // within the window and measurably ~6x slower than this early-exit,
-    // caught by actually timing it rather than trusting complexity-class
-    // reasoning alone.
     let naive_gt = window.find('>')?;
     if !window[..naive_gt].contains('"') && !window[..naive_gt].contains('\'') {
         return Some(naive_gt);
@@ -2218,6 +2236,33 @@ mod tests {
     }
 
     #[test]
+    fn long_run_of_single_quoted_oversized_divs_is_linear_not_quadratic() {
+        // Regression: `find_tag_end`'s old fast pre-check
+        // (`!window.contains('"') && !window.contains('\'')`) was safe when
+        // `window` was always `MAX_TAG_SCAN`-bounded, but `oversized_tag_body_start`/
+        // `push_oversized_generic_tag` call it unbounded, on the entire
+        // remaining document. For many single-quoted oversized tags in a
+        // row with no `"` anywhere in the whole document,
+        // `window.contains('"')` alone had to scan the *entire* remaining
+        // document to confirm that absence, on every single tag — genuinely
+        // O(n^2) (confirmed by timing before the fix: 16,000 such tags took
+        // over two minutes, each doubling roughly quadrupling the time).
+        // Removed that pre-check entirely in favor of `window.find('>')`,
+        // which doesn't need to prove anything about the rest of the
+        // window once it finds a match.
+        let candidate = format!("<div data-x='{}'>", "A".repeat(5000));
+        let html = candidate.repeat(2_000);
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(nodes.len(), 1, "expected one nested chain of <div>s");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "parse took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
     fn style_content_with_a_stray_angle_bracket_does_not_swallow_later_siblings() {
         let nodes = parse("<style>/* a<b */</style><p>Visible</p>");
         assert_eq!(nodes.len(), 2);
@@ -2336,6 +2381,22 @@ mod tests {
     fn html_comments_are_never_rendered() {
         let nodes = parse("Before<!-- hidden -->After");
         assert_eq!(text(&nodes), "BeforeAfter");
+    }
+
+    #[test]
+    fn abrupt_empty_comment_closes_immediately_not_at_the_next_real_close() {
+        // Regression guard, not a fix: `<!-->` (the browser-tolerated
+        // "abrupt empty comment" spelling) already closes correctly —
+        // `comment_end`'s `rest.find("-->")` naturally matches by reusing
+        // the opening `<!--`'s own trailing two dashes as the closing
+        // delimiter's dashes (string search permits overlapping matches),
+        // so the comment ends right there with empty content rather than
+        // swallowing the rest of the document. Locking this in explicitly
+        // since it wasn't covered by an existing test.
+        let nodes = parse("<!--><p>Visible</p>");
+        assert_eq!(nodes.len(), 1, "expected just the <p>, got {nodes:?}");
+        assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "p"));
+        assert_eq!(text(&nodes), "Visible");
     }
 
     #[test]
@@ -2780,6 +2841,26 @@ mod tests {
         // inside the (supposedly unquoted) value ended the tag early,
         // leaking the rest of the value as visible text.
         let nodes = parse(r#"<div title = "Balance > 100">Visible</div>"#);
+        assert_eq!(nodes.len(), 1, "expected a single <div>, got {nodes:?}");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "div");
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn stray_equals_and_quote_inside_an_already_started_unquoted_value_does_not_swallow_the_tag() {
+        // Regression: `is_attr_value_quote` treated *any* quote preceded
+        // by `=` as a genuine opener, but a second `=` (or quote) can
+        // legally occur inside a value that already started *unquoted* —
+        // `title=x="` means the value starts unquoted at `x`, and the
+        // following `=`/`"` are just more literal (parse-error-tolerant)
+        // value content, not a fresh attribute. Without distinguishing
+        // this, the `"` was mistaken for a real opener, found no matching
+        // close, and the oversized-tag fallback discarded the rest of the
+        // document looking for one that was never real.
+        let nodes = parse(r#"<div title=x=">Visible</div>"#);
         assert_eq!(nodes.len(), 1, "expected a single <div>, got {nodes:?}");
         let Node::Element { tag, children } = &nodes[0] else {
             panic!("expected an element")
