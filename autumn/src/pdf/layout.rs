@@ -573,6 +573,21 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
     }
 }
 
+/// Non-breaking space variants this renderer treats identically to a
+/// literal `&nbsp;` (U+00A0) for line-breaking purposes: U+2007 FIGURE
+/// SPACE and U+202F NARROW NO-BREAK SPACE, both common in localized
+/// number formatting (aligned digit columns; French-style thousands
+/// separators, e.g. `10 000`) — and, like U+00A0, whitespace per
+/// Unicode's `White_Space` property, so a blanket `char::is_whitespace()`
+/// check alone can't tell them apart from an ordinary breakable space.
+/// Purely a line-breaking concern: whether the glyph itself renders
+/// correctly is the same already-documented base-14/WinAnsi-encoding
+/// limitation that applies to any character outside that set (CJK,
+/// emoji, ...) — unaffected by this.
+const fn is_non_breaking_space(c: char) -> bool {
+    matches!(c, '\u{00A0}' | '\u{2007}' | '\u{202F}')
+}
+
 /// Flatten `spans` into words, splitting each run's text on whitespace and
 /// tracking, per word, whether it was directly adjacent (no whitespace) to
 /// the previous span's text — see [`Word::Text::glue`]. A span whose text is
@@ -604,22 +619,23 @@ fn words_of(spans: &[Span]) -> Vec<Word> {
                 // next to a token that already renders the NBSP as one, and
                 // allows a line break at a boundary the NBSP was meant to make
                 // unbreakable.
-                let is_breakable_ws = |c: char| c.is_whitespace() && c != '\u{00A0}';
+                let is_breakable_ws = |c: char| c.is_whitespace() && !is_non_breaking_space(c);
                 let starts_with_ws = text.starts_with(is_breakable_ws);
                 let ends_with_ws = text.ends_with(is_breakable_ws);
-                let starts_with_nbsp = text.starts_with('\u{00A0}');
-                let ends_with_nbsp = text.ends_with('\u{00A0}');
+                let starts_with_nbsp = text.starts_with(is_non_breaking_space);
+                let ends_with_nbsp = text.ends_with(is_non_breaking_space);
                 let mut emitted_any = false;
-                // Split on breakable whitespace only — NBSP (`&nbsp;`,
-                // decoded to U+00A0) satisfies `char::is_whitespace()` so
-                // `split_whitespace()` would treat it as an ordinary word
+                // Split on breakable whitespace only — NBSP and its other
+                // non-breaking variants (`&nbsp;`/U+00A0, U+2007, U+202F —
+                // see `is_non_breaking_space`) satisfy `char::is_whitespace()`
+                // so `split_whitespace()` would treat them as an ordinary word
                 // separator, discarding the entire point of a *non*-breaking
                 // space: it stays inside the resulting token instead, so a
                 // line can never break between the words it joins (it still
                 // renders as a real space — `char_width_1000em` gives it the
                 // same width as a plain space — the token is just atomic).
                 for (i, w) in text
-                    .split(|c: char| c.is_whitespace() && c != '\u{00A0}')
+                    .split(is_breakable_ws)
                     .filter(|w| !w.is_empty())
                     .enumerate()
                 {
@@ -652,14 +668,16 @@ type StyledWord = (String, bool, bool, bool);
 /// line by itself, e.g. a long URL/hash/identifier with no internal
 /// whitespace to break at).
 ///
-/// An embedded NBSP (`&nbsp;`, kept inside the token by `words_of` — see
-/// [`Word::Text::unbreakable`] for the same rule at a *span* boundary) must
-/// never sit at a chunk boundary on *either* side: as the last character of
-/// one chunk, it isolates whatever follows onto the next; as the first
-/// character of a chunk, it isolates whatever precedes it onto the
-/// previous *and* leaves a rendered leading space at the start of the new
-/// line — both indistinguishable from an ordinary space wrapping there,
-/// exactly what the NBSP forbids. Consecutive NBSPs chain: `A&nbsp;B&nbsp;C`
+/// An embedded non-breaking space (`&nbsp;`/U+00A0, or one of the other
+/// variants [`is_non_breaking_space`] recognizes, kept inside the token by
+/// `words_of` — see [`Word::Text::unbreakable`] for the same rule at a
+/// *span* boundary) must never sit at a chunk boundary on *either* side: as
+/// the last character of one chunk, it isolates whatever follows onto the
+/// next; as the first character of a chunk, it isolates whatever precedes
+/// it onto the previous *and* leaves a rendered leading space at the start
+/// of the new line — both indistinguishable from an ordinary space
+/// wrapping there, exactly what a non-breaking space forbids. Consecutive
+/// ones chain: `A&nbsp;B&nbsp;C`
 /// has *no* legal split point anywhere between `A` and `C`, so when the
 /// natural per-character boundary would land inside that chain, the whole
 /// chain (back to the nearest ordinary, non-NBSP-adjacent character) moves
@@ -706,7 +724,7 @@ fn split_into_fitting_chunks(
     let mut run_width = 0.0f32;
     for ch in text.chars() {
         let ch_width = f32::from(char_width_1000em(ch, bold)) / 1000.0 * font_size_pt;
-        let connected = ch == '\u{00A0}' || current.ends_with('\u{00A0}');
+        let connected = is_non_breaking_space(ch) || current.ends_with(is_non_breaking_space);
         let limit = if chunks.is_empty() {
             first_chunk_max_width_pt
         } else {
@@ -1392,6 +1410,35 @@ mod tests {
     }
 
     #[test]
+    fn oversized_token_does_not_split_around_other_unicode_non_breaking_space_variants() {
+        // Same regression as the U+00A0 case above, for U+2007/U+202F —
+        // see `is_non_breaking_space`.
+        for nbsp in ['\u{2007}', '\u{202F}'] {
+            let text = format!("{}{nbsp}B", "A".repeat(67));
+            let font_size_pt = 11.0;
+            let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
+                + text_width_pt(&nbsp.to_string(), font_size_pt, false)
+                + 0.5;
+            let chunks =
+                split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt, max_width_pt);
+            assert!(
+                chunks
+                    .iter()
+                    .all(|c| !c.starts_with(nbsp) && !c.ends_with(nbsp)),
+                "U+{:04X}: no chunk boundary may sit immediately before or after it, got \
+                 {chunks:?}",
+                nbsp as u32
+            );
+            let reassembled: String = chunks.concat();
+            assert_eq!(
+                reassembled, text,
+                "U+{:04X}: splitting must not drop or reorder any characters",
+                nbsp as u32
+            );
+        }
+    }
+
+    #[test]
     fn oversized_token_does_not_split_when_the_incoming_character_is_the_nbsp() {
         // Regression: overflow can be triggered by the NBSP *arriving* as
         // the current character, not just by it already sitting at the end
@@ -1525,6 +1572,47 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].len(), 1);
         assert_eq!(lines[0][0].0, "Invoice\u{00A0}#42");
+    }
+
+    #[test]
+    fn other_unicode_non_breaking_space_variants_also_keep_their_words_on_one_line() {
+        // Regression: `is_breakable_ws`/`words_of`'s NBSP handling only
+        // exempted U+00A0 — but U+2007 FIGURE SPACE and U+202F NARROW
+        // NO-BREAK SPACE are both whitespace per Unicode's `White_Space`
+        // property (so `char::is_whitespace()` alone can't tell them
+        // apart from an ordinary breakable space) and both common in
+        // localized number formatting (aligned digit columns; French-style
+        // thousands separators like `10 000`) — without special-casing
+        // them the same way as U+00A0, a line could break inside such a
+        // number.
+        for nbsp in ['\u{2007}', '\u{202F}'] {
+            let text = format!("10{nbsp}000");
+            let words = words_of(&[Span::Run {
+                text: text.clone(),
+                bold: false,
+                italic: false,
+            }]);
+            assert_eq!(
+                words,
+                vec![Word::Text {
+                    text: text.clone(),
+                    bold: false,
+                    italic: false,
+                    glue: false,
+                    unbreakable: false,
+                }],
+                "U+{:04X} must not split the run into two breakable words, got {words:?}",
+                nbsp as u32
+            );
+            let narrow_width = text_width_pt(&text, 12.0, false) + 1.0;
+            let lines = wrap(&words, narrow_width, 12.0);
+            assert_eq!(
+                lines.len(),
+                1,
+                "U+{:04X}: the number must stay on one line, got {lines:?}",
+                nbsp as u32
+            );
+        }
     }
 
     #[test]
