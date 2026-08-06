@@ -1187,7 +1187,7 @@ APP_URL="$(terraform output -raw app_url)"   # known only after the FIRST apply 
 # app can't boot. HealthCheckConfiguration restores the real "/health" path
 # — main.tf's bootstrap revision used "/" (nginx's own default response)
 # since the bootstrap placeholder doesn't serve /health.
-aws apprunner update-service --service-arn "$SERVICE_ARN" \
+OPERATION_ID=$(aws apprunner update-service --service-arn "$SERVICE_ARN" \
   --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/health\"}" \
   --source-configuration "{
   \"ImageRepository\": {
@@ -1207,7 +1207,27 @@ aws apprunner update-service --service-arn "$SERVICE_ARN" \
   },
   \"AuthenticationConfiguration\": { \"AccessRoleArn\": \"$ACCESS_ROLE\" },
   \"AutoDeploymentsEnabled\": false
-}"
+}" --query 'OperationId' --output text)
+
+# update-service only STARTS an asynchronous operation — a bare successful
+# exit here just means App Runner accepted the request, not that the real
+# image actually booted. If it fails health checks, App Runner rolls the
+# service back on its own; poll list-operations for this specific
+# OperationId's terminal status rather than trusting the call's exit code.
+OP_STATUS=""
+for _ in $(seq 1 60); do   # 10 minutes (60 x 10s)
+  OP_STATUS=$(aws apprunner list-operations --service-arn "$SERVICE_ARN" \
+    --query "OperationSummaryList[?Id=='$OPERATION_ID'].Status | [0]" --output text)
+  [ "$OP_STATUS" = "SUCCEEDED" ] && break
+  case "$OP_STATUS" in
+    FAILED|ROLLBACK_FAILED|ROLLBACK_SUCCEEDED)
+      echo "cutover failed (status=$OP_STATUS) — App Runner may have rolled back to the bootstrap image"
+      exit 1
+      ;;
+  esac
+  sleep 10
+done
+[ "$OP_STATUS" = "SUCCEEDED" ] || { echo "cutover did not complete within the time budget (status=$OP_STATUS)"; exit 1; }
 ```
 
 **State file security and `.gitignore`.** Same caveats as Azure: Terraform
@@ -1340,13 +1360,39 @@ done
 # production config sets auto_migrate_in_production = false, so nothing
 # else does this for you. run-task only starts the task and returns
 # immediately, so poll for it to stop, then check its exit code.
+#
+# `aws ecs wait tasks-stopped` has its own fixed ~10-minute budget (100
+# checks x 6s) and exits nonzero once that's exhausted regardless of
+# whether the task is still running — and ECS tasks have no runtime limit
+# of their own, so a migration that blows this budget keeps running in the
+# background even after this script gives up. Poll manually instead so a
+# timeout can explicitly stop the task before failing; otherwise retrying
+# this walkthrough could start a second migration while the first is still
+# mutating the schema.
 TASK_ARN=$(aws ecs run-task --cluster "$CLUSTER" --task-definition "$MIGRATE_ARN" \
   --launch-type FARGATE \
   --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":$SUBNETS,\"securityGroups\":[\"$SG\"],\"assignPublicIp\":\"DISABLED\"}}" \
   --query 'tasks[0].taskArn' --output text)
-aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
-EXIT_CODE=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
-  --query 'tasks[0].containers[0].exitCode' --output text)
+[ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ] || { echo "failed to start the migration task"; exit 1; }
+
+EXIT_CODE=""
+for _ in $(seq 1 60); do   # 10 minutes (60 x 10s)
+  STATUS=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+    --query 'tasks[0].lastStatus' --output text)
+  if [ "$STATUS" = "STOPPED" ]; then
+    EXIT_CODE=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+      --query 'tasks[0].containers[0].exitCode' --output text)
+    break
+  fi
+  sleep 10
+done
+if [ -z "$EXIT_CODE" ]; then
+  echo "migration did not finish within the time budget — stopping it"
+  aws ecs stop-task --cluster "$CLUSTER" --task "$TASK_ARN" \
+    --reason "manual deploy: migration exceeded its polling budget" >/dev/null
+  aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+  exit 1
+fi
 [ "$EXIT_CODE" = "0" ] || { echo "migration failed"; exit 1; }
 
 aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \

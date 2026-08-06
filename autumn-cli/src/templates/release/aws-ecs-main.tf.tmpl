@@ -746,7 +746,21 @@ resource "aws_ecs_service" "this" {
   deployment_maximum_percent         = 200
   deployment_minimum_healthy_percent = 100
 
-  depends_on = [aws_lb_listener.https]
+  # The database_url/signing_secret/redis_url *version* resources (not just
+  # the secret containers referenced by ARN in local.container_secrets)
+  # must exist before tasks are scheduled: the task definition's `secrets`
+  # block only implies a dependency on the empty secret container, since
+  # that's the resource actually referenced by .arn — without this,
+  # Terraform is free to schedule tasks as soon as the (still-valueless)
+  # secret exists, racing the version write. Tasks then fail secret
+  # injection at startup, and the deployment circuit breaker above can
+  # permanently fail the first deployment before the versions appear.
+  depends_on = [
+    aws_lb_listener.https,
+    aws_secretsmanager_secret_version.database_url,
+    aws_secretsmanager_secret_version.signing_secret,
+    aws_secretsmanager_secret_version.redis_url,
+  ]
 
   lifecycle {
     # CI registers new task definition revisions and repoints the service

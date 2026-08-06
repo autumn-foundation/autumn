@@ -3624,6 +3624,34 @@ previous_secrets = []
     }
 
     #[test]
+    fn aws_app_runner_service_waits_for_secret_versions_before_starting() {
+        // runtime_environment_secrets only references the secret
+        // CONTAINERS (aws_secretsmanager_secret.*.arn), so Terraform's
+        // implicit dependency graph doesn't wait for the *_version
+        // resources that actually write the secret values — without an
+        // explicit depends_on, the service can start (and fail to resolve
+        // AUTUMN_DATABASE__PRIMARY_URL) before RDS-derived value exists.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let service_block = content
+            .split("resource \"aws_apprunner_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare aws_apprunner_service.this");
+        for dep in [
+            "aws_secretsmanager_secret_version.database_url",
+            "aws_secretsmanager_secret_version.signing_secret",
+        ] {
+            assert!(
+                service_block.contains(dep),
+                "aws_apprunner_service.this must depend on {dep}, not just the secret \
+                 container it references by ARN: {service_block}"
+            );
+        }
+    }
+
+    #[test]
     fn aws_app_runner_names_are_sanitized_for_underscored_uppercase_project_name() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "My_Test_App");
@@ -3925,6 +3953,37 @@ previous_secrets = []
                 && service_block.contains("rollback = true"),
             "the ECS service must enable circuit-breaker rollback: {service_block}"
         );
+    }
+
+    #[test]
+    fn aws_ecs_service_waits_for_secret_versions_before_starting() {
+        // local.container_secrets only references the secret CONTAINERS
+        // (aws_secretsmanager_secret.*.arn), so Terraform's implicit
+        // dependency graph doesn't wait for the *_version resources that
+        // actually write the secret values — without an explicit
+        // depends_on, the service can schedule tasks before RDS's derived
+        // database_url value (or, when enabled, Redis's) exists, and the
+        // deployment circuit breaker can permanently fail the first
+        // deployment as a result.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let service_block = content
+            .split("resource \"aws_ecs_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare the ECS service");
+        for dep in [
+            "aws_secretsmanager_secret_version.database_url",
+            "aws_secretsmanager_secret_version.signing_secret",
+            "aws_secretsmanager_secret_version.redis_url",
+        ] {
+            assert!(
+                service_block.contains(dep),
+                "aws_ecs_service.this must depend on {dep}, not just the secret \
+                 container it references by ARN: {service_block}"
+            );
+        }
     }
 
     #[test]
