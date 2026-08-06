@@ -645,14 +645,24 @@ type StyledWord = (String, bool, bool, bool);
 /// character of a chunk, it isolates whatever precedes it onto the
 /// previous *and* leaves a rendered leading space at the start of the new
 /// line — both indistinguishable from an ordinary space wrapping there,
-/// exactly what the NBSP forbids. When the natural per-character boundary
-/// would land on either side of an NBSP, the character before it, the NBSP
-/// itself, and the incoming character all move to the *next* chunk
-/// together, so the boundary lands on an ordinary character instead.
+/// exactly what the NBSP forbids. Consecutive NBSPs chain: `A&nbsp;B&nbsp;C`
+/// has *no* legal split point anywhere between `A` and `C`, so when the
+/// natural per-character boundary would land inside that chain, the whole
+/// chain (back to the nearest ordinary, non-NBSP-adjacent character) moves
+/// to the *next* chunk together — the same "relocate the whole unbreakable
+/// run, not just its last word" rule [`wrap`] applies to a glued run of
+/// *words*, applied here at the character level via an equivalent
+/// incrementally-tracked `run_start`/`run_width` (not recomputed by
+/// rescanning `current` on every overflow, for the same reason `wrap`'s
+/// `run_width` isn't: a long chain of NBSP-glued characters must stay
+/// linear, not quadratic, in the number of overflow events).
 ///
 /// Always makes progress: a chunk always gets at least one character even if
-/// that character alone exceeds `max_width_pt`, so this can't loop forever
-/// on a pathologically narrow `max_width_pt`.
+/// that character alone exceeds `max_width_pt` — the sole exception being a
+/// chunk that's entirely one NBSP-connected chain with no earlier split
+/// point to relocate to, which is left overflowing rather than split
+/// mid-chain, the same as an entire line that's one unbreakable run in
+/// [`wrap`].
 fn split_into_fitting_chunks(
     text: &str,
     font_size_pt: f32,
@@ -662,38 +672,38 @@ fn split_into_fitting_chunks(
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut current_width = 0.0f32;
+    // Byte index into `current` (always a char boundary) where the
+    // NBSP-connected run ending at `current`'s last character begins, and
+    // that run's width — see the function docs above.
+    let mut run_start = 0usize;
+    let mut run_width = 0.0f32;
     for ch in text.chars() {
         let ch_width = f32::from(char_width_1000em(ch, bold)) / 1000.0 * font_size_pt;
+        let connected = ch == '\u{00A0}' || current.ends_with('\u{00A0}');
         if !current.is_empty() && current_width + ch_width > max_width_pt {
-            // Overflow can be triggered by the NBSP *arriving* as `ch`
-            // (`current` doesn't yet end with one) just as much as by it
-            // already sitting at the end of `current` — both need the same
-            // "pull the preceding character along" treatment, just applied
-            // from opposite sides of the boundary.
-            if ch == '\u{00A0}' || current.ends_with('\u{00A0}') {
-                let nbsp = if current.ends_with('\u{00A0}') {
-                    current.pop()
-                } else {
-                    None
-                };
-                let prev = current.pop();
-                if !current.is_empty() {
+            if connected {
+                if run_start > 0 {
+                    let tail = current.split_off(run_start);
                     chunks.push(std::mem::take(&mut current));
+                    current = tail;
+                    current_width = run_width;
+                    run_start = 0;
                 }
-                if let Some(prev) = prev {
-                    current.push(prev);
-                }
-                if let Some(nbsp) = nbsp {
-                    current.push(nbsp);
-                }
-                current_width = current
-                    .chars()
-                    .map(|c| f32::from(char_width_1000em(c, bold)) / 1000.0 * font_size_pt)
-                    .sum();
+                // Else the whole chunk built so far is one NBSP-connected
+                // chain with nowhere earlier to split — accept the
+                // overflow rather than break mid-chain.
             } else {
                 chunks.push(std::mem::take(&mut current));
                 current_width = 0.0;
+                run_start = 0;
+                run_width = 0.0;
             }
+        }
+        if connected {
+            run_width += ch_width;
+        } else {
+            run_start = current.len();
+            run_width = ch_width;
         }
         current.push(ch);
         current_width += ch_width;
@@ -1234,6 +1244,37 @@ mod tests {
         let font_size_pt = 11.0;
         let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
             + text_width_pt("i", font_size_pt, false)
+            + 0.5;
+        let chunks = split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt);
+        assert!(
+            chunks
+                .iter()
+                .all(|c| !c.starts_with('\u{00A0}') && !c.ends_with('\u{00A0}')),
+            "no chunk boundary may sit immediately before or after an NBSP, got {chunks:?}"
+        );
+        let reassembled: String = chunks.concat();
+        assert_eq!(
+            reassembled, text,
+            "splitting must not drop or reorder any characters"
+        );
+    }
+
+    #[test]
+    fn oversized_token_moves_the_entire_nbsp_connected_chain_not_just_one_neighbor() {
+        // Regression: when an oversized token contains *multiple* NBSPs,
+        // the previous fix only pulled one preceding character back before
+        // emitting the chunk — if that character was itself connected to
+        // an earlier NBSP, the emitted chunk still ended in that earlier
+        // NBSP, just relocating which NBSP boundary got broken rather than
+        // fixing the underlying bug. A repro matching the reported one: 66
+        // `A`s followed by `&nbsp;B&nbsp;C` — the As plus the first NBSP
+        // plus `B` fit within the content width, but adding the second
+        // NBSP doesn't, so the naive split used to land the first chunk
+        // right after the first NBSP, breaking that boundary too.
+        let text = format!("{}\u{00A0}B\u{00A0}C", "A".repeat(66));
+        let font_size_pt = 11.0;
+        let max_width_pt = text_width_pt(&"A".repeat(66), font_size_pt, false)
+            + text_width_pt("\u{00A0}B", font_size_pt, false)
             + 0.5;
         let chunks = split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt);
         assert!(

@@ -27,9 +27,17 @@ const fn base_width_1000em(ch: char) -> u16 {
         // narrow ASCII punctuation, plus curly single quotes and low-9 quote
         '\'' | 'i' | 'j' | 'l' | '\u{2018}' | '\u{2019}' | '\u{201A}' => 222,
         // wider ASCII punctuation, plus curly double quotes and double low-9 quote
-        '(' | ')' | '[' | ']' | '"' | '-' | 'f' | 'r' | 't' | '/' | '\\' | '\u{201C}'
-        | '\u{201D}' | '\u{201E}' => 333,
-        '0'..='9' | '\u{2013}' /* – en dash */ | '\u{20AC}' /* € euro */ => 556,
+        '(' | ')' | '[' | ']' | '-' | 'f' | 'r' | 't' | '/' | '\\' | '\u{201C}' | '\u{201D}'
+        | '\u{201E}' => 333,
+        // `"` (ASCII quotedbl) used to share the 333 bucket above with the
+        // *curly* double quotes, but Helvetica's real quotedbl width (355)
+        // is wider than theirs — same underestimation risk as the other
+        // punctuation fixes above. A repro matching the reported one: 135
+        // `"`s at 11pt used to estimate ~494.5pt (fits a 495.28pt content
+        // area) while Helvetica actually renders them at ~527pt (doesn't).
+        '"' => 355,
+        '0'..='9' | '\u{2013}' /* – en dash */ | '\u{20AC}' /* € euro */
+        | '\u{2020}' /* † dagger */ | '\u{2021}' /* ‡ double dagger */ => 556,
         'm' | 'M' => 833,
         // These four used to share the 833 bucket above with m/M, but their
         // real Helvetica AFM widths vary enough to matter: `W` in particular
@@ -107,12 +115,6 @@ const fn base_width_1000em(ch: char) -> u16 {
         '\u{00C0}'..='\u{00DE}' if ch != '\u{00D7}' => 667, // Latin-1 uppercase accented (approx like A-Z)
         '\u{00A9}' | '\u{00AE}' => 737,                     // © copyright, ® registered
         '\u{2022}' => 350,                                  // • bullet
-        // † and ‡ used to sit at 500, but Helvetica renders both at 556 —
-        // same underestimation risk as the other wide-glyph fixes above. A
-        // repro matching the reported one: 90 `†`s at 11pt used to estimate
-        // ~495pt (fits a 495.28pt content area) while Helvetica actually
-        // renders them at ~550pt (doesn't).
-        '\u{2020}' | '\u{2021}' => 556,                     // † dagger, ‡ double dagger
         '\u{00B0}' => 400,                                  // ° degree
         // Math/comparison operators used to fall into the generic ASCII
         // fallback (556) below, but Helvetica renders them wider (584) —
@@ -227,6 +229,25 @@ mod tests {
             "171 is at 11pt bold ({hundred_seventy_one_is}pt) must be estimated wider than a \
              495pt content area, matching Helvetica-Bold's real ~523pt rendering, not the old \
              ~493pt underestimate"
+        );
+    }
+
+    #[test]
+    fn regular_double_quotes_are_not_underestimated() {
+        // Regression: `"` (ASCII quotedbl) used to share the 333 bucket
+        // with the curly double quotes, but Helvetica's real quotedbl
+        // width (355) is wider than theirs. A repro matching the reported
+        // one: 135 `"`s at 11pt used to estimate ~494.5pt (fits a 495.28pt
+        // content area) while Helvetica actually renders them at ~527pt
+        // (doesn't).
+        assert_eq!(char_width_1000em('"', false), 355);
+        let hundred_thirty_five_quotes = text_width_pt(&"\"".repeat(135), 11.0, false);
+        let content_area_pt = 495.28;
+        assert!(
+            hundred_thirty_five_quotes > content_area_pt,
+            "135 \"s at 11pt ({hundred_thirty_five_quotes}pt) must be estimated wider than a \
+             495.28pt content area, matching Helvetica's real ~527pt rendering, not the old \
+             ~494.5pt underestimate"
         );
     }
 
