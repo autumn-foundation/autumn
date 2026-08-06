@@ -110,6 +110,14 @@ const fn base_width_1000em(ch: char) -> u16 {
         // ~489pt (fits a 495pt content area) while Helvetica actually
         // renders them at ~514pt (doesn't).
         '+' | '<' | '=' | '>' | '~' => 584,
+        // `¼`/`½`/`¾` (U+00BC-00BE) are representable WinAnsi fraction
+        // glyphs, not ASCII and outside the Latin-1 accented-letter range
+        // below — they fell all the way through to the generic 556
+        // fallback, but Helvetica renders all three at 834 units. A repro
+        // matching the reported one: 60 `¼`s at 11pt used to estimate
+        // ~367pt (fits a 495pt content area) while Helvetica actually
+        // renders them at ~550pt (doesn't).
+        '\u{00BC}' | '\u{00BD}' | '\u{00BE}' => 834,
         _ if ch.is_ascii() => 556,
         '\u{00DF}'..='\u{00FF}' if ch != '\u{00F7}' => 556, // Latin-1 lowercase accented (approx default)
         // Everything else that WinAnsi (`printpdf`'s built-in-font encoding,
@@ -423,6 +431,27 @@ mod tests {
             seventy_scarons > content_area_pt,
             "70 Šs at 11pt ({seventy_scarons}pt) must be estimated wider than a 495pt content \
              area, matching Helvetica's real ~514pt rendering, not the old ~428pt underestimate"
+        );
+    }
+
+    #[test]
+    fn fraction_glyphs_are_not_underestimated_as_generic_non_ascii_characters() {
+        // Regression: `¼`/`½`/`¾` (U+00BC-00BE) are representable WinAnsi
+        // fraction glyphs, but they're outside both the ASCII and Latin-1
+        // accented-letter ranges, so they fell all the way through to the
+        // generic 556 fallback — same underestimation risk as the earlier
+        // wide-glyph fixes. A repro matching the reported one: 60 `¼`s at
+        // 11pt used to estimate ~367pt (fits a 495pt content area) while
+        // Helvetica actually renders them at ~550pt (doesn't).
+        assert_eq!(char_width_1000em('\u{00BC}', false), 834); // ¼
+        assert_eq!(char_width_1000em('\u{00BD}', false), 834); // ½
+        assert_eq!(char_width_1000em('\u{00BE}', false), 834); // ¾
+        let sixty_quarters = text_width_pt(&"\u{00BC}".repeat(60), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            sixty_quarters > content_area_pt,
+            "60 ¼s at 11pt ({sixty_quarters}pt) must be estimated wider than a 495pt content \
+             area, matching Helvetica's real ~550pt rendering, not the old ~367pt underestimate"
         );
     }
 

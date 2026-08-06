@@ -95,8 +95,19 @@ fn implicitly_closes(open_tag: &str, new_tag: &str) -> bool {
             (open_tag, new_tag),
             ("li", "li")
                 | ("dt" | "dd", "dt" | "dd")
-                | ("tr", "tr")
-                | ("td" | "th", "td" | "th" | "tr")
+                // A new table section (`<thead>`/`<tbody>`/`<tfoot>`)
+                // closes an open cell/row/section the same way a new
+                // `<tr>` does — `<table><thead><tr><th>H<tbody>...` omits
+                // `</th>`, `</tr>`, *and* `</thead>` together, and without
+                // this the whole `<tbody>` (and its row/cell) nested
+                // *inside* the still-open header cell, so
+                // `extract_table_rows` (which only reads a `<tr>`'s
+                // *direct* `<td>`/`<th>` children) flattened the body
+                // row's text into the header cell instead of emitting it
+                // as a separate row.
+                | ("tr", "tr" | "thead" | "tbody" | "tfoot")
+                | ("td" | "th", "td" | "th" | "tr" | "thead" | "tbody" | "tfoot")
+                | ("thead" | "tbody" | "tfoot", "thead" | "tbody" | "tfoot")
         )
 }
 
@@ -761,6 +772,50 @@ mod tests {
         assert_eq!(tag, "tr");
         assert_eq!(row2.len(), 1);
         assert_eq!(text(row2), "C");
+    }
+
+    #[test]
+    fn omitted_th_tr_and_thead_closing_tags_are_implied_by_a_following_tbody() {
+        // Regression: valid HTML can omit `</th>`, `</tr>`, *and* `</thead>`
+        // together before a following `<tbody>` — none of `td`/`th`'s,
+        // `tr`'s, or `thead`'s implied-close rules covered a new table
+        // section starting, only a new cell/row within the *same* section,
+        // so the whole `<tbody>` (and its row/cell) nested inside the
+        // still-open header cell instead of becoming `<thead>`'s sibling.
+        let nodes = parse("<table><thead><tr><th>H<tbody><tr><td>A</table>");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "table");
+        assert_eq!(
+            children.len(),
+            2,
+            "expected <thead> and <tbody> as siblings, got {children:?}"
+        );
+        let Node::Element {
+            tag,
+            children: thead_children,
+        } = &children[0]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "thead");
+        assert_eq!(thead_children.len(), 1, "expected one <tr>");
+        assert_eq!(text(thead_children), "H");
+        let Node::Element {
+            tag,
+            children: tbody_children,
+        } = &children[1]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "tbody");
+        assert_eq!(tbody_children.len(), 1, "expected one <tr>");
+        assert_eq!(
+            text(tbody_children),
+            "A",
+            "the body row must be a sibling row, not text flattened into the header cell"
+        );
     }
 
     #[test]
