@@ -439,16 +439,6 @@ fn push_oversized_generic_tag(
     Some(body_start)
 }
 
-/// Bound on how far [`consume_raw_text`] scans past a candidate
-/// `</script`/`</style` prefix looking for the closing `>` — the same
-/// defense as [`MAX_TAG_SCAN`] for the same reason: a legitimate closing
-/// tag has no attributes and essentially no whitespace before `>`, but an
-/// unbounded `after_tag.find('>')` would cost O(remaining input) on every
-/// failed candidate — a raw-text body containing many `"</script "`
-/// fragments with no `>` anywhere would make this O(n^2) overall, the same
-/// shape of bug [`MAX_TAG_SCAN`]/[`MAX_CLOSE_SCAN`] were fixed for.
-const MAX_RAW_CLOSE_SCAN: usize = 64;
-
 /// Scan `input[pos..]` for the literal, case-insensitive closing tag for a
 /// [raw text element](is_raw_text_element) (e.g. `</script>`, allowing
 /// whitespace before the `>`), returning the text before it and the
@@ -468,12 +458,16 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
             continue;
         }
         let after_tag = &after_slash[tag.len()..];
-        // Must be immediately followed by whitespace or '>' — not e.g.
-        // "</scripty>" merely starting with "script".
+        // Must be immediately followed by whitespace, '/', or '>' — not
+        // e.g. "</scripty>" merely starting with "script". '/' covers the
+        // browser-tolerated XHTML-style self-closing spelling of a closing
+        // tag, `</script/>` — without it here, that slash fails this
+        // boundary check, the candidate is skipped, and the scan runs to
+        // EOF instead, dropping all following visible content.
         let is_boundary = after_tag
             .chars()
             .next()
-            .is_none_or(|c| c == '>' || c.is_whitespace());
+            .is_none_or(|c| c == '>' || c == '/' || c.is_whitespace());
         if !is_boundary {
             continue;
         }
@@ -488,47 +482,54 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
 
 /// Locates the `>` that ends a raw-text closing tag candidate, given
 /// `after_tag` (the text right after the tag name, e.g. right after
-/// `</script`). Two passes, both bounded overall — never reintroducing the
-/// O(n^2) risk [`MAX_RAW_CLOSE_SCAN`] exists to prevent:
+/// `</script`). Bounds the search to *before the next literal `<`* rather
+/// than a fixed byte count — unlike a fixed bound, this can never reject a
+/// genuine closing tag just because its attribute list is long (mirroring
+/// why [`oversized_tag_body_start`] moved away from a fixed window), while
+/// still never reintroducing the O(n^2) risk a naive fully-unbounded
+/// search would have here specifically: [`consume_raw_text`]'s outer
+/// `match_indices('<')` loop calls this once per candidate and, on
+/// failure, moves on to try the *next* one rather than stopping (unlike
+/// [`handle_closing_tag`], where a failed unbounded search jumps straight
+/// to EOF and ends the whole parse) — so a raw-text body containing many
+/// `"</script "` fragments with no `>` anywhere would make a fully
+/// unbounded search here pay a full remaining-input scan on every single
+/// failed candidate, genuinely O(n^2). Bounding to the next `<` instead
+/// makes each candidate's own share of the work exactly the gap up to that
+/// next `<` — and since every one of those gaps is disjoint (the
+/// `match_indices` iterator itself walks past each `<` exactly once), the
+/// total across every candidate in one [`consume_raw_text`] call is
+/// O(`rest.len()`), not O(candidates × `rest.len()`), regardless of how
+/// long any individual gap (i.e. attribute list) is.
 ///
-/// 1. A cheap bounded search within [`MAX_RAW_CLOSE_SCAN`] bytes, using the
-///    same quote-aware [`find_tag_end`] an opening tag's own `>` search
-///    uses — real browsers' end-tag tokenizer *does* enter a quote-aware,
-///    attribute-value-like state once whitespace follows the tag name (by
-///    which point [`consume_raw_text`]'s `is_boundary` check has already
-///    confirmed we're here), so e.g. `</script data-x=">secret">` must
-///    skip the quoted `>` and end at the real one after it, not treat the
-///    quoted `>` as the close and leak `secret">` as visible text. Covers
-///    the overwhelmingly common case, including stray non-whitespace
-///    content before `>` as long as it's close by.
-/// 2. If that fails, a fallback that walks through a *pure* run of ASCII
-///    whitespace immediately following (unbounded in length, but legal per
-///    the HTML5 end-tag grammar's "closing tag, arbitrary whitespace, then
-///    `>`"), succeeding only if `>` immediately follows it. This can't
-///    blow up quadratically even though it's unbounded: every byte it
-///    walks is whitespace, which can never itself be a `<` — so
-///    [`consume_raw_text`]'s outer `match_indices('<')` loop never
-///    revisits any of it while looking for the *next* candidate. Total
-///    work across every failed candidate in one call stays O(`rest.len()`),
-///    same as the `match_indices` scan it's riding along with. A pure
-///    whitespace run never contains a quote, so this pass needs no
-///    quote-awareness of its own.
+/// Quote-aware within that window for the same reason [`parse_open_tag`]'s
+/// own `>` search is: real browsers' end-tag tokenizer *does* enter a
+/// quote-aware, attribute-value-like state once whitespace follows the tag
+/// name (by which point [`consume_raw_text`]'s `is_boundary` check has
+/// already confirmed we're here), so e.g. `</script data-x=">secret">`
+/// must skip the quoted `>` and end at the real one after it, not treat
+/// the quoted `>` as the close and leak `secret">` as visible text.
 ///
-/// Without pass 1's quote-awareness, a quoted attribute value in the
-/// closing tag containing a literal `>` was mistaken for the real one,
-/// leaking the rest of the attribute value and the genuine subsequent
-/// content as visible text. Without pass 2, a legitimate closing tag with
-/// 64+ bytes of whitespace before `>` (rare, but valid HTML) was rejected
-/// outright, making [`consume_raw_text`] scan through to EOF instead —
-/// hiding all following visible content for `script`/`style`, or
-/// rendering the literal (unclosed-looking) tag text for
-/// `title`/`textarea`.
+/// Falls back to walking a *pure* run of ASCII whitespace from the start
+/// of the window, succeeding only if `>` immediately follows it — legal
+/// per the HTML5 end-tag grammar's "closing tag, arbitrary whitespace,
+/// then `>`". A pure whitespace run can never contain `<`, so it never
+/// reaches past the window's own bound anyway; this pass exists because a
+/// long whitespace run before `>` isn't something [`find_tag_end`] itself
+/// recognizes as a close (it only looks for `>`, quote-aware, not for
+/// "whitespace then `>`" specifically after failing to find one some other
+/// way) — without it, a legitimate closing tag with a long run of
+/// whitespace before `>` was rejected outright, making
+/// [`consume_raw_text`] scan through to EOF instead — hiding all following
+/// visible content for `script`/`style`, or rendering the literal
+/// (unclosed-looking) tag text for `title`/`textarea`.
 fn raw_close_tag_end(after_tag: &str) -> Option<usize> {
-    find_tag_end(bounded_prefix(after_tag, MAX_RAW_CLOSE_SCAN)).or_else(|| {
-        let ws_len = after_tag
+    let window = &after_tag[..after_tag.find('<').unwrap_or(after_tag.len())];
+    find_tag_end(window).or_else(|| {
+        let ws_len = window
             .find(|c: char| !c.is_whitespace())
-            .unwrap_or(after_tag.len());
-        after_tag[ws_len..].starts_with('>').then_some(ws_len)
+            .unwrap_or(window.len());
+        window[ws_len..].starts_with('>').then_some(ws_len)
     })
 }
 
@@ -1012,8 +1013,8 @@ const MAX_TAG_SCAN: usize = 4096;
 /// `s.char_indices()` up to the bound), nudged back to the nearest char
 /// boundary so the result can't split a multi-byte character. Used to cap
 /// a scan for a delimiter (`>`) at a fixed cost instead of the full
-/// remaining input length — see [`MAX_TAG_SCAN`] and
-/// [`MAX_RAW_CLOSE_SCAN`] for why that bound matters.
+/// remaining input length — see [`MAX_TAG_SCAN`] for why that bound
+/// matters.
 fn bounded_prefix(s: &str, max_len: usize) -> &str {
     let mut end = s.len().min(max_len);
     while end > 0 && !s.is_char_boundary(end) {
@@ -2524,9 +2525,9 @@ mod tests {
         // for `>` after a candidate `</script`/`</style` prefix — but
         // HTML5's end-tag grammar allows *arbitrary* whitespace between
         // the tag name and `>`. A real (if unusually padded) closing tag
-        // with 64+ whitespace bytes before `>` used to fall outside that
-        // bound entirely, so `consume_raw_text` never recognized it and
-        // scanned through to EOF instead — hiding everything after it.
+        // with whitespace bytes before `>` past that bound used to fall
+        // outside it entirely, so `consume_raw_text` never recognized it
+        // and scanned through to EOF instead — hiding everything after it.
         let padding = " ".repeat(200);
         let html = format!("<script>alert(1)</script{padding}><p>Visible</p>");
         let nodes = parse(&html);
@@ -2544,6 +2545,54 @@ mod tests {
     }
 
     #[test]
+    fn raw_text_closing_tag_with_a_long_non_whitespace_attribute_is_still_recognized() {
+        // Regression: `raw_close_tag_end`'s fixed 64-byte bound couldn't
+        // see a real `>` sitting behind more than 64 bytes of non-
+        // whitespace attribute content, and the whitespace-only fallback
+        // rejects anything but pure whitespace before `>` — so a genuine
+        // (if unusually padded) closing tag like
+        // `</script data-x="...100+ bytes...">` was rejected outright,
+        // hiding everything after it instead of just the attribute value.
+        let value = "x".repeat(100);
+        let html = format!(r#"<script>hidden</script data-x="{value}">Visible"#);
+        let nodes = parse(&html);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "expected script + trailing text, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected the first node to be an element")
+        };
+        assert_eq!(tag, "script");
+        assert_eq!(text(children), "hidden");
+        assert_eq!(nodes[1], Node::Text("Visible".to_owned()));
+    }
+
+    #[test]
+    fn raw_text_closing_tag_recognizes_xhtml_style_self_closing_slash() {
+        // Regression: the raw-text closing-tag boundary check only
+        // accepted whitespace or `>` right after the tag name, so the
+        // browser-tolerated XHTML-style spelling `</script/>` (slash
+        // immediately after the name) failed to match at all, and the
+        // scan ran through to EOF — dropping all following visible
+        // content.
+        let html = "<script>hidden</script/><p>Visible</p>";
+        let nodes = parse(html);
+        assert_eq!(nodes.len(), 2, "expected script + <p>, got {nodes:?}");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected the first node to be an element")
+        };
+        assert_eq!(tag, "script");
+        assert_eq!(text(children), "hidden");
+        let Node::Element { tag, children } = &nodes[1] else {
+            panic!("expected the second node to be an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
     fn long_run_of_raw_text_closes_padded_with_whitespace_is_linear_not_quadratic() {
         // Regression guard for `raw_close_tag_end`'s arbitrary-whitespace
         // fallback: unlike the bounded search it falls back from, its
@@ -2552,6 +2601,35 @@ mod tests {
         // each followed by a long run of whitespace but never a `>`)
         // still parses in linear, not quadratic, time.
         let candidate = format!("</script{}", " ".repeat(200));
+        let html = format!("<script>{}", candidate.repeat(2_000));
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(nodes.len(), 1);
+        assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "script"));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "parse took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_run_of_raw_text_closes_padded_with_long_attributes_is_linear_not_quadratic() {
+        // Regression guard specifically for the fix that let
+        // `raw_close_tag_end` see past its old fixed byte bound: naively
+        // making that search fully unbounded (mirroring the fix already
+        // applied to `oversized_tag_body_start`) would have reintroduced
+        // O(n^2) here specifically, because `consume_raw_text` tries the
+        // *next* `<` candidate on failure instead of stopping (unlike
+        // `handle_closing_tag`, where a failed unbounded search jumps
+        // straight to EOF and ends the whole parse). Each candidate below
+        // carries 300+ bytes of non-whitespace attribute-like content
+        // (long enough to blow well past the old 64-byte bound) and no
+        // real `>` — with a naive fully-unbounded search this would pay a
+        // full remaining-input scan per candidate; bounding the search to
+        // the next literal `<` instead keeps each candidate's cost to its
+        // own gap.
+        let candidate = format!("</script data-x=\"{}", "y".repeat(300));
         let html = format!("<script>{}", candidate.repeat(2_000));
         let start = std::time::Instant::now();
         let nodes = parse(&html);
