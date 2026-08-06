@@ -75,6 +75,11 @@ fn is_void_element(tag: &str) -> bool {
 /// its own top-level [`Block`](super::layout) — `<p>Intro<table>...</table>`
 /// flattens the table's rows/cells into bare inline text (`IntroAB`
 /// instead of a real table) since `inline_spans` has no notion of a table.
+/// For `head`/`body`, the failure mode is the most severe of all: `head`
+/// is in `is_non_rendered` (in `layout.rs`), so nesting `body` under a
+/// still-open `head` — a valid, common HTML5 document with an omitted
+/// `</head>` — discards the *entire visible document* wholesale, not just
+/// one element's structure.
 ///
 /// Doesn't need to cover every HTML5 optional-end-tag rule, only the ones
 /// for tags this renderer actually gives that special treatment to.
@@ -86,6 +91,7 @@ fn implicitly_closes(open_tag: &str, new_tag: &str) -> bool {
                 | ("dt" | "dd", "dt" | "dd")
                 | ("tr", "tr")
                 | ("td" | "th", "td" | "th" | "tr")
+                | ("head", "body")
         )
 }
 
@@ -704,6 +710,36 @@ mod tests {
         };
         assert_eq!(tag, "p");
         assert_eq!(text(children), "After");
+    }
+
+    #[test]
+    fn an_omitted_head_closing_tag_is_implied_by_body() {
+        // Regression: `</head>` is also an HTML5 "optional end tag" —
+        // omitting it is common/valid (`<html><head><title>X</title><body>...`).
+        // Without implied-close handling, `<body>` nested *inside* the
+        // still-open `<head>` — and since `head` is in `is_non_rendered`
+        // (`layout.rs`), its entire subtree is discarded, silently dropping
+        // the whole visible document.
+        let nodes = parse("<html><head><title>X</title><body><p>Visible</p></body></html>");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "html");
+        assert_eq!(
+            children.len(),
+            2,
+            "expected <head> and <body> as siblings, got {children:?}"
+        );
+        assert!(matches!(&children[0], Node::Element { tag, .. } if tag == "head"));
+        let Node::Element {
+            tag,
+            children: body_children,
+        } = &children[1]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "body");
+        assert_eq!(text(body_children), "Visible");
     }
 
     #[test]

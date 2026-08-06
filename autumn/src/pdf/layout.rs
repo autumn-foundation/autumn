@@ -1531,6 +1531,30 @@ mod tests {
     }
 
     #[test]
+    fn omitted_head_close_before_body_does_not_discard_the_whole_document() {
+        // Regression: without an implied close, `<body>` nested *inside* the
+        // still-open `<head>` — and `head` is in `is_non_rendered`, so its
+        // entire subtree (which would now include `<body>`) was discarded
+        // wholesale, dropping the whole visible document, not just one
+        // element's structure.
+        let nodes = super::super::html::parse(
+            "<html><head><title>X</title><body><p>Visible</p></body></html>",
+        );
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected the <body>'s <p> to survive, got {blocks:?}"
+        );
+        assert!(
+            matches!(&blocks[0], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "Visible".to_owned(), bold: false, italic: false,
+            }])
+        );
+    }
+
+    #[test]
     fn description_list_terms_and_values_keep_their_own_blocks() {
         // Regression: `<dl>`/`<dt>`/`<dd>` (as emitted by scaffold detail
         // views — e.g. a `property_list` widget) fell through the generic

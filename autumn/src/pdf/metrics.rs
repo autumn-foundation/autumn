@@ -50,7 +50,12 @@ const fn base_width_1000em(ch: char) -> u16 {
         // at ~513pt (doesn't).
         'w' | 'C' | 'D' | 'H' | 'N' | 'R' | 'U' => 722,
         'G' | 'O' | 'Q' => 778,
-        'A'..='Z' => 667,
+        // `&` used to fall into the generic ASCII fallback (556) below, but
+        // its real Helvetica width (667) is wider — same underestimation
+        // risk as the letters above: a 70-character run of `&`s at 11pt
+        // used to estimate ~428pt (fits a 495pt content area) while
+        // Helvetica renders it at ~514pt (doesn't).
+        '&' | 'A'..='Z' => 667,
         '\u{00C0}'..='\u{00DE}' if ch != '\u{00D7}' => 667, // Latin-1 uppercase accented (approx like A-Z)
         '\u{2014}' | '\u{2026}' | '\u{2030}' | '\u{2122}' => 1000, // — em dash, … ellipsis, ‰, ™
         '\u{00A9}' | '\u{00AE}' => 737,                     // © copyright, ® registered
@@ -242,6 +247,25 @@ mod tests {
             hundred_eighty_is > content_area_pt,
             "180 Is at 11pt ({hundred_eighty_is}pt) must be estimated wider than a 495pt \
              content area, matching Helvetica's real ~550pt rendering, not the old ~440pt \
+             underestimate"
+        );
+    }
+
+    #[test]
+    fn ampersand_is_not_underestimated_as_a_generic_ascii_character() {
+        // Regression: `&` used to fall into the generic ASCII fallback
+        // (556), but its real Helvetica width (667) is wider — same
+        // underestimation risk as the earlier fixes. A repro matching the
+        // reported one: 70 `&`s at 11pt used to estimate ~428pt (fits a
+        // 495pt content area) while Helvetica actually renders them at
+        // ~514pt (doesn't).
+        assert_eq!(char_width_1000em('&', false), 667);
+        let seventy_ampersands = text_width_pt(&"&".repeat(70), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            seventy_ampersands > content_area_pt,
+            "70 &s at 11pt ({seventy_ampersands}pt) must be estimated wider than a 495pt \
+             content area, matching Helvetica's real ~514pt rendering, not the old ~428pt \
              underestimate"
         );
     }
