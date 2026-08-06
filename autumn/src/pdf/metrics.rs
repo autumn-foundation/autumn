@@ -78,6 +78,13 @@ const fn base_width_1000em(ch: char) -> u16 {
         '\u{2022}' => 350,                                  // • bullet
         '\u{2020}' | '\u{2021}' => 500,                     // † dagger, ‡ double dagger
         '\u{00B0}' => 400,                                  // ° degree
+        // Math/comparison operators used to fall into the generic ASCII
+        // fallback (556) below, but Helvetica renders them wider (584) —
+        // same underestimation risk as the other wide-glyph fixes above. A
+        // repro matching the reported one: 80 `+`s at 11pt used to estimate
+        // ~489pt (fits a 495pt content area) while Helvetica actually
+        // renders them at ~514pt (doesn't).
+        '+' | '<' | '=' | '>' | '~' => 584,
         _ if ch.is_ascii() => 556,
         '\u{00DF}'..='\u{00FF}' if ch != '\u{00F7}' => 556, // Latin-1 lowercase accented (approx default)
         // Everything else that WinAnsi (`printpdf`'s built-in-font encoding,
@@ -322,6 +329,26 @@ mod tests {
             fifty_oes > content_area_pt,
             "50 Œs at 11pt ({fifty_oes}pt) must be estimated wider than a 495pt content area, \
              matching Helvetica's real ~550pt rendering, not the old ~306pt underestimate"
+        );
+    }
+
+    #[test]
+    fn math_operators_are_not_underestimated_as_generic_ascii_characters() {
+        // Regression: `+`/`<`/`=`/`>`/`~` used to fall into the generic
+        // ASCII fallback (556), but Helvetica renders them wider (584) —
+        // same underestimation risk as the earlier fixes. A repro matching
+        // the reported one: 80 `+`s at 11pt used to estimate ~489pt (fits a
+        // 495pt content area) while Helvetica actually renders them at
+        // ~514pt (doesn't).
+        for op in ['+', '<', '=', '>', '~'] {
+            assert_eq!(char_width_1000em(op, false), 584, "operator {op:?}");
+        }
+        let eighty_pluses = text_width_pt(&"+".repeat(80), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            eighty_pluses > content_area_pt,
+            "80 +s at 11pt ({eighty_pluses}pt) must be estimated wider than a 495pt content \
+             area, matching Helvetica's real ~514pt rendering, not the old ~489pt underestimate"
         );
     }
 

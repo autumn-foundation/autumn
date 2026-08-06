@@ -56,9 +56,19 @@ enum Word {
         /// No whitespace separated this word from the previous one in the
         /// source HTML (e.g. `$<strong>42.00</strong>`, where "$" and
         /// "42.00" are adjacent spans with nothing between them) — render
-        /// with no space before it, and never break a line between it and
-        /// the previous word.
+        /// with no space before it. [`wrap`] still breaks a line here if the
+        /// glued pair doesn't fit together (see `unbreakable` below for the
+        /// one case where it must not).
         glue: bool,
+        /// A literal NBSP (`&nbsp;`) sits at this glue boundary — trailing
+        /// on the previous span's text, or leading on this one. Unlike
+        /// ordinary `glue` (two adjacent spans with nothing between them,
+        /// where a line break is an acceptable fallback if they don't fit),
+        /// an NBSP is the source HTML explicitly asking for these two words
+        /// to never separate across a line break — so [`wrap`] must move
+        /// this word *and* the one it's glued to together, rather than
+        /// breaking between them on overflow. Always implies `glue`.
+        unbreakable: bool,
     },
     Break,
 }
@@ -133,6 +143,21 @@ fn is_block_boundary_in_inline_context(tag: &str) -> bool {
                 | "footer"
                 | "nav"
                 | "aside"
+                // A nested `<table>` (e.g. `<td><table>...</table></td>`) has
+                // no dedicated `Block::Table` path here — `extract_table_rows`
+                // only runs on a *top-level* table — so without this, its
+                // `table`/`tr`/`td`/`th` structure fell through to the
+                // generic transparent-wrapper case and glued adjacent cells'
+                // text directly together (`<td>A</td><td>B</td>` rendering
+                // as "AB"). Not a real nested table (no grid/borders), but
+                // keeps each cell's content from merging into its neighbor.
+                | "table"
+                | "thead"
+                | "tbody"
+                | "tfoot"
+                | "tr"
+                | "td"
+                | "th"
         )
 }
 
@@ -522,11 +547,17 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
 fn words_of(spans: &[Span]) -> Vec<Word> {
     let mut words = Vec::new();
     let mut glue_next = false;
+    // Whether the pending `glue_next` boundary is specifically an NBSP —
+    // i.e. the previous span's text ended with a literal U+00A0 — as
+    // opposed to two spans with plain nothing (no whitespace at all)
+    // between them. See [`Word::Text::unbreakable`].
+    let mut glue_next_unbreakable = false;
     for span in spans {
         match span {
             Span::Break => {
                 words.push(Word::Break);
                 glue_next = false;
+                glue_next_unbreakable = false;
             }
             Span::Run { text, bold, italic } => {
                 // Must agree with the split predicate below on what counts as
@@ -542,6 +573,8 @@ fn words_of(spans: &[Span]) -> Vec<Word> {
                 let is_breakable_ws = |c: char| c.is_whitespace() && c != '\u{00A0}';
                 let starts_with_ws = text.starts_with(is_breakable_ws);
                 let ends_with_ws = text.ends_with(is_breakable_ws);
+                let starts_with_nbsp = text.starts_with('\u{00A0}');
+                let ends_with_nbsp = text.ends_with('\u{00A0}');
                 let mut emitted_any = false;
                 // Split on breakable whitespace only — NBSP (`&nbsp;`,
                 // decoded to U+00A0) satisfies `char::is_whitespace()` so
@@ -556,15 +589,18 @@ fn words_of(spans: &[Span]) -> Vec<Word> {
                     .filter(|w| !w.is_empty())
                     .enumerate()
                 {
+                    let glue = i == 0 && glue_next && !starts_with_ws;
                     words.push(Word::Text {
                         text: w.to_owned(),
                         bold: *bold,
                         italic: *italic,
-                        glue: i == 0 && glue_next && !starts_with_ws,
+                        glue,
+                        unbreakable: glue && (glue_next_unbreakable || starts_with_nbsp),
                     });
                     emitted_any = true;
                 }
                 glue_next = emitted_any && !ends_with_ws;
+                glue_next_unbreakable = emitted_any && ends_with_nbsp;
             }
         }
     }
@@ -620,6 +656,13 @@ fn split_into_fitting_chunks(
 /// an ordinary word boundary would; the only difference glue makes is that
 /// no rendered space is inserted, which a line break doesn't need anyway.
 ///
+/// [`Word::Text::unbreakable`] words are held to a stricter rule: an NBSP
+/// means the source HTML explicitly forbids a line break at that boundary,
+/// so on overflow the *entire* unbreakable run built up so far (tracked via
+/// `run_start`/`run_width`, not just the word that doesn't fit) moves to the
+/// next line together, rather than splitting between the run and the new
+/// word the way ordinary glue would.
+///
 /// A single word wider than `max_width_pt` on its own (a long URL, hash, or
 /// identifier with nowhere to break) is character-wrapped via
 /// [`split_into_fitting_chunks`] instead of being left to overflow the page
@@ -629,18 +672,29 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
     let mut lines = Vec::new();
     let mut current: Vec<StyledWord> = Vec::new();
     let mut current_width = 0.0f32;
+    // Index into `current` where the active unbreakable (NBSP-glued) run
+    // begins, and that run's total width — tracked incrementally (not
+    // recomputed by summing `current[run_start..]` on each word) so a long
+    // chain of NBSP-glued words stays linear, not quadratic, in the number
+    // of words — see the `long_run_of_unterminated_*` lint on this module
+    // for why that class of bug matters here.
+    let mut run_start = 0usize;
+    let mut run_width = 0.0f32;
 
     for word in words {
         match word {
             Word::Break => {
                 lines.push(std::mem::take(&mut current));
                 current_width = 0.0;
+                run_start = 0;
+                run_width = 0.0;
             }
             Word::Text {
                 text,
                 bold,
                 italic,
                 glue,
+                unbreakable,
             } => {
                 let w = text_width_pt(text, font_size_pt, *bold);
                 if w > max_width_pt && !text.is_empty() {
@@ -659,6 +713,34 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
                             lines.push(vec![(chunk, *bold, *italic, false)]);
                         }
                     }
+                    run_start = 0;
+                    run_width = current_width;
+                    continue;
+                }
+                if *unbreakable && !current.is_empty() {
+                    let new_run_width = run_width + w;
+                    let prefix_width = current_width - run_width;
+                    if run_start > 0 && prefix_width + new_run_width > max_width_pt {
+                        // The run (everything from `run_start` on) doesn't
+                        // fit after this word either — relocate the whole
+                        // run, plus this word, to a fresh line rather than
+                        // splitting the NBSP boundary the way ordinary glue
+                        // would.
+                        let tail = current.split_off(run_start);
+                        lines.push(std::mem::take(&mut current));
+                        current = tail;
+                        current_width = new_run_width;
+                        run_start = 0;
+                    } else {
+                        // Either it still fits alongside the run, or
+                        // `run_start == 0` (the run already spans the whole
+                        // line from its start, same as an ordinary oversized
+                        // glued word on an empty line) — nowhere better to
+                        // put it, so accept the overflow rather than loop.
+                        current_width = prefix_width + new_run_width;
+                    }
+                    current.push((text.clone(), *bold, *italic, true));
+                    run_width = new_run_width;
                     continue;
                 }
                 let mut glued = *glue && !current.is_empty();
@@ -682,6 +764,8 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
                 } else {
                     w + space_w
                 };
+                run_start = current.len();
+                run_width = w;
                 current.push((text.clone(), *bold, *italic, glued));
             }
         }
@@ -1040,6 +1124,7 @@ mod tests {
                 bold: false,
                 italic: false,
                 glue: false,
+                unbreakable: false,
             },
             Word::Break,
             Word::Text {
@@ -1047,6 +1132,7 @@ mod tests {
                 bold: false,
                 italic: false,
                 glue: false,
+                unbreakable: false,
             },
         ];
         let lines = wrap(&words, 1000.0, 12.0);
@@ -1072,6 +1158,7 @@ mod tests {
                 bold: false,
                 italic: false,
                 glue: false,
+                unbreakable: false,
             }],
             "NBSP must not split the run into two breakable words"
         );
@@ -1116,12 +1203,14 @@ mod tests {
                     bold: false,
                     italic: false,
                     glue: false,
+                    unbreakable: false,
                 },
                 Word::Text {
                     text: "\u{00A0}world".to_owned(),
                     bold: true,
                     italic: false,
                     glue: true,
+                    unbreakable: true,
                 },
             ],
             "the NBSP-led word must glue to the previous word, not add a second separator"
@@ -1142,12 +1231,14 @@ mod tests {
                 bold: false,
                 italic: false,
                 glue: false,
+                unbreakable: false,
             },
             Word::Text {
                 text: "WWWW".to_owned(),
                 bold: false,
                 italic: false,
                 glue: true,
+                unbreakable: false,
             },
         ];
         let max_width_pt = 50.0;
@@ -1171,6 +1262,66 @@ mod tests {
             lines[1],
             vec![("WWWW".to_owned(), false, false, false)],
             "the word that moved to a new line is no longer glued to anything on it"
+        );
+    }
+
+    #[test]
+    fn unbreakable_nbsp_pair_moves_together_when_it_does_not_fit() {
+        // Regression: `Hello<strong>&nbsp;world</strong>` after earlier text
+        // that leaves room for "Hello" but not the NBSP-glued "world" — the
+        // overflow branch used to treat this exactly like ordinary glue
+        // (`glued_run_that_cannot_fit_still_breaks_the_line` above), pushing
+        // "Prefix Hello" together as a finished line and placing the
+        // NBSP-led word alone on the next line — splitting the exact
+        // boundary NBSP forbids a break at. An NBSP pair that doesn't fit
+        // must move to the new line *together*, not split.
+        let words = vec![
+            Word::Text {
+                text: "WWWW".to_owned(), // stands in for "Prefix"
+                bold: false,
+                italic: false,
+                glue: false,
+                unbreakable: false,
+            },
+            Word::Text {
+                text: "WWWW".to_owned(), // stands in for "Hello"
+                bold: false,
+                italic: false,
+                glue: false,
+                unbreakable: false,
+            },
+            Word::Text {
+                text: "WWWW".to_owned(), // stands in for NBSP-led "world"
+                bold: false,
+                italic: false,
+                glue: true,
+                unbreakable: true,
+            },
+        ];
+        let word_width = text_width_pt("WWWW", 12.0, false);
+        let space_w = text_width_pt(" ", 12.0, false);
+        // Fits "Prefix Hello" (two words + one space) but not a third glued
+        // "WWWW" on top of that; a fresh line fits the NBSP pair alone
+        // (two words, no space between them).
+        let max_width_pt = 2.0f32.mul_add(word_width, space_w) + 0.5;
+        let lines = wrap(&words, max_width_pt, 12.0);
+        assert_eq!(
+            lines.len(),
+            2,
+            "the NBSP pair must move to a new line rather than splitting across two"
+        );
+        assert_eq!(
+            lines[0],
+            vec![("WWWW".to_owned(), false, false, false)],
+            "only the unrelated prefix word stays on the first line"
+        );
+        assert_eq!(
+            lines[1],
+            vec![
+                ("WWWW".to_owned(), false, false, false),
+                ("WWWW".to_owned(), false, false, true),
+            ],
+            "the NBSP-glued pair must move together onto the second line"
         );
     }
 
@@ -1497,6 +1648,45 @@ mod tests {
     }
 
     #[test]
+    fn nested_table_inside_a_cell_keeps_its_rows_and_cells_separate() {
+        // Regression: a `<table>` nested inside a `<td>` has no dedicated
+        // `Block::Table` path (only a top-level table gets one) — its inner
+        // `table`/`tr`/`td` nodes used to fall through `inline_spans`'s
+        // generic transparent-wrapper case, so adjacent cells' text glued
+        // directly together with no separator: `<td>A</td><td>B</td>`
+        // rendered as "AB".
+        let nodes = super::super::html::parse(
+            "<table><tr><td><table><tr><td>A</td><td>B</td></tr></table></td></tr></table>",
+        );
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(blocks.len(), 1);
+        let Block::Table(rows) = &blocks[0] else {
+            panic!("expected a table block");
+        };
+        assert_eq!(rows.len(), 1);
+        let (spans, is_header) = &rows[0].cells[0];
+        assert!(!is_header);
+        assert_eq!(
+            spans,
+            &[
+                Span::Run {
+                    text: "A".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+                Span::Break,
+                Span::Run {
+                    text: "B".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+            ],
+            "the nested table's cells must be line-break separated, not glued into \"AB\""
+        );
+    }
+
+    #[test]
     fn omitted_p_close_before_a_table_still_produces_a_real_table_block() {
         // Regression: without an implied close, `<p>Intro<table>...</table>`
         // nested the table *inside* the still-open `<p>`, so `flatten_blocks`'s
@@ -1638,12 +1828,14 @@ mod tests {
                     bold: false,
                     italic: false,
                     glue: false,
+                    unbreakable: false,
                 },
                 Word::Text {
                     text: "world".to_owned(),
                     bold: false,
                     italic: false,
                     glue: false,
+                    unbreakable: false,
                 },
             ],
             "the space between the two spans must survive as a real word boundary"
