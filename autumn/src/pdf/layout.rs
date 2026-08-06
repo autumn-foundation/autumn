@@ -271,7 +271,20 @@ fn inline_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Sp
             bold: false,
             italic: false,
         });
+        // If this item's content starts with a block boundary (e.g.
+        // `<li><p>Child</p></li>`), `inline_spans` pushes a break *before*
+        // it — normally correct (separating one block from the one before
+        // it), but here `out` already ends with the marker's own `Run`, so
+        // that leading break lands directly between the marker and its
+        // first line of content instead of before a preceding sibling,
+        // splitting them across two lines. Strip exactly that one leading
+        // break (never more — anything after it is legitimate inter-block
+        // spacing within the item's own content).
+        let content_start = out.len();
         inline_spans(children, false, false, depth + 1, out);
+        if out.get(content_start) == Some(&Span::Break) {
+            out.remove(content_start);
+        }
     }
 }
 
@@ -1662,6 +1675,48 @@ mod tests {
                 },
             ],
             "the nested item must keep its own bullet marker instead of losing all list semantics"
+        );
+    }
+
+    #[test]
+    fn nested_list_item_marker_stays_beside_paragraph_wrapped_content() {
+        // Regression: `inline_list_items` pushes the marker `Run` directly
+        // into `out`, then calls `inline_spans` for the item's content —
+        // when that content starts with a block boundary (here `<p>`),
+        // `inline_spans` pushes a break *before* it, which is correct when
+        // something precedes it but here lands directly between the
+        // marker and its own first line, splitting `<li><p>Child</p></li>`
+        // into the marker alone on one line and "Child" on the next.
+        let nodes =
+            super::super::html::parse("<ul><li>Parent<ul><li><p>Child</p></li></ul></li></ul>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(blocks.len(), 1);
+        let Block::ListItem { marker, spans } = &blocks[0] else {
+            panic!("expected a list item block");
+        };
+        assert_eq!(marker, "\u{2022}");
+        assert_eq!(
+            spans,
+            &[
+                Span::Run {
+                    text: "Parent".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+                Span::Break,
+                Span::Run {
+                    text: "\u{2022} ".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+                Span::Run {
+                    text: "Child".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+            ],
+            "the nested marker must stay on the same line as its paragraph-wrapped content"
         );
     }
 

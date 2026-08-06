@@ -138,9 +138,15 @@ pub(super) const fn char_width_1000em(ch: char, bold: bool) -> u16 {
     let w = base_width_1000em(ch);
     if bold {
         // +40/1000em (~7% at typical text sizes) mirrors the modest widening
-        // seen between Helvetica and Helvetica-Bold AFM widths; deliberately
-        // approximate, see module docs.
-        w.saturating_add(40)
+        // seen between Helvetica and Helvetica-Bold AFM widths for most
+        // glyphs; deliberately approximate, see module docs. The straight
+        // double quote is a real exception, not just approximation noise:
+        // Helvetica-Bold's quotedbl (474) is far wider than a flat +40
+        // over the regular width (333 + 40 = 373) would give it. A repro
+        // matching the reported one: 120 `"`s at 11pt used to estimate
+        // ~492pt (fits a 495pt content area) while Helvetica-Bold actually
+        // renders them at ~626pt (doesn't).
+        if ch == '"' { 474 } else { w.saturating_add(40) }
     } else {
         w
     }
@@ -179,6 +185,26 @@ mod tests {
         for ch in ['a', 'M', ' ', '.', '维'] {
             assert!(char_width_1000em(ch, true) >= char_width_1000em(ch, false));
         }
+    }
+
+    #[test]
+    fn bold_double_quotes_are_not_underestimated_by_the_flat_bold_offset() {
+        // Regression: bold widths are normally estimated as regular + 40,
+        // but Helvetica-Bold's quotedbl (474) is far wider than that flat
+        // offset gives it (333 regular + 40 = 373) — same underestimation
+        // risk as the other wide-glyph fixes. A repro matching the
+        // reported one: 120 `"`s at 11pt used to estimate ~492pt (fits a
+        // 495pt content area) while Helvetica-Bold actually renders them
+        // at ~626pt (doesn't).
+        assert_eq!(char_width_1000em('"', true), 474);
+        let hundred_twenty_quotes = text_width_pt(&"\"".repeat(120), 11.0, true);
+        let content_area_pt = 495.0;
+        assert!(
+            hundred_twenty_quotes > content_area_pt,
+            "120 \"s at 11pt bold ({hundred_twenty_quotes}pt) must be estimated wider than a \
+             495pt content area, matching Helvetica-Bold's real ~626pt rendering, not the old \
+             ~492pt underestimate"
+        );
     }
 
     #[test]
