@@ -245,27 +245,46 @@ fn oversized_raw_text_tag_name(s: &str) -> Option<&'static str> {
     None
 }
 
+/// Locates the byte position right after an oversized tag's own `>` —
+/// `after_name` is the position right after the tag name (e.g. right after
+/// `<script`, before any attributes), and this searches the still-unparsed
+/// attribute list for the real closing `>` via the same quote-aware
+/// [`find_tag_end`] [`parse_open_tag`] itself uses, just unbounded this
+/// time (safe from [`MAX_TAG_SCAN`]'s O(n^2) risk even so — see
+/// [`push_oversized_head_tag`]'s docs for why). Falls back to `len` (EOF)
+/// if no `>` is ever found, matching this parser's usual auto-close-at-EOF
+/// tolerance.
+///
+/// Quote-awareness matters here specifically: a naive scan for `>` (or,
+/// worse, skipping straight to a raw-text-style scan for `</name` from
+/// `after_name` without finding the real `>` at all) can be fooled by a
+/// quoted attribute value that itself contains a `</name`-looking
+/// substring appearing *before* the tag's actual closing `>` — e.g.
+/// `<script data-x="</script>` followed by more oversized attribute data
+/// and then `">Secret</script>` — mistaking that quoted text for the real
+/// closing tag and leaking everything after it (the rest of the attribute
+/// value, and the element's real content) as visible text.
+fn oversized_tag_body_start(input: &str, after_name: usize, len: usize) -> usize {
+    find_tag_end(&input[after_name..]).map_or(len, |i| after_name + i + 1)
+}
+
 /// Handles an oversized `<head ...>` opening tag once
-/// [`oversized_raw_text_tag_name`] has already recognized it — see that
-/// function's docs for why `head` can't reuse the same discard-to-literal-
-/// closing-tag treatment as the other five non-rendered tags. `input` is
-/// the whole document, `after_name` the byte position right after `<head`
-/// (i.e. `pos + 1 + "head".len()`), and `len` the document's total length
-/// (used as the fallback if the tag's own `>` is never found, matching
-/// this parser's usual auto-close-at-EOF tolerance). Returns the new `pos`.
-/// Extracted out of [`parse`] purely to keep that function's line count
-/// down — this has no state of its own beyond `stack`.
+/// [`oversized_raw_text_tag_name`] has already recognized it and
+/// [`oversized_tag_body_start`] has located where its content begins — see
+/// that function's docs for why `head` can't reuse the same
+/// discard-to-literal-closing-tag treatment as the other five
+/// non-rendered tags. Pushes a real `head` frame and returns `body_start`
+/// unchanged (accepted as a parameter purely so the caller doesn't have to
+/// juggle two different "new pos" values across the `if`). Extracted out
+/// of [`parse`] purely to keep that function's line count down — this has
+/// no state of its own beyond `stack`.
 fn push_oversized_head_tag(
     stack: &mut Vec<(String, Vec<Node>, usize)>,
-    input: &str,
-    after_name: usize,
-    len: usize,
+    body_start: usize,
 ) -> usize {
-    let gt = find_tag_end(&input[after_name..]);
-    let new_pos = gt.map_or(len, |i| after_name + i + 1);
     let structural_idx = nearest_structural_idx(stack, "head");
     stack.push(("head".to_owned(), Vec::new(), structural_idx));
-    new_pos
+    body_start
 }
 
 /// Bound on how far [`consume_raw_text`] scans past a candidate
@@ -450,9 +469,12 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             // the six non-rendered tags specifically (their own `>` pushed
             // past the bound by e.g. an oversized attribute), that
             // fallback would leak their content into the visible document
-            // — see `oversized_raw_text_tag_name`. Discard straight
-            // through to the closing tag (or EOF) via the same raw-text
-            // scan already used for a normally-parsed `<script>`/`<style>`
+            // — see `oversized_raw_text_tag_name`. First skip past the
+            // oversized tag's *own* attribute list (its content must
+            // never be scanned before its real `>` is found — see
+            // `oversized_tag_body_start`), then discard straight through
+            // to the closing tag (or EOF) via the same raw-text scan
+            // already used for a normally-parsed `<script>`/`<style>`
             // (reused here, not just for those two, since it does exactly
             // what's needed: skip to the matching closing tag and throw
             // everything in between away), without emitting any node for
@@ -460,10 +482,11 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             // handling — see `push_oversized_head_tag`.
             if let Some(name) = oversized_raw_text_tag_name(&input[pos..]) {
                 let after_name = pos + 1 + name.len();
+                let body_start = oversized_tag_body_start(input, after_name, len);
                 pos = if name == "head" {
-                    push_oversized_head_tag(&mut stack, input, after_name, len)
+                    push_oversized_head_tag(&mut stack, body_start)
                 } else {
-                    consume_raw_text(input, after_name, name).1
+                    consume_raw_text(input, body_start, name).1
                 };
                 continue;
             }
@@ -1314,6 +1337,32 @@ mod tests {
             !rendered.contains("secret") && !rendered.contains('Q'),
             "the script's source and its oversized attribute value must never appear as \
              visible text, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_tag_with_a_closing_tag_look_alike_in_its_own_attribute_is_not_fooled() {
+        // Regression: the oversized-tag fallback's raw-text scan started
+        // right after the tag *name* — still inside the still-unparsed,
+        // still-open attribute list — rather than after the tag's own
+        // real `>`. A quoted attribute value containing a `</script`-
+        // looking substring *before* that real `>` (e.g.
+        // `<script data-x="</script>` followed by oversized attribute
+        // data and then `">Secret</script>`) got mistaken for the actual
+        // closing tag, after which the rest of the attribute value and
+        // "Secret" were reparsed as ordinary visible markup/text.
+        let oversized_attr = format!("</script>{}", "Q".repeat(5000));
+        let html = format!(r#"<script data-x="{oversized_attr}">Secret</script><p>Visible</p>"#);
+        let nodes = parse(&html);
+        let rendered = text(&nodes);
+        assert!(
+            !rendered.contains("Secret") && !rendered.contains('Q'),
+            "the script's source and its oversized attribute value (including the embedded \
+             </script>-looking substring) must never appear as visible text, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Visible"),
+            "the following sibling <p> must still render normally, got {rendered:?}"
         );
     }
 

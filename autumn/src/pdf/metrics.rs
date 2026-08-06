@@ -106,7 +106,17 @@ const fn base_width_1000em(ch: char) -> u16 {
         // A repro matching the reported one: 80 `¿`s at 11pt used to
         // estimate ~489pt (fits a 495pt content area) while Helvetica
         // actually renders them at ~538pt (doesn't).
-        '\u{017D}' | '\u{00DF}' | '\u{00F8}' | '\u{00BF}' => 611,
+        //
+        // `þ` (U+00FE, thorn) also shares this width (611); like ß/ø it
+        // falls within the Latin-1-lowercase-accented range below (which
+        // approximates the whole block at 556, underestimating it the
+        // same way), but this arm being listed first is enough — match
+        // arms are tried in order, so this specific width wins without
+        // needing an explicit exclusion in that range's guard too. A
+        // repro matching the reported one: 80 `þ`s at 11pt used to
+        // estimate ~489pt (fits a 495pt content area) while Helvetica
+        // actually renders them at ~538pt (doesn't).
+        '\u{017D}' | '\u{00DF}' | '\u{00F8}' | '\u{00BF}' | '\u{00FE}' => 611,
         // `Æ`/`Œ` (and their lowercase forms `æ`/`œ`, merged into the `%`/`W`
         // arms above to avoid duplicate match bodies) are representable
         // WinAnsi ligatures, not accented letters — the Latin-1 range below
@@ -649,6 +659,24 @@ mod tests {
         assert!(
             eighty_sharp_s > content_area_pt,
             "80 ßs at 11pt ({eighty_sharp_s}pt) must be estimated wider than a 495pt content \
+             area, matching Helvetica's real ~538pt rendering, not the old ~489pt underestimate"
+        );
+    }
+
+    #[test]
+    fn lowercase_thorn_is_not_underestimated() {
+        // Regression: `þ` (U+00FE) used to fall into the blanket
+        // Latin-1-lowercase-accented range (556), but Helvetica renders it
+        // at 611 units — same underestimation risk as ß/ø above. A repro
+        // matching the reported one: 80 `þ`s at 11pt used to estimate
+        // ~489pt (fits a 495pt content area) while Helvetica actually
+        // renders them at ~538pt (doesn't).
+        assert_eq!(char_width_1000em('\u{00FE}', false), 611); // þ
+        let eighty_thorns = text_width_pt(&"\u{00FE}".repeat(80), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            eighty_thorns > content_area_pt,
+            "80 þs at 11pt ({eighty_thorns}pt) must be estimated wider than a 495pt content \
              area, matching Helvetica's real ~538pt rendering, not the old ~489pt underestimate"
         );
     }
