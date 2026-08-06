@@ -98,6 +98,16 @@ fn ttl_millis_for_redis(ttl: std::time::Duration) -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
+/// Whether `url` needs the `rustls` `CryptoProvider` installed to connect —
+/// true only for the TLS (`rediss://`) scheme. A plain `redis://` URL never
+/// touches TLS, so it must not claim the process-wide default: doing so
+/// could pre-empt a later, unrelated attempt elsewhere in the process to
+/// install a different provider (e.g. `aws-lc-rs`) for something that
+/// actually needs one.
+fn needs_tls_crypto_provider(url: &str) -> bool {
+    url.starts_with("rediss://")
+}
+
 impl RedisCache {
     /// Connect using an explicit URL and key prefix.
     ///
@@ -117,10 +127,16 @@ impl RedisCache {
         // (matching the backend already used by this workspace's other rustls
         // call sites) makes a `rediss://` URL usable regardless of init
         // order; `.ok()` makes it idempotent since a concurrent/earlier call
-        // may have already installed one.
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        // may have already installed one. Scoped to `rediss://` URLs only —
+        // a plain `redis://` connection never touches TLS, so claiming the
+        // process-wide default here would be able to pre-empt a later,
+        // unrelated attempt elsewhere in the process to install a different
+        // provider (e.g. `aws-lc-rs`) for something that actually needs it.
+        if needs_tls_crypto_provider(url) {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .ok();
+        }
         let client = redis::Client::open(url)?;
         let manager = ConnectionManager::new(client).await?;
         Ok(Self {
@@ -427,6 +443,17 @@ mod tests {
     #[test]
     fn redis_ttl_millis_never_uses_zero() {
         assert_eq!(ttl_millis_for_redis(std::time::Duration::ZERO), 1);
+    }
+
+    #[test]
+    fn plain_redis_urls_do_not_claim_the_process_wide_tls_provider() {
+        assert!(!needs_tls_crypto_provider("redis://127.0.0.1:6379/"));
+        assert!(!needs_tls_crypto_provider("redis://user:pass@host:6379/0"));
+    }
+
+    #[test]
+    fn rediss_urls_still_claim_the_tls_provider() {
+        assert!(needs_tls_crypto_provider("rediss://127.0.0.1:6380/"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

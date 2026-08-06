@@ -207,24 +207,40 @@ fn is_raw_text_element(tag: &str) -> bool {
 /// same as [`is_structural_tag`] mirrors (rather than calls into) the
 /// tag sets it's related to elsewhere in this file.
 ///
-/// The caller in [`parse`] gives the returned `"head"` different handling
-/// than the other five: `<head>`'s closing tag is optional (implicitly
-/// closed by later non-head content, see [`implicitly_closes`]), so
-/// discarding straight through to a literal `</head>` the way the other
-/// five raw-text-scan would swallow the rest of the document — including
-/// `<body>` — whenever `</head>` is omitted, which is legal HTML. See the
-/// call site for how `head` instead gets a real stack frame.
+/// The caller in [`parse`] gives three of the six —`head`, `noscript`, and
+/// `template`— different handling than `script`/`style`/`title`: those
+/// three are [structural, generally-parsed elements](is_structural_tag)
+/// even when normally sized (their content is real markup, only hidden at
+/// render time by `is_non_rendered`), so discarding straight through to a
+/// literal closing tag the way the true [raw-text elements](is_raw_text_element)
+/// do would be wrong two different ways. For `head`, whose closing tag is
+/// optional (implicitly closed by later non-head content, see
+/// [`implicitly_closes`]), it would swallow the rest of the document —
+/// including `<body>` — whenever `</head>` is omitted, which is legal
+/// HTML. For `noscript`/`template`, it would stop at the first *nested*
+/// same-name closing tag rather than the correctly-matching outer one —
+/// e.g. `<template>` containing another `<template>` — leaking whatever
+/// sits between the inner and outer closing tags into the visible
+/// document instead of keeping it inside the (fully hidden) outer
+/// element's subtree. See the call site for how all three instead get a
+/// real stack frame and fall through to normal parsing, exactly like a
+/// normally-sized instance of the same tag already does.
 ///
 /// `<textarea>` is deliberately excluded even though it's also
 /// tag-name-adjacent raw text: unlike these six, it isn't
 /// `is_non_rendered` — its content is meant to render normally — so
 /// silently discarding it here the same way would be a regression, not a
-/// fix. Nested same-tag content in the five raw-text-scanned tags (e.g. a
-/// `<template>` containing another `<template>`) closes at the first
-/// matching closing tag rather than the correctly-nested one, the same
-/// simplification [`consume_raw_text`] already accepts for
-/// `<script>`/`<style>` — acceptable here too since that fallback only
-/// ever discards the content, never renders it.
+/// fix. Nested same-tag content still closes at the first matching closing
+/// tag rather than the correctly-nested one for the three genuinely
+/// raw-text tags (`script`/`style`/`title`), the same simplification
+/// [`consume_raw_text`] already accepts for a normally-sized `<script>`/
+/// `<style>` — acceptable there since that fallback only ever discards the
+/// content, and it's never rendered either way. `head`/`noscript`/
+/// `template` don't get that simplification (see the call site in
+/// [`parse`]): their content is real, generally-parsed markup that's only
+/// hidden at render time, so nested same-name tags must close in the
+/// correct (innermost-first) order the way normal parsing already
+/// guarantees.
 fn oversized_raw_text_tag_name(s: &str) -> Option<&'static str> {
     debug_assert!(s.starts_with('<'));
     let rest = &s[1..];
@@ -251,7 +267,7 @@ fn oversized_raw_text_tag_name(s: &str) -> Option<&'static str> {
 /// attribute list for the real closing `>` via the same quote-aware
 /// [`find_tag_end`] [`parse_open_tag`] itself uses, just unbounded this
 /// time (safe from [`MAX_TAG_SCAN`]'s O(n^2) risk even so — see
-/// [`push_oversized_head_tag`]'s docs for why). Falls back to `len` (EOF)
+/// [`push_oversized_nested_tag`]'s docs for why). Falls back to `len` (EOF)
 /// if no `>` is ever found, matching this parser's usual auto-close-at-EOF
 /// tolerance.
 ///
@@ -268,22 +284,26 @@ fn oversized_tag_body_start(input: &str, after_name: usize, len: usize) -> usize
     find_tag_end(&input[after_name..]).map_or(len, |i| after_name + i + 1)
 }
 
-/// Handles an oversized `<head ...>` opening tag once
-/// [`oversized_raw_text_tag_name`] has already recognized it and
-/// [`oversized_tag_body_start`] has located where its content begins — see
-/// that function's docs for why `head` can't reuse the same
-/// discard-to-literal-closing-tag treatment as the other five
-/// non-rendered tags. Pushes a real `head` frame and returns `body_start`
-/// unchanged (accepted as a parameter purely so the caller doesn't have to
-/// juggle two different "new pos" values across the `if`). Extracted out
-/// of [`parse`] purely to keep that function's line count down — this has
-/// no state of its own beyond `stack`.
-fn push_oversized_head_tag(
+/// Handles an oversized `<head ...>`/`<noscript ...>`/`<template ...>`
+/// opening tag once [`oversized_raw_text_tag_name`] has already recognized
+/// it (and confirmed it isn't one of the three genuinely
+/// [raw-text](is_raw_text_element) tags) and [`oversized_tag_body_start`]
+/// has located where its content begins — see [`oversized_raw_text_tag_name`]'s
+/// docs for why these three can't reuse the same discard-to-literal-
+/// closing-tag treatment as `script`/`style`/`title`. Pushes a real frame
+/// for `name` (exactly as a normally-sized instance of the same tag would
+/// get) and returns `body_start` unchanged (accepted as a parameter purely
+/// so the caller doesn't have to juggle two different "new pos" values
+/// across the `if`). Extracted out of [`parse`] purely to keep that
+/// function's line count down — this has no state of its own beyond
+/// `stack`.
+fn push_oversized_nested_tag(
     stack: &mut Vec<(String, Vec<Node>, usize)>,
+    name: &str,
     body_start: usize,
 ) -> usize {
-    let structural_idx = nearest_structural_idx(stack, "head");
-    stack.push(("head".to_owned(), Vec::new(), structural_idx));
+    let structural_idx = nearest_structural_idx(stack, name);
+    stack.push((name.to_owned(), Vec::new(), structural_idx));
     body_start
 }
 
@@ -472,21 +492,24 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             // — see `oversized_raw_text_tag_name`. First skip past the
             // oversized tag's *own* attribute list (its content must
             // never be scanned before its real `>` is found — see
-            // `oversized_tag_body_start`), then discard straight through
-            // to the closing tag (or EOF) via the same raw-text scan
-            // already used for a normally-parsed `<script>`/`<style>`
-            // (reused here, not just for those two, since it does exactly
-            // what's needed: skip to the matching closing tag and throw
-            // everything in between away), without emitting any node for
-            // the (unparseable) opening tag itself. `head` needs different
-            // handling — see `push_oversized_head_tag`.
+            // `oversized_tag_body_start`), then either discard straight
+            // through to the closing tag (or EOF) via the same raw-text
+            // scan already used for a normally-parsed `<script>`/`<style>`/
+            // `<title>` (reused here since it does exactly what's needed
+            // for genuinely raw-text content: skip to the matching closing
+            // tag and throw everything in between away, without emitting
+            // any node for the unparseable opening tag itself), or, for
+            // `head`/`noscript`/`template` — whose content is real,
+            // generally-parsed markup rather than raw text, see
+            // `push_oversized_nested_tag` — push a real frame and fall
+            // through to normal parsing instead.
             if let Some(name) = oversized_raw_text_tag_name(&input[pos..]) {
                 let after_name = pos + 1 + name.len();
                 let body_start = oversized_tag_body_start(input, after_name, len);
-                pos = if name == "head" {
-                    push_oversized_head_tag(&mut stack, body_start)
-                } else {
+                pos = if is_raw_text_element(name) {
                     consume_raw_text(input, body_start, name).1
+                } else {
+                    push_oversized_nested_tag(&mut stack, name, body_start)
                 };
                 continue;
             }
@@ -1403,24 +1426,40 @@ mod tests {
         // only the first three got the oversized-tag suppression fix. A
         // repro matching the reported one: an oversized `<template>`
         // leaked both its attribute value and "Secret" into the visible
-        // document. Unlike `<head>`, neither of these two has an
-        // implied-close rule, so (like script/style/title) their content
-        // is fully and unconditionally suppressed, regardless of what it
-        // contains.
+        // document. Both get a real stack frame and normal parsing (see
+        // `push_oversized_nested_tag`), so what matters at this (parser)
+        // layer is that "Secret" and the oversized attribute value stay
+        // nested *inside* the element's own subtree — never escaping as a
+        // top-level sibling — since `layout.rs`'s `is_non_rendered` (tested
+        // separately) is what actually hides a whole subtree at render
+        // time; `text()` here has no such filter, so it isn't the right
+        // tool to assert final visibility for a tag with real children.
         for tag in ["noscript", "template"] {
             let oversized_attr = "Q".repeat(5000);
             let html = format!(r#"<{tag} data-x="{oversized_attr}">Secret</{tag}><p>Visible</p>"#);
             let nodes = parse(&html);
-            let rendered = text(&nodes);
-            assert!(
-                !rendered.contains("Secret") && !rendered.contains('Q'),
-                "tag {tag:?}: its text and oversized attribute value must never appear as \
-                 visible text, got {rendered:?}"
+            assert_eq!(
+                nodes.len(),
+                2,
+                "tag {tag:?}: expected exactly the oversized element and its sibling <p> at the \
+                 top level (nothing escaped as an extra sibling), got {nodes:?}"
             );
-            assert!(
-                rendered.contains("Visible"),
-                "tag {tag:?}: the following sibling <p> must still render normally, got \
-                 {rendered:?}"
+            let Node::Element { tag: first_tag, .. } = &nodes[0] else {
+                panic!("tag {tag:?}: expected the first top-level node to be an element")
+            };
+            assert_eq!(first_tag, tag);
+            let Node::Element {
+                tag: second_tag,
+                children,
+            } = &nodes[1]
+            else {
+                panic!("tag {tag:?}: expected the second top-level node to be an element")
+            };
+            assert_eq!(second_tag, "p");
+            assert_eq!(
+                text(children),
+                "Visible",
+                "tag {tag:?}: the following sibling <p> must still render normally"
             );
         }
     }
@@ -1449,6 +1488,55 @@ mod tests {
             rendered.contains("Visible"),
             "the <body> content must still render even though </head> was never written, got \
              {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_template_nested_inside_itself_hides_everything_up_to_the_outer_close() {
+        // Regression: the oversized-tag fallback used to route `<template>`
+        // through the same raw-text scan as `script`/`style`/`title`
+        // (`consume_raw_text`), which stops at the *first* literal closing
+        // tag and — for these three genuinely raw-text tags — never
+        // pushes a node for the (unparseable) opening tag at all. For a
+        // nested `<template><template>inner</template>leak</template>`
+        // body, that first closing tag is the *inner* one, so the old code
+        // discarded everything up through it, emitted no `template`
+        // element whatsoever, and resumed *normal top-level* parsing
+        // right on "leak" — turning it into a bare top-level text node
+        // (rendered) instead of staying nested inside the outer
+        // template's subtree (hidden by `layout.rs`'s `is_non_rendered`)
+        // the way real HTML5 nesting requires.
+        let oversized_attr = "Q".repeat(5000);
+        let html = format!(
+            r#"<template data-x="{oversized_attr}"><template>inner</template>leak</template><p>Visible</p>"#
+        );
+        let nodes = parse(&html);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "expected exactly the outer template element and its sibling <p> at the top level \
+             (nothing escaped as an extra sibling), got {nodes:?}"
+        );
+        let Node::Element { tag: first_tag, .. } = &nodes[0] else {
+            panic!(
+                "expected the first top-level node to be the outer template element, not a \
+                 leaked text node, got {:?}",
+                nodes[0]
+            )
+        };
+        assert_eq!(first_tag, "template");
+        let Node::Element {
+            tag: second_tag,
+            children,
+        } = &nodes[1]
+        else {
+            panic!("expected the second top-level node to be an element")
+        };
+        assert_eq!(second_tag, "p");
+        assert_eq!(
+            text(children),
+            "Visible",
+            "the following sibling <p> must still render normally"
         );
     }
 
