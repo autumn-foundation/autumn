@@ -3464,6 +3464,72 @@ previous_secrets = []
     }
 
     #[test]
+    fn aws_app_runner_provisions_a_reachable_one_shot_migration_task() {
+        // App Runner has no release-phase hook of its own, and RDS is
+        // private with no public entry point — main.tf must provision SOME
+        // real, reachable compute for `autumn migrate` to run against,
+        // rather than leaving that to unwritten operator infrastructure.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        for resource in [
+            "resource \"aws_ecs_cluster\" \"migrate\"",
+            "resource \"aws_ecs_task_definition\" \"migrate\"",
+            "resource \"aws_iam_role\" \"migrate_execution\"",
+            "resource \"aws_iam_role\" \"migrate_task\"",
+        ] {
+            assert!(
+                content.contains(resource),
+                "main.tf must declare {resource} so the migration task has somewhere \
+                 to run: {content}"
+            );
+        }
+        let task_def_block = content
+            .split("resource \"aws_ecs_task_definition\" \"migrate\"")
+            .nth(1)
+            .expect("main.tf must declare the migrate task definition");
+        assert!(
+            task_def_block.contains("autumn migrate"),
+            "the migrate task must actually run `autumn migrate`: {task_def_block}"
+        );
+        assert!(
+            task_def_block.contains("aws_secretsmanager_secret.database_url.arn"),
+            "the migrate task must be able to read the derived database URL: {task_def_block}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_migration_task_reuses_the_vpc_connector_security_group() {
+        // RDS's ingress rule (aws_security_group.database) only trusts
+        // aws_security_group.vpc_connector as a source — the migration
+        // task must be run with that SAME security group attached (via the
+        // vpc_connector_security_group_id output) rather than provisioning
+        // a second, parallel security group RDS's rule doesn't know about.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let outputs = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        for name in [
+            "migrate_cluster_name",
+            "migrate_task_family",
+            "private_subnet_ids",
+            "vpc_connector_security_group_id",
+        ] {
+            assert!(
+                outputs.contains(&format!("output \"{name}\"")),
+                "outputs.tf must declare output \"{name}\" for the migration task's \
+                 `aws ecs run-task` call: {outputs}"
+            );
+        }
+        assert!(
+            outputs.contains("aws_security_group.vpc_connector.id"),
+            "vpc_connector_security_group_id must reuse the SAME security group RDS's \
+             ingress rule trusts, not a new one: {outputs}"
+        );
+    }
+
+    #[test]
     fn aws_app_runner_main_tf_derives_database_url_not_a_variable() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -3982,6 +4048,33 @@ previous_secrets = []
                 service_block.contains(dep),
                 "aws_ecs_service.this must depend on {dep}, not just the secret \
                  container it references by ARN: {service_block}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_ecs_service_waits_for_execution_role_policies_before_starting() {
+        // The task definition's execution_role_arn only orders creation
+        // after the ROLE itself, not the policies attached to it — without
+        // an explicit depends_on, tasks could be scheduled before the
+        // execution role can actually pull the image, ship logs, or inject
+        // secrets, failing during resource initialization.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let service_block = content
+            .split("resource \"aws_ecs_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare the ECS service");
+        for dep in [
+            "aws_iam_role_policy_attachment.execution_managed",
+            "aws_iam_role_policy.execution_secrets",
+        ] {
+            assert!(
+                service_block.contains(dep),
+                "aws_ecs_service.this must depend on {dep}, not just the execution \
+                 role itself: {service_block}"
             );
         }
     }

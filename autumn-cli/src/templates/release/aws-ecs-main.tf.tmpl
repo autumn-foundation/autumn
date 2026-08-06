@@ -755,11 +755,20 @@ resource "aws_ecs_service" "this" {
   # secret exists, racing the version write. Tasks then fail secret
   # injection at startup, and the deployment circuit breaker above can
   # permanently fail the first deployment before the versions appear.
+  # aws_iam_role_policy_attachment.execution_managed/aws_iam_role_policy.
+  # execution_secrets are also required here: the task definition's
+  # execution_role_arn only orders creation after the ROLE itself, not the
+  # policies attached to it, so without this the service could schedule
+  # tasks before the execution role can actually pull the image, ship logs,
+  # or inject secrets — failing during resource initialization and
+  # potentially tripping the circuit breaker above on the very first apply.
   depends_on = [
     aws_lb_listener.https,
     aws_secretsmanager_secret_version.database_url,
     aws_secretsmanager_secret_version.signing_secret,
     aws_secretsmanager_secret_version.redis_url,
+    aws_iam_role_policy_attachment.execution_managed,
+    aws_iam_role_policy.execution_secrets,
   ]
 
   lifecycle {

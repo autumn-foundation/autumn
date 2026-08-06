@@ -1104,9 +1104,9 @@ This generates:
 
 | File | Purpose |
 |---|---|
-| `main.tf` | A VPC (private subnets for RDS + the App Runner VPC connector, one public subnet + NAT gateway for the app's own outbound traffic), an ECR repository, RDS PostgreSQL, Secrets Manager entries for the database URL and signing secret, and the App Runner service itself. |
+| `main.tf` | A VPC (private subnets for RDS + the App Runner VPC connector, one public subnet + NAT gateway for the app's own outbound traffic), an ECR repository, RDS PostgreSQL, Secrets Manager entries for the database URL and signing secret, the App Runner service itself, and a minimal one-shot ECS Fargate task+cluster whose only job is running `autumn migrate` against private RDS (App Runner has no release-phase hook of its own). |
 | `variables.tf` | `app_name`, `region`, `image_tag`, `bootstrap_image`, `instance_cpu`/`instance_memory`, `db_instance_class`, `vpc_cidr`, `min_size`/`max_size` (default 1/10), and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
-| `outputs.tf` | `app_url`, `service_arn`, `service_name`, `ecr_repository_url`, `apprunner_access_role_arn`. |
+| `outputs.tf` | `app_url`, `service_arn`, `service_name`, `ecr_repository_url`, `apprunner_access_role_arn`, plus `migrate_cluster_name`/`migrate_task_family`/`private_subnet_ids`/`vpc_connector_security_group_id` for the one-shot migration task. |
 | `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
 
 There is no CI workflow for this target — it's the fast/minimal path; wire
@@ -1114,7 +1114,9 @@ up your own deploy automation once you outgrow the manual walkthrough
 below, or move to [`--target aws-ecs`](#deploy-to-aws-ecs-fargate).
 
 **Why App Runner and not ECS/EKS**: it is the closest managed analog to
-Fly.io — auto-TLS, auto-scale, no ALB or cluster to manage — good for teams
+Fly.io — auto-TLS, auto-scale, no ALB or app-hosting cluster to manage
+(the one-shot migration task above is deliberately minimal — no service, no
+ALB, no autoscaling — and isn't in the way day to day) — good for teams
 new to AWS or doing a quick migration.
 
 **Egress routes through the VPC.** Setting
@@ -1176,7 +1178,56 @@ docker build \
 docker push "$ECR:$TAG"
 ```
 
-**Run `autumn migrate` against the database now, before the cutover below** — the generated production config sets `auto_migrate_in_production = false`, so nothing else runs it, and App Runner has no separate release-phase hook the way ECS's one-shot migration task or Azure's migration job does. RDS is private (not publicly accessible), so this means connecting through the VPC — from a bastion host, an SSM Session Manager port-forward, or a one-off ECS/Fargate task, whichever your setup already has. Only proceed to the `update-service` call below once migrations have actually completed; running it first serves the new, schema-dependent code against the old schema.
+**Run `autumn migrate` against the database now, before the cutover below** — the generated production config sets `auto_migrate_in_production = false`, so nothing else runs it, and App Runner has no separate release-phase hook the way ECS's one-shot migration task or Azure's migration job does. RDS is private (not publicly accessible), so `main.tf` provisions a dedicated one-shot ECS Fargate task purely to reach it — using the same private subnets and VPC-connector security group App Runner's own traffic already uses, so there's no second security group or RDS rule to keep in sync. Only proceed to the `update-service` call below once migrations have actually completed; running it first serves the new, schema-dependent code against the old schema.
+
+```bash
+MIGRATE_CLUSTER="$(terraform output -raw migrate_cluster_name)"
+MIGRATE_FAMILY="$(terraform output -raw migrate_task_family)"
+SUBNETS="$(terraform output -json private_subnet_ids | jq -c .)"
+SG="$(terraform output -raw vpc_connector_security_group_id)"
+
+# Task definitions are immutable per revision — register a new one with the
+# real image, keeping every other setting Terraform declared (env, secrets,
+# logging) untouched.
+NEW_DEF=$(aws ecs describe-task-definition --task-definition "$MIGRATE_FAMILY" --query 'taskDefinition' | \
+  jq --arg IMAGE "$ECR:$TAG" ".containerDefinitions[0].image = \$IMAGE | \
+    del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, \
+        .registeredAt, .registeredBy, .deregisteredAt)")
+MIGRATE_ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition --cli-input-json file:///dev/stdin \
+  --query 'taskDefinition.taskDefinitionArn' --output text)
+
+# run-task only starts the task and returns immediately, so poll for it to
+# stop, then check its exit code. `aws ecs wait tasks-stopped` has its own
+# fixed ~10-minute budget and exits nonzero once exhausted regardless of
+# whether the task is still running — and ECS tasks have no runtime limit of
+# their own — so poll manually and explicitly stop the task on timeout
+# rather than leaving it running in the background.
+TASK_ARN=$(aws ecs run-task --cluster "$MIGRATE_CLUSTER" --task-definition "$MIGRATE_ARN" \
+  --launch-type FARGATE \
+  --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":$SUBNETS,\"securityGroups\":[\"$SG\"],\"assignPublicIp\":\"DISABLED\"}}" \
+  --query 'tasks[0].taskArn' --output text)
+[ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ] || { echo "failed to start the migration task"; exit 1; }
+
+EXIT_CODE=""
+for _ in $(seq 1 60); do   # 10 minutes (60 x 10s)
+  STATUS=$(aws ecs describe-tasks --cluster "$MIGRATE_CLUSTER" --tasks "$TASK_ARN" \
+    --query 'tasks[0].lastStatus' --output text)
+  if [ "$STATUS" = "STOPPED" ]; then
+    EXIT_CODE=$(aws ecs describe-tasks --cluster "$MIGRATE_CLUSTER" --tasks "$TASK_ARN" \
+      --query 'tasks[0].containers[0].exitCode' --output text)
+    break
+  fi
+  sleep 10
+done
+if [ -z "$EXIT_CODE" ]; then
+  echo "migration did not finish within the time budget — stopping it"
+  aws ecs stop-task --cluster "$MIGRATE_CLUSTER" --task "$TASK_ARN" \
+    --reason "manual deploy: migration exceeded its polling budget" >/dev/null
+  aws ecs wait tasks-stopped --cluster "$MIGRATE_CLUSTER" --tasks "$TASK_ARN"
+  exit 1
+fi
+[ "$EXIT_CODE" = "0" ] || { echo "migration failed"; exit 1; }
+```
 
 ```bash
 APP_URL="$(terraform output -raw app_url)"   # known only after the FIRST apply created the service
@@ -1397,7 +1448,16 @@ fi
 
 aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
   --task-definition "$APP_ARN" --force-new-deployment >/dev/null
-aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+# services-stable exits 255 once its own ~10-minute polling budget (100
+# checks x 6s) is exhausted, regardless of whether the deployment is still
+# genuinely in progress — without checking that explicitly, the script
+# would fall through to the PRIMARY-deployment comparison below, which can
+# still match $APP_ARN mid-rollout and report false success.
+aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE" || {
+  echo "deployment did not stabilize within the waiter's time budget"
+  exit 1
+}
 
 # services-stable's predicate only requires ONE deployment to have
 # runningCount == desiredCount — if the new revision failed its health

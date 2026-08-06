@@ -54,3 +54,34 @@ output "signing_secret_secret_arn" {
   description = "Secrets Manager ARN for the signing secret — required by the deploy walkthrough's cutover `update-service` call (RuntimeEnvironmentSecrets)."
   value       = aws_secretsmanager_secret.signing_secret.arn
 }
+
+# The four outputs below back the deploy walkthrough's `aws ecs run-task`
+# call for the one-shot migration task (see aws_ecs_task_definition.migrate
+# in main.tf) — App Runner has no release-phase hook of its own, and RDS is
+# private with no public entry point, so migrations need this dedicated
+# path into the VPC.
+
+output "migrate_cluster_name" {
+  description = "ECS cluster name required by the deploy walkthrough's `aws ecs run-task` call for the one-shot migration task."
+  value       = aws_ecs_cluster.migrate.name
+}
+
+output "migrate_task_family" {
+  description = "Task definition family for the one-shot migration task — the deploy walkthrough registers a fresh revision with the real image before every cutover, since App Runner never runs migrations on its own."
+  value       = aws_ecs_task_definition.migrate.family
+}
+
+output "private_subnet_ids" {
+  description = "Private subnet IDs required by the deploy walkthrough's `aws ecs run-task --network-configuration` for the one-shot migration task."
+  value       = aws_subnet.private[*].id
+}
+
+# Deliberately the SAME security group the App Runner VPC connector itself
+# uses, not a new one: RDS's ingress rule (aws_security_group.database)
+# already trusts this security group as its source, so running the
+# migration task with it attached reaches RDS without a second security
+# group or RDS rule to keep in sync.
+output "vpc_connector_security_group_id" {
+  description = "Security group ID shared by the App Runner VPC connector and RDS's own ingress rule — required by the deploy walkthrough's `aws ecs run-task --network-configuration` for the one-shot migration task."
+  value       = aws_security_group.vpc_connector.id
+}

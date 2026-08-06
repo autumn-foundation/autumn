@@ -4,9 +4,12 @@
 # (private subnets for RDS + the App Runner VPC connector, one public subnet
 # + NAT gateway so the running app still has general internet egress — see
 # the note on `network_configuration` below), RDS PostgreSQL, Secrets
-# Manager entries for the database URL and signing secret, and the App
-# Runner service itself. Closest AWS analog to Fly.io: auto-TLS, auto-scale,
-# no ALB or cluster to manage.
+# Manager entries for the database URL and signing secret, the App Runner
+# service itself, and a minimal one-shot ECS Fargate task+cluster whose only
+# job is reaching private RDS to run `autumn migrate` (App Runner has no
+# release-phase hook of its own — see the migration task's own comment
+# below). Closest AWS analog to Fly.io otherwise: auto-TLS, auto-scale, no
+# ALB or a real (app-hosting) cluster to manage.
 #
 # Secrets (`signing_secret`, `database_admin_password`) have no default in
 # variables.tf. Supply them via `TF_VAR_*` environment variables or your
@@ -323,6 +326,58 @@ resource "aws_iam_role_policy" "apprunner_instance_secrets" {
   policy = data.aws_iam_policy_document.apprunner_instance_secrets.json
 }
 
+# App Runner has no release-phase hook of its own (unlike ECS's one-shot
+# migration task or Azure's migration job), and RDS is private with no
+# public entry point — so migrations need SOME compute inside this VPC that
+# can reach it. These two roles back a one-shot ECS Fargate task (below)
+# that exists ONLY to run `autumn migrate`; it deliberately reuses the same
+# private subnets and VPC-connector security group App Runner's own traffic
+# already uses (see aws_ecs_task_definition.migrate) rather than
+# provisioning a second, parallel path into RDS. ECS's execution/task role
+# split doesn't overlap with App Runner's own access/instance roles above —
+# different trust policies (ecs-tasks.amazonaws.com vs.
+# build/tasks.apprunner.amazonaws.com) mean the roles can't be shared.
+data "aws_iam_policy_document" "ecs_tasks_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "migrate_execution" {
+  name               = "${local.app_name_safe}-migrate-exec"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "migrate_execution_managed" {
+  role       = aws_iam_role.migrate_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+data "aws_iam_policy_document" "migrate_execution_secrets" {
+  statement {
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.database_url.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "migrate_execution_secrets" {
+  name   = "secrets-access"
+  role   = aws_iam_role.migrate_execution.id
+  policy = data.aws_iam_policy_document.migrate_execution_secrets.json
+}
+
+# Empty by default (least privilege) — the migration task itself makes no
+# AWS API calls, it only talks to RDS via the connection string injected by
+# the execution role's secrets access above.
+resource "aws_iam_role" "migrate_task" {
+  name               = "${local.app_name_safe}-migrate-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+}
+
 # ── Secrets Manager ─────────────────────────────────────────────────────────
 
 # AUTUMN_DATABASE__PRIMARY_URL — mirrors the same env var name used by the
@@ -374,6 +429,70 @@ resource "aws_db_instance" "this" {
   # waiting on a final snapshot. Set to `false` (and set
   # `final_snapshot_identifier`) before a real production cutover.
   skip_final_snapshot = true
+}
+
+# ── One-shot migration task ─────────────────────────────────────────────────
+# A minimal ECS Fargate cluster + task definition whose only job is running
+# `autumn migrate` inside the VPC, before each cutover — see the IAM role
+# comment above for why this exists. The deploy walkthrough
+# (docs/guide/deployment.md) registers a fresh revision with the real image
+# and runs it via `aws ecs run-task --network-configuration` using the
+# private_subnet_ids/vpc_connector_security_group_id outputs, so the task's
+# ENI carries the same security group RDS's own ingress rule already trusts
+# — no second security group or RDS rule to keep in sync.
+
+resource "aws_cloudwatch_log_group" "migrate" {
+  name              = "/ecs/${local.app_name_safe}-migrate"
+  retention_in_days = 30
+}
+
+resource "aws_ecs_cluster" "migrate" {
+  name = "${local.app_name_safe}-migrate"
+}
+
+resource "aws_ecs_task_definition" "migrate" {
+  family                   = "${local.app_name_safe}-migrate"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  # Deliberately fixed and independent of var.instance_cpu/instance_memory:
+  # those are App Runner's own instance-sizing format ("1 vCPU"/"2 GB"), not
+  # the numeric Fargate task-definition units this resource requires, and a
+  # one-shot migration has no reason to scale with the running service's
+  # size anyway — the smallest Fargate size is enough to run `autumn migrate`.
+  cpu                = "256"
+  memory             = "512"
+  execution_role_arn = aws_iam_role.migrate_execution.arn
+  task_role_arn      = aws_iam_role.migrate_task.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "migrate"
+      image     = var.bootstrap_image
+      essential = true
+      command   = ["sh", "-lc", "autumn migrate"]
+
+      secrets = [
+        { name = "AUTUMN_DATABASE__PRIMARY_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.migrate.name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "migrate"
+        }
+      }
+    }
+  ])
+
+  lifecycle {
+    # The deploy walkthrough registers a new revision with the real image
+    # ahead of every cutover (mirroring aws-ecs-main.tf's identical
+    # "migrate" task); without this, a later `terraform apply` would revert
+    # that revision back to the bootstrap placeholder.
+    ignore_changes = [container_definitions]
+  }
 }
 
 # ── App Runner ───────────────────────────────────────────────────────────────
