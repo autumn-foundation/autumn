@@ -38,9 +38,15 @@ const fn base_width_1000em(ch: char) -> u16 {
         // overflows — the exact overflow-past-the-boundary failure mode the
         // character-wrap safety net exists to prevent (see `wrap` in
         // `layout.rs`).
-        'W' => 944,
+        // `\u{0153}` (œ) shares `W`'s real Helvetica width (944) — merged in
+        // here rather than given its own arm to avoid a `match_same_arms`
+        // clippy lint; see the Æ/Œ comment further below for why œ/æ need
+        // non-fallback widths at all.
+        'W' | '\u{0153}' => 944,
         '@' => 1015,
-        '%' => 889,
+        // `\u{00E6}` (æ) shares `%`'s real Helvetica width (889) — same
+        // match_same_arms merge as `W`/œ above.
+        '%' | '\u{00E6}' => 889,
         // Same underestimation risk as `W` above, for the rest of the
         // uppercase alphabet (plus lowercase `w`, which happens to share
         // the same real width): these letters are genuinely wider than the
@@ -56,23 +62,23 @@ const fn base_width_1000em(ch: char) -> u16 {
         // used to estimate ~428pt (fits a 495pt content area) while
         // Helvetica renders it at ~514pt (doesn't).
         '&' | 'A'..='Z' => 667,
-        // `Æ`/`æ` fall inside the Latin-1 accented ranges below, which
-        // approximate most of that range at the plain-letter width — but
-        // Helvetica renders these ligatures markedly wider than a single
-        // letter (1000/889 vs the 667/556 the ranges below would give them),
-        // same underestimation risk as the other wide-glyph fixes above. A
-        // repro matching the reported one: 50 `Æ`s at 11pt used to estimate
+        // `Æ`/`Œ` (and their lowercase forms `æ`/`œ`, merged into the `%`/`W`
+        // arms above to avoid duplicate match bodies) are representable
+        // WinAnsi ligatures, not accented letters — the Latin-1 range below
+        // approximates most of that range at the plain-letter width, but
+        // Helvetica renders these ligatures markedly wider (1000/944/889 vs
+        // the 667/556 the ranges below would give them), same
+        // underestimation risk as the other wide-glyph fixes above. A repro
+        // matching the reported one: 50 `Æ`s at 11pt used to estimate
         // ~367pt (fits a 495pt content area) while Helvetica actually
         // renders them at ~550pt (doesn't).
-        '\u{00C6}' => 1000, // Æ Latin capital ligature AE
+        '\u{00C6}' | '\u{0152}' | '\u{2014}' | '\u{2026}' | '\u{2030}' | '\u{2122}' => 1000, // Æ, Œ, — em dash, … ellipsis, ‰, ™
         '\u{00C0}'..='\u{00DE}' if ch != '\u{00D7}' => 667, // Latin-1 uppercase accented (approx like A-Z)
-        '\u{2014}' | '\u{2026}' | '\u{2030}' | '\u{2122}' => 1000, // — em dash, … ellipsis, ‰, ™
         '\u{00A9}' | '\u{00AE}' => 737,                     // © copyright, ® registered
         '\u{2022}' => 350,                                  // • bullet
         '\u{2020}' | '\u{2021}' => 500,                     // † dagger, ‡ double dagger
         '\u{00B0}' => 400,                                  // ° degree
         _ if ch.is_ascii() => 556,
-        '\u{00E6}' => 889, // æ Latin small ligature ae — see `Æ` above
         '\u{00DF}'..='\u{00FF}' if ch != '\u{00F7}' => 556, // Latin-1 lowercase accented (approx default)
         // Everything else that WinAnsi (`printpdf`'s built-in-font encoding,
         // effectively CP1252) *can* represent renders as its actual glyph,
@@ -297,6 +303,25 @@ mod tests {
             fifty_aes > content_area_pt,
             "50 Æs at 11pt ({fifty_aes}pt) must be estimated wider than a 495pt content area, \
              matching Helvetica's real ~550pt rendering, not the old ~367pt underestimate"
+        );
+    }
+
+    #[test]
+    fn oe_ligatures_are_not_underestimated_as_the_generic_fallback() {
+        // Regression: `Œ`/`œ` (U+0152/U+0153) aren't in the Latin-1 range at
+        // all, so they fell all the way through to the generic 556 fallback,
+        // but Helvetica renders them at 1000/944 — same underestimation risk
+        // as the Æ/æ fix above. A repro matching the reported one: 50 `Œ`s
+        // at 11pt used to estimate ~306pt (fits a 495pt content area) while
+        // Helvetica actually renders them at ~550pt (doesn't).
+        assert_eq!(char_width_1000em('\u{0152}', false), 1000);
+        assert_eq!(char_width_1000em('\u{0153}', false), 944);
+        let fifty_oes = text_width_pt(&"\u{0152}".repeat(50), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            fifty_oes > content_area_pt,
+            "50 Œs at 11pt ({fifty_oes}pt) must be estimated wider than a 495pt content area, \
+             matching Helvetica's real ~550pt rendering, not the old ~306pt underestimate"
         );
     }
 
