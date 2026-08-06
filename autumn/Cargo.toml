@@ -301,7 +301,7 @@ redis = { workspace = true, optional = true }
 tokio-cron-scheduler.workspace = true
 validator.workspace = true
 uuid = { version = "1", features = ["v4"] }
-rand = "0.9"
+rand = "0.10"
 rand_chacha = "0.9"
 chrono = { workspace = true }
 chrono-tz.workspace = true
