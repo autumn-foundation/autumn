@@ -398,7 +398,20 @@ resource "aws_apprunner_service" "this" {
       image_repository_type = "ECR_PUBLIC"
 
       image_configuration {
-        port = "3000"
+        # var.bootstrap_image (nginx) listens on its own default port 80,
+        # not 3000 — declaring "3000" here while the bootstrap container
+        # only serves 80 would fail App Runner's own health check (below)
+        # on the very first apply, and `aws_apprunner_service` blocks
+        # `terraform apply` until the service reaches a stable state, so a
+        # failing bootstrap health check hangs the apply rather than just
+        # leaving a transient warning. Real deploys land via `aws
+        # apprunner update-service` (docs/guide/deployment.md), which
+        # passes the app's real port (3000) and health check path
+        # (/health) explicitly in the same call — App Runner's health
+        # check configuration is a mutable, service-level setting, not
+        # tied to source_configuration, so that follow-up call is enough
+        # to restore it; Terraform never needs to re-apply it.
+        port = "80"
 
         runtime_environment_variables = {
           AUTUMN_PROFILE = "prod"
@@ -429,9 +442,13 @@ resource "aws_apprunner_service" "this" {
 
   auto_scaling_configuration_arn = aws_apprunner_auto_scaling_configuration_version.this.arn
 
+  # "/" (nginx's own default welcome page, always 200), not "/health" — see
+  # the image_configuration.port comment above; the real cutover call in
+  # docs/guide/deployment.md restores "/health" once the actual app (which
+  # serves it) is live.
   health_check_configuration {
     protocol = "HTTP"
-    path     = "/health"
+    path     = "/"
   }
 
   depends_on = [

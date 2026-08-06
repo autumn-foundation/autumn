@@ -45,11 +45,16 @@ variable "image_tag" {
 # placeholder on the first apply, then ignores further container definition
 # drift (see the `lifecycle.ignore_changes` blocks in main.tf) once
 # aws-deploy.yml/the manual walkthrough take over registering revisions
-# with the real image.
+# with the real image. Deliberately plain nginx, not e.g. AWS's own
+# hello-app-runner quickstart image: the "app" task's container definition
+# (main.tf) overrides its entrypoint/command to listen on port 3000 and
+# serve /health, matching the ALB target group's fixed health check — an
+# image whose default listening port isn't a well-known, documented
+# constant would leave the bootstrap revision permanently unhealthy.
 variable "bootstrap_image" {
-  description = "Public placeholder image Terraform uses to register the ECS task definitions before any real image has been pushed to ECR."
+  description = "Public placeholder image Terraform uses to register the ECS task definitions before any real image has been pushed to ECR. If you change this for the \"app\" family, keep main.tf's entryPoint/command override (or an equivalent) so it still listens on port 3000 and serves 200 on /health."
   type        = string
-  default     = "public.ecr.aws/aws-containers/hello-app-runner:latest"
+  default     = "public.ecr.aws/nginx/nginx:latest"
 }
 
 variable "cpu" {

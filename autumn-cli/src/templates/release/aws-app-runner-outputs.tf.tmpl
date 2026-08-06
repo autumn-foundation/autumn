@@ -29,3 +29,19 @@ output "apprunner_access_role_arn" {
   description = "ARN of the IAM role that grants App Runner pull access to the private ECR repository — pass this as the `access-role-arn` once the deploy walkthrough switches source_configuration over to your own image."
   value       = aws_iam_role.apprunner_access.arn
 }
+
+# `aws apprunner update-service --source-configuration` REPLACES the image
+# configuration wholesale, not merges it — the deploy walkthrough's cutover
+# call must therefore re-supply RuntimeEnvironmentSecrets explicitly (using
+# these ARNs) alongside the real image, or the cutover silently drops
+# AUTUMN_DATABASE__PRIMARY_URL/AUTUMN_SECURITY__SIGNING_SECRET and the real
+# app can't boot.
+output "database_url_secret_arn" {
+  description = "Secrets Manager ARN for the derived database URL — required by the deploy walkthrough's cutover `update-service` call (RuntimeEnvironmentSecrets)."
+  value       = aws_secretsmanager_secret.database_url.arn
+}
+
+output "signing_secret_secret_arn" {
+  description = "Secrets Manager ARN for the signing secret — required by the deploy walkthrough's cutover `update-service` call (RuntimeEnvironmentSecrets)."
+  value       = aws_secretsmanager_secret.signing_secret.arn
+}

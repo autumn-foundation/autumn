@@ -12,7 +12,7 @@ instance_memory    = "2 GB"
 db_instance_class  = "db.t4g.micro"
 vpc_cidr           = "10.0.0.0/16"
 
-# bootstrap_image = "public.ecr.aws/aws-containers/hello-app-runner:latest"  # rarely needs to change
+# bootstrap_image = "public.ecr.aws/nginx/nginx:latest"  # rarely needs to change — see variables.tf if you do
 
 min_size = 1
 max_size = 10
@@ -21,7 +21,7 @@ max_size = 10
 # There is no database_url variable to set: main.tf derives the connection
 # string from the RDS instance this same apply creates.
 #
-#   export TF_VAR_database_admin_password="$(openssl rand -base64 24)"
+#   export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
 #   export TF_VAR_signing_secret="$(openssl rand -hex 32)"
 #
 # database_admin_password = (set via TF_VAR_database_admin_password)

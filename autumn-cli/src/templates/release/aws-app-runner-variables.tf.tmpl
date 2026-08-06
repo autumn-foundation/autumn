@@ -23,11 +23,17 @@ variable "image_tag" {
 # this public ECR Public Gallery placeholder (which needs no access role) on
 # the first apply, then ignores further source_configuration drift (see the
 # `lifecycle.ignore_changes` block in main.tf) once the deploy walkthrough
-# takes over managing the real image.
+# takes over managing the real image. Deliberately plain nginx, not e.g. AWS's
+# own hello-app-runner quickstart image: App Runner's health check blocks
+# `terraform apply` until the service is stable, and nginx's listening port
+# (80) and default "/" response (200) are well-known constants main.tf's
+# image_configuration.port/health_check_configuration.path are set to match
+# — an image whose actual listening port/response isn't a documented,
+# stable fact you can rely on risks apply hanging until it times out.
 variable "bootstrap_image" {
-  description = "Public ECR Public Gallery placeholder image App Runner uses to create the service before any real image has been pushed to your own ECR repository."
+  description = "Public ECR Public Gallery placeholder image App Runner uses to create the service before any real image has been pushed to your own ECR repository. Must actually listen on port 80 and return 200 for \"/\" — see main.tf's image_configuration/health_check_configuration comments — if you change this."
   type        = string
-  default     = "public.ecr.aws/aws-containers/hello-app-runner:latest"
+  default     = "public.ecr.aws/nginx/nginx:latest"
 }
 
 variable "instance_cpu" {

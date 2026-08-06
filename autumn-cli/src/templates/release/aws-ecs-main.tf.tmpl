@@ -650,6 +650,22 @@ resource "aws_ecs_task_definition" "app" {
       image     = var.bootstrap_image
       essential = true
 
+      # var.bootstrap_image (nginx) doesn't listen on port 3000 or serve
+      # /health out of the box — but unlike App Runner, the ALB target
+      # group's health check (aws_lb_target_group.this, fixed at port 3000
+      # + path /health) is a PERMANENT Terraform-managed resource the real
+      # app must satisfy too; there's no separate "swap it back after
+      # cutover" step available here the way there is for App Runner's
+      # mutable, service-level health check. So the bootstrap revision must
+      # ALSO pass it: reconfigure the public nginx image, at startup, to
+      # listen on 3000 and return 200 for / and /health, overriding its
+      # own entrypoint entirely so this runs regardless of the image's own
+      # default command.
+      entryPoint = ["sh", "-c"]
+      command = [
+        "echo 'server { listen 3000; location / { return 200; } location /health { return 200; } }' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
+      ]
+
       portMappings = [
         { containerPort = 3000, protocol = "tcp" }
       ]

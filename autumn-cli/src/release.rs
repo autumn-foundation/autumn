@@ -3547,6 +3547,36 @@ previous_secrets = []
     }
 
     #[test]
+    fn aws_app_runner_bootstrap_health_check_matches_the_placeholder_not_the_real_app() {
+        // aws_apprunner_service blocks `terraform apply` until the service
+        // reaches a stable state — declaring port 3000 / path "/health"
+        // against a bootstrap image that doesn't serve either would hang
+        // the very first apply. The placeholder (nginx) listens on 80 and
+        // returns 200 for "/" by default; the real port/path are restored
+        // by the deploy walkthrough's cutover call, which owns App
+        // Runner's mutable, service-level health check configuration.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("port = \"80\""),
+            "the bootstrap image_configuration must declare port 80 (nginx's real default), \
+             not 3000: {content}"
+        );
+        let health_check_block = content
+            .split("health_check_configuration {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("main.tf must declare health_check_configuration");
+        assert!(
+            health_check_block.contains("path     = \"/\""),
+            "the bootstrap health check must probe \"/\" (nginx's default 200 response), \
+             not \"/health\": {health_check_block}"
+        );
+    }
+
+    #[test]
     fn aws_app_runner_instance_role_secrets_policy_is_scoped_not_wildcard() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -3628,6 +3658,8 @@ previous_secrets = []
             "service_name",
             "ecr_repository_url",
             "apprunner_access_role_arn",
+            "database_url_secret_arn",
+            "signing_secret_secret_arn",
         ] {
             assert!(
                 content.contains(&format!("output \"{name}\"")),
@@ -3637,6 +3669,27 @@ previous_secrets = []
         assert!(
             !content.contains("{{"),
             "outputs.tf must not contain any unsubstituted template placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_secret_arn_outputs_reference_the_real_secrets() {
+        // The deploy walkthrough's cutover `update-service` call must
+        // re-supply RuntimeEnvironmentSecrets (the call replaces the image
+        // configuration wholesale, not merges it) — these outputs are how
+        // it gets the ARNs, so they must point at the actual secrets, not
+        // just exist as a name.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        assert!(
+            content.contains("aws_secretsmanager_secret.database_url.arn"),
+            "{content}"
+        );
+        assert!(
+            content.contains("aws_secretsmanager_secret.signing_secret.arn"),
+            "{content}"
         );
     }
 
@@ -3868,6 +3921,50 @@ previous_secrets = []
             "the ECS service must ignore task_definition drift so CI-registered revisions \
              aren't reverted by a later `terraform apply`: {service_block}"
         );
+    }
+
+    #[test]
+    fn aws_ecs_app_bootstrap_container_actually_listens_on_the_alb_health_check_port() {
+        // Unlike App Runner, the ALB target group's health check (port
+        // 3000, path /health) is a PERMANENT Terraform-managed resource —
+        // there's no separate "swap it back after cutover" step available,
+        // so the bootstrap container must satisfy it directly. The public
+        // placeholder (nginx) doesn't do this out of the box; the "app"
+        // container must override its entrypoint/command to configure it.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let app_block = content
+            .split("resource \"aws_ecs_task_definition\" \"app\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\nresource").next())
+            .expect("main.tf must declare the app task definition");
+        assert!(
+            app_block.contains("entryPoint"),
+            "the app container must override entryPoint so it runs regardless of the \
+             placeholder image's own default command: {app_block}"
+        );
+        assert!(
+            app_block.contains("listen 3000"),
+            "the app container's bootstrap command must configure the placeholder to listen \
+             on port 3000, matching the ALB target group: {app_block}"
+        );
+        assert!(
+            app_block.contains("/health"),
+            "the app container's bootstrap command must serve the same /health path the \
+             target group checks: {app_block}"
+        );
+        // The "migrate" task's command is already overridden to run `autumn
+        // migrate` and is never actually invoked against the bootstrap
+        // image in practice (CI always registers a real-image revision
+        // first) — it doesn't need the nginx trick.
+        let migrate_block = content
+            .split("resource \"aws_ecs_task_definition\" \"migrate\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\nresource").next())
+            .expect("main.tf must declare the migrate task definition");
+        assert!(migrate_block.contains("autumn migrate"), "{migrate_block}");
     }
 
     #[test]

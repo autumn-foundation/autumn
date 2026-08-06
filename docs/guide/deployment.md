@@ -1134,7 +1134,7 @@ Provision the infrastructure and set secrets via Terraform variables:
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars   # edit app_name/region/etc.
-export TF_VAR_database_admin_password="$(openssl rand -base64 24)"
+export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
 export TF_VAR_signing_secret="$(openssl rand -hex 32)"
 
 terraform init
@@ -1154,6 +1154,8 @@ same follow-up call, not on the first `terraform apply`:
 ECR="$(terraform output -raw ecr_repository_url)"
 SERVICE_ARN="$(terraform output -raw service_arn)"
 ACCESS_ROLE="$(terraform output -raw apprunner_access_role_arn)"
+DATABASE_URL_ARN="$(terraform output -raw database_url_secret_arn)"
+SIGNING_SECRET_ARN="$(terraform output -raw signing_secret_secret_arn)"
 TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
 
 aws ecr get-login-password | docker login --username AWS --password-stdin "$ECR"
@@ -1167,7 +1169,16 @@ docker build \
 docker push "$ECR:$TAG"
 
 APP_URL="$(terraform output -raw app_url)"   # known only after the FIRST apply created the service
-aws apprunner update-service --service-arn "$SERVICE_ARN" --source-configuration "{
+# --source-configuration REPLACES the image configuration wholesale, not
+# merges it — RuntimeEnvironmentSecrets must be re-supplied here alongside
+# the real image, or the cutover silently drops
+# AUTUMN_DATABASE__PRIMARY_URL/AUTUMN_SECURITY__SIGNING_SECRET and the real
+# app can't boot. HealthCheckConfiguration restores the real "/health" path
+# — main.tf's bootstrap revision used "/" (nginx's own default response)
+# since the bootstrap placeholder doesn't serve /health.
+aws apprunner update-service --service-arn "$SERVICE_ARN" \
+  --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/health\"}" \
+  --source-configuration "{
   \"ImageRepository\": {
     \"ImageIdentifier\": \"$ECR:$TAG\",
     \"ImageRepositoryType\": \"ECR\",
@@ -1176,6 +1187,10 @@ aws apprunner update-service --service-arn "$SERVICE_ARN" --source-configuration
       \"RuntimeEnvironmentVariables\": {
         \"AUTUMN_PROFILE\": \"prod\",
         \"AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS\": \"${APP_URL#https://}\"
+      },
+      \"RuntimeEnvironmentSecrets\": {
+        \"AUTUMN_DATABASE__PRIMARY_URL\": \"$DATABASE_URL_ARN\",
+        \"AUTUMN_SECURITY__SIGNING_SECRET\": \"$SIGNING_SECRET_ARN\"
       }
     }
   },
@@ -1248,7 +1263,7 @@ Provision the infrastructure and set secrets via Terraform variables:
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars   # edit app_name/domain_name/route53_zone_id/etc.
-export TF_VAR_database_admin_password="$(openssl rand -base64 24)"
+export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
 export TF_VAR_signing_secret="$(openssl rand -hex 32)"
 
 terraform init
