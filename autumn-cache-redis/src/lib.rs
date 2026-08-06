@@ -108,6 +108,19 @@ impl RedisCache {
         url: &str,
         key_prefix: impl Into<String>,
     ) -> Result<Self, RedisCacheError> {
+        // The workspace links both `ring` and `aws-lc-rs` (via other rustls
+        // consumers, e.g. opentelemetry-otlp's `tls-aws-lc`), so rustls can no
+        // longer auto-select a process-wide default `CryptoProvider` — and
+        // `redis`'s `tokio-rustls-comp` builds its `ClientConfig` via the
+        // short-form `rustls::ClientConfig::builder()`, which panics instead
+        // of erroring when that default is missing. Installing `ring` here
+        // (matching the backend already used by this workspace's other rustls
+        // call sites) makes a `rediss://` URL usable regardless of init
+        // order; `.ok()` makes it idempotent since a concurrent/earlier call
+        // may have already installed one.
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         let client = redis::Client::open(url)?;
         let manager = ConnectionManager::new(client).await?;
         Ok(Self {
