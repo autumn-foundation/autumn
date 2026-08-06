@@ -16,10 +16,16 @@
 /// wider) without claiming per-glyph accuracy.
 const fn base_width_1000em(ch: char) -> u16 {
     match ch {
-        ' ' | '\u{00A0}' => 278, // space, non-breaking space
+        // `.`/`,`/`!`/`:`/`;`/`I` used to share the 222 bucket below with
+        // the genuinely narrow glyphs, but their real Helvetica width
+        // (278, same as a plain space) is wider — the same underestimation
+        // risk already fixed for `W`/`G`/etc: an unbroken run of these
+        // could be judged narrow enough to fit a line it actually
+        // overflows once rendered.
+        ' ' | '\u{00A0}' | '.' | ',' | '!' | ':' | ';' | 'I' => 278,
+        '|' => 260, // narrower than the 278 punctuation above, wider than the 222 below
         // narrow ASCII punctuation, plus curly single quotes and low-9 quote
-        '.' | ',' | '\'' | '!' | ':' | ';' | '|' | 'i' | 'j' | 'l' | 'I' | '\u{2018}'
-        | '\u{2019}' | '\u{201A}' => 222,
+        '\'' | 'i' | 'j' | 'l' | '\u{2018}' | '\u{2019}' | '\u{201A}' => 222,
         // wider ASCII punctuation, plus curly double quotes and double low-9 quote
         '(' | ')' | '[' | ']' | '"' | '-' | 'f' | 'r' | 't' | '/' | '\\' | '\u{201C}'
         | '\u{201D}' | '\u{201E}' => 333,
@@ -33,16 +39,16 @@ const fn base_width_1000em(ch: char) -> u16 {
         // character-wrap safety net exists to prevent (see `wrap` in
         // `layout.rs`).
         'W' => 944,
-        'w' => 722,
         '@' => 1015,
         '%' => 889,
         // Same underestimation risk as `W` above, for the rest of the
-        // uppercase alphabet: these seven letters are genuinely wider than
-        // the 667 fallback the remaining (correctly- or safely-estimated)
+        // uppercase alphabet (plus lowercase `w`, which happens to share
+        // the same real width): these letters are genuinely wider than the
+        // 667 fallback the remaining (correctly- or safely-estimated)
         // letters share below — e.g. 60 `G`s at 11pt used to estimate
         // ~440pt (fits a 495pt content area) while Helvetica renders them
         // at ~513pt (doesn't).
-        'C' | 'D' | 'H' | 'N' | 'R' | 'U' => 722,
+        'w' | 'C' | 'D' | 'H' | 'N' | 'R' | 'U' => 722,
         'G' | 'O' | 'Q' => 778,
         'A'..='Z' => 667,
         '\u{00C0}'..='\u{00DE}' if ch != '\u{00D7}' => 667, // Latin-1 uppercase accented (approx like A-Z)
@@ -210,6 +216,33 @@ mod tests {
             sixty_gs > content_area_pt,
             "60 Gs at 11pt ({sixty_gs}pt) must be estimated wider than a 495pt content area, \
              matching Helvetica's real ~513pt rendering, not the old ~440pt underestimate"
+        );
+    }
+
+    #[test]
+    fn remaining_narrow_glyphs_are_not_underestimated() {
+        // Regression: `.`/`,`/`!`/`:`/`;`/`I` used to share the 222/1000em
+        // bucket with genuinely narrow glyphs (`i`/`j`/`l`), but their real
+        // Helvetica width (278, same as a plain space) is wider — same
+        // underestimation risk as the earlier wide-glyph fixes. A repro
+        // matching the reported one: 180 `I`s at 11pt used to estimate
+        // ~440pt (fits a 495pt content area) while Helvetica actually
+        // renders them at ~550pt (doesn't).
+        assert_eq!(char_width_1000em('I', false), 278);
+        assert_eq!(char_width_1000em('!', false), 278);
+        assert_eq!(char_width_1000em(':', false), 278);
+        assert_eq!(char_width_1000em(';', false), 278);
+        assert_eq!(char_width_1000em('.', false), 278);
+        assert_eq!(char_width_1000em(',', false), 278);
+        // `i`/`j`/`l` are genuinely narrow and must stay that way.
+        assert_eq!(char_width_1000em('i', false), 222);
+        let hundred_eighty_is = text_width_pt(&"I".repeat(180), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            hundred_eighty_is > content_area_pt,
+            "180 Is at 11pt ({hundred_eighty_is}pt) must be estimated wider than a 495pt \
+             content area, matching Helvetica's real ~550pt rendering, not the old ~440pt \
+             underestimate"
         );
     }
 

@@ -131,6 +131,8 @@ fn is_block_boundary_in_inline_context(tag: &str) -> bool {
                 | "main"
                 | "header"
                 | "footer"
+                | "nav"
+                | "aside"
         )
 }
 
@@ -399,15 +401,17 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     // `flatten_blocks`'s own pending/flush accumulator
                     // produces exactly the same single implicit paragraph
                     // this used to build directly. HTML5's semantic
-                    // sectioning elements (`section`/`article`/`main`/
-                    // `header`/`footer`) commonly wrap block content the
-                    // same way a `<div>` does — without them here, adjacent
-                    // `<section>`s of loose text (`<main><section>Summary</section><section>Details</section></main>`)
+                    // sectioning/landmark elements (`section`/`article`/
+                    // `main`/`header`/`footer`/`nav`/`aside`) commonly wrap
+                    // block content the same way a `<div>` does — without
+                    // them here, adjacent elements of loose text
+                    // (`<main><section>Summary</section><section>Details</section></main>`,
+                    // and equally `<aside>Summary</aside><aside>Details</aside>`)
                     // fell through to the generic transparent-passthrough
                     // arm and accumulated into one pending paragraph with no
                     // separator (`SummaryDetails`).
                     "div" | "blockquote" | "dl" | "section" | "article" | "main" | "header"
-                    | "footer" => {
+                    | "footer" | "nav" | "aside" => {
                         flush(&mut pending, out);
                         flatten_blocks(children, depth + 1, out);
                     }
@@ -488,6 +492,8 @@ fn flatten_into_pending(nodes: &[Node], depth: u32, pending: &mut Vec<Span>, out
                             | "main"
                             | "header"
                             | "footer"
+                            | "nav"
+                            | "aside"
                     )
                 {
                     if !pending.is_empty() {
@@ -1363,6 +1369,30 @@ mod tests {
     }
 
     #[test]
+    fn nav_and_aside_keep_adjacent_blocks_separate() {
+        // Same bug as `semantic_sectioning_elements_keep_adjacent_blocks_separate`,
+        // reported again for `nav`/`aside` after the first fix.
+        let nodes = super::super::html::parse("<aside>Summary</aside><aside>Details</aside>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected 2 separate paragraphs, got {blocks:?}"
+        );
+        assert!(
+            matches!(&blocks[0], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "Summary".to_owned(), bold: false, italic: false,
+            }])
+        );
+        assert!(
+            matches!(&blocks[1], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "Details".to_owned(), bold: false, italic: false,
+            }])
+        );
+    }
+
+    #[test]
     fn list_item_with_nested_paragraphs_keeps_them_separate() {
         // Regression: `<li>`'s content goes through `inline_spans`, which
         // had no notion of a block boundary — `<li><p>First</p><p>Second</p></li>`
@@ -1463,6 +1493,40 @@ mod tests {
                 },
             ],
             "nested paragraphs inside a cell must be line-break separated, with no trailing break"
+        );
+    }
+
+    #[test]
+    fn omitted_p_close_before_a_table_still_produces_a_real_table_block() {
+        // Regression: without an implied close, `<p>Intro<table>...</table>`
+        // nested the table *inside* the still-open `<p>`, so `flatten_blocks`'s
+        // `"p"` arm sent the whole thing through `inline_spans` — which has
+        // no notion of a table — flattening its rows/cells into bare inline
+        // text ("IntroAB") instead of a real `Block::Table`.
+        let nodes = super::super::html::parse(
+            "<p>Intro</p><table><tr><td>A</td><td>B</td></tr></table><p>After</p>",
+        );
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(
+            blocks.len(),
+            3,
+            "expected 3 separate blocks (p, table, p), got {blocks:?}"
+        );
+        assert!(
+            matches!(&blocks[0], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "Intro".to_owned(), bold: false, italic: false,
+            }])
+        );
+        let Block::Table(rows) = &blocks[1] else {
+            panic!("expected a real table block, got {:?}", blocks[1]);
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cells.len(), 2, "expected two separate cells");
+        assert!(
+            matches!(&blocks[2], Block::Paragraph(spans) if spans == &[Span::Run {
+                text: "After".to_owned(), bold: false, italic: false,
+            }])
         );
     }
 

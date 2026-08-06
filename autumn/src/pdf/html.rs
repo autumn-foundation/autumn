@@ -59,30 +59,67 @@ fn is_void_element(tag: &str) -> bool {
 
 /// Whether opening `new_tag` implicitly closes an `open_tag` still open at
 /// the top of the stack — HTML5's "optional end tag" rule, scoped to the
-/// handful of list/table elements this renderer gives special
-/// (marker/cell/row) treatment to. Real-world or hand-written HTML commonly
-/// omits these closing tags (`<ul><li>One<li>Two</ul>`,
-/// `<tr><td>A<td>B</table>`); without this, the new tag nests *inside* the
-/// still-open previous one instead of becoming its sibling — and
-/// `extract_list_items`/`extract_table_rows` (in `layout.rs`) only look at
-/// *direct* children, so the nested element's marker/cell/row boundary
-/// becomes invisible to them (a second bullet silently disappears, a second
-/// cell silently merges into the first).
+/// tags this renderer gives special (marker/cell/row/block) treatment to.
+/// Real-world or hand-written HTML commonly omits these closing tags
+/// (`<ul><li>One<li>Two</ul>`, `<tr><td>A<td>B</table>`,
+/// `<p>Intro<table>...</table>`); without this, the new tag nests *inside*
+/// the still-open previous one instead of becoming its sibling.
+///
+/// For `li`/`dt`/`dd`/`tr`/`td`/`th`, `extract_list_items`/
+/// `extract_table_rows` (in `layout.rs`) only look at *direct* children, so
+/// a nested-instead-of-sibling element's marker/cell/row boundary becomes
+/// invisible to them (a second bullet silently disappears, a second cell
+/// silently merges into the first). For `p`, the failure mode is
+/// different but just as real: a still-open `<p>` swallows the next
+/// supported block element as inline content instead of letting it become
+/// its own top-level [`Block`](super::layout) — `<p>Intro<table>...</table>`
+/// flattens the table's rows/cells into bare inline text (`IntroAB`
+/// instead of a real table) since `inline_spans` has no notion of a table.
 ///
 /// Doesn't need to cover every HTML5 optional-end-tag rule, only the ones
-/// for tags this renderer actually gives that special treatment to — an
-/// omitted `</p>` before something other than another block tag, for
-/// example, doesn't have the same "silently loses structure" failure mode
-/// here, since a stray `<p>` outside `<ul>`/`<ol>`/`<table>` just flattens
-/// to a paragraph either way (see `flatten_blocks`).
+/// for tags this renderer actually gives that special treatment to.
 fn implicitly_closes(open_tag: &str, new_tag: &str) -> bool {
+    (open_tag == "p" && closes_open_paragraph(new_tag))
+        || matches!(
+            (open_tag, new_tag),
+            ("li", "li")
+                | ("dt" | "dd", "dt" | "dd")
+                | ("tr", "tr")
+                | ("td" | "th", "td" | "th" | "tr")
+        )
+}
+
+/// Tags that, per HTML5's `<p>` implied-end-tag rule, close an open `<p>`
+/// when they start — restricted to headings and the block-level container
+/// tags this renderer gives real block/list/table structure to, since only
+/// those have the "swallowed as inline content" failure mode
+/// [`implicitly_closes`] exists to prevent.
+fn closes_open_paragraph(new_tag: &str) -> bool {
     matches!(
-        (open_tag, new_tag),
-        ("li", "li")
-            | ("dt", "dt" | "dd")
-            | ("dd", "dt" | "dd")
-            | ("tr", "tr")
-            | ("td" | "th", "td" | "th" | "tr")
+        new_tag,
+        "p" | "div"
+            | "blockquote"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "hr"
+            | "table"
+            | "ul"
+            | "ol"
+            | "li"
+            | "section"
+            | "article"
+            | "main"
+            | "header"
+            | "footer"
+            | "nav"
+            | "aside"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
     )
 }
 
@@ -232,31 +269,7 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             }
             if let Some((tag, self_closing, tag_end)) = parse_open_tag(&input[pos..]) {
                 pos += tag_end;
-
-                // HTML5's "optional end tag" rule for the handful of
-                // list/table elements this renderer gives special
-                // (marker/cell/row) treatment to — see `implicitly_closes`.
-                // Cascades (rather than checking only the immediate stack
-                // top once) so e.g. a new `<tr>` closes both an open `<td>`
-                // *and* the `<tr>` above it, not just the cell.
-                while stack.len() > 1 {
-                    let should_close = stack
-                        .last()
-                        .is_some_and(|(open_tag, _)| implicitly_closes(open_tag, &tag));
-                    if !should_close {
-                        break;
-                    }
-                    let (closed_tag, children) =
-                        stack.pop().expect("just checked stack.last() above");
-                    stack
-                        .last_mut()
-                        .expect("root frame is never popped")
-                        .1
-                        .push(Node::Element {
-                            tag: closed_tag,
-                            children,
-                        });
-                }
+                close_implied_tags(&mut stack, &tag);
 
                 if !self_closing && is_raw_text_element(&tag) {
                     // `<script>`/`<style>`/`<title>`/`<textarea>` content is
@@ -320,6 +333,32 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
     }
 
     stack.pop().expect("root frame always present").1
+}
+
+/// Cascades [`implicitly_closes`] up `stack`: pops and closes every open
+/// frame (innermost first) that opening `new_tag` implicitly closes, so
+/// e.g. a new `<tr>` closes both an open `<td>` *and* the `<tr>` above it,
+/// not just the immediate stack top. Extracted out of [`parse`] purely to
+/// keep that function's line count down — this has no state of its own
+/// beyond `stack`.
+fn close_implied_tags(stack: &mut Vec<(String, Vec<Node>)>, new_tag: &str) {
+    while stack.len() > 1 {
+        let should_close = stack
+            .last()
+            .is_some_and(|(open_tag, _)| implicitly_closes(open_tag, new_tag));
+        if !should_close {
+            break;
+        }
+        let (closed_tag, children) = stack.pop().expect("just checked stack.last() above");
+        stack
+            .last_mut()
+            .expect("root frame is never popped")
+            .1
+            .push(Node::Element {
+                tag: closed_tag,
+                children,
+            });
+    }
 }
 
 fn push_text(stack: &mut [(String, Vec<Node>)], text: &str) {
@@ -637,6 +676,34 @@ mod tests {
         assert_eq!(tag, "tr");
         assert_eq!(row2.len(), 1);
         assert_eq!(text(row2), "C");
+    }
+
+    #[test]
+    fn an_omitted_p_closing_tag_is_implied_by_a_following_block_element() {
+        // Regression: `<p>` is also an HTML5 "optional end tag" element —
+        // real/hand-written HTML commonly omits `</p>` before the next
+        // block element starts. Without implied-close handling, a
+        // following `<table>` nested *inside* the still-open `<p>` instead
+        // of becoming its sibling, and since `<p>`'s content goes through
+        // `inline_spans` (which has no notion of a table), the table's
+        // rows/cells flattened into bare inline text.
+        let nodes = parse("<p>Intro<table><tr><td>A</td><td>B</td></tr></table><p>After");
+        assert_eq!(
+            nodes.len(),
+            3,
+            "expected <p>, <table>, <p> as three siblings, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "Intro");
+        assert!(matches!(&nodes[1], Node::Element { tag, .. } if tag == "table"));
+        let Node::Element { tag, children } = &nodes[2] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "After");
     }
 
     #[test]
