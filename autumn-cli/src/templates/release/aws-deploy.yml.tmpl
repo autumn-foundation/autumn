@@ -286,8 +286,13 @@ jobs:
           # fails, so a LATER deploy could start a second migration task
           # while this one is still mutating the schema.
           echo "::error::migration task did not finish within the time budget — stopping it" >&2
+          # Redirects stdout rather than passing an --output flag: the AWS
+          # CLI's valid --output values are json/yaml/yaml-stream/text/
+          # table/off (there is no "none"), and even "off" may not exist on
+          # older CLI builds — a plain redirect discards the response
+          # regardless of CLI version.
           aws ecs stop-task --cluster "$ECS_CLUSTER_NAME" --task "$TASK_ARN" \
-            --reason "aws-deploy.yml: migration exceeded its polling budget" --output none
+            --reason "aws-deploy.yml: migration exceeded its polling budget" >/dev/null
           aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER_NAME" --tasks "$TASK_ARN"
           exit 1
         env:
@@ -303,8 +308,7 @@ jobs:
             --cluster "$ECS_CLUSTER_NAME" \
             --service "$ECS_SERVICE_NAME" \
             --task-definition "$APP_TASK_DEF_ARN" \
-            --force-new-deployment \
-            --output none
+            --force-new-deployment >/dev/null
           aws ecs wait services-stable \
             --cluster "$ECS_CLUSTER_NAME" \
             --services "$ECS_SERVICE_NAME"

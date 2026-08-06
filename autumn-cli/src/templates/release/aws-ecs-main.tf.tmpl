@@ -684,6 +684,36 @@ resource "aws_ecs_task_definition" "app" {
     }
   ])
 
+  # KNOWN LIMITATION: because container_definitions is ignored wholesale
+  # (see below), a config-only change — flipping enable_redis_cache, or
+  # editing domain_name — never reaches AWS on its own. CI's task
+  # definition registration (aws-deploy.yml) clones whatever revision is
+  # CURRENTLY ACTIVE in AWS via `describe-task-definition`, not this
+  # resource's locally-declared state, so there is no `terraform apply`
+  # that pushes such a change out.
+  #
+  # ignore_changes can't be scoped to just the `image` key inside
+  # container_definitions — it's a single jsonencode()'d string attribute,
+  # and Terraform's ignore_changes only operates on whole attributes, never
+  # a path inside one. Ignoring the whole thing is deliberate, not an
+  # oversight: the alternative (removing this ignore_changes entirely)
+  # would make Terraform re-register a bootstrap-image revision as the
+  # family's latest on the very next unrelated `terraform apply` — CI's
+  # `describe-task-definition --task-definition "$APP_TASK_FAMILY"` fetches
+  # by FAMILY NAME, always the latest revision regardless of who registered
+  # it, so the NEXT deploy would clone that bootstrap revision (nginx,
+  # wrong entrypoint) instead of the real app's last known-good one — the
+  # exact class of bug this ignore_changes exists to prevent, just
+  # triggered from the other direction.
+  #
+  # To push a genuine config-only change out: `terraform taint
+  # aws_ecs_task_definition.app && terraform apply` forces a fresh
+  # revision reflecting the current .tf-declared container_definitions
+  # (including the bootstrap image — the live ECS SERVICE is unaffected,
+  # since it separately ignores task_definition drift), then re-run
+  # aws-deploy.yml (or the manual walkthrough) once more so CI clones that
+  # new revision — now carrying the config change — forward onto the real
+  # image.
   lifecycle {
     ignore_changes = [container_definitions]
   }

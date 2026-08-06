@@ -4331,6 +4331,23 @@ previous_secrets = []
     }
 
     #[test]
+    fn aws_workflow_never_uses_the_invalid_output_none_value() {
+        // The AWS CLI's --output only accepts json/yaml/yaml-stream/text/
+        // table/off — "none" isn't a valid value and makes the command
+        // exit non-zero instead of suppressing output. Discarding via
+        // shell redirection works regardless of CLI version (older
+        // versions may not support "off" either).
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        assert!(
+            !content.contains("--output none"),
+            "the workflow must not pass the invalid --output none value to the AWS CLI: {content}"
+        );
+    }
+
+    #[test]
     fn aws_workflow_runs_migrations_before_updating_the_service() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");

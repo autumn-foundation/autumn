@@ -1158,7 +1158,10 @@ DATABASE_URL_ARN="$(terraform output -raw database_url_secret_arn)"
 SIGNING_SECRET_ARN="$(terraform output -raw signing_secret_secret_arn)"
 TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
 
-aws ecr get-login-password | docker login --username AWS --password-stdin "$ECR"
+# docker login takes a registry hostname, not a repository path — $ECR
+# includes the repository suffix (e.g. "<account>.dkr.ecr.<region>.amazonaws.com/my-app"),
+# so strip everything from the first "/" onward.
+aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR%%/*}"
 docker build \
   --build-arg AUTUMN_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
   --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="$(git rev-parse --short HEAD)" \
@@ -1167,7 +1170,11 @@ docker build \
   --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   -t "$ECR:$TAG" .
 docker push "$ECR:$TAG"
+```
 
+**Run `autumn migrate` against the database now, before the cutover below** — the generated production config sets `auto_migrate_in_production = false`, so nothing else runs it, and App Runner has no separate release-phase hook the way ECS's one-shot migration task or Azure's migration job does. RDS is private (not publicly accessible), so this means connecting through the VPC — from a bastion host, an SSM Session Manager port-forward, or a one-off ECS/Fargate task, whichever your setup already has. Only proceed to the `update-service` call below once migrations have actually completed; running it first serves the new, schema-dependent code against the old schema.
+
+```bash
 APP_URL="$(terraform output -raw app_url)"   # known only after the FIRST apply created the service
 # --source-configuration REPLACES the image configuration wholesale, not
 # merges it — RuntimeEnvironmentSecrets must be re-supplied here alongside
@@ -1198,11 +1205,6 @@ aws apprunner update-service --service-arn "$SERVICE_ARN" \
   \"AutoDeploymentsEnabled\": false
 }"
 ```
-
-Run `autumn migrate` against the database (from your own machine, a
-bastion, or a one-off ECS/Fargate task — App Runner itself has no separate
-release-phase hook) *before* the update above lands, the same
-`auto_migrate_in_production = false` rule as every other target.
 
 **State file security and `.gitignore`.** Same caveats as Azure: Terraform
 state holds every secret in plaintext regardless of `sensitive = true`;
@@ -1289,7 +1291,10 @@ SUBNETS="$(terraform output -json private_subnet_ids | jq -c .)"
 SG="$(terraform output -raw ecs_tasks_security_group_id)"
 TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
 
-aws ecr get-login-password | docker login --username AWS --password-stdin "$ECR"
+# docker login takes a registry hostname, not a repository path — $ECR
+# includes the repository suffix (e.g. "<account>.dkr.ecr.<region>.amazonaws.com/my-app"),
+# so strip everything from the first "/" onward.
+aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR%%/*}"
 docker build \
   --build-arg AUTUMN_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
   --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="$(git rev-parse --short HEAD)" \
@@ -1337,8 +1342,18 @@ EXIT_CODE=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
 [ "$EXIT_CODE" = "0" ] || { echo "migration failed"; exit 1; }
 
 aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
-  --task-definition "$APP_ARN" --force-new-deployment --output none
+  --task-definition "$APP_ARN" --force-new-deployment >/dev/null
 aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+# services-stable's predicate only requires ONE deployment to have
+# runningCount == desiredCount — if the new revision failed its health
+# checks, the deployment circuit breaker rolls the service back to the
+# PREVIOUS revision, and that older deployment satisfies the waiter just as
+# well. Without this check you could see "success" even though $APP_ARN
+# was never actually running.
+DEPLOYED_TASK_DEF=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+  --query "services[0].deployments[?status=='PRIMARY'].taskDefinition | [0]" --output text)
+[ "$DEPLOYED_TASK_DEF" = "$APP_ARN" ] || { echo "deployment rolled back to $DEPLOYED_TASK_DEF"; exit 1; }
 ```
 
 Terraform is told to ignore both the service's `task_definition` and each
