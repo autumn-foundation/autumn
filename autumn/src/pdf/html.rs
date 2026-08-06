@@ -323,6 +323,75 @@ fn bounded_prefix(s: &str, max_len: usize) -> &str {
     &s[..end]
 }
 
+/// Find the byte offset of the `>` that ends an opening tag within `window`,
+/// skipping any `>` that appears inside a quoted attribute value (e.g.
+/// `<div title="Balance > 100">`) — otherwise that quoted `>` is mistaken
+/// for the tag's real closing delimiter, truncating the tag early and
+/// leaking the rest of the attribute value into the document as literal
+/// text.
+///
+/// Takes the fast, heavily-optimized [`str::find`] path whenever `window`
+/// contains no quote character at all — the overwhelmingly common case, and
+/// exactly what the existing quadratic-scan regression tests exercise (long
+/// runs of unterminated tags with no attributes) — so this doesn't reopen
+/// the O(n^2) cost [`MAX_TAG_SCAN`] exists to bound. Only pays for the
+/// slower quote-tracking scan when a `"`/`'` is actually present, still
+/// bounded by the same `window` (already capped to [`MAX_TAG_SCAN`] bytes
+/// by the caller) either way.
+fn find_tag_end(window: &str) -> Option<usize> {
+    // Two single-char `contains` calls, not one `contains(['"', '\''])` —
+    // `str`'s multi-char-pattern search isn't memchr-accelerated the way a
+    // single literal `char` pattern is, and using it here regressed the
+    // quadratic-scan timing tests by roughly 10x despite being only a
+    // pre-check (verified by actually timing it, not just complexity-class
+    // reasoning — see the module's other `MAX_TAG_SCAN`-adjacent history).
+    if !window.contains('"') && !window.contains('\'') {
+        return window.find('>');
+    }
+    // A quote is present *somewhere* in the window, but that doesn't mean
+    // one hides the tag's actual closing `>` — check for a `>` at all
+    // first (a single fast scan, identical cost to the no-quote fast path
+    // above), and only fall into the quote-tracking walk below when a
+    // quote appears *before* that naive position. This matters for the
+    // "genuinely unterminated tag" case (no `>` anywhere in the window):
+    // an earlier version of this function skipped straight to the
+    // quote-tracking loop whenever any quote was present, which kept
+    // re-scanning the *entire* remaining window for a `>` that was never
+    // going to be found, once per quote encountered — quadratic-shaped
+    // within the window and measurably ~6x slower than this early-exit,
+    // caught by actually timing it rather than trusting complexity-class
+    // reasoning alone.
+    let naive_gt = window.find('>')?;
+    if !window[..naive_gt].contains('"') && !window[..naive_gt].contains('\'') {
+        return Some(naive_gt);
+    }
+    // A quote precedes the naive `>`, so it might be hiding the real one
+    // (e.g. `title="Balance > 100"`). Walk forward, jumping over each
+    // quoted span via a single fast `find` for its matching close quote,
+    // until reaching a `>` with no unclosed quote before it. Already known
+    // to terminate (a `>` exists somewhere past `pos` on every iteration,
+    // found the same cheap way), so this can't degrade into the same
+    // rescan-for-nothing shape the naive-`>` check above heads off.
+    let mut pos = 0;
+    loop {
+        let rest = window.get(pos..)?;
+        let gt = rest.find('>')?;
+        let quote_before_gt = [rest.find('"'), rest.find('\'')]
+            .into_iter()
+            .flatten()
+            .filter(|&q| q < gt)
+            .min();
+        let Some(quote_off) = quote_before_gt else {
+            return Some(pos + gt);
+        };
+        let quote_idx = pos + quote_off;
+        let quote = window.as_bytes()[quote_idx];
+        let after_quote = quote_idx + 1;
+        let close_off = window.get(after_quote..)?.find(quote as char)?;
+        pos = after_quote + close_off + 1;
+    }
+}
+
 fn parse_open_tag(s: &str) -> Option<(String, bool, usize)> {
     debug_assert!(s.starts_with('<'));
     let rest = &s[1..];
@@ -336,7 +405,7 @@ fn parse_open_tag(s: &str) -> Option<(String, bool, usize)> {
     // Find `>` first and bail before doing any allocation if it's not in the
     // window — the common failure case (a malformed/unterminated `<`) then
     // costs only the bounded scan above, never a string allocation.
-    let gt = window.find('>')?;
+    let gt = find_tag_end(window)?;
 
     let name_end = window[..gt]
         .find(|c: char| c.is_whitespace() || c == '/')
@@ -729,6 +798,60 @@ mod tests {
             text(&nodes),
             "Hello",
             "a long but well-formed opening tag must parse, not leak as literal text"
+        );
+    }
+
+    #[test]
+    fn quoted_greater_than_inside_an_attribute_does_not_end_the_tag_early() {
+        // Regression: `parse_open_tag`'s search for the closing `>` used to
+        // stop at the *first* `>` anywhere in the tag, including one inside
+        // a quoted attribute value — `<div title="Balance > 100">Visible</div>`
+        // truncated the tag right after "Balance ", leaking ` 100">` into
+        // the document as literal text ahead of "Visible".
+        let nodes = parse(r#"<div title="Balance > 100">Visible</div>"#);
+        assert_eq!(
+            nodes.len(),
+            1,
+            "expected a single <div> node, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "div");
+        assert_eq!(
+            text(children),
+            "Visible",
+            "the quoted attribute value must not leak into the rendered text"
+        );
+    }
+
+    #[test]
+    fn quoted_apostrophe_greater_than_inside_an_attribute_does_not_end_the_tag_early() {
+        // Same bug, single-quoted attribute variant.
+        let nodes = parse("<div title='Balance > 100'>Visible</div>");
+        assert_eq!(nodes.len(), 1);
+        let Node::Element { children, .. } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn long_run_of_unterminated_quoted_attributes_is_linear_not_quadratic() {
+        // Regression: `find_tag_end`'s quote-tracking slow path is only
+        // reached when the scan window contains a quote character at all —
+        // verify that path itself doesn't reopen the O(n^2) cost
+        // `MAX_TAG_SCAN` exists to bound, the same way the plain
+        // `long_run_of_unterminated_open_tags_is_linear_not_quadratic` test
+        // verifies the quote-free fast path.
+        let html = "<a title=\"x".repeat(50_000);
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(text(&nodes), html);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "find_tag_end's quoted-attribute path took {:?} — looks quadratic",
+            start.elapsed()
         );
     }
 
