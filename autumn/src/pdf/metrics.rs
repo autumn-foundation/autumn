@@ -81,12 +81,18 @@ const fn base_width_1000em(ch: char) -> u16 {
         // like `&` used to — their real Helvetica width (667) matches the
         // rest of this arm.
         '&' | 'A'..='Z' | '\u{0160}' | '\u{0178}' => 667,
-        // `Ž` (U+017D) is the same shape of gap as `Š`/`Ÿ` just above, but
-        // its own real Helvetica width (611) doesn't match any existing
-        // arm to merge into. A repro matching the reported one: 70 `Š`s at
-        // 11pt used to estimate ~428pt (fits a 495pt content area) while
-        // Helvetica actually renders them at ~514pt (doesn't).
-        '\u{017D}' => 611,
+        // `Ž` (U+017D) is the same shape of gap as `Š`/`Ÿ` just above. A
+        // repro matching the reported one: 70 `Š`s at 11pt used to
+        // estimate ~428pt (fits a 495pt content area) while Helvetica
+        // actually renders them at ~514pt (doesn't).
+        //
+        // `ß`/`ø` (U+00DF/U+00F8) share the same real width (611) — they'd
+        // otherwise fall into the Latin-1-lowercase-accented range further
+        // below, which approximates the whole range at 556, underestimating
+        // both the same way. A repro matching the reported one: 80 `ß`s at
+        // 11pt used to estimate ~489pt (fits a 495pt content area) while
+        // Helvetica actually renders them at ~538pt (doesn't).
+        '\u{017D}' | '\u{00DF}' | '\u{00F8}' => 611,
         // `Æ`/`Œ` (and their lowercase forms `æ`/`œ`, merged into the `%`/`W`
         // arms above to avoid duplicate match bodies) are representable
         // WinAnsi ligatures, not accented letters — the Latin-1 range below
@@ -482,6 +488,25 @@ mod tests {
             seventy_scarons > content_area_pt,
             "70 Šs at 11pt ({seventy_scarons}pt) must be estimated wider than a 495pt content \
              area, matching Helvetica's real ~514pt rendering, not the old ~428pt underestimate"
+        );
+    }
+
+    #[test]
+    fn sharp_s_and_o_slash_are_not_underestimated() {
+        // Regression: `ß`/`ø` (U+00DF/U+00F8) used to fall into the blanket
+        // Latin-1-lowercase-accented range (556), but Helvetica renders
+        // both at 611 units — same underestimation risk as the earlier
+        // wide-glyph fixes. A repro matching the reported one: 80 `ß`s at
+        // 11pt used to estimate ~489pt (fits a 495pt content area) while
+        // Helvetica actually renders them at ~538pt (doesn't).
+        assert_eq!(char_width_1000em('\u{00DF}', false), 611); // ß
+        assert_eq!(char_width_1000em('\u{00F8}', false), 611); // ø
+        let eighty_sharp_s = text_width_pt(&"\u{00DF}".repeat(80), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            eighty_sharp_s > content_area_pt,
+            "80 ßs at 11pt ({eighty_sharp_s}pt) must be estimated wider than a 495pt content \
+             area, matching Helvetica's real ~538pt rendering, not the old ~489pt underestimate"
         );
     }
 

@@ -376,15 +376,22 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
 /// down, the same way real HTML5 closes enclosing formatting elements
 /// along with whatever they're inside when that container closes.
 fn is_phrasing_wrapper(tag: &str) -> bool {
-    // `span`/`a` carry no styling meaning of their own here, but
-    // `inline_spans`'s generic transparent-passthrough case treats them
-    // exactly like `strong`/`b`/`em`/`i` — recursing straight through to
-    // their content — so they're just as safe to search past. Reported
-    // repro: `<ul><li><span>One<li>Two</ul>` left the second `<li>`
-    // nested under the first (stopping at `span`) instead of closing it,
-    // so `extract_list_items` emitted only one marker and flattened "Two"
-    // as unmarked text.
-    matches!(tag, "strong" | "b" | "em" | "i" | "span" | "a")
+    // None of these carry styling meaning of their own here, but
+    // `inline_spans`'s generic transparent-passthrough case treats *any*
+    // tag it doesn't specially recognize this same way — recursing
+    // straight through to its content — so any such tag is safe to search
+    // past. This list only needs to cover commonly-used ones as they turn
+    // up; it isn't (and can't cheaply be) exhaustive, since `inline_spans`
+    // treats literally every unrecognized tag transparently. Reported
+    // repro: `<ul><li><span>One<li>Two</ul>` (and similarly `<small>`,
+    // `<code>`, `<abbr>`, `<label>`) left the second `<li>` nested under
+    // the first (stopping at the wrapper) instead of closing it, so
+    // `extract_list_items` emitted only one marker and flattened "Two" as
+    // unmarked text.
+    matches!(
+        tag,
+        "strong" | "b" | "em" | "i" | "span" | "a" | "small" | "code" | "abbr" | "label"
+    )
 }
 
 /// Cascades [`implicitly_closes`] up `stack`: repeatedly finds the closest
@@ -784,6 +791,32 @@ mod tests {
         };
         assert_eq!(tag, "li");
         assert_eq!(text(second_li), "Two");
+    }
+
+    #[test]
+    fn an_omitted_li_closing_tag_is_implied_through_the_remaining_transparent_wrappers() {
+        // Regression: after the `span`/`a` fix, other standard phrasing
+        // wrappers `inline_spans` also treats transparently (`small`,
+        // `code`, `abbr`, `label`, ...) still stopped the implied-close
+        // search — same bug, different tag.
+        for wrapper in ["small", "code", "abbr", "label"] {
+            let html = format!("<ul><li><{wrapper}>One<li>Two</ul>");
+            let nodes = parse(&html);
+            assert_eq!(nodes.len(), 1, "wrapper {wrapper:?}");
+            let Node::Element { tag, children } = &nodes[0] else {
+                panic!("expected an element ({wrapper:?})")
+            };
+            assert_eq!(tag, "ul");
+            assert_eq!(
+                children.len(),
+                2,
+                "expected two sibling <li>s for wrapper {wrapper:?}, got {children:?}"
+            );
+            let Node::Element { tag, .. } = &children[1] else {
+                panic!("expected an element ({wrapper:?})")
+            };
+            assert_eq!(tag, "li", "wrapper {wrapper:?}");
+        }
     }
 
     #[test]

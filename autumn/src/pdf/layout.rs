@@ -638,6 +638,14 @@ type StyledWord = (String, bool, bool, bool);
 /// line by itself, e.g. a long URL/hash/identifier with no internal
 /// whitespace to break at).
 ///
+/// An embedded NBSP (`&nbsp;`, kept inside the token by `words_of` — see
+/// [`Word::Text::unbreakable`] for the same rule at a *span* boundary) must
+/// never end up as the last character of a chunk: that would isolate
+/// whatever follows it onto the next chunk, indistinguishable from an
+/// ordinary space wrapping there — exactly what the NBSP forbids. When the
+/// natural per-character boundary would do that, the trailing NBSP moves to
+/// the *next* chunk instead, staying paired with what follows it.
+///
 /// Always makes progress: a chunk always gets at least one character even if
 /// that character alone exceeds `max_width_pt`, so this can't loop forever
 /// on a pathologically narrow `max_width_pt`.
@@ -653,8 +661,16 @@ fn split_into_fitting_chunks(
     for ch in text.chars() {
         let ch_width = f32::from(char_width_1000em(ch, bold)) / 1000.0 * font_size_pt;
         if !current.is_empty() && current_width + ch_width > max_width_pt {
-            chunks.push(std::mem::take(&mut current));
-            current_width = 0.0;
+            if current.ends_with('\u{00A0}') && current.chars().count() > 1 {
+                current.pop();
+                chunks.push(std::mem::take(&mut current));
+                current.push('\u{00A0}');
+                current_width =
+                    f32::from(char_width_1000em('\u{00A0}', bold)) / 1000.0 * font_size_pt;
+            } else {
+                chunks.push(std::mem::take(&mut current));
+                current_width = 0.0;
+            }
         }
         current.push(ch);
         current_width += ch_width;
@@ -1126,6 +1142,35 @@ mod tests {
             .collect();
         assert_eq!(
             reassembled, "https://example.com/a/very/long/path/that/has/no/spaces/anywhere/at/all",
+            "splitting must not drop or reorder any characters"
+        );
+    }
+
+    #[test]
+    fn oversized_token_does_not_split_immediately_after_an_embedded_nbsp() {
+        // Regression: an oversized token (already too wide for one line, so
+        // it goes through `split_into_fitting_chunks`'s plain character
+        // splitter) that happens to contain an embedded NBSP had no NBSP
+        // awareness — if the natural per-character width boundary fell
+        // right after the NBSP, it ended up as the last character of one
+        // chunk and whatever followed it started the next, breaking
+        // exactly the boundary NBSP forbids. A repro matching the reported
+        // one: 67 `A`s followed by `&nbsp;B` — the 67 As plus the NBSP fit
+        // within the content width, but adding `B` doesn't, so the naive
+        // split lands right after the NBSP.
+        let text = format!("{}\u{00A0}B", "A".repeat(67));
+        let font_size_pt = 11.0;
+        let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
+            + text_width_pt("\u{00A0}", font_size_pt, false)
+            + 0.5;
+        let chunks = split_into_fitting_chunks(&text, font_size_pt, false, max_width_pt);
+        assert!(
+            chunks.iter().all(|c| !c.ends_with('\u{00A0}')),
+            "no chunk may end with a trailing NBSP, got {chunks:?}"
+        );
+        let reassembled: String = chunks.concat();
+        assert_eq!(
+            reassembled, text,
             "splitting must not drop or reorder any characters"
         );
     }
