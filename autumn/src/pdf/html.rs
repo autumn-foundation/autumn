@@ -482,55 +482,70 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
 
 /// Locates the `>` that ends a raw-text closing tag candidate, given
 /// `after_tag` (the text right after the tag name, e.g. right after
-/// `</script`). Bounds the search to *before the next literal `<`* rather
-/// than a fixed byte count — unlike a fixed bound, this can never reject a
-/// genuine closing tag just because its attribute list is long (mirroring
-/// why [`oversized_tag_body_start`] moved away from a fixed window), while
-/// still never reintroducing the O(n^2) risk a naive fully-unbounded
-/// search would have here specifically: [`consume_raw_text`]'s outer
-/// `match_indices('<')` loop calls this once per candidate and, on
-/// failure, moves on to try the *next* one rather than stopping (unlike
-/// [`handle_closing_tag`], where a failed unbounded search jumps straight
-/// to EOF and ends the whole parse) — so a raw-text body containing many
-/// `"</script "` fragments with no `>` anywhere would make a fully
-/// unbounded search here pay a full remaining-input scan on every single
-/// failed candidate, genuinely O(n^2). Bounding to the next `<` instead
-/// makes each candidate's own share of the work exactly the gap up to that
-/// next `<` — and since every one of those gaps is disjoint (the
-/// `match_indices` iterator itself walks past each `<` exactly once), the
-/// total across every candidate in one [`consume_raw_text`] call is
-/// O(`rest.len()`), not O(candidates × `rest.len()`), regardless of how
-/// long any individual gap (i.e. attribute list) is.
+/// `</script`). A single quote-aware forward scan for `>`, `<`, or a quote
+/// character (`is_attr_value_quote`-gated exactly like [`find_tag_end`]),
+/// stopping at whichever comes first — an unquoted `<` ends the scan with
+/// `None` (this candidate never closes; some other tag starts here
+/// instead), a genuinely quoted span is skipped over via its matching
+/// close quote, and `>` outside any quoted span is the real answer.
 ///
-/// Quote-aware within that window for the same reason [`parse_open_tag`]'s
-/// own `>` search is: real browsers' end-tag tokenizer *does* enter a
-/// quote-aware, attribute-value-like state once whitespace follows the tag
-/// name (by which point [`consume_raw_text`]'s `is_boundary` check has
-/// already confirmed we're here), so e.g. `</script data-x=">secret">`
-/// must skip the quoted `>` and end at the real one after it, not treat
-/// the quoted `>` as the close and leak `secret">` as visible text.
+/// Unbounded by any fixed byte count — unlike a fixed window, this can
+/// never reject a genuine closing tag just because its attribute list (or
+/// a run of whitespace before `>`, legal per HTML5's end-tag grammar) is
+/// long (mirroring why [`oversized_tag_body_start`] moved away from a
+/// fixed window) — while still never reintroducing the O(n^2) risk a naive
+/// fully-unbounded *quote-blind* search would have here specifically:
+/// [`consume_raw_text`]'s outer `match_indices('<')` loop calls this once
+/// per candidate and, on failure, moves on to try the *next* one rather
+/// than stopping (unlike [`handle_closing_tag`], where a failed unbounded
+/// search jumps straight to EOF and ends the whole parse) — so a raw-text
+/// body containing many `"</script "` fragments with no `>` anywhere would
+/// make a search that ignored `<` entirely pay a full remaining-input scan
+/// on every single failed candidate, genuinely O(n^2). Stopping at the
+/// first *unquoted* `<` instead makes each candidate's own share of the
+/// work bounded by the gap up to that `<` (or, if a genuinely quoted span
+/// is open, by the gap to its matching close quote) — every such gap is
+/// disjoint from every other candidate's, so the total across every
+/// candidate in one [`consume_raw_text`] call stays O(`rest.len()`), not
+/// O(candidates × `rest.len()`).
 ///
-/// Falls back to walking a *pure* run of ASCII whitespace from the start
-/// of the window, succeeding only if `>` immediately follows it — legal
-/// per the HTML5 end-tag grammar's "closing tag, arbitrary whitespace,
-/// then `>`". A pure whitespace run can never contain `<`, so it never
-/// reaches past the window's own bound anyway; this pass exists because a
-/// long whitespace run before `>` isn't something [`find_tag_end`] itself
-/// recognizes as a close (it only looks for `>`, quote-aware, not for
-/// "whitespace then `>`" specifically after failing to find one some other
-/// way) — without it, a legitimate closing tag with a long run of
-/// whitespace before `>` was rejected outright, making
-/// [`consume_raw_text`] scan through to EOF instead — hiding all following
-/// visible content for `script`/`style`, or rendering the literal
-/// (unclosed-looking) tag text for `title`/`textarea`.
+/// Quote-awareness matters for two distinct reasons here. First, the same
+/// one [`parse_open_tag`]'s own `>` search has: real browsers' end-tag
+/// tokenizer *does* enter a quote-aware, attribute-value-like state once
+/// whitespace follows the tag name (by which point [`consume_raw_text`]'s
+/// `is_boundary` check has already confirmed we're here), so e.g.
+/// `</script data-x=">secret">` must skip the quoted `>` and end at the
+/// real one after it, not treat the quoted `>` as the close and leak
+/// `secret">` as visible text. Second, and specific to this function: a
+/// quoted attribute value can itself legally contain a literal `<` (e.g.
+/// `</script data-x="<">Visible`) — without quote-awareness on the `<`
+/// stop condition too, that embedded `<` would be mistaken for the start
+/// of a new tag, ending the scan with `None` even though a real `>`
+/// follows right after the value closes, and hiding `Visible` (or, for
+/// `title`/`textarea`, being unable to recognize the close at all) as a
+/// result.
 fn raw_close_tag_end(after_tag: &str) -> Option<usize> {
-    let window = &after_tag[..after_tag.find('<').unwrap_or(after_tag.len())];
-    find_tag_end(window).or_else(|| {
-        let ws_len = window
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(window.len());
-        window[ws_len..].starts_with('>').then_some(ws_len)
-    })
+    let bytes = after_tag.as_bytes();
+    let mut pos = 0;
+    loop {
+        let rel = bytes[pos..]
+            .iter()
+            .position(|&b| matches!(b, b'>' | b'<' | b'"' | b'\''))?;
+        let idx = pos + rel;
+        match bytes[idx] {
+            b'>' => return Some(idx),
+            b'<' => return None,
+            quote => {
+                if !is_attr_value_quote(bytes, idx) {
+                    pos = idx + 1;
+                    continue;
+                }
+                let after_quote = idx + 1;
+                let close_off = after_tag.get(after_quote..)?.find(quote as char)?;
+                pos = after_quote + close_off + 1;
+            }
+        }
+    }
 }
 
 /// Bound on how many frames back [`parse`]'s closing-tag matcher scans
@@ -1023,12 +1038,26 @@ fn bounded_prefix(s: &str, max_len: usize) -> &str {
     &s[..end]
 }
 
+/// Whether the quote byte at `bytes[quote_idx]` is a genuine attribute-value
+/// opener — i.e. immediately preceded by `=` — rather than a literal quote
+/// character sitting inside an *unquoted* attribute value (e.g. `it's` in
+/// `title=it's`, a parse-error condition real browsers still tolerate: the
+/// tag still ends at the next real `>`, not at a second apostrophe that may
+/// not even exist). Treating every quote character as toggling a quoted
+/// span — regardless of what precedes it — makes such a value's stray
+/// quote wrongly swallow the rest of the tag (and, if no matching quote
+/// ever appears, the rest of the document) looking for a close that was
+/// never a real attribute value to begin with.
+fn is_attr_value_quote(bytes: &[u8], quote_idx: usize) -> bool {
+    quote_idx > 0 && bytes[quote_idx - 1] == b'='
+}
+
 /// Find the byte offset of the `>` that ends an opening tag within `window`,
-/// skipping any `>` that appears inside a quoted attribute value (e.g.
-/// `<div title="Balance > 100">`) — otherwise that quoted `>` is mistaken
-/// for the tag's real closing delimiter, truncating the tag early and
-/// leaking the rest of the attribute value into the document as literal
-/// text.
+/// skipping any `>` that appears inside a *genuinely quoted* attribute value
+/// (e.g. `<div title="Balance > 100">`) — otherwise that quoted `>` is
+/// mistaken for the tag's real closing delimiter, truncating the tag early
+/// and leaking the rest of the attribute value into the document as literal
+/// text. See [`is_attr_value_quote`] for what makes a quote "genuine".
 ///
 /// Takes the fast, heavily-optimized [`str::find`] path whenever `window`
 /// contains no quote character at all — the overwhelmingly common case, and
@@ -1067,8 +1096,12 @@ fn find_tag_end(window: &str) -> Option<usize> {
     }
     // A quote precedes the naive `>`, so it might be hiding the real one
     // (e.g. `title="Balance > 100"`). Walk forward, jumping over each
-    // quoted span via a single fast `find` for its matching close quote,
-    // until reaching a `>` with no unclosed quote before it.
+    // *genuinely* quoted span (see [`is_attr_value_quote`]) via a single
+    // fast `find` for its matching close quote, until reaching a `>` with
+    // no unclosed quote before it. A quote character that isn't a genuine
+    // opener (not preceded by `=`) is just literal content — skip past it
+    // and keep looking, rather than trying (and likely failing, if no
+    // matching quote of that style exists later) to pair it with one.
     //
     // Regression: an earlier version of this loop re-derived `gt` via a
     // fresh `rest.find('>')` on *every* iteration, scanning from the
@@ -1085,8 +1118,16 @@ fn find_tag_end(window: &str) -> Option<usize> {
     // *past* it — meaning that old `gt` was actually inside the quote and
     // was never real to begin with; otherwise it's unchanged from the
     // last time it was found, so reusing it is correct, not just faster.
+    //
+    // Skipping a non-genuine quote (`pos = quote_idx + 1`, loop again)
+    // doesn't reopen that same O(n^2) shape either: `rest.bytes().position`
+    // always finds the *next* quote character regardless of whether it
+    // turns out to be genuine, so a long run of stray quote characters
+    // (e.g. `it's don't can't...`) still only costs the gap between
+    // consecutive quotes each time, not a rescan of the whole remaining
+    // span.
     let mut pos = 0;
-    let mut gt = window.find('>')?;
+    let mut gt = naive_gt;
     loop {
         if gt < pos {
             gt = pos + window.get(pos..)?.find('>')?;
@@ -1109,6 +1150,10 @@ fn find_tag_end(window: &str) -> Option<usize> {
             return Some(gt);
         };
         let quote_idx = pos + quote_off;
+        if !is_attr_value_quote(window.as_bytes(), quote_idx) {
+            pos = quote_idx + 1;
+            continue;
+        }
         let quote = window.as_bytes()[quote_idx];
         let after_quote = quote_idx + 1;
         let close_off = window.get(after_quote..)?.find(quote as char)?;
@@ -2758,6 +2803,51 @@ mod tests {
     }
 
     #[test]
+    fn literal_quote_in_an_unquoted_attribute_value_does_not_swallow_the_tag() {
+        // Regression: `find_tag_end` used to treat *any* quote character as
+        // opening a quoted span, regardless of what precedes it — but an
+        // unquoted attribute value can legally contain a literal quote
+        // (`title=it's` is a parse-error condition real browsers still
+        // tolerate, ending the tag at the next real `>`). With no second
+        // apostrophe anywhere in the document, the old logic searched for a
+        // matching close that didn't exist and gave up, discarding an
+        // already-known-valid `>` and losing "Visible" past it.
+        let nodes = parse("<div title=it's>Visible</div>");
+        assert_eq!(
+            nodes.len(),
+            1,
+            "expected a single <div> node, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "div");
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn raw_text_closing_tag_with_a_literal_angle_bracket_in_a_quoted_attribute_still_closes() {
+        // Regression: `raw_close_tag_end`'s scan used to stop at the first
+        // literal `<` character, even one sitting inside a genuinely quoted
+        // attribute value — `</script data-x="<">Visible` has its own real
+        // close right after the quoted value, but the embedded `<` was
+        // mistaken for the start of a new tag, rejecting the candidate and
+        // running the scan to EOF (hiding "Visible").
+        let nodes = parse(r#"<script>hidden</script data-x="<">Visible"#);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "expected script + trailing text, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected the first node to be an element")
+        };
+        assert_eq!(tag, "script");
+        assert_eq!(text(children), "hidden");
+        assert_eq!(nodes[1], Node::Text("Visible".to_owned()));
+    }
+
+    #[test]
     fn long_run_of_unterminated_quoted_attributes_is_linear_not_quadratic() {
         // Regression: `find_tag_end`'s quote-tracking slow path is only
         // reached when the scan window contains a quote character at all —
@@ -2793,6 +2883,53 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "find_tag_end's quoted-attribute path took {:?} — looks quadratic",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_run_of_stray_apostrophes_before_the_real_close_is_linear_not_quadratic() {
+        // Regression guard for the fix that made `find_tag_end` skip a
+        // quote character that isn't a genuine attribute-value opener:
+        // verify a long run of such stray quotes (none preceded by `=`,
+        // so none pair up) still resolves in linear, not quadratic, time
+        // — each skip only costs the gap to the *next* quote character,
+        // not a rescan of the whole remaining span.
+        let html = format!("<div title={}>Visible</div>", "it's ".repeat(50_000));
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(
+            nodes.len(),
+            1,
+            "expected a single <div> node, got {nodes:?}"
+        );
+        let Node::Element { children, .. } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(text(children), "Visible");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "find_tag_end took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_run_of_raw_text_closes_with_quoted_angle_brackets_is_linear_not_quadratic() {
+        // Regression guard for the fix that made `raw_close_tag_end` skip
+        // past a genuinely quoted `<` instead of treating it as a
+        // candidate boundary: verify many candidates each carrying a
+        // quoted `<` (but no real close) still resolve in linear, not
+        // quadratic, time.
+        let candidate = "</script data-x=\"<\" ";
+        let html = format!("<script>{}", candidate.repeat(2_000));
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(nodes.len(), 1);
+        assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "script"));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "parse took {:?} — looks quadratic again",
             start.elapsed()
         );
     }
