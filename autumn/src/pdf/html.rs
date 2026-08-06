@@ -182,37 +182,43 @@ fn is_raw_text_element(tag: &str) -> bool {
 
 /// If `s` (starting with `<`) looks like the start of an opening tag for
 /// one of the six tags `layout.rs`'s `is_non_rendered` hides wholesale
-/// (`script`, `style`, `noscript`, `template`, `head`, `title`) —
-/// case-insensitively, and only when the tag name is immediately followed
-/// by a real tag-name boundary (whitespace, `/`, or `>`), not merely a
-/// shared prefix (`<scripted>` doesn't count) — returns its canonical
-/// lowercase tag name.
+/// (`script`, `style`, `noscript`, `template`, `head`, `title`), or for
+/// `textarea` — case-insensitively, and only when the tag name is
+/// immediately followed by a real tag-name boundary (whitespace, `/`, or
+/// `>`), not merely a shared prefix (`<scripted>` doesn't count) — returns
+/// its canonical lowercase tag name.
 ///
 /// Used only as a fallback once [`parse_open_tag`] has already failed (its
 /// bounded search found no `>` within [`MAX_TAG_SCAN`]) — e.g. one of these
-/// six tags carrying an attribute long enough to push its own `>` past
+/// seven tags carrying an attribute long enough to push its own `>` past
 /// that bound. Without this, [`parse`]'s normal "unrecognized tag"
 /// fallback treats the lone `<` as literal text and re-parses everything
 /// after it one byte at a time — meaning content that's supposed to be
-/// hidden (`layout.rs` skips these tags' subtrees entirely, and
-/// `script`/`style`/`title` content additionally isn't even meant to be
-/// *tokenized* as markup, see [`is_raw_text_element`]) leaks into the
-/// visible document instead — for `<title>` inside a still-open `<head>`,
-/// the non-whitespace fallback text also implicitly closes the head (see
-/// [`push_text`]), so both the oversized attribute *and* the title text
-/// leak in.
+/// hidden (`layout.rs` skips the six `is_non_rendered` tags' subtrees
+/// entirely, and `script`/`style`/`title`/`textarea` content additionally
+/// isn't even meant to be *tokenized* as markup, see
+/// [`is_raw_text_element`]) leaks into the visible document instead — for
+/// `<title>` inside a still-open `<head>`, the non-whitespace fallback
+/// text also implicitly closes the head (see [`push_text`]), so both the
+/// oversized attribute *and* the title text leak in; for `<textarea>`
+/// specifically, the fallback also means its real content (meant to
+/// render, unlike the other six) gets tokenized as markup instead of
+/// staying raw text — a stray `<b>`-looking sequence inside it would
+/// wrongly become a real element instead of literal text.
 ///
-/// Mirrors `is_non_rendered`'s tag set rather than importing it: this
+/// Mostly mirrors `is_non_rendered`'s tag set (plus `textarea`, which
+/// isn't `is_non_rendered` — see below) rather than importing it: this
 /// small parser has no dependency on `layout.rs`'s rendering decisions,
 /// same as [`is_structural_tag`] mirrors (rather than calls into) the
 /// tag sets it's related to elsewhere in this file.
 ///
-/// The caller in [`parse`] gives three of the six —`head`, `noscript`, and
-/// `template`— different handling than `script`/`style`/`title`: those
-/// three are [structural, generally-parsed elements](is_structural_tag)
-/// even when normally sized (their content is real markup, only hidden at
-/// render time by `is_non_rendered`), so discarding straight through to a
-/// literal closing tag the way the true [raw-text elements](is_raw_text_element)
+/// The caller in [`parse`] gives three of the six `is_non_rendered` tags
+/// — `head`, `noscript`, and `template` — different handling than
+/// `script`/`style`/`title`: those three are [structural,
+/// generally-parsed elements](is_structural_tag) even when normally
+/// sized (their content is real markup, only hidden at render time by
+/// `is_non_rendered`), so discarding straight through to a literal
+/// closing tag the way the true [raw-text elements](is_raw_text_element)
 /// do would be wrong two different ways. For `head`, whose closing tag is
 /// optional (implicitly closed by later non-head content, see
 /// [`implicitly_closes`]), it would swallow the rest of the document —
@@ -226,25 +232,32 @@ fn is_raw_text_element(tag: &str) -> bool {
 /// real stack frame and fall through to normal parsing, exactly like a
 /// normally-sized instance of the same tag already does.
 ///
-/// `<textarea>` is deliberately excluded even though it's also
-/// tag-name-adjacent raw text: unlike these six, it isn't
-/// `is_non_rendered` — its content is meant to render normally — so
-/// silently discarding it here the same way would be a regression, not a
-/// fix. Nested same-tag content still closes at the first matching closing
-/// tag rather than the correctly-nested one for the three genuinely
-/// raw-text tags (`script`/`style`/`title`), the same simplification
+/// `textarea` gets a fourth kind of handling, different again: like
+/// `script`/`style`/`title` it's a genuine [raw-text
+/// element](is_raw_text_element) (its content must not be tokenized as
+/// markup), so it reuses the same [`consume_raw_text`] scan those three
+/// do — but unlike them, its content is real, rendered text (a form
+/// default value, say), not something `is_non_rendered` discards, so the
+/// scanned text is emitted as a real child node instead of thrown away —
+/// see the call site's `push_oversized_raw_text_content_tag`. Nested
+/// same-tag content still closes at the first matching closing tag rather
+/// than the correctly-nested one for all four genuinely raw-text tags
+/// (`script`/`style`/`title`/`textarea`), the same simplification
 /// [`consume_raw_text`] already accepts for a normally-sized `<script>`/
-/// `<style>` — acceptable there since that fallback only ever discards the
-/// content, and it's never rendered either way. `head`/`noscript`/
-/// `template` don't get that simplification (see the call site in
-/// [`parse`]): their content is real, generally-parsed markup that's only
-/// hidden at render time, so nested same-name tags must close in the
-/// correct (innermost-first) order the way normal parsing already
-/// guarantees.
+/// `<style>`/`<textarea>` — acceptable here too since real HTML doesn't
+/// nest these tags either (a literal `<textarea>` inside a `<textarea>`
+/// is just more raw text up to the first `</textarea>`, not a nested
+/// element). `head`/`noscript`/`template` don't get that simplification
+/// (see the call site in [`parse`]): their content is real,
+/// generally-parsed markup that's only hidden at render time, so nested
+/// same-name tags must close in the correct (innermost-first) order the
+/// way normal parsing already guarantees.
 fn oversized_raw_text_tag_name(s: &str) -> Option<&'static str> {
     debug_assert!(s.starts_with('<'));
     let rest = &s[1..];
-    for name in ["script", "style", "title", "head", "noscript", "template"] {
+    for name in [
+        "script", "style", "title", "head", "noscript", "template", "textarea",
+    ] {
         if rest.len() < name.len()
             || !rest.as_bytes()[..name.len()].eq_ignore_ascii_case(name.as_bytes())
         {
@@ -305,6 +318,40 @@ fn push_oversized_nested_tag(
     let structural_idx = nearest_structural_idx(stack, name);
     stack.push((name.to_owned(), Vec::new(), structural_idx));
     body_start
+}
+
+/// Handles an oversized `<textarea ...>` opening tag once
+/// [`oversized_raw_text_tag_name`] has already recognized it and
+/// [`oversized_tag_body_start`] has located where its content begins — see
+/// that function's docs for why `textarea` can't reuse either of the
+/// other two treatments: it's a genuine [raw-text element](is_raw_text_element)
+/// (its content must not be tokenized as markup, so it needs the same
+/// [`consume_raw_text`] scan `script`/`style`/`title` use), but unlike
+/// those three its content is real, rendered text rather than something
+/// `is_non_rendered` discards, so — mirroring the normal-sized `textarea`
+/// handling in [`parse`] — the scanned text is decoded and emitted as a
+/// real child node instead of thrown away. Extracted out of [`parse`]
+/// purely to keep that function's line count down.
+fn push_oversized_raw_text_content_tag(
+    stack: &mut [(String, Vec<Node>, usize)],
+    input: &str,
+    body_start: usize,
+    name: &str,
+) -> usize {
+    let (text, new_pos) = consume_raw_text(input, body_start, name);
+    let mut children = Vec::new();
+    if !text.is_empty() {
+        children.push(Node::Text(decode_entities(text)));
+    }
+    stack
+        .last_mut()
+        .expect("root frame is never popped")
+        .1
+        .push(Node::Element {
+            tag: name.to_owned(),
+            children,
+        });
+    new_pos
 }
 
 /// Bound on how far [`consume_raw_text`] scans past a candidate
@@ -546,27 +593,30 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             // `parse_open_tag` found no `>` within `MAX_TAG_SCAN` — normally
             // that just means an unterminated/malformed tag, handled below
             // by falling back to literal text one byte at a time. But for
-            // the six non-rendered tags specifically (their own `>` pushed
-            // past the bound by e.g. an oversized attribute), that
-            // fallback would leak their content into the visible document
-            // — see `oversized_raw_text_tag_name`. First skip past the
-            // oversized tag's *own* attribute list (its content must
-            // never be scanned before its real `>` is found — see
-            // `oversized_tag_body_start`), then either discard straight
-            // through to the closing tag (or EOF) via the same raw-text
-            // scan already used for a normally-parsed `<script>`/`<style>`/
-            // `<title>` (reused here since it does exactly what's needed
-            // for genuinely raw-text content: skip to the matching closing
-            // tag and throw everything in between away, without emitting
-            // any node for the unparseable opening tag itself), or, for
-            // `head`/`noscript`/`template` — whose content is real,
+            // the seven tags `oversized_raw_text_tag_name` recognizes
+            // (their own `>` pushed past the bound by e.g. an oversized
+            // attribute), that fallback would leak their content into the
+            // visible document — see that function's docs for the full
+            // three-way (four, counting `textarea`) split in how each
+            // group is handled below. First skip past the oversized tag's
+            // *own* attribute list (its content must never be scanned
+            // before its real `>` is found — see `oversized_tag_body_start`),
+            // then: for `script`/`style`/`title`, discard straight through
+            // to the closing tag (or EOF) via the same raw-text scan
+            // already used for a normally-parsed instance, without
+            // emitting any node for the unparseable opening tag itself;
+            // for `textarea`, the same scan but keeping (not discarding)
+            // the real content, see `push_oversized_raw_text_content_tag`;
+            // for `head`/`noscript`/`template` — whose content is real,
             // generally-parsed markup rather than raw text, see
             // `push_oversized_nested_tag` — push a real frame and fall
             // through to normal parsing instead.
             if let Some(name) = oversized_raw_text_tag_name(&input[pos..]) {
                 let after_name = pos + 1 + name.len();
                 let body_start = oversized_tag_body_start(input, after_name, len);
-                pos = if is_raw_text_element(name) {
+                pos = if name == "textarea" {
+                    push_oversized_raw_text_content_tag(&mut stack, input, body_start, name)
+                } else if is_raw_text_element(name) {
                     consume_raw_text(input, body_start, name).1
                 } else {
                     push_oversized_nested_tag(&mut stack, name, body_start)
@@ -1738,6 +1788,43 @@ mod tests {
             "Visible",
             "the following sibling <p> must still render normally"
         );
+    }
+
+    #[test]
+    fn oversized_textarea_tag_still_renders_its_content_as_raw_text() {
+        // Regression: `textarea` was entirely missing from
+        // `oversized_raw_text_tag_name`'s recognized set — an oversized
+        // `<textarea data-x="...4KiB...">` (its own `>` pushed past
+        // `MAX_TAG_SCAN`) fell all the way through to `parse`'s generic
+        // "unrecognized tag" fallback, which (a) rendered the opening
+        // tag's oversized attribute soup as literal visible text and (b)
+        // tokenized the textarea's real content as ordinary markup
+        // instead of raw text — a `<b>`-looking sequence inside it would
+        // wrongly become a real `<b>` element instead of staying literal,
+        // unlike a normal-sized `<textarea>`.
+        let oversized_attr = "Q".repeat(5000);
+        let html = format!(r#"<textarea data-x="{oversized_attr}">a<b</textarea><p>Visible</p>"#);
+        let nodes = parse(&html);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "expected the textarea element and its sibling <p>, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected the first top-level node to be an element")
+        };
+        assert_eq!(tag, "textarea");
+        assert_eq!(
+            text(children),
+            "a<b",
+            "the oversized attribute must not leak, and the real content must survive as \
+             literal raw text (not tokenized as markup), got {children:?}"
+        );
+        let Node::Element { tag, children } = &nodes[1] else {
+            panic!("expected the second top-level node to be an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "Visible");
     }
 
     #[test]

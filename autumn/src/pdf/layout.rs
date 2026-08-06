@@ -750,6 +750,131 @@ fn split_into_fitting_chunks(
 /// identifier with nowhere to break) is character-wrapped via
 /// [`split_into_fitting_chunks`] instead of being left to overflow the page
 /// or table-cell boundary.
+///
+/// If an NBSP-glued (unbreakable) word is itself individually oversized,
+/// [`wrap`] calls this to character-split it while keeping the first chunk
+/// glued to whatever `current` already holds — `w` is that word's own
+/// (already-known-oversized) width, counted into `*current_width` before
+/// this runs. Returns `true` and leaves `current`/`current_width`/`lines`
+/// updated (first chunk appended and flushed, remaining chunks distributed,
+/// last one left as the new `current`) if splitting actually produced more
+/// than one chunk; returns `false` with nothing touched if
+/// [`split_into_fitting_chunks`] returned only one chunk (nothing left to
+/// split — e.g. the whole word is one NBSP-connected chain with no earlier
+/// split point, see that function's own accepted-overflow fallback), so the
+/// caller can fall through to its plain glue-the-whole-word-as-is path.
+/// Extracted out of [`wrap`] purely to keep that function's line count
+/// down — this has no state of its own beyond its `&mut` parameters.
+#[allow(clippy::too_many_arguments)]
+fn split_oversized_glued_word(
+    text: &str,
+    bold: bool,
+    italic: bool,
+    w: f32,
+    font_size_pt: f32,
+    max_width_pt: f32,
+    current: &mut Vec<StyledWord>,
+    current_width: &mut f32,
+    lines: &mut Vec<Vec<StyledWord>>,
+) -> bool {
+    let mut chunks = split_into_fitting_chunks(text, font_size_pt, bold, max_width_pt).into_iter();
+    let first = chunks
+        .next()
+        .expect("split_into_fitting_chunks never returns empty chunks for non-empty text");
+    let rest: Vec<String> = chunks.collect();
+    if rest.is_empty() {
+        return false;
+    }
+    let first_w = text_width_pt(&first, font_size_pt, bold);
+    *current_width = *current_width - w + first_w;
+    current.push((first, bold, italic, true));
+    lines.push(std::mem::take(current));
+    let last = rest.len() - 1;
+    for (i, chunk) in rest.into_iter().enumerate() {
+        let chunk_w = text_width_pt(&chunk, font_size_pt, bold);
+        if i == last {
+            *current_width = chunk_w;
+            *current = vec![(chunk, bold, italic, false)];
+        } else {
+            lines.push(vec![(chunk, bold, italic, false)]);
+        }
+    }
+    true
+}
+
+/// Handles an NBSP-glued (`unbreakable`) word once the caller ([`wrap`])
+/// has already confirmed `unbreakable` is set and `current` isn't empty —
+/// the two preconditions for this word needing glued-run handling instead
+/// of the plain word-wrap path below. An unbreakable word must never be
+/// split away from whatever it's glued to just because it also happens to
+/// be individually too wide for one line on its own, so on overflow the
+/// *entire* unbreakable run built up so far (tracked via `run_start`/
+/// `run_width`, not just this word) relocates to a fresh line together,
+/// rather than splitting between the run and this word the way ordinary
+/// glue would; if there's nowhere better to put it (`run_start == 0`, the
+/// run already spans the whole line from its start), the overflow is
+/// accepted instead of looping forever.
+///
+/// The NBSP boundary only forbids a break *right there*, though — it says
+/// nothing about the rest of this word if it's *also* individually wider
+/// than a whole line (e.g. a still-open `<strong>` run glued via `&nbsp;`
+/// to 100 characters of unbroken text). Left whole, that's not just
+/// suboptimal, it's the entire remaining run rendered as one unsplit,
+/// unbounded-width token — overflowing and clipped, not merely spilling a
+/// little past the margin. [`split_oversized_glued_word`] character-splits
+/// it the same way the ordinary oversized-token branch in [`wrap`] does,
+/// just keeping the first chunk glued right here; see its docs for the
+/// `false` fallback (nothing left to split) this falls through from.
+///
+/// Extracted out of [`wrap`] purely to keep that function's line count
+/// down — this has no state of its own beyond its `&mut` parameters.
+#[allow(clippy::too_many_arguments)]
+fn handle_unbreakable_word(
+    text: &str,
+    bold: bool,
+    italic: bool,
+    w: f32,
+    font_size_pt: f32,
+    max_width_pt: f32,
+    current: &mut Vec<StyledWord>,
+    current_width: &mut f32,
+    run_start: &mut usize,
+    run_width: &mut f32,
+    lines: &mut Vec<Vec<StyledWord>>,
+) {
+    let new_run_width = *run_width + w;
+    let prefix_width = *current_width - *run_width;
+    if *run_start > 0 && prefix_width + new_run_width > max_width_pt {
+        let tail = current.split_off(*run_start);
+        lines.push(std::mem::take(current));
+        *current = tail;
+        *current_width = new_run_width;
+        *run_start = 0;
+    } else {
+        *current_width = prefix_width + new_run_width;
+    }
+    if w > max_width_pt
+        && !text.is_empty()
+        && split_oversized_glued_word(
+            text,
+            bold,
+            italic,
+            w,
+            font_size_pt,
+            max_width_pt,
+            current,
+            current_width,
+            lines,
+        )
+    {
+        *run_start = 0;
+        *run_width = *current_width;
+        return;
+    }
+    current.push((text.to_owned(), bold, italic, true));
+    *run_width = new_run_width;
+}
+
 fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledWord>> {
     let space_w = text_width_pt(" ", font_size_pt, false);
     let mut lines = Vec::new();
@@ -780,43 +905,26 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
                 unbreakable,
             } => {
                 let w = text_width_pt(text, font_size_pt, *bold);
-                // Checked *before* the oversized-token branch below: an
-                // unbreakable (NBSP-glued) word must never be split away
-                // from whatever it's glued to just because it also happens
-                // to be individually too wide for one line on its own — a
-                // still-open <strong> run glued to preceding text via
-                // &nbsp; used to hit the oversized branch first, which
-                // unconditionally flushed `current` as its own line (losing
-                // the glue) and then character-split the word with no
-                // notion of the NBSP boundary at all. This reuses the same
-                // relocate-or-accept-overflow logic already used for a run
-                // that doesn't fit for non-oversized reasons — an
-                // unbreakable word that's oversized on its own is just the
-                // most extreme case of "doesn't fit", same fallback.
+                // See `handle_unbreakable_word`'s docs for why this needs
+                // its own path, checked *before* the oversized-token
+                // branch below — an unbreakable (NBSP-glued) word must
+                // never be split away from whatever it's glued to just
+                // because it also happens to be individually too wide for
+                // one line on its own.
                 if *unbreakable && !current.is_empty() {
-                    let new_run_width = run_width + w;
-                    let prefix_width = current_width - run_width;
-                    if run_start > 0 && prefix_width + new_run_width > max_width_pt {
-                        // The run (everything from `run_start` on) doesn't
-                        // fit after this word either — relocate the whole
-                        // run, plus this word, to a fresh line rather than
-                        // splitting the NBSP boundary the way ordinary glue
-                        // would.
-                        let tail = current.split_off(run_start);
-                        lines.push(std::mem::take(&mut current));
-                        current = tail;
-                        current_width = new_run_width;
-                        run_start = 0;
-                    } else {
-                        // Either it still fits alongside the run, or
-                        // `run_start == 0` (the run already spans the whole
-                        // line from its start, same as an ordinary oversized
-                        // glued word on an empty line) — nowhere better to
-                        // put it, so accept the overflow rather than loop.
-                        current_width = prefix_width + new_run_width;
-                    }
-                    current.push((text.clone(), *bold, *italic, true));
-                    run_width = new_run_width;
+                    handle_unbreakable_word(
+                        text,
+                        *bold,
+                        *italic,
+                        w,
+                        font_size_pt,
+                        max_width_pt,
+                        &mut current,
+                        &mut current_width,
+                        &mut run_start,
+                        &mut run_width,
+                        &mut lines,
+                    );
                     continue;
                 }
                 if w > max_width_pt && !text.is_empty() {
@@ -1533,14 +1641,22 @@ mod tests {
     fn unbreakable_word_that_is_individually_oversized_stays_glued_to_its_predecessor() {
         // Regression: `Hello<strong>&nbsp;` followed by a long unbroken run
         // of characters is individually wider than a whole line on its
-        // own — the oversized-token branch used to run *before* the
-        // unbreakable check, so it unconditionally flushed `current`
-        // ("Hello") as its own finished line (losing the glue to the
-        // NBSP-led word) and then character-split the oversized word with
-        // no notion of the NBSP boundary at all. The unbreakable check now
-        // runs first and reuses the same relocate-or-accept-overflow
-        // fallback already used for a run that doesn't fit for ordinary
-        // (non-oversized) reasons.
+        // own. Fixed in two rounds:
+        // 1. The oversized-token branch used to run *before* the
+        //    unbreakable check, so it unconditionally flushed `current`
+        //    ("Hello") as its own finished line (losing the glue to the
+        //    NBSP-led word) and then character-split the oversized word
+        //    with no notion of the NBSP boundary at all. Fixed by checking
+        //    `unbreakable` first.
+        // 2. That first fix then went too far the other way: it glued the
+        //    *entire* oversized word onto "Hello" with no splitting at
+        //    all, so the whole run rendered as one unsplit, unbounded
+        //    token — overflowing and clipped, not merely spilling a
+        //    little past the margin. The NBSP only forbids a break right
+        //    at its own boundary; the rest of the run has no such
+        //    constraint, so it's still character-split — just with its
+        //    first chunk kept glued to "Hello", the same protected
+        //    boundary as before.
         let words = vec![
             Word::Text {
                 text: "Hello".to_owned(),
@@ -1564,10 +1680,10 @@ mod tests {
             "fixture word must be individually oversized"
         );
         let lines = wrap(&words, max_width_pt, 11.0);
-        assert_eq!(
-            lines.len(),
-            1,
-            "\"Hello\" and its NBSP-glued word must stay on the same line, not split apart"
+        assert!(
+            lines.len() > 1,
+            "the oversized NBSP-led word must still be character-split across multiple \
+             lines instead of left whole, got {lines:?}"
         );
         assert_eq!(
             lines[0][0],
@@ -1576,11 +1692,37 @@ mod tests {
         );
         assert!(
             lines[0][1].0.starts_with('\u{00A0}'),
-            "the NBSP-led word must stay glued (with its NBSP intact) right after \"Hello\""
+            "the first chunk of the NBSP-led word must stay glued (with its NBSP intact) \
+             right after \"Hello\", got {:?}",
+            lines[0][1]
         );
         assert!(
             lines[0][1].3,
-            "the NBSP-led word must still render glued (no rendered space before it)"
+            "the first chunk of the NBSP-led word must still render glued (no rendered \
+             space before it)"
+        );
+        // Every line after the first is a fresh chunk with no NBSP
+        // involved, so `split_into_fitting_chunks` guarantees each one
+        // actually fits (only an all-NBSP-connected chain with nowhere
+        // earlier to split is allowed to overflow, which none of these are).
+        for (i, line) in lines.iter().enumerate().skip(1) {
+            let line_width: f32 = line
+                .iter()
+                .map(|(text, bold, _, _)| text_width_pt(text, 11.0, *bold))
+                .sum();
+            assert!(
+                line_width <= max_width_pt,
+                "line {i} exceeds max_width_pt ({line_width} > {max_width_pt}): {line:?}"
+            );
+        }
+        let rejoined: String = lines
+            .iter()
+            .flat_map(|line| line.iter().map(|(text, ..)| text.as_str()))
+            .collect();
+        assert_eq!(
+            rejoined,
+            format!("Hello\u{00A0}{}", "A".repeat(100)),
+            "splitting into chunks must not drop or duplicate any characters"
         );
     }
 
