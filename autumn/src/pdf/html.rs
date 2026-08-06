@@ -274,33 +274,28 @@ fn oversized_raw_text_tag_name(s: &str) -> Option<&'static str> {
     None
 }
 
-/// The correct fallback position when a bounded oversized-tag `>` search
-/// (in [`oversized_tag_body_start`], [`handle_closing_tag`], and
-/// [`push_oversized_generic_tag`]) fails to find a real `>` *within its
-/// scan window* — the absolute position right after that window, **not**
-/// `len` (EOF). "Not found within the bound" must never be conflated with
-/// "not found at all, so consume everything to the end of the document":
-/// the former only means this parser gave up looking this far, not that
-/// there's nothing real beyond it. A `<img src="...far more than 256 KiB
-/// of base64...">` followed by genuine subsequent content (`Visible`, a
-/// closing tag's own real content, ...) has that content sitting right
-/// after the oversized attribute, not at EOF — treating "beyond the
-/// window" the same as "EOF" silently swallowed it entirely instead of
-/// just this one oversized tag's own unparseable attribute soup.
-fn oversized_scan_window_end(input: &str, after: usize) -> usize {
-    after + bounded_prefix(&input[after..], MAX_OVERSIZED_TAG_SCAN).len()
-}
-
 /// Locates the byte position right after an oversized tag's own `>` —
 /// `after_name` is the position right after the tag name (e.g. right after
 /// `<script`, before any attributes), and this searches the still-unparsed
 /// attribute list for the real closing `>` via the same quote-aware
-/// [`find_tag_end`] [`parse_open_tag`] itself uses, just bounded to the
-/// more generous [`MAX_OVERSIZED_TAG_SCAN`] instead — see that constant's
-/// docs for why a second, larger bound still matters here even though
-/// `find_tag_end` itself is linear. Falls back to
-/// [`oversized_scan_window_end`] (not `len`/EOF) if no real `>` is found
-/// within that bound — see that function's docs for why.
+/// [`find_tag_end`] [`parse_open_tag`] itself uses, just unbounded this
+/// time. Falls back to `len` (EOF) if no real `>` is ever found, matching
+/// this parser's usual auto-close-at-EOF tolerance.
+///
+/// Unbounded is safe here (a bounded-window fallback used to exist and was
+/// removed — see [`find_tag_end`]'s own docs for why an earlier version of
+/// *it* wasn't safe unbounded, and how that was fixed at the root instead
+/// of by adding a window here): scoping the search to a fixed-size window
+/// and giving up beyond it doesn't just risk a *slower* search, it's
+/// outright wrong — it can never distinguish "the real `>` is genuinely
+/// far away" (e.g. a large but legitimate base64 attribute) from "there
+/// is no real `>` at all," so it either has to give up early on valid
+/// content or, if it instead treats the window boundary as a fake body
+/// start, leaks whatever's left of the attribute value (and the literal
+/// `">`) as visible text once normal parsing resumes mid-attribute. Now
+/// that `find_tag_end` itself costs O(distance to the real `>`, or to EOF
+/// if there is none) rather than O(window size), removing the window
+/// entirely is both simpler and strictly more correct.
 ///
 /// Quote-awareness matters here specifically: a naive scan for `>` (or,
 /// worse, skipping straight to a raw-text-style scan for `</name` from
@@ -311,11 +306,8 @@ fn oversized_scan_window_end(input: &str, after: usize) -> usize {
 /// and then `">Secret</script>` — mistaking that quoted text for the real
 /// closing tag and leaking everything after it (the rest of the attribute
 /// value, and the element's real content) as visible text.
-fn oversized_tag_body_start(input: &str, after_name: usize) -> usize {
-    find_tag_end(bounded_prefix(&input[after_name..], MAX_OVERSIZED_TAG_SCAN)).map_or_else(
-        || oversized_scan_window_end(input, after_name),
-        |i| after_name + i + 1,
-    )
+fn oversized_tag_body_start(input: &str, after_name: usize, len: usize) -> usize {
+    find_tag_end(&input[after_name..]).map_or(len, |i| after_name + i + 1)
 }
 
 /// Handles an oversized `<head ...>`/`<noscript ...>`/`<template ...>`
@@ -402,13 +394,10 @@ const MAX_TAG_NAME_SCAN: usize = 128;
 /// Mirrors the normal (non-oversized) tag-push logic in [`parse`]
 /// (`close_implied_tags`, then push an empty element for a self-closing
 /// or [void](is_void_element) tag, or a real frame otherwise) — just
-/// locating the real `>` (and whether it's self-closing) the same way
-/// [`oversized_tag_body_start`] does for the seven tags that function
-/// covers, bounded to [`MAX_OVERSIZED_TAG_SCAN`] for the same reason —
-/// including falling back to [`oversized_scan_window_end`] (not EOF) if
-/// no real `>` is found within that bound, so a void/self-closing tag
-/// whose attribute list exceeds even that generous bound doesn't swallow
-/// the rest of the document as if it were the tag's own content. Returns
+/// locating the real `>` (and whether it's self-closing) the same
+/// unbounded quote-aware way [`oversized_tag_body_start`] does for the
+/// seven tags that function covers — see its docs for why unbounded is
+/// both simpler and more correct than a bounded-window fallback. Returns
 /// `None` if `input[pos..]` doesn't even look like the start of a tag
 /// name — no leading ASCII-alphabetic character, or no tag-name boundary
 /// within [`MAX_TAG_NAME_SCAN`] — so the caller can fall through to its
@@ -417,6 +406,7 @@ fn push_oversized_generic_tag(
     stack: &mut Vec<(String, Vec<Node>, usize)>,
     input: &str,
     pos: usize,
+    len: usize,
 ) -> Option<usize> {
     let rest = &input[pos + 1..];
     let first = rest.chars().next()?;
@@ -427,13 +417,10 @@ fn push_oversized_generic_tag(
         .find(|c: char| c == '>' || c == '/' || c.is_whitespace())?;
     let tag = rest[..name_end].to_ascii_lowercase();
     let after_name = pos + 1 + name_end;
-    let gt = find_tag_end(bounded_prefix(&input[after_name..], MAX_OVERSIZED_TAG_SCAN));
+    let gt = find_tag_end(&input[after_name..]);
     let self_closing =
         gt.is_some_and(|i| input[after_name..after_name + i].trim_end().ends_with('/'));
-    let body_start = gt.map_or_else(
-        || oversized_scan_window_end(input, after_name),
-        |i| after_name + i + 1,
-    );
+    let body_start = gt.map_or(len, |i| after_name + i + 1);
 
     close_implied_tags(stack, &tag);
     if self_closing || is_void_element(&tag) {
@@ -597,24 +584,26 @@ fn handle_closing_tag(
         .find(|c: char| c == '>' || c == '/' || c.is_whitespace())
         .unwrap_or(rest.len());
     let name = rest[..name_end].to_ascii_lowercase();
-    // Two tiers, same reasoning as `MAX_OVERSIZED_TAG_SCAN`'s docs: the
-    // cheap `MAX_TAG_SCAN`-bounded search handles every realistic closing
-    // tag (attributes are already rare there, let alone oversized ones),
-    // so it's tried first on every single `</` in the document. Only a
-    // closing tag whose own attribute list *itself* exceeds that falls
-    // through to the larger (but still bounded, for the same total-cost
-    // reason) second attempt. If even *that* fails to find the real `>`,
-    // resume right after the scanned window (see
-    // `oversized_scan_window_end`) rather than at EOF — otherwise
-    // `</div data-x="...far more than 256 KiB...">Visible` would silently
-    // drop `Visible` and everything else genuinely following it, not just
-    // this one (extraordinarily verbose) closing tag's own attribute soup.
-    let tag_end = find_tag_end(bounded_prefix(rest, MAX_TAG_SCAN))
-        .or_else(|| find_tag_end(bounded_prefix(rest, MAX_OVERSIZED_TAG_SCAN)));
-    let new_pos = tag_end.map_or_else(
-        || oversized_scan_window_end(input, pos + 2),
-        |i| pos + 2 + i + 1,
-    );
+    // Two tiers: the cheap `MAX_TAG_SCAN`-bounded search handles every
+    // realistic closing tag (attributes are already rare there, let alone
+    // oversized ones) in O(1), so it's tried first on every single `</` in
+    // the document — essential here (unlike the *unconditionally* unbounded
+    // search `oversized_tag_body_start`/`push_oversized_generic_tag` use),
+    // since without this cheap gate, many consecutive ordinary closing tags
+    // (say `</div></span></div>...`, no attributes at all) would each pay
+    // an unbounded `find_tag_end` call's initial quote-presence scan
+    // reaching toward whatever quote character comes next in the document —
+    // redone by every one of them, the same O(closing tags × distance)
+    // shape the bound elsewhere in this module exists to prevent. Once a
+    // closing tag's own attribute list *itself* exceeds `MAX_TAG_SCAN`
+    // (already an unusual, `MAX_TAG_SCAN`-bytes-costly-to-trigger case),
+    // the second attempt is unbounded — safe there for the same reason
+    // `oversized_tag_body_start` doesn't need a window either. `rest.len()`
+    // (EOF) is the correct fallback if even that never finds a real `>`,
+    // since an unbounded search means "not found" genuinely means "nowhere
+    // in the rest of the document," not "gave up early."
+    let tag_end = find_tag_end(bounded_prefix(rest, MAX_TAG_SCAN)).or_else(|| find_tag_end(rest));
+    let new_pos = pos + 2 + tag_end.map_or(rest.len(), |i| i + 1);
 
     let matching_depth = if name.is_empty() {
         None
@@ -638,6 +627,31 @@ fn handle_closing_tag(
     new_pos
 }
 
+/// Locates the position right after an HTML comment's closing delimiter,
+/// given `pos` pointing at its opening `<!--`. Real browsers accept two
+/// different closing delimiters — the standard `-->`, and the
+/// parse-error-tolerant `--!>` (WHATWG's "comment end bang state", reached
+/// after `--` is followed by `!` instead of `>`) — and close the comment
+/// at whichever one is written, not just the standard one. Without
+/// recognizing the second form, `<!-- hidden --!><p>Visible</p>` searched
+/// only for a literal `-->` that never appears, so the comment (and the
+/// bounded `find` failing) fell back to swallowing the *entire rest of
+/// the document* as one unterminated comment — discarding `<p>Visible</p>`
+/// along with it, not just the comment's own content. Falls back to `len`
+/// (EOF) if *neither* delimiter is ever found, matching this parser's
+/// usual auto-close-at-EOF tolerance.
+fn comment_end(input: &str, pos: usize, len: usize) -> usize {
+    let rest = &input[pos..];
+    [
+        rest.find("-->").map(|i| i + 3),
+        rest.find("--!>").map(|i| i + 4),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .map_or(len, |i| pos + i)
+}
+
 /// Parse `input` into a forest of top-level [`Node`]s.
 pub(super) fn parse(input: &str) -> Vec<Node> {
     let bytes = input.as_bytes();
@@ -653,8 +667,7 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
     while pos < len {
         if bytes[pos] == b'<' {
             if input[pos..].starts_with("<!--") {
-                let end = input[pos..].find("-->").map_or(len, |i| pos + i + 3);
-                pos = end;
+                pos = comment_end(input, pos, len);
                 continue;
             }
             if input[pos..].starts_with("<!") || input[pos..].starts_with("<?") {
@@ -746,7 +759,7 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             // through to normal parsing instead.
             if let Some(name) = oversized_raw_text_tag_name(&input[pos..]) {
                 let after_name = pos + 1 + name.len();
-                let body_start = oversized_tag_body_start(input, after_name);
+                let body_start = oversized_tag_body_start(input, after_name, len);
                 pos = if name == "textarea" {
                     push_oversized_raw_text_content_tag(&mut stack, input, body_start, name)
                 } else if is_raw_text_element(name) {
@@ -761,7 +774,7 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             // — gets the same fallback treatment, just pushed as a normal
             // element instead of the seven's special handling. See
             // `push_oversized_generic_tag`'s docs.
-            if let Some(new_pos) = push_oversized_generic_tag(&mut stack, input, pos) {
+            if let Some(new_pos) = push_oversized_generic_tag(&mut stack, input, pos, len) {
                 pos = new_pos;
                 continue;
             }
@@ -993,29 +1006,6 @@ fn push_text(stack: &mut Vec<(String, Vec<Node>, usize)>, text: &str) {
 /// utility-class soup, several `data-*`/`aria-*` attributes — still parses
 /// instead of being rejected and leaked into the PDF as literal text.
 const MAX_TAG_SCAN: usize = 4096;
-
-/// Bound on the quote-aware `>` search used once a tag is already known to
-/// be oversized (its own `>` didn't fit within [`MAX_TAG_SCAN`]) —
-/// [`oversized_tag_body_start`], [`handle_closing_tag`]'s fallback tier,
-/// and [`push_oversized_generic_tag`] all use it. [`find_tag_end`] itself
-/// is linear in the size of the window it's given (an earlier version
-/// wasn't — see its own docs), so this bound isn't there to protect a
-/// single call; it protects against *many* calls each getting handed a
-/// huge window. Every caller here is reached only after its own
-/// `MAX_TAG_SCAN`-bounded attempt already failed, so triggering many of
-/// them still costs the attacker at least `MAX_TAG_SCAN` bytes each —
-/// without this second bound, though, each of those (already-paid-for)
-/// triggers could scan up to the *entire remaining document*, so a
-/// document densely packed with the minimum oversized-tag payload could
-/// still cost O(triggers × remaining document length) overall. Bounding
-/// the fallback window too keeps each trigger's *own* worst case
-/// constant, so total cost stays linear in document size. Sized well
-/// beyond `MAX_TAG_SCAN` (256 KiB) so it only matters for the genuinely
-/// rare case of an oversized tag's attribute list *itself* exceeding 4
-/// KiB — any realistic large attribute value (a base64 thumbnail, a JSON
-/// blob) still parses correctly; only a deliberately pathological payload
-/// falls back further to this parser's usual auto-close-at-EOF tolerance.
-const MAX_OVERSIZED_TAG_SCAN: usize = 256 * 1024;
 
 /// Take a byte-length-bounded, UTF-8-safe prefix of `s` — cheap regardless
 /// of `max_len`'s size (no per-char iterator overhead, unlike walking
@@ -2125,23 +2115,41 @@ mod tests {
     }
 
     #[test]
-    fn oversized_ordinary_tag_beyond_even_the_generous_bound_does_not_drop_the_rest_of_the_document()
-     {
-        // Regression: when even `MAX_OVERSIZED_TAG_SCAN` (256 KiB) isn't
-        // enough to find the tag's real `>` — e.g. a base64 data URI
-        // attribute genuinely larger than that — `push_oversized_generic_tag`
-        // used to fall back straight to EOF, silently dropping all
-        // subsequent content ("Visible" here) as if it never existed. It
-        // now resumes parsing right after the scanned window instead (see
-        // `oversized_scan_window_end`) — the reported repro:
-        // `<img src="...over 256 KiB of base64...">Visible`.
+    fn oversized_ordinary_tag_far_beyond_any_fixed_bound_still_finds_its_real_close() {
+        // Regression: an earlier fix bounded the oversized-attribute search
+        // to a fixed window (`MAX_OVERSIZED_TAG_SCAN`, 256 KiB) and, once
+        // beyond it, resumed parsing mid-attribute instead of at the real
+        // `>` — for a base64 data URI attribute genuinely larger than that
+        // window, e.g. `<img src="...over 256 KiB of base64...">Visible`,
+        // this leaked the remaining attribute-value suffix (and the
+        // literal `">`) as visible PDF text before "Visible", not just
+        // silently dropping content but actively rendering garbage.
+        // `push_oversized_generic_tag`'s search is unbounded now (safe
+        // since `find_tag_end` itself is linear in distance-to-answer, not
+        // window size — see its docs), so an attribute of *any* size still
+        // resolves to its real `>` exactly, with nothing leaked.
         let oversized_attr = "Q".repeat(300 * 1024);
         let html = format!(r#"<img src="{oversized_attr}">Visible"#);
         let nodes = parse(&html);
+        assert_eq!(
+            nodes.len(),
+            2,
+            "expected the void <img> and its sibling text, with no leaked attribute-soup \
+             siblings in between, got a tree with {} nodes",
+            nodes.len()
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected the first node to be an element")
+        };
+        assert_eq!(tag, "img");
         assert!(
-            text(&nodes).contains("Visible"),
-            "content genuinely following an extremely oversized tag must not be silently \
-             dropped as if the rest of the document didn't exist"
+            children.is_empty(),
+            "img is a void element, got {children:?}"
+        );
+        assert_eq!(
+            nodes[1],
+            Node::Text("Visible".to_owned()),
+            "the oversized attribute value must not leak into visible text"
         );
     }
 
@@ -2258,6 +2266,40 @@ mod tests {
         assert_eq!(text(&parse("hello</>world")), "helloworld");
         assert_eq!(text(&parse("<div></></div>")), "");
         assert_eq!(text(&parse("</>")), "");
+    }
+
+    #[test]
+    fn html_comments_are_never_rendered() {
+        let nodes = parse("Before<!-- hidden -->After");
+        assert_eq!(text(&nodes), "BeforeAfter");
+    }
+
+    #[test]
+    fn comment_closed_with_the_browser_tolerated_bang_terminator_does_not_swallow_the_rest_of_the_document()
+     {
+        // Regression: real browsers close an HTML comment at either the
+        // standard `-->` or the parse-error-tolerant `--!>` (WHATWG's
+        // "comment end bang state") — this parser only recognized the
+        // former, so `<!-- hidden --!><p>Visible</p>` searched for a
+        // literal `-->` that never appeared anywhere, falling back to
+        // swallowing the *entire rest of the document* as one
+        // unterminated comment, discarding `<p>Visible</p>` along with it.
+        let nodes = parse("<!-- hidden --!><p>Visible</p>");
+        assert_eq!(nodes.len(), 1, "got {nodes:?}");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected the comment to be skipped and only the <p> to remain")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn comment_closes_at_whichever_terminator_appears_first() {
+        // Two comments in the same document, one closed each way — both
+        // must close at their own (first-encountered) terminator, with the
+        // literal text between them surviving as real visible content.
+        let nodes = parse("<!-- a --!>b<!-- c -->d");
+        assert_eq!(text(&nodes), "bd");
     }
 
     #[test]
@@ -2648,29 +2690,27 @@ mod tests {
         //
         // The whole string is one giant unterminated `<a title="x...`
         // attribute (its quote never closes, and no `>` appears anywhere)
-        // — `push_oversized_generic_tag` now recognizes this as a real
-        // (if malformed) `<a>` tag once its name is found (`"a"`, well
-        // within `MAX_TAG_NAME_SCAN`). It does *not* swallow the whole
-        // (550,000-byte) document as one single tag, though: once its own
-        // `>` search comes up empty even within the generous
-        // `MAX_OVERSIZED_TAG_SCAN` bound, it resumes parsing right after
-        // that scan window (see `oversized_scan_window_end`) rather than
-        // at EOF — "not found within the bound" must never be conflated
-        // with "not found at all". For this specific pathological input,
-        // that means normal parsing resumes mid-attribute, immediately
-        // re-triggers the same oversized-tag handling, and so on in
-        // roughly `len / MAX_OVERSIZED_TAG_SCAN` bounded steps — the exact
-        // resulting tree shape (nested `<a>`s with stray attribute-soup
-        // text fragments) is an accepted artifact of resuming mid-token
-        // on a genuinely degenerate input, not something worth pinning
-        // down exactly; what matters here is that parsing still completes
-        // without panicking and in linear (not quadratic) time.
+        // — `push_oversized_generic_tag` recognizes this as a real (if
+        // malformed) `<a>` tag once its name is found (`"a"`, well within
+        // `MAX_TAG_NAME_SCAN`), and its unbounded `>` search (see
+        // `oversized_tag_body_start`'s docs for why unbounded is safe)
+        // correctly determines no real `>` exists anywhere, auto-closing
+        // the `<a>` at EOF — the same "unterminated tag/attribute swallows
+        // the rest of the document, invisibly, rather than rendering as
+        // literal text" tolerance already established for the seven
+        // special tags (and for real browsers, whose tokenizer stays in
+        // attribute-value state until EOF too).
         let html = "<a title=\"x".repeat(50_000);
         let start = std::time::Instant::now();
         let nodes = parse(&html);
-        assert!(
-            !nodes.is_empty(),
-            "parsing must still produce something, not silently vanish"
+        assert_eq!(
+            nodes,
+            vec![Node::Element {
+                tag: "a".to_owned(),
+                children: Vec::new(),
+            }],
+            "the whole unterminated attribute must be swallowed into one auto-closed <a>, \
+             not leaked as visible text"
         );
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
