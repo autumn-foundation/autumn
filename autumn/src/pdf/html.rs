@@ -180,34 +180,46 @@ fn is_raw_text_element(tag: &str) -> bool {
     matches!(tag, "script" | "style" | "title" | "textarea")
 }
 
-/// If `s` (starting with `<`) looks like the start of a `<script`,
-/// `<style`, or `<title` opening tag — case-insensitively, and only when
-/// the tag name is immediately followed by a real tag-name boundary
-/// (whitespace, `/`, or `>`), not merely a shared prefix (`<scripted>`
-/// doesn't count) — returns its canonical lowercase tag name.
+/// If `s` (starting with `<`) looks like the start of an opening tag for
+/// one of the six tags `layout.rs`'s `is_non_rendered` hides wholesale
+/// (`script`, `style`, `noscript`, `template`, `head`, `title`) —
+/// case-insensitively, and only when the tag name is immediately followed
+/// by a real tag-name boundary (whitespace, `/`, or `>`), not merely a
+/// shared prefix (`<scripted>` doesn't count) — returns its canonical
+/// lowercase tag name.
 ///
 /// Used only as a fallback once [`parse_open_tag`] has already failed (its
-/// bounded search found no `>` within [`MAX_TAG_SCAN`]) — e.g. a `<script>`
-/// carrying an attribute long enough to push the tag's own `>` past that
-/// bound. Without this, [`parse`]'s normal "unrecognized tag" fallback
-/// treats the lone `<` as literal text and re-parses everything after it
-/// one byte at a time — which, for these three tags specifically, means
-/// their raw source (never meant to be tokenized as markup at all, see
-/// [`is_raw_text_element`]) leaks into the visible document instead of
-/// staying non-rendered — for `<title>` inside a still-open `<head>`, the
-/// non-whitespace fallback text also implicitly closes the head (see
-/// [`push_text`]), so both the oversized attribute *and* the title text
-/// leak in.
+/// bounded search found no `>` within [`MAX_TAG_SCAN`]) — e.g. one of these
+/// six tags carrying an attribute long enough to push its own `>` past
+/// that bound. Without this, [`parse`]'s normal "unrecognized tag"
+/// fallback treats the lone `<` as literal text and re-parses everything
+/// after it one byte at a time — meaning content that's supposed to be
+/// hidden (`layout.rs` skips these tags' subtrees entirely, and
+/// `script`/`style`/`title` content additionally isn't even meant to be
+/// *tokenized* as markup, see [`is_raw_text_element`]) leaks into the
+/// visible document instead — for `<title>`/`<head>` inside a still-open
+/// `<head>`, the non-whitespace fallback text also implicitly closes the
+/// head (see [`push_text`]), so both the oversized attribute *and* the
+/// element's own text leak in.
+///
+/// Mirrors `is_non_rendered`'s tag set rather than importing it: this
+/// small parser has no dependency on `layout.rs`'s rendering decisions,
+/// same as [`is_structural_tag`] mirrors (rather than calls into) the
+/// tag sets it's related to elsewhere in this file.
 ///
 /// `<textarea>` is deliberately excluded even though it's also
-/// tag-name-adjacent raw text: unlike these three, it isn't
-/// `is_non_rendered` in `layout.rs` — its content is meant to render
-/// normally — so silently discarding it here (the way this fallback
-/// discards script/style/title) would be a regression, not a fix.
+/// tag-name-adjacent raw text: unlike these six, it isn't
+/// `is_non_rendered` — its content is meant to render normally — so
+/// silently discarding it here the same way would be a regression, not a
+/// fix. Nested same-tag content (e.g. a `<template>` containing another
+/// `<template>`) closes at the first matching closing tag rather than the
+/// correctly-nested one, the same simplification [`consume_raw_text`]
+/// already accepts for `<script>`/`<style>` — acceptable here too since
+/// this fallback only ever discards the content, never renders it.
 fn oversized_raw_text_tag_name(s: &str) -> Option<&'static str> {
     debug_assert!(s.starts_with('<'));
     let rest = &s[1..];
-    for name in ["script", "style", "title"] {
+    for name in ["script", "style", "title", "head", "noscript", "template"] {
         if rest.len() < name.len()
             || !rest.as_bytes()[..name.len()].eq_ignore_ascii_case(name.as_bytes())
         {
@@ -389,14 +401,16 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             // `parse_open_tag` found no `>` within `MAX_TAG_SCAN` — normally
             // that just means an unterminated/malformed tag, handled below
             // by falling back to literal text one byte at a time. But for
-            // `<script`/`<style`/`<title` specifically (their own `>`
-            // pushed past the bound by e.g. an oversized attribute), that
-            // fallback would leak their raw non-rendered source into the
-            // visible document — see `oversized_raw_text_tag_name`.
-            // Discard straight through to the closing tag (or EOF) via the
-            // same raw-text scan a normally-parsed one already uses,
-            // without emitting any node for the (unparseable) opening tag
-            // itself.
+            // the six non-rendered tags specifically (their own `>` pushed
+            // past the bound by e.g. an oversized attribute), that
+            // fallback would leak their content into the visible document
+            // — see `oversized_raw_text_tag_name`. Discard straight
+            // through to the closing tag (or EOF) via the same raw-text
+            // scan already used for a normally-parsed `<script>`/`<style>`
+            // (reused here, not just for those two, since it does exactly
+            // what's needed: skip to the matching closing tag and throw
+            // everything in between away), without emitting any node for
+            // the (unparseable) opening tag itself.
             if let Some(name) = oversized_raw_text_tag_name(&input[pos..]) {
                 let (_, new_pos) = consume_raw_text(input, pos + 1 + name.len(), name);
                 pos = new_pos;
@@ -1278,6 +1292,32 @@ mod tests {
             rendered.contains("Visible"),
             "the following sibling <p> must still render normally, got {rendered:?}"
         );
+    }
+
+    #[test]
+    fn oversized_non_rendered_tags_do_not_leak_into_the_visible_document() {
+        // Regression: `oversized_raw_text_tag_name` recognized `<script`/
+        // `<style`/`<title` but missed `<head`/`<noscript`/`<template` —
+        // all six are `is_non_rendered` in `layout.rs`, but only the first
+        // three got the oversized-tag suppression fix. A repro matching
+        // the reported one: an oversized `<template>` leaked both its
+        // attribute value and "Secret" into the visible document.
+        for tag in ["head", "noscript", "template"] {
+            let oversized_attr = "Q".repeat(5000);
+            let html = format!(r#"<{tag} data-x="{oversized_attr}">Secret</{tag}><p>Visible</p>"#);
+            let nodes = parse(&html);
+            let rendered = text(&nodes);
+            assert!(
+                !rendered.contains("Secret") && !rendered.contains('Q'),
+                "tag {tag:?}: its text and oversized attribute value must never appear as \
+                 visible text, got {rendered:?}"
+            );
+            assert!(
+                rendered.contains("Visible"),
+                "tag {tag:?}: the following sibling <p> must still render normally, got \
+                 {rendered:?}"
+            );
+        }
     }
 
     #[test]
