@@ -165,6 +165,16 @@ fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut 
                 "strong" | "b" => inline_spans(children, true, italic, depth + 1, out),
                 "em" | "i" => inline_spans(children, bold, true, depth + 1, out),
                 _ if is_non_rendered(tag) => {}
+                "ul" => {
+                    push_block_break(out);
+                    inline_list_items(children, false, depth + 1, out);
+                    push_block_break(out);
+                }
+                "ol" => {
+                    push_block_break(out);
+                    inline_list_items(children, true, depth + 1, out);
+                    push_block_break(out);
+                }
                 _ if is_block_boundary_in_inline_context(tag) => {
                     push_block_break(out);
                     inline_spans(children, bold, italic, depth + 1, out);
@@ -173,6 +183,48 @@ fn inline_spans(nodes: &[Node], bold: bool, italic: bool, depth: u32, out: &mut 
                 _ => inline_spans(children, bold, italic, depth + 1, out),
             },
         }
+    }
+}
+
+/// Like [`extract_list_items`], but emits each item's marker + content as
+/// flat [`Span`]s (with a line break between items) instead of
+/// [`Block::ListItem`]s. `inline_spans` can't produce nested `Block`s — it's
+/// the leaf-level representation already used for a list item's or table
+/// cell's own content — so a `<ul>`/`<ol>` nested inside one (e.g.
+/// `<li>Parent<ul><li>Child</li></ul></li>`) used to fall through to the
+/// generic transparent-wrapper case, which recursed into the inner `<li>`
+/// via the same `is_block_boundary_in_inline_context` handling as a stray
+/// `<p>` — a line break plus bare text, no marker, no list semantics at
+/// all. Not real nested-list layout (no indentation), but keeps each item's
+/// bullet/number instead of losing it — same degrade philosophy as
+/// `inline_spans`'s other block-boundary handling.
+fn inline_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<Span>) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let mut index = 0u32;
+    for node in nodes {
+        let Node::Element { tag, children } = node else {
+            continue;
+        };
+        if tag != "li" {
+            continue;
+        }
+        index += 1;
+        if index > 1 {
+            push_block_break(out);
+        }
+        let marker = if ordered {
+            format!("{index}. ")
+        } else {
+            "\u{2022} ".to_owned()
+        };
+        out.push(Span::Run {
+            text: marker,
+            bold: false,
+            italic: false,
+        });
+        inline_spans(children, false, false, depth + 1, out);
     }
 }
 
@@ -445,8 +497,19 @@ fn words_of(spans: &[Span]) -> Vec<Word> {
                 glue_next = false;
             }
             Span::Run { text, bold, italic } => {
-                let starts_with_ws = text.starts_with(char::is_whitespace);
-                let ends_with_ws = text.ends_with(char::is_whitespace);
+                // Must agree with the split predicate below on what counts as
+                // a "real" (breakable) whitespace boundary — NBSP doesn't,
+                // since it's deliberately kept *inside* the resulting token
+                // rather than split off. Using the blanket `char::is_whitespace`
+                // here (which NBSP also satisfies) would say a span starting/
+                // ending with NBSP has a "real" separator at that edge, gluing
+                // it to nothing — so `wrap` inserts its own extra plain space
+                // next to a token that already renders the NBSP as one, and
+                // allows a line break at a boundary the NBSP was meant to make
+                // unbreakable.
+                let is_breakable_ws = |c: char| c.is_whitespace() && c != '\u{00A0}';
+                let starts_with_ws = text.starts_with(is_breakable_ws);
+                let ends_with_ws = text.ends_with(is_breakable_ws);
                 let mut emitted_any = false;
                 // Split on breakable whitespace only — NBSP (`&nbsp;`,
                 // decoded to U+00A0) satisfies `char::is_whitespace()` so
@@ -979,6 +1042,49 @@ mod tests {
     }
 
     #[test]
+    fn non_breaking_space_leading_a_styled_span_still_glues_to_the_previous_word() {
+        // Regression: `Hello<strong>&nbsp;world</strong>` — the leading NBSP
+        // stays inside the second span's token (`"\u{00A0}world"`, per the
+        // fix above), but `starts_with_ws`/`ends_with_ws` used the blanket
+        // `char::is_whitespace()` predicate, which NBSP also satisfies. That
+        // treated the span boundary as a "real" separator and set `glue:
+        // false` — so `wrap` would insert its own plain space next to a
+        // token that already renders the NBSP as one (a visible double
+        // space), and would allow a line break exactly where the NBSP was
+        // meant to forbid one.
+        let words = words_of(&[
+            Span::Run {
+                text: "Hello".to_owned(),
+                bold: false,
+                italic: false,
+            },
+            Span::Run {
+                text: "\u{00A0}world".to_owned(),
+                bold: true,
+                italic: false,
+            },
+        ]);
+        assert_eq!(
+            words,
+            vec![
+                Word::Text {
+                    text: "Hello".to_owned(),
+                    bold: false,
+                    italic: false,
+                    glue: false,
+                },
+                Word::Text {
+                    text: "\u{00A0}world".to_owned(),
+                    bold: true,
+                    italic: false,
+                    glue: true,
+                },
+            ],
+            "the NBSP-led word must glue to the previous word, not add a second separator"
+        );
+    }
+
+    #[test]
     fn glued_run_that_cannot_fit_still_breaks_the_line() {
         // Regression: two adjacently-styled runs with no whitespace between
         // them (e.g. `<strong>...</strong><em>...</em>`) were always kept on
@@ -1218,6 +1324,45 @@ mod tests {
                 },
             ],
             "nested paragraphs must be line-break separated, with no trailing break"
+        );
+    }
+
+    #[test]
+    fn nested_list_inside_a_list_item_keeps_its_markers() {
+        // Regression: `<li>`'s content goes through `inline_spans`, which had
+        // no explicit handling for a nested `<ul>`/`<ol>` — it fell through
+        // to the generic transparent-wrapper case, so `<ul><li>Parent<ul><li>Child</li></ul></li></ul>`
+        // reduced the inner `<li>` to a bare line break plus text, with no
+        // bullet and no list semantics at all.
+        let nodes = super::super::html::parse("<ul><li>Parent<ul><li>Child</li></ul></li></ul>");
+        let mut blocks = Vec::new();
+        flatten_blocks(&nodes, 0, &mut blocks);
+        assert_eq!(blocks.len(), 1);
+        let Block::ListItem { marker, spans } = &blocks[0] else {
+            panic!("expected a list item block");
+        };
+        assert_eq!(marker, "\u{2022}");
+        assert_eq!(
+            spans,
+            &[
+                Span::Run {
+                    text: "Parent".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+                Span::Break,
+                Span::Run {
+                    text: "\u{2022} ".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+                Span::Run {
+                    text: "Child".to_owned(),
+                    bold: false,
+                    italic: false,
+                },
+            ],
+            "the nested item must keep its own bullet marker instead of losing all list semantics"
         );
     }
 

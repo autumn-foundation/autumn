@@ -65,8 +65,18 @@ fn is_void_element(tag: &str) -> bool {
 /// swallows the real `</script>`, leaving the element unclosed and nesting
 /// (and, since `is_non_rendered` in `layout.rs` skips its subtree, hiding)
 /// everything that follows.
+///
+/// `title` is technically an RCDATA element (character references still
+/// decode, unlike true raw text), not a raw-text one — but its content is
+/// always discarded by `is_non_rendered` in `layout.rs` regardless, so that
+/// distinction is moot here. What matters is that `title`, like
+/// `script`/`style`, must not have its content tokenized as markup: a
+/// tag-looking sequence such as `<title>a<b</title>` would otherwise let
+/// `<b` consume the real `</title>` the same way an unhandled `<script>`
+/// body could, leaving everything after it nested (and hidden) inside an
+/// unclosed `title`.
 fn is_raw_text_element(tag: &str) -> bool {
-    matches!(tag, "script" | "style")
+    matches!(tag, "script" | "style" | "title")
 }
 
 /// Bound on how far [`consume_raw_text`] scans past a candidate
@@ -461,6 +471,28 @@ mod tests {
         let nodes = parse("<style>/* a<b */</style><p>Visible</p>");
         assert_eq!(nodes.len(), 2);
         assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "style"));
+        let Node::Element { tag, children } = &nodes[1] else {
+            panic!("expected the second top-level node to be an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
+    fn title_content_with_a_stray_angle_bracket_does_not_swallow_later_siblings() {
+        // Regression: `title` wasn't in `is_raw_text_element`'s tag list,
+        // so `<title>a<b</title><p>Visible</p>` let the stray `<b` inside
+        // the title get parsed as a bogus opening tag that consumed the
+        // real `</title>` — same shape of bug as the `<script>`/`<style>`
+        // cases above, just for the one other tag `is_non_rendered` in
+        // `layout.rs` discards wholesale.
+        let nodes = parse("<title>a<b</title><p>Visible</p>");
+        assert_eq!(
+            nodes.len(),
+            2,
+            "the <p> must be a sibling of <title>, not swallowed into it"
+        );
+        assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "title"));
         let Node::Element { tag, children } = &nodes[1] else {
             panic!("expected the second top-level node to be an element")
         };
