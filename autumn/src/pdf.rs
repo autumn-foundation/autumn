@@ -1,6 +1,6 @@
 //! Render server-side templates to downloadable PDF documents.
 //!
-//! [`Pdf`] turns an HTML string — typically a [`maud::Markup`] view you
+//! [`Pdf`](crate::pdf::Pdf) turns an HTML string — typically a [`maud::Markup`] view you
 //! already render on-screen — into a PDF document served with the right
 //! `Content-Type: application/pdf` and `Content-Disposition` headers (via
 //! [`Download`](crate::download::Download), which already handles RFC
@@ -39,7 +39,7 @@
 //! `<head>`, and `<title>` are the exception — their content is never
 //! rendered as visible text, matching how a browser treats them, so passing
 //! a full server-rendered page (not just a purpose-built fragment) to
-//! [`Pdf::from_html`] doesn't leak inline CSS/JS source into the PDF.
+//! [`Pdf::from_html`](crate::pdf::Pdf::from_html) doesn't leak inline CSS/JS source into the PDF.
 //!
 //! Text outside the base-14 fonts' WinAnsi encoding (CJK, emoji, ...) is
 //! rendered as `?` by the underlying PDF writer rather than corrupting the
@@ -52,7 +52,7 @@
 //! # Determinism
 //!
 //! Rendering the same HTML input always produces the same visible content:
-//! [`extract_text`] (and the [`assert_pdf_contains`](crate::test::TestResponse::assert_pdf_contains)
+//! [`extract_text`](crate::pdf::extract_text) (and the [`assert_pdf_contains`](crate::test::TestResponse::assert_pdf_contains)
 //! test helper built on it) returns identical text for identical input, with
 //! no wall-clock or other hidden state read during rendering — any
 //! timestamp that should appear in the document (e.g. an invoice's "Generated
