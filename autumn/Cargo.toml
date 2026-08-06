@@ -329,7 +329,7 @@ sha2 = "0.10"
 infer = { version = "0.16", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 getrandom = "0.2"
 hex = "0.4"
 include_dir = { version = "0.7", optional = true }
