@@ -184,17 +184,17 @@ pub(super) const fn char_width_1000em(ch: char, bold: bool) -> u16 {
         // 11pt used to estimate ~492pt (fits a 495pt content area) while
         // Helvetica-Bold actually renders them at ~626pt (doesn't).
         //
-        // The curly double quotes (`\u{201C}`/`\u{201D}`, quotedblleft/
-        // quotedblright) are the same shape of exception: Helvetica-Bold
-        // renders both at 500, also far wider than the flat offset over
-        // their regular width (333 + 56 = 389) would give them. A repro
-        // matching the reported one: an unbroken `<strong>` run of 115
-        // curly double quotes used to estimate ~492pt (fits a 495pt
-        // content area) while Helvetica-Bold actually renders them at
-        // ~633pt (doesn't).
+        // The curly double quotes (`\u{201C}`/`\u{201D}`/`\u{201E}`,
+        // quotedblleft/quotedblright/quotedblbase) are the same shape of
+        // exception: Helvetica-Bold renders all three at 500, also far
+        // wider than the flat offset over their regular width (333 + 56 =
+        // 389) would give them. A repro matching the reported one: an
+        // unbroken `<strong>` run of 115 double-low quotes used to
+        // estimate ~492pt (fits a 495pt content area) while Helvetica-Bold
+        // actually renders them at ~633pt (doesn't).
         if ch == '"' {
             474
-        } else if ch == '\u{201C}' || ch == '\u{201D}' {
+        } else if ch == '\u{201C}' || ch == '\u{201D}' || ch == '\u{201E}' {
             500
         } else {
             w.saturating_add(56)
@@ -301,22 +301,25 @@ mod tests {
     #[test]
     fn bold_curly_double_quotes_are_not_underestimated_by_the_flat_bold_offset() {
         // Regression: same shape of exception as the ASCII quotedbl fix
-        // above — Helvetica-Bold's quotedblleft/quotedblright (500) are far
-        // wider than the flat offset over their regular width (333 + 56 =
-        // 389) gives them. A repro matching the reported one: an unbroken
-        // `<strong>` run of 115 curly double quotes at 11pt used to
-        // estimate ~492pt (fits a 495pt content area) while Helvetica-Bold
-        // actually renders them at ~633pt (doesn't).
+        // above — Helvetica-Bold's quotedblleft/quotedblright/quotedblbase
+        // (500) are far wider than the flat offset over their regular
+        // width (333 + 56 = 389) gives them. A repro matching the reported
+        // one: an unbroken `<strong>` run of 115 curly double quotes at
+        // 11pt used to estimate ~492pt (fits a 495pt content area) while
+        // Helvetica-Bold actually renders them at ~633pt (doesn't).
         assert_eq!(char_width_1000em('\u{201C}', true), 500);
         assert_eq!(char_width_1000em('\u{201D}', true), 500);
-        let hundred_fifteen_quotes = text_width_pt(&"\u{201C}".repeat(115), 11.0, true);
-        let content_area_pt = 495.0;
-        assert!(
-            hundred_fifteen_quotes > content_area_pt,
-            "115 curly double quotes at 11pt bold ({hundred_fifteen_quotes}pt) must be \
-             estimated wider than a 495pt content area, matching Helvetica-Bold's real ~633pt \
-             rendering, not the old ~492pt underestimate"
-        );
+        assert_eq!(char_width_1000em('\u{201E}', true), 500);
+        for ch in ['\u{201C}', '\u{201E}'] {
+            let hundred_fifteen_quotes = text_width_pt(&ch.to_string().repeat(115), 11.0, true);
+            let content_area_pt = 495.0;
+            assert!(
+                hundred_fifteen_quotes > content_area_pt,
+                "115 {ch:?}s at 11pt bold ({hundred_fifteen_quotes}pt) must be estimated wider \
+                 than a 495pt content area, matching Helvetica-Bold's real ~633pt rendering, \
+                 not the old ~492pt underestimate"
+            );
+        }
     }
 
     #[test]

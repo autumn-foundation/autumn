@@ -197,25 +197,34 @@ fn is_raw_text_element(tag: &str) -> bool {
 /// hidden (`layout.rs` skips these tags' subtrees entirely, and
 /// `script`/`style`/`title` content additionally isn't even meant to be
 /// *tokenized* as markup, see [`is_raw_text_element`]) leaks into the
-/// visible document instead — for `<title>`/`<head>` inside a still-open
-/// `<head>`, the non-whitespace fallback text also implicitly closes the
-/// head (see [`push_text`]), so both the oversized attribute *and* the
-/// element's own text leak in.
+/// visible document instead — for `<title>` inside a still-open `<head>`,
+/// the non-whitespace fallback text also implicitly closes the head (see
+/// [`push_text`]), so both the oversized attribute *and* the title text
+/// leak in.
 ///
 /// Mirrors `is_non_rendered`'s tag set rather than importing it: this
 /// small parser has no dependency on `layout.rs`'s rendering decisions,
 /// same as [`is_structural_tag`] mirrors (rather than calls into) the
 /// tag sets it's related to elsewhere in this file.
 ///
+/// The caller in [`parse`] gives the returned `"head"` different handling
+/// than the other five: `<head>`'s closing tag is optional (implicitly
+/// closed by later non-head content, see [`implicitly_closes`]), so
+/// discarding straight through to a literal `</head>` the way the other
+/// five raw-text-scan would swallow the rest of the document — including
+/// `<body>` — whenever `</head>` is omitted, which is legal HTML. See the
+/// call site for how `head` instead gets a real stack frame.
+///
 /// `<textarea>` is deliberately excluded even though it's also
 /// tag-name-adjacent raw text: unlike these six, it isn't
 /// `is_non_rendered` — its content is meant to render normally — so
 /// silently discarding it here the same way would be a regression, not a
-/// fix. Nested same-tag content (e.g. a `<template>` containing another
-/// `<template>`) closes at the first matching closing tag rather than the
-/// correctly-nested one, the same simplification [`consume_raw_text`]
-/// already accepts for `<script>`/`<style>` — acceptable here too since
-/// this fallback only ever discards the content, never renders it.
+/// fix. Nested same-tag content in the five raw-text-scanned tags (e.g. a
+/// `<template>` containing another `<template>`) closes at the first
+/// matching closing tag rather than the correctly-nested one, the same
+/// simplification [`consume_raw_text`] already accepts for
+/// `<script>`/`<style>` — acceptable here too since that fallback only
+/// ever discards the content, never renders it.
 fn oversized_raw_text_tag_name(s: &str) -> Option<&'static str> {
     debug_assert!(s.starts_with('<'));
     let rest = &s[1..];
@@ -234,6 +243,29 @@ fn oversized_raw_text_tag_name(s: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Handles an oversized `<head ...>` opening tag once
+/// [`oversized_raw_text_tag_name`] has already recognized it — see that
+/// function's docs for why `head` can't reuse the same discard-to-literal-
+/// closing-tag treatment as the other five non-rendered tags. `input` is
+/// the whole document, `after_name` the byte position right after `<head`
+/// (i.e. `pos + 1 + "head".len()`), and `len` the document's total length
+/// (used as the fallback if the tag's own `>` is never found, matching
+/// this parser's usual auto-close-at-EOF tolerance). Returns the new `pos`.
+/// Extracted out of [`parse`] purely to keep that function's line count
+/// down — this has no state of its own beyond `stack`.
+fn push_oversized_head_tag(
+    stack: &mut Vec<(String, Vec<Node>, usize)>,
+    input: &str,
+    after_name: usize,
+    len: usize,
+) -> usize {
+    let gt = find_tag_end(&input[after_name..]);
+    let new_pos = gt.map_or(len, |i| after_name + i + 1);
+    let structural_idx = nearest_structural_idx(stack, "head");
+    stack.push(("head".to_owned(), Vec::new(), structural_idx));
+    new_pos
 }
 
 /// Bound on how far [`consume_raw_text`] scans past a candidate
@@ -298,6 +330,49 @@ fn consume_raw_text<'a>(input: &'a str, pos: usize, tag: &str) -> (&'a str, usiz
 /// ignored, rather than auto-closing a deep run of intervening tags.
 const MAX_CLOSE_SCAN: usize = 512;
 
+/// Handles a `</tag>` closing sequence at `input[pos..]` (the caller has
+/// already confirmed it starts with `"</"`): matches it against the
+/// nearest open frame with that name within [`MAX_CLOSE_SCAN`] frames of
+/// the stack, closing everything down to and including it. A stray/
+/// mismatched close tag with no matching opener nearby is ignored rather
+/// than corrupting the tree — this also covers an empty tag name (`</>`),
+/// which must never match: the implicit root frame is *also* keyed by an
+/// empty string (it has no tag), and popping it would leave `stack`
+/// empty. Returns the new `pos`, past the closing tag. Extracted out of
+/// [`parse`] purely to keep that function's line count down — this has no
+/// state of its own beyond `stack`.
+fn handle_closing_tag(
+    stack: &mut Vec<(String, Vec<Node>, usize)>,
+    input: &str,
+    pos: usize,
+) -> usize {
+    let rest = &input[pos + 2..];
+    let name_end = rest.find('>').unwrap_or(rest.len());
+    let name = rest[..name_end].trim().to_ascii_lowercase();
+    let new_pos = pos + 2 + name_end + usize::from(name_end < rest.len());
+
+    let matching_depth = if name.is_empty() {
+        None
+    } else {
+        let window_start = stack.len().saturating_sub(MAX_CLOSE_SCAN);
+        stack[window_start..]
+            .iter()
+            .rposition(|(tag, _, _)| *tag == name)
+            .map(|i| window_start + i)
+    };
+    if let Some(depth) = matching_depth {
+        while stack.len() > depth {
+            let (tag, children, _) = stack.pop().expect("depth <= stack.len()");
+            stack
+                .last_mut()
+                .expect("root frame is never popped")
+                .1
+                .push(Node::Element { tag, children });
+        }
+    }
+    new_pos
+}
+
 /// Parse `input` into a forest of top-level [`Node`]s.
 pub(super) fn parse(input: &str) -> Vec<Node> {
     let bytes = input.as_bytes();
@@ -323,37 +398,8 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                 pos = end;
                 continue;
             }
-            if let Some(rest) = input[pos..].strip_prefix("</") {
-                let name_end = rest.find('>').unwrap_or(rest.len());
-                let name = rest[..name_end].trim().to_ascii_lowercase();
-                pos += 2 + name_end + usize::from(name_end < rest.len());
-
-                // Close frames up to and including the matching open tag, if
-                // any exists within the last MAX_CLOSE_SCAN frames of the
-                // stack. A stray/mismatched close tag with no matching
-                // opener nearby is ignored rather than corrupting the tree.
-                // An empty tag name (`</>`) must never match: the implicit
-                // root frame is *also* keyed by an empty string (it has no
-                // tag), and popping it would leave `stack` empty.
-                let matching_depth = if name.is_empty() {
-                    None
-                } else {
-                    let window_start = stack.len().saturating_sub(MAX_CLOSE_SCAN);
-                    stack[window_start..]
-                        .iter()
-                        .rposition(|(tag, _, _)| *tag == name)
-                        .map(|i| window_start + i)
-                };
-                if let Some(depth) = matching_depth {
-                    while stack.len() > depth {
-                        let (tag, children, _) = stack.pop().expect("depth <= stack.len()");
-                        stack
-                            .last_mut()
-                            .expect("root frame is never popped")
-                            .1
-                            .push(Node::Element { tag, children });
-                    }
-                }
+            if input[pos..].starts_with("</") {
+                pos = handle_closing_tag(&mut stack, input, pos);
                 continue;
             }
             if let Some((tag, self_closing, tag_end)) = parse_open_tag(&input[pos..]) {
@@ -410,10 +456,15 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             // (reused here, not just for those two, since it does exactly
             // what's needed: skip to the matching closing tag and throw
             // everything in between away), without emitting any node for
-            // the (unparseable) opening tag itself.
+            // the (unparseable) opening tag itself. `head` needs different
+            // handling — see `push_oversized_head_tag`.
             if let Some(name) = oversized_raw_text_tag_name(&input[pos..]) {
-                let (_, new_pos) = consume_raw_text(input, pos + 1 + name.len(), name);
-                pos = new_pos;
+                let after_name = pos + 1 + name.len();
+                pos = if name == "head" {
+                    push_oversized_head_tag(&mut stack, input, after_name, len)
+                } else {
+                    consume_raw_text(input, after_name, name).1
+                };
                 continue;
             }
             // A lone '<' that isn't a recognizable tag: treat as literal text.
@@ -1295,14 +1346,19 @@ mod tests {
     }
 
     #[test]
-    fn oversized_non_rendered_tags_do_not_leak_into_the_visible_document() {
+    fn oversized_noscript_and_template_tags_do_not_leak_into_the_visible_document() {
         // Regression: `oversized_raw_text_tag_name` recognized `<script`/
-        // `<style`/`<title` but missed `<head`/`<noscript`/`<template` —
-        // all six are `is_non_rendered` in `layout.rs`, but only the first
-        // three got the oversized-tag suppression fix. A repro matching
-        // the reported one: an oversized `<template>` leaked both its
-        // attribute value and "Secret" into the visible document.
-        for tag in ["head", "noscript", "template"] {
+        // `<style`/`<title` but missed `<noscript`/`<template` (and
+        // `<head`, covered separately below since it needs different
+        // handling) — all six are `is_non_rendered` in `layout.rs`, but
+        // only the first three got the oversized-tag suppression fix. A
+        // repro matching the reported one: an oversized `<template>`
+        // leaked both its attribute value and "Secret" into the visible
+        // document. Unlike `<head>`, neither of these two has an
+        // implied-close rule, so (like script/style/title) their content
+        // is fully and unconditionally suppressed, regardless of what it
+        // contains.
+        for tag in ["noscript", "template"] {
             let oversized_attr = "Q".repeat(5000);
             let html = format!(r#"<{tag} data-x="{oversized_attr}">Secret</{tag}><p>Visible</p>"#);
             let nodes = parse(&html);
@@ -1318,6 +1374,33 @@ mod tests {
                  {rendered:?}"
             );
         }
+    }
+
+    #[test]
+    fn oversized_head_tag_does_not_swallow_the_rest_of_the_document_at_an_implicit_close() {
+        // Regression: an earlier fix added `head` to the same
+        // raw-text-scan-to-literal-closing-tag suppression as the other
+        // five non-rendered tags — but `<head>`'s closing tag is legally
+        // optional (HTML5, and this parser's own `implicitly_closes`,
+        // close it as soon as non-head content begins), so a document
+        // that omits `</head>` entirely — an oversized `<head data-x="...">`
+        // directly followed by `<body>Visible</body>`, with no `</head>`
+        // anywhere — used to have that raw-text scan search for a literal
+        // `</head>` all the way to EOF, discarding the *entire rest of the
+        // document* including the visible body.
+        let oversized_attr = "Q".repeat(5000);
+        let html = format!(r#"<head data-x="{oversized_attr}"><body>Visible</body>"#);
+        let nodes = parse(&html);
+        let rendered = text(&nodes);
+        assert!(
+            !rendered.contains('Q'),
+            "the oversized attribute value must never appear as visible text, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Visible"),
+            "the <body> content must still render even though </head> was never written, got \
+             {rendered:?}"
+        );
     }
 
     #[test]
