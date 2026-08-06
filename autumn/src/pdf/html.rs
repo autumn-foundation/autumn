@@ -57,6 +57,35 @@ fn is_void_element(tag: &str) -> bool {
     )
 }
 
+/// Whether opening `new_tag` implicitly closes an `open_tag` still open at
+/// the top of the stack — HTML5's "optional end tag" rule, scoped to the
+/// handful of list/table elements this renderer gives special
+/// (marker/cell/row) treatment to. Real-world or hand-written HTML commonly
+/// omits these closing tags (`<ul><li>One<li>Two</ul>`,
+/// `<tr><td>A<td>B</table>`); without this, the new tag nests *inside* the
+/// still-open previous one instead of becoming its sibling — and
+/// `extract_list_items`/`extract_table_rows` (in `layout.rs`) only look at
+/// *direct* children, so the nested element's marker/cell/row boundary
+/// becomes invisible to them (a second bullet silently disappears, a second
+/// cell silently merges into the first).
+///
+/// Doesn't need to cover every HTML5 optional-end-tag rule, only the ones
+/// for tags this renderer actually gives that special treatment to — an
+/// omitted `</p>` before something other than another block tag, for
+/// example, doesn't have the same "silently loses structure" failure mode
+/// here, since a stray `<p>` outside `<ul>`/`<ol>`/`<table>` just flattens
+/// to a paragraph either way (see `flatten_blocks`).
+fn implicitly_closes(open_tag: &str, new_tag: &str) -> bool {
+    matches!(
+        (open_tag, new_tag),
+        ("li", "li")
+            | ("dt", "dt" | "dd")
+            | ("dd", "dt" | "dd")
+            | ("tr", "tr")
+            | ("td" | "th", "td" | "th" | "tr")
+    )
+}
+
 /// "Raw text" elements per the HTML5 parsing spec: their content is never
 /// tokenized as markup at all, even if it contains characters that look
 /// like tags (e.g. a JS comparison `a<b` inside `<script>`, or a CSS `>`
@@ -203,6 +232,32 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
             }
             if let Some((tag, self_closing, tag_end)) = parse_open_tag(&input[pos..]) {
                 pos += tag_end;
+
+                // HTML5's "optional end tag" rule for the handful of
+                // list/table elements this renderer gives special
+                // (marker/cell/row) treatment to — see `implicitly_closes`.
+                // Cascades (rather than checking only the immediate stack
+                // top once) so e.g. a new `<tr>` closes both an open `<td>`
+                // *and* the `<tr>` above it, not just the cell.
+                while stack.len() > 1 {
+                    let should_close = stack
+                        .last()
+                        .is_some_and(|(open_tag, _)| implicitly_closes(open_tag, &tag));
+                    if !should_close {
+                        break;
+                    }
+                    let (closed_tag, children) =
+                        stack.pop().expect("just checked stack.last() above");
+                    stack
+                        .last_mut()
+                        .expect("root frame is never popped")
+                        .1
+                        .push(Node::Element {
+                            tag: closed_tag,
+                            children,
+                        });
+                }
+
                 if !self_closing && is_raw_text_element(&tag) {
                     // `<script>`/`<style>`/`<title>`/`<textarea>` content is
                     // never tokenized as markup — see `consume_raw_text` —
@@ -518,6 +573,70 @@ mod tests {
         assert_eq!(tag, "p");
         assert_eq!(text(children), "Hello bold world");
         assert!(matches!(&children[1], Node::Element { tag, .. } if tag == "strong"));
+    }
+
+    #[test]
+    fn an_omitted_li_closing_tag_is_implied_by_the_next_li() {
+        // Regression: `<li>` is an HTML5 "optional end tag" element — real
+        // or hand-written HTML commonly omits `</li>` before the next
+        // `<li>` starts. Without implied-close handling, the second `<li>`
+        // nested *inside* the first instead of becoming its sibling.
+        let nodes = parse("<ul><li>One<li>Two</ul>");
+        assert_eq!(nodes.len(), 1);
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "ul");
+        assert_eq!(
+            children.len(),
+            2,
+            "expected two sibling <li>s, got {children:?}"
+        );
+        for (child, expected_text) in children.iter().zip(["One", "Two"]) {
+            let Node::Element { tag, children } = child else {
+                panic!("expected an element")
+            };
+            assert_eq!(tag, "li");
+            assert_eq!(text(children), expected_text);
+        }
+    }
+
+    #[test]
+    fn an_omitted_td_closing_tag_is_implied_by_the_next_td_or_tr() {
+        // Same bug, table-cell/row variant: `<td>`/`<th>`/`<tr>` are also
+        // optional-end-tag elements, and a new `<tr>` must close both an
+        // open `<td>` *and* the `<tr>` above it, not just the cell.
+        let nodes = parse("<table><tr><td>A<td>B<tr><td>C</table>");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "table");
+        assert_eq!(
+            children.len(),
+            2,
+            "expected two sibling <tr>s, got {children:?}"
+        );
+        let Node::Element {
+            tag,
+            children: row1,
+        } = &children[0]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "tr");
+        assert_eq!(row1.len(), 2, "expected two sibling <td>s, got {row1:?}");
+        assert_eq!(text(std::slice::from_ref(&row1[0])), "A");
+        assert_eq!(text(std::slice::from_ref(&row1[1])), "B");
+        let Node::Element {
+            tag,
+            children: row2,
+        } = &children[1]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "tr");
+        assert_eq!(row2.len(), 1);
+        assert_eq!(text(row2), "C");
     }
 
     #[test]

@@ -36,6 +36,14 @@ const fn base_width_1000em(ch: char) -> u16 {
         'w' => 722,
         '@' => 1015,
         '%' => 889,
+        // Same underestimation risk as `W` above, for the rest of the
+        // uppercase alphabet: these seven letters are genuinely wider than
+        // the 667 fallback the remaining (correctly- or safely-estimated)
+        // letters share below — e.g. 60 `G`s at 11pt used to estimate
+        // ~440pt (fits a 495pt content area) while Helvetica renders them
+        // at ~513pt (doesn't).
+        'C' | 'D' | 'H' | 'N' | 'R' | 'U' => 722,
+        'G' | 'O' | 'Q' => 778,
         'A'..='Z' => 667,
         '\u{00C0}'..='\u{00DE}' if ch != '\u{00D7}' => 667, // Latin-1 uppercase accented (approx like A-Z)
         '\u{2014}' | '\u{2026}' | '\u{2030}' | '\u{2122}' => 1000, // — em dash, … ellipsis, ‰, ™
@@ -176,6 +184,32 @@ mod tests {
             fifty_ws > content_area_pt,
             "50 Ws at 11pt ({fifty_ws}pt) must be estimated wider than a 495pt content area, \
              matching Helvetica's real ~519pt rendering, not the old ~458pt underestimate"
+        );
+    }
+
+    #[test]
+    fn remaining_wide_uppercase_letters_are_not_underestimated() {
+        // Regression: after the `W`/`w`/`@`/`%` fix, the rest of the
+        // uppercase alphabet still shared one flat 667/1000em fallback —
+        // but `C`/`D`/`G`/`H`/`N`/`O`/`Q`/`R`/`U` are genuinely wider than
+        // that in real Helvetica. A repro matching the reported one: 60
+        // `G`s at 11pt used to estimate ~440pt (fits a 495pt content area)
+        // while Helvetica actually renders them at ~513pt (doesn't).
+        assert_eq!(char_width_1000em('G', false), 778);
+        assert_eq!(char_width_1000em('O', false), 778);
+        assert_eq!(char_width_1000em('Q', false), 778);
+        assert_eq!(char_width_1000em('C', false), 722);
+        assert_eq!(char_width_1000em('D', false), 722);
+        assert_eq!(char_width_1000em('H', false), 722);
+        assert_eq!(char_width_1000em('N', false), 722);
+        assert_eq!(char_width_1000em('R', false), 722);
+        assert_eq!(char_width_1000em('U', false), 722);
+        let sixty_gs = text_width_pt(&"G".repeat(60), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            sixty_gs > content_area_pt,
+            "60 Gs at 11pt ({sixty_gs}pt) must be estimated wider than a 495pt content area, \
+             matching Helvetica's real ~513pt rendering, not the old ~440pt underestimate"
         );
     }
 
