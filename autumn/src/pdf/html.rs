@@ -394,14 +394,21 @@ const MAX_TAG_NAME_SCAN: usize = 128;
 /// Mirrors the normal (non-oversized) tag-push logic in [`parse`]
 /// (`close_implied_tags`, then push an empty element for a self-closing
 /// or [void](is_void_element) tag, or a real frame otherwise) — just
-/// locating the real `>` (and whether it's self-closing) the same
-/// unbounded quote-aware way [`oversized_tag_body_start`] does for the
-/// seven tags that function covers — see its docs for why unbounded is
-/// both simpler and more correct than a bounded-window fallback. Returns
-/// `None` if `input[pos..]` doesn't even look like the start of a tag
-/// name — no leading ASCII-alphabetic character, or no tag-name boundary
-/// within [`MAX_TAG_NAME_SCAN`] — so the caller can fall through to its
-/// plain literal-text handling for a genuinely bogus `<`.
+/// locating the real `>` the same unbounded quote-aware way
+/// [`oversized_tag_body_start`] does for the seven tags that function
+/// covers — see its docs for why unbounded is both simpler and more
+/// correct than a bounded-window fallback. Returns `None` if `input[pos..]`
+/// doesn't even look like the start of a tag name — no leading
+/// ASCII-alphabetic character, or no tag-name boundary within
+/// [`MAX_TAG_NAME_SCAN`] — so the caller can fall through to its plain
+/// literal-text handling for a genuinely bogus `<`.
+///
+/// A trailing XHTML-style `/` (self-closing syntax) is not treated as
+/// meaningful here, matching the normal (non-oversized) tag-push path —
+/// see its docs for why: real browsers ignore that flag on every ordinary
+/// (non-void, non-foreign) HTML element, so honoring it here would push an
+/// empty element and let whatever follows become a sibling instead of the
+/// element's real content.
 fn push_oversized_generic_tag(
     stack: &mut Vec<(String, Vec<Node>, usize)>,
     input: &str,
@@ -418,12 +425,10 @@ fn push_oversized_generic_tag(
     let tag = rest[..name_end].to_ascii_lowercase();
     let after_name = pos + 1 + name_end;
     let gt = find_tag_end(&input[after_name..]);
-    let self_closing =
-        gt.is_some_and(|i| input[after_name..after_name + i].trim_end().ends_with('/'));
     let body_start = gt.map_or(len, |i| after_name + i + 1);
 
     close_implied_tags(stack, &tag);
-    if self_closing || is_void_element(&tag) {
+    if is_void_element(&tag) {
         stack
             .last_mut()
             .expect("root frame is never popped")
@@ -696,7 +701,7 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                 pos = handle_closing_tag(&mut stack, input, pos);
                 continue;
             }
-            if let Some((tag, self_closing, tag_end)) = parse_open_tag(&input[pos..]) {
+            if let Some((tag, tag_end)) = parse_open_tag(&input[pos..]) {
                 pos += tag_end;
                 close_implied_tags(&mut stack, &tag);
 
@@ -710,20 +715,6 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                     // (matching the normal text-node path below) — a no-op
                     // for the two tags whose content is discarded anyway,
                     // and required for `title`/`textarea`'s real content.
-                    //
-                    // `self_closing` is deliberately ignored here (unlike
-                    // the generic `self_closing || is_void_element` case
-                    // below): these four are non-void HTML elements, and
-                    // real browsers ignore a stray XHTML-style `/>` on a
-                    // non-void, non-foreign element entirely — `<script
-                    // src="x" />alert(1)</script>` still parses exactly
-                    // like `<script src="x">`, with `alert(1)` as its raw
-                    // content, not as sibling markup. Treating
-                    // `self_closing` as authoritative here would resume
-                    // *normal* parsing right after the `/>`, letting the
-                    // real script/style source (or title/textarea markup)
-                    // be tokenized and rendered as visible document
-                    // content instead of staying raw/hidden.
                     let (text, new_pos) = consume_raw_text(input, pos, &tag);
                     pos = new_pos;
                     let mut children = Vec::new();
@@ -737,7 +728,14 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
                         .push(Node::Element { tag, children });
                     continue;
                 }
-                if self_closing || is_void_element(&tag) {
+                // A trailing XHTML-style `/` (self-closing syntax) is not
+                // treated as meaningful here — real browsers ignore that
+                // flag entirely on every ordinary (non-void, non-foreign)
+                // HTML element: `<li/>One<li/>Two` still opens two real,
+                // non-empty `<li>` elements, not two empty ones with "One"/
+                // "Two" as stray siblings. Only whether the tag is
+                // genuinely void decides whether it gets real children.
+                if is_void_element(&tag) {
                     stack
                         .last_mut()
                         .expect("root frame is never popped")
@@ -996,9 +994,11 @@ fn push_text(stack: &mut Vec<(String, Vec<Node>, usize)>, text: &str) {
 
 /// Parse an opening tag starting at `s[0] == '<'`.
 ///
-/// Returns `(tag_name, self_closing, total_consumed_len)`, or `None` if `s`
-/// doesn't start with a well-formed tag (e.g. `< foo>` with a space, or an
-/// unterminated `<foo`).
+/// Returns `(tag_name, total_consumed_len)`, or `None` if `s` doesn't start
+/// with a well-formed tag (e.g. `< foo>` with a space, or an unterminated
+/// `<foo`). A trailing XHTML-style `/` is consumed as part of the tag but
+/// not reported separately — see [`parse`]'s call site for why it isn't
+/// meaningful to this parser.
 ///
 /// Attributes are ignored entirely (no CSS support), but a literal `>`
 /// inside a quoted attribute value is still handled correctly — see
@@ -1039,17 +1039,33 @@ fn bounded_prefix(s: &str, max_len: usize) -> &str {
 }
 
 /// Whether the quote byte at `bytes[quote_idx]` is a genuine attribute-value
-/// opener — i.e. immediately preceded by `=` — rather than a literal quote
-/// character sitting inside an *unquoted* attribute value (e.g. `it's` in
-/// `title=it's`, a parse-error condition real browsers still tolerate: the
-/// tag still ends at the next real `>`, not at a second apostrophe that may
-/// not even exist). Treating every quote character as toggling a quoted
-/// span — regardless of what precedes it — makes such a value's stray
-/// quote wrongly swallow the rest of the tag (and, if no matching quote
-/// ever appears, the rest of the document) looking for a close that was
-/// never a real attribute value to begin with.
+/// opener — i.e. preceded by `=` (skipping any whitespace in between, since
+/// HTML5's attribute syntax permits it: `title = "x"` is valid, not just
+/// `title="x"`) — rather than a literal quote character sitting inside an
+/// *unquoted* attribute value (e.g. `it's` in `title=it's`, a parse-error
+/// condition real browsers still tolerate: the tag still ends at the next
+/// real `>`, not at a second apostrophe that may not even exist). Treating
+/// every quote character as toggling a quoted span — regardless of what
+/// precedes it — makes such a value's stray quote wrongly swallow the rest
+/// of the tag (and, if no matching quote ever appears, the rest of the
+/// document) looking for a close that was never a real attribute value to
+/// begin with.
+///
+/// The backward whitespace walk can't reopen the O(n^2) risk this module's
+/// quote-tracking guards against: it only ever continues through whitespace
+/// bytes, stopping at the first non-whitespace one behind it — for a chain
+/// of quote characters each separated by a whitespace run, that's the exact
+/// same run [`find_tag_end`]'s/[`raw_close_tag_end`]'s own forward scan
+/// already paid to reach this quote in the first place, not some
+/// unboundedly larger distance. Total backward-walk cost across every quote
+/// candidate in one call stays O(the forward scan's own total), i.e. still
+/// linear in the input.
 fn is_attr_value_quote(bytes: &[u8], quote_idx: usize) -> bool {
-    quote_idx > 0 && bytes[quote_idx - 1] == b'='
+    let mut i = quote_idx;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    i > 0 && bytes[i - 1] == b'='
 }
 
 /// Find the byte offset of the `>` that ends an opening tag within `window`,
@@ -1161,7 +1177,7 @@ fn find_tag_end(window: &str) -> Option<usize> {
     }
 }
 
-fn parse_open_tag(s: &str) -> Option<(String, bool, usize)> {
+fn parse_open_tag(s: &str) -> Option<(String, usize)> {
     debug_assert!(s.starts_with('<'));
     let rest = &s[1..];
     let first = rest.chars().next()?;
@@ -1180,8 +1196,7 @@ fn parse_open_tag(s: &str) -> Option<(String, bool, usize)> {
         .find(|c: char| c.is_whitespace() || c == '/')
         .unwrap_or(gt);
     let tag = window[..name_end].to_ascii_lowercase();
-    let self_closing = window[..gt].trim_end().ends_with('/');
-    Some((tag, self_closing, 1 + gt + 1))
+    Some((tag, 1 + gt + 1))
 }
 
 /// Decode the small set of entities likely to appear in developer-authored
@@ -2084,26 +2099,29 @@ mod tests {
 
     #[test]
     fn oversized_ordinary_tag_self_closing_and_void_variants_still_work() {
-        // Same bug as above, covering the two branches
-        // `push_oversized_generic_tag` has to replicate from the normal
-        // (non-oversized) tag-push path: an oversized self-closing tag
-        // (XHTML-style `/>`) and an oversized void element must not push
-        // a real stack frame — either would otherwise swallow later
-        // sibling content as their own children instead of leaving it as
-        // a sibling.
+        // Covers the same behavior `push_oversized_generic_tag` has to
+        // replicate from the normal (non-oversized) tag-push path: an
+        // oversized void element must not push a real stack frame (it
+        // would otherwise swallow later sibling content as its own
+        // children instead of leaving it as a sibling), while an oversized
+        // *non-void* self-closing tag (XHTML-style `/>`) must still open a
+        // real, non-empty frame — real browsers ignore that flag entirely
+        // on an ordinary HTML element, so `<my-widget ... />Visible`
+        // nests "Visible" as `my-widget`'s own content, the same as a
+        // normal-sized `<my-widget ...>Visible` (no closing tag) would.
         let oversized_attr = "Q".repeat(5000);
         let html = format!(r#"<my-widget data-x="{oversized_attr}" />Visible"#);
         let nodes = parse(&html);
         assert_eq!(
             nodes.len(),
-            2,
-            "expected the self-closing tag and its sibling text, got {nodes:?}"
+            1,
+            "expected a single <my-widget>, got {nodes:?}"
         );
-        assert!(matches!(
-            &nodes[0],
-            Node::Element { tag, children } if tag == "my-widget" && children.is_empty()
-        ));
-        assert_eq!(nodes[1], Node::Text("Visible".to_owned()));
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "my-widget");
+        assert_eq!(text(children), "Visible");
 
         let html = format!(r#"<img data-x="{oversized_attr}">Visible"#);
         let nodes = parse(&html);
@@ -2723,6 +2741,54 @@ mod tests {
     }
 
     #[test]
+    fn self_closing_syntax_on_an_ordinary_non_void_element_is_ignored_like_a_real_browser() {
+        // Regression: the generic (non-raw-text) tag-push branch honored
+        // XHTML-style `/>` on *any* element, even an ordinary non-void one
+        // — but real browsers ignore that flag entirely outside void and
+        // foreign (SVG/MathML) elements. `<li/>` pushed an empty `<li>`
+        // instead of opening a real frame, so `<ul><li/>One<li/>Two</ul>`
+        // left "One"/"Two" as stray text children of `<ul>` — invisible to
+        // `extract_list_items`, which only reads `<li>` children — instead
+        // of inside their own list items.
+        let nodes = parse("<ul><li/>One<li/>Two</ul>");
+        assert_eq!(nodes.len(), 1, "expected a single <ul>, got {nodes:?}");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "ul");
+        assert_eq!(
+            children.len(),
+            2,
+            "expected two <li> children, got {children:?}"
+        );
+        for (child, expected) in children.iter().zip(["One", "Two"]) {
+            let Node::Element { tag, children } = child else {
+                panic!("expected an <li> element, got {child:?}")
+            };
+            assert_eq!(tag, "li");
+            assert_eq!(text(children), expected);
+        }
+    }
+
+    #[test]
+    fn attribute_value_quote_separated_from_equals_by_whitespace_is_still_recognized() {
+        // Regression: `is_attr_value_quote` originally required the quote
+        // to be *immediately* preceded by `=`, but HTML5's attribute
+        // syntax permits whitespace around `=` (`title = "x"` is valid,
+        // not just `title="x"`). Without tolerating it, the quote wasn't
+        // recognized as a genuine attribute-value opener, so a literal `>`
+        // inside the (supposedly unquoted) value ended the tag early,
+        // leaking the rest of the value as visible text.
+        let nodes = parse(r#"<div title = "Balance > 100">Visible</div>"#);
+        assert_eq!(nodes.len(), 1, "expected a single <div>, got {nodes:?}");
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "div");
+        assert_eq!(text(children), "Visible");
+    }
+
+    #[test]
     fn closing_tag_deeper_than_the_scan_window_is_ignored_not_matched() {
         // Documents the accepted precision loss from bounding the
         // closing-tag scan (MAX_CLOSE_SCAN): a close whose matching opener
@@ -2896,6 +2962,36 @@ mod tests {
         // — each skip only costs the gap to the *next* quote character,
         // not a rescan of the whole remaining span.
         let html = format!("<div title={}>Visible</div>", "it's ".repeat(50_000));
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(
+            nodes.len(),
+            1,
+            "expected a single <div> node, got {nodes:?}"
+        );
+        let Node::Element { children, .. } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(text(children), "Visible");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "find_tag_end took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_run_of_whitespace_separated_stray_apostrophes_is_linear_not_quadratic() {
+        // Regression guard specifically for `is_attr_value_quote`'s
+        // backward whitespace walk: unlike the tightly-packed test above,
+        // each stray apostrophe here is itself preceded by a run of
+        // whitespace (not `=`), forcing the backward walk to actually
+        // traverse whitespace before concluding it isn't a genuine
+        // attribute-value opener. Verify this still resolves in linear,
+        // not quadratic, time — each backward walk only re-covers the
+        // same gap the forward scan already paid for to reach that quote,
+        // not a rescan of the whole prior span.
+        let html = format!("<div title={}>Visible</div>", "x     '".repeat(50_000));
         let start = std::time::Instant::now();
         let nodes = parse(&html);
         assert_eq!(
