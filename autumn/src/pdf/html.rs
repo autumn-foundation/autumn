@@ -376,7 +376,15 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
 /// down, the same way real HTML5 closes enclosing formatting elements
 /// along with whatever they're inside when that container closes.
 fn is_phrasing_wrapper(tag: &str) -> bool {
-    matches!(tag, "strong" | "b" | "em" | "i")
+    // `span`/`a` carry no styling meaning of their own here, but
+    // `inline_spans`'s generic transparent-passthrough case treats them
+    // exactly like `strong`/`b`/`em`/`i` — recursing straight through to
+    // their content — so they're just as safe to search past. Reported
+    // repro: `<ul><li><span>One<li>Two</ul>` left the second `<li>`
+    // nested under the first (stopping at `span`) instead of closing it,
+    // so `extract_list_items` emitted only one marker and flattened "Two"
+    // as unmarked text.
+    matches!(tag, "strong" | "b" | "em" | "i" | "span" | "a")
 }
 
 /// Cascades [`implicitly_closes`] up `stack`: repeatedly finds the closest
@@ -734,6 +742,48 @@ mod tests {
             assert_eq!(tag, "li");
             assert_eq!(text(children), expected_text);
         }
+    }
+
+    #[test]
+    fn an_omitted_li_closing_tag_is_implied_through_a_transparent_inline_wrapper() {
+        // Regression: `close_implied_tags`'s look-through only recognized
+        // `strong`/`b`/`em`/`i` as skippable phrasing wrappers — `span`/`a`
+        // are just as transparent to `inline_spans` (its generic
+        // passthrough case treats them identically), but weren't in the
+        // skip set, so `<ul><li><span>One<li>Two</ul>` left the second
+        // `<li>` nested under the first (stopping the search at `span`)
+        // instead of closing it.
+        let nodes = parse("<ul><li><span>One<li>Two</ul>");
+        assert_eq!(nodes.len(), 1);
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "ul");
+        assert_eq!(
+            children.len(),
+            2,
+            "expected two sibling <li>s, got {children:?}"
+        );
+        let Node::Element {
+            tag,
+            children: first_li,
+        } = &children[0]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "li");
+        assert_eq!(first_li.len(), 1, "expected one <span> child");
+        assert!(matches!(&first_li[0], Node::Element { tag, .. } if tag == "span"));
+        assert_eq!(text(first_li), "One");
+        let Node::Element {
+            tag,
+            children: second_li,
+        } = &children[1]
+        else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "li");
+        assert_eq!(text(second_li), "Two");
     }
 
     #[test]

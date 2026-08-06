@@ -109,7 +109,12 @@ const fn base_width_1000em(ch: char) -> u16 {
         // repro matching the reported one: 80 `+`s at 11pt used to estimate
         // ~489pt (fits a 495pt content area) while Helvetica actually
         // renders them at ~514pt (doesn't).
-        '+' | '<' | '=' | '>' | '~' => 584,
+        //
+        // `×`/`÷` (U+00D7/U+00F7) share the same real width (584) but are
+        // excluded from the Latin-1 ranges above/below (they aren't
+        // accented letters) — same underestimation gap as the ASCII
+        // operators, just reached via a different fallthrough path.
+        '+' | '<' | '=' | '>' | '~' | '\u{00D7}' | '\u{00F7}' => 584,
         // `¼`/`½`/`¾` (U+00BC-00BE) are representable WinAnsi fraction
         // glyphs, not ASCII and outside the Latin-1 accented-letter range
         // below — they fell all the way through to the generic 556
@@ -407,6 +412,26 @@ mod tests {
         assert!(
             eighty_pluses > content_area_pt,
             "80 +s at 11pt ({eighty_pluses}pt) must be estimated wider than a 495pt content \
+             area, matching Helvetica's real ~514pt rendering, not the old ~489pt underestimate"
+        );
+    }
+
+    #[test]
+    fn multiplication_and_division_signs_are_not_underestimated() {
+        // Regression: `×`/`÷` (U+00D7/U+00F7) share the ASCII operators'
+        // real width (584) but are excluded from the Latin-1 ranges (not
+        // accented letters), so they fell through to the generic 556
+        // fallback instead of the operator bucket. A repro matching the
+        // reported one: 80 `×`s at 11pt used to estimate ~489pt (fits a
+        // 495pt content area) while Helvetica actually renders them at
+        // ~514pt (doesn't).
+        assert_eq!(char_width_1000em('\u{00D7}', false), 584); // ×
+        assert_eq!(char_width_1000em('\u{00F7}', false), 584); // ÷
+        let eighty_times = text_width_pt(&"\u{00D7}".repeat(80), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            eighty_times > content_area_pt,
+            "80 ×s at 11pt ({eighty_times}pt) must be estimated wider than a 495pt content \
              area, matching Helvetica's real ~514pt rendering, not the old ~489pt underestimate"
         );
     }
