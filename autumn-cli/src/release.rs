@@ -3540,7 +3540,8 @@ previous_secrets = []
             "the App Runner service must start from the bootstrap placeholder image: {service_block}"
         );
         assert!(
-            service_block.contains("ignore_changes = [source_configuration]"),
+            service_block
+                .contains("ignore_changes = [source_configuration, health_check_configuration]"),
             "the App Runner service must ignore source_configuration drift once CI/the manual \
              walkthrough deploys the real image: {service_block}"
         );
@@ -3573,6 +3574,30 @@ previous_secrets = []
             health_check_block.contains("path     = \"/\""),
             "the bootstrap health check must probe \"/\" (nginx's default 200 response), \
              not \"/health\": {health_check_block}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_ignores_health_check_drift_after_cutover_restores_it() {
+        // The cutover call (docs/guide/deployment.md) switches
+        // health_check_configuration from the bootstrap's "/" to the real
+        // app's "/health" — without ignoring this block too, a later
+        // `terraform apply` would see that as drift from this resource's
+        // own declared "/" and revert it, breaking the real app's health
+        // check.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let service_block = content
+            .split("resource \"aws_apprunner_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare the App Runner service");
+        assert!(
+            service_block
+                .contains("ignore_changes = [source_configuration, health_check_configuration]"),
+            "the App Runner service must ignore health_check_configuration drift alongside \
+             source_configuration: {service_block}"
         );
     }
 
@@ -3917,9 +3942,31 @@ previous_secrets = []
             .nth(1)
             .expect("main.tf must declare the ECS service");
         assert!(
-            service_block.contains("ignore_changes = [task_definition]"),
+            service_block.contains("ignore_changes = [task_definition, desired_count]"),
             "the ECS service must ignore task_definition drift so CI-registered revisions \
              aren't reverted by a later `terraform apply`: {service_block}"
+        );
+    }
+
+    #[test]
+    fn aws_ecs_ignores_desired_count_drift_managed_by_autoscaling() {
+        // Application Auto Scaling changes desired_count directly at
+        // runtime — without ignoring it, a later `terraform apply` would
+        // treat a live scaling decision as drift from var.desired_count
+        // and forcibly reset capacity, either yanking it during a load
+        // spike or adding unwanted tasks right after a scale-in.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let service_block = content
+            .split("resource \"aws_ecs_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare the ECS service");
+        assert!(
+            service_block.contains("desired_count]"),
+            "the ECS service must ignore desired_count drift once Application Auto Scaling \
+             owns it: {service_block}"
         );
     }
 
@@ -4483,6 +4530,45 @@ previous_secrets = []
         let deploy_pos = content.find("Deploy new image to the ECS service").unwrap();
         assert!(register_migrate_pos < migrate_pos, "{content}");
         assert!(register_app_pos < deploy_pos, "{content}");
+    }
+
+    #[test]
+    fn aws_workflow_strips_bootstrap_entrypoint_only_from_the_app_registration() {
+        // Terraform's bootstrap "app" task definition overrides
+        // entryPoint/command to make the placeholder nginx image satisfy
+        // the ALB health check (main.tf) — describe-task-definition would
+        // otherwise carry that override forward onto the REAL image, which
+        // has no nginx and runs as an unprivileged user, so the container
+        // would exit immediately instead of falling through to its own
+        // Dockerfile ENTRYPOINT/CMD. The "migrate" family's own `command`
+        // (autumn migrate) is intentional and permanent, so its
+        // registration step must NOT strip it.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
+        let app_step = content
+            .split("Register a new \"app\" task definition revision")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("must find the app registration step");
+        assert!(
+            app_step.contains(
+                "del(.containerDefinitions[0].entryPoint, .containerDefinitions[0].command)"
+            ),
+            "the app registration step must strip the bootstrap entryPoint/command before \
+             registering the real image: {app_step}"
+        );
+        let migrate_step = content
+            .split("Register a new \"migrate\" task definition revision")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("must find the migrate registration step");
+        assert!(
+            !migrate_step.contains("del(.containerDefinitions[0].entryPoint"),
+            "the migrate registration step must NOT strip its own (intentional, permanent) \
+             command: {migrate_step}"
+        );
     }
 
     #[test]

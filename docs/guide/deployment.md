@@ -1301,13 +1301,23 @@ docker push "$ECR:$TAG"
 
 # Task definitions are immutable per revision — register a NEW one for each
 # family with the real image, keeping every other setting Terraform
-# declared (env, secrets, logging) untouched.
+# declared (env, secrets, logging) untouched. The "app" family also strips
+# entryPoint/command: Terraform's bootstrap revision overrides both to make
+# the placeholder nginx image satisfy the ALB health check before any real
+# image exists (main.tf) — carrying that override onto the REAL image would
+# make it try to run the bootstrap's nginx script instead of its own
+# Dockerfile ENTRYPOINT/CMD (tini + the compiled binary), and the container
+# would exit immediately. The "migrate" family's own command (`autumn
+# migrate`) is intentional and permanent, not bootstrap-specific, so it's
+# left untouched.
 for FAMILY_OUT in app_task_family:APP migrate_task_family:MIGRATE; do
   FAMILY="$(terraform output -raw "${FAMILY_OUT%%:*}")"
+  STRIP_ENTRYPOINT="del(.containerDefinitions[0].entryPoint, .containerDefinitions[0].command) | "
+  [ "${FAMILY_OUT##*:}" = "MIGRATE" ] && STRIP_ENTRYPOINT=""
   NEW_DEF=$(aws ecs describe-task-definition --task-definition "$FAMILY" --query 'taskDefinition' | \
-    jq --arg IMAGE "$ECR:$TAG" '.containerDefinitions[0].image = $IMAGE |
+    jq --arg IMAGE "$ECR:$TAG" ".containerDefinitions[0].image = \$IMAGE | ${STRIP_ENTRYPOINT}
       del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
-          .registeredAt, .registeredBy, .deregisteredAt)')
+          .registeredAt, .registeredBy, .deregisteredAt)")
   ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition --cli-input-json file:///dev/stdin \
     --query 'taskDefinition.taskDefinitionArn' --output text)
   eval "${FAMILY_OUT##*:}_ARN=$ARN"

@@ -184,10 +184,19 @@ jobs:
         id: register_app
         run: |
           set -euo pipefail
+          # Also strips entryPoint/command: Terraform's bootstrap revision
+          # (main.tf) overrides both to make the placeholder nginx image
+          # satisfy the ALB health check before any real image exists (see
+          # its own comment) — describe-task-definition would otherwise
+          # carry that override forward onto the REAL image, which has no
+          # nginx and runs as an unprivileged user, so the container would
+          # exit immediately instead of falling through to its own
+          # Dockerfile ENTRYPOINT/CMD (tini + the compiled binary).
           NEW_DEF=$(aws ecs describe-task-definition --task-definition "$APP_TASK_FAMILY" \
             --query 'taskDefinition' | \
             jq --arg IMAGE "$ECR_REPOSITORY_URL:$IMAGE_TAG" \
               '.containerDefinitions[0].image = $IMAGE |
+               del(.containerDefinitions[0].entryPoint, .containerDefinitions[0].command) |
                del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
                    .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)')
           NEW_ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition --cli-input-json file:///dev/stdin \

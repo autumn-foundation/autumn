@@ -464,6 +464,14 @@ resource "aws_apprunner_service" "this" {
     # The bootstrap (ECR_PUBLIC, no access role) and a real deploy (ECR,
     # with an access role) are structurally different repository types, so
     # the whole block — not just the image identifier — must be ignored.
-    ignore_changes = [source_configuration]
+    #
+    # health_check_configuration is ignored for the same reason: the
+    # cutover call also switches the health check from the bootstrap's "/"
+    # (nginx's default response) to the real app's "/health" (see the
+    # health_check_configuration comment above). Without ignoring it here
+    # too, a later `terraform apply` would see that as drift from this
+    # resource's own declared "/" and revert it — breaking the real app's
+    # health check the moment anyone re-applies.
+    ignore_changes = [source_configuration, health_check_configuration]
   }
 }

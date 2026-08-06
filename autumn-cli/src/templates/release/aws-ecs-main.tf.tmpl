@@ -722,7 +722,15 @@ resource "aws_ecs_service" "this" {
     # CI registers new task definition revisions and repoints the service
     # at them directly (aws-deploy.yml); without this, `terraform apply`
     # would revert every live deploy back to the bootstrap revision above.
-    ignore_changes = [task_definition]
+    #
+    # desired_count is ignored for the same class of reason: Application
+    # Auto Scaling (below) changes it directly at runtime in response to
+    # load, and that's a live scaling decision, not drift — without
+    # ignoring it, a later `terraform apply` would treat the scaled value
+    # as having drifted from var.desired_count and forcibly reset it,
+    # either yanking capacity during a load spike or adding unwanted tasks
+    # right after a scale-in.
+    ignore_changes = [task_definition, desired_count]
   }
 }
 
