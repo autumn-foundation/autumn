@@ -1143,6 +1143,16 @@ terraform init
 terraform apply
 ```
 
+**Generate these two values once, then persist and reuse them** — save
+them in a password manager or your CI's secret store the same way you
+would any other production secret, rather than regenerating fresh values
+on every `terraform apply`. Re-running these `openssl rand` commands in a
+later shell session and re-applying changes the live RDS password and
+Secrets Manager signing secret in place, but the App Runner service's
+`source_configuration` is `lifecycle`-ignored (see `main.tf`) — it never
+redeploys to pick up the change, so already-running containers keep using
+the OLD values and lose database access as connections recycle.
+
 The App Runner service starts from a public ECR Public Gallery placeholder
 image (`bootstrap_image`) — App Runner must pull *some* image to create a
 first revision, and a brand-new private ECR repository has none yet. Build
@@ -1350,6 +1360,16 @@ export TF_VAR_signing_secret="$(openssl rand -hex 32)"
 terraform init
 terraform apply
 ```
+
+**Generate these two values once, then persist and reuse them** — save
+them in a password manager or your CI's secret store the same way you
+would any other production secret, rather than regenerating fresh values
+on every `terraform apply`. Re-running these `openssl rand` commands in a
+later shell session and re-applying changes the live RDS password and
+Secrets Manager signing secret in place, but the ECS service's
+`task_definition` is `lifecycle`-ignored (see `main.tf`) — it never
+redeploys to pick up the change, so already-running tasks keep using the
+OLD values and lose database access as connections recycle.
 
 The "app" and "migrate" ECS task definitions both start from a public
 placeholder image (`bootstrap_image`) — Fargate must pull *some* image to
