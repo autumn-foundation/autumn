@@ -75,7 +75,18 @@ const fn base_width_1000em(ch: char) -> u16 {
         // risk as the letters above: a 70-character run of `&`s at 11pt
         // used to estimate ~428pt (fits a 495pt content area) while
         // Helvetica renders it at ~514pt (doesn't).
-        '&' | 'A'..='Z' => 667,
+        // `Š`/`Ÿ` (U+0160/U+0178) are uppercase WinAnsi/CP1252 letters
+        // outside the Latin-1 block entirely (no C0-DE range arm below
+        // catches them), so they fell through to the 556 ASCII fallback
+        // like `&` used to — their real Helvetica width (667) matches the
+        // rest of this arm.
+        '&' | 'A'..='Z' | '\u{0160}' | '\u{0178}' => 667,
+        // `Ž` (U+017D) is the same shape of gap as `Š`/`Ÿ` just above, but
+        // its own real Helvetica width (611) doesn't match any existing
+        // arm to merge into. A repro matching the reported one: 70 `Š`s at
+        // 11pt used to estimate ~428pt (fits a 495pt content area) while
+        // Helvetica actually renders them at ~514pt (doesn't).
+        '\u{017D}' => 611,
         // `Æ`/`Œ` (and their lowercase forms `æ`/`œ`, merged into the `%`/`W`
         // arms above to avoid duplicate match bodies) are representable
         // WinAnsi ligatures, not accented letters — the Latin-1 range below
@@ -391,6 +402,27 @@ mod tests {
             sixty_odiaereses > content_area_pt,
             "60 Ös at 11pt ({sixty_odiaereses}pt) must be estimated wider than a 495pt content \
              area, matching Helvetica's real ~513pt rendering, not the old ~440pt underestimate"
+        );
+    }
+
+    #[test]
+    fn remaining_cp1252_uppercase_letters_are_not_underestimated() {
+        // Regression: `Š`/`Ž`/`Ÿ` (U+0160/U+017D/U+0178) are uppercase
+        // WinAnsi/CP1252 letters entirely outside the Latin-1 (C0-DE) block,
+        // so they fell all the way through to the generic 556 fallback —
+        // same underestimation risk as the earlier wide-glyph fixes. A
+        // repro matching the reported one: 70 `Š`s at 11pt used to estimate
+        // ~428pt (fits a 495pt content area) while Helvetica actually
+        // renders them at ~514pt (doesn't).
+        assert_eq!(char_width_1000em('\u{0160}', false), 667); // Š
+        assert_eq!(char_width_1000em('\u{0178}', false), 667); // Ÿ
+        assert_eq!(char_width_1000em('\u{017D}', false), 611); // Ž
+        let seventy_scarons = text_width_pt(&"\u{0160}".repeat(70), 11.0, false);
+        let content_area_pt = 495.0;
+        assert!(
+            seventy_scarons > content_area_pt,
+            "70 Šs at 11pt ({seventy_scarons}pt) must be estimated wider than a 495pt content \
+             area, matching Helvetica's real ~514pt rendering, not the old ~428pt underestimate"
         );
     }
 

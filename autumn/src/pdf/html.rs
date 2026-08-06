@@ -355,29 +355,75 @@ pub(super) fn parse(input: &str) -> Vec<Node> {
     stack.pop().expect("root frame always present").1
 }
 
-/// Cascades [`implicitly_closes`] up `stack`: pops and closes every open
-/// frame (innermost first) that opening `new_tag` implicitly closes, so
-/// e.g. a new `<tr>` closes both an open `<td>` *and* the `<tr>` above it,
-/// not just the immediate stack top. Extracted out of [`parse`] purely to
-/// keep that function's line count down — this has no state of its own
-/// beyond `stack`.
+/// Inline-formatting tags this parser treats as transparent wrappers around
+/// their content (`layout.rs`'s `inline_spans` recurses straight through
+/// them, tracking bold/italic). Unlike a genuine block container (`ul`,
+/// `table`, `div`, ...), one of these sitting directly above a still-open
+/// frame doesn't change *what* new content belongs to — so
+/// [`close_implied_tags`] may look straight through a run of them when
+/// deciding whether `new_tag`'s opening should close something further
+/// down, the same way real HTML5 closes enclosing formatting elements
+/// along with whatever they're inside when that container closes.
+fn is_phrasing_wrapper(tag: &str) -> bool {
+    matches!(tag, "strong" | "b" | "em" | "i")
+}
+
+/// Cascades [`implicitly_closes`] up `stack`: repeatedly finds the closest
+/// still-open frame that opening `new_tag` implicitly closes and pops down
+/// to it, so e.g. a new `<tr>` closes both an open `<td>` *and* the `<tr>`
+/// above it (found and closed one loop iteration apart), not just the
+/// immediate stack top. Extracted out of [`parse`] purely to keep that
+/// function's line count down — this has no state of its own beyond
+/// `stack`.
+///
+/// Looks *past* a run of [`is_phrasing_wrapper`] frames at the top, not
+/// just at the top itself: `<p><strong>Intro<table>` has `strong` sitting
+/// directly above the still-open `p` when `<table>` opens, and `strong`
+/// has no implied-close rule of its own against `table` — checking only
+/// `stack.last()` would stop right there and never see the `p` beneath,
+/// leaving the table nested inside it (and flattened through
+/// `inline_spans`, which has no notion of a table, instead of becoming a
+/// real `Block::Table`). Only phrasing wrappers are skipped this way — a
+/// genuine block container (`ul`, `table`, ...) sitting at the top always
+/// stops the search at that frame, matching or not, so e.g.
+/// `<ul><li>Parent<ul><li>Child` correctly leaves the inner `<li>` opening
+/// *inside* the inner `<ul>` rather than reaching past it to close the
+/// outer `<li>` two levels up.
 fn close_implied_tags(stack: &mut Vec<(String, Vec<Node>)>, new_tag: &str) {
-    while stack.len() > 1 {
-        let should_close = stack
-            .last()
-            .is_some_and(|(open_tag, _)| implicitly_closes(open_tag, new_tag));
-        if !should_close {
+    loop {
+        if stack.len() <= 1 {
             break;
         }
-        let (closed_tag, children) = stack.pop().expect("just checked stack.last() above");
-        stack
-            .last_mut()
-            .expect("root frame is never popped")
-            .1
-            .push(Node::Element {
-                tag: closed_tag,
-                children,
-            });
+        // Bounded the same way the closing-tag matcher in `parse` bounds
+        // its scan (`MAX_CLOSE_SCAN`) and for the same reason: this now
+        // runs on *every* opening tag, so an unbounded walk through a
+        // stack that's nothing but phrasing wrappers (e.g. `n` unclosed
+        // `<strong>`s, which never stop the walk early) would be an O(n)
+        // scan repeated n times — O(n²) overall, the same blowup already
+        // fixed elsewhere in this parser for a pathologically deep
+        // (adversarial or accidental) stack. A stack of anything *else*
+        // that never closes (e.g. `n` unclosed `<span>`s) stops the walk
+        // on its very first frame, so this bound only matters for the
+        // phrasing-wrapper case.
+        let floor = stack.len().saturating_sub(MAX_CLOSE_SCAN).max(1);
+        let mut target = stack.len() - 1;
+        while target > floor && is_phrasing_wrapper(&stack[target].0) {
+            target -= 1;
+        }
+        if !implicitly_closes(&stack[target].0, new_tag) {
+            break;
+        }
+        while stack.len() > target {
+            let (closed_tag, children) = stack.pop().expect("stack.len() > target >= 1");
+            stack
+                .last_mut()
+                .expect("root frame is never popped")
+                .1
+                .push(Node::Element {
+                    tag: closed_tag,
+                    children,
+                });
+        }
     }
 }
 
@@ -746,6 +792,40 @@ mod tests {
     }
 
     #[test]
+    fn an_omitted_p_closing_tag_is_implied_through_intervening_inline_formatting() {
+        // Regression: `close_implied_tags` used to check only the stack's
+        // *top* frame. `<p><strong>Intro<table>...` has `strong` sitting
+        // directly above the still-open `<p>` when `<table>` opens, and
+        // `strong` has no implied-close rule of its own against `table` —
+        // checking only the top stopped right there and never saw the `<p>`
+        // beneath it, so the table stayed nested inside the still-open `<p>`
+        // (and `<strong>`) instead of becoming a sibling.
+        let nodes = parse("<p><strong>Intro<table><tr><td>A</td><td>B</td></tr></table><p>After");
+        assert_eq!(
+            nodes.len(),
+            3,
+            "expected <p>, <table>, <p> as three siblings, got {nodes:?}"
+        );
+        let Node::Element { tag, children } = &nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(
+            children.len(),
+            1,
+            "expected a single <strong> child, got {children:?}"
+        );
+        assert!(matches!(&children[0], Node::Element { tag, .. } if tag == "strong"));
+        assert_eq!(text(children), "Intro");
+        assert!(matches!(&nodes[1], Node::Element { tag, .. } if tag == "table"));
+        let Node::Element { tag, children } = &nodes[2] else {
+            panic!("expected an element")
+        };
+        assert_eq!(tag, "p");
+        assert_eq!(text(children), "After");
+    }
+
+    #[test]
     fn an_omitted_head_closing_tag_is_implied_by_body() {
         // Regression: `</head>` is also an HTML5 "optional end tag" —
         // omitting it is common/valid (`<html><head><title>X</title><body>...`).
@@ -1063,6 +1143,49 @@ mod tests {
         // None of the "</x>" closes match anything, so they're all ignored
         // — the tree is just 50,000 nested (empty) <a> elements.
         assert_eq!(nodes.len(), 1);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "parse took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_run_of_never_closing_wrapper_tags_is_linear_not_quadratic() {
+        // A non-phrasing-wrapper tag (`span` isn't `strong`/`b`/`em`/`i`)
+        // stops `close_implied_tags`'s walk on its very first frame, so a
+        // long run of never-closing `<span>`s should cost O(1) per tag
+        // regardless of stack depth — this is the cheap case; see
+        // `long_run_of_never_closing_phrasing_wrappers_is_linear_not_quadratic`
+        // just below for the bounded-but-not-free phrasing-wrapper case.
+        let html = "<span>".repeat(100_000);
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(nodes.len(), 1, "expected one deeply nested <span> tree");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "parse took {:?} — looks quadratic again",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_run_of_never_closing_phrasing_wrappers_is_linear_not_quadratic() {
+        // Regression: `close_implied_tags` now walks *past* a run of open
+        // phrasing-wrapper frames (`strong`/`b`/`em`/`i` — see
+        // `an_omitted_p_closing_tag_is_implied_through_intervening_inline_formatting`)
+        // looking for a frame beneath them that `new_tag`'s opening
+        // implicitly closes. Unlike a non-wrapper tag (which stops the walk
+        // immediately), a long run of *never-closing* wrappers — e.g. `n`
+        // unclosed `<strong>`s, which never themselves match any
+        // implied-close rule and so never stop the walk early — would walk
+        // the full stack depth on every one of the n tag opens without this
+        // bounded the same way `MAX_CLOSE_SCAN` bounds the closing-tag
+        // matcher, for the same O(n^2) reason.
+        let html = "<strong>".repeat(100_000);
+        let start = std::time::Instant::now();
+        let nodes = parse(&html);
+        assert_eq!(nodes.len(), 1, "expected one deeply nested <strong> tree");
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "parse took {:?} — looks quadratic again",
