@@ -5565,10 +5565,10 @@ previous_secrets = []
             .expect("auth step must be present");
         let setup_pos = content
             .find("google-github-actions/setup-gcloud@v2")
-            .expect("gcp-deploy.yml must set up the gcloud CLI: {content}");
+            .expect("gcp-deploy.yml must set up the gcloud CLI");
         let configure_docker_pos = content
             .find("gcloud auth configure-docker")
-            .expect("gcp-deploy.yml must configure Docker for Artifact Registry: {content}");
+            .expect("gcp-deploy.yml must configure Docker for Artifact Registry");
         let build_pos = content
             .find("docker build \\")
             .expect("build step must be present");
