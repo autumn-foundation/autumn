@@ -156,6 +156,11 @@ locals {
     "artifactregistry.googleapis.com",
     "servicenetworking.googleapis.com",
     "redis.googleapis.com",
+    # google_compute_network / google_compute_global_address (below) are
+    # Compute Engine resources — a fresh project without this API already
+    # enabled fails the very first `terraform apply` at VPC creation
+    # otherwise.
+    "compute.googleapis.com",
   ])
 }
 
@@ -353,8 +358,22 @@ resource "google_redis_instance" "this" {
   authorized_network = google_compute_network.this.id
   connect_mode       = "PRIVATE_SERVICE_ACCESS"
 
+  # AUTH (a generated password, below) is enabled, but transit encryption is
+  # deliberately left off. Memorystore's `SERVER_AUTHENTICATION` mode
+  # presents a private, instance-specific CA certificate — not one chained
+  # to a public root — and `autumn-cache-redis`'s `RedisCache::connect`
+  # (rustls, via the `redis` crate's default TLS setup) only trusts the
+  # standard public CA store, with no hook to supply a custom one. Unlike
+  # AWS ElastiCache/Azure Redis Cache (both terminate TLS with
+  # publicly-trusted certificates and work with the exact same client),
+  # enabling this mode here would produce a `rediss://` URL the app can
+  # never actually connect with — TLS handshake fails cert verification and
+  # the app aborts at startup. Traffic to this instance never leaves the
+  # private VPC (see `connect_mode` above and the VPC connector wiring on
+  # the Cloud Run service/job), so AUTH-only is an acceptable trade-off
+  # here, not a silent downgrade to an internet-exposed unencrypted link.
   auth_enabled            = true
-  transit_encryption_mode = "SERVER_AUTHENTICATION"
+  transit_encryption_mode = "DISABLED"
 
   depends_on = [google_service_networking_connection.this, google_project_service.apis]
 }
@@ -375,7 +394,9 @@ resource "google_secret_manager_secret_version" "redis_url" {
   count = var.enable_redis_cache ? 1 : 0
 
   secret      = google_secret_manager_secret.redis_url[0].id
-  secret_data = "rediss://:${urlencode(google_redis_instance.this[0].auth_string)}@${google_redis_instance.this[0].host}:${google_redis_instance.this[0].port}"
+  # "redis://", not "rediss://" — see the transit_encryption_mode comment
+  # on google_redis_instance.this above for why TLS is off here.
+  secret_data = "redis://:${urlencode(google_redis_instance.this[0].auth_string)}@${google_redis_instance.this[0].host}:${google_redis_instance.this[0].port}"
 }
 
 resource "google_secret_manager_secret_iam_member" "redis_url_access" {

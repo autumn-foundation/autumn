@@ -296,6 +296,16 @@ fn nested_workflow_relocation_warning(dir: &Path, workflow_rel_path: &str) -> Op
         return None;
     }
     let rel = dir.strip_prefix(&git_root).ok()?;
+    // The suggested `working-directory:` always runs inside the generated
+    // workflow's own YAML on a Linux CI runner (every template here targets
+    // `ubuntu-latest`), regardless of which OS `autumn release init` itself
+    // ran on — so this must always render with forward slashes, even when
+    // `rel.display()` would use `\` on a Windows host.
+    let rel_forward_slash = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
     Some(format!(
         "Warning: this project lives inside a Git repository whose root is\n\
          {}, but `{workflow_rel_path}` was written under\n\
@@ -305,11 +315,10 @@ fn nested_workflow_relocation_warning(dir: &Path, workflow_rel_path: &str) -> Op
          the following so its `docker build` step still finds this crate's\n\
          Dockerfile:\n\
          \n\
-         defaults:\n  run:\n    working-directory: {}\n",
+         defaults:\n  run:\n    working-directory: {rel_forward_slash}\n",
         git_root.display(),
         dir.display(),
         git_root.display(),
-        rel.display(),
     ))
 }
 
@@ -5304,12 +5313,51 @@ previous_secrets = []
             "vpcaccess.googleapis.com",
             "artifactregistry.googleapis.com",
             "servicenetworking.googleapis.com",
+            // google_compute_network / google_compute_global_address are
+            // Compute Engine resources — a fresh project without this API
+            // pre-enabled would fail the very first apply at VPC creation.
+            "compute.googleapis.com",
         ] {
             assert!(
                 content.contains(api),
                 "main.tf must enable {api}: {content}"
             );
         }
+    }
+
+    #[test]
+    fn gcp_main_tf_redis_avoids_a_tls_mode_the_client_cant_verify() {
+        // Memorystore's SERVER_AUTHENTICATION mode presents a private,
+        // instance-specific CA — not a publicly-trusted one — and
+        // autumn-cache-redis's RedisCache::connect has no hook to trust a
+        // custom CA. Unlike AWS ElastiCache/Azure Redis Cache (both use
+        // publicly-trusted certs and work with the same client), enabling
+        // that mode here would generate a rediss:// URL the app can never
+        // actually connect with. Traffic stays inside the private VPC
+        // regardless, so AUTH-only (no transit encryption) is correct here.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("transit_encryption_mode = \"DISABLED\""),
+            "google_redis_instance must not claim SERVER_AUTHENTICATION — the client \
+             can't verify Memorystore's private CA: {content}"
+        );
+        assert!(
+            content.contains("auth_enabled            = true"),
+            "google_redis_instance must still require AUTH: {content}"
+        );
+        let redis_url_version = content
+            .split("resource \"google_secret_manager_secret_version\" \"redis_url\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the redis_url secret version");
+        assert!(
+            redis_url_version.contains("\"redis://:"),
+            "the derived redis_url secret must use the redis:// scheme, matching \
+             transit_encryption_mode = DISABLED, not rediss://: {redis_url_version}"
+        );
     }
 
     #[test]
