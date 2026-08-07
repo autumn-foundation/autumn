@@ -5059,6 +5059,36 @@ previous_secrets = []
     }
 
     #[test]
+    fn gcp_vpc_connector_name_respects_the_weighted_21_char_limit() {
+        // Serverless VPC Access connector names must stay under 21
+        // characters where EACH HYPHEN COUNTS AS TWO characters toward that
+        // limit (confirmed against Google's own docs: "must be less than
+        // 21 characters long, and ... hyphens (-) count as two
+        // characters") — an undocumented-in-the-Terraform-provider quirk
+        // distinct from the usual RFC 1035 label rule every other resource
+        // here follows. A 10-letter, hyphen-free base ("abcdefghij") plus
+        // the fixed "-connector" suffix already sits at the weighted
+        // boundary (10 + 2 + 9 = 21, i.e. rejected), so a naive raw
+        // character cap (this scaffold's previous 15-character cap) is far
+        // too permissive, and any cap that doesn't first strip hyphens
+        // from the base can blow the budget on hyphens alone.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains(
+                "connector_name_safe = substr(replace(local.app_name_hyphenated, \"-\", \"\"), 0, 9)"
+            ),
+            "connector_name_safe must strip hyphens from the base before capping it (so \
+             weighted length equals raw length), and cap the hyphen-free base at 9 \
+             characters — 9 (base) + 11 (the \"-connector\" suffix's weighted length: \
+             2 for its hyphen + 9 for \"connector\") = 20, just under the 21-character \
+             weighted limit: {content}"
+        );
+    }
+
+    #[test]
     fn gcp_main_tf_vpc_network_waits_for_compute_api_activation() {
         // Nothing in google_compute_network.this references an attribute of
         // google_project_service.apis, so without an explicit depends_on,
@@ -5541,6 +5571,26 @@ previous_secrets = []
             main_tf.contains("max_instance_request_concurrency = 80"),
             "main.tf must set concurrency to 80 requests per instance (Cloud Run's own \
              default, made explicit and tunable): {main_tf}"
+        );
+    }
+
+    #[test]
+    fn gcp_variables_tf_documents_db_tier_connection_budget_vs_max_instances() {
+        // db-f1-micro's small max_connections ceiling (~25) combined with
+        // pool_size=10 (autumn.production.toml.example) and the default
+        // max_instances of 10 means scaling out under real load can exhaust
+        // the tier's connection budget well before hitting max_instances —
+        // not an apply-time failure, but a documented gotcha operators must
+        // resize for before relying on autoscaling in production.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            variables_tf.contains("max_connections") && variables_tf.contains("pool_size"),
+            "variables.tf must document the relationship between db_tier's \
+             max_connections ceiling and max_instances * pool_size, so operators know \
+             to resize db_tier before scaling out in production: {variables_tf}"
         );
     }
 

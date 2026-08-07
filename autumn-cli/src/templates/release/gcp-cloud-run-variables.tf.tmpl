@@ -44,6 +44,21 @@ variable "db_tier" {
   default     = "db-f1-micro"
 }
 
+# ── Connection budget ────────────────────────────────────────────────────────
+# The default db_tier (db-f1-micro) initializes Postgres with a small
+# max_connections ceiling — around 25, run `SHOW max_connections;` against
+# your instance to confirm the exact figure for its memory size. Each Cloud
+# Run instance opens up to `pool_size` connections
+# (autumn.production.toml.example defaults to 10), so scaling out past ~2
+# concurrently-busy instances at that default pool size can already exhaust
+# a db-f1-micro instance's connection budget well before max_instances'
+# default ceiling of 10 is reached. db-f1-micro is a dev-appropriate default
+# specifically because of this — before relying on autoscaling toward
+# max_instances in production, size db_tier so its max_connections
+# comfortably exceeds `max_instances * pool_size` (e.g. db-custom-2-7680
+# supports roughly 200) or lower pool_size/max_instances to fit the tier
+# you're on.
+
 variable "vpc_connector_cidr" {
   description = "Unused /28 CIDR range in the VPC for the Serverless VPC Access connector. Must not overlap 10.100.0.0/16 — the private-service-access range Cloud SQL/Memorystore use (see main.tf's google_compute_global_address.private_service_access)."
   type        = string

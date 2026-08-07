@@ -121,12 +121,16 @@ locals {
     : local.service_account_id_base
   )
 
-  # Serverless VPC Access connector names are capped at 25 characters — far
-  # tighter than every other resource this scaffold touches (which get the
-  # usual 63-char RFC 1035 budget), so app_name_safe (capped at 40) needs its
-  # own, shorter budget here: 15 characters leaves room for the fixed
-  # "-connector" suffix (10 characters) to still fit under 25.
-  connector_name_safe = trim(substr(local.app_name_hyphenated, 0, 15), "-")
+  # Serverless VPC Access connector names must be under 21 characters where
+  # each hyphen counts as TWO characters toward that limit (an undocumented
+  # quirk of the underlying API, not the usual RFC 1035 label rule every
+  # other resource here follows) — e.g. "abcdefghij-connector" (a 10-letter
+  # base) is already at the 21-character weighted boundary and gets
+  # rejected. Stripping hyphens from the base entirely sidesteps the
+  # weighting question: with no hyphens left, weighted length equals raw
+  # character count, so an N-character base plus the fixed "-connector"
+  # suffix (weighted 2 + 9 = 11) just needs N <= 9 to stay under 21.
+  connector_name_safe = substr(replace(local.app_name_hyphenated, "-", ""), 0, 9)
 
   # Memorystore instance IDs are capped at 40 characters — app_name_safe
   # alone is already capped at 40, so appending the fixed "-redis" suffix

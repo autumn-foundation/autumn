@@ -1571,6 +1571,17 @@ the two (or three, with Redis) secrets it needs via
 `secretAccessor` binding, which would let a compromised container read
 every secret in the project.
 
+**The default `db_tier` is sized for dev, not for `max_instances` at full
+scale.** `db-f1-micro`'s Postgres `max_connections` ceiling is small (around
+25 — run `SHOW max_connections;` against your instance to confirm), while
+each Cloud Run instance opens up to `pool_size` connections
+(`autumn.production.toml.example` defaults to 10). At the default
+`max_instances` of 10, scaling out under real load can exhaust that budget
+well before hitting the instance ceiling. Before relying on autoscaling in
+production, size `db_tier` so its `max_connections` comfortably exceeds
+`max_instances * pool_size` (e.g. `db-custom-2-7680` supports roughly 200),
+or lower `pool_size`/`max_instances` to fit the tier you're on.
+
 **Resource names are sanitized, not verbatim.** A Cargo package name may
 contain underscores or uppercase letters (both invalid in Cloud Run/RFC
 1035-style GCP resource names), so every resource name this scaffold
