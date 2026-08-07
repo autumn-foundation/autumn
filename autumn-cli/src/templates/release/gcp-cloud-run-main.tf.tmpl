@@ -180,6 +180,17 @@ resource "google_project_service" "apis" {
 resource "google_compute_network" "this" {
   name                    = "${local.app_name_safe}-vpc"
   auto_create_subnetworks = false
+
+  # Without this, Terraform has no reason to order network creation after
+  # API enablement (nothing here references an attribute of
+  # google_project_service.apis) and may create it concurrently — on a
+  # fresh project where Compute Engine isn't enabled yet, that races the
+  # enablement and fails the first `terraform apply`. Every other resource
+  # here that transitively depends on this network (the PSA global address,
+  # the VPC connector, Cloud SQL, Redis) inherits the correct ordering
+  # through their own reference to google_compute_network.this, so this is
+  # the only explicit dependency needed.
+  depends_on = [google_project_service.apis]
 }
 
 # Reserves an internal IP range for the private services access peering

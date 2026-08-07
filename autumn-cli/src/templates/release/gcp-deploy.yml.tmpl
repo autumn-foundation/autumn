@@ -97,11 +97,18 @@ jobs:
           # the tag unique per actual execution, not just per commit.
           echo "value=${SAFE_REF}-${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
+      # `project_id` matters even though the deployer authenticates via WIF:
+      # without it, gcloud's active project defaults to whatever project the
+      # deployer service account itself lives in (e.g. a shared CI project),
+      # not the project this scaffold's resources were created in — every
+      # `gcloud run`/`gcloud auth configure-docker` call below would then
+      # target the wrong project, or fail to find the service/job at all.
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v2

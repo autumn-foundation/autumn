@@ -5059,6 +5059,30 @@ previous_secrets = []
     }
 
     #[test]
+    fn gcp_main_tf_vpc_network_waits_for_compute_api_activation() {
+        // Nothing in google_compute_network.this references an attribute of
+        // google_project_service.apis, so without an explicit depends_on,
+        // Terraform has no reason to order network creation after API
+        // enablement — on a fresh project it can race the enablement and
+        // fail the first `terraform apply`.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let network_block = content
+            .split("resource \"google_compute_network\" \"this\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the google_compute_network resource");
+        assert!(
+            network_block.contains("depends_on")
+                && network_block.contains("google_project_service.apis"),
+            "google_compute_network.this must depend on google_project_service.apis: \
+             {network_block}"
+        );
+    }
+
+    #[test]
     fn gcp_main_tf_postgres_database_name_is_length_bounded() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -5600,6 +5624,30 @@ previous_secrets = []
     }
 
     #[test]
+    fn gcp_workflow_selects_the_configured_target_project() {
+        // WIF authentication alone doesn't set gcloud's active project — if
+        // the deployer service account lives in a different project than
+        // the one this scaffold's resources were created in (e.g. a shared
+        // CI project), every gcloud command below would target the wrong
+        // project (or fail to find the resources) without this.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        let auth_step = content
+            .split("uses: google-github-actions/auth@v2")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("the auth step must be present");
+        assert!(
+            auth_step.contains("project_id: ${{ vars.GCP_PROJECT_ID }}"),
+            "the auth step must pass project_id so gcloud targets the configured \
+             project, not wherever the deployer service account happens to live: \
+             {auth_step}"
+        );
+    }
+
+    #[test]
     fn gcp_workflow_sets_up_gcloud_and_configures_docker_before_building() {
         // ubuntu-latest doesn't ship gcloud, and `docker push` to Artifact
         // Registry needs a configured credential helper — without both,
@@ -5615,7 +5663,7 @@ previous_secrets = []
             .find("google-github-actions/setup-gcloud@v2")
             .expect("gcp-deploy.yml must set up the gcloud CLI");
         let configure_docker_pos = content
-            .find("gcloud auth configure-docker")
+            .find("run: gcloud auth configure-docker")
             .expect("gcp-deploy.yml must configure Docker for Artifact Registry");
         let build_pos = content
             .find("docker build \\")
