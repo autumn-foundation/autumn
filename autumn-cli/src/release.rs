@@ -5220,6 +5220,43 @@ previous_secrets = []
     }
 
     #[test]
+    fn gcp_main_tf_secret_refs_pin_the_created_version_not_latest() {
+        // Cloud Run resolves a secret_key_ref's version once, when a NEW
+        // revision is created — an already-running revision's already-
+        // running instances never re-read "latest". If the env block kept
+        // the literal string "latest", rotating database_admin_password/
+        // signing_secret via Terraform (which creates a new
+        // google_secret_manager_secret_version) wouldn't change anything
+        // Terraform sees as a diff in the Cloud Run service/job spec, so no
+        // new revision would roll out at all — leaving the whole fleet
+        // pinned to the OLD secret value while Cloud SQL had already
+        // started requiring the NEW password. Referencing the version
+        // resource's own `.version` attribute means a rotation IS a diff,
+        // and rolls out as a new revision.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            !content.contains("version = \"latest\""),
+            "no secret_key_ref may pin to the \"latest\" alias — Cloud Run only \
+             resolves it once per revision, so a Terraform-driven secret rotation \
+             would silently fail to roll out to already-running instances: {content}"
+        );
+        for version_ref in [
+            "version = google_secret_manager_secret_version.database_url.version",
+            "version = google_secret_manager_secret_version.signing_secret.version",
+            "version = google_secret_manager_secret_version.redis_url[0].version",
+        ] {
+            assert!(
+                content.contains(version_ref),
+                "main.tf must pin every secret_key_ref to its version resource's \
+                 `.version` attribute: expected to find `{version_ref}`: {content}"
+            );
+        }
+    }
+
+    #[test]
     fn gcp_main_tf_secret_access_is_scoped_per_secret_not_project_wide() {
         // A project-wide `roles/secretmanager.secretAccessor` grant (via
         // google_project_iam_member) would let a compromised container read
