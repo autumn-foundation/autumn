@@ -1876,10 +1876,10 @@ fn mount_user_routes(
     ))
 }
 
-// This fallback never actually errors, but it must keep the same signature
-// as the `feature = "i18n"` variant above (which can), since the single
-// call site invokes whichever cfg variant is compiled in without its own
-// branching.
+// This variant never actually returns `Err` (only the `i18n`-enabled sibling
+// above can, on a locale-prefix path collision) — but it must keep the same
+// `Result` signature so the single call site doesn't need its own
+// `#[cfg(feature = "i18n")]` branch.
 #[cfg(not(feature = "i18n"))]
 #[allow(clippy::unnecessary_wraps)]
 fn mount_user_routes(

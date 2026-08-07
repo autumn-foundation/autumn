@@ -1481,6 +1481,10 @@ const SHARED_MAIN_MODULE_NAMES: &[&str] = &[
     // A fixed single-file module (`src/notifications.rs`, no directory) —
     // `shared_module_backing_path_exists` already handles that shape.
     "notifications",
+    // `autumn generate teams` (issue #1261) — like the other directory-backed
+    // entries above, `shared_module_backing_path_exists` treats this as
+    // orphaned once `src/teams/` is gone.
+    "teams",
 ];
 
 /// Whether `name`'s backing module still exists on disk — either as

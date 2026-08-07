@@ -179,6 +179,21 @@ The committed tree here is the rendered form of the embedded starter; the
 
 ---
 
+### `examples/teams` — Organization Membership & Email Invitations
+
+<!-- catalog:example name=teams tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building a multi-user B2B SaaS who needs teammates, roles, and email invitations without hand-rolling the join table, token record, and accept route |
+| **Journey** | Team membership: sign up → get a personal organization as `Owner` → invite a teammate by email and role → they accept (signup-then-join or direct join) → a role-gated member-management screen |
+| **Key capabilities** | Row-level multi-tenancy with the active organization as tenant (`#[repository(tenant_scoped)]`, issue #695), a closed `Role` enum + hierarchy-aware `require_role` guard layered on the existing session/Policy role plumbing (issue #496), `#[mailer]` invitation email, idempotent invite-accept, last-`Owner` protection |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Run command** | `cargo run -p teams` |
+| **Success proof** | After signing up in the browser, `GET /members` returns `200 OK` showing the signer as `owner`; inviting a teammate and following the accept link in the dev mailbox creates exactly one `Membership` row even on a double-click |
+
+---
+
 ### `examples/media-room` — Live Mesh Rooms
 
 <!-- catalog:example name=media-room tier=supported -->
@@ -194,6 +209,23 @@ The committed tree here is the rendered form of the embedded starter; the
 
 Boots with no database or `MediaMTX` server; the companion narrative is
 `docs/guide/media.md`.
+
+---
+
+### `examples/invoice` — PDF Downloads
+
+<!-- catalog:example name=invoice tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building billing/reporting features who needs a downloadable PDF |
+| **Journey** | Render one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` |
+| **Key capabilities** | `autumn_web::pdf::Pdf::from_markup`, `.filename(...)`, the `Clock` extractor for deterministic rendering, `TestResponse::assert_pdf_contains` |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p invoice` |
+| **Success proof** | `curl -OJ http://localhost:3000/invoices/42/pdf` downloads `invoice-42.pdf` |
+
+Boots with no database; the companion narrative is `docs/guide/pdf-downloads.md`.
 
 ---
 
@@ -240,6 +272,7 @@ can pick the closest starting point without overlap.
 | Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
+| PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf` |
 
 ---
 

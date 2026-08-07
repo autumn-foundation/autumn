@@ -370,6 +370,11 @@ pub mod notifications;
 pub mod openapi;
 pub mod pagination;
 pub mod paths;
+/// Render server-side templates to downloadable PDF documents.
+///
+/// Enable with the Cargo feature `pdf`.
+#[cfg(feature = "pdf")]
+pub mod pdf;
 /// Eager-loading (preload) runtime for `#[model]` associations.
 ///
 /// See [`preload`] for [`preload::Preloaded`], [`preload::NotLoaded`], and the

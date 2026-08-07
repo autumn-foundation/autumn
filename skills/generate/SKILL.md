@@ -35,6 +35,7 @@ them; on 0.5.0 fall back to the documented manual alternative.
 | `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth); **(trunk-dev)** also scaffolds a configurable password policy and persistent "remember me" login by default, authenticated change-password/change-email flows, and `--magic-link` passwordless login |
 | `admin` | `admin Post title:String body:Text` | Admin plugin resource page — fields must be supplied explicitly; generator does not read the model |
 | `policy` **(trunk-dev)** | `policy Post` | Scaffolds `<Pascal>Policy`/`<Pascal>Scope` for an EXISTING model — owner-or-admin `update`/`delete` plus an owner-scoped `list`. When no owner column (`user_id`/`author_id`/`owner_id`) is found, emits a default-deny TODO stub instead (issue #1125) |
+| `teams` **(trunk-dev)** | `teams` | Organization membership + email invitations (issue #1261): `Organization`/`Membership`/`Invitation` models + migrations, a closed `Owner`/`Admin`/`Member` role + `require_role` guard, an `InvitationMailer`, and member-management routes under `src/teams/`. Takes **no name argument** — always emits this fixed set. Composes `#[repository(tenant_scoped)]` (#695) and the session `"role"` key (#496); does not scaffold its own login/signup — see "teams" below. |
 | `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
 | `pwa` | `pwa` | PWA scaffolding — manifest, service worker, offline shell, icons, route handlers, smoke test |
 | `wizard` | `wizard checkout shipping payment review` | Session-backed multi-step form — step structs, GET/POST handlers, confirm/commit/cancel, and ignored integration test skeletons |
@@ -420,6 +421,52 @@ concurrent-lock TOCTOU. It sits before the TOTP branch, so it covers both
 `--magic-link` and `--magic-link --totp`; a locked account renders the same
 generic failure page as an expired/consumed/unknown token, so there is no
 oracle.
+
+### teams (trunk-dev)
+```
+Next steps:
+1. `autumn generate teams` takes no name/model argument — it always emits the
+   fixed Organization/Membership/Invitation set under src/teams/. Requires an
+   existing `users` table (e.g. from `autumn generate auth`); it does not
+   scaffold login/signup itself. Postgres only — rejects a SQLite-backed
+   project up front with an actionable error.
+2. Wire the three-line auth-integration seam by hand (see
+   docs/generate-teams.md):
+   - After your own signup handler creates the user, call
+     `teams::routes::organizations::provision_default_organization(user.id, &mut db)`
+     to make them the Owner of a personal organization (org+membership run in
+     one transaction; wrap your own user insert in `db.tx(...)` too and call
+     `provision_default_organization_on_conn` on the same `conn` instead if
+     you need full 3-way atomicity with the account row).
+   - After your own login handler resolves the session, call
+     `teams::role::establish_org_session(...)` to set the active
+     organization + role in the session.
+   - Before (or as part of) your own account-deletion handler, call
+     `teams::routes::organizations::remove_all_memberships(user.id, &mut db)`
+     — `Membership` has no FK to your `users` table, so nothing else notices
+     the account is gone; skipping this leaves a deleted user's team access
+     live on any device with a still-valid session cookie.
+3. Set `[tenancy]` in autumn.toml: `source = "session"`,
+   `session_key = "organization_id"`, and list `/invite` (NOT `/invitations`)
+   in `public_paths` — `/invite/{token}` is the invitee-facing accept flow;
+   `/invitations` is the Admin-only create/revoke/resend surface and must
+   stay tenant-gated.
+4. Run: autumn migrate   (applies the organizations/memberships/invitations
+   migration)
+5. Generated forms already carry CSRF tokens — every mutating form embeds a
+   hidden `_csrf` field sourced from an `Option<CsrfToken>` extractor, so no
+   manual wiring is needed here even with the framework's on-by-default CSRF
+   protection.
+6. If you generated auth with a custom resource name (e.g.
+   `autumn generate auth Account`, table `accounts` rather than the default
+   `users`), edit `src/teams/routes/invitations.rs`'s `caller_email_lookup`
+   module by hand to match — it hard-codes a `users` table name as a
+   placeholder, since this generator can't introspect which name a separate,
+   prior `auth` generation used.
+7. `examples/teams` is the fully-wired reference this generator adapts
+   from — it owns its own `users` table end to end, so all three integration
+   points from step 2 are inlined directly into its `routes/auth.rs`.
+```
 
 ## Flags
 

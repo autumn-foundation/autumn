@@ -326,7 +326,11 @@ enum LiveEventBusPublisherInner {
     },
     RedisPubSub {
         channel: String,
-        client: redis::Client,
+        // Boxed: enabling the `redis` crate's TLS feature (tokio-rustls-comp,
+        // needed for rediss:// URLs like Azure Redis Cache's) grows
+        // `redis::Client` enough to trip clippy::large_enum_variant against
+        // the other, much smaller variant.
+        client: Box<redis::Client>,
     },
 }
 
@@ -414,7 +418,7 @@ impl LiveEventBusPublisher {
                     .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
                 LiveEventBusPublisherInner::RedisPubSub {
                     channel: config.channel.clone(),
-                    client,
+                    client: Box::new(client),
                 }
             }
         };

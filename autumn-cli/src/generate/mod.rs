@@ -34,6 +34,7 @@ pub mod system_test;
 pub mod task;
 pub mod tauri;
 pub mod tauri_mobile;
+pub mod teams;
 pub mod wizard;
 
 use std::path::{Path, PathBuf};
@@ -176,6 +177,31 @@ pub fn sqlite_add_not_null_without_default_error(table: &str, column: &str) -> G
          can be added safely. (A NOT NULL column is fine inside CREATE TABLE — this limit is \
          specific to ALTER TABLE ADD COLUMN.)"
     ))
+}
+
+/// The generate-time rejection for `autumn generate teams` on a
+/// `SQLite`-backed app (issue #1261).
+///
+/// `teams`' migration and `#[model]`/`#[repository]` templates are fixed,
+/// hand-written Postgres DDL/Diesel code (`BIGSERIAL`, `NOW()`, `TIMESTAMP`,
+/// `diesel = { features = ["postgres", ...] }`) — unlike `generate model`,
+/// there is no per-field backend-aware rendering path to route through for
+/// `teams`' handful of hardcoded tables. Emitting it against a `SQLite`
+/// project would silently produce a migration `autumn migrate` fails to
+/// apply. Rather than do that, generation fails here with an actionable
+/// message; genuine `SQLite` support (backend-aware DDL, matching the
+/// `generate model`/`scaffold` foundation from issue #1614) is a follow-up,
+/// not attempted in this slice.
+#[must_use]
+pub fn sqlite_teams_unsupported_error() -> GenerateError {
+    GenerateError::Config(
+        "`autumn generate teams` requires the Postgres backend: its migration and \
+         `#[model]`/`#[repository]` templates are fixed Postgres DDL/Diesel code \
+         (BIGSERIAL, NOW(), TIMESTAMP, the `diesel` \"postgres\" feature), with no \
+         SQLite-aware rendering path yet. Target a Postgres database to use \
+         `autumn generate teams`."
+            .to_owned(),
+    )
 }
 
 /// Common flags shared by every `generate` subcommand.

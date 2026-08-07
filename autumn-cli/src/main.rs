@@ -661,6 +661,7 @@ enum Commands {
     ///   autumn release init --force
     ///   autumn release init --target fly
     ///   autumn release init --target docker-compose
+    ///   autumn release init --target azure-container-apps
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
@@ -1956,13 +1957,24 @@ enum ReleaseCommands {
     /// Emit production-ready deployment files at the project root.
     ///
     /// Default (no --target): Dockerfile + .dockerignore + autumn.production.toml.example.
-    /// --target fly        : also emits fly.toml.
-    /// --target docker-compose : also emits docker-compose.yml with app + Postgres.
+    /// --target fly                    : also emits fly.toml.
+    /// --target docker-compose         : also emits docker-compose.yml with app + Postgres.
+    /// --target azure-container-apps   : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/azure-deploy.yml.
+    /// --target aws-app-runner         : also emits main.tf, variables.tf, outputs.tf, and
+    ///                                   terraform.tfvars.example (ECR + App Runner + RDS,
+    ///                                   no CI workflow — fast/minimal path).
+    /// --target aws-ecs                : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/aws-deploy.yml (VPC/ALB/ECS
+    ///                                   Fargate/RDS — production path).
     Init {
         /// Overwrite existing files instead of erroring on collision.
         #[arg(long)]
         force: bool,
-        /// Deployment target: fly | docker-compose (omit for bare Dockerfile).
+        /// Deployment target: fly | docker-compose | azure-container-apps | aws-app-runner |
+        /// aws-ecs (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
         /// Scaffold a separate worker-role service in the generated
@@ -2206,6 +2218,40 @@ enum GenerateCommands {
     Policy {
         /// Model name (`PascalCase` or `snake_case`, e.g. `Post`).
         name: String,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Generate team membership: organizations, roles (Owner/Admin/Member),
+    /// and email invitations (issue #1261).
+    ///
+    /// Composes already-stable primitives — `#[repository(tenant_scoped)]`
+    /// (issue #695), the session `"role"` key (issue #496), and the Mail
+    /// stack (`#[mailer]`) — rather than introducing a new authorization
+    /// mechanism. Takes no name: it always emits the same fixed
+    /// `Organization`/`Membership`/`Invitation` set.
+    ///
+    /// Creates:
+    ///   - `src/teams/`              — models, schema, repositories, role
+    ///     guard, invitation mailer, and route handlers
+    ///   - `migrations/<timestamp>_create_teams/` — organizations,
+    ///     memberships, invitations tables
+    ///   - `src/main.rs`             — `mod teams;` + routes wired into the
+    ///     app builder
+    ///   - `Cargo.toml`              — `"mail"` feature added to `autumn-web`
+    ///
+    /// Does NOT generate `routes/auth.rs` — your app's own login/signup
+    /// already exists. See `docs/generate-teams.md` for the two-line
+    /// integration seam, or `examples/teams` for a fully-wired reference app.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate teams
+    #[command(verbatim_doc_comment)]
+    Teams {
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -3845,6 +3891,14 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let plan =
                 generate::policy::plan_policy(&resolve_cwd(), &name, mode == ApplyMode::Destroy);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Teams { dry_run, force } => {
+            let plan = generate::teams::plan_teams(
+                &resolve_cwd(),
+                &generate::timestamp_now(),
+                mode == ApplyMode::Destroy,
+            );
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Channel {
@@ -6066,6 +6120,42 @@ mod tests {
             panic!("expected release init");
         };
         assert_eq!(target.as_deref(), Some("docker-compose"));
+    }
+
+    #[test]
+    fn parse_release_init_with_azure_container_apps_target() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "release",
+            "init",
+            "--target",
+            "azure-container-apps",
+        ])
+        .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("azure-container-apps"));
+    }
+
+    #[test]
+    fn parse_release_init_with_aws_app_runner_target() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "aws-app-runner"])
+            .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("aws-app-runner"));
+    }
+
+    #[test]
+    fn parse_release_init_with_aws_ecs_target() {
+        let cli =
+            Cli::try_parse_from(["autumn", "release", "init", "--target", "aws-ecs"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("aws-ecs"));
     }
 
     #[test]

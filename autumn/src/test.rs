@@ -3462,6 +3462,34 @@ impl TestResponse {
         self
     }
 
+    /// Assert a rendered PDF response's extracted text contains the given
+    /// substring — e.g. `resp.assert_pdf_contains("Total: $42.00")`.
+    ///
+    /// Extracts text via [`crate::pdf::extract_text`], which reads back
+    /// exactly what [`Pdf`](crate::pdf::Pdf) (or any well-formed PDF) wrote,
+    /// so this works against the in-process test client with no headless
+    /// browser involved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the body isn't a parseable PDF, or doesn't contain
+    /// `substring`.
+    #[cfg(feature = "pdf")]
+    #[track_caller]
+    pub fn assert_pdf_contains(&self, substring: &str) -> &Self {
+        let text = crate::pdf::extract_text(&self.body).unwrap_or_else(|e| {
+            panic!(
+                "response body is not a parseable PDF: {e}\n{} bytes",
+                self.body.len()
+            )
+        });
+        assert!(
+            text.contains(substring),
+            "expected PDF text to contain `{substring}`.\nExtracted text: {text}"
+        );
+        self
+    }
+
     /// Assert the response body exactly equals the given string.
     #[track_caller]
     pub fn assert_body_eq(&self, expected: &str) -> &Self {
