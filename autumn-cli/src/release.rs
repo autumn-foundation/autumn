@@ -5536,7 +5536,9 @@ previous_secrets = []
             .find("docker build \\")
             .expect("build step must be present");
         assert!(
-            auth_pos < setup_pos && setup_pos < configure_docker_pos && configure_docker_pos < build_pos,
+            auth_pos < setup_pos
+                && setup_pos < configure_docker_pos
+                && configure_docker_pos < build_pos,
             "auth, then gcloud setup, then Docker configuration must all precede the \
              build step: {content}"
         );
