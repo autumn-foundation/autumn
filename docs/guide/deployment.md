@@ -55,6 +55,11 @@ below and are better fits in specific cases:
 - **[Deploy to AWS ECS Fargate](#deploy-to-aws-ecs-fargate)** — the
   production AWS path: VPC/ALB/ECS Fargate/RDS, for AWS-experienced infra
   teams who already have runbooks for this shape.
+- **[Deploy to GCP Cloud Run](#deploy-to-gcp-cloud-run)** —
+  Terraform-provisioned Cloud Run, Artifact Registry, Cloud SQL PostgreSQL
+  behind a Serverless VPC Access connector, and Secret Manager-backed
+  secrets, for GCP shops that already have workload identity federation in
+  place.
 - **The container path** ([Step 1](#step-1--create-the-project) through
   [How the production image works](#how-the-production-image-works)) — a
   portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
@@ -1526,6 +1531,236 @@ taking that gateway's own AZ down with it can interrupt egress for tasks
 in the *other* AZ too. Add a second NAT gateway (one per AZ, each private
 route table pointed at the one in its own AZ) before a real multi-AZ
 production cutover.
+
+---
+
+## Deploy to GCP Cloud Run
+
+Scaffold a Terraform configuration alongside the production Dockerfile:
+
+```bash
+autumn release init --force --target gcp-cloud-run
+```
+
+This generates:
+
+| File | Purpose |
+|---|---|
+| `main.tf` | An Artifact Registry repository, a VPC with a Serverless VPC Access connector, Cloud SQL for PostgreSQL on a private IP (no public exposure), a dedicated runtime service account scoped to `roles/cloudsql.client` plus per-secret `secretAccessor` grants, Secret Manager entries for the database URL and signing secret, the Cloud Run service itself, and a one-shot Cloud Run Job that runs `autumn migrate`. An optional Memorystore Redis instance is gated behind `enable_redis_cache` — **infrastructure only**, see the callout below. |
+| `variables.tf` | `project_id` (required — no default), `app_name`, `region`, `image_tag`, `db_tier`, `vpc_connector_cidr`, `bootstrap_image`, `min_instances`/`max_instances` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
+| `outputs.tf` | `service_url`, `service_name`, `artifact_registry_repository_url`, `migrate_job_name`, `service_account_email`, `sql_instance_connection_name`, `region`, and `project_id`. |
+| `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
+| `.github/workflows/gcp-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to Artifact Registry, updates and executes the migration job to completion, then updates the Cloud Run service — on a `v*` tag push (or manual dispatch). |
+
+**Redis cache is infrastructure only.** `enable_redis_cache = true`
+provisions a Memorystore Redis instance and wires
+`AUTUMN_CACHE__BACKEND=redis` / `AUTUMN_CACHE__REDIS__URL` into the Cloud
+Run service, but Autumn's cache subsystem has no built-in Redis
+implementation — unlike sessions, channels, and jobs, which activate purely
+from config once compiled with the `redis` Cargo feature. Setting these env
+vars alone does nothing: your application must *also* depend on the
+`autumn-cache-redis` crate and register `.plugin(RedisCachePlugin::new())`
+in `main.rs`, or the config is parsed and silently never read — you'd pay
+for a Redis instance the app never talks to. See
+[Shared Cache](cloud-native.md#shared-cache) for the three steps.
+
+**Secret access is scoped per secret, not project-wide.** The runtime
+service account is granted `roles/secretmanager.secretAccessor` on exactly
+the two (or three, with Redis) secrets it needs via
+`google_secret_manager_secret_iam_member` — never a project-wide
+`secretAccessor` binding, which would let a compromised container read
+every secret in the project.
+
+**The default `db_tier` is sized for dev, not for `max_instances` at full
+scale.** `db-f1-micro`'s Postgres `max_connections` ceiling is small (around
+25 — run `SHOW max_connections;` against your instance to confirm), while
+each Cloud Run instance opens up to `pool_size` connections
+(`autumn.production.toml.example` defaults to 10). At the default
+`max_instances` of 10, scaling out under real load can exhaust that budget
+well before hitting the instance ceiling. Before relying on autoscaling in
+production, size `db_tier` so its `max_connections` comfortably exceeds
+`max_instances * pool_size` (e.g. `db-custom-2-7680` supports roughly 200),
+or lower `pool_size`/`max_instances` to fit the tier you're on.
+
+**Rotating `database_admin_password` replaces the sole live credential in
+place.** `google_sql_user.this`'s password update is ordered before the
+`database_url` secret version (so a new Cloud Run revision never starts
+with a password Cloud SQL hasn't accepted yet), but any already-running
+revision still holds the OLD password in its resolved env until it's
+replaced by the new one — a brief reconnect window during rollout, not a
+zero-downtime rotation. A fully staged handoff would need a second
+database user, which this scaffold doesn't provision; if you need
+zero-downtime credential rotation, add one and cut over manually.
+
+**Resource names are sanitized, not verbatim.** A Cargo package name may
+contain underscores or uppercase letters (both invalid in Cloud Run/RFC
+1035-style GCP resource names), so every resource name this scaffold
+touches (the Cloud Run service and job, the Artifact Registry repository,
+the VPC/connector, the Cloud SQL instance, the service account) is
+lowercased, any other character is mapped to a hyphen, runs of hyphens are
+collapsed to one, and a leading/trailing hyphen is trimmed — `my_app`/`My
+App`/`my--app` all become `my-app`. Sanitization happens once, in Terraform
+(`local.app_name_safe`) — the generated workflow never *hardcodes* a name,
+reading `GCP_SERVICE_NAME` etc. as a repository variable instead of baking
+one into the YAML. But that variable is a snapshot you set from
+`terraform output`, not a live link to Terraform state — see the note on
+resyncing it below if you edit `app_name` after scaffolding.
+
+Why Cloud Run and not GKE or App Engine: it is the closest managed analog
+to Fly.io — fully managed, auto-TLS, managed ingress, scales to zero,
+pay-per-request — while GKE is operationally heavy and App Engine Standard
+doesn't support arbitrary binaries.
+
+Provision the infrastructure and set secrets via Terraform variables (never
+as literals in `terraform.tfvars`). A single apply is enough — there is no
+`database_url` variable to pre-compute: main.tf derives the connection
+string from the Cloud SQL instance this same apply creates, from its
+private IP plus `database_admin_password`.
+
+```bash
+cp terraform.tfvars.example terraform.tfvars   # edit app_name/region/project_id/etc.
+export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
+export TF_VAR_signing_secret="$(openssl rand -hex 32)"
+
+terraform init
+terraform apply
+```
+
+The Cloud Run service and migration job both start from Google's public
+Cloud Run "hello" quickstart image (`bootstrap_image` — Cloud Run must have
+*some* image to create a first revision, and a brand-new Artifact Registry
+repository has none yet; unlike App Runner's nginx placeholder, this image
+already honors the `PORT` env var Cloud Run injects, so no bootstrap-port
+workaround is needed). Build and push your real image, run migrations, then
+cut the service over:
+
+```bash
+# gcloud's "current project" is whatever `gcloud config get-value project`
+# happens to be set to — not necessarily this one. Pass --project to every
+# call below explicitly, or a stale/different ambient project setting can
+# silently target the wrong project (the image push would still succeed,
+# since $AR_URL embeds the target project on its own — only for migration
+# and deployment to then fail to find the resources this apply just
+# created, or worse, update same-named resources elsewhere).
+PROJECT_ID="$(terraform output -raw project_id)"
+REGION="$(terraform output -raw region)"
+SERVICE_NAME="$(terraform output -raw service_name)"   # sanitized — may differ from your Cargo package name
+AR_URL="$(terraform output -raw artifact_registry_repository_url)"
+MIGRATE_JOB="$(terraform output -raw migrate_job_name)"
+TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
+
+gcloud auth configure-docker "$(echo "$AR_URL" | cut -d/ -f1)" --quiet
+docker build \
+  --build-arg AUTUMN_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="$(git rev-parse --short HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_DIRTY="$([ -z "$(git status --porcelain)" ] && echo false || echo true)" \
+  --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t "$AR_URL/$SERVICE_NAME:$TAG" .
+docker push "$AR_URL/$SERVICE_NAME:$TAG"
+
+# Run migrations to completion BEFORE updating the service — the generated
+# production config sets auto_migrate_in_production = false, so nothing
+# else does this for you. `gcloud run jobs update --image` persists the new
+# image onto the job's stored template (leaving its command/env untouched);
+# `gcloud run jobs execute --wait` then blocks until the execution actually
+# finishes and exits non-zero on failure — no manual poll loop needed here,
+# unlike the Azure/AWS walkthroughs above, since gcloud provides a
+# synchronous wait natively.
+gcloud run jobs update "$MIGRATE_JOB" --project "$PROJECT_ID" --region "$REGION" \
+  --image "$AR_URL/$SERVICE_NAME:$TAG" --quiet
+gcloud run jobs execute "$MIGRATE_JOB" --project "$PROJECT_ID" --region "$REGION" --wait
+
+gcloud run services update "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+  --image "$AR_URL/$SERVICE_NAME:$TAG" --quiet
+```
+
+Terraform is told to ignore both resources' image afterward
+(`lifecycle.ignore_changes`), so a later `terraform apply` won't revert a
+live deploy back to the bootstrap placeholder.
+
+**Automated deploys on tag push:** `.github/workflows/gcp-deploy.yml` only
+runs once you add the required repository secrets and variables it
+documents in its header comment — secrets `GCP_WORKLOAD_IDENTITY_PROVIDER`/
+`GCP_DEPLOYER_SERVICE_ACCOUNT` for OIDC login via
+`google-github-actions/auth` (no service account key needed: the workflow's
+`id-token: write` permission plus a Workload Identity Federation provider
+trusting GitHub's OIDC issuer is enough), and variables (not secrets —
+they're just config) `GCP_PROJECT_ID`/`GCP_REGION`/
+`GCP_ARTIFACT_REGISTRY_URL`/`GCP_SERVICE_NAME`/`GCP_MIGRATE_JOB_NAME` (all
+five are `terraform output` values — never hand-typed) — until then it
+stays dormant:
+
+```bash
+gh variable set GCP_PROJECT_ID --body "$(terraform output -raw project_id)"
+gh variable set GCP_REGION --body "$(terraform output -raw region)"
+gh variable set GCP_ARTIFACT_REGISTRY_URL --body "$(terraform output -raw artifact_registry_repository_url)"
+gh variable set GCP_SERVICE_NAME --body "$(terraform output -raw service_name)"
+gh variable set GCP_MIGRATE_JOB_NAME --body "$(terraform output -raw migrate_job_name)"
+```
+
+Once configured, pushing a `v*` tag builds, pushes to Artifact Registry,
+updates and executes the migration job to completion (aborting before any
+deploy if it fails), and runs `gcloud run services update` automatically.
+
+**These repository variables are a one-time snapshot, not a live link to
+Terraform state.** If you edit `app_name` (or `region`) in
+`terraform.tfvars` after the workflow is already configured, `terraform
+apply` renames the underlying Cloud Run service/job/Artifact Registry
+repository, but GitHub has no way to know that happened — the variables
+above keep pointing at the OLD names until you re-run the same
+`gh variable set` commands with fresh `terraform output` values. Skipping
+this after an `app_name` change means the next tag push builds and
+deploys against resources that may no longer exist.
+
+**Grant the deployer service account `iam.serviceAccountUser` on the
+runtime service account**, not just `run.developer` on the service: Cloud
+Run requires whoever deploys a revision to be able to act as whatever
+service account that revision runs as — a deployer scoped only to
+`run.developer` 403s the moment the workflow tries to update the service or
+execute the migration job.
+
+**The image tag is unique per execution, not just per commit** and
+**overlapping runs are serialized, never interleaved** — for the identical
+reasons documented for [Azure's workflow](#deploy-to-azure-container-apps)
+above: `gcp-deploy.yml` folds `GITHUB_RUN_ID`/`GITHUB_RUN_ATTEMPT` into the
+image tag, uses a repository-scoped `concurrency` group with
+`cancel-in-progress: false`, and checks for a newer superseding run
+(`run_number`) right before migrating.
+
+**The app's own hostname is a trusted host, automatically — with no second
+apply.** Autumn's `prod` profile fails fast at startup — the process never
+binds — when [`security.trusted_hosts.hosts`](#trusted-hosts-host-header-allow-list)
+is empty, and `main.tf` sets `AUTUMN_PROFILE=prod`. Cloud Run's default URL
+format is `https://<service>-<project number>.<region>.run.app` (Google
+switched to including the project *number* in 2022, specifically so a
+deleted-and-recreated service can't be squatted at the old URL) — fully
+derivable at plan time from a `google_project` data source, unlike App
+Runner's subdomain (only assigned once the service exists) or unlike
+needing to wait for `google_cloud_run_v2_service.this.uri` to be known
+after creation. `main.tf` computes it as `local.service_url_host` and
+passes it in as `AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS`, so the very first
+`terraform apply` — before any CI has ever run — already serves traffic
+instead of crash-looping.
+
+**State file security.** `terraform apply` writes `database_admin_password`,
+the derived database connection string, and `signing_secret` into
+`terraform.tfstate` **in plaintext** — Terraform's `sensitive = true` only
+redacts CLI plan/apply output, never the state file itself. Add
+`*.tfstate*`, `.terraform/`, and `terraform.tfvars` to `.gitignore` before
+running `terraform init` (`autumn release init --target gcp-cloud-run` does
+this for you, merging into an existing `.gitignore` without touching
+unrelated lines), and use a remote backend (e.g. a Google Cloud Storage
+bucket with versioning and encryption at rest) instead of local state for
+any real deployment.
+
+**Production hardening.** Two scaffold defaults trade convenience for
+recoverability and are worth revisiting before a real deploy: Cloud SQL's
+`deletion_protection = false` and the Cloud Run service/job's own
+`deletion_protection = false` (both let `terraform destroy`/recreate cycles
+run without a manual override first, but also mean an accidental `destroy`
+isn't blocked — flip both to `true` once real data/traffic depends on
+them).
 
 ---
 

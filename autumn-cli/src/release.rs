@@ -36,6 +36,16 @@ mod templates {
     pub const AWS_ECS_TFVARS_EXAMPLE: &str =
         include_str!("templates/release/aws-ecs-terraform.tfvars.example.tmpl");
     pub const AWS_DEPLOY_WORKFLOW: &str = include_str!("templates/release/aws-deploy.yml.tmpl");
+
+    pub const GCP_CLOUD_RUN_MAIN_TF: &str =
+        include_str!("templates/release/gcp-cloud-run-main.tf.tmpl");
+    pub const GCP_CLOUD_RUN_VARIABLES_TF: &str =
+        include_str!("templates/release/gcp-cloud-run-variables.tf.tmpl");
+    pub const GCP_CLOUD_RUN_OUTPUTS_TF: &str =
+        include_str!("templates/release/gcp-cloud-run-outputs.tf.tmpl");
+    pub const GCP_CLOUD_RUN_TFVARS_EXAMPLE: &str =
+        include_str!("templates/release/gcp-cloud-run-terraform.tfvars.example.tmpl");
+    pub const GCP_DEPLOY_WORKFLOW: &str = include_str!("templates/release/gcp-deploy.yml.tmpl");
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +68,7 @@ pub enum Target {
     AzureContainerApps,
     AwsAppRunner,
     AwsEcs,
+    GcpCloudRun,
 }
 
 impl std::str::FromStr for Target {
@@ -69,9 +80,10 @@ impl std::str::FromStr for Target {
             "azure-container-apps" => Ok(Self::AzureContainerApps),
             "aws-app-runner" => Ok(Self::AwsAppRunner),
             "aws-ecs" => Ok(Self::AwsEcs),
+            "gcp-cloud-run" => Ok(Self::GcpCloudRun),
             other => Err(format!(
                 "unknown target '{other}'; expected 'fly', 'docker-compose', \
-                 'azure-container-apps', 'aws-app-runner', or 'aws-ecs'"
+                 'azure-container-apps', 'aws-app-runner', 'aws-ecs', or 'gcp-cloud-run'"
             )),
         }
     }
@@ -85,7 +97,7 @@ impl std::str::FromStr for Target {
 const fn is_terraform_target(target: Target) -> bool {
     matches!(
         target,
-        Target::AzureContainerApps | Target::AwsAppRunner | Target::AwsEcs
+        Target::AzureContainerApps | Target::AwsAppRunner | Target::AwsEcs | Target::GcpCloudRun
     )
 }
 
@@ -284,6 +296,16 @@ fn nested_workflow_relocation_warning(dir: &Path, workflow_rel_path: &str) -> Op
         return None;
     }
     let rel = dir.strip_prefix(&git_root).ok()?;
+    // The suggested `working-directory:` always runs inside the generated
+    // workflow's own YAML on a Linux CI runner (every template here targets
+    // `ubuntu-latest`), regardless of which OS `autumn release init` itself
+    // ran on — so this must always render with forward slashes, even when
+    // `rel.display()` would use `\` on a Windows host.
+    let rel_forward_slash = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
     Some(format!(
         "Warning: this project lives inside a Git repository whose root is\n\
          {}, but `{workflow_rel_path}` was written under\n\
@@ -293,11 +315,10 @@ fn nested_workflow_relocation_warning(dir: &Path, workflow_rel_path: &str) -> Op
          the following so its `docker build` step still finds this crate's\n\
          Dockerfile:\n\
          \n\
-         defaults:\n  run:\n    working-directory: {}\n",
+         defaults:\n  run:\n    working-directory: {rel_forward_slash}\n",
         git_root.display(),
         dir.display(),
         git_root.display(),
-        rel.display(),
     ))
 }
 
@@ -361,7 +382,7 @@ pub fn init(
 /// `aws-ecs`) — the comment names all three so it stays legible however the
 /// project got its `.gitignore` merged.
 const TERRAFORM_GITIGNORE_ENTRIES: &[&str] = &[
-    "# Terraform (autumn release init --target azure-container-apps / aws-app-runner / aws-ecs)",
+    "# Terraform (autumn release init --target azure-container-apps / aws-app-runner / aws-ecs / gcp-cloud-run)",
     ".terraform/",
     "*.tfstate",
     "*.tfstate.*",
@@ -564,6 +585,19 @@ fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
             files.push((
                 ".github/workflows/aws-deploy.yml",
                 templates::AWS_DEPLOY_WORKFLOW,
+            ));
+        }
+        Target::GcpCloudRun => {
+            files.push(("main.tf", templates::GCP_CLOUD_RUN_MAIN_TF));
+            files.push(("variables.tf", templates::GCP_CLOUD_RUN_VARIABLES_TF));
+            files.push(("outputs.tf", templates::GCP_CLOUD_RUN_OUTPUTS_TF));
+            files.push((
+                "terraform.tfvars.example",
+                templates::GCP_CLOUD_RUN_TFVARS_EXAMPLE,
+            ));
+            files.push((
+                ".github/workflows/gcp-deploy.yml",
+                templates::GCP_DEPLOY_WORKFLOW,
             ));
         }
         Target::Default => {}
@@ -3313,6 +3347,14 @@ previous_secrets = []
     }
 
     #[test]
+    fn parse_target_gcp_cloud_run() {
+        assert_eq!(
+            "gcp-cloud-run".parse::<Target>().unwrap(),
+            Target::GcpCloudRun
+        );
+    }
+
+    #[test]
     fn parse_target_unknown_is_error() {
         assert!("kubernetes".parse::<Target>().is_err());
     }
@@ -3326,6 +3368,7 @@ previous_secrets = []
             "azure-container-apps",
             "aws-app-runner",
             "aws-ecs",
+            "gcp-cloud-run",
         ] {
             assert!(err.contains(name), "error must mention '{name}': {err}");
         }
@@ -4884,12 +4927,1248 @@ previous_secrets = []
     }
 
     #[test]
-    fn is_terraform_target_covers_all_three_terraform_targets() {
+    fn is_terraform_target_covers_all_terraform_targets() {
         assert!(is_terraform_target(Target::AzureContainerApps));
         assert!(is_terraform_target(Target::AwsAppRunner));
         assert!(is_terraform_target(Target::AwsEcs));
+        assert!(is_terraform_target(Target::GcpCloudRun));
         assert!(!is_terraform_target(Target::Default));
         assert!(!is_terraform_target(Target::Fly));
         assert!(!is_terraform_target(Target::DockerCompose));
+    }
+
+    // ── --target=gcp-cloud-run ───────────────────────────────────────────────
+
+    #[test]
+    fn gcp_cloud_run_target_creates_all_expected_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        for name in [
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+            ".github/workflows/gcp-deploy.yml",
+        ] {
+            assert!(
+                dir.join(name).is_file(),
+                "{name} must be created for --target=gcp-cloud-run"
+            );
+        }
+        // Base scaffolding is still emitted alongside the GCP-specific files.
+        assert!(dir.join("Dockerfile").is_file());
+        assert!(dir.join(".dockerignore").is_file());
+        assert!(dir.join("autumn.production.toml.example").is_file());
+    }
+
+    #[test]
+    fn gcp_cloud_run_target_returns_nested_workflow_path_in_created_list() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        let files = init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|f| f == ".github/workflows/gcp-deploy.yml"),
+            "created-files list must include the nested workflow path: {files:?}"
+        );
+    }
+
+    #[test]
+    fn default_target_does_not_create_gcp_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        for name in [
+            "main.tf",
+            "variables.tf",
+            "outputs.tf",
+            "terraform.tfvars.example",
+            ".github/workflows/gcp-deploy.yml",
+        ] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} must NOT be created for the default target"
+            );
+        }
+    }
+
+    #[test]
+    fn gcp_main_tf_has_artifact_registry_and_cloud_run_service() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_artifact_registry_repository"),
+            "main.tf must provision an Artifact Registry repository: {content}"
+        );
+        assert!(
+            content.contains("resource \"google_cloud_run_v2_service\""),
+            "main.tf must provision the Cloud Run service: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_has_cloud_sql_with_private_ip_only() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_sql_database_instance"),
+            "main.tf must provision a Cloud SQL PostgreSQL instance: {content}"
+        );
+        let ip_config = content
+            .split("ip_configuration {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("main.tf must declare an ip_configuration block");
+        assert!(
+            ip_config.contains("ipv4_enabled") && ip_config.contains("false"),
+            "Cloud SQL must not have a public IPv4 address — private IP only via the \
+             VPC connector: {ip_config}"
+        );
+        assert!(
+            ip_config.contains("private_network"),
+            "Cloud SQL's ip_configuration must set private_network: {ip_config}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_has_vpc_access_connector_wired_into_cloud_run() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_vpc_access_connector"),
+            "main.tf must provision a Serverless VPC Access connector: {content}"
+        );
+        assert!(
+            content.contains("google_vpc_access_connector.this.id"),
+            "the Cloud Run service must reference the VPC connector: {content}"
+        );
+        assert!(
+            content.contains("egress    = \"PRIVATE_RANGES_ONLY\"")
+                || content.contains("egress = \"PRIVATE_RANGES_ONLY\""),
+            "vpc_access egress should stay scoped to private ranges so general internet \
+             egress doesn't route through the connector: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_vpc_connector_name_respects_the_weighted_21_char_limit() {
+        // Serverless VPC Access connector names must stay under 21
+        // characters where EACH HYPHEN COUNTS AS TWO characters toward that
+        // limit (confirmed against Google's own docs: "must be less than
+        // 21 characters long, and ... hyphens (-) count as two
+        // characters") — an undocumented-in-the-Terraform-provider quirk
+        // distinct from the usual RFC 1035 label rule every other resource
+        // here follows. A 10-letter, hyphen-free base ("abcdefghij") plus
+        // the fixed "-connector" suffix already sits at the weighted
+        // boundary (10 + 2 + 9 = 21, i.e. rejected), so a naive raw
+        // character cap (this scaffold's previous 15-character cap) is far
+        // too permissive, and any cap that doesn't first strip hyphens
+        // from the base can blow the budget on hyphens alone.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains(
+                "connector_name_safe = substr(replace(local.app_name_hyphenated, \"-\", \"\"), 0, 9)"
+            ),
+            "connector_name_safe must strip hyphens from the base before capping it (so \
+             weighted length equals raw length), and cap the hyphen-free base at 9 \
+             characters — 9 (base) + 11 (the \"-connector\" suffix's weighted length: \
+             2 for its hyphen + 9 for \"connector\") = 20, just under the 21-character \
+             weighted limit: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_vpc_network_waits_for_compute_api_activation() {
+        // Nothing in google_compute_network.this references an attribute of
+        // google_project_service.apis, so without an explicit depends_on,
+        // Terraform has no reason to order network creation after API
+        // enablement — on a fresh project it can race the enablement and
+        // fail the first `terraform apply`.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let network_block = content
+            .split("resource \"google_compute_network\" \"this\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the google_compute_network resource");
+        assert!(
+            network_block.contains("depends_on")
+                && network_block.contains("google_project_service.apis"),
+            "google_compute_network.this must depend on google_project_service.apis: \
+             {network_block}"
+        );
+    }
+
+    #[test]
+    fn gcp_redis_instance_name_stays_under_memorystores_40_char_limit() {
+        // app_name_safe alone is already capped at 40 (Memorystore's own
+        // limit) — appending the fixed "-redis" suffix on top of it would
+        // overflow the limit for any sanitized name longer than 34
+        // characters, exactly the class of bug the VPC connector's own
+        // shorter budget already guards against.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("redis_name_safe = trim(substr(local.app_name_hyphenated, 0, 34)"),
+            "main.tf must derive a length-bounded local for the Redis instance name, \
+             capped so the fixed \"-redis\" suffix still fits under Memorystore's \
+             40-character limit: {content}"
+        );
+        assert!(
+            content.contains("\"${local.redis_name_safe}-redis\""),
+            "the Redis instance must use the length-bounded local, not app_name_safe \
+             directly: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_service_account_waits_for_iam_api_activation() {
+        // Nothing in google_service_account.cloud_run references an
+        // attribute of google_project_service.apis, so without an explicit
+        // depends_on, Terraform has no reason to order it after the IAM API
+        // is enabled — on a fresh project this fails with SERVICE_DISABLED.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let sa_block = content
+            .split("resource \"google_service_account\" \"cloud_run\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the google_service_account resource");
+        assert!(
+            sa_block.contains("depends_on") && sa_block.contains("google_project_service.apis"),
+            "google_service_account.cloud_run must depend on \
+             google_project_service.apis: {sa_block}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_postgres_database_name_is_length_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let raw_local_line = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("postgres_database_name_raw"))
+            .expect("main.tf must declare a postgres_database_name_raw local");
+        assert!(
+            raw_local_line.contains("substr(") && raw_local_line.contains(", 63)"),
+            "the Postgres database name must be truncated to 63 characters: {raw_local_line}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_postgres_database_name_avoids_reserved_names() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        for reserved in ["postgres", "cloudsqladmin", "template0", "template1"] {
+            assert!(
+                content.contains(&format!("\"{reserved}\"")),
+                "the reserved-name guard must list {reserved:?}: {content}"
+            );
+        }
+        let database_name_local = content
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("postgres_database_name ="))
+            .take_while(|l| !l.trim_start().starts_with('}'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            database_name_local.contains("contains(") && database_name_local.contains("_prod"),
+            "postgres_database_name must fall back to a suffixed name when the \
+             sanitized value collides with a reserved database name: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_has_secret_manager_with_database_and_signing_secrets() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_secret_manager_secret"),
+            "main.tf must provision Secret Manager secrets: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_DATABASE__PRIMARY_URL"),
+            "main.tf must wire the primary DB URL env var from Secret Manager: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_SECURITY__SIGNING_SECRET"),
+            "main.tf must wire the signing secret env var from Secret Manager: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_secret_refs_pin_the_created_version_not_latest() {
+        // Cloud Run resolves a secret_key_ref's version once, when a NEW
+        // revision is created — an already-running revision's already-
+        // running instances never re-read "latest". If the env block kept
+        // the literal string "latest", rotating database_admin_password/
+        // signing_secret via Terraform (which creates a new
+        // google_secret_manager_secret_version) wouldn't change anything
+        // Terraform sees as a diff in the Cloud Run service/job spec, so no
+        // new revision would roll out at all — leaving the whole fleet
+        // pinned to the OLD secret value while Cloud SQL had already
+        // started requiring the NEW password. Referencing the version
+        // resource's own `.version` attribute means a rotation IS a diff,
+        // and rolls out as a new revision.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            !content.contains("version = \"latest\""),
+            "no secret_key_ref may pin to the \"latest\" alias — Cloud Run only \
+             resolves it once per revision, so a Terraform-driven secret rotation \
+             would silently fail to roll out to already-running instances: {content}"
+        );
+        for version_ref in [
+            "version = google_secret_manager_secret_version.database_url.version",
+            "version = google_secret_manager_secret_version.signing_secret.version",
+            "version = google_secret_manager_secret_version.redis_url[0].version",
+        ] {
+            assert!(
+                content.contains(version_ref),
+                "main.tf must pin every secret_key_ref to its version resource's \
+                 `.version` attribute: expected to find `{version_ref}`: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcp_database_url_secret_version_waits_for_sql_user_password_update() {
+        // Unlike AWS RDS (master password lives on the DB instance
+        // resource itself, so referencing its .address here already
+        // creates an implicit ordering edge), Cloud SQL splits the
+        // instance and its user credentials into two independent
+        // resources: google_sql_database_instance.this (referenced for
+        // the private IP) and google_sql_user.this (which actually owns
+        // `password`). Without an explicit dependency, rotating
+        // database_admin_password gives Terraform no reason to apply the
+        // google_sql_user.this password update before this secret
+        // version — the Cloud Run revision this secret version triggers
+        // (via the pinned .version) could then start using the NEW
+        // password before Cloud SQL has actually accepted it.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let secret_version_block = content
+            .split("resource \"google_secret_manager_secret_version\" \"database_url\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the database_url secret version resource");
+        assert!(
+            secret_version_block.contains("depends_on")
+                && secret_version_block.contains("google_sql_user.this"),
+            "google_secret_manager_secret_version.database_url must depend on \
+             google_sql_user.this so a password rotation updates Cloud SQL before the \
+             secret version (and the Cloud Run revision it triggers) picks up the new \
+             value: {secret_version_block}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_secret_access_is_scoped_per_secret_not_project_wide() {
+        // A project-wide `roles/secretmanager.secretAccessor` grant (via
+        // google_project_iam_member) would let a compromised container read
+        // every secret in the project — the grant must instead be scoped to
+        // exactly the secrets this app uses via
+        // google_secret_manager_secret_iam_member.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_secret_manager_secret_iam_member"),
+            "secret access must be granted per-secret via \
+             google_secret_manager_secret_iam_member: {content}"
+        );
+        assert!(
+            !content.contains("google_project_iam_member\" \"secret"),
+            "must not grant a project-wide secretAccessor role: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_wires_trusted_hosts_so_prod_actually_binds() {
+        // AUTUMN_PROFILE=prod makes fail_fast_on_invalid_trusted_hosts exit
+        // the process immediately when security.trusted_hosts.hosts is
+        // empty (see docs/guide/deployment.md's "Trusted hosts" section).
+        // Without this, the container never binds after the first real
+        // deploy — it would crash-loop instead of serving traffic.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS"),
+            "main.tf must set AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS on the Cloud Run \
+             service: {content}"
+        );
+        assert!(
+            content.contains("local.service_url_host"),
+            "the trusted host must be derived from local.service_url_host (known at \
+             plan time from the project number), not require a second apply: {content}"
+        );
+        assert!(
+            content.contains("data.google_project.this.number"),
+            "service_url_host must be derived from the project NUMBER (Cloud Run's \
+             default URL format), not the project ID: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_grants_public_invoker_access() {
+        // Cloud Run services default to requiring IAM-authenticated
+        // invocations — without an explicit allUsers invoker grant, the
+        // deployed app would 403 every request from a browser.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_cloud_run_v2_service_iam_member"),
+            "main.tf must grant an IAM invoker binding on the Cloud Run service: {content}"
+        );
+        assert!(
+            content.contains("roles/run.invoker") && content.contains("allUsers"),
+            "main.tf must grant roles/run.invoker to allUsers for public ingress: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_service_account_scoped_to_cloudsql_client_not_broader() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_service_account"),
+            "main.tf must provision a dedicated runtime service account: {content}"
+        );
+        assert!(
+            content.contains("roles/cloudsql.client"),
+            "the runtime service account must be granted roles/cloudsql.client: {content}"
+        );
+        assert!(
+            !content.contains("roles/editor") && !content.contains("roles/owner"),
+            "the runtime service account must never be granted a broad primitive role: \
+             {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_has_one_shot_migration_job() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_cloud_run_v2_job") && content.contains("\"migrate\""),
+            "main.tf must provision a one-shot Cloud Run Job for migrations: {content}"
+        );
+        assert!(
+            content.contains("autumn migrate"),
+            "the migration job must run `autumn migrate`: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_redis_api_is_gated_behind_enable_redis_cache() {
+        // Every core resource (VPC, Artifact Registry, service account,
+        // Secret Manager) depends on the ENTIRE google_project_service.apis
+        // for_each set — unconditionally including redis.googleapis.com
+        // would mean a project/org policy that merely disallows Redis
+        // (even with enable_redis_cache left false, Redis never requested)
+        // fails the whole apply, not just the optional Redis piece.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("var.enable_redis_cache ? [\"redis.googleapis.com\"] : []"),
+            "redis.googleapis.com must only be added to required_apis when \
+             enable_redis_cache is true: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_psa_range_is_explicit_and_wont_collide_with_connector_cidr() {
+        // Both the PSA global address and the VPC connector are
+        // independently scheduled after network creation; if Google
+        // auto-picked the PSA /16 and it happened to contain the
+        // connector's CIDR, one of the two creations would fail with an
+        // overlap error. An explicit, documented address removes the
+        // ambiguity entirely.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let psa_block = content
+            .split("resource \"google_compute_global_address\" \"private_service_access\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the private_service_access resource");
+        assert!(
+            psa_block.contains("address       = \"10.100.0.0\""),
+            "the PSA range must be pinned to an explicit address, not left for \
+             Google to auto-allocate: {psa_block}"
+        );
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        let default_line = variables_tf
+            .lines()
+            .skip_while(|l| !l.contains("variable \"vpc_connector_cidr\""))
+            .find(|l| l.trim_start().starts_with("default"))
+            .expect("vpc_connector_cidr must declare a default");
+        assert!(
+            default_line.contains("10.8.0.0/28"),
+            "the default connector CIDR must not have silently changed to \
+             something that could overlap the pinned 10.100.0.0/16 PSA range: \
+             {default_line}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_redis_is_off_by_default_and_gated() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            main_tf.contains("google_redis_instance"),
+            "main.tf must provision an optional Memorystore Redis instance: {main_tf}"
+        );
+        assert!(
+            main_tf.contains("var.enable_redis_cache ? 1 : 0"),
+            "the Redis instance must be gated behind enable_redis_cache via count: {main_tf}"
+        );
+
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        let default_line = variables_tf
+            .lines()
+            .skip_while(|l| !l.contains("variable \"enable_redis_cache\""))
+            .find(|l| l.trim_start().starts_with("default"))
+            .expect("enable_redis_cache must declare a default");
+        assert!(
+            default_line.contains("false"),
+            "enable_redis_cache must default to false: {default_line}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_wires_redis_env_vars_into_cloud_run_service() {
+        // Provisioning the Redis instance alone does nothing — Autumn's
+        // cache subsystem only activates it via these two env vars. A
+        // regression dropping the `dynamic "env"` blocks would silently
+        // leave the (paid) Memorystore instance unused while every other
+        // "redis is gated" assertion still passes.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("AUTUMN_CACHE__BACKEND"),
+            "main.tf must wire AUTUMN_CACHE__BACKEND into the Cloud Run service when \
+             Redis is enabled: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_CACHE__REDIS__URL")
+                && content.contains("google_secret_manager_secret.redis_url[0].secret_id"),
+            "main.tf must wire AUTUMN_CACHE__REDIS__URL from the redis_url secret: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_has_private_services_access_peering_for_cloud_sql() {
+        // Cloud SQL's (and Redis's) private IP depends entirely on this
+        // peering; ip_configuration alone doesn't provision it.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_compute_global_address") && content.contains("VPC_PEERING"),
+            "main.tf must reserve a VPC peering range for private services access: \
+             {content}"
+        );
+        assert!(
+            content.contains("google_service_networking_connection"),
+            "main.tf must establish the private services access peering connection: \
+             {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_enables_required_apis() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_project_service"),
+            "main.tf must enable the GCP APIs this scaffold's resources depend on, so a \
+             fresh project works without a manual `gcloud services enable` step: {content}"
+        );
+        for api in [
+            "run.googleapis.com",
+            "sqladmin.googleapis.com",
+            "secretmanager.googleapis.com",
+            "vpcaccess.googleapis.com",
+            "artifactregistry.googleapis.com",
+            "servicenetworking.googleapis.com",
+            // google_compute_network / google_compute_global_address are
+            // Compute Engine resources — a fresh project without this API
+            // pre-enabled would fail the very first apply at VPC creation.
+            "compute.googleapis.com",
+            // google_service_account.cloud_run fails with SERVICE_DISABLED
+            // on a fresh project without this API pre-enabled.
+            "iam.googleapis.com",
+            // data.google_project.this reads project metadata through the
+            // Cloud Resource Manager API — a fresh project without this API
+            // pre-enabled fails at plan time with SERVICE_DISABLED.
+            "cloudresourcemanager.googleapis.com",
+        ] {
+            assert!(
+                content.contains(api),
+                "main.tf must enable {api}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcp_main_tf_project_data_source_waits_for_resourcemanager_api_activation() {
+        // data.google_project.this is a data source, which Terraform will
+        // otherwise try to read during the initial refresh/plan phase —
+        // before google_project_service.apis has run — on a fresh project
+        // where cloudresourcemanager.googleapis.com isn't enabled yet, that
+        // read fails with SERVICE_DISABLED before any resource here even
+        // starts creating. depends_on defers a data source's read until
+        // after its dependencies have applied.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let project_data_block = content
+            .split("data \"google_project\" \"this\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the google_project data source");
+        assert!(
+            project_data_block.contains("depends_on")
+                && project_data_block.contains("google_project_service.apis"),
+            "data.google_project.this must depend on google_project_service.apis: \
+             {project_data_block}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_redis_avoids_a_tls_mode_the_client_cant_verify() {
+        // Memorystore's SERVER_AUTHENTICATION mode presents a private,
+        // instance-specific CA — not a publicly-trusted one — and
+        // autumn-cache-redis's RedisCache::connect has no hook to trust a
+        // custom CA. Unlike AWS ElastiCache/Azure Redis Cache (both use
+        // publicly-trusted certs and work with the same client), enabling
+        // that mode here would generate a rediss:// URL the app can never
+        // actually connect with. Traffic stays inside the private VPC
+        // regardless, so AUTH-only (no transit encryption) is correct here.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("transit_encryption_mode = \"DISABLED\""),
+            "google_redis_instance must not claim SERVER_AUTHENTICATION — the client \
+             can't verify Memorystore's private CA: {content}"
+        );
+        assert!(
+            content.contains("auth_enabled            = true"),
+            "google_redis_instance must still require AUTH: {content}"
+        );
+        let redis_url_version = content
+            .split("resource \"google_secret_manager_secret_version\" \"redis_url\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the redis_url secret version");
+        assert!(
+            redis_url_version.contains("\"redis://:"),
+            "the derived redis_url secret must use the redis:// scheme, matching \
+             transit_encryption_mode = DISABLED, not rediss://: {redis_url_version}"
+        );
+    }
+
+    #[test]
+    fn gcp_scale_defaults_match_the_issue() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        for (var_name, expected) in [("min_instances", "1"), ("max_instances", "10")] {
+            let default_line = variables_tf
+                .lines()
+                .skip_while(|l| !l.contains(&format!("variable \"{var_name}\"")))
+                .find(|l| l.trim_start().starts_with("default"))
+                .unwrap_or_else(|| panic!("{var_name} must declare a default"));
+            assert!(
+                default_line.contains(expected),
+                "{var_name} must default to {expected}: {default_line}"
+            );
+        }
+
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            main_tf.contains("max_instance_request_concurrency = 80"),
+            "main.tf must set concurrency to 80 requests per instance (Cloud Run's own \
+             default, made explicit and tunable): {main_tf}"
+        );
+    }
+
+    #[test]
+    fn gcp_variables_tf_documents_db_tier_connection_budget_vs_max_instances() {
+        // db-f1-micro's small max_connections ceiling (~25) combined with
+        // pool_size=10 (autumn.production.toml.example) and the default
+        // max_instances of 10 means scaling out under real load can exhaust
+        // the tier's connection budget well before hitting max_instances —
+        // not an apply-time failure, but a documented gotcha operators must
+        // resize for before relying on autoscaling in production.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            variables_tf.contains("max_connections") && variables_tf.contains("pool_size"),
+            "variables.tf must document the relationship between db_tier's \
+             max_connections ceiling and max_instances * pool_size, so operators know \
+             to resize db_tier before scaling out in production: {variables_tf}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_documents_always_allocated_cpu_option() {
+        // Issue #1280 asks for a "CPU: always-allocated option commented
+        // out for latency-sensitive workloads" — Cloud Run's cost-optimized
+        // default only allocates CPU while a request is in flight
+        // (cpu_idle = true); the always-allocated alternative must be
+        // present, just not the active setting.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let resources_block = content
+            .split("resources {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n      }").next())
+            .expect("the Cloud Run service container must declare a resources block");
+        assert!(
+            resources_block.contains("cpu_idle = true"),
+            "cpu_idle must default to true (cost-optimized, scale-to-zero-friendly): \
+             {resources_block}"
+        );
+        assert!(
+            resources_block
+                .lines()
+                .any(|l| l.trim_start().starts_with("# cpu_idle = false")),
+            "an always-allocated-CPU option (cpu_idle = false) must be present, \
+             commented out, for latency-sensitive workloads: {resources_block}"
+        );
+    }
+
+    #[test]
+    fn gcp_secrets_have_no_default_and_are_sensitive() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        for var_name in ["database_admin_password", "signing_secret"] {
+            let block = content
+                .split(&format!("variable \"{var_name}\""))
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| panic!("variables.tf must declare {var_name}"));
+            assert!(
+                block.contains("sensitive") && block.contains("true"),
+                "{var_name} must be marked sensitive: {block}"
+            );
+            assert!(
+                !block.contains("default"),
+                "{var_name} must have no default value: {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcp_no_committed_secret_literals() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let tfvars = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
+        // The documented placeholder ("# database_admin_password = (set via ...)") is a
+        // commented-out line, matching the azure-container-apps/aws-* targets' identical
+        // convention — only a non-comment assignment would be a real committed secret.
+        for line in tfvars.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            assert!(
+                !trimmed.starts_with("database_admin_password")
+                    && !trimmed.starts_with("signing_secret"),
+                "terraform.tfvars.example must not assign the secret variables directly \
+                 on a non-comment line: {line:?} in {tfvars}"
+            );
+        }
+        assert!(
+            tfvars.contains("TF_VAR_database_admin_password")
+                && tfvars.contains("TF_VAR_signing_secret"),
+            "terraform.tfvars.example must document the TF_VAR_* env var pattern instead: \
+             {tfvars}"
+        );
+    }
+
+    #[test]
+    fn gcp_target_adds_terraform_gitignore_entries() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let gitignore = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        for pattern in [
+            ".terraform/",
+            "*.tfstate",
+            "*.tfstate.*",
+            "terraform.tfvars",
+        ] {
+            assert!(
+                gitignore.contains(pattern),
+                ".gitignore must contain {pattern:?} for the gcp-cloud-run target: {gitignore}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcp_dockerignore_excludes_terraform_state() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
+        for pattern in [".terraform/", "*.tfstate", "terraform.tfvars"] {
+            assert!(
+                content.contains(pattern),
+                ".dockerignore must exclude {pattern:?} so terraform.tfstate is never sent \
+                 to the Docker build context: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcp_outputs_tf_declares_expected_outputs_with_no_unsubstituted_placeholders() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-blog");
+        init(&dir, "my-blog", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("outputs.tf")).unwrap();
+        for output in [
+            "service_url",
+            "service_name",
+            "artifact_registry_repository_url",
+            "migrate_job_name",
+            "service_account_email",
+            "project_id",
+        ] {
+            assert!(
+                content.contains(&format!("output \"{output}\"")),
+                "outputs.tf must declare output {output:?}: {content}"
+            );
+        }
+        assert!(
+            content.contains("my-blog"),
+            "outputs.tf must substitute the project name: {content}"
+        );
+        assert!(
+            !content.contains("{{"),
+            "outputs.tf must not contain unsubstituted placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn init_without_force_errors_if_gcp_workflow_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        fs::write(dir.join(".github/workflows/gcp-deploy.yml"), "existing").unwrap();
+        let err = init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap_err();
+        assert!(matches!(err, ReleaseError::FileExists(_)));
+    }
+
+    #[test]
+    fn gcp_target_gitignore_merge_is_idempotent_on_repeat_init() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        init(&dir, "my-app", true, Target::GcpCloudRun, false).unwrap();
+        let gitignore = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        let terraform_dir_count = gitignore
+            .lines()
+            .filter(|l| l.trim() == ".terraform/")
+            .count();
+        assert_eq!(
+            terraform_dir_count, 1,
+            "re-running init with --force must not duplicate gitignore entries: {gitignore}"
+        );
+    }
+
+    // ── gcp-cloud-run workflow ────────────────────────────────────────────────
+
+    #[test]
+    fn gcp_workflow_triggers_on_tag_push_and_manual_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("tags:"),
+            "gcp-deploy.yml must trigger on tag push: {content}"
+        );
+        assert!(
+            content.contains("workflow_dispatch:"),
+            "gcp-deploy.yml must also support manual dispatch: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_authenticates_via_workload_identity_federation() {
+        // No long-lived service account key: the workflow must use OIDC via
+        // google-github-actions/auth with a workload identity provider, not
+        // a downloaded JSON key.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("google-github-actions/auth@v2"),
+            "gcp-deploy.yml must authenticate via google-github-actions/auth: {content}"
+        );
+        assert!(
+            content.contains("workload_identity_provider"),
+            "gcp-deploy.yml must use Workload Identity Federation, not a static key: {content}"
+        );
+        assert!(
+            !content.to_lowercase().contains("credentials_json"),
+            "gcp-deploy.yml must not authenticate via a downloaded service-account key: \
+             {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_selects_the_configured_target_project() {
+        // WIF authentication alone doesn't set gcloud's active project — if
+        // the deployer service account lives in a different project than
+        // the one this scaffold's resources were created in (e.g. a shared
+        // CI project), every gcloud command below would target the wrong
+        // project (or fail to find the resources) without this.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        let auth_step = content
+            .split("uses: google-github-actions/auth@v2")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("the auth step must be present");
+        assert!(
+            auth_step.contains("project_id: ${{ vars.GCP_PROJECT_ID }}"),
+            "the auth step must pass project_id so gcloud targets the configured \
+             project, not wherever the deployer service account happens to live: \
+             {auth_step}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_sets_up_gcloud_and_configures_docker_before_building() {
+        // ubuntu-latest doesn't ship gcloud, and `docker push` to Artifact
+        // Registry needs a configured credential helper — without both,
+        // every build/push step in this workflow fails.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        let auth_pos = content
+            .find("google-github-actions/auth@v2")
+            .expect("auth step must be present");
+        let setup_pos = content
+            .find("google-github-actions/setup-gcloud@v2")
+            .expect("gcp-deploy.yml must set up the gcloud CLI");
+        let configure_docker_pos = content
+            .find("run: gcloud auth configure-docker")
+            .expect("gcp-deploy.yml must configure Docker for Artifact Registry");
+        let build_pos = content
+            .find("docker build \\")
+            .expect("build step must be present");
+        assert!(
+            auth_pos < setup_pos
+                && setup_pos < configure_docker_pos
+                && configure_docker_pos < build_pos,
+            "auth, then gcloud setup, then Docker configuration must all precede the \
+             build step: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_builds_pushes_to_artifact_registry_and_deploys() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("docker build"),
+            "gcp-deploy.yml must build the release image: {content}"
+        );
+        assert!(
+            content.contains("docker push"),
+            "gcp-deploy.yml must push to Artifact Registry: {content}"
+        );
+        assert!(
+            content.contains("gcloud run services update"),
+            "gcp-deploy.yml must deploy the new image to the Cloud Run service: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_passes_git_provenance_build_args_to_docker() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        for arg in [
+            "AUTUMN_BUILD_GIT_SHA",
+            "AUTUMN_BUILD_GIT_SHA_SHORT",
+            "AUTUMN_BUILD_GIT_BRANCH",
+            "AUTUMN_BUILD_GIT_DIRTY",
+            "AUTUMN_BUILD_TIMESTAMP",
+        ] {
+            assert!(
+                content.contains(&format!("--build-arg {arg}=")),
+                "gcp-deploy.yml's docker build must pass --build-arg {arg}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcp_workflow_updates_migration_job_image_before_executing_it() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+
+        let migration_step = content
+            .split("Run database migrations")
+            .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
+            .expect("a 'Run database migrations' step must exist");
+
+        let update_pos = migration_step
+            .find("gcloud run jobs update")
+            .expect("the migration job's image must be updated first");
+        let execute_pos = migration_step
+            .find("gcloud run jobs execute")
+            .expect("`jobs execute` must follow to actually run the now-updated job");
+        assert!(
+            update_pos < execute_pos,
+            "the job's image must be updated BEFORE it's executed: {migration_step}"
+        );
+
+        let update_block = &migration_step[update_pos..execute_pos];
+        assert!(
+            update_block.contains("--image"),
+            "`jobs update` must be the one that carries --image: {update_block}"
+        );
+
+        let execute_block = &migration_step[execute_pos..];
+        assert!(
+            !execute_block.contains("--image"),
+            "`jobs execute` must not carry --image: {execute_block}"
+        );
+        assert!(
+            execute_block.contains("--wait"),
+            "`jobs execute` must block until the execution finishes via --wait, so the \
+             deploy step below never runs against an unmigrated schema: {execute_block}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_never_hardcodes_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("secrets."),
+            "gcp-deploy.yml must source credentials from GitHub Actions secrets, never \
+             hardcode them: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_runs_migrations_before_updating_the_service() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        let migrate_pos = content
+            .find("gcloud run jobs execute \"$GCP_MIGRATE_JOB_NAME\"")
+            .expect("migration job execute must be present");
+        let deploy_pos = content
+            .find("gcloud run services update \"$GCP_SERVICE_NAME\"")
+            .expect("deploy step must be present");
+        assert!(
+            migrate_pos < deploy_pos,
+            "the migration job must run BEFORE the service is updated to the new image: \
+             {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_sanitizes_ref_name_for_docker_tag() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("tr -c 'A-Za-z0-9_.-' '-'"),
+            "gcp-deploy.yml must map every character outside Docker's tag charset to \"-\": \
+             {content}"
+        );
+        assert!(
+            !content.contains(":${GITHUB_REF_NAME}") && !content.contains(":$GITHUB_REF_NAME"),
+            "no docker/gcloud command may use the raw, unsanitized ref as an image tag: \
+             {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_image_tag_is_unique_per_execution() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("${GITHUB_SHA:0:12}"),
+            "the computed image tag must include the commit SHA: {content}"
+        );
+        assert!(
+            content.contains("${GITHUB_RUN_ID}") && content.contains("${GITHUB_RUN_ATTEMPT}"),
+            "the computed image tag must also include the run ID and run attempt: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_serializes_overlapping_runs() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("concurrency:"),
+            "gcp-deploy.yml must define a concurrency group so overlapping runs queue \
+             instead of racing: {content}"
+        );
+        assert!(
+            content.contains("cancel-in-progress: false"),
+            "cancel-in-progress must be false — killing a run mid-migration or \
+             mid-cutover is worse than making the next run wait: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_guards_against_superseded_run_before_migrating() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("actions: read"),
+            "gcp-deploy.yml must grant actions: read to query other workflow runs: {content}"
+        );
+        assert!(
+            content.contains("run_number > ${{ github.run_number }}"),
+            "the guard must compare against other runs' run_number: {content}"
+        );
+
+        let guard_pos = content
+            .find("gh api")
+            .expect("the run_number staleness guard must be present");
+        let migrate_pos = content
+            .find("gcloud run jobs execute \"$GCP_MIGRATE_JOB_NAME\"")
+            .expect("migration job execute must be present");
+        let deploy_pos = content
+            .find("gcloud run services update \"$GCP_SERVICE_NAME\"")
+            .expect("deploy step must be present");
+        assert!(
+            guard_pos < migrate_pos && migrate_pos < deploy_pos,
+            "the staleness guard must run BEFORE migration, which must run BEFORE \
+             deploy: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_documents_that_repo_variables_need_manual_resync() {
+        // GCP_SERVICE_NAME/GCP_MIGRATE_JOB_NAME/GCP_ARTIFACT_REGISTRY_URL are
+        // GitHub repository variables — a one-time snapshot of `terraform
+        // output`, not a live link to Terraform state. If app_name/region
+        // changes after the workflow is configured, Terraform renames the
+        // underlying GCP resources but GitHub has no way to know that
+        // happened; the header comment must say so explicitly rather than
+        // implying this stays in sync automatically.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("not a live link to Terraform") && content.contains("manually re-run"),
+            "gcp-deploy.yml's header comment must warn that the repository variables \
+             are a manual snapshot that goes stale after an app_name/region change, \
+             not something kept in sync automatically: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_sources_service_name_from_terraform_not_hardcoded() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "My_Test_App");
+        init(&dir, "My_Test_App", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("vars.GCP_SERVICE_NAME"),
+            "GCP_SERVICE_NAME must be sourced from a repository variable (terraform \
+             output service_name), not hardcoded: {content}"
+        );
+        assert!(
+            !content.contains("My_Test_App") && !content.contains("my-test-app"),
+            "gcp-deploy.yml must not bake in any form of the project name as a GCP \
+             resource identifier: {content}"
+        );
+        assert!(
+            !content.contains("{{project_name}}"),
+            "gcp-deploy.yml must not contain unsubstituted placeholders: {content}"
+        );
     }
 }

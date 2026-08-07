@@ -348,6 +348,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Actions only discovers `.github/workflows/` at the git repository root,
   not a Cargo workspace member subdirectory) — both previously
   Azure-specific — now cover all three Terraform targets generically.
+- **release:** `autumn release init --target gcp-cloud-run` (#1280) — a GCP
+  deployment target alongside `fly`/`azure-container-apps`/`aws-app-runner`/
+  `aws-ecs`. `main.tf` provisions an Artifact Registry repository, a VPC with
+  a Serverless VPC Access connector, Cloud SQL for PostgreSQL on a private IP
+  (no public exposure), a dedicated runtime service account scoped to
+  `roles/cloudsql.client` plus per-secret `secretAccessor` grants (never a
+  project-wide `secretAccessor` binding), Secret Manager entries for the
+  database URL and signing secret, the Cloud Run service itself (min 1 / max
+  10 instances), a one-shot Cloud Run Job that runs `autumn migrate`, and an
+  optional Memorystore Redis instance gated behind `enable_redis_cache` (same
+  infrastructure-only caveat as Azure's Redis Cache and AWS's ElastiCache —
+  the app must also depend on `autumn-cache-redis` and register
+  `RedisCachePlugin`). `.github/workflows/gcp-deploy.yml` is an opt-in
+  Workload-Identity-Federation-based workflow (no service account key) that
+  builds the release image, pushes it to Artifact Registry, updates and
+  executes the migration job to completion via `gcloud run jobs execute
+  --wait` (a native synchronous wait — no manual poll loop needed, unlike the
+  Azure/AWS targets' workflows), then updates the Cloud Run service. The
+  database connection string is derived inside Terraform from the Cloud SQL
+  instance the same apply creates rather than taken as an input variable, so
+  a single `terraform apply` is enough. Both the service and the migration
+  job start from Google's public Cloud Run "hello" quickstart image
+  (`bootstrap_image`) — Cloud Run must have *some* image to create a first
+  revision, and a brand-new Artifact Registry repository has none yet — and
+  `lifecycle.ignore_changes` stops a later `terraform apply` from reverting a
+  live deploy back to it. GCP resource names are sanitized the same way as
+  the other Terraform targets (lowercased, mapped to alphanumerics-and-
+  hyphens, hyphen runs collapsed, a leading/trailing hyphen trimmed, a fixed
+  "app" fallback when that leaves nothing or a non-letter-leading value).
+  Unlike App Runner's own assigned subdomain (only known after the service is
+  created), Cloud Run's default URL format
+  (`<service>-<project number>.<region>.run.app`, using the project
+  *number*, not the project ID) is derivable at plan time from a
+  `google_project` data source, so `AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS` is
+  set correctly from the very first `terraform apply` — no second apply or
+  post-create CLI call needed. `autumn release init`'s shared Terraform
+  `.gitignore` merge and nested-workflow-relocation warning now cover all
+  four Terraform targets.
 - **i18n:** locale-prefixed routing and a path-preserving locale switcher
   (#1251). A new `[i18n] locale_prefix_enabled` flag (default `false` — no
   behavior change for existing apps) makes every route registered via

@@ -662,6 +662,7 @@ enum Commands {
     ///   autumn release init --target fly
     ///   autumn release init --target docker-compose
     ///   autumn release init --target azure-container-apps
+    ///   autumn release init --target gcp-cloud-run
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
@@ -1969,12 +1970,17 @@ enum ReleaseCommands {
     ///                                   terraform.tfvars.example, and
     ///                                   .github/workflows/aws-deploy.yml (VPC/ALB/ECS
     ///                                   Fargate/RDS — production path).
+    /// --target gcp-cloud-run          : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/gcp-deploy.yml (Artifact
+    ///                                   Registry + Cloud Run + Cloud SQL behind a VPC
+    ///                                   connector, opt-in Memorystore Redis).
     Init {
         /// Overwrite existing files instead of erroring on collision.
         #[arg(long)]
         force: bool,
         /// Deployment target: fly | docker-compose | azure-container-apps | aws-app-runner |
-        /// aws-ecs (omit for bare Dockerfile).
+        /// aws-ecs | gcp-cloud-run (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
         /// Scaffold a separate worker-role service in the generated
@@ -6156,6 +6162,16 @@ mod tests {
             panic!("expected release init");
         };
         assert_eq!(target.as_deref(), Some("aws-ecs"));
+    }
+
+    #[test]
+    fn parse_release_init_with_gcp_cloud_run_target() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "gcp-cloud-run"])
+            .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("gcp-cloud-run"));
     }
 
     #[test]
