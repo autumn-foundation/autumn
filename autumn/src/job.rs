@@ -3968,6 +3968,42 @@ impl LocalQueueBuffer {
     }
 }
 
+/// Equal-jitter backoff: spreads job retries across `[base/2, base]` instead of
+/// retrying every failed job at the *exact* same virtual instant.
+///
+/// The local job runtime's exponential backoff (`base_delay =
+/// initial_backoff_ms * 2^(attempt-1)`) is a pure function of
+/// `initial_backoff_ms` and `attempt` — nothing job-specific. When several jobs
+/// in the same queue fail at the same instant (a downstream dependency blips
+/// and takes every in-flight job down with it), every one of them computes the
+/// identical `base_delay` and therefore retries at the identical instant: a
+/// synchronized "thundering herd" that immediately re-floods the dependency it
+/// just backed off from instead of spreading the retry load. Drawing the
+/// spread from the framework's injected [`crate::entropy::Entropy`] seam
+/// breaks the synchronization — real OS entropy in production, seeded and
+/// bit-for-bit reproducible under a [`crate::sim::Sim`] run — while keeping the
+/// worst case no worse than the un-jittered delay (`delay <= base_delay_ms`),
+/// so this changes no existing retry-timeout budget.
+///
+/// "Equal jitter" (half the delay is guaranteed, the other half is random) is
+/// used over "full jitter" (`rand(0, base)`) so a retry can never fire
+/// near-instantly under heavy jitter — see
+/// <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>.
+///
+/// `half` rounds *up* (`div_ceil`, not plain integer division) so a small
+/// configured backoff is still honored: at `base_delay_ms = 1`, plain
+/// `1 / 2 == 0` would let the retry fire immediately (`0ms`) instead of
+/// preserving the configured 1ms floor, and would do so on *every* attempt of
+/// a job configured with a tiny backoff — silently turning it into a tight
+/// retry loop (Codex review). `spread` is sized so `half + (0..spread)` covers
+/// exactly `[half, base_delay_ms]` inclusive, so the delay is never less than
+/// half the base and never more than the base itself.
+fn jittered_retry_delay_ms(entropy: &dyn crate::entropy::Entropy, base_delay_ms: u64) -> u64 {
+    let half = base_delay_ms.div_ceil(2);
+    let spread = base_delay_ms - half + 1;
+    half + entropy.next_u64() % spread
+}
+
 #[allow(clippy::too_many_lines)]
 async fn execute_local_job(
     job: QueuedJob,
@@ -4171,7 +4207,8 @@ async fn execute_local_job(
                 let traceparent = job.traceparent;
                 #[cfg(feature = "telemetry-otlp")]
                 let tracestate = job.tracestate;
-                let delay = backoff_ms.saturating_mul(2_u64.saturating_pow(job.attempt - 1));
+                let base_delay = backoff_ms.saturating_mul(2_u64.saturating_pow(job.attempt - 1));
+                let delay = jittered_retry_delay_ms(state.entropy(), base_delay);
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     registry.record_enqueue(&name);
@@ -9002,6 +9039,64 @@ mod tests {
                 "forced failure",
             )))
         })
+    }
+
+    #[test]
+    fn jittered_retry_delay_stays_within_the_equal_jitter_bounds() {
+        let entropy = crate::entropy::SeededEntropy::new(0);
+        for _ in 0..1_000 {
+            let delay = jittered_retry_delay_ms(&entropy, 1_000);
+            assert!(
+                (500..=1_000).contains(&delay),
+                "equal jitter must land in [base/2, base], got {delay}"
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_retry_delay_is_a_pure_function_of_the_entropy_stream() {
+        // Same seed, same number of prior draws ⇒ identical jittered delay —
+        // this is what makes a `#[sim_test]` retry-storm run bit-for-bit
+        // reproducible from its seed (W7, issue #1797).
+        let a = crate::entropy::SeededEntropy::new(42);
+        let b = crate::entropy::SeededEntropy::new(42);
+        let delays_a: Vec<u64> = (0..8).map(|_| jittered_retry_delay_ms(&a, 1_000)).collect();
+        let delays_b: Vec<u64> = (0..8).map(|_| jittered_retry_delay_ms(&b, 1_000)).collect();
+        assert_eq!(delays_a, delays_b);
+        assert!(
+            delays_a
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 1,
+            "a real spread of draws should not collapse to a single delay value: {delays_a:?}"
+        );
+    }
+
+    #[test]
+    fn jittered_retry_delay_preserves_a_one_millisecond_backoff() {
+        // A job configured with `backoff_ms = 1` must still wait ~1ms, not
+        // retry immediately: plain integer division (`1 / 2 == 0`) would let
+        // every attempt draw a 0ms delay, silently turning a tiny configured
+        // backoff into a tight retry loop (Codex review).
+        let entropy = crate::entropy::SeededEntropy::new(3);
+        for _ in 0..256 {
+            assert_eq!(jittered_retry_delay_ms(&entropy, 1), 1);
+        }
+    }
+
+    #[test]
+    fn jittered_retry_delay_never_exceeds_the_unjittered_delay() {
+        // The fix must never make a retry wait *longer* than the un-jittered
+        // exponential delay — only spread the herd within it — so it changes
+        // no existing retry-timeout budget.
+        let entropy = crate::entropy::SeededEntropy::new(7);
+        for base in [0, 1, 2, 3, 100, 250, 1_000, 60_000] {
+            for _ in 0..64 {
+                let delay = jittered_retry_delay_ms(&entropy, base);
+                assert!(delay <= base, "delay {delay} exceeded base {base}");
+            }
+        }
     }
 
     #[cfg(feature = "db")]

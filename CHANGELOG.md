@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sim-testing:** fix a genuine **job-backoff thundering herd** the
+  deterministic simulation harness caught (W7, #1797): the local job
+  runtime's retry backoff (`execute_local_job`, `job.rs`) computed a pure
+  exponential delay (`initial_backoff_ms * 2^(attempt-1)`) with no jitter —
+  a function of a job's *configuration* only, not its identity — so when
+  several jobs in the same queue fail at the same instant (a downstream
+  dependency blip), every one of them retried at the *exact same* instant,
+  immediately re-flooding the dependency it just backed off from. The new
+  `jittered_retry_delay_ms` draws an equal-jitter spread
+  (`[base.div_ceil(2), base]`, never *longer* than the un-jittered delay) from
+  the framework's injected `Entropy` seam (`state.entropy()`) — real OS
+  entropy in production, seeded and bit-for-bit reproducible under a
+  `#[sim_test]` seed; the ceiling (not plain integer division) keeps a small
+  configured `backoff_ms` (e.g. `1`) from rounding its floor down to an
+  immediate 0ms retry (Codex review). A real-clock
+  integration test cannot deliberately reproduce this bug (it would need N
+  real jobs to fail within the same millisecond); the new worked-example test
+  (`tests/integration/sim_retry_storm.rs`) builds the adversarial condition
+  directly by enqueuing N jobs that all fail their first attempt on the
+  sim's paused runtime, then asserts via `always!`/`sometimes!` that their
+  retries spread across more than one checkpoint of the backoff window — the
+  exact class of whole-app concurrency bug DST (#1797) exists to catch.
+  Verified the test actually catches the regression: temporarily reverting
+  `jittered_retry_delay_ms` to the old un-jittered formula reproduces the
+  herd (all 12 retries land in the final checkpoint bucket) and fails the
+  `always!`; restoring the fix passes it again. Entropy injection is opt-in
+  under the sim (`Sim::build` wires the virtual clock automatically but not
+  entropy), and the test's first draft missed wiring it, so its jitter
+  silently drew from real OS randomness rather than `AUTUMN_SIM_SEED` (Codex
+  review) — fixed by mounting with `.with_entropy(SeededEntropy::new(sim.seed))`,
+  proved by a new `retry_checkpoints_replay_deterministically_from_the_seed`
+  test that runs the same seed twice and asserts on the identical outcome.
+  New guide
+  `docs/guide/simulation-testing.md` walks through `#[sim_test]`, virtual
+  time, deterministic entropy, chaos, `always!`/`sometimes!`, the seed-sweep
+  runner, and this worked example end-to-end. [no-plugin]
 - **pdf:** render server-side templates to downloadable PDF documents
   (#1317). A new opt-in `pdf` Cargo feature adds `autumn_web::pdf::Pdf`, an
   `IntoResponse` built on the existing `Download` responder — `Pdf::from_html`
