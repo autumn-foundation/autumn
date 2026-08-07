@@ -407,6 +407,12 @@ resource "google_cloud_run_v2_service" "this" {
       max_instance_count = var.max_instances
     }
 
+    # Requests per instance before Cloud Run starts another one. 80 is
+    # Cloud Run's own default when this is omitted entirely; set explicitly
+    # (rather than left implicit) so it's a visible, tunable knob instead of
+    # an unstated platform default.
+    max_instance_request_concurrency = 80
+
     vpc_access {
       connector = google_vpc_access_connector.this.id
       # Only route RFC 1918 (private) destinations through the connector —
@@ -426,6 +432,24 @@ resource "google_cloud_run_v2_service" "this" {
 
       ports {
         container_port = 3000
+      }
+
+      # CPU is only allocated while an instance is actively handling a
+      # request by default (`cpu_idle = true`) — the cost-optimized setting,
+      # and required for `min_instances = 0` scale-to-zero to actually save
+      # cost between requests. Latency-sensitive workloads that do
+      # background work between requests (e.g. an in-process scheduler, a
+      # long-lived websocket keepalive) need the CPU allocated for the full
+      # instance lifetime instead: set `cpu_idle = false` below (Cloud Run
+      # then bills for the whole instance lifetime, not just request
+      # processing).
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+        cpu_idle = true
+        # cpu_idle = false  # uncomment for always-allocated CPU
       }
 
       env {

@@ -5329,6 +5329,43 @@ previous_secrets = []
                 "{var_name} must default to {expected}: {default_line}"
             );
         }
+
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            main_tf.contains("max_instance_request_concurrency = 80"),
+            "main.tf must set concurrency to 80 requests per instance (Cloud Run's own \
+             default, made explicit and tunable): {main_tf}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_documents_always_allocated_cpu_option() {
+        // Issue #1280 asks for a "CPU: always-allocated option commented
+        // out for latency-sensitive workloads" — Cloud Run's cost-optimized
+        // default only allocates CPU while a request is in flight
+        // (cpu_idle = true); the always-allocated alternative must be
+        // present, just not the active setting.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let resources_block = content
+            .split("resources {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n      }").next())
+            .expect("the Cloud Run service container must declare a resources block");
+        assert!(
+            resources_block.contains("cpu_idle = true"),
+            "cpu_idle must default to true (cost-optimized, scale-to-zero-friendly): \
+             {resources_block}"
+        );
+        assert!(
+            resources_block
+                .lines()
+                .any(|l| l.trim_start().starts_with("# cpu_idle = false")),
+            "an always-allocated-CPU option (cpu_idle = false) must be present, \
+             commented out, for latency-sensitive workloads: {resources_block}"
+        );
     }
 
     #[test]
