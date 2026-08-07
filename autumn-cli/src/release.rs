@@ -5533,7 +5533,7 @@ previous_secrets = []
             .find("gcloud auth configure-docker")
             .expect("gcp-deploy.yml must configure Docker for Artifact Registry: {content}");
         let build_pos = content
-            .find("docker build")
+            .find("docker build \\")
             .expect("build step must be present");
         assert!(
             auth_pos < setup_pos && setup_pos < configure_docker_pos && configure_docker_pos < build_pos,
