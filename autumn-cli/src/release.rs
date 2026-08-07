@@ -5445,12 +5445,42 @@ previous_secrets = []
             // google_service_account.cloud_run fails with SERVICE_DISABLED
             // on a fresh project without this API pre-enabled.
             "iam.googleapis.com",
+            // data.google_project.this reads project metadata through the
+            // Cloud Resource Manager API — a fresh project without this API
+            // pre-enabled fails at plan time with SERVICE_DISABLED.
+            "cloudresourcemanager.googleapis.com",
         ] {
             assert!(
                 content.contains(api),
                 "main.tf must enable {api}: {content}"
             );
         }
+    }
+
+    #[test]
+    fn gcp_main_tf_project_data_source_waits_for_resourcemanager_api_activation() {
+        // data.google_project.this is a data source, which Terraform will
+        // otherwise try to read during the initial refresh/plan phase —
+        // before google_project_service.apis has run — on a fresh project
+        // where cloudresourcemanager.googleapis.com isn't enabled yet, that
+        // read fails with SERVICE_DISABLED before any resource here even
+        // starts creating. depends_on defers a data source's read until
+        // after its dependencies have applied.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let project_data_block = content
+            .split("data \"google_project\" \"this\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the google_project data source");
+        assert!(
+            project_data_block.contains("depends_on")
+                && project_data_block.contains("google_project_service.apis"),
+            "data.google_project.this must depend on google_project_service.apis: \
+             {project_data_block}"
+        );
     }
 
     #[test]

@@ -59,8 +59,17 @@ provider "google" {
 # derivable at plan time, with no chicken-and-egg problem the way App
 # Runner's own assigned subdomain has (App Runner has nothing to derive its
 # hostname from until the service is actually created).
+#
+# This read hits the Cloud Resource Manager API, which a fresh project may
+# not have enabled yet — depends_on defers it until after
+# google_project_service.apis has enabled cloudresourcemanager.googleapis.com,
+# rather than letting Terraform evaluate it during the initial refresh/plan
+# (before any resource in this configuration has run) and fail with
+# SERVICE_DISABLED.
 data "google_project" "this" {
   project_id = var.project_id
+
+  depends_on = [google_project_service.apis]
 }
 
 # Secret Manager secret IDs and the Cloud SQL instance name are soft-deleted
@@ -178,6 +187,11 @@ locals {
       # SERVICE_DISABLED on a fresh project without the IAM API already
       # enabled.
       "iam.googleapis.com",
+      # data.google_project.this (above) reads project metadata through the
+      # Cloud Resource Manager API — a fresh project without this API
+      # already enabled fails at plan time with SERVICE_DISABLED, before
+      # any other resource here even starts creating.
+      "cloudresourcemanager.googleapis.com",
     ],
     var.enable_redis_cache ? ["redis.googleapis.com"] : []
   ))
