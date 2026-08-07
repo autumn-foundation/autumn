@@ -119,6 +119,12 @@ locals {
   # "-connector" suffix (10 characters) to still fit under 25.
   connector_name_safe = trim(substr(local.app_name_hyphenated, 0, 15), "-")
 
+  # Memorystore instance IDs are capped at 40 characters — app_name_safe
+  # alone is already capped at 40, so appending the fixed "-redis" suffix
+  # (6 characters) can overflow it for any sanitized name longer than 34
+  # characters. Its own shorter budget here leaves exactly that headroom.
+  redis_name_safe = trim(substr(local.app_name_hyphenated, 0, 34), "-")
+
   # Cloud Run's default URL is "https://<service>-<project number>.<region>.run.app"
   # (not the project ID) — a format Google switched to in 2022 specifically
   # so a deleted-and-recreated service under someone else's project can't be
@@ -361,7 +367,7 @@ resource "google_secret_manager_secret_iam_member" "signing_secret_access" {
 resource "google_redis_instance" "this" {
   count = var.enable_redis_cache ? 1 : 0
 
-  name               = "${local.app_name_safe}-redis"
+  name               = "${local.redis_name_safe}-redis"
   tier               = "BASIC"
   memory_size_gb     = 1
   region             = var.region

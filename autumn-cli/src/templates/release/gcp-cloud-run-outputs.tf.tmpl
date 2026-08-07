@@ -45,3 +45,14 @@ output "region" {
   description = "GCP region `terraform apply` provisioned into — used by every `gcloud` call in the deploy walkthrough/CI so they always target the same region Terraform used."
   value       = var.region
 }
+
+# `gcloud`'s "current project" is whatever `gcloud config get-value project`
+# (or the operator's ambient shell state) happens to be set to — not
+# necessarily this project. Every `gcloud run`/`gcloud sql` call in the
+# deploy walkthrough must pass `--project` explicitly with this value, or it
+# can silently target the wrong project (or fail to find the resources this
+# apply just created) if the two ever diverge.
+output "project_id" {
+  description = "GCP project `terraform apply` provisioned into — pass as `--project` to every `gcloud` call in the deploy walkthrough so it never depends on gcloud's ambient current-project setting."
+  value       = var.project_id
+}

@@ -5083,6 +5083,30 @@ previous_secrets = []
     }
 
     #[test]
+    fn gcp_redis_instance_name_stays_under_memorystores_40_char_limit() {
+        // app_name_safe alone is already capped at 40 (Memorystore's own
+        // limit) — appending the fixed "-redis" suffix on top of it would
+        // overflow the limit for any sanitized name longer than 34
+        // characters, exactly the class of bug the VPC connector's own
+        // shorter budget already guards against.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("redis_name_safe = trim(substr(local.app_name_hyphenated, 0, 34)"),
+            "main.tf must derive a length-bounded local for the Redis instance name, \
+             capped so the fixed \"-redis\" suffix still fits under Memorystore's \
+             40-character limit: {content}"
+        );
+        assert!(
+            content.contains("\"${local.redis_name_safe}-redis\""),
+            "the Redis instance must use the length-bounded local, not app_name_safe \
+             directly: {content}"
+        );
+    }
+
+    #[test]
     fn gcp_main_tf_postgres_database_name_is_length_bounded() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -5538,6 +5562,7 @@ previous_secrets = []
             "artifact_registry_repository_url",
             "migrate_job_name",
             "service_account_email",
+            "project_id",
         ] {
             assert!(
                 content.contains(&format!("output \"{output}\"")),

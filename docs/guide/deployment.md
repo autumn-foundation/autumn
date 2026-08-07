@@ -1548,7 +1548,7 @@ This generates:
 |---|---|
 | `main.tf` | An Artifact Registry repository, a VPC with a Serverless VPC Access connector, Cloud SQL for PostgreSQL on a private IP (no public exposure), a dedicated runtime service account scoped to `roles/cloudsql.client` plus per-secret `secretAccessor` grants, Secret Manager entries for the database URL and signing secret, the Cloud Run service itself, and a one-shot Cloud Run Job that runs `autumn migrate`. An optional Memorystore Redis instance is gated behind `enable_redis_cache` — **infrastructure only**, see the callout below. |
 | `variables.tf` | `project_id` (required — no default), `app_name`, `region`, `image_tag`, `db_tier`, `vpc_connector_cidr`, `bootstrap_image`, `min_instances`/`max_instances` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
-| `outputs.tf` | `service_url`, `service_name`, `artifact_registry_repository_url`, `migrate_job_name`, `service_account_email`, `sql_instance_connection_name`, and `region`. |
+| `outputs.tf` | `service_url`, `service_name`, `artifact_registry_repository_url`, `migrate_job_name`, `service_account_email`, `sql_instance_connection_name`, `region`, and `project_id`. |
 | `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
 | `.github/workflows/gcp-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to Artifact Registry, updates and executes the migration job to completion, then updates the Cloud Run service — on a `v*` tag push (or manual dispatch). |
 
@@ -1614,6 +1614,14 @@ workaround is needed). Build and push your real image, run migrations, then
 cut the service over:
 
 ```bash
+# gcloud's "current project" is whatever `gcloud config get-value project`
+# happens to be set to — not necessarily this one. Pass --project to every
+# call below explicitly, or a stale/different ambient project setting can
+# silently target the wrong project (the image push would still succeed,
+# since $AR_URL embeds the target project on its own — only for migration
+# and deployment to then fail to find the resources this apply just
+# created, or worse, update same-named resources elsewhere).
+PROJECT_ID="$(terraform output -raw project_id)"
 REGION="$(terraform output -raw region)"
 SERVICE_NAME="$(terraform output -raw service_name)"   # sanitized — may differ from your Cargo package name
 AR_URL="$(terraform output -raw artifact_registry_repository_url)"
@@ -1638,11 +1646,11 @@ docker push "$AR_URL/$SERVICE_NAME:$TAG"
 # finishes and exits non-zero on failure — no manual poll loop needed here,
 # unlike the Azure/AWS walkthroughs above, since gcloud provides a
 # synchronous wait natively.
-gcloud run jobs update "$MIGRATE_JOB" --region "$REGION" \
+gcloud run jobs update "$MIGRATE_JOB" --project "$PROJECT_ID" --region "$REGION" \
   --image "$AR_URL/$SERVICE_NAME:$TAG" --quiet
-gcloud run jobs execute "$MIGRATE_JOB" --region "$REGION" --wait
+gcloud run jobs execute "$MIGRATE_JOB" --project "$PROJECT_ID" --region "$REGION" --wait
 
-gcloud run services update "$SERVICE_NAME" --region "$REGION" \
+gcloud run services update "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
   --image "$AR_URL/$SERVICE_NAME:$TAG" --quiet
 ```
 
