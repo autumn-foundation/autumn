@@ -1582,6 +1582,16 @@ production, size `db_tier` so its `max_connections` comfortably exceeds
 `max_instances * pool_size` (e.g. `db-custom-2-7680` supports roughly 200),
 or lower `pool_size`/`max_instances` to fit the tier you're on.
 
+**Rotating `database_admin_password` replaces the sole live credential in
+place.** `google_sql_user.this`'s password update is ordered before the
+`database_url` secret version (so a new Cloud Run revision never starts
+with a password Cloud SQL hasn't accepted yet), but any already-running
+revision still holds the OLD password in its resolved env until it's
+replaced by the new one — a brief reconnect window during rollout, not a
+zero-downtime rotation. A fully staged handoff would need a second
+database user, which this scaffold doesn't provision; if you need
+zero-downtime credential rotation, add one and cut over manually.
+
 **Resource names are sanitized, not verbatim.** A Cargo package name may
 contain underscores or uppercase letters (both invalid in Cloud Run/RFC
 1035-style GCP resource names), so every resource name this scaffold

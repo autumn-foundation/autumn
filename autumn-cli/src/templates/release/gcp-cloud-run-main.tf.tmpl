@@ -366,6 +366,25 @@ resource "google_secret_manager_secret" "database_url" {
 resource "google_secret_manager_secret_version" "database_url" {
   secret      = google_secret_manager_secret.database_url.id
   secret_data = "postgres://${local.postgres_admin_username}:${urlencode(var.database_admin_password)}@${google_sql_database_instance.this.private_ip_address}:5432/${local.postgres_database_name}?sslmode=require"
+
+  # Unlike AWS RDS (where the master password lives directly on the DB
+  # instance resource, so referencing aws_db_instance.this.address here
+  # already creates an implicit ordering edge), Cloud SQL splits the
+  # instance and its user credentials into two independent resources —
+  # google_sql_database_instance.this (referenced above, for the private
+  # IP) and google_sql_user.this (which actually owns `password`). Without
+  # this explicit dependency, rotating database_admin_password gives
+  # Terraform no reason to update google_sql_user.this before this secret
+  # version — the two can apply in either order or concurrently, so the
+  # Cloud Run revision this secret version triggers (see the
+  # secret_key_ref version pin below) could start using the NEW password
+  # before Cloud SQL has actually accepted it. Ordering the secret version
+  # after the user update closes that specific race, though it doesn't
+  # eliminate a brief reconnect window for OLD revisions still holding the
+  # password that's being replaced in place — a full zero-downtime rotation
+  # would need a staged second database user, out of scope for this
+  # scaffold.
+  depends_on = [google_sql_user.this]
 }
 
 # AUTUMN_SECURITY__SIGNING_SECRET — required in production; see

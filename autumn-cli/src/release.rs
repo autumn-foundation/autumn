@@ -5257,6 +5257,39 @@ previous_secrets = []
     }
 
     #[test]
+    fn gcp_database_url_secret_version_waits_for_sql_user_password_update() {
+        // Unlike AWS RDS (master password lives on the DB instance
+        // resource itself, so referencing its .address here already
+        // creates an implicit ordering edge), Cloud SQL splits the
+        // instance and its user credentials into two independent
+        // resources: google_sql_database_instance.this (referenced for
+        // the private IP) and google_sql_user.this (which actually owns
+        // `password`). Without an explicit dependency, rotating
+        // database_admin_password gives Terraform no reason to apply the
+        // google_sql_user.this password update before this secret
+        // version — the Cloud Run revision this secret version triggers
+        // (via the pinned .version) could then start using the NEW
+        // password before Cloud SQL has actually accepted it.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let secret_version_block = content
+            .split("resource \"google_secret_manager_secret_version\" \"database_url\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the database_url secret version resource");
+        assert!(
+            secret_version_block.contains("depends_on")
+                && secret_version_block.contains("google_sql_user.this"),
+            "google_secret_manager_secret_version.database_url must depend on \
+             google_sql_user.this so a password rotation updates Cloud SQL before the \
+             secret version (and the Cloud Run revision it triggers) picks up the new \
+             value: {secret_version_block}"
+        );
+    }
+
+    #[test]
     fn gcp_main_tf_secret_access_is_scoped_per_secret_not_project_wide() {
         // A project-wide `roles/secretmanager.secretAccessor` grant (via
         // google_project_iam_member) would let a compromised container read
