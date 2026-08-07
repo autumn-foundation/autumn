@@ -5280,11 +5280,20 @@ previous_secrets = []
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
         let tfvars = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
-        assert!(
-            !tfvars.contains("database_admin_password =")
-                && !tfvars.contains("signing_secret ="),
-            "terraform.tfvars.example must not assign the secret variables directly: {tfvars}"
-        );
+        // The documented placeholder ("# database_admin_password = (set via ...)") is a
+        // commented-out line, matching the azure-container-apps/aws-* targets' identical
+        // convention — only a non-comment assignment would be a real committed secret.
+        for line in tfvars.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            assert!(
+                !trimmed.starts_with("database_admin_password") && !trimmed.starts_with("signing_secret"),
+                "terraform.tfvars.example must not assign the secret variables directly \
+                 on a non-comment line: {line:?} in {tfvars}"
+            );
+        }
         assert!(
             tfvars.contains("TF_VAR_database_admin_password")
                 && tfvars.contains("TF_VAR_signing_secret"),
@@ -5521,10 +5530,10 @@ previous_secrets = []
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
         let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
         let migrate_pos = content
-            .find("gcloud run jobs execute")
+            .find("gcloud run jobs execute \"$GCP_MIGRATE_JOB_NAME\"")
             .expect("migration job execute must be present");
         let deploy_pos = content
-            .find("gcloud run services update")
+            .find("gcloud run services update \"$GCP_SERVICE_NAME\"")
             .expect("deploy step must be present");
         assert!(
             migrate_pos < deploy_pos,
@@ -5604,10 +5613,10 @@ previous_secrets = []
             .find("gh api")
             .expect("the run_number staleness guard must be present");
         let migrate_pos = content
-            .find("gcloud run jobs execute")
+            .find("gcloud run jobs execute \"$GCP_MIGRATE_JOB_NAME\"")
             .expect("migration job execute must be present");
         let deploy_pos = content
-            .find("gcloud run services update")
+            .find("gcloud run services update \"$GCP_SERVICE_NAME\"")
             .expect("deploy step must be present");
         assert!(
             guard_pos < migrate_pos && migrate_pos < deploy_pos,
