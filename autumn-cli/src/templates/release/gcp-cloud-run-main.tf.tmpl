@@ -112,6 +112,13 @@ locals {
     : local.service_account_id_base
   )
 
+  # Serverless VPC Access connector names are capped at 25 characters — far
+  # tighter than every other resource this scaffold touches (which get the
+  # usual 63-char RFC 1035 budget), so app_name_safe (capped at 40) needs its
+  # own, shorter budget here: 15 characters leaves room for the fixed
+  # "-connector" suffix (10 characters) to still fit under 25.
+  connector_name_safe = trim(substr(local.app_name_hyphenated, 0, 15), "-")
+
   # Cloud Run's default URL is "https://<service>-<project number>.<region>.run.app"
   # (not the project ID) — a format Google switched to in 2022 specifically
   # so a deleted-and-recreated service under someone else's project can't be
@@ -194,7 +201,7 @@ resource "google_service_networking_connection" "this" {
 # unused /28 in the VPC, distinct from the private-service-access range
 # above.
 resource "google_vpc_access_connector" "this" {
-  name          = "${local.app_name_safe}-connector"
+  name          = "${local.connector_name_safe}-connector"
   region        = var.region
   network       = google_compute_network.this.name
   ip_cidr_range = var.vpc_connector_cidr
@@ -244,8 +251,8 @@ resource "google_sql_database_instance" "this" {
     tier = var.db_tier
 
     ip_configuration {
-      ipv4_enabled                                 = false
-      private_network                              = google_compute_network.this.id
+      ipv4_enabled = false
+      private_network = google_compute_network.this.id
       enable_private_path_for_google_cloud_services = true
     }
 
@@ -494,12 +501,19 @@ resource "google_cloud_run_v2_service" "this" {
   # create the service as soon as the (still-valueless) secret exists,
   # racing the version write. The per-secret IAM grants must also exist
   # first: without `secretAccessor`, the bootstrap revision fails to resolve
-  # the secret at startup and the first apply never stabilizes.
+  # the secret at startup and the first apply never stabilizes. Referencing
+  # the redis_url resources without an index is deliberate and valid even
+  # though they're `count`-gated: when `enable_redis_cache = false` they have
+  # zero instances, so this depends on nothing extra; when `true`, it closes
+  # the identical race for Redis that the comment above describes for the
+  # other two secrets.
   depends_on = [
     google_secret_manager_secret_version.database_url,
     google_secret_manager_secret_version.signing_secret,
+    google_secret_manager_secret_version.redis_url,
     google_secret_manager_secret_iam_member.database_url_access,
     google_secret_manager_secret_iam_member.signing_secret_access,
+    google_secret_manager_secret_iam_member.redis_url_access,
   ]
 
   lifecycle {

@@ -3338,6 +3338,14 @@ previous_secrets = []
     }
 
     #[test]
+    fn parse_target_gcp_cloud_run() {
+        assert_eq!(
+            "gcp-cloud-run".parse::<Target>().unwrap(),
+            Target::GcpCloudRun
+        );
+    }
+
+    #[test]
     fn parse_target_unknown_is_error() {
         assert!("kubernetes".parse::<Target>().is_err());
     }
@@ -3351,6 +3359,7 @@ previous_secrets = []
             "azure-container-apps",
             "aws-app-runner",
             "aws-ecs",
+            "gcp-cloud-run",
         ] {
             assert!(err.contains(name), "error must mention '{name}': {err}");
         }
@@ -5235,6 +5244,75 @@ previous_secrets = []
     }
 
     #[test]
+    fn gcp_main_tf_wires_redis_env_vars_into_cloud_run_service() {
+        // Provisioning the Redis instance alone does nothing — Autumn's
+        // cache subsystem only activates it via these two env vars. A
+        // regression dropping the `dynamic "env"` blocks would silently
+        // leave the (paid) Memorystore instance unused while every other
+        // "redis is gated" assertion still passes.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("AUTUMN_CACHE__BACKEND"),
+            "main.tf must wire AUTUMN_CACHE__BACKEND into the Cloud Run service when \
+             Redis is enabled: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_CACHE__REDIS__URL")
+                && content.contains("google_secret_manager_secret.redis_url[0].secret_id"),
+            "main.tf must wire AUTUMN_CACHE__REDIS__URL from the redis_url secret: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_has_private_services_access_peering_for_cloud_sql() {
+        // Cloud SQL's (and Redis's) private IP depends entirely on this
+        // peering; ip_configuration alone doesn't provision it.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_compute_global_address") && content.contains("VPC_PEERING"),
+            "main.tf must reserve a VPC peering range for private services access: \
+             {content}"
+        );
+        assert!(
+            content.contains("google_service_networking_connection"),
+            "main.tf must establish the private services access peering connection: \
+             {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_enables_required_apis() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("google_project_service"),
+            "main.tf must enable the GCP APIs this scaffold's resources depend on, so a \
+             fresh project works without a manual `gcloud services enable` step: {content}"
+        );
+        for api in [
+            "run.googleapis.com",
+            "sqladmin.googleapis.com",
+            "secretmanager.googleapis.com",
+            "vpcaccess.googleapis.com",
+            "artifactregistry.googleapis.com",
+            "servicenetworking.googleapis.com",
+        ] {
+            assert!(
+                content.contains(api),
+                "main.tf must enable {api}: {content}"
+            );
+        }
+    }
+
+    #[test]
     fn gcp_scale_defaults_match_the_issue() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -5433,6 +5511,34 @@ previous_secrets = []
             !content.to_lowercase().contains("credentials_json"),
             "gcp-deploy.yml must not authenticate via a downloaded service-account key: \
              {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_workflow_sets_up_gcloud_and_configures_docker_before_building() {
+        // ubuntu-latest doesn't ship gcloud, and `docker push` to Artifact
+        // Registry needs a configured credential helper — without both,
+        // every build/push step in this workflow fails.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        let auth_pos = content
+            .find("google-github-actions/auth@v2")
+            .expect("auth step must be present");
+        let setup_pos = content
+            .find("google-github-actions/setup-gcloud@v2")
+            .expect("gcp-deploy.yml must set up the gcloud CLI: {content}");
+        let configure_docker_pos = content
+            .find("gcloud auth configure-docker")
+            .expect("gcp-deploy.yml must configure Docker for Artifact Registry: {content}");
+        let build_pos = content
+            .find("docker build")
+            .expect("build step must be present");
+        assert!(
+            auth_pos < setup_pos && setup_pos < configure_docker_pos && configure_docker_pos < build_pos,
+            "auth, then gcloud setup, then Docker configuration must all precede the \
+             build step: {content}"
         );
     }
 
