@@ -1600,11 +1600,11 @@ the VPC/connector, the Cloud SQL instance, the service account) is
 lowercased, any other character is mapped to a hyphen, runs of hyphens are
 collapsed to one, and a leading/trailing hyphen is trimmed — `my_app`/`My
 App`/`my--app` all become `my-app`. Sanitization happens once, in Terraform
-(`local.app_name_safe`) — the generated workflow never hardcodes a name; it
-reads the result back via `terraform output service_name` (as the
-`GCP_SERVICE_NAME` repository variable), so editing `app_name` in
-`terraform.tfvars` after scaffolding is picked up automatically instead of
-silently deploying under a stale name.
+(`local.app_name_safe`) — the generated workflow never *hardcodes* a name,
+reading `GCP_SERVICE_NAME` etc. as a repository variable instead of baking
+one into the YAML. But that variable is a snapshot you set from
+`terraform output`, not a live link to Terraform state — see the note on
+resyncing it below if you edit `app_name` after scaffolding.
 
 Why Cloud Run and not GKE or App Engine: it is the closest managed analog
 to Fly.io — fully managed, auto-TLS, managed ingress, scales to zero,
@@ -1689,10 +1689,29 @@ trusting GitHub's OIDC issuer is enough), and variables (not secrets —
 they're just config) `GCP_PROJECT_ID`/`GCP_REGION`/
 `GCP_ARTIFACT_REGISTRY_URL`/`GCP_SERVICE_NAME`/`GCP_MIGRATE_JOB_NAME` (all
 five are `terraform output` values — never hand-typed) — until then it
-stays dormant. Once configured, pushing a `v*` tag builds, pushes to
-Artifact Registry, updates and executes the migration job to completion
-(aborting before any deploy if it fails), and runs `gcloud run services
-update` automatically.
+stays dormant:
+
+```bash
+gh variable set GCP_PROJECT_ID --body "$(terraform output -raw project_id)"
+gh variable set GCP_REGION --body "$(terraform output -raw region)"
+gh variable set GCP_ARTIFACT_REGISTRY_URL --body "$(terraform output -raw artifact_registry_repository_url)"
+gh variable set GCP_SERVICE_NAME --body "$(terraform output -raw service_name)"
+gh variable set GCP_MIGRATE_JOB_NAME --body "$(terraform output -raw migrate_job_name)"
+```
+
+Once configured, pushing a `v*` tag builds, pushes to Artifact Registry,
+updates and executes the migration job to completion (aborting before any
+deploy if it fails), and runs `gcloud run services update` automatically.
+
+**These repository variables are a one-time snapshot, not a live link to
+Terraform state.** If you edit `app_name` (or `region`) in
+`terraform.tfvars` after the workflow is already configured, `terraform
+apply` renames the underlying Cloud Run service/job/Artifact Registry
+repository, but GitHub has no way to know that happened — the variables
+above keep pointing at the OLD names until you re-run the same
+`gh variable set` commands with fresh `terraform output` values. Skipping
+this after an `app_name` change means the next tag push builds and
+deploys against resources that may no longer exist.
 
 **Grant the deployer service account `iam.serviceAccountUser` on the
 runtime service account**, not just `run.developer` on the service: Cloud

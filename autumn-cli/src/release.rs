@@ -6130,6 +6130,27 @@ previous_secrets = []
     }
 
     #[test]
+    fn gcp_workflow_documents_that_repo_variables_need_manual_resync() {
+        // GCP_SERVICE_NAME/GCP_MIGRATE_JOB_NAME/GCP_ARTIFACT_REGISTRY_URL are
+        // GitHub repository variables — a one-time snapshot of `terraform
+        // output`, not a live link to Terraform state. If app_name/region
+        // changes after the workflow is configured, Terraform renames the
+        // underlying GCP resources but GitHub has no way to know that
+        // happened; the header comment must say so explicitly rather than
+        // implying this stays in sync automatically.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join(".github/workflows/gcp-deploy.yml")).unwrap();
+        assert!(
+            content.contains("not a live link to Terraform") && content.contains("manually re-run"),
+            "gcp-deploy.yml's header comment must warn that the repository variables \
+             are a manual snapshot that goes stale after an app_name/region change, \
+             not something kept in sync automatically: {content}"
+        );
+    }
+
+    #[test]
     fn gcp_workflow_sources_service_name_from_terraform_not_hardcoded() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "My_Test_App");

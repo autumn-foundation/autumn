@@ -27,12 +27,18 @@
 #   GCP_PROJECT_ID           — the project you deployed into.
 #   GCP_REGION                — output of `terraform output region`.
 #   GCP_ARTIFACT_REGISTRY_URL — output of `terraform output artifact_registry_repository_url`.
-#   GCP_SERVICE_NAME          — output of `terraform output service_name`. Always
-#     read from Terraform, never hardcoded: if `app_name` is edited in
-#     terraform.tfvars after scaffolding, Terraform renames the Cloud Run
-#     service to match, and this workflow must follow — not target whatever
-#     the project was called when `autumn release init` ran.
+#   GCP_SERVICE_NAME          — output of `terraform output service_name`.
 #   GCP_MIGRATE_JOB_NAME      — output of `terraform output migrate_job_name`.
+#
+# These repository variables are a snapshot, not a live link to Terraform
+# state: if `app_name` (or `region`) is edited in terraform.tfvars after
+# scaffolding, `terraform apply` renames the underlying GCP resources, but
+# GitHub has no way to know that happened — GCP_SERVICE_NAME/
+# GCP_MIGRATE_JOB_NAME/GCP_ARTIFACT_REGISTRY_URL stay pointed at the OLD
+# names until you manually re-run the `gh variable set` commands below
+# (see docs/guide/deployment.md's GCP section) with fresh `terraform
+# output` values. Forgetting this step means the next tag push builds and
+# deploys against resources that may no longer exist.
 
 name: gcp-deploy
 
