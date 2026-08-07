@@ -5,9 +5,15 @@ attribute that hands your test a seeded [`Sim`] handle, a paused deterministic
 executor, and a virtual clock, so your whole app's concurrency — retries,
 scheduled ticks, background jobs — runs identically on every machine and every
 run. A failure prints a copy-pasteable line that reproduces it exactly, and a
-seed-sweep runner explores thousands of seeds per commit looking for
-rare-interleaving bugs a conventional integration test would never stumble
-into.
+seed-sweep runner (`sweep_proptest`, see below) lets you drive *your own*
+workload against many seeds looking for rare-interleaving bugs a single-seed
+test would never stumble into. **This sweeping is opt-in, not automatic**:
+autumn's own CI runs a built-in `sim-sweep` job as a smoke check of the
+harness mechanism itself (a small, fixed toy scenario over a few hundred
+seeds) — it does not explore your application's interleavings. Wiring
+`sweep_proptest` against your own scenario, in your own CI, is how you get
+that coverage for your app; see "Property-based op-driving + the seed sweep"
+below.
 
 ```
 ┌──────────────────┐
@@ -50,8 +56,10 @@ use autumn_web::sim_test;
 #[sim_test]
 async fn deterministic(mut sim: Sim) {
     // The seed comes from `AUTUMN_SIM_SEED` (hex `0x..` or decimal), default 0.
-    // Everything derived from `sim` — its clock, its RNG, the app it mounts —
-    // is a pure function of this seed.
+    // `sim`'s own clock and RNG (`sim.rng()`) are pure functions of this seed.
+    // An app mounted with `sim.build(...)` inherits the seeded clock
+    // automatically, but NOT seeded entropy — see "Deterministic
+    // identifiers" below for what that means and how to opt in.
     assert_eq!(sim.seed, 0);
 }
 ```
@@ -190,15 +198,24 @@ match sweep_proptest(0..1000, &strategy, |sim, ops| apply_ops(sim, ops)) {
 
 `sweep_proptest` runs [`Sim::run_proptest`] sequentially across every seed in
 the range, stopping at the first failure and reporting its seed plus a
-proptest-shrunk minimal op-sequence. The CI-facing driver is the `sim-sweep`
-binary:
+proptest-shrunk minimal op-sequence.
+
+**This is a library function you call from your own `[[bin]]` or test, driven
+against your own `Strategy`/`body` for your own app's properties** — nothing
+runs it for you automatically. Autumn's own repository ships one example of
+wiring it up: `autumn/src/bin/sim_sweep.rs`, a small `[[bin]]` that sweeps a
+fixed, deliberately-correct toy account scenario as a smoke check that the
+sweep mechanism itself works (`sim_sweep_driver`'s DoD test proves it catches
+a real invariant break using a deliberately-buggy variant of the same toy
+scenario). Autumn's own CI runs that binary as its own job (`Sim sweep`,
+structured like the `loom` job, 512 seeds) on every push and
+PR — but that job exercises the harness, not your application. To get this
+coverage for your own app, write a `[[bin]]` following the same shape against
+your own scenario and wire it into your own CI.
 
 ```bash
 AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release --features sim-testing --bin sim-sweep
 ```
-
-This runs as its own CI job (`Sim sweep`, structured like the `loom` job) on
-every push and PR.
 
 ---
 

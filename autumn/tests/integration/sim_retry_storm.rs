@@ -44,9 +44,13 @@
 //! reverting `jittered_retry_delay_ms` to the old unjittered
 //! `backoff_ms.saturating_mul(2_u64.saturating_pow(attempt - 1))` locally and
 //! rerunning this test reproduces the herd — every retry lands in the exact
-//! same checkpoint bucket — and the `always!` invariant below fails, printing
-//! the deterministic `AUTUMN_SIM_SEED=…` replay line. With the fix in place the
-//! same seed passes.
+//! same checkpoint bucket — and the assertion below fails, printing the
+//! deterministic `AUTUMN_SIM_SEED=…` replay line (`#[sim_test]` prints it on
+//! *any* panic, not just an `always!` violation). With the fix in place the
+//! same seed passes. This is a plain `assert!`, not `always!`: a spread is
+//! overwhelmingly likely for a correctly-jittered seed but not guaranteed by
+//! construction, so it isn't a hard invariant in the DST sense (see the
+//! comment beside the assertion itself for the full reasoning).
 //!
 //! # Wiring seeded entropy explicitly (Codex review)
 //!
@@ -73,8 +77,8 @@ use autumn_web::plugin::Plugin;
 use autumn_web::prelude::*;
 use autumn_web::sim::Sim;
 use autumn_web::sim_test;
+use autumn_web::sometimes;
 use autumn_web::test::TestApp;
-use autumn_web::{always, sometimes};
 use serde::{Deserialize, Serialize};
 
 /// Number of jobs made to fail "simultaneously" under the sim's virtual clock.
@@ -225,11 +229,20 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
     let spread = retry_checkpoints
         .iter()
         .any(|checkpoint| *checkpoint != first);
+    // `sometimes!` (not `always!`) is the correct assertion here: equal
+    // jitter makes a spread *overwhelmingly likely* for a given seed, not
+    // guaranteed by construction the way an `always!` hard invariant should
+    // be — a small fraction of seeds could legitimately place every draw in
+    // the same checkpoint bucket without the fix being broken (Codex
+    // review). `sometimes!` + `assert_all_sometimes_satisfied` below still
+    // fails this specific, fixed-seed (`AUTUMN_SIM_SEED` default `0`) test
+    // exactly when the herd reproduces (verified: see this module's DoD
+    // notes), without mischaracterizing what's actually guaranteed.
     sometimes!(
         spread,
         "retries observed spread across more than one checkpoint of the backoff window"
     );
-    always!(
+    assert!(
         spread,
         "all {STORM_SIZE} retries landed in the exact same checkpoint of the backoff \
          window ({:?}) — a synchronized thundering herd (seed={:#x})",
@@ -239,6 +252,9 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
 
     // Single-run non-vacuity check: the `sometimes!` target above must have
     // actually fired in this run, not merely be theoretically reachable.
+    // (Redundant with the `assert!` above for this single seed, but this is
+    // the check a sweep across many seeds would rely on if this scenario is
+    // ever swept — see the module docs.)
     autumn_web::sim::assert_all_sometimes_satisfied();
 }
 
