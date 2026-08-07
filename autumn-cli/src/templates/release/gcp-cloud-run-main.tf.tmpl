@@ -167,6 +167,9 @@ locals {
     # enabled fails the very first `terraform apply` at VPC creation
     # otherwise.
     "compute.googleapis.com",
+    # google_service_account.cloud_run (below) fails with SERVICE_DISABLED
+    # on a fresh project without the IAM API already enabled.
+    "iam.googleapis.com",
   ])
 }
 
@@ -250,6 +253,12 @@ resource "google_artifact_registry_repository" "this" {
 resource "google_service_account" "cloud_run" {
   account_id   = local.service_account_id
   display_name = "Runtime identity for {{project_name}} on Cloud Run"
+
+  # Without this, Terraform has no reason to order service-account creation
+  # after the IAM API is enabled (nothing here references an attribute of
+  # google_project_service.apis) — on a fresh project this fails with
+  # SERVICE_DISABLED.
+  depends_on = [google_project_service.apis]
 }
 
 resource "google_project_iam_member" "cloudsql_client" {

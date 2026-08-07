@@ -5107,6 +5107,28 @@ previous_secrets = []
     }
 
     #[test]
+    fn gcp_service_account_waits_for_iam_api_activation() {
+        // Nothing in google_service_account.cloud_run references an
+        // attribute of google_project_service.apis, so without an explicit
+        // depends_on, Terraform has no reason to order it after the IAM API
+        // is enabled — on a fresh project this fails with SERVICE_DISABLED.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let sa_block = content
+            .split("resource \"google_service_account\" \"cloud_run\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the google_service_account resource");
+        assert!(
+            sa_block.contains("depends_on") && sa_block.contains("google_project_service.apis"),
+            "google_service_account.cloud_run must depend on \
+             google_project_service.apis: {sa_block}"
+        );
+    }
+
+    #[test]
     fn gcp_main_tf_postgres_database_name_is_length_bounded() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -5365,6 +5387,9 @@ previous_secrets = []
             // Compute Engine resources — a fresh project without this API
             // pre-enabled would fail the very first apply at VPC creation.
             "compute.googleapis.com",
+            // google_service_account.cloud_run fails with SERVICE_DISABLED
+            // on a fresh project without this API pre-enabled.
+            "iam.googleapis.com",
         ] {
             assert!(
                 content.contains(api),
