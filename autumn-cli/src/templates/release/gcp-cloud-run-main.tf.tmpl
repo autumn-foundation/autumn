@@ -154,23 +154,33 @@ locals {
   # than assuming the project already has them on) means a fresh GCP
   # project works on the first `terraform apply` with no manual `gcloud
   # services enable` step.
-  required_apis = toset([
-    "run.googleapis.com",
-    "sqladmin.googleapis.com",
-    "secretmanager.googleapis.com",
-    "vpcaccess.googleapis.com",
-    "artifactregistry.googleapis.com",
-    "servicenetworking.googleapis.com",
-    "redis.googleapis.com",
-    # google_compute_network / google_compute_global_address (below) are
-    # Compute Engine resources — a fresh project without this API already
-    # enabled fails the very first `terraform apply` at VPC creation
-    # otherwise.
-    "compute.googleapis.com",
-    # google_service_account.cloud_run (below) fails with SERVICE_DISABLED
-    # on a fresh project without the IAM API already enabled.
-    "iam.googleapis.com",
-  ])
+  # redis.googleapis.com is deliberately conditional, not always-on: every
+  # core resource (the VPC, Artifact Registry, the service account, Secret
+  # Manager) is ordered behind this ENTIRE for_each set via depends_on, so
+  # unconditionally including an API here means a project/org policy that
+  # merely disallows Redis (with enable_redis_cache left at its default
+  # false — Redis never even requested) would fail the whole apply, not
+  # just the optional Redis piece.
+  required_apis = toset(concat(
+    [
+      "run.googleapis.com",
+      "sqladmin.googleapis.com",
+      "secretmanager.googleapis.com",
+      "vpcaccess.googleapis.com",
+      "artifactregistry.googleapis.com",
+      "servicenetworking.googleapis.com",
+      # google_compute_network / google_compute_global_address (below) are
+      # Compute Engine resources — a fresh project without this API
+      # already enabled fails the very first `terraform apply` at VPC
+      # creation otherwise.
+      "compute.googleapis.com",
+      # google_service_account.cloud_run (below) fails with
+      # SERVICE_DISABLED on a fresh project without the IAM API already
+      # enabled.
+      "iam.googleapis.com",
+    ],
+    var.enable_redis_cache ? ["redis.googleapis.com"] : []
+  ))
 }
 
 resource "google_project_service" "apis" {
@@ -205,10 +215,21 @@ resource "google_compute_network" "this" {
 # Reserves an internal IP range for the private services access peering
 # below — Cloud SQL's private IP and (when enabled) Memorystore Redis both
 # live in this peered range, never on the public internet.
+#
+# `address` is set explicitly (not left for Google to auto-allocate) so
+# this range is deterministically known and can never overlap
+# `var.vpc_connector_cidr` (default 10.8.0.0/28): both this peering range
+# and the connector's range are independently scheduled after network
+# creation, so if Google auto-picked this /16 and it happened to contain
+# the connector's CIDR, one of the two creations would fail with an
+# overlap error. 10.100.0.0/16 is comfortably outside the 10.8.0.0/28
+# default — if you change `vpc_connector_cidr`, pick something outside
+# 10.100.0.0/16 too.
 resource "google_compute_global_address" "private_service_access" {
   name          = "${local.app_name_safe}-psa"
   purpose       = "VPC_PEERING"
   address_type  = "INTERNAL"
+  address       = "10.100.0.0"
   prefix_length = 16
   network       = google_compute_network.this.id
 }

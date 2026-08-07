@@ -5296,6 +5296,61 @@ previous_secrets = []
     }
 
     #[test]
+    fn gcp_main_tf_redis_api_is_gated_behind_enable_redis_cache() {
+        // Every core resource (VPC, Artifact Registry, service account,
+        // Secret Manager) depends on the ENTIRE google_project_service.apis
+        // for_each set — unconditionally including redis.googleapis.com
+        // would mean a project/org policy that merely disallows Redis
+        // (even with enable_redis_cache left false, Redis never requested)
+        // fails the whole apply, not just the optional Redis piece.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            content.contains("var.enable_redis_cache ? [\"redis.googleapis.com\"] : []"),
+            "redis.googleapis.com must only be added to required_apis when \
+             enable_redis_cache is true: {content}"
+        );
+    }
+
+    #[test]
+    fn gcp_main_tf_psa_range_is_explicit_and_wont_collide_with_connector_cidr() {
+        // Both the PSA global address and the VPC connector are
+        // independently scheduled after network creation; if Google
+        // auto-picked the PSA /16 and it happened to contain the
+        // connector's CIDR, one of the two creations would fail with an
+        // overlap error. An explicit, documented address removes the
+        // ambiguity entirely.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let psa_block = content
+            .split("resource \"google_compute_global_address\" \"private_service_access\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("main.tf must declare the private_service_access resource");
+        assert!(
+            psa_block.contains("address       = \"10.100.0.0\""),
+            "the PSA range must be pinned to an explicit address, not left for \
+             Google to auto-allocate: {psa_block}"
+        );
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        let default_line = variables_tf
+            .lines()
+            .skip_while(|l| !l.contains("variable \"vpc_connector_cidr\""))
+            .find(|l| l.trim_start().starts_with("default"))
+            .expect("vpc_connector_cidr must declare a default");
+        assert!(
+            default_line.contains("10.8.0.0/28"),
+            "the default connector CIDR must not have silently changed to \
+             something that could overlap the pinned 10.100.0.0/16 PSA range: \
+             {default_line}"
+        );
+    }
+
+    #[test]
     fn gcp_main_tf_redis_is_off_by_default_and_gated() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");

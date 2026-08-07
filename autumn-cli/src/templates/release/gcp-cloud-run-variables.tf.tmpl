@@ -45,7 +45,7 @@ variable "db_tier" {
 }
 
 variable "vpc_connector_cidr" {
-  description = "Unused /28 CIDR range in the VPC for the Serverless VPC Access connector. Must not overlap the private-service-access range Cloud SQL/Memorystore use."
+  description = "Unused /28 CIDR range in the VPC for the Serverless VPC Access connector. Must not overlap 10.100.0.0/16 — the private-service-access range Cloud SQL/Memorystore use (see main.tf's google_compute_global_address.private_service_access)."
   type        = string
   default     = "10.8.0.0/28"
 }
