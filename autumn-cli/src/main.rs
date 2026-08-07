@@ -6166,9 +6166,8 @@ mod tests {
 
     #[test]
     fn parse_release_init_with_gcp_cloud_run_target() {
-        let cli =
-            Cli::try_parse_from(["autumn", "release", "init", "--target", "gcp-cloud-run"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "gcp-cloud-run"])
+            .unwrap();
         let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
             panic!("expected release init");
         };

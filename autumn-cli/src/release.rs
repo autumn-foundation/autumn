@@ -4950,7 +4950,9 @@ previous_secrets = []
         let dir = make_project(&tmp, "my-app");
         let files = init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
         assert!(
-            files.iter().any(|f| f == ".github/workflows/gcp-deploy.yml"),
+            files
+                .iter()
+                .any(|f| f == ".github/workflows/gcp-deploy.yml"),
             "created-files list must include the nested workflow path: {files:?}"
         );
     }
@@ -5289,7 +5291,8 @@ previous_secrets = []
                 continue;
             }
             assert!(
-                !trimmed.starts_with("database_admin_password") && !trimmed.starts_with("signing_secret"),
+                !trimmed.starts_with("database_admin_password")
+                    && !trimmed.starts_with("signing_secret"),
                 "terraform.tfvars.example must not assign the secret variables directly \
                  on a non-comment line: {line:?} in {tfvars}"
             );
@@ -5308,7 +5311,12 @@ previous_secrets = []
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
         let gitignore = fs::read_to_string(dir.join(".gitignore")).unwrap();
-        for pattern in [".terraform/", "*.tfstate", "*.tfstate.*", "terraform.tfvars"] {
+        for pattern in [
+            ".terraform/",
+            "*.tfstate",
+            "*.tfstate.*",
+            "terraform.tfvars",
+        ] {
             assert!(
                 gitignore.contains(pattern),
                 ".gitignore must contain {pattern:?} for the gcp-cloud-run target: {gitignore}"
