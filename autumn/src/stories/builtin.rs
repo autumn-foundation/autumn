@@ -450,5 +450,36 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 )
             }
         },
+        story! {
+            "Display",
+            "Reaction controls",
+            {
+                use autumn_web::widgets::{ReactionControls, reaction_controls};
+
+                // The view half of `#[votable]`: `react()` returns the new
+                // aggregate and the viewer's own reaction, which is all this
+                // widget needs. Plain POST forms, upgraded in place by htmx.
+                maud::html! {
+                    // Sum mode -- signed up/down votes. The viewer has already
+                    // upvoted, so the up arrow renders as a pressed toggle.
+                    (reaction_controls(
+                        &ReactionControls::votes(
+                            "votes-42",
+                            "/posts/42/upvote",
+                            "/posts/42/downvote",
+                        )
+                        .aggregate(7)
+                        .current(Some(1))
+                        .label("Post score"),
+                    ))
+                    // Count mode -- one membership toggle, not yet pressed.
+                    (reaction_controls(
+                        &ReactionControls::likes("likes-42", "/posts/42/like")
+                            .aggregate(3)
+                            .label("Likes"),
+                    ))
+                }
+            }
+        },
     ]
 }

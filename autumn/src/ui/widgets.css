@@ -1403,6 +1403,84 @@
     cursor: not-allowed;
 }
 
+/* ── Reaction controls (autumn-reaction-*, issue #1362) ───────────────────── */
+
+/* The `role="group"` container holds one no-JS POST form per direction with
+   the aggregate between them. A column stacks up / count / down into the
+   familiar vote-arrow strip; `likes` mode simply renders one form and the
+   count, so the same rule serves both. */
+.autumn-reaction-controls {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.125rem;
+}
+
+/* Each direction is its own form so it can be submitted without JS; strip the
+   default block-level margin so the arrows sit tight against the count. */
+.autumn-reaction {
+    display: inline-flex;
+    margin: 0;
+}
+
+/* The direction modifiers carry no geometry of their own -- they exist as
+   styling/targeting hooks so an app can re-colour a single direction (e.g. a
+   warm upvote, a cool downvote) without forking the base rules. */
+.autumn-reaction-up {
+    color: inherit;
+}
+
+.autumn-reaction-down {
+    color: inherit;
+}
+
+.autumn-reaction-like {
+    color: inherit;
+}
+
+/* Borderless icon button: the glyph is the affordance, so no chrome until
+   hover/focus. `color: inherit` keeps the resting arrow the same weight as
+   surrounding text; `--text-muted` would drop below 3:1 on `--surface`. */
+.autumn-reaction-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.125rem 0.375rem;
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    background-color: transparent;
+    color: var(--text);
+    font: inherit;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.autumn-reaction-button:hover {
+    background-color: var(--surface);
+    border-color: var(--border);
+}
+
+.autumn-reaction-button:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+/* The viewer's own reaction (`aria-pressed="true"`). Colour is a redundant
+   cue only -- `aria-pressed` is the machine-readable state -- so this never
+   has to carry the meaning alone. */
+.autumn-reaction-active {
+    color: var(--primary);
+    border-color: var(--primary);
+}
+
+/* The aggregate, announced via `aria-live="polite"` after an htmx swap.
+   `tabular-nums` stops the strip from reflowing as the score changes width. */
+.autumn-reaction-count {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+}
+
 /* ── Cookie-consent banner (issue #1214) ──────────────────────────────────── */
 
 /* `position: sticky` (not `fixed`) deliberately: the banner is spliced right

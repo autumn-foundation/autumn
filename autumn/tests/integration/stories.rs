@@ -237,6 +237,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "nav-bar",
     "nav-link",
     "property-list",
+    "reaction-controls",
     "stat-card",
     "tabs",
     "toast",
