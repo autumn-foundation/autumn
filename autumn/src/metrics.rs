@@ -2033,6 +2033,24 @@ mod tests {
     }
 
     #[test]
+    fn timer_guard_records_when_dropped_during_panic_unwind() {
+        let name = unique_name("facade_timer_unwind_seconds");
+        let t = timer(&name);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = t.start();
+            panic!("handler blew up");
+        }));
+        assert!(unwound.is_err(), "the closure must actually panic");
+
+        let instrument = expect_instrument(&name);
+        let (count, _sum, _buckets) = histogram_parts(only_series(&instrument));
+        assert_eq!(
+            count, 1,
+            "a guard dropped while unwinding must still record"
+        );
+    }
+
+    #[test]
     fn timer_time_records_the_closure_duration() {
         let name = unique_name("facade_timer_time_seconds");
         let value = timer(&name).time(|| 21 * 2);
