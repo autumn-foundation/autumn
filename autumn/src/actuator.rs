@@ -7266,6 +7266,332 @@ mod tests {
         assert_eq!(first.fields["order_id"].as_str().unwrap(), "A-1001");
         assert_eq!(first.request_id.as_deref(), Some("req-abc"));
     }
+
+    // ── App-metrics facade exposition (issue #1378) ───────────────────────
+    //
+    // The facade registry is process-global, so every test here records into
+    // instrument names built with `metrics::testing::unique_name` and asserts
+    // with `contains()` on those names. Never assert whole-body equality or
+    // the absence of unrelated families.
+
+    /// Fetch a body from the actuator router mounted at `/actuator`.
+    async fn actuator_body(uri: &str) -> String {
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_renders_facade_counter_gauge_and_histogram() {
+        use crate::metrics::testing::unique_name;
+
+        let counter_name = unique_name("facade_expo_orders_total");
+        crate::metrics::describe_counter(&counter_name, "Orders placed");
+        crate::metrics::counter(&counter_name)
+            .with_label("status", "paid")
+            .with_label("region", "eu")
+            .increment(3);
+
+        let gauge_name = unique_name("facade_expo_queue_depth");
+        crate::metrics::describe_gauge(&gauge_name, "Queue depth");
+        crate::metrics::gauge(&gauge_name).set(2.5);
+
+        let hist_name = unique_name("facade_expo_work_seconds");
+        crate::metrics::describe_histogram(&hist_name, "Work duration");
+        let hist = crate::metrics::histogram(&hist_name).with_label("route", "/x");
+        hist.record(0.25);
+        hist.record(0.75);
+
+        let text = actuator_body("/actuator/prometheus").await;
+
+        // Counter: HELP/TYPE plus an integer-rendered sample with sorted labels.
+        assert!(
+            text.contains(&format!("# HELP {counter_name} Orders placed")),
+            "missing counter HELP in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("# TYPE {counter_name} counter")),
+            "missing counter TYPE in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{counter_name}{{region=\"eu\",status=\"paid\"}} 3"
+            )),
+            "counter must render as an integer with sorted labels in:\n{text}"
+        );
+
+        // Gauge.
+        assert!(
+            text.contains(&format!("# TYPE {gauge_name} gauge")),
+            "missing gauge TYPE in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("{gauge_name} 2.5")),
+            "missing gauge sample in:\n{text}"
+        );
+
+        // Histogram: one TYPE line for the base name, cumulative buckets with
+        // `le` appended after the user labels, then `_sum` and `_count`.
+        assert!(
+            text.contains(&format!("# HELP {hist_name} Work duration")),
+            "missing histogram HELP in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("# TYPE {hist_name} histogram")),
+            "missing histogram TYPE in:\n{text}"
+        );
+        for (le, value) in [
+            ("0.005", 0),
+            ("0.01", 0),
+            ("0.025", 0),
+            ("0.05", 0),
+            ("0.1", 0),
+            ("0.25", 1),
+            ("0.5", 1),
+            ("1", 2),
+            ("2.5", 2),
+            ("5", 2),
+            ("10", 2),
+            ("+Inf", 2),
+        ] {
+            let line = format!("{hist_name}_bucket{{route=\"/x\",le=\"{le}\"}} {value}");
+            assert!(
+                text.contains(&line),
+                "missing bucket line `{line}` in:\n{text}"
+            );
+        }
+        assert!(
+            text.contains(&format!("{hist_name}_sum{{route=\"/x\"}} 1")),
+            "missing histogram sum in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("{hist_name}_count{{route=\"/x\"}} 2")),
+            "missing histogram count in:\n{text}"
+        );
+        // `le="+Inf"` must structurally equal `_count`.
+        assert!(
+            text.contains(&format!("{hist_name}_bucket{{route=\"/x\",le=\"+Inf\"}} 2")),
+            "+Inf bucket must equal _count in:\n{text}"
+        );
+        // Exactly one TYPE block per family, no duplicates.
+        assert_eq!(
+            text.matches(&format!("# TYPE {counter_name} counter"))
+                .count(),
+            1,
+            "duplicate TYPE line for {counter_name} in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_prefers_facade_over_colliding_plugin_family() {
+        use crate::metrics::testing::unique_name;
+
+        let name = unique_name("facade_expo_collision_total");
+        crate::metrics::describe_counter(&name, "From the facade");
+        crate::metrics::counter(&name).increment(1);
+
+        struct CollidingSource(String);
+        impl MetricsSource for CollidingSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: self.0.clone(),
+                    help: "From the plugin".to_string(),
+                    kind: MetricKind::Gauge,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 99.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("colliding_plugin", Arc::new(CollidingSource(name.clone())))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains(&format!("# HELP {name} From the facade")),
+            "the facade family must win the name in:\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("# HELP {name} From the plugin")),
+            "the plugin family must be skipped in:\n{text}"
+        );
+        assert_eq!(
+            text.matches(&format!("# TYPE {name} ")).count(),
+            1,
+            "exactly one TYPE line for {name} in:\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("{name} 99")),
+            "the plugin sample must not be emitted in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_plugin_family_colliding_with_facade_histogram_count() {
+        use crate::metrics::testing::unique_name;
+
+        let base = unique_name("facade_expo_derived_seconds");
+        crate::metrics::histogram(&base).record(0.25);
+        let derived = format!("{base}_count");
+
+        struct DerivedSource(String);
+        impl MetricsSource for DerivedSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: self.0.clone(),
+                    help: "Plugin shadowing a derived name".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 77.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("derived_plugin", Arc::new(DerivedSource(derived.clone())))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            !text.contains("Plugin shadowing a derived name"),
+            "a plugin family named after a facade histogram's derived family must be skipped in:\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("{derived} 77")),
+            "the plugin sample must not be emitted in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("{derived} 1")),
+            "the facade's own derived count must still be present in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_includes_app_section_for_facade_metrics() {
+        use crate::metrics::testing::unique_name;
+
+        let counter_name = unique_name("facade_json_orders_total");
+        crate::metrics::describe_counter(&counter_name, "Orders placed");
+        crate::metrics::counter(&counter_name)
+            .with_label("status", "paid")
+            .increment(3);
+
+        let hist_name = unique_name("facade_json_work_seconds");
+        crate::metrics::histogram(&hist_name).record(0.25);
+        crate::metrics::histogram(&hist_name).record(0.75);
+
+        let text = actuator_body("/actuator/metrics").await;
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let app = json
+            .get("app")
+            .unwrap_or_else(|| panic!("missing top-level `app` key in:\n{text}"));
+        let instruments = app
+            .as_array()
+            .unwrap_or_else(|| panic!("`app` must be an array in:\n{text}"));
+
+        let entry = instruments
+            .iter()
+            .find(|i| i["name"] == serde_json::json!(counter_name))
+            .unwrap_or_else(|| panic!("missing {counter_name} in:\n{text}"));
+        assert_eq!(entry["kind"], serde_json::json!("counter"));
+        assert_eq!(entry["help"], serde_json::json!("Orders placed"));
+        assert_eq!(entry["dropped_series"], serde_json::json!(0));
+        assert_eq!(
+            entry["series"][0]["labels"]["status"],
+            serde_json::json!("paid")
+        );
+        assert_eq!(
+            entry["series"][0]["value"]["value"].as_u64(),
+            Some(3),
+            "the JSON view must match the prometheus view"
+        );
+
+        let hist = instruments
+            .iter()
+            .find(|i| i["name"] == serde_json::json!(hist_name))
+            .unwrap_or_else(|| panic!("missing {hist_name} in:\n{text}"));
+        assert_eq!(hist["kind"], serde_json::json!("histogram"));
+        let value = &hist["series"][0]["value"];
+        assert_eq!(value["count"].as_u64(), Some(2));
+        assert!(
+            (value["sum"].as_f64().unwrap() - 1.0).abs() < f64::EPSILON,
+            "unexpected histogram sum in:\n{text}"
+        );
+        let buckets = value["buckets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing histogram buckets in:\n{text}"));
+        let last = buckets.last().unwrap();
+        assert_eq!(last[0], serde_json::json!("+Inf"));
+        assert_eq!(last[1].as_u64(), Some(2), "+Inf must equal count");
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_disabled_hides_facade_metrics() {
+        use crate::metrics::testing::unique_name;
+
+        // Recording always works; only exposure is gated. With the scrape
+        // endpoint disabled there must be no route that leaks the facade.
+        let name = unique_name("facade_gated_total");
+        crate::metrics::counter(&name).increment(1);
+
+        let app = actuator_router_with_prefix("/actuator", false, false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[cfg(test)]

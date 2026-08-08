@@ -44,6 +44,8 @@
 //! - [`extract`] -- Re-exported Axum extractors ([`Form`],
 //!   [`Json`], [`Path`], [`Query`], and optional multipart support).
 //! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
+//! - [`metrics`] -- One-line app-defined counters, gauges, and timers,
+//!   exposed automatically on `/actuator/prometheus` and `/actuator/metrics`.
 
 //! - [`middleware`] -- Built-in middleware (request IDs).
 //! - [`pagination`] -- Standardized `page`/`size` extractor and response wrapper.
@@ -150,6 +152,11 @@ pub mod mail;
 pub mod maintenance;
 #[cfg(feature = "managed-pg")]
 pub mod managed_pg;
+/// One-line call-site facade for app-defined counters, gauges, and timers.
+///
+/// Recorded metrics are exposed automatically by the actuator — see
+/// [`mod@metrics`].
+pub mod metrics;
 #[cfg(feature = "db")]
 pub mod migrate;
 pub(crate) mod pg_conn_str;
