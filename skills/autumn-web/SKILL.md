@@ -421,6 +421,55 @@ See `examples/reddit-clone` (`Post` ↔ `Tag` via `post_tags`) for a full
 worked example, and `docs/adr/0008-associations-and-eager-loading.md` for
 the design.
 
+**Never hand-roll a votes/likes table.** `#[votable(by = <Reactor>)]` on a
+`#[model]` declares a `(reactor, target)`-unique edge table plus a
+denormalised aggregate column on the target **(unreleased — trunk-dev,
+#1362)**:
+
+```rust
+#[autumn_web::model]
+#[votable(by = User, aggregate = sum)]   // or: aggregate = count, name = like
+pub struct Post {
+    #[id]
+    pub id: i64,
+    pub score: i64,          // the aggregate column
+}
+```
+
+`aggregate = sum` (default) → edge `value SMALLINT`, target `score =
+SUM(value)`; `aggregate = count` → no value column, target `{name}_count =
+COUNT(*)`. Defaults: `name = vote`, `table = pluralize(name)`, `reactor_fk =
+{snake(by)}_id`, `target_fk = {snake(Model)}_id`, `value_column = value`,
+`column = score` / `{name}_count` — each overridable. At most one `#[votable]`
+per model. The edge table is the app's migration to write, and its composite
+`UNIQUE (reactor_fk, target_fk)` is **load-bearing** (it is the `ON CONFLICT`
+arbiter); both FKs must be `BIGINT NOT NULL` and the aggregate column `BIGINT
+NOT NULL DEFAULT 0`.
+
+The model emits a `{Model}Reactions` trait blanket-implemented for that
+model's repository — import it as `_`, no repository attribute needed:
+
+```rust
+use crate::models::PostReactions as _;
+
+let r = posts.react(user_id, post_id, 1).await?;  // count mode: no `value` arg
+r.value;      // Option<i16> — this reactor's reaction AFTER the call
+r.aggregate;  // i64 — the newly persisted score, exact as of commit
+r.outcome;    // ReactionOutcome::{Inserted, Flipped, Removed}
+let mine: Option<i16> = posts.reaction_of(user_id, post_id).await?;
+```
+
+`react()` is a race-safe toggle: same value again removes the edge, a
+different value flips it, a new one inserts it — and the aggregate is
+recomputed from ground truth and persisted in the **same transaction** under
+an exclusive lock on the target row, so concurrent reactions converge to at
+most one edge per pair and a reader never sees edge/aggregate disagreement.
+Soft-deleted targets are `NotFound`. **Like the m2m helpers, `react()` takes
+its own pooled connection — never hold a `Db` extractor across the call on a
+small pool.** Pair it with the `reaction_controls` widget (see the widgets
+section). See `docs/guide/votable.md` and `examples/reddit-clone`
+(`src/routes/votes.rs`).
+
 Deleting a parent can cascade to its children in one transaction — declare
 `dependent(...)` on the parent's `#[repository]` instead of hand-writing the
 child cleanup **(unreleased — trunk-dev)**:

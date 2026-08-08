@@ -18,7 +18,8 @@ use scoped_futures::ScopedFutureExt;
 
 use crate::jobs::{PostPublicationArgs, PostPublicationJob};
 use crate::models::{
-    Comment, CommentAssociations, NewTag, Post, PostAssociations, PostTagsMutations, Subreddit, Tag,
+    Comment, CommentAssociations, NewTag, Post, PostAssociations, PostReactions as _,
+    PostTagsMutations, Subreddit, Tag,
 };
 use crate::repositories::{PgPostRepository, PgVoteRepository, PostRepository};
 use crate::schema::{posts, subreddits, tags};
@@ -245,7 +246,10 @@ pub async fn front_page(
                             li id=(format!("post-{}", post.id)) class="posts-feed-item transition-all" {
                                 div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
                                     div class="flex items-start gap-3 p-4" {
-                                        (vote_controls(post.id, post.score))
+                                        // Feed: `None` rather than one
+                                        // `reaction_of` per row (an N+1). A
+                                        // batch accessor is the follow-up.
+                                        (vote_controls(post.id, post.score, None))
                                         div class="flex-1 min-w-0" {
                                             a href=(paths::show(&sub.slug, &post.slug))
                                                class="text-lg font-medium text-gray-900 hover:text-orange-600 line-clamp-2" {
@@ -683,10 +687,19 @@ pub async fn show(
         .collect();
     post_comments.sort_by_key(|c| std::cmp::Reverse(c.score));
 
-    let is_author = current_user_id
+    let viewer_id = current_user_id
         .as_ref()
-        .and_then(|id| id.parse::<i64>().ok())
-        .is_some_and(|id| id == post.author_id);
+        .and_then(|id| id.parse::<i64>().ok());
+    let is_author = viewer_id.is_some_and(|id| id == post.author_id);
+
+    // The viewer's own vote, so the detail page's control renders pressed
+    // (#1362). One indexed lookup on the edge table, and only here — feeds pass
+    // `None` to avoid an N+1. `db` was dropped above and `preload` has already
+    // returned, so this is the only live checkout on the single-connection pool.
+    let current_vote = match viewer_id {
+        Some(uid) => repo.reaction_of(uid, post.id).await?,
+        None => None,
+    };
 
     // Consume the flash only after all fallible work above.
     let flash_html = flash.render().await;
@@ -707,7 +720,7 @@ pub async fn show(
             // Post card
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mb-6" {
                 div class="flex items-start gap-4" {
-                    (vote_controls(post.id, post.score))
+                    (vote_controls(post.id, post.score, current_vote))
                     div class="flex-1" {
                         h1 class="text-2xl font-bold text-gray-900 mb-2" { (post.title) }
                         div class="text-xs text-gray-400 mb-4" {

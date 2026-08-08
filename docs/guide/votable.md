@@ -1,0 +1,506 @@
+# Votes, Likes and Reactions — `#[votable]`
+
+Every social feature eventually grows the same 130 lines: a `(user, thing)`
+edge table, a route that reads the user's existing row, branches three ways
+(toggle off / flip / insert), and then a second, unprotected statement that
+recomputes a denormalised `score` or `like_count` on the parent row. It looks
+trivial. It is not: the read-then-branch is a race with itself, the aggregate
+recompute is a race with *every other voter*, and the two writes are usually
+not in the same transaction, so readers can see a vote that the score does not
+reflect.
+
+`#[votable]` makes that a declaration. You name the reactor model and the
+aggregate mode; the `#[model]` macro generates the edge table's typed
+`diesel::table!`, a `react()` that toggles/flips/inserts, and an aggregate
+recompute that runs **in the same transaction, under an exclusive lock on the
+target row** — so the persisted aggregate always equals ground truth, even
+across different reactors hitting the same target at the same instant. The
+view half is [`reaction_controls`](../../autumn/src/widgets.rs), a no-JS htmx
+widget that renders the buttons and the live total.
+
+> A complete runnable version of everything below lives in
+> [`examples/reddit-clone`](../../examples/reddit-clone): `Post` carries
+> `#[votable(by = User, aggregate = sum)]` in
+> [`src/models.rs`](../../examples/reddit-clone/src/models.rs), the whole vote
+> route is [`src/routes/votes.rs`](../../examples/reddit-clone/src/routes/votes.rs),
+> and [`tests/votable_pg_integration.rs`](../../examples/reddit-clone/tests/votable_pg_integration.rs)
+> proves the race-safety claims against a real Postgres — including 50
+> simultaneous clicks on one `(user, post)` pair.
+
+## Prerequisites
+
+`#[votable]` is part of `#[autumn_web::model]`, so it needs the default
+Postgres/Diesel stack any Autumn app with a `#[model]` and a `#[repository]`
+already has. Nothing extra to enable:
+
+```toml
+[dependencies]
+autumn-web = { version = "0.6", features = ["maud"] }
+```
+
+The `maud` feature is only needed for the widget half; the `react()` /
+`reaction_of()` helpers are part of the core `db` surface. The result types
+live in `autumn_web::repository::{Reaction, ReactionOutcome}`.
+
+## The attribute
+
+```rust,ignore
+#[autumn_web::model]
+#[votable(by = User, aggregate = sum)]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub score: i64,      // the aggregate column
+}
+```
+
+Two modes:
+
+- **`aggregate = sum`** (the default) — signed reactions. The edge table has a
+  `value SMALLINT` column and the target's `score` is `SUM(value)`. This is
+  up/down voting.
+- **`aggregate = count`** — unary reactions. The edge table has *no* value
+  column (a row simply exists or does not), and the target's `{name}_count` is
+  `COUNT(*)`. This is likes, favourites, bookmarks.
+
+Every name is inferred, and every inference has an override:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `by` | **required** | the reactor model, e.g. `User` |
+| `aggregate` | `sum` | `sum` (signed) \| `count` (unary) |
+| `name` | `vote` | reaction name; drives `table` and the count column |
+| `table` | `pluralize(name)` → `votes` | the edge table |
+| `reactor_fk` | `{snake(by)}_id` → `user_id` | edge column → reactor |
+| `target_fk` | `{snake(Model)}_id` → `post_id` | edge column → this model |
+| `value_column` | `value` (sum mode only) | the edge's signed value |
+| `column` | `score` (sum) / `{name}_count` (count) | the aggregate column |
+
+A likes feature is therefore one line:
+
+```rust,ignore
+#[votable(by = User, aggregate = count, name = like)]
+// -> table `likes`, columns `user_id` / `article_id`, aggregate `like_count`
+```
+
+The defaults are not arbitrary: they are exactly the schema reddit-clone has
+shipped since its first migration, which is why adding `#[votable]` to that
+example required **no overrides and no migration at all**.
+
+## The required migration
+
+The edge table is yours to create — `#[votable]` declares its Diesel types, not
+its DDL. Three things are load-bearing:
+
+1. **The composite `UNIQUE (reactor_fk, target_fk)`.** It is the `ON CONFLICT`
+   arbiter the generated upsert names by column list. Without it the insert
+   fails with `42P10 there is no unique or exclusion constraint matching the ON
+   CONFLICT specification`; with it, "at most one edge per (reactor, target)" is
+   a database guarantee rather than an application convention.
+2. **Both foreign keys `BIGINT NOT NULL`.** `NULL`s are distinct in a Postgres
+   unique constraint, so a nullable target column would silently let duplicates
+   accumulate. The generated hidden `table!` declares them non-nullable, which
+   makes a `NULL` target unrepresentable on the write path.
+3. **The aggregate column `BIGINT NOT NULL DEFAULT 0`**, and the value column
+   `SMALLINT` (the value type is fixed at `i16`; the aggregate at `i64`).
+
+```sql
+CREATE TABLE votes (
+    id         BIGSERIAL PRIMARY KEY,
+    user_id    BIGINT NOT NULL REFERENCES users(id),
+    post_id    BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    value      SMALLINT NOT NULL CHECK (value IN (-1, 1)),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, post_id)              -- the ON CONFLICT arbiter
+);
+CREATE INDEX idx_votes_post_id ON votes (post_id);   -- the aggregate recompute
+
+ALTER TABLE posts ADD COLUMN score BIGINT NOT NULL DEFAULT 0;
+```
+
+For `aggregate = count`, drop the `value` column entirely and name the
+aggregate `{name}_count`.
+
+## The generated API
+
+`#[model]` emits a `{Model}Reactions` trait, blanket-implemented for any
+repository of that model — so your existing `#[repository]` picks it up with no
+attribute of its own. Import it as `_`:
+
+```rust,ignore
+use crate::models::PostReactions as _;
+use autumn_web::repository::{Reaction, ReactionOutcome};
+
+// sum mode
+let r: Reaction = posts.react(user_id, post_id, 1).await?;
+r.value;      // Option<i16>  — the reactor's reaction AFTER the call
+r.aggregate;  // i64          — the newly persisted score, exact at commit
+r.outcome;    // ReactionOutcome::{Inserted, Flipped, Removed}
+
+// count mode has no `value` parameter — a like row is pure membership:
+// let r = articles.react(user_id, article_id).await?;
+
+// AC4: the viewer's own state, for rendering
+let mine: Option<i16> = posts.reaction_of(user_id, post_id).await?;
+```
+
+`react()` is a **toggle**: the same value again removes the edge (`Removed`,
+`value: None`), a different value replaces it in place (`Flipped`), a new one
+inserts it (`Inserted`). `reaction_of` returns `Option<i16>` in *both* modes —
+count mode yields `Some(1)` — so view code is mode-independent.
+
+`Reaction` carries everything a route needs to re-render, which is the whole
+point: **zero follow-up queries** after a vote.
+
+## Before / after
+
+Here is reddit-clone's `cast_vote` before `#[votable]`. This is the code the
+attribute deletes — an existence probe, a read, a three-way match, and a raw
+`sql_query` score recompute, none of them in a transaction, all of them on the
+request's `Db` connection:
+
+```rust,ignore
+// BEFORE — examples/reddit-clone/src/routes/votes.rs (~130 lines of mechanics)
+
+// Verify the post exists before touching votes
+let post_exists: bool = diesel::dsl::select(diesel::dsl::exists(posts::table.find(post_id)))
+    .get_result(&mut **db)
+    .await?;
+if !post_exists {
+    return Err(AutumnError::not_found_msg("Post not found"));
+}
+
+// Check if user already voted on this post
+let existing_value: Option<i16> = votes::table
+    .filter(votes::user_id.eq(user_id))
+    .filter(votes::post_id.eq(post_id))
+    .select(votes::value)
+    .first(&mut **db)
+    .await
+    .optional()?;
+
+match existing_value {
+    Some(old_value) if old_value == value => {
+        // Same vote again — toggle off (remove vote)
+        diesel::delete(
+            votes::table
+                .filter(votes::user_id.eq(user_id))
+                .filter(votes::post_id.eq(post_id)),
+        )
+        .execute(&mut **db)
+        .await?;
+    }
+    Some(_) => {
+        // Different vote — flip direction
+        diesel::update(
+            votes::table
+                .filter(votes::user_id.eq(user_id))
+                .filter(votes::post_id.eq(post_id)),
+        )
+        .set(votes::value.eq(value))
+        .execute(&mut **db)
+        .await?;
+    }
+    None => {
+        // New vote
+        diesel::insert_into(votes::table)
+            .values((
+                votes::user_id.eq(user_id),
+                votes::post_id.eq(post_id),
+                votes::value.eq(value),
+            ))
+            .on_conflict((votes::user_id, votes::post_id))
+            .do_update()
+            .set(votes::value.eq(value))
+            .execute(&mut **db)
+            .await?;
+    }
+}
+
+// Recompute the score
+diesel::sql_query(
+    "UPDATE posts SET score = COALESCE((SELECT SUM(value::bigint) FROM votes \
+     WHERE post_id = $1), 0) WHERE id = $1",
+)
+.bind::<diesel::sql_types::BigInt, _>(post_id)
+.execute(&mut **db)
+.await?;
+
+// Reload the post just to learn its new score
+let post: Post = posts::table.find(post_id).first(&mut **db).await?;
+let new_score = post.score;
+```
+
+That code has three defects, and only one of them is obvious:
+
+- The `SELECT value` → `match` window is unprotected, so two clicks from the
+  same user can both take the `None` branch (one gets a `23505`) or both take
+  the `Some(v)` branch (one vote silently lost).
+- Worse, and *not* fixed by making the edge write a single upsert: two
+  **different** users voting on the same post each run the `SELECT SUM(...)`
+  subquery against their own snapshot, which does not contain the other's
+  uncommitted edge. Both write `score = 1`. The truth is `2`, and the error is
+  permanent.
+- The edge write and the score write are separate statements outside a
+  transaction, so a reader between them sees a vote the score does not include.
+
+After — the entire body, verbatim from the example:
+
+```rust,ignore
+// AFTER — the vote logic is these three statements.
+let user_id: i64 = session
+    .get("user_id")
+    .await
+    .ok_or_else(|| AutumnError::unauthorized_msg("Login required to vote"))?
+    .parse()
+    .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
+
+let reaction = posts_repo.react(user_id, post_id, value).await?;
+
+Ok(vote_controls(post_id, reaction.aggregate, reaction.value))
+```
+
+Auth, mutation, render. **Zero raw SQL, zero `diesel::` calls, no transaction
+management, no reload to learn the new score** — and all three defects above
+are gone by construction. (The example's SSE fan-out is unrelated to voting; it
+was moved to a `broadcast_post_update` helper so the vote path reads as vote
+logic.)
+
+## The race-safety contract
+
+`react()` acquires its own pooled connection and runs everything inside a
+single immediate transaction (`BEGIN` on Postgres, `BEGIN IMMEDIATE` on
+SQLite). Five statements, in this order:
+
+```text
+S1  guard + exclusive lock on the target row
+      pg:     SELECT id FROM posts WHERE id = $t [AND deleted_at IS NULL] FOR UPDATE;
+      sqlite: SELECT id FROM posts WHERE id = $t [AND deleted_at IS NULL];
+      0 rows -> AutumnError::not_found, transaction rolls back
+
+S2  the reactor's current edge (safe: the lock is held)
+      SELECT value FROM votes WHERE user_id = $r AND post_id = $t;
+
+S3  exactly one of
+  (a) SELECT returned the same value -> toggle off
+      DELETE FROM votes WHERE user_id = $r AND post_id = $t;
+  (b) SELECT returned a different value -> flip
+      UPDATE votes SET value = $value WHERE user_id = $r AND post_id = $t;
+  (c) SELECT returned nothing -> insert
+      INSERT INTO votes (user_id, post_id, value) VALUES ($r, $t, $value)
+        ON CONFLICT (user_id, post_id) DO UPDATE SET value = EXCLUDED.value;
+
+S4  ground-truth aggregate (safe: the lock is held)
+      sum:   SELECT SUM(value) FROM votes WHERE post_id = $t;
+      count: SELECT COUNT(*)   FROM votes WHERE post_id = $t;
+
+S5  persist
+      UPDATE posts SET score = $agg WHERE id = $t [AND deleted_at IS NULL];
+
+COMMIT
+```
+
+**Why this is correct, in one paragraph.** S1 takes an exclusive row lock on
+the target and holds it to commit, so S2–S5 of any two `react()` calls on the
+same target never interleave — a concurrent execution is therefore equivalent
+to *some* serial execution, and it suffices to check one call in isolation. For
+edge cardinality: the composite `UNIQUE` means the pair has 0 or 1 rows before
+the call; branch (a) needs 1 and leaves 0, (b) needs 1 and leaves 1, (c) needs
+0 and leaves 1 — so 50 concurrent same-pair clicks are just 50 sequential
+toggles, ending at 0 or 1 and never raising a `23505`. For the aggregate: S4
+runs after S3 inside the critical section, and under READ COMMITTED its
+per-statement snapshot contains this transaction's own S3 write plus every edge
+committed by a transaction that previously held the lock (it released the lock
+only at commit) — and no *other* transaction can have an uncommitted edge for
+this target, because it would need the lock we are holding. So S4 is the exact
+post-state, S5 persists it, and both writes commit together, meaning an outside
+reader sees either (edge before, score before) or (edge after, score after) and
+never a mixture.
+
+The `FOR UPDATE` is emitted only in the Postgres arm; on SQLite `BEGIN
+IMMEDIATE` takes the database-wide write lock at transaction start, which is
+strictly stronger than a per-target lock.
+
+Two caveats worth knowing:
+
+- **Isolation level.** The argument above assumes Postgres' default READ
+  COMMITTED. Under `REPEATABLE READ` or `SERIALIZABLE` a contended
+  `SELECT ... FOR UPDATE` aborts with `40001 could not serialize access`
+  instead of blocking. That is fail-safe, not corrupting, but the caller has to
+  retry.
+- **Deadlocks.** Every `react()` locks exactly one target and always in the
+  same order (target row, then that target's edge), so `react()` calls cannot
+  deadlock each other. It *can* block behind an unrelated outer transaction
+  that has already locked the same target row on another connection.
+
+## `react()` runs on its own connection
+
+**`react()` checks out its own pooled connection. It does not join an enclosing
+`Db::tx`, and you must not hold a `Db` extractor across the call.** On a small
+pool — reddit-clone deliberately runs `max_size = 1` — a handler that extracts
+`Db` and then awaits `react()` deadlocks forever waiting for a second
+connection that can never be freed.
+
+This is why the example's vote route takes `PgPostRepository` and never `Db`,
+and why every other checkout in that path (the reload for the SSE fan-out) is
+short-lived and strictly sequential:
+
+```rust,ignore
+// NOTE: no `Db` extractor. `react()` checks out its *own* pooled connection,
+// and this example runs a single-connection pool.
+async fn cast_vote(
+    post_id: i64,
+    value: i16,
+    session: &Session,
+    posts_repo: &PgPostRepository,
+    state: &AppState,
+) -> AutumnResult<Markup> { /* ... */ }
+```
+
+The same rule applies to the m2m mutation helpers (`add_*` / `remove_*` /
+`set_*`), which acquire their connection the same way.
+
+## Soft-delete semantics
+
+When the target model has a `deleted_at` field, the macro emits
+`AND deleted_at IS NULL` on **both** S1 and S5. So:
+
+- Reacting to a soft-deleted target returns `AutumnError::not_found` and writes
+  nothing — no edge is created and the aggregate is untouched. Soft-deleted and
+  genuinely missing targets are indistinguishable to callers, matching the
+  repository layer's `soft_delete` scoping.
+- `reaction_of` deliberately does **not** consult the target: it reports a fact
+  about the *edge* (what this reactor chose), which remains true regardless of
+  the target's visibility.
+
+Models without a `deleted_at` field get neither clause — it is a compile-time
+decision with zero runtime cost.
+
+Edge-level soft delete (a `deleted_at` on the edge table itself, instead of
+hard-deleting on toggle-off) and reactor-side soft delete (dropping a
+soft-deleted user's votes from every aggregate) are out of scope.
+
+## The aggregate is recomputed, not accumulated — and not via commit hooks
+
+Issue #1362 suggested recomputing the aggregate by "reusing
+`repository_commit_hooks`". That is not possible, and the guide records why
+rather than quietly diverging.
+[`repository_commit_hooks`](../../autumn/src/repository_commit_hooks.rs) is a
+**durable post-commit queue**: only the *enqueue* happens in your transaction;
+the hook body runs later, on a different connection, with retries and a
+dead-letter path. A hook therefore cannot be atomic with the edge mutation, and
+between commit and hook execution a reader would observe exactly the
+edge/aggregate disagreement the acceptance criterion forbids.
+
+So `react()` enqueues no hook. It does the recompute inline (S4 + S5) inside
+the same transaction. Two consequences worth internalising:
+
+- The aggregate is derived from **ground truth** (`SUM`/`COUNT` over the edges)
+  on every write, never accumulated as `score = score + delta`. That makes it
+  **self-healing**: any historical drift — including drift left behind by a
+  hand-rolled route like the "before" code above — is corrected by the next
+  reaction on that target. Delta arithmetic can only preserve an error forever.
+- Post-commit side effects (SSE fan-out, notifications, moderation queues) are
+  *not* `react()`'s job. The durable queue is the right tool for those, and an
+  `after_react` hook is a named follow-up below.
+
+## The widget
+
+[`reaction_controls`](../../autumn/src/widgets.rs) is the view half. It takes
+pre-extracted data — never a model or a repository — and renders one
+CSRF-protected `<form method="post">` per direction plus the live aggregate:
+
+```rust,ignore
+use autumn_web::widgets::{ReactionControls, reaction_controls};
+
+pub fn vote_controls(post_id: i64, score: i64, current: Option<i16>) -> Markup {
+    reaction_controls(
+        &ReactionControls::votes(
+            format!("votes-{post_id}"),
+            super::votes::__autumn_path_upvote(post_id),
+            super::votes::__autumn_path_downvote(post_id),
+        )
+        .aggregate(score)
+        .current(current)
+        .label("Post score"),
+    )
+}
+```
+
+- `ReactionControls::votes(dom_id, up_action, down_action)` renders up form /
+  aggregate / down form; `ReactionControls::likes(dom_id, action)` renders a
+  single toggle plus the count.
+- `.current(...)` takes `reaction_of()`'s result and presses the matching
+  button (`aria-pressed="true"` plus the `autumn-reaction-active` class);
+  `None` presses neither, which is what feeds and signed-out viewers pass.
+- Each form carries `hx-post` / `hx-target` / `hx-swap="outerHTML"`, with
+  `hx-target` defaulting to `#{dom_id}` — so the control replaces itself in
+  place. With JavaScript off the plain form POST still works.
+- The glyphs live in `<span aria-hidden="true">`, so each button's accessible
+  name comes from an explicit `aria-label` (`up_label` / `down_label` /
+  `like_label` to override). The aggregate sits in an `aria-live="polite"`
+  span. See the [accessibility guide](accessibility.md).
+- CSRF: `.csrf(Some(&csrf_token), Some(&csrf_field))`, or the
+  `.csrf_token(...)` / `.csrf_field(...)` primitives. With no token, no hidden
+  input is rendered.
+
+The route returns the same widget, so the response *is* the swap payload:
+
+```rust,ignore
+let reaction = posts_repo.react(user_id, post_id, value).await?;
+Ok(vote_controls(post_id, reaction.aggregate, reaction.value))
+```
+
+Styling hooks (`.autumn-reaction-controls`, `.autumn-reaction`,
+`.autumn-reaction-up`, `.autumn-reaction-down`, `.autumn-reaction-like`,
+`.autumn-reaction-button`, `.autumn-reaction-active`,
+`.autumn-reaction-count`) ship in the framework stylesheet — see
+[widget styling](widget-styling.md).
+
+## Known limits
+
+- **One `#[votable]` per model.** A model that wants both votes *and* bookmarks
+  cannot express it yet; a second attribute is a compile error, because
+  `{Model}Reactions` / `react` / `reaction_of` would be ambiguous.
+- **The recompute is O(edges per target).** `SUM(value) WHERE post_id = $t` is
+  an index scan on every single click. On a post with 500k votes that is real
+  work. Index the target FK on the edge table; the exactness is deliberate (see
+  the self-healing argument above), but it is a genuine scaling ceiling.
+- **Writes to one target serialize.** All reactions to one hot target queue on
+  its row lock. The aggregate `UPDATE` already took an exclusive lock on that
+  same row, so the design only extends the critical section by three short
+  statements — it changes the constant, not the asymptotics — but a viral
+  target is still capped at roughly one reaction per round trip.
+- **Five round trips per call.** Fine for a button press; do not loop `react()`
+  for a bulk import.
+- **READ COMMITTED is assumed** (see above).
+- **Feed pages cannot cheaply highlight the viewer's own reactions.** One
+  `reaction_of` per row is an N+1, which is why the example's feeds pass
+  `None`.
+
+## Follow-ups
+
+These are deliberately *not* in the first release:
+
+- **`reaction_of_many(reactor_id, &[target_id])`** — one batched lookup so feed
+  pages can highlight the viewer's reactions without an N+1.
+- **`aggregate = sum(delta)` fast mode** — `score = score + :delta` with a
+  periodic reconciliation job, trading exactness-per-write for O(1) writes on
+  very high-cardinality targets.
+- **Multiple `#[votable]` per model**, disambiguated by `name`, generating
+  `{Model}{Name}Reactions` / `react_{name}`.
+- **An `after_react` commit hook** — enqueued inside the reaction transaction
+  (the enqueue *is* transactional) so SSE fan-out and notifications become
+  durable instead of fire-and-forget.
+
+## See also
+
+- [Repositories](repositories.md) — the generated CRUD surface `react()` and
+  `reaction_of()` attach to.
+- [Aggregate queries](aggregates.md) — `GROUP BY` roll-ups over the edge table
+  itself, e.g. reddit-clone's "Top posts by votes" leaderboard.
+- [Soft delete](soft-delete.md) — the repository-layer scoping `react()`
+  mirrors.
+- [`docs/adr/0008-associations-and-eager-loading.md`](../adr/0008-associations-and-eager-loading.md)
+  — the design record, including the rejected lock-free and CTE designs.

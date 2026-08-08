@@ -1,16 +1,22 @@
-//! Vote routes — upvote and downvote posts via htmx.
+//! Vote routes — upvote and downvote posts via `#[votable]` + htmx.
 //!
-//! Demonstrates: htmx-powered partial page updates, session-based
-//! authentication, upsert with ON CONFLICT, returning updated HTML
-//! fragments instead of full pages.
+//! Demonstrates: the declarative `#[votable(by = User, aggregate = sum)]`
+//! association (#1362) replacing ~130 lines of hand-written toggle/flip/upsert
+//! SQL and a raw `UPDATE posts SET score = (SELECT SUM(...))` recompute with a
+//! single race-safe `posts.react(...)` call; htmx partial updates; session
+//! auth.
 
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::Post;
-use crate::schema::{posts, votes};
+// The reaction trait `#[votable]` emits on `Post`; it is blanket-implemented
+// for `PgPostRepository`, which is what brings `react` / `reaction_of` into
+// scope here.
+use crate::models::{Post, PostReactions as _, Subreddit, User};
+use crate::repositories::PgPostRepository;
+use crate::schema::{posts, subreddits, users};
 
 use super::layout::vote_controls;
 
@@ -19,10 +25,10 @@ use super::layout::vote_controls;
 pub async fn upvote(
     Path(post_id): Path<i64>,
     session: Session,
-    mut db: Db,
+    posts_repo: PgPostRepository,
     State(state): State<AppState>,
 ) -> AutumnResult<Markup> {
-    cast_vote(post_id, 1, &session, &mut db, &state).await
+    cast_vote(post_id, 1, &session, &posts_repo, &state).await
 }
 
 /// Downvote a post (-1). Returns updated vote controls HTML via htmx.
@@ -30,18 +36,23 @@ pub async fn upvote(
 pub async fn downvote(
     Path(post_id): Path<i64>,
     session: Session,
-    mut db: Db,
+    posts_repo: PgPostRepository,
     State(state): State<AppState>,
 ) -> AutumnResult<Markup> {
-    cast_vote(post_id, -1, &session, &mut db, &state).await
+    cast_vote(post_id, -1, &session, &posts_repo, &state).await
 }
 
-/// Cast a vote on a post. Handles insert-or-update and score recalculation.
+/// Cast a vote on a post: authenticate, `react`, re-render the control.
+///
+/// NOTE: no `Db` extractor anywhere in this path. `react()` checks out its
+/// *own* pooled connection (it does not join a caller's transaction), and this
+/// example runs a single-connection pool — holding a `Db` across the call
+/// would deadlock waiting for a second connection that can never free up.
 async fn cast_vote(
     post_id: i64,
     value: i16,
     session: &Session,
-    db: &mut Db,
+    posts_repo: &PgPostRepository,
     state: &AppState,
 ) -> AutumnResult<Markup> {
     let user_id: i64 = session
@@ -51,89 +62,40 @@ async fn cast_vote(
         .parse()
         .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
 
-    // Verify the post exists before touching votes
-    let post_exists: bool = diesel::dsl::select(diesel::dsl::exists(posts::table.find(post_id)))
-        .get_result(&mut **db)
-        .await?;
-    if !post_exists {
-        return Err(AutumnError::not_found_msg("Post not found"));
-    }
+    // Toggle / flip / insert this user's vote AND recompute `posts.score` from
+    // ground truth, atomically and race-safely, in one call: the target row is
+    // locked for the whole read-decide-write-recompute window. A missing or
+    // soft-deleted post is `NotFound`. The returned `Reaction` carries the new
+    // aggregate and the user's own value, so re-rendering needs no follow-up
+    // query.
+    let reaction = posts_repo.react(user_id, post_id, value).await?;
 
-    // Check if user already voted on this post
-    let existing_value: Option<i16> = votes::table
-        .filter(votes::user_id.eq(user_id))
-        .filter(votes::post_id.eq(post_id))
-        .select(votes::value)
-        .first(&mut **db)
-        .await
-        .optional()?;
+    broadcast_post_update(post_id, state).await?;
 
-    match existing_value {
-        Some(old_value) if old_value == value => {
-            // Same vote again — toggle off (remove vote)
-            diesel::delete(
-                votes::table
-                    .filter(votes::user_id.eq(user_id))
-                    .filter(votes::post_id.eq(post_id)),
-            )
-            .execute(&mut **db)
-            .await?;
-        }
-        Some(_) => {
-            // Different vote — flip direction
-            diesel::update(
-                votes::table
-                    .filter(votes::user_id.eq(user_id))
-                    .filter(votes::post_id.eq(post_id)),
-            )
-            .set(votes::value.eq(value))
-            .execute(&mut **db)
-            .await?;
-        }
-        None => {
-            // New vote
-            diesel::insert_into(votes::table)
-                .values((
-                    votes::user_id.eq(user_id),
-                    votes::post_id.eq(post_id),
-                    votes::value.eq(value),
-                ))
-                .on_conflict((votes::user_id, votes::post_id))
-                .do_update()
-                .set(votes::value.eq(value))
-                .execute(&mut **db)
-                .await?;
-        }
-    }
+    Ok(vote_controls(post_id, reaction.aggregate, reaction.value))
+}
 
-    // Recompute the score atomically in a single statement on the request's
-    // primary `db` connection — no read-then-write race. Score maintenance is a
-    // WRITE: it must see this transaction's just-written vote and stay atomic
-    // with it, so it must NOT be a replica-eligible read. (For a replica-routed
-    // *read* of vote tallies via the typed grouped-aggregate API (#1364), see
-    // the "Top posts by votes" leaderboard on the front page — routes::posts.)
-    diesel::sql_query(
-        "UPDATE posts SET score = COALESCE((SELECT SUM(value::bigint) FROM votes WHERE post_id = $1), 0) WHERE id = $1"
-    )
-    .bind::<diesel::sql_types::BigInt, _>(post_id)
-    .execute(&mut **db)
-    .await?;
+/// Publish the updated post fragment to the global and per-subreddit SSE
+/// topics (presentation, not vote logic).
+///
+/// Pool discipline: `react()` released its connection before returning, this
+/// helper's checkout is short-lived and dropped before the fan-out, so no two
+/// checkouts ever overlap on the example's `max_size = 1` pool.
+async fn broadcast_post_update(post_id: i64, state: &AppState) -> AutumnResult<()> {
+    let pool = state
+        .pool()
+        .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
+    let mut conn = pool.get().await.map_err(AutumnError::from)?;
 
-    // Load the updated post to broadcast it.
-    let post: Post = posts::table.find(post_id).first(&mut **db).await?;
-    let new_score = post.score;
-
-    // Load the subreddit to get its slug
-    let sub: crate::models::Subreddit = crate::schema::subreddits::table
+    // Reload the post (its `score` was just updated inside `react()`'s
+    // transaction), plus the relations the live fragment renders.
+    let post: Post = posts::table.find(post_id).first(&mut conn).await?;
+    let sub: Subreddit = subreddits::table
         .find(post.subreddit_id)
-        .first(&mut **db)
+        .first(&mut conn)
         .await?;
-
-    // Load the author to get their username
-    let author: crate::models::User = crate::schema::users::table
-        .find(post.author_id)
-        .first(&mut **db)
-        .await?;
+    let author: User = users::table.find(post.author_id).first(&mut conn).await?;
+    drop(conn);
 
     let lookup = crate::repositories::PostRelationsLookup {
         author_name: author.username,
@@ -142,8 +104,8 @@ async fn cast_vote(
     };
 
     let sse_state = state.clone();
-    let sse_post = post.clone();
-    let sse_sub_slug = sub.slug.clone();
+    let sse_post = post;
+    let sse_sub_slug = sub.slug;
     crate::repositories::CURRENT_POST_RELATIONS
         .scope(lookup, async move {
             let _ = sse_state.broadcast().publish_oob(
@@ -154,7 +116,7 @@ async fn cast_vote(
             );
 
             let _ = sse_state.broadcast().publish_oob(
-                &format!("posts:r/{}", sse_sub_slug),
+                &format!("posts:r/{sse_sub_slug}"),
                 &sse_post.dom_id(),
                 &autumn_web::htmx::OobSwap::OuterHTML,
                 &sse_post.render_fragment(),
@@ -162,7 +124,7 @@ async fn cast_vote(
         })
         .await;
 
-    Ok(vote_controls(post_id, new_score))
+    Ok(())
 }
 
 autumn_web::paths![upvote, downvote];

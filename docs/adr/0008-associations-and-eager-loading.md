@@ -246,3 +246,106 @@ introducing a parallel system:
 See `autumn-macros/src/lib.rs`'s `#[model]` doc comment for the full
 `through =` syntax and `examples/reddit-clone` (`Post` ↔ `Tag` via
 `post_tags`) for the reference implementation.
+
+## Update: votable (#1362)
+
+Added `#[votable(by = <Reactor>, aggregate = sum|count)]` as a third
+association kind on `#[model]` — a `(reactor, target)`-unique edge table plus
+an aggregate column (`score` / `{name}_count`) maintained on the target. It
+reuses this ADR's machinery rather than introducing a parallel one: the edge
+table is a hidden per-association `diesel::table!` (the m2m pattern), and the
+generated `{Model}Reactions` trait (`react` / `reaction_of`) is
+blanket-implemented over the same `M2mConnSource<Model = M>` bound the m2m
+mutation traits use, so `#[repository]` needed no change at all.
+
+**Design space for the write path, and why the pessimistic lock won.** The
+acceptance criteria asked for "a single upsert/delete, no read-then-write
+window". We deliberately implemented something different — and stronger — and
+record the alternatives here:
+
+- **Lock-free upsert + separate aggregate recompute** (the closest reading of
+  the literal AC, and what reddit-clone did by hand). *Rejected.* It fixes the
+  same-user double-click and leaves the far more dangerous bug untouched: two
+  **different** reactors on the same target each run `SELECT SUM(value)`
+  against a snapshot that excludes the other's uncommitted edge, then both
+  write the same score. The persisted aggregate is permanently off by one vote,
+  in the ordinary production workload, with no error anywhere.
+- **Delta arithmetic (`score = score + :delta`) from an upsert's `RETURNING`.**
+  *Rejected.* The delta needs the *old* value, which Postgres cannot return
+  from an upsert before PG 18's `RETURNING OLD.*`. Smuggling it via an extra
+  `prev_value` column would force a schema change and break the "works on the
+  table you already have" property. Accumulated aggregates also preserve any
+  historical drift forever, where a recompute is self-healing.
+- **A single data-modifying CTE** (`WITH del AS (DELETE … RETURNING) INSERT …
+  ON CONFLICT DO UPDATE`). *Rejected.* It reads as an elegant one-statement
+  answer and is wrong: the `INSERT`'s unique-index arbiter runs against the
+  statement snapshot in which the just-deleted row is still live, so the insert
+  conflicts with it and `DO UPDATE` fails with `tuple to be updated was already
+  modified`. Data-modifying CTEs are also unsupported on SQLite.
+- **`xmax = 0` inserted/updated discrimination.** *Rejected* on the same
+  grounds as folklore in general: it is a documented-nowhere implementation
+  detail that reviewers cannot check and that has no SQLite analogue.
+- **Per-edge `SELECT … FOR UPDATE`.** *Rejected.* `FOR UPDATE` on zero rows
+  locks nothing, so the insert race — the one the issue cares about — is
+  exactly the case it fails to cover.
+- **Advisory locks / `SERIALIZABLE` + retry.** *Rejected* as heavier failure
+  surfaces (hash collisions serialising unrelated pairs; a retry policy and
+  latency tail) for no additional correctness over a row lock.
+- **A database trigger or generated column.** *Rejected* — SQL the user must
+  write and maintain is the opposite of a declarative Rust attribute, and it
+  diverges per backend.
+- **Chosen: a pessimistic exclusive lock on the *target row*** (`SELECT id FROM
+  targets WHERE id = $t FOR UPDATE` on Postgres; `BEGIN IMMEDIATE`'s
+  database-wide write lock on SQLite), taken *before* the edge is read and held
+  to commit, with the edge read/branch/write and the `SUM`/`COUNT` recompute
+  and the aggregate `UPDATE` all inside it. The literal AC ("single
+  upsert/delete") is not met; the property it exists to buy — the decision
+  cannot be invalidated between reading and acting on it — is met and extended
+  to cover the aggregate. The correctness argument is one paragraph a reviewer
+  can verify (mutual exclusion per target ⇒ equivalent to some serial
+  execution ⇒ prove the invariant serially), rather than snapshot lawyering. It
+  costs per-target write serialisation and five round trips per call, both
+  documented as known limits. The target row is the row we must exclusively
+  lock for the `UPDATE` anyway, so the design extends the existing critical
+  section backwards over three short statements — it changes the constant, not
+  the asymptotics. The `ON CONFLICT (reactor_fk, target_fk) DO UPDATE` is still
+  emitted on the insert branch (unreachable under the lock) so a lock-bypassing
+  writer produces an idempotent update rather than a `23505`.
+
+**Deviation from the issue: no commit hooks.** AC3 asked for the aggregate to
+be recomputed "atomically in the same transaction … (reusing
+`repository_commit_hooks`)". Those two clauses are mutually exclusive.
+`repository_commit_hooks` is a durable *post-commit* queue: only the enqueue is
+in-transaction, and hook bodies run later on a different connection with
+retries and a dead-letter path. A hook therefore cannot be atomic with the edge
+mutation, and the window between commit and hook execution is precisely the
+edge/aggregate disagreement the normative half of AC3 forbids. We honoured the
+normative clause with an in-transaction `UPDATE` and treated the parenthetical
+as a non-binding implementation suggestion. `react()` enqueues no hook. An
+`after_react` hook — for SSE fan-out, notifications, moderation — *is* the
+correct use of the durable queue and is recorded as a follow-up; it would
+replace reddit-clone's current fire-and-forget `publish_oob`.
+
+**Count-mode arity.** `aggregate = count` emits `react(reactor_id, target_id)`
+with **no** `value` parameter, so the two modes have different arities. The
+alternative considered was a uniform `react(reactor_id, target_id, value)` in
+both modes with a runtime check that count-mode callers pass `1`. Rejected: a
+count edge table has no value column (its rows are pure membership, exactly
+like an m2m join row), so a `value` parameter would be a meaningless argument
+validated at run time instead of eliminated at compile time. `reaction_of`
+*does* keep a uniform `Option<i16>` return in both modes (count mode yields
+`Some(1)`), which is what keeps view and widget code mode-independent — the
+asymmetry is deliberate and confined to the write side.
+
+**Scope cuts recorded as follow-ups:** at most one `#[votable]` per model
+(a second is a directed compile error, since `{Model}Reactions` / `react` /
+`reaction_of` would be ambiguous); no batch `reaction_of_many`, so feed pages
+render un-highlighted controls rather than an N+1; no `aggregate = sum(delta)`
+fast mode for very high-cardinality targets; and `M2mConnSource` keeps its
+m2m-specific name pending a mechanical `AssocConnSource` rename.
+
+See `docs/guide/votable.md` for the user-facing treatment,
+`autumn-macros/src/lib.rs`'s `#[model]` doc comment for the attribute grammar
+and required migration, and `examples/reddit-clone` (`Post` ← `User` via
+`votes`) for the reference implementation — including the conversion that
+deleted the example's hand-written vote SQL.

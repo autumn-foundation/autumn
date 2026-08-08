@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **model:** declarative votable/reaction association via `#[votable(by =
+  ..., aggregate = sum|count)]` (#1362). Votes, likes and favourites are the
+  same shape every time — a `(reactor, target)`-unique edge table, a
+  toggle/flip/insert on it, and a denormalised `score` / `{name}_count` on the
+  target that must stay exactly equal to `SUM(value)` / `COUNT(*)` — and
+  hand-writing it is a read-then-write race on the edge *plus* a lost-update
+  race on the aggregate whenever two *different* reactors touch one target.
+  Declaring `#[votable(by = User, aggregate = sum)]` on a `#[model]` now emits
+  the edge table's `diesel::table!` into a hidden per-association module (the
+  `through =` many-to-many pattern from #1324, so it never collides with a
+  hand-written `schema.rs` entry) plus a `{Model}Reactions` trait
+  blanket-implemented for that model's `#[repository]` — no repository
+  attribute, no macro changes on the repository side. The trait gives
+  `react(reactor_id, target_id, value) -> Reaction { value: Option<i16>,
+  aggregate: i64, outcome: Inserted|Flipped|Removed }` and
+  `reaction_of(reactor_id, target_id) -> Option<i16>`
+  (`autumn_web::repository::{Reaction, ReactionOutcome}`); `aggregate = count`
+  emits `react(reactor_id, target_id)` with no `value` parameter, since a
+  unary-like edge row is pure membership. `react()` is idempotent and
+  race-safe: the same value again toggles the edge off, a different value
+  flips it in place, a new one inserts it, and the aggregate is recomputed
+  from ground truth (`SUM`/`COUNT`, never accumulated as a delta, so
+  pre-existing drift self-heals) and persisted **in the same transaction**,
+  under an exclusive lock on the target row held across the whole
+  read-decide-write-recompute window (`SELECT ... FOR UPDATE` on Postgres,
+  `BEGIN IMMEDIATE`'s write lock on SQLite). N concurrent reactions on one
+  target therefore converge to at most one edge per `(reactor, target)` with
+  no `23505` escaping to any caller, the persisted aggregate is exact even
+  across different reactors, and a reader never observes edge/aggregate
+  disagreement — verified against real Postgres by 50 simultaneous clicks on
+  one pair. Every name is inferred with an override for each (`name`, `table`,
+  `reactor_fk`, `target_fk`, `value_column`, `column`); the defaults resolve
+  to `votes` / `user_id` / `post_id` / `value` / `score`, which is why
+  `examples/reddit-clone` adopted it with **no migration and no overrides**,
+  collapsing ~130 lines of hand-written toggle/flip/upsert SQL and a raw
+  `sql_query` score recompute in `src/routes/votes.rs` to a single
+  `posts.react(...)` call with zero raw SQL. The composite `UNIQUE (reactor_fk,
+  target_fk)` on the edge table is load-bearing (it is the `ON CONFLICT`
+  arbiter) and remains the app's migration to write. Soft-delete aware: when
+  the target model has a `deleted_at` field, reacting to a soft-deleted target
+  is `NotFound` and leaves its aggregate untouched, matching the repository
+  layer's scoping. The view half is the new no-JS
+  `autumn_web::widgets::{ReactionControls, reaction_controls}` (also prelude
+  re-exported): one CSRF-protected `<form method="post">` per direction,
+  upgraded in place by htmx (`hx-swap="outerHTML"` onto the control's own
+  `dom_id`), ARIA toggle buttons with real accessible names and
+  `aria-pressed`, and an `aria-live` aggregate. Known limits, all documented:
+  at most one `#[votable]` per model (a second is a directed compile error),
+  the recompute is O(edges per target), writes to one target serialise, READ
+  COMMITTED is assumed (stricter isolation fails with `40001` rather than
+  corrupting), and — like the m2m mutation helpers — `react()` acquires its
+  **own** pooled connection and does not join an enclosing `Db::tx`, so a
+  handler must not hold a `Db` extractor across the call on a small pool.
+  Contrary to the issue's parenthetical suggestion, the recompute does **not**
+  reuse `repository_commit_hooks`: that is a durable post-commit queue running
+  on a different connection, which structurally cannot be atomic with the edge
+  mutation — see `docs/adr/0008-associations-and-eager-loading.md` for the
+  reasoning and the rejected lock-free/CTE/delta designs. Purely additive; no
+  existing association, model, or repository behaviour changes; minor version
+  bump. See the new `docs/guide/votable.md`.
 - **sim-testing:** fix a genuine **job-backoff thundering herd** the
   deterministic simulation harness caught (W7, #1797): the local job
   runtime's retry backoff (`execute_local_job`, `job.rs`) computed a pure

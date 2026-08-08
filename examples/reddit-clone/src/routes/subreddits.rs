@@ -252,7 +252,9 @@ pub async fn show(
                         div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
                             div class="flex items-start gap-3 p-4" {
                                 // Vote controls
-                                (super::layout::vote_controls(*post_id, *score))
+                                // Feed: `None` (see the front page) — no
+                                // per-row `reaction_of` lookup.
+                                (super::layout::vote_controls(*post_id, *score, None))
 
                                 // Post info
                                 div class="flex-1 min-w-0" {
