@@ -180,7 +180,21 @@ pub fn layout(
 /// `Some(1)` / `Some(-1)` press the matching button, `None` presses neither.
 /// Feeds and live fragments pass `None` deliberately — highlighting every row
 /// would cost one query per post (a batch accessor is the tracked follow-up).
-pub fn vote_controls(post_id: i64, score: i64, current: Option<i16>) -> Markup {
+///
+/// `csrf` is the handler's own `CsrfToken` extractor. CSRF protection is
+/// **enabled** in this app (`autumn.toml`), so it is load-bearing for the no-JS
+/// path: the hidden `_csrf` input is what lets a plain form POST through when
+/// JavaScript is off. The htmx path would survive without it — the framework's
+/// `autumn-htmx-csrf.js` shim sends the token as a header — so a missing token
+/// fails only for the visitors least able to work around it. `None` is
+/// therefore correct in exactly one place: fragments broadcast over SSE, which
+/// by construction only reach clients that are running htmx.
+pub fn vote_controls(
+    post_id: i64,
+    score: i64,
+    current: Option<i16>,
+    csrf: Option<&autumn_web::security::CsrfToken>,
+) -> Markup {
     reaction_controls(
         &ReactionControls::votes(
             format!("votes-{post_id}"),
@@ -189,6 +203,9 @@ pub fn vote_controls(post_id: i64, score: i64, current: Option<i16>) -> Markup {
         )
         .aggregate(score)
         .current(current)
+        // The form-field name stays the default `_csrf`, which is what the
+        // app's CSRF layer expects.
+        .csrf(csrf, None)
         .label("Post score"),
     )
 }

@@ -99,6 +99,87 @@ fn marks_the_current_reaction_aria_pressed() {
 }
 
 #[test]
+fn marks_the_down_button_active_when_current_is_negative() {
+    let html = reaction_controls(
+        &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+            .aggregate(-1)
+            .current(Some(-1)),
+    )
+    .into_string();
+
+    // The active *class* (not just the aria-pressed ordering) must land on the
+    // down button: styling keys off it, and a swapped branch would still put
+    // the aria attributes in the right order while highlighting the wrong side.
+    let down_form = html
+        .split(r#"class="autumn-reaction autumn-reaction-down""#)
+        .nth(1)
+        .expect("a down form");
+    assert!(
+        down_form.contains("autumn-reaction-button autumn-reaction-active"),
+        "the down button carries the active class: {html}"
+    );
+    assert_eq!(
+        html.matches("autumn-reaction-active").count(),
+        1,
+        "exactly one direction is highlighted: {html}"
+    );
+    // The up button is the plain, unpressed one.
+    let up_form = html
+        .split(r#"class="autumn-reaction autumn-reaction-up""#)
+        .nth(1)
+        .expect("an up form");
+    let up_button = up_form.split("</form>").next().expect("the up button");
+    assert!(
+        !up_button.contains("autumn-reaction-active"),
+        "the up button is not highlighted: {html}"
+    );
+}
+
+#[test]
+fn marks_the_like_button_pressed_and_active_in_like_mode() {
+    let html = reaction_controls(
+        &ReactionControls::likes("likes-42", "/posts/42/like")
+            .aggregate(3)
+            .current(Some(1)),
+    )
+    .into_string();
+
+    assert!(
+        html.contains(r#"aria-pressed="true""#),
+        "the viewer's like is a pressed toggle: {html}"
+    );
+    assert!(
+        html.contains("autumn-reaction-button autumn-reaction-active"),
+        "the like button carries the active class: {html}"
+    );
+    assert!(!html.contains(r#"aria-pressed="false""#), "{html}");
+}
+
+#[test]
+fn like_mode_ignores_a_negative_current() {
+    // Documented behavior: `current` is `{None, Some(1), Some(-1)}`, and count
+    // mode has no down direction — a `Some(-1)` (which `reaction_of()` never
+    // returns in count mode) presses nothing rather than pressing the like.
+    let html = reaction_controls(
+        &ReactionControls::likes("likes-42", "/posts/42/like")
+            .aggregate(3)
+            .current(Some(-1)),
+    )
+    .into_string();
+
+    assert!(!html.contains(r#"aria-pressed="true""#), "{html}");
+    assert_eq!(
+        html.matches(r#"aria-pressed="false""#).count(),
+        1,
+        "the single like button renders as an unpressed toggle: {html}"
+    );
+    assert!(
+        !html.contains("autumn-reaction-active"),
+        "nothing is highlighted: {html}"
+    );
+}
+
+#[test]
 fn marks_no_button_pressed_when_current_is_none() {
     let html = reaction_controls(
         &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
@@ -286,7 +367,11 @@ fn degrades_to_a_plain_post_form() {
     )
     .into_string();
 
-    // Works with JavaScript off: real forms, real submit buttons, no inline JS.
+    // The markup half of the no-JS path: real forms, real submit buttons, no
+    // inline JS or styles. This does not on its own prove the POST *succeeds*
+    // with JavaScript off — in a CSRF-protected app the plain form also needs
+    // the hidden token (`threads_the_csrf_hidden_input`); without it only the
+    // htmx path works, via the header shim.
     assert_eq!(
         html.matches(r#"<form method="post""#).count(),
         2,

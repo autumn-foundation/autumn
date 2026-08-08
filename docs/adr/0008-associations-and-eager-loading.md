@@ -294,8 +294,8 @@ record the alternatives here:
 - **A database trigger or generated column.** *Rejected* — SQL the user must
   write and maintain is the opposite of a declarative Rust attribute, and it
   diverges per backend.
-- **Chosen: a pessimistic exclusive lock on the *target row*** (`SELECT id FROM
-  targets WHERE id = $t FOR UPDATE` on Postgres; `BEGIN IMMEDIATE`'s
+- **Chosen: a pessimistic lock on the *target row*** (`SELECT id FROM targets
+  WHERE id = $t FOR NO KEY UPDATE` on Postgres; `BEGIN IMMEDIATE`'s
   database-wide write lock on SQLite), taken *before* the edge is read and held
   to commit, with the edge read/branch/write and the `SUM`/`COUNT` recompute
   and the aggregate `UPDATE` all inside it. The literal AC ("single
@@ -304,8 +304,14 @@ record the alternatives here:
   to cover the aggregate. The correctness argument is one paragraph a reviewer
   can verify (mutual exclusion per target ⇒ equivalent to some serial
   execution ⇒ prove the invariant serially), rather than snapshot lawyering. It
-  costs per-target write serialisation and five round trips per call, both
-  documented as known limits. The target row is the row we must exclusively
+  costs per-target write serialisation and seven round trips per call
+  (`BEGIN`, S1-S5, `COMMIT`), both documented as known limits.
+  **`FOR NO KEY UPDATE`, not `FOR UPDATE`:** the two are equally exclusive
+  against each other, so the mutual-exclusion argument is unchanged, but
+  `FOR UPDATE` also conflicts with the `FOR KEY SHARE` lock a referencing
+  insert takes — under it, inserting a comment on a post would queue behind
+  every vote on that post. `react()` only writes a non-key column, so it takes
+  the weaker mode. The target row is the row we must exclusively
   lock for the `UPDATE` anyway, so the design extends the existing critical
   section backwards over three short statements — it changes the constant, not
   the asymptotics. The `ON CONFLICT (reactor_fk, target_fk) DO UPDATE` is still
@@ -336,6 +342,17 @@ validated at run time instead of eliminated at compile time. `reaction_of`
 *does* keep a uniform `Option<i16>` return in both modes (count mode yields
 `Some(1)`), which is what keeps view and widget code mode-independent — the
 asymmetry is deliberate and confined to the write side.
+
+**Nullable target FKs are tolerated.** The generated hidden `table!` declares
+the edge's target FK non-nullable, so nothing `react()` writes can be `NULL`,
+but the *DDL* column may be nullable — which it already is in reddit-clone,
+whose `votes` table is an XOR over `post_id` / `comment_id`. A Postgres unique
+constraint treats `NULL`s as distinct, so `UNIQUE (user_id, post_id)`
+constrains exactly the rows this association writes and ignores the comment
+votes. We chose to document and test that coexistence
+(`react_is_exact_when_the_edge_table_has_a_nullable_target_fk`) rather than
+require `NOT NULL`, which would have made "works on the table you already
+have" false for the flagship example.
 
 **Scope cuts recorded as follow-ups:** at most one `#[votable]` per model
 (a second is a directed compile error, since `{Model}Reactions` / `react` /

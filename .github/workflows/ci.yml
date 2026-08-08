@@ -382,6 +382,7 @@ jobs:
             --test sqlite_crud_basic \
             --test sqlite_field_conversions \
             --test sqlite_upsert_isolation \
+            --test sqlite_votable \
             --test sqlite_dependent_destroy \
             --test sqlite_commit_hook_worker \
             --test sim_chaos \

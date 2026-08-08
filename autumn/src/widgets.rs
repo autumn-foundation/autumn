@@ -811,6 +811,17 @@ pub fn transition_controls(
 /// The struct owns every string it renders (no lifetimes), so a handler can
 /// build it from borrowed request data and hand it straight to the widget.
 ///
+/// # `dom_id` is trusted
+///
+/// `dom_id` is rendered as the container's `id` **and** interpolated into the
+/// default `hx-target` (`#{dom_id}`), where it is read as a CSS selector
+/// fragment. Pass a value you construct — `format!("votes-{post_id}")` from a
+/// typed id is the intended shape — never a raw request parameter or any other
+/// attacker-controlled string. Maud escapes the attribute value, so this is not
+/// an injection hole; it is a correctness one: a value containing whitespace,
+/// `#`, `.` or a quote yields a selector that matches nothing and an htmx swap
+/// that silently does not land.
+///
 /// # Example
 ///
 /// ```rust
@@ -905,9 +916,13 @@ impl ReactionControls {
 
     /// Set the viewer's own current reaction (`reaction_of()`'s result).
     ///
-    /// `Some(1)` presses the up/like button, `Some(-1)` the down button, and
-    /// `None` (the default — what a feed or a signed-out viewer passes)
-    /// presses neither.
+    /// The rendered domain is `{None, Some(1), Some(-1)}`: `Some(1)` presses
+    /// the up/like button, `Some(-1)` the down button, and `None` (the
+    /// default — what a feed or a signed-out viewer passes) presses neither.
+    /// Any other value presses nothing, and in like/count mode `Some(-1)`
+    /// presses nothing either, since that mode renders no down direction.
+    /// (`reaction_of()` only ever yields those three, so this matters just for
+    /// hand-built configs.)
     #[must_use]
     pub const fn current(mut self, v: Option<i16>) -> Self {
         self.current = v;
@@ -943,7 +958,8 @@ impl ReactionControls {
     }
 
     /// Set the `hx-target` each form swaps. Default: `#{dom_id}` — the control
-    /// replaces itself in place.
+    /// replaces itself in place. The value is a CSS selector, so it is subject
+    /// to the same "must not be attacker-controlled" rule as `dom_id`.
     #[must_use]
     pub fn hx_target(mut self, s: impl Into<String>) -> Self {
         self.hx_target = s.into();
@@ -991,8 +1007,9 @@ impl ReactionControls {
     }
 }
 
-/// Render a no-JS reaction control: one CSRF-protected `POST` form per
-/// direction plus the target's live aggregate, upgraded in place by htmx.
+/// Render a no-JS reaction control: one `POST` form per direction (CSRF-
+/// protected when a token is threaded) plus the target's live aggregate,
+/// upgraded in place by htmx.
 ///
 /// This is the view half of the `#[votable]` association (issue #1362). The
 /// generated `repo.react(reactor_id, target_id, value)` returns a `Reaction`
@@ -1020,14 +1037,20 @@ impl ReactionControls {
 ///   form; [`ReactionControls::likes`] renders a single like form and the
 ///   aggregate.
 /// - Each direction is an independent `<form method="post" action=(action)>`
-///   carrying the hidden CSRF input and a single `<button type="submit">`, so
-///   the control works with JavaScript disabled. The same form also carries
-///   `hx-post` / `hx-target` / `hx-swap="outerHTML"`, so with htmx loaded the
-///   submit is intercepted and the response replaces the control in place.
+///   carrying a single `<button type="submit">` (plus the hidden CSRF input
+///   when a token is threaded), so the control still submits with JavaScript
+///   disabled. The same form also carries `hx-post` / `hx-target` /
+///   `hx-swap="outerHTML"`, so with htmx loaded the submit is intercepted and
+///   the response replaces the control in place.
+/// - **The widget emits `<form>` elements.** HTML forbids nesting a form
+///   inside another form, so never render this widget inside one — the browser
+///   drops the inner form and the buttons submit the outer one instead. Place
+///   it as a sibling.
 /// - Each button is an ARIA toggle: `aria-pressed="true"` exactly on the
 ///   direction matching `current` (`Some(1)` → up/like, `Some(-1)` → down),
-///   which also gets the `autumn-reaction-active` class. `current(None)`
-///   presses neither.
+///   which also gets the `autumn-reaction-active` class. `current(None)` —
+///   and, in like/count mode, `current(Some(-1))`, which has no direction to
+///   match — presses neither.
 /// - The glyph (`▲` / `▼` / `♥`) lives in a `<span aria-hidden="true">`, so
 ///   the button's accessible name comes from its explicit `aria-label` — a
 ///   screen reader never announces a nameless icon button.
@@ -1035,7 +1058,7 @@ impl ReactionControls {
 ///   `aria-live="polite"` span, so an htmx swap announces the new total.
 /// - No JavaScript, no inline styles: plain HTML forms and buttons only.
 ///
-/// # CSRF
+/// # CSRF — required for the no-JS path
 ///
 /// Call [`ReactionControls::csrf`] with the handler's `Option<&CsrfToken>` and
 /// `Option<&CsrfFormField>` (or the [`ReactionControls::csrf_token`] /
@@ -1043,6 +1066,15 @@ impl ReactionControls {
 /// every form gets a hidden `<input type="hidden">` named after the field
 /// (defaulting to `"_csrf"`), exactly like scaffolded forms. With no token,
 /// no hidden input is rendered.
+///
+/// **This is what makes the JavaScript-off fallback actually work.** With CSRF
+/// protection enabled and no token threaded, the htmx path still succeeds —
+/// the framework's `autumn-htmx-csrf.js` shim adds the token as a request
+/// header — but the plain form POST carries no token and is rejected with
+/// `403`. A control rendered without `.csrf(...)` is therefore htmx-only in a
+/// CSRF-protected app. Thread the token on every page a no-JS visitor can
+/// reach; the one place it is legitimately omitted is a fragment that only
+/// reaches JS-enabled clients (an SSE/live payload).
 ///
 /// # CSS hooks
 ///
@@ -5171,6 +5203,55 @@ mod tests {
             |_to| true,
             Some(&token),
             Some(&field),
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"<input type="hidden" name="csrf_custom" value="secret-token">"#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    // ── reaction_controls CSRF sugar ───────────────────────────────────
+
+    /// The `.csrf(Option<&CsrfToken>, Option<&CsrfFormField>)` sugar is the
+    /// path every real handler uses (a `CsrfToken` cannot be constructed
+    /// outside this crate, so the integration tests can only exercise the
+    /// `.csrf_token(&str)` primitive). reddit-clone's `vote_controls` calls it
+    /// with the page's extractor, which is what puts the hidden input in the
+    /// post-detail markup and makes the no-JS form POST pass CSRF.
+    #[test]
+    fn reaction_controls_csrf_sugar_renders_the_hidden_input_in_every_form() {
+        let token = crate::security::CsrfToken::new("secret-token".to_string());
+        let html = reaction_controls(
+            &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+                .aggregate(7)
+                .csrf(Some(&token), None),
+        )
+        .into_string();
+        assert_eq!(
+            html.matches(r#"<input type="hidden" name="_csrf" value="secret-token">"#)
+                .count(),
+            2,
+            "{html}"
+        );
+
+        // `None` is the SSE-fragment case: htmx-only, no hidden input.
+        let anonymous = reaction_controls(
+            &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+                .aggregate(7)
+                .csrf(None, None),
+        )
+        .into_string();
+        assert!(!anonymous.contains("_csrf"), "{anonymous}");
+    }
+
+    #[test]
+    fn reaction_controls_csrf_sugar_honors_a_custom_field_name() {
+        let token = crate::security::CsrfToken::new("secret-token".to_string());
+        let field = crate::security::CsrfFormField("csrf_custom".to_string());
+        let html = reaction_controls(
+            &ReactionControls::likes("likes-42", "/posts/42/like").csrf(Some(&token), Some(&field)),
         )
         .into_string();
         assert!(

@@ -1,6 +1,6 @@
-//! #1362: only `sum` (signed up/down votes) and `count` (unary likes) are
-//! supported aggregates — average/star ratings are explicitly out of scope, so
-//! an unknown mode must not silently fall back to a default.
+//! #1362: `sum` (signed up/down votes) and `count` (unary likes) are the only
+//! aggregate modes — there is no `avg`, and arbitrary signed weights are
+//! expressed with sum + `value_column`. An unknown mode must not fall back.
 use autumn_web::model;
 
 diesel::table! {

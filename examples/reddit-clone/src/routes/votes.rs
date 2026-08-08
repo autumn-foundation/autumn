@@ -1,10 +1,11 @@
 //! Vote routes — upvote and downvote posts via `#[votable]` + htmx.
 //!
 //! Demonstrates: the declarative `#[votable(by = User, aggregate = sum)]`
-//! association (#1362) replacing ~130 lines of hand-written toggle/flip/upsert
+//! association (#1362) replacing ~90 lines of hand-written toggle/flip/upsert
 //! SQL and a raw `UPDATE posts SET score = (SELECT SUM(...))` recompute with a
-//! single race-safe `posts.react(...)` call; htmx partial updates; session
-//! auth.
+//! single race-safe `posts.react(...)` call (this file went from 168 lines to
+//! 130, and the vote logic itself is now three statements); htmx partial
+//! updates; session auth.
 
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
@@ -25,10 +26,11 @@ use super::layout::vote_controls;
 pub async fn upvote(
     Path(post_id): Path<i64>,
     session: Session,
+    csrf: CsrfToken,
     posts_repo: PgPostRepository,
     State(state): State<AppState>,
 ) -> AutumnResult<Markup> {
-    cast_vote(post_id, 1, &session, &posts_repo, &state).await
+    cast_vote(post_id, 1, &session, &csrf, &posts_repo, &state).await
 }
 
 /// Downvote a post (-1). Returns updated vote controls HTML via htmx.
@@ -36,22 +38,29 @@ pub async fn upvote(
 pub async fn downvote(
     Path(post_id): Path<i64>,
     session: Session,
+    csrf: CsrfToken,
     posts_repo: PgPostRepository,
     State(state): State<AppState>,
 ) -> AutumnResult<Markup> {
-    cast_vote(post_id, -1, &session, &posts_repo, &state).await
+    cast_vote(post_id, -1, &session, &csrf, &posts_repo, &state).await
 }
 
 /// Cast a vote on a post: authenticate, `react`, re-render the control.
 ///
 /// NOTE: no `Db` extractor anywhere in this path. `react()` checks out its
-/// *own* pooled connection (it does not join a caller's transaction), and this
-/// example runs a single-connection pool — holding a `Db` across the call
-/// would deadlock waiting for a second connection that can never free up.
+/// *own* pooled connection (it does not join a caller's transaction), so a
+/// handler that holds a `Db` across the call needs *two* connections at once.
+/// That works in dev and deadlocks under load: once concurrent requests reach
+/// the pool size (10 by default), every one of them is holding one connection
+/// and waiting for a second that no other request can release.
+///
+/// The re-rendered control carries the viewer's CSRF token, so the buttons in
+/// the swapped-in fragment keep working with JavaScript off.
 async fn cast_vote(
     post_id: i64,
     value: i16,
     session: &Session,
+    csrf: &CsrfToken,
     posts_repo: &PgPostRepository,
     state: &AppState,
 ) -> AutumnResult<Markup> {
@@ -72,15 +81,21 @@ async fn cast_vote(
 
     broadcast_post_update(post_id, state).await?;
 
-    Ok(vote_controls(post_id, reaction.aggregate, reaction.value))
+    Ok(vote_controls(
+        post_id,
+        reaction.aggregate,
+        reaction.value,
+        Some(csrf),
+    ))
 }
 
 /// Publish the updated post fragment to the global and per-subreddit SSE
 /// topics (presentation, not vote logic).
 ///
-/// Pool discipline: `react()` released its connection before returning, this
-/// helper's checkout is short-lived and dropped before the fan-out, so no two
-/// checkouts ever overlap on the example's `max_size = 1` pool.
+/// Pool discipline: `react()` released its connection before returning, and
+/// this helper's checkout is short-lived and dropped before the fan-out, so a
+/// request never holds two connections at once — which is exactly what keeps
+/// the pool from deadlocking under concurrent votes.
 async fn broadcast_post_update(post_id: i64, state: &AppState) -> AutumnResult<()> {
     let pool = state
         .pool()

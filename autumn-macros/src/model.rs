@@ -13,7 +13,7 @@
 //! Recognises `#[id]`, `#[indexed]`, and `#[validate(...)]` field attributes.
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::{ToTokens as _, format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
@@ -259,6 +259,42 @@ struct VotableSpec {
     column: String,
 }
 
+/// Reject a `#[votable(key = value)]` value that is not a plain Rust
+/// identifier.
+///
+/// Every name-shaped value in the attribute is spliced into generated code
+/// through `format_ident!` — as a table/column ident inside the hidden
+/// `diesel::table!` declarations, or (for `name`) as a fragment of the hidden
+/// module ident. `format_ident!` **panics** on a non-identifier, and a
+/// proc-macro panic reaches the user as an opaque "proc macro panicked" with no
+/// span pointing at the mistake. A raw identifier (`r#type`) does not panic but
+/// renders its `r#` prefix into the generated name, silently producing a
+/// column/table that cannot exist. Both are rejected here, spanned on the
+/// offending value.
+///
+/// # Errors
+///
+/// Returns a [`syn::Error`] naming the value and the key it was given for.
+fn check_votable_ident_value(
+    key: &syn::Ident,
+    value: &str,
+    span: proc_macro2::Span,
+) -> syn::Result<()> {
+    if !value.starts_with("r#") && syn::parse_str::<syn::Ident>(value).is_ok() {
+        return Ok(());
+    }
+    Err(syn::Error::new(
+        span,
+        format!(
+            "`{value}` is not a valid identifier for `{key} = ...` in \
+             `#[votable]`: the value is spliced verbatim into generated table, \
+             column and module names, so it must be a plain Rust identifier — \
+             no spaces or punctuation, no leading digit, no keyword, and no \
+             `r#` prefix"
+        ),
+    ))
+}
+
 /// Parse a single `#[votable(...)]` attribute into a resolved [`VotableSpec`].
 ///
 /// Grammar (a `key = value` loop, each value a bare ident or a string literal;
@@ -296,20 +332,41 @@ fn parse_votable_attr(attr: &syn::Attribute, model_ident: &syn::Ident) -> syn::R
     let mut value_column_value: Option<String> = None;
     let mut column: Option<String> = None;
 
+    // Every key already seen in *this* attribute, mapped to the value it was
+    // given. A repeat would otherwise silently win last-write, so a typo'd
+    // `by = A, by = B` would compile against the wrong reactor.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
     attr.parse_args_with(|input: ParseStream| {
         while !input.is_empty() {
             let key: syn::Ident = input.parse()?;
             input.parse::<syn::Token![=]>()?;
             // Accept either a bare identifier (`table = votes`) or a string
             // literal (`table = "votes"`), exactly like the association attrs.
-            let (value_ident, value) = if input.peek(LitStr) {
+            let (value_ident, value, value_span) = if input.peek(LitStr) {
                 let lit: LitStr = input.parse()?;
-                (None, lit.value())
+                let span = lit.span();
+                (None, lit.value(), span)
             } else {
                 let ident: syn::Ident = input.parse()?;
-                (Some(ident.clone()), ident.to_string())
+                let span = ident.span();
+                (Some(ident.clone()), ident.to_string(), span)
             };
+            if let Some(previous) = seen.insert(key.to_string(), value.clone()) {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    format!(
+                        "duplicate `{key} = ...` in `#[votable]` (was \
+                         `{previous}`, now `{value}`): each key may be given \
+                         at most once — the later value would silently win"
+                    ),
+                ));
+            }
             if key == "by" {
+                // Every value that becomes part of a generated ident is
+                // validated, so a mistake is a directed error rather than a
+                // `format_ident!` panic (or, for `r#`, a garbage name).
+                check_votable_ident_value(&key, &value, value_span)?;
                 reactor = Some(match value_ident {
                     Some(ident) => ident,
                     None => syn::parse_str::<syn::Ident>(&value).map_err(|_| {
@@ -334,17 +391,26 @@ fn parse_votable_attr(attr: &syn::Attribute, model_ident: &syn::Ident) -> syn::R
                     }
                 });
             } else if key == "name" {
+                // `name` feeds `format_ident!` composites (the hidden module
+                // ident and the `{name}_count` aggregate column), so it is held
+                // to the same identifier rule as the column names.
+                check_votable_ident_value(&key, &value, value_span)?;
                 name = Some(value);
             } else if key == "table" {
+                check_votable_ident_value(&key, &value, value_span)?;
                 table = Some(value);
             } else if key == "reactor_fk" {
+                check_votable_ident_value(&key, &value, value_span)?;
                 reactor_fk = Some(value);
             } else if key == "target_fk" {
+                check_votable_ident_value(&key, &value, value_span)?;
                 target_fk = Some(value);
             } else if key == "value_column" {
+                check_votable_ident_value(&key, &value, value_span)?;
                 value_column = Some(key.clone());
                 value_column_value = Some(value);
             } else if key == "column" {
+                check_votable_ident_value(&key, &value, value_span)?;
                 column = Some(value);
             } else {
                 return Err(syn::Error::new_spanned(
@@ -1525,13 +1591,17 @@ fn emit_association_items(
 ///
 /// `react()` runs S1–S5 (lock target → read edge → toggle/flip/insert →
 /// recompute the aggregate from ground truth → persist) inside one
-/// `scoped_immediate_transaction`. The Postgres `SELECT ... FOR UPDATE` row
-/// lock is held from before the edge is read until commit, so concurrent
+/// `scoped_immediate_transaction`. The Postgres `SELECT ... FOR NO KEY UPDATE`
+/// row lock is held from before the edge is read until commit, so concurrent
 /// reactions on one target are serialized and the recomputed aggregate is
 /// exact; `SQLite` gets strictly stronger mutual exclusion from `BEGIN
-/// IMMEDIATE`, which is why `for_update()` lives only in the `pg` arm of
+/// IMMEDIATE`, which is why `for_no_key_update()` lives only in the `pg` arm of
 /// `backend_select!` (it is a parse error on `SQLite`, and the unselected arm
 /// is never type-checked).
+///
+/// `pk_ident` is the model's primary-key field (resolved by the caller exactly
+/// as the CRUD codegen resolves it), used to emit the `i64`-primary-key
+/// compile-time guard.
 #[allow(clippy::too_many_lines)]
 fn emit_votable_items(
     model_ident: &syn::Ident,
@@ -1539,6 +1609,7 @@ fn emit_votable_items(
     vis: &syn::Visibility,
     spec: &VotableSpec,
     has_deleted_at: bool,
+    pk_ident: Option<&syn::Ident>,
 ) -> TokenStream {
     let model_snake = pascal_to_snake(&model_ident.to_string());
     // Length-prefixed for the same reason as the m2m join module: it keeps two
@@ -1554,6 +1625,30 @@ fn emit_votable_items(
     let agg_column = format_ident!("{}", spec.column);
     let trait_ident = format_ident!("{model_ident}Reactions");
     let is_sum = spec.aggregate == VoteAggregate::Sum;
+
+    // ── Compile-time guards ──────────────────────────────────────────────
+    // The whole reaction surface is typed on `i64` ids: the hidden edge table
+    // declares both foreign keys `Int8`, and `react(reactor_id: i64, target_id:
+    // i64)` binds them directly. A UUID- or i32-keyed model would otherwise
+    // compile the trait fine and only fail deep inside a Diesel bound (or, on
+    // an i32 key, silently widen). Pin the model's own primary key here so the
+    // error points at the model.
+    let pk_guard = pk_ident.map(|pk| {
+        quote! {
+            const _: fn(&#model_ident) -> i64 = |__autumn_votable_model| {
+                __autumn_votable_model.#pk
+            };
+        }
+    });
+    // `by = <Reactor>` is otherwise never mentioned in the generated code (the
+    // edge table stores a bare `i64` reactor fk), so a typo'd model name would
+    // compile silently. Force its name resolution the way every other
+    // association attribute does.
+    let reactor_ident = &spec.reactor;
+    let reactor_guard = quote! {
+        const _: ::core::marker::PhantomData<#reactor_ident> =
+            ::core::marker::PhantomData;
+    };
 
     // ── The hidden module ────────────────────────────────────────────────
     let value_column_decl = spec.value_column.as_ref().map(|value_column| {
@@ -1811,14 +1906,25 @@ fn emit_votable_items(
          recompute `{}.{}` from ground truth in the **same** transaction, so a \
          reader never observes edge/aggregate disagreement.\n\
          \n\
-         Idempotent and race-safe: the target row is locked for the whole \
+         Race-safe: the target row is locked for the whole \
          read-decide-write-recompute window, so N concurrent calls converge to \
          at most one edge per `({}, {})` and the persisted aggregate always \
          equals `{aggregate_word}`.\n\
          \n\
+         **Not idempotent — it is a toggle.** Calling it twice with the same \
+         arguments reacts and then un-reacts. In particular, blindly retrying \
+         a call that timed out (or whose response was lost) can *invert* the \
+         outcome: the first attempt may well have committed. Callers that need \
+         retry safety must dedupe above this layer — an idempotency key on the \
+         HTTP request, or re-reading `reaction_of()` before retrying.\n\
+         \n\
          Runs on its **own** pooled connection — it does not join an enclosing \
          `Db::tx`. Do not hold a `Db` extractor across this call on a small \
          pool.\n\
+         \n\
+         `value` is **not** validated: it is written to the edge table as \
+         given, so the edge table's `CHECK` constraint is what keeps the sum \
+         meaningful. Never bind it straight from a request body.\n\
          \n\
          # Errors\n\
          \n\
@@ -1834,6 +1940,12 @@ fn emit_votable_items(
          page. For feed pages prefer rendering un-highlighted controls over an \
          N+1 — a batch accessor is tracked as a follow-up.\n\
          \n\
+         A **read**: it routes per this repository's read route, so a \
+         configured replica serves it, and it does not pin read-your-writes. \
+         It can therefore lag a `react()` this request just committed — render \
+         from the `Reaction` that `react()` returned instead of re-reading, or \
+         use a `primary_reads` / `on_primary()` repository.\n\
+         \n\
          # Errors\n\
          \n\
          Any database error.",
@@ -1842,6 +1954,9 @@ fn emit_votable_items(
 
     quote! {
         #hidden_module
+
+        #pk_guard
+        #reactor_guard
 
         #[doc = #trait_doc]
         #vis trait #trait_ident {
@@ -1887,12 +2002,19 @@ fn emit_votable_items(
                     _,
                 >(&mut *conn, |conn| {
                     async move {
-                        // S1: take the exclusive lock on the target row before
-                        // anything is read, and use the same statement as the
-                        // existence/soft-delete guard. On SQLite the enclosing
-                        // `BEGIN IMMEDIATE` already serializes writers, so the
-                        // unsupported `FOR UPDATE` is redundant as well as
-                        // unemittable.
+                        // S1: take the row lock on the target before anything
+                        // is read, and use the same statement as the
+                        // existence/soft-delete guard. `FOR NO KEY UPDATE`, not
+                        // `FOR UPDATE`: this transaction only ever writes the
+                        // target's aggregate column, never its key, and the
+                        // weaker mode still conflicts with itself (so reactions
+                        // on one target stay serialized) while NOT conflicting
+                        // with the `FOR KEY SHARE` locks Postgres takes for
+                        // foreign-key checks — a concurrent `INSERT INTO
+                        // comments (post_id) …` therefore does not queue behind
+                        // a vote. On SQLite the enclosing `BEGIN IMMEDIATE`
+                        // already serializes writers, so the unsupported
+                        // locking clause is redundant as well as unemittable.
                         let __target: ::core::option::Option<i64> =
                             ::autumn_web::backend_select! {
                                 pg => {
@@ -1900,7 +2022,7 @@ fn emit_votable_items(
                                         .filter(#edge_mod::#table_ident::id.eq(target_id))
                                         #live_filter
                                         .select(#edge_mod::#table_ident::id)
-                                        .for_update()
+                                        .for_no_key_update()
                                         .first::<i64>(conn)
                                         .await
                                         .optional()
@@ -1934,7 +2056,7 @@ fn emit_votable_items(
                         #aggregate_query
 
                         // S5 — persist, in the same transaction as S3.
-                        ::autumn_web::reexports::diesel::update(
+                        let __persisted: usize = ::autumn_web::reexports::diesel::update(
                             #edge_mod::#table_ident::table
                                 .filter(#edge_mod::#table_ident::id.eq(target_id))
                                 #live_filter
@@ -1944,11 +2066,25 @@ fn emit_votable_items(
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
 
-                        ::core::result::Result::Ok(::autumn_web::repository::Reaction {
-                            value: __new_value,
-                            aggregate: __aggregate,
-                            outcome: __outcome,
-                        })
+                        // Defense in depth: unreachable while S1's lock holds —
+                        // the target existed and was live when we locked it, and
+                        // nobody can delete or soft-delete it underneath us. If
+                        // the lock strength ever regresses this fails loudly
+                        // instead of committing an edge whose aggregate was
+                        // silently dropped on the floor.
+                        if __persisted == 0 {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::not_found_msg(#not_found_msg)
+                            );
+                        }
+
+                        ::core::result::Result::Ok(
+                            ::autumn_web::repository::Reaction::__new(
+                                __new_value,
+                                __aggregate,
+                                __outcome,
+                            )
+                        )
                     }
                     .scope_boxed()
                 })
@@ -1963,7 +2099,9 @@ fn emit_votable_items(
                 use ::autumn_web::reexports::diesel::result::OptionalExtension as _;
                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
-                let mut conn = self.__autumn_m2m_write_conn().await?;
+                // A read: routed per the repository's `ReadRoute`, and it does
+                // not mark the read-your-writes pin.
+                let mut conn = self.__autumn_m2m_read_conn().await?;
                 #reaction_of_body
             }
         }
@@ -4265,17 +4403,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Validate that `#[votable]`'s aggregate column names an existing field,
-    // mirroring the shard_key check above. Without it the hidden edge module
-    // declares the column regardless and the mistake only surfaces as a runtime
-    // `42703 column "score" does not exist` on the very first reaction.
+    // Validate that `#[votable]`'s aggregate column names an existing field of
+    // the right type, mirroring the shard_key check above. Without the
+    // existence check the hidden edge module declares the column regardless and
+    // the mistake only surfaces as a runtime `42703 column "score" does not
+    // exist` on the very first reaction; without the type check the column is
+    // projected as `Int8` and a real `i32`/`Option<i64>` field only fails as an
+    // opaque Diesel trait-resolution wall inside the generated `react()`.
     let votable_items = match votable {
         None => TokenStream::new(),
         Some(ref spec) => {
-            let column_exists = all_fields
+            let aggregate_field = all_fields
                 .iter()
-                .any(|f| f.ident.as_ref().is_some_and(|i| i == &spec.column));
-            if !column_exists {
+                .find(|f| f.ident.as_ref().is_some_and(|i| i == &spec.column));
+            let Some(aggregate_field) = aggregate_field else {
                 let attr = outer_attrs
                     .iter()
                     .find(|a| is_votable_attr(a))
@@ -4290,11 +4431,38 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ),
                 )
                 .to_compile_error();
+            };
+            // The aggregate is `SUM(value)` / `COUNT(*)` — both `BIGINT` — and
+            // the generated `Reaction::aggregate` is `i64`, so anything else is
+            // a schema mismatch, not a convenience to be coerced.
+            let aggregate_ty = aggregate_field.ty.to_token_stream().to_string();
+            if aggregate_ty != "i64" {
+                return syn::Error::new_spanned(
+                    &aggregate_field.ty,
+                    format!(
+                        "votable aggregate column `{}` on model `{name}` must be \
+                         `i64` (BIGINT), found `{aggregate_ty}`; the aggregate is \
+                         `SUM(value)` / `COUNT(*)` and is written back as an \
+                         `i64` — widen the column and the field",
+                        spec.column,
+                    ),
+                )
+                .to_compile_error();
             }
             let has_deleted_at = all_fields
                 .iter()
                 .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
-            emit_votable_items(name, &table_ident, vis, spec, has_deleted_at)
+            let pk_ident = all_fields
+                .iter()
+                .find(|f| has_attr(f, "id"))
+                .or_else(|| {
+                    all_fields.iter().find(|f| match &f.ty {
+                        syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                        _ => false,
+                    })
+                })
+                .and_then(|f| f.ident.as_ref());
+            emit_votable_items(name, &table_ident, vis, spec, has_deleted_at, pk_ident)
         }
     };
 
@@ -7922,6 +8090,116 @@ mod tests {
     }
 
     #[test]
+    fn votable_rejects_non_identifier_string_values() {
+        // Every name-shaped value is spliced into a generated ident through
+        // `format_ident!`, which *panics* on a non-identifier — an opaque
+        // "proc macro panicked" with no span. Each key must instead produce a
+        // directed error naming the offending value.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        for (key, attr) in [
+            (
+                "table",
+                syn::parse_quote!(#[votable(by = User, table = "my votes")]),
+            ),
+            (
+                "name",
+                syn::parse_quote!(#[votable(by = User, name = "my vote")]),
+            ),
+            (
+                "reactor_fk",
+                syn::parse_quote!(#[votable(by = User, reactor_fk = "user id")]),
+            ),
+            (
+                "target_fk",
+                syn::parse_quote!(#[votable(by = User, target_fk = "post-id")]),
+            ),
+            (
+                "value_column",
+                syn::parse_quote!(#[votable(by = User, value_column = "1value")]),
+            ),
+            (
+                "column",
+                syn::parse_quote!(#[votable(by = User, column = "score; DROP TABLE posts")]),
+            ),
+            ("by", syn::parse_quote!(#[votable(by = "Not A Type")])),
+        ] {
+            let attrs: Vec<syn::Attribute> = vec![attr];
+            let Err(err) = resolve_votable(&model, &attrs) else {
+                panic!("expected `{key}` with a non-identifier value to be rejected");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("is not a valid identifier") || msg.contains("valid model type name"),
+                "expected a directed identifier error for `{key}`, got: {msg}"
+            );
+            assert!(
+                msg.contains(key),
+                "expected the error to name the offending key `{key}`, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn votable_rejects_raw_identifier_values() {
+        // A raw identifier parses as an `Ident` but renders its `r#` prefix
+        // into the generated table/column/module names, silently producing a
+        // column that cannot exist. Reject it with the same directed error
+        // rather than emitting garbage.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, name = r#type)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected a raw-identifier `name` to be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is not a valid identifier"),
+            "expected the identifier error, got: {msg}"
+        );
+        assert!(
+            msg.contains("r#"),
+            "expected the error to mention the `r#` prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_duplicate_key_within_one_attribute() {
+        // A repeated key silently last-writes today, so `by = User, by = Bot`
+        // would compile against the wrong reactor. Reject it, quoting both
+        // values so the mistake is obvious.
+        let model: syn::Ident = syn::parse_quote!(Post);
+
+        let by: Vec<syn::Attribute> = vec![syn::parse_quote!(#[votable(by = User, by = Bot)])];
+        let Err(err) = resolve_votable(&model, &by) else {
+            panic!("expected a duplicate `by` to be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate `by = ...`"),
+            "expected the duplicate-key error to name the key, got: {msg}"
+        );
+        assert!(
+            msg.contains("User") && msg.contains("Bot"),
+            "expected both the previous and the new value quoted back, got: {msg}"
+        );
+
+        let aggregate: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = sum, aggregate = count)])];
+        let Err(err) = resolve_votable(&model, &aggregate) else {
+            panic!("expected a duplicate `aggregate` to be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate `aggregate = ...`"),
+            "expected the duplicate-key error to name the key, got: {msg}"
+        );
+        assert!(
+            msg.contains("sum") && msg.contains("count"),
+            "expected both the previous and the new value quoted back, got: {msg}"
+        );
+    }
+
+    #[test]
     fn votable_aggregate_column_must_exist_on_model() {
         // The hidden edge module declares the aggregate column regardless, so
         // a missing field would otherwise only surface as a runtime `42703` on
@@ -7951,6 +8229,45 @@ mod tests {
             generated.contains("column = "),
             "expected the error to point at the `column = <field>` override, got: {generated}"
         );
+    }
+
+    #[test]
+    fn votable_aggregate_column_must_be_i64() {
+        // The aggregate is `SUM(value)` / `COUNT(*)` — BIGINT — projected as
+        // `Int8` in the hidden module and written back as an `i64`. An `i32` or
+        // `Option<i64>` field would otherwise fail as an opaque Diesel
+        // trait-resolution wall inside the generated `react()`.
+        for (ty, rendered) in [
+            (quote! { i32 }, "i32"),
+            (quote! { Option<i64> }, "Option < i64 >"),
+        ] {
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    #[votable(by = User, aggregate = sum)]
+                    pub struct Post {
+                        #[id]
+                        pub id: i64,
+                        pub score: #ty,
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                generated.contains("compile_error"),
+                "expected a compile error for a `{rendered}` aggregate column, got: {generated}"
+            );
+            assert!(
+                generated
+                    .contains("votable aggregate column `score` on model `Post` must be `i64`"),
+                "expected the directed wrong-type message, got: {generated}"
+            );
+            assert!(
+                generated.contains(&format!("found `{rendered}`")),
+                "expected the offending type quoted back, got: {generated}"
+            );
+        }
     }
 
     // ── Votable (#1362) codegen shape ─────────────────────────────────────
@@ -8088,9 +8405,16 @@ mod tests {
 
     #[test]
     fn votable_react_locks_the_target_row_on_pg_only() {
-        // `FOR UPDATE` is a parse error on SQLite, so the row lock lives in the
-        // `pg` arm of `backend_select!` (the unselected arm is never
+        // A locking clause is a parse error on SQLite, so the row lock lives in
+        // the `pg` arm of `backend_select!` (the unselected arm is never
         // type-checked); SQLite gets its mutual exclusion from BEGIN IMMEDIATE.
+        //
+        // `FOR NO KEY UPDATE`, not `FOR UPDATE`: react() only writes a
+        // non-key column, and the weaker mode still self-conflicts (reactions
+        // on one target stay serialized) without conflicting with the
+        // `FOR KEY SHARE` locks Postgres takes for foreign-key checks — so a
+        // concurrent `INSERT INTO comments (post_id) …` does not queue behind a
+        // vote.
         let generated = model_macro(
             quote! {},
             quote! {
@@ -8108,9 +8432,34 @@ mod tests {
             generated.contains("backend_select"),
             "expected the per-backend split, got: {generated}"
         );
+        // The lock must be part of the S1 locking SELECT itself (same statement
+        // as the existence/soft-delete guard), not merely present somewhere.
         assert!(
-            generated.contains("for_update"),
-            "expected an exclusive row lock on the target row, got: {generated}"
+            generated.contains(
+                "pg => { __autumn_votable_4_post_vote :: posts :: table . filter \
+                 (__autumn_votable_4_post_vote :: posts :: id . eq (target_id)) . select \
+                 (__autumn_votable_4_post_vote :: posts :: id) . for_no_key_update ()"
+            ),
+            "expected FOR NO KEY UPDATE chained onto the pg arm's S1 target \
+             select, got: {generated}"
+        );
+        // …and it must live *only* there: the sqlite arm cannot even parse it.
+        let s1 = generated
+            .split_once("let __target")
+            .expect("the S1 locking select")
+            .1;
+        let pg_arm = s1
+            .split_once("sqlite =>")
+            .expect("the backend_select! sqlite arm")
+            .0;
+        assert!(
+            pg_arm.contains(". for_no_key_update ()"),
+            "expected the row lock inside the pg arm, got: {pg_arm}"
+        );
+        assert_eq!(
+            generated.matches("for_no_key_update").count(),
+            1,
+            "expected exactly one locking clause (pg arm only), got: {generated}"
         );
     }
 
@@ -8132,9 +8481,16 @@ mod tests {
         )
         .to_string();
 
+        // The full arbiter column list, not just "an on_conflict somewhere": a
+        // regression to a single-column arbiter (`(user_id)`) is exactly the
+        // 42P10 this pins, and would still satisfy a bare `contains`.
         assert!(
-            generated.contains("on_conflict"),
-            "expected an upsert on the edge insert, got: {generated}"
+            generated.contains(
+                "on_conflict ((__autumn_votable_4_post_vote :: votes :: user_id , \
+                 __autumn_votable_4_post_vote :: votes :: post_id ,))"
+            ),
+            "expected the composite (reactor_fk, target_fk) ON CONFLICT \
+             arbiter, got: {generated}"
         );
         assert!(
             generated.contains("do_update"),
@@ -8209,9 +8565,15 @@ mod tests {
         )
         .to_string();
 
+        // Three sites, all load-bearing: the pg arm's locking S1 select, the
+        // sqlite arm's S1 select, and the S5 aggregate UPDATE. Dropping any one
+        // of them lets a soft-deleted target be reacted on (or its aggregate
+        // rewritten), so count them rather than accepting a single hit.
         assert!(
-            soft.contains("deleted_at . is_null ()"),
-            "expected the soft-delete guard on a model with deleted_at, got: {soft}"
+            soft.matches("deleted_at . is_null ()").count() >= 3,
+            "expected the soft-delete guard on both S1 arms and the S5 update \
+             (>= 3 sites), got {}: {soft}",
+            soft.matches("deleted_at . is_null ()").count()
         );
         assert!(
             soft.contains("deleted_at -> Nullable < Timestamp >"),
@@ -8220,6 +8582,162 @@ mod tests {
         assert!(
             !hard.contains("is_null"),
             "a model without deleted_at must not emit a soft-delete guard, got: {hard}"
+        );
+    }
+
+    #[test]
+    fn votable_emits_i64_primary_key_and_reactor_type_guards() {
+        // Two compile-time guards the rest of the codegen silently assumes:
+        //
+        // * the whole reaction surface is typed on `i64` ids (both edge fks are
+        //   `Int8`, `react(reactor_id: i64, target_id: i64)` binds them
+        //   directly), so a UUID- or i32-keyed model must fail *at the model*;
+        // * `by = <Reactor>` is otherwise never mentioned in the emitted code —
+        //   the edge stores a bare `i64` — so a typo'd model name would compile
+        //   silently unless its name resolution is forced.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("const _ : fn (& Post) -> i64"),
+            "expected the i64-primary-key guard, got: {generated}"
+        );
+        assert!(
+            generated.contains("PhantomData < User >"),
+            "expected the reactor-type name-resolution guard, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_returns_a_reaction_via_the_hidden_constructor() {
+        // `Reaction` is `#[non_exhaustive]`, so the generated code — which
+        // expands in the *application's* crate — cannot write a struct literal.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("repository :: Reaction :: __new"),
+            "expected the Reaction to be built through its hidden constructor, \
+             got: {generated}"
+        );
+        assert!(
+            !generated.contains("Reaction { value"),
+            "a struct literal would not compile downstream of #[non_exhaustive], \
+             got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_fails_loudly_when_the_aggregate_update_hits_no_row() {
+        // Defense in depth (S5): unreachable while S1's lock holds, but if the
+        // lock strength ever regresses, committing an edge whose aggregate was
+        // silently dropped is the one failure mode that leaves the two out of
+        // sync forever.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("let __persisted : usize"),
+            "expected the S5 update's affected-row count to be captured, got: {generated}"
+        );
+        assert!(
+            generated.contains("if __persisted == 0"),
+            "expected a zero-row S5 update to abort the transaction, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_reaction_of_reads_on_a_read_connection() {
+        // `reaction_of` is a read: it routes per the repository's ReadRoute
+        // (replica-eligible) and must NOT mark the read-your-writes pin, which
+        // acquiring the write connection would do. `react` keeps the write one.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("self . __autumn_m2m_read_conn ()"),
+            "expected reaction_of to take a read connection, got: {generated}"
+        );
+        assert_eq!(
+            generated.matches("__autumn_m2m_write_conn").count(),
+            1,
+            "expected exactly one write-connection acquisition (react's), got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_doc_warns_that_a_toggle_is_not_idempotent() {
+        // A toggle is not idempotent, and the dangerous corollary is that a
+        // blind retry of a timed-out call can invert the outcome. The generated
+        // rustdoc must say so rather than claiming idempotence.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("Idempotent"),
+            "react() is a toggle — the docs must not claim idempotence, got: {generated}"
+        );
+        assert!(
+            generated.contains("Not idempotent"),
+            "expected the toggle caveat in react()'s docs, got: {generated}"
+        );
+        assert!(
+            generated.contains("idempotency key"),
+            "expected the retry-safety guidance in react()'s docs, got: {generated}"
+        );
+        assert!(
+            generated.contains("does not pin read-your-writes") || generated.contains("read route"),
+            "expected reaction_of's read-routing note, got: {generated}"
         );
     }
 

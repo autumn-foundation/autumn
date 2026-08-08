@@ -130,10 +130,16 @@ impl autumn_web::live::LiveFragment for Post {
                 // 1. Card Layout Version
                 div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
                     div class="flex items-start gap-3 p-4" {
-                        // `None`: a live fragment is rendered for broadcast to
-                        // every subscriber, so there is no "current viewer"
-                        // whose own vote could be highlighted.
-                        (crate::routes::layout::vote_controls(self.id, self.score, None))
+                        // Both `None`s are deliberate. There is no "current
+                        // viewer" for a fragment broadcast to every subscriber,
+                        // so no vote can be highlighted; and there is no CSRF
+                        // token, because this fragment is delivered over SSE
+                        // and therefore only ever reaches a client running
+                        // htmx — whose requests carry the token as a header via
+                        // `autumn-htmx-csrf.js`. A no-JS visitor never receives
+                        // this markup; they get the server-rendered page, whose
+                        // controls do carry the hidden `_csrf` input.
+                        (crate::routes::layout::vote_controls(self.id, self.score, None, None))
                         div class="flex-1 min-w-0" {
                             a href=(card_url)
                                class="text-lg font-medium text-gray-900 hover:text-orange-600 line-clamp-2" {

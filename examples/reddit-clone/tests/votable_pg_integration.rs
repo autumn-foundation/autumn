@@ -21,14 +21,21 @@
 //!    place; there is never a second row for the pair.
 //! 4. `votable_react_is_race_safe_on_the_shipped_votes_table` -- AC2 and the
 //!    issue's success metric: 50 simultaneous clicks on the same
-//!    `(user, post)` pair converge to at most one edge, no caller sees a
-//!    unique-violation, and `posts.score` still equals `SUM(value)`.
+//!    `(user, post)` pair are 50 serialized toggles, so they end at exactly
+//!    zero edges with `posts.score` back at `0`, and no caller sees a
+//!    unique-violation.
 //! 5. `leaderboard_grouped_aggregate_still_works_after_react` -- the regression
 //!    guard for #1364: `#[votable]`'s hidden edge `table!` must not disturb
 //!    `crate::schema::votes`, the `Vote` model, or
 //!    `VoteRepository::sum_value_grouped_by_post_id`, which the front-page
 //!    "Top posts by votes" leaderboard depends on (including its `IS NOT NULL`
-//!    group guard that excludes comment votes).
+//!    group guard that excludes comment votes). It also seeds a `NULL`-post_id
+//!    comment vote *before* reacting, so the whole burst runs against a table
+//!    that already holds rows the association must ignore.
+//!
+//! This suite is illustrative: it is **not** part of CI (the example's
+//! Docker tests are not swept). The CI-backed race-safety evidence is
+//! `autumn/tests/integration/model_votable.rs`.
 //!
 //! The Docker-backed tests are `#[ignore]` (like the other PG integration
 //! tests) and run via testcontainers by default. When Docker is unavailable,
@@ -78,8 +85,8 @@ enum PgHandle {
 
 async fn start_postgres() -> (PgHandle, Pool<AsyncPgConnection>) {
     // Sized to comfortably exceed the 50 concurrent clicks in the race test, so
-    // no caller ever queues on pool acquisition. (The *application* runs a
-    // single-connection pool — see `routes::posts` — but a concurrency test
+    // no caller ever queues on pool acquisition. (The *application* runs the
+    // default pool of 10 — see `routes::posts` — but a concurrency test
     // deliberately does not.)
     if let Ok(url) = std::env::var("AUTUMN_TEST_PG_URL") {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
@@ -317,10 +324,12 @@ async fn votable_react_flips() {
 }
 
 /// The issue's headline success metric, on the real table: 50 simultaneous
-/// clicks from one user on one post. No caller may see a `23505`, the pair must
-/// end up with at most one edge, and `posts.score` must still equal
-/// `SUM(value)` — invariants that hold under every interleaving, so this test
-/// cannot flake on scheduling.
+/// clicks from one user on one post. No caller may see a `23505`, and because
+/// the target-row lock serialises the whole read-decide-write window, 50
+/// concurrent same-value clicks are 50 sequential toggles — an even count, so
+/// the pair must end with **no** edge and `posts.score` back at `0`. That holds
+/// under every interleaving, so the test cannot flake on scheduling. (The
+/// framework suite pins the odd-count case too.)
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers) or AUTUMN_TEST_PG_URL"]
 async fn votable_react_is_race_safe_on_the_shipped_votes_table() {
@@ -347,12 +356,17 @@ async fn votable_react_is_race_safe_on_the_shipped_votes_table() {
     }
 
     let edges = vote_edge_count(&mut conn, users[0], post).await;
-    assert!(
-        (0..=1).contains(&edges),
-        "exactly one edge per (user, post) at most, got {edges}"
+    assert_eq!(
+        edges, 0,
+        "the target-row lock serialises the clicks, so 50 same-value toggles \
+         from empty must end at exactly 0 edges, got {edges}"
     );
 
     let snap = score_snapshot(&mut conn, post).await;
+    assert_eq!(
+        snap.persisted, 0,
+        "an even number of toggles leaves posts.score at 0"
+    );
     assert_eq!(
         snap.persisted, snap.ground_truth,
         "posts.score ({}) must equal SUM(votes.value) ({}) after 50 concurrent clicks",
@@ -378,22 +392,14 @@ async fn leaderboard_grouped_aggregate_still_works_after_react() {
     let hot = seed_post(&mut conn, "hot", users[0], sub).await;
     let cold = seed_post(&mut conn, "cold", users[0], sub).await;
 
-    let posts = PgPostRepository::with_pool_untracked(pool.clone());
-    // A react burst: `hot` ends on +3, `cold` on -1.
-    for user in &users[..3] {
-        posts.react(*user, hot, 1).await.expect("upvote hot");
-    }
-    posts
-        .react(users[3], cold, -1)
-        .await
-        .expect("downvote cold");
-
-    // The scores the votable path persisted.
-    assert_eq!(score_snapshot(&mut conn, hot).await.persisted, 3);
-    assert_eq!(score_snapshot(&mut conn, cold).await.persisted, -1);
-
-    // A comment vote (NULL post_id) must stay excluded from the leaderboard —
-    // the exact behaviour the grouped-aggregate `IS NOT NULL` guard provides.
+    // Seed the comment vote FIRST, so every `react()` below runs against a
+    // `votes` table that already contains rows with a `NULL` post_id. That is
+    // the direction that matters: the generated code declares `post_id`
+    // non-nullable in its hidden `table!` and recomputes with
+    // `WHERE post_id = $t`, so a pre-existing NULL row must neither be summed
+    // into a post's score nor collide with `votes_unique_post` (a Postgres
+    // unique constraint treats NULLs as distinct). The same rows also prove the
+    // leaderboard's `IS NOT NULL` group guard still excludes comment votes.
     diesel::sql_query("INSERT INTO comments (post_id, author_id, body) VALUES ($1, $2, 'c')")
         .bind::<BigInt, _>(hot)
         .bind::<BigInt, _>(users[0])
@@ -408,6 +414,21 @@ async fn leaderboard_grouped_aggregate_still_works_after_react() {
     .execute(&mut conn)
     .await
     .expect("seed comment vote");
+
+    let posts = PgPostRepository::with_pool_untracked(pool.clone());
+    // A react burst: `hot` ends on +3, `cold` on -1. `users[0]` already holds a
+    // NULL-post_id vote row, and still reacts to `hot` normally.
+    for user in &users[..3] {
+        posts.react(*user, hot, 1).await.expect("upvote hot");
+    }
+    posts
+        .react(users[3], cold, -1)
+        .await
+        .expect("downvote cold");
+
+    // The scores the votable path persisted — the comment vote is not in them.
+    assert_eq!(score_snapshot(&mut conn, hot).await.persisted, 3);
+    assert_eq!(score_snapshot(&mut conn, cold).await.persisted, -1);
 
     let votes_repo = PgVoteRepository::with_pool_untracked(pool.clone());
     let top: Vec<(i64, Option<i64>)> = votes_repo

@@ -429,10 +429,11 @@ denormalised aggregate column on the target **(unreleased — trunk-dev,
 ```rust
 #[autumn_web::model]
 #[votable(by = User, aggregate = sum)]   // or: aggregate = count, name = like
+                                         // — always BELOW #[model]
 pub struct Post {
     #[id]
-    pub id: i64,
-    pub score: i64,          // the aggregate column
+    pub id: i64,             // must be i64
+    pub score: i64,          // the aggregate column, must be i64
 }
 ```
 
@@ -443,8 +444,11 @@ COUNT(*)`. Defaults: `name = vote`, `table = pluralize(name)`, `reactor_fk =
 `column = score` / `{name}_count` — each overridable. At most one `#[votable]`
 per model. The edge table is the app's migration to write, and its composite
 `UNIQUE (reactor_fk, target_fk)` is **load-bearing** (it is the `ON CONFLICT`
-arbiter); both FKs must be `BIGINT NOT NULL` and the aggregate column `BIGINT
-NOT NULL DEFAULT 0`.
+arbiter), as is a `CHECK` on the value column — `react()` does **not** validate
+`value`, so never bind it from a request. The aggregate column must be `BIGINT
+NOT NULL DEFAULT 0`; both FKs should be `BIGINT NOT NULL` (a nullable target FK
+is tolerated — the unique constraint then covers only the non-`NULL` rows,
+which are exactly the ones `react()` writes).
 
 The model emits a `{Model}Reactions` trait blanket-implemented for that
 model's repository — import it as `_`, no repository attribute needed:
@@ -461,13 +465,17 @@ let mine: Option<i16> = posts.reaction_of(user_id, post_id).await?;
 
 `react()` is a race-safe toggle: same value again removes the edge, a
 different value flips it, a new one inserts it — and the aggregate is
-recomputed from ground truth and persisted in the **same transaction** under
-an exclusive lock on the target row, so concurrent reactions converge to at
-most one edge per pair and a reader never sees edge/aggregate disagreement.
-Soft-deleted targets are `NotFound`. **Like the m2m helpers, `react()` takes
-its own pooled connection — never hold a `Db` extractor across the call on a
-small pool.** Pair it with the `reaction_controls` widget (see the widgets
-section). See `docs/guide/votable.md` and `examples/reddit-clone`
+recomputed from ground truth and persisted in the **same transaction** under a
+`FOR NO KEY UPDATE` lock on the target row, so concurrent reactions converge to
+at most one edge per pair and a reader never sees edge/aggregate disagreement.
+A toggle is not idempotent — never blindly retry a timed-out call.
+Soft-deleted targets are `NotFound`. `reaction_of()` is a read and is
+replica-eligible (no read-your-writes pin — re-render from the `Reaction` the
+write returned). **Like the m2m helpers, `react()` takes its own pooled
+connection — never hold a `Db` extractor across the call, or the handler needs
+two connections at once and deadlocks at pool-size concurrency.** Pair it with
+the `reaction_controls` widget (see the widgets section), threading the CSRF
+token so the no-JS form POST works. See `docs/guide/votable.md` and `examples/reddit-clone`
 (`src/routes/votes.rs`).
 
 Deleting a parent can cascade to its children in one transaction — declare

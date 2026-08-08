@@ -292,19 +292,32 @@ pub struct Reaction { pub value: Option<i16>, pub aggregate: i64,
 pub enum ReactionOutcome { Inserted, Flipped, Removed }
 ```
 
+`#[votable]` must be written **below** `#[model]` (attribute macros are
+consumed top-down; above it, the error is `cannot find attribute votable`).
+The model's `#[id]` and aggregate fields must both be `i64` — both are
+compile-checked.
+
 `react()` toggles (same value again removes the edge), flips (different value
 replaces it), or inserts, and recomputes the target's aggregate column from
 ground truth (`SUM(value)` / `COUNT(*)`) and persists it **in the same
-transaction**, under an exclusive lock on the target row (`SELECT … FOR
-UPDATE` on Postgres, `BEGIN IMMEDIATE` on SQLite) held across the whole
+transaction**, under a row lock on the target (`SELECT … FOR NO KEY UPDATE` on
+Postgres — weak enough that referencing inserts, e.g. a comment on the same
+post, are not blocked; `BEGIN IMMEDIATE` on SQLite) held across the whole
 read-decide-write-recompute window. Concurrent callers therefore converge to
 at most one edge per `(reactor, target)` with no `23505` escaping, and the
 persisted aggregate is exact even across different reactors. A missing or
-soft-deleted target is `NotFound`. `reaction_of` is a single indexed lookup
-(no batch form yet — feed pages should pass `None` to the widget rather than
+soft-deleted target is `NotFound`. **`react()` does not validate `value`** —
+it writes whatever `i16` you pass, so branch on the route and put a
+`CHECK (value IN (-1, 1))` on the column; never bind it from a request. A
+toggle is not idempotent: a blind retry of a timed-out call inverts it, so use
+an HTTP-layer idempotency key if you need retry safety. `reaction_of` is a
+single indexed lookup on a **read** connection (replica-eligible, does not pin
+read-your-writes — re-render from the `Reaction` the write returned; and no
+batch form yet, so feed pages should pass `None` to the widget rather than
 issue an N+1). **`react()` acquires its own pooled connection and does not
-join an enclosing `Db::tx`** — never hold a `Db` extractor across the call on
-a small pool. See `docs/guide/votable.md`.
+join an enclosing `Db::tx`** — never hold a `Db` extractor across the call, or
+the handler needs two connections at once and deadlocks once concurrency
+reaches the pool size. See `docs/guide/votable.md`.
 
 **(unreleased)** — `ListQuery` extractor + `SortDir` (#1126): an `Infallible`
 query extractor parsing `?sort=<col>`, `?dir=asc|desc`, and
@@ -455,7 +468,11 @@ Per-primitive setters (in addition to the shared set):
   no-JS `<form method="post">` per direction carrying `hx-post` / `hx-target`
   / `hx-swap="outerHTML"`, ARIA toggle buttons (`aria-pressed`, explicit
   `aria-label`, glyph in `aria-hidden` span) and an `aria-live="polite"`
-  aggregate. CSS hooks `.autumn-reaction-controls` / `.autumn-reaction` /
+  aggregate. Thread `.csrf(...)` on any page a no-JS visitor can reach — the
+  hidden input is what makes the plain form POST pass CSRF (the htmx path is
+  covered by the header shim either way). `dom_id` is interpolated into the
+  default `hx-target` selector, so build it yourself; never nest the widget
+  inside another `<form>`. CSS hooks `.autumn-reaction-controls` / `.autumn-reaction` /
   `.autumn-reaction-up` / `.autumn-reaction-down` / `.autumn-reaction-like` /
   `.autumn-reaction-button` / `.autumn-reaction-active` /
   `.autumn-reaction-count`. Prelude re-exported.

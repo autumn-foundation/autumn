@@ -27,14 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reaction_of(reactor_id, target_id) -> Option<i16>`
   (`autumn_web::repository::{Reaction, ReactionOutcome}`); `aggregate = count`
   emits `react(reactor_id, target_id)` with no `value` parameter, since a
-  unary-like edge row is pure membership. `react()` is idempotent and
-  race-safe: the same value again toggles the edge off, a different value
-  flips it in place, a new one inserts it, and the aggregate is recomputed
-  from ground truth (`SUM`/`COUNT`, never accumulated as a delta, so
-  pre-existing drift self-heals) and persisted **in the same transaction**,
-  under an exclusive lock on the target row held across the whole
-  read-decide-write-recompute window (`SELECT ... FOR UPDATE` on Postgres,
-  `BEGIN IMMEDIATE`'s write lock on SQLite). N concurrent reactions on one
+  unary-like edge row is pure membership. `react()` is a race-safe toggle
+  (not idempotent — a blind retry of a timed-out call inverts the outcome, so
+  retry safety belongs in an HTTP-layer idempotency key): the same value again
+  toggles the edge off, a different value flips it in place, a new one inserts
+  it, and the aggregate is recomputed from ground truth (`SUM`/`COUNT`, never
+  accumulated as a delta, so pre-existing drift self-heals) and persisted
+  **in the same transaction**, under a row lock on the target held across the
+  whole read-decide-write-recompute window (`SELECT ... FOR NO KEY UPDATE` on
+  Postgres — the weaker mode, so concurrent referencing inserts such as a new
+  comment on the same post are not blocked; `BEGIN IMMEDIATE`'s write lock on
+  SQLite). N concurrent reactions on one
   target therefore converge to at most one edge per `(reactor, target)` with
   no `23505` escaping to any caller, the persisted aggregate is exact even
   across different reactors, and a reader never observes edge/aggregate
@@ -43,25 +46,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reactor_fk`, `target_fk`, `value_column`, `column`); the defaults resolve
   to `votes` / `user_id` / `post_id` / `value` / `score`, which is why
   `examples/reddit-clone` adopted it with **no migration and no overrides**,
-  collapsing ~130 lines of hand-written toggle/flip/upsert SQL and a raw
-  `sql_query` score recompute in `src/routes/votes.rs` to a single
-  `posts.react(...)` call with zero raw SQL. The composite `UNIQUE (reactor_fk,
-  target_fk)` on the edge table is load-bearing (it is the `ON CONFLICT`
-  arbiter) and remains the app's migration to write. Soft-delete aware: when
+  collapsing ~90 lines of hand-written toggle/flip/upsert SQL and a raw
+  `sql_query` score recompute in `src/routes/votes.rs` (168 lines to 130) to a
+  single `posts.react(...)` call, leaving zero raw SQL in that file. The
+  composite `UNIQUE (reactor_fk, target_fk)` on the edge table is load-bearing
+  (it is the `ON CONFLICT` arbiter) and remains the app's migration to write,
+  as is a `CHECK` on the value column: `react()` does **not** validate `value`,
+  so never bind it straight from a request. A nullable target FK in the DDL is
+  tolerated (reddit-clone's `votes` is an XOR over `post_id`/`comment_id`) —
+  the unique constraint then covers only the non-`NULL` rows, which are exactly
+  the ones this association writes. The model's `#[id]` and aggregate field
+  must both be `i64`, checked at compile time, and `#[votable]` must be written
+  **below** `#[model]`. Soft-delete aware: when
   the target model has a `deleted_at` field, reacting to a soft-deleted target
   is `NotFound` and leaves its aggregate untouched, matching the repository
   layer's scoping. The view half is the new no-JS
   `autumn_web::widgets::{ReactionControls, reaction_controls}` (also prelude
-  re-exported): one CSRF-protected `<form method="post">` per direction,
+  re-exported): one `<form method="post">` per direction carrying the hidden
+  CSRF input when a token is threaded,
   upgraded in place by htmx (`hx-swap="outerHTML"` onto the control's own
   `dom_id`), ARIA toggle buttons with real accessible names and
-  `aria-pressed`, and an `aria-live` aggregate. Known limits, all documented:
+  `aria-pressed`, and an `aria-live` aggregate. The hidden CSRF input is what
+  makes the JavaScript-off path work — thread `.csrf(...)` on any page a no-JS
+  visitor can reach, or the plain form POST is rejected while the htmx path
+  keeps working via the header shim. Known limits, all documented:
   at most one `#[votable]` per model (a second is a directed compile error),
   the recompute is O(edges per target), writes to one target serialise, READ
-  COMMITTED is assumed (stricter isolation fails with `40001` rather than
-  corrupting), and — like the m2m mutation helpers — `react()` acquires its
+  COMMITTED is assumed (a contended locking read blocks first and then fails
+  with `40001` rather than corrupting), `react()` bypasses model hooks and does
+  not touch `updated_at`, `tenant_scoped` repositories are not tenant-filtered
+  inside `react()`/`reaction_of()` (id-scoped only, the same caveat as the m2m
+  helpers), every edge *write* must go through `react()` for the aggregate to
+  stay exact, and — like the m2m mutation helpers — `react()` acquires its
   **own** pooled connection and does not join an enclosing `Db::tx`, so a
-  handler must not hold a `Db` extractor across the call on a small pool.
+  handler must not hold a `Db` extractor across the call (that needs two
+  connections at once and deadlocks once concurrency reaches the pool size).
+  `reaction_of()` is a read and routes through the repository's read route, so
+  it is replica-eligible and does not pin read-your-writes — re-render from the
+  `Reaction` the write returned.
   Contrary to the issue's parenthetical suggestion, the recompute does **not**
   reuse `repository_commit_hooks`: that is a durable post-commit queue running
   on a different connection, which structurally cannot be atomic with the edge

@@ -3020,6 +3020,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             > {
                 self.__autumn_acquire_conn().await
             }
+
+            // Read-only association/reaction accessors (`#[votable]`'s
+            // `reaction_of()`) route exactly like every other generated read:
+            // through the repository's `ReadRoute` snapshot, without marking
+            // the read-your-writes pin.
+            async fn __autumn_m2m_read_conn(
+                &self,
+            ) -> ::autumn_web::AutumnResult<
+                ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
+                    ::autumn_web::RuntimeConnection,
+                >,
+            > {
+                self.__autumn_acquire_read_conn().await
+            }
         }
     };
 

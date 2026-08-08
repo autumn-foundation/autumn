@@ -543,18 +543,38 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// = like)]` → table `likes`, column `like_count`. At most one `#[votable]` per
 /// model.
 ///
+/// **Write `#[votable]` *below* `#[model]`.** It is consumed by `#[model]`, not
+/// registered as an attribute in its own right, so an attribute macro written
+/// above it never sees it — an error reading `cannot find attribute `votable`
+/// in this scope` means the two lines are the wrong way round.
+///
 /// ## Required migration
 ///
 /// The edge table is the user's to create, and its **composite `UNIQUE
 /// (reactor_fk, target_fk)` is load-bearing**: it is the `ON CONFLICT` arbiter
 /// the generated upsert names, and it is what makes "at most one edge per
-/// (reactor, target)" a database guarantee. Both foreign keys must be
-/// `BIGINT NOT NULL` (a nullable target would defeat the arbiter — `NULL`s are
-/// distinct in a unique constraint), the value column `SMALLINT`, and the
-/// aggregate column `BIGINT NOT NULL DEFAULT 0`:
+/// (reactor, target)" a database guarantee. The value column is `SMALLINT`, the
+/// aggregate column `BIGINT NOT NULL DEFAULT 0`, and the model's own primary key
+/// must be `BIGINT`/`i64` (both edge foreign keys are bound as `i64`; a
+/// UUID-keyed model is a compile error).
+///
+/// `NOT NULL` on both foreign keys is strongly recommended: `NULL`s are
+/// distinct in a unique constraint, so a nullable column is not covered by the
+/// arbiter. A nullable *target* FK is nevertheless tolerated when every row this
+/// association writes is non-`NULL` — the shape an XOR edge table has (reddit-
+/// clone's `votes` points at either a post or a comment), where the unique
+/// constraint still fully covers the non-`NULL` rows `react()` creates.
+///
+/// The `CHECK` on `value` is load-bearing in sum mode: **`react()` does not
+/// validate `value`** — it writes what it is given, and the sum is only
+/// meaningful because the database refuses anything outside the legal set.
+/// Never bind `value` straight from a request; map the request to `1` / `-1`
+/// yourself. A violating value surfaces as a database error (a 500), not a
+/// validation failure.
 ///
 /// ```sql
 /// CREATE TABLE votes (
+///     id      BIGSERIAL PRIMARY KEY,
 ///     user_id BIGINT NOT NULL REFERENCES users(id),
 ///     post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
 ///     value   SMALLINT NOT NULL CHECK (value IN (-1, 1)),
@@ -581,15 +601,24 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// let mine: Option<i16> = posts.reaction_of(user_id, post_id).await?;
 /// ```
 ///
-/// `react()` is idempotent and race-safe: the same value again toggles the edge
-/// off, a different value flips it in place, a new one inserts it — and the
-/// aggregate is recomputed from ground truth (`SUM`/`COUNT`) and persisted in
-/// the **same transaction**, so a reader never observes edge/aggregate
-/// disagreement. The target row is locked (`SELECT ... FOR UPDATE` on Postgres,
+/// `react()` is race-safe: the same value again toggles the edge off, a
+/// different value flips it in place, a new one inserts it — and the aggregate
+/// is recomputed from ground truth (`SUM`/`COUNT`) and persisted in the **same
+/// transaction**, so a reader never observes edge/aggregate disagreement. The
+/// target row is locked (`SELECT ... FOR NO KEY UPDATE` on Postgres — it does
+/// not conflict with the `FOR KEY SHARE` locks foreign-key checks take, so
+/// concurrent inserts referencing the target do not queue behind votes;
 /// `BEGIN IMMEDIATE` on `SQLite`) for the whole read-decide-write-recompute
 /// window, so concurrent reactions on one target converge to at most one edge
 /// per `(reactor, target)` and the persisted aggregate is exact even across
 /// *different* reactors.
+///
+/// It is **not idempotent** — it is a toggle. Retrying a call that timed out can
+/// invert the outcome, because the first attempt may have committed; callers
+/// that need retry safety dedupe above this layer (an idempotency key on the
+/// HTTP request). `reaction_of()` is a plain read: it follows the repository's
+/// read route (so a replica may serve it) and does not pin read-your-writes, so
+/// render from the `Reaction` that `react()` returned rather than re-reading.
 ///
 /// When the model has a `deleted_at` field, reacting to a soft-deleted target
 /// is `NotFound` and leaves its aggregate untouched.

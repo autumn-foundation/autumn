@@ -517,7 +517,9 @@ pub trait ModelPrimaryKey {
 /// helpers (#1362): the `{Model}Reactions` trait `#[model]` emits is
 /// blanket-implemented over `M2mConnSource<Model = TheVotableModel>`, and
 /// `react()` acquires its own connection through
-/// [`M2mConnSource::__autumn_m2m_write_conn`] exactly like an `add_*` does.
+/// [`M2mConnSource::__autumn_m2m_write_conn`] exactly like an `add_*` does,
+/// while the read-only `reaction_of()` uses
+/// [`M2mConnSource::__autumn_m2m_read_conn`].
 ///
 /// Not part of the public API; not implemented by hand.
 #[cfg(feature = "db")]
@@ -528,12 +530,33 @@ pub trait M2mConnSource: Send + Sync {
     type Model;
 
     /// Acquire a primary-pool connection for an `add_*`/`remove_*`/`set_*`
-    /// many-to-many mutation, or for a `#[votable]` `react()`/`reaction_of()`.
+    /// many-to-many mutation, or for a `#[votable]` `react()`.
     ///
     /// Mirrors the write-connection acquisition every
     /// other mutating generated method uses (marks the read-your-writes pin
     /// on success).
     fn __autumn_m2m_write_conn(
+        &self,
+    ) -> impl ::std::future::Future<
+        Output = crate::AutumnResult<
+            diesel_async::pooled_connection::deadpool::Object<crate::db::RuntimeConnection>,
+        >,
+    > + Send;
+
+    /// Acquire a connection for a *read-only* association/reaction accessor —
+    /// currently `#[votable]`'s `reaction_of()`.
+    ///
+    /// Routes exactly like every other generated read: per the repository's
+    /// [`ReadRoute`] snapshot, so a configured replica serves it (and an
+    /// `Unavailable` route fails fast). Unlike
+    /// [`__autumn_m2m_write_conn`](M2mConnSource::__autumn_m2m_write_conn) it
+    /// does **not** mark the read-your-writes pin — it is a read, so it neither
+    /// pins subsequent reads to the primary nor promises to observe a write
+    /// this request has not yet committed. A caller that must see its own
+    /// just-committed `react()` on a replica-backed repository should read
+    /// through a `primary_reads` / `on_primary()` repository, or use the
+    /// `Reaction` value `react()` already returned.
+    fn __autumn_m2m_read_conn(
         &self,
     ) -> impl ::std::future::Future<
         Output = crate::AutumnResult<
@@ -561,7 +584,11 @@ pub trait M2mConnSource: Send + Sync {
 /// // Only a signed (`aggregate = sum`) reaction can be flipped.
 /// assert_ne!(ReactionOutcome::Inserted, ReactionOutcome::Flipped);
 /// ```
+///
+/// `#[non_exhaustive]`: a future aggregate mode may add an outcome, so match
+/// arms in downstream crates must carry a `_ => …` fallback.
 #[cfg(feature = "db")]
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReactionOutcome {
     /// The reactor had no reaction on this target; one was created.
@@ -586,22 +613,28 @@ pub enum ReactionOutcome {
 /// a route never has to issue a follow-up `SELECT` for the new score or for the
 /// viewer's own reaction.
 ///
+/// `#[non_exhaustive]`: `react()` is the only constructor, so a later field
+/// (say, the edge's `created_at`) is not a breaking change. Read the fields;
+/// do not struct-literal one from outside this crate.
+///
 /// # Examples
 ///
 /// ```
 /// use autumn_web::repository::{Reaction, ReactionOutcome};
 ///
-/// // What `react(user_id, post_id, 1)` returns for a first upvote on a post
-/// // whose score was 6.
-/// let reaction = Reaction {
-///     value: Some(1),
-///     aggregate: 7,
-///     outcome: ReactionOutcome::Inserted,
-/// };
-/// assert_eq!(reaction.value, Some(1));
-/// assert_eq!(reaction.aggregate, 7);
+/// // `react(user_id, post_id, 1)` on a post whose score was 6 returns
+/// // value `Some(1)`, aggregate `7`, outcome `Inserted`. Callers read those
+/// // fields — `react()` is the only constructor, and the wildcard arm is what
+/// // `#[non_exhaustive]` asks of a downstream match.
+/// fn label(reaction: &Reaction) -> String {
+///     match reaction.outcome {
+///         ReactionOutcome::Removed => format!("score {}", reaction.aggregate),
+///         _ => format!("score {} (yours: {:?})", reaction.aggregate, reaction.value),
+///     }
+/// }
 /// ```
 #[cfg(feature = "db")]
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaction {
     /// The reactor's reaction *after* the call: `Some(value)` after an insert
@@ -616,6 +649,25 @@ pub struct Reaction {
     pub aggregate: i64,
     /// Which edge mutation ran.
     pub outcome: ReactionOutcome,
+}
+
+#[cfg(feature = "db")]
+impl Reaction {
+    /// Framework plumbing: the constructor `#[votable]`'s generated `react()`
+    /// uses.
+    ///
+    /// `Reaction` is `#[non_exhaustive]`, so the generated code — which expands
+    /// in the *application's* crate — cannot write a struct literal. Not a
+    /// public API; call `react()` instead.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn __new(value: Option<i16>, aggregate: i64, outcome: ReactionOutcome) -> Self {
+        Self {
+            value,
+            aggregate,
+            outcome,
+        }
+    }
 }
 
 /// Metadata trait implemented for model structs to expose FTS configuration.

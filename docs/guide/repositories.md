@@ -379,11 +379,11 @@ Declare it on the `#[model]` instead (issue #1362):
 
 ```rust
 #[autumn_web::model]
-#[votable(by = User, aggregate = sum)]   // or: aggregate = count, name = like
+#[votable(by = User, aggregate = sum)]   // must be BELOW #[model]
 pub struct Post {
     #[id]
-    pub id: i64,
-    pub score: i64,          // the aggregate column
+    pub id: i64,             // must be i64
+    pub score: i64,          // the aggregate column, must be i64
 }
 ```
 
@@ -401,14 +401,21 @@ r.outcome;    // Inserted | Flipped | Removed
 let mine: Option<i16> = posts.reaction_of(user_id, post_id).await?;
 ```
 
-`react()` is idempotent and race-safe: the same value again toggles the edge
-off, a different value flips it, a new one inserts it — and the aggregate is
-recomputed from ground truth and persisted **in the same transaction**, under
-an exclusive lock on the target row, so a reader never observes edge/aggregate
-disagreement. Soft-deleted targets are `NotFound`. Like the m2m mutation
-helpers, `react()` acquires **its own** pooled connection and does not join an
-enclosing `Db::tx` — do not hold a `Db` extractor across the call on a small
-pool.
+`react()` is a race-safe toggle: the same value again toggles the edge off, a
+different value flips it, a new one inserts it — and the aggregate is
+recomputed from ground truth and persisted **in the same transaction**, under a
+`FOR NO KEY UPDATE` lock on the target row (weak enough not to block
+referencing inserts such as a new comment on the same post), so a reader never
+observes edge/aggregate disagreement. It is *not* idempotent: never blindly
+retry a timed-out call, or the retry toggles the reaction back off. It also
+does **not** validate `value` — put a `CHECK` on the column and never bind
+`value` from a request. Soft-deleted targets are `NotFound`. Like the m2m
+mutation helpers, `react()` acquires **its own** pooled connection and does not
+join an enclosing `Db::tx` — do not hold a `Db` extractor across the call, or
+the handler needs two connections at once and deadlocks once concurrency
+reaches the pool size. `reaction_of()` is a read: it routes through the
+repository's read route, so it is replica-eligible and does not pin
+read-your-writes.
 
 The matching no-JS htmx widget is `autumn_web::widgets::reaction_controls`.
 Full treatment — the defaults table, the required migration, the before/after
