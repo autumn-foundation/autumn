@@ -122,6 +122,8 @@ mod middleware_pipeline;
 mod migrate_checksum_proptest;
 #[cfg(feature = "db")]
 mod model_field_attrs;
+#[cfg(feature = "db")]
+mod model_votable;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]
@@ -260,6 +262,8 @@ mod widgets_charts;
 #[cfg(feature = "maud")]
 mod widgets_infinite_feed;
 mod widgets_modal;
+#[cfg(feature = "maud")]
+mod widgets_reaction_controls;
 mod widgets_tabs;
 #[cfg(feature = "maud")]
 mod widgets_toast;
