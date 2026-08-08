@@ -68,8 +68,16 @@ checkout_completed_total{status="paid"} 3
 ```
 
 `describe_gauge` and `describe_histogram` do the same for the other kinds.
-Describing an instrument also registers it, so a described-but-never-recorded
-metric shows up with a `# TYPE` line and no samples.
+
+Describing a metric does **not** register it — the description is held until the
+first `counter(...)`/`gauge(...)`/`histogram(...)` call creates the instrument.
+So the two calls may come in either order, and a metric that is described but
+never recorded stays out of the scrape output entirely. (It also means
+`describe_histogram` cannot accidentally freeze a histogram's bucket bounds; see
+[Buckets](#buckets).)
+
+Help text is stripped of control characters — a `# HELP` line is one line — and
+truncated to 512 characters.
 
 ---
 
@@ -92,13 +100,22 @@ use autumn_web::metrics;
 metrics::counter("emails_sent_total").increment(1);
 
 // Gauge: set, increment, decrement.
-metrics::gauge("worker_queue_depth").set(42);
+metrics::gauge("worker_queue_depth").set(queue.len()); // usize, u64, i64, f64…
 metrics::gauge("worker_queue_depth").increment(1);
 metrics::gauge("worker_queue_depth").decrement(1);
 
 // Histogram: any non-negative observation (not just seconds).
 metrics::histogram("upload_size_bytes").record(2_048);
 ```
+
+Gauges and histograms take any primitive number, including `usize`, `u64` and
+`i64` — so `set(queue.len())` compiles without a cast. Values above 2^53 are
+rounded to the nearest `f64`, which is all Prometheus can carry anyway.
+
+Counters saturate at `u64::MAX` instead of wrapping: a wrapped total is
+indistinguishable from a counter reset and would give `rate()` an enormous
+phantom spike. Non-finite values (`NaN`, `±Inf`) are rejected on gauges and
+histograms alike, so the scrape and the JSON view can never disagree.
 
 ---
 
@@ -159,18 +176,27 @@ Timers and histograms use these default upper bounds, in seconds:
 ```
 
 Override them for one instrument at startup, **before** it is first used —
-bounds are frozen at first use so they cannot move under a running scrape
+bounds are frozen at registration so they cannot move under a running scrape
 target:
 
 ```rust
-autumn_web::metrics::set_histogram_buckets(
+use autumn_web::metrics;
+
+// Either order works: describing a metric does not register it.
+metrics::describe_histogram("payment_duration_seconds", "Card charge latency");
+metrics::set_histogram_buckets(
     "payment_duration_seconds",
     &[0.05, 0.1, 0.5, 1.0, 5.0, 30.0],
 );
 ```
 
 Bounds must be 1..=20 finite, positive, strictly ascending values; anything else
-is ignored with a warning and the defaults are kept.
+is ignored with a warning and the defaults are kept. A call that arrives after
+the histogram has been registered is ignored with a warning too.
+
+Bounds are rendered into `le` exactly as `client_golang` renders them, so a
+recording rule that matches `le` as a string keeps working: plain decimal inside
+`[1e-4, 1e21)` and exponential outside it (`5e-05`, `1e+21`).
 
 A timer renders as a standard Prometheus histogram — cumulative `_bucket` lines
 ending at `le="+Inf"`, which always equals `_count`:
@@ -189,16 +215,25 @@ payment_duration_seconds_count 4
 ```
 
 Non-finite and negative observations are rejected with a warning, so `_sum` can
-never become `NaN`.
+never become `NaN`. `_sum` is still an `f64` accumulator that is never reset, so
+a long-lived process recording astronomically large observations can eventually
+saturate it to `+Inf` — permanently. Recording seconds (what `timer` does) keeps
+you many orders of magnitude away from that.
 
 ---
 
 ## Labels and cardinality
 
 `with_label` attaches a label to the series a handle records into. Labels are
-canonicalized for you: sorted by key, deduplicated first-wins, values truncated
-to 128 characters. An invalid or reserved label name (`le`, `quantile`, anything
-starting `__`) drops that **label**, never the sample.
+canonicalized for you: sorted by key, deduplicated first-wins, values stripped of
+control characters (a stray `\n` or ANSI escape cannot split or forge an
+exposition line) and truncated to 128 characters. An invalid, over-long or
+reserved label name (`le`, `quantile`, anything starting `__`) drops that
+**label**, never the sample.
+
+When a handle carries more than eight usable labels, the ones kept are those with
+the lexicographically smallest names — never the first eight you happened to
+attach — so the same label set always lands in the same series.
 
 ```rust
 metrics::counter("checkout_completed_total")
@@ -217,21 +252,33 @@ metrics::counter("checkout_completed_total")
 The facade enforces hard caps so a mistake degrades the metric instead of the
 process:
 
-| Limit                       | Value | On overflow                                    |
-| --------------------------- | ----- | ---------------------------------------------- |
-| Series per instrument       | 100   | Further label sets dropped and counted          |
-| Instruments in the registry | 256   | Further new names get an inert handle           |
-| Labels per series           | 8     | Extra labels dropped, sample still recorded     |
-| Label value length          | 128   | Truncated                                       |
+| Limit                             | Value          | On overflow                                      |
+| --------------------------------- | -------------- | ------------------------------------------------ |
+| **Labeled** series per instrument | 100            | Samples with a new label set dropped and counted |
+| Instruments in the registry       | 256            | Further new names get an inert handle            |
+| Labels per series                 | 8              | Extra labels dropped, sample still recorded      |
+| Label value length                | 128 characters | Truncated                                        |
+| Metric name length                | 128 bytes      | **Rejected** — inert handle, never truncated     |
+| Label name length                 | 128 bytes      | Label dropped, sample still recorded             |
+| Help text length                  | 512 characters | Truncated                                        |
+
+The unlabeled series — what a handle with no `with_label` call records into — is
+separate and does not count against the 100. Names are rejected rather than
+truncated, because two names sharing a 128-byte prefix would otherwise silently
+become one metric.
 
 Hitting the series cap logs **one** warning per instrument and is visible in the
 scrape itself, so you can alert on it:
 
 ```
-# HELP autumn_metrics_series_dropped_total App metric label sets dropped because the metric hit its series cardinality cap
+# HELP autumn_metrics_series_dropped_total App metric samples dropped because the metric had already hit its series cardinality cap
 # TYPE autumn_metrics_series_dropped_total counter
 autumn_metrics_series_dropped_total{metric="checkout_completed_total"} 57
 ```
+
+That counts **samples**, not distinct label sets: a hot call site hammering one
+over-cap label set is exactly what you need to see, and counting distinct sets
+would mean remembering the very label sets the cap exists to stop remembering.
 
 Series are never evicted once retained — evicting a counter would reset it and
 break `rate()`.
@@ -252,7 +299,17 @@ break `rate()`.
   family.
 
 Every rejection logs one warning and returns an **inert handle** that records
-nothing. The facade never panics and never poisons the scrape output.
+nothing. The facade never panics and never poisons the scrape output. Rejected
+names are escaped and truncated before they reach the log, so a name carrying
+newlines or ANSI escapes cannot forge log records.
+
+> **Registration order can lock you out, and the only signal is a log line.**
+> The derived-name reservation runs in both directions and first registration
+> wins, so a gauge named `payment_duration_seconds_sum` registered anywhere in
+> the process permanently blocks the histogram `payment_duration_seconds` — and
+> the block is silent apart from one warning at the losing call site. Pick
+> `_sum`/`_count`/`_bucket`-suffixed names only when you mean the derived
+> families of a histogram you own.
 
 Unlike the built-in families, app metrics carry **no implicit `version` label**.
 The label set belongs entirely to your call site, so the framework cannot
@@ -301,10 +358,10 @@ prometheus = true    # /actuator/prometheus scrape endpoint — on by default
 ```
 
 With `prometheus = false` the scrape endpoint is not mounted at all (`404`), for
-app metrics exactly as for built-in ones — there is no bypass. Your call sites
-keep recording; the data is simply not scrapeable, and the router says so once
-at startup. `/actuator/metrics` still shows the `app` key under the same
-visibility rules as the built-in families. See
+app metrics exactly as for built-in ones — there is no bypass. Only the
+**Prometheus scrape format** is gated: your call sites keep recording, the
+router says so once at startup, and `/actuator/metrics` still shows the `app`
+key, under the same visibility rules as the built-in families. See
 [Plugin Metrics Sources](metrics-sources.md#actuator-exposure-config) for how
 this interacts with `actuator.sensitive`.
 
@@ -344,3 +401,9 @@ autumn_web::metrics::counter(&name).increment(1);
 Assert with `contains()` on those unique names — never on whole-body equality or
 line counts of the scrape output, which also carries built-in families and
 anything a concurrent test recorded.
+
+Those names are never reclaimed and they share the process-wide 256-instrument
+budget with every other test in the same binary. A handful per test is fine; a
+loop that registers hundreds will exhaust the registry for whatever runs after
+it. Cap the loop, or reuse one name with different labels — that cap is
+per-instrument.

@@ -4,21 +4,20 @@
 //! interesting thing happens — no traits to implement, no types to define, no
 //! registry to wire into the app builder:
 //!
-//! ```rust,no_run
+//! ```rust
 //! use autumn_web::metrics;
 //!
-//! # fn checkout() {
 //! metrics::counter("checkout_completed_total")
 //!     .with_label("status", "paid")
 //!     .increment(1);
-//! # }
 //! ```
 //!
 //! Everything recorded here is exposed automatically by the actuator:
 //! `/actuator/prometheus` renders the Prometheus text format and
 //! `/actuator/metrics` renders the same data as JSON under a top-level `app`
-//! key. Recording always works; only *exposure* is gated by
-//! `actuator.prometheus`.
+//! key. Recording always works, and `actuator.prometheus = false` gates only
+//! the Prometheus scrape endpoint — the JSON `/actuator/metrics` view still
+//! carries the `app` key.
 //!
 //! ## Which instrument do I want?
 //!
@@ -36,8 +35,8 @@
 //! label with user input, IDs, or anything else unbounded: each distinct
 //! combination of label values is a separate time series, and the facade caps
 //! an instrument at [`MAX_SERIES_PER_METRIC`](crate::metrics::MAX_SERIES_PER_METRIC)
-//! series (excess label sets are dropped and counted in
-//! [`InstrumentSnapshot::dropped_series`](crate::metrics::InstrumentSnapshot::dropped_series)).
+//! labeled series (samples carrying excess label sets are dropped and counted
+//! in [`InstrumentSnapshot::dropped_series`](crate::metrics::InstrumentSnapshot::dropped_series)).
 //!
 //! ## Reserved names
 //!
@@ -61,30 +60,61 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-/// Maximum number of distinct label sets (series) retained per instrument.
+/// Maximum number of distinct **labeled** series retained per instrument.
 ///
-/// Once an instrument holds this many series, further distinct label sets are
-/// dropped and counted in [`InstrumentSnapshot::dropped_series`].
+/// The unlabeled series — what a handle with no `with_label` call records
+/// into — is separate and does not count towards this cap. Once an instrument
+/// holds this many labeled series, samples carrying a label set it has not
+/// seen before are dropped and counted in
+/// [`InstrumentSnapshot::dropped_series`].
 pub const MAX_SERIES_PER_METRIC: usize = 100;
 
 /// Maximum number of distinct instruments the process-global registry holds.
 pub const MAX_INSTRUMENTS: usize = 256;
 
 /// Maximum number of labels retained on a single series; extras are dropped.
+///
+/// The retained subset is the one with the lexicographically smallest label
+/// names, so which labels survive never depends on the order `with_label` was
+/// called in.
 pub const MAX_LABELS_PER_SERIES: usize = 8;
 
-/// Maximum length of a label value; longer values are truncated.
+/// Maximum length of a label value, **in characters** (not bytes).
+///
+/// A value at this cap can occupy up to four times as many bytes when it holds
+/// non-ASCII text. Longer values are truncated on a character boundary.
 pub const MAX_LABEL_VALUE_LEN: usize = 128;
+
+/// Maximum length of a metric name, in bytes.
+///
+/// Metric names are ASCII by construction (they must match Prometheus' own
+/// `[a-zA-Z_][a-zA-Z0-9_]*` grammar to be accepted at all), so bytes and
+/// characters coincide. An over-long name is **rejected**, never truncated:
+/// truncation would silently merge two distinct metrics into one family.
+pub const MAX_METRIC_NAME_LEN: usize = 128;
+
+/// Maximum length of a label name, in bytes.
+///
+/// ASCII by construction, like [`MAX_METRIC_NAME_LEN`]. An over-long label
+/// name drops that label — never the sample, and never by truncation.
+pub const MAX_LABEL_NAME_LEN: usize = 128;
+
+/// Maximum length of `# HELP` text, **in characters**; longer text is
+/// truncated on a character boundary.
+pub const MAX_HELP_LEN: usize = 512;
 
 /// Default histogram bucket upper bounds, in seconds.
 ///
 /// The implicit `+Inf` bucket is always present and is not listed here.
-pub const DEFAULT_BUCKETS: [f64; 11] = [
+pub const DEFAULT_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
 /// Largest number of bucket upper bounds [`set_histogram_buckets`] accepts.
-const MAX_BUCKET_BOUNDS: usize = 20;
+pub const MAX_BUCKET_BOUNDS: usize = 20;
+
+/// How much of a rejected name a log line reproduces, in characters.
+const LOG_NAME_PREVIEW_LEN: usize = 64;
 
 /// Label names Prometheus reserves for its own use; the facade drops them.
 const RESERVED_LABEL_NAMES: [&str; 2] = ["le", "quantile"];
@@ -104,18 +134,35 @@ pub(crate) const HISTOGRAM_SUFFIXES: [&str; 3] = ["_bucket", "_sum", "_count"];
 /// [`crate::cache::read_through_metrics`].
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::default);
 
+/// Descriptions waiting for the instrument they name to be registered, keyed
+/// by metric name and tagged with the kind they were written for.
+type PendingHelp = HashMap<Box<str>, (InstrumentKind, Box<str>)>;
+
 /// Every registered instrument, plus the latches that keep warnings from
 /// turning into hot-path log floods.
+///
+/// **Lock order**: the two `pending_*` maps are only ever locked while the
+/// `instruments` lock is already held, never the other way round. Resolving
+/// them inside the critical section that publishes an instrument is what makes
+/// [`describe_counter`] / [`set_histogram_buckets`] free of a
+/// check-then-register race with a concurrent first use.
 #[derive(Debug, Default)]
 struct Registry {
     /// Registered instruments keyed by metric name.
     instruments: RwLock<HashMap<Box<str>, Arc<Instrument>>>,
-    /// Bucket bounds configured before their histogram was first used.
+    /// Bucket bounds configured before their histogram was registered.
     pending_buckets: RwLock<HashMap<Box<str>, Box<[f64]>>>,
+    /// Help text recorded by `describe_*` before its instrument was
+    /// registered, with the kind the description was written for.
+    pending_help: RwLock<PendingHelp>,
     /// Names already warned about, so a rejected name warns exactly once.
     warned_names: RwLock<HashSet<Box<str>>>,
     /// Latches the single "too many instruments" warning.
     over_capacity_warned: AtomicBool,
+    /// Latches the single "too many pending bucket overrides" warning.
+    pending_buckets_full_warned: AtomicBool,
+    /// Latches the single "too many pending descriptions" warning.
+    pending_help_full_warned: AtomicBool,
 }
 
 impl Registry {
@@ -144,7 +191,7 @@ impl Registry {
         }
         // Outside the lock: a `tracing` subscriber is user code.
         tracing::warn!(
-            metric = %name,
+            metric = %sanitize_for_log(name),
             reason,
             "app metric rejected; recording through an inert handle"
         );
@@ -154,12 +201,55 @@ impl Registry {
     fn warn_over_capacity(&self, name: &str) {
         if !self.over_capacity_warned.swap(true, Ordering::Relaxed) {
             tracing::warn!(
-                metric = %name,
+                metric = %sanitize_for_log(name),
                 cap = MAX_INSTRUMENTS,
                 "app metric registry is at capacity; further new metric names are ignored"
             );
         }
     }
+
+    /// Warn once that too many histograms have bucket overrides waiting for a
+    /// first use that never came.
+    fn warn_pending_buckets_full(&self, name: &str) {
+        if !self
+            .pending_buckets_full_warned
+            .swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                metric = %sanitize_for_log(name),
+                cap = MAX_INSTRUMENTS,
+                "too many histograms have bucket bounds configured but were never registered; \
+                 ignoring further `set_histogram_buckets` calls for unregistered names"
+            );
+        }
+    }
+
+    /// Warn once that too many descriptions are waiting for instruments that
+    /// were never registered.
+    fn warn_pending_help_full(&self, name: &str) {
+        if !self.pending_help_full_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                metric = %sanitize_for_log(name),
+                cap = MAX_INSTRUMENTS,
+                "too many app metrics have been described but were never registered; \
+                 ignoring further `describe_*` calls for unregistered names"
+            );
+        }
+    }
+}
+
+/// Render an untrusted name for a log line.
+///
+/// A name only reaches a warning path *because* it was rejected, so it may
+/// carry newlines, ANSI escapes or anything else that would let a call site
+/// forge log records. [`str::escape_debug`] neutralizes those, and the length
+/// cap keeps a pathological name from flooding the log.
+fn sanitize_for_log(name: &str) -> String {
+    let preview: String = name.escape_debug().take(LOG_NAME_PREVIEW_LEN).collect();
+    if name.escape_debug().nth(LOG_NAME_PREVIEW_LEN).is_some() {
+        return format!("{preview}…");
+    }
+    preview
 }
 
 /// Sorted, deduplicated label pairs identifying one series of an instrument.
@@ -178,7 +268,8 @@ struct Instrument {
     /// Histogram bucket upper bounds; empty for counters and gauges. Frozen at
     /// registration so bucket boundaries never move under a scrape target.
     bounds: Box<[f64]>,
-    /// Allocation-free fast path for the (overwhelmingly common) no-label case.
+    /// Allocation-free fast path for the no-label case: recording through it
+    /// takes no lock and canonicalizes nothing.
     unlabeled: Series,
     /// Whether anything was ever recorded into [`Self::unlabeled`]; an
     /// untouched instrument must not report a phantom zero series.
@@ -222,20 +313,29 @@ impl Instrument {
     /// lock at all.
     fn record(&self, labels: &[(String, String)], update: impl FnOnce(&Series)) {
         if labels.is_empty() {
-            update(&self.unlabeled);
-            self.unlabeled_used.store(true, Ordering::Relaxed);
+            self.record_unlabeled(update);
             return;
         }
         let key = self.canonical_key(labels);
         if key.is_empty() {
             // Every label was rejected; the sample still belongs somewhere.
-            update(&self.unlabeled);
-            self.unlabeled_used.store(true, Ordering::Relaxed);
+            self.record_unlabeled(update);
             return;
         }
         if let Some(series) = self.series_for(&key) {
             update(&series);
         }
+    }
+
+    /// Apply `update` to the unlabeled fast-path series.
+    ///
+    /// The "used" flag is published *before* the update, never after: a scrape
+    /// that sees the flag but not yet the value renders a zero-valued series,
+    /// which is harmless, while the other order could hide a recorded sample
+    /// from the scrape entirely.
+    fn record_unlabeled(&self, update: impl FnOnce(&Series)) {
+        self.unlabeled_used.store(true, Ordering::Relaxed);
+        update(&self.unlabeled);
     }
 
     /// Look up (or register) the series for `key`, honouring the cardinality
@@ -268,41 +368,46 @@ impl Instrument {
         Some(fresh)
     }
 
-    /// Count one dropped label set and warn about it at most once.
+    /// Count one dropped sample and warn about it at most once.
     fn note_dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
         if !self.cap_warned.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 metric = %self.name,
                 cap = MAX_SERIES_PER_METRIC,
-                "app metric hit its series cardinality cap; further label sets are dropped. \
-                 Label values must come from a small closed set — never user input or IDs"
+                "app metric hit its series cardinality cap; samples carrying a new label set \
+                 are dropped. Label values must come from a small closed set — never user \
+                 input or IDs"
             );
         }
     }
 
-    /// Canonicalize a handle's pending labels into a series key: invalid and
-    /// reserved names dropped, duplicates resolved first-wins, values
-    /// truncated, at most [`MAX_LABELS_PER_SERIES`] kept, sorted by key.
+    /// Canonicalize a handle's pending labels into a series key: invalid,
+    /// reserved and over-long names dropped, duplicates resolved first-wins,
+    /// values sanitized, sorted by key, then cut to
+    /// [`MAX_LABELS_PER_SERIES`].
     fn canonical_key(&self, labels: &[(String, String)]) -> SeriesKey {
-        let mut kept: Vec<(Box<str>, Box<str>)> =
-            Vec::with_capacity(labels.len().min(MAX_LABELS_PER_SERIES));
+        let mut kept: Vec<(Box<str>, Box<str>)> = Vec::with_capacity(labels.len());
         for (key, value) in labels {
             if !is_acceptable_label_name(key) {
-                self.warn_labels("invalid or reserved label name");
+                self.warn_labels("invalid, reserved or over-long label name");
                 continue;
             }
             if kept.iter().any(|(existing, _)| **existing == **key) {
                 self.warn_labels("duplicate label name");
                 continue;
             }
-            if kept.len() >= MAX_LABELS_PER_SERIES {
-                self.warn_labels("too many labels");
-                continue;
-            }
-            kept.push((key.as_str().into(), truncate_label_value(value)));
+            kept.push((key.as_str().into(), sanitize_label_value(value)));
         }
+        // Sort *before* cutting to the cap. Truncating in insertion order would
+        // make the surviving subset — and therefore the identity of the series
+        // — depend on the order `with_label` happened to be called in, so the
+        // same ten labels applied in two orders would land in two series.
         kept.sort_by(|(a, _), (b, _)| a.cmp(b));
+        if kept.len() > MAX_LABELS_PER_SERIES {
+            kept.truncate(MAX_LABELS_PER_SERIES);
+            self.warn_labels("too many labels");
+        }
         kept.into_boxed_slice()
     }
 
@@ -318,12 +423,13 @@ impl Instrument {
     }
 
     /// Warn at most once that this instrument was handed an unusable value.
-    fn warn_value(&self, value: f64) {
+    fn warn_value(&self, value: f64, reason: &'static str) {
         if !self.value_warned.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 metric = %self.name,
                 value,
-                "histogram observation must be finite and non-negative; dropping it"
+                reason,
+                "app metric value rejected; dropping the sample"
             );
         }
     }
@@ -334,11 +440,20 @@ impl Instrument {
             let help = self.help.read().unwrap_or_else(PoisonError::into_inner);
             help.to_string()
         };
-        let labeled: Vec<(SeriesKey, Arc<Series>)> = {
+        // Build each series' owned label map while the read lock is held: the
+        // alternative — cloning every `SeriesKey` and converting afterwards —
+        // allocates each label twice for no less time under the lock.
+        let labeled: Vec<(BTreeMap<String, String>, Arc<Series>)> = {
             let series = self.series.read().unwrap_or_else(PoisonError::into_inner);
             series
                 .iter()
-                .map(|(key, value)| (key.clone(), Arc::clone(value)))
+                .map(|(key, value)| {
+                    let labels = key
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    (labels, Arc::clone(value))
+                })
                 .collect()
         };
 
@@ -349,12 +464,9 @@ impl Instrument {
                 value: self.unlabeled.value(&self.bounds),
             });
         }
-        for (key, value) in labeled {
+        for (labels, value) in labeled {
             series.push(SeriesSnapshot {
-                labels: key
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
+                labels,
                 value: value.value(&self.bounds),
             });
         }
@@ -366,7 +478,6 @@ impl Instrument {
             kind: self.kind,
             series,
             dropped_series: self.dropped.load(Ordering::Relaxed),
-            buckets: self.bounds.to_vec(),
         }
     }
 }
@@ -406,10 +517,16 @@ impl Series {
         }
     }
 
-    /// Add `amount` to a counter series.
+    /// Add `amount` to a counter series, saturating at [`u64::MAX`].
+    ///
+    /// Saturating rather than wrapping: a wrapped total looks to `PromQL`
+    /// exactly like a counter reset, so `rate()` would report an enormous
+    /// phantom spike. A pinned total is obviously broken instead.
     fn add(&self, amount: u64) {
         if let Self::Counter(total) = self {
-            total.fetch_add(amount, Ordering::Relaxed);
+            let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(amount))
+            });
         }
     }
 
@@ -477,27 +594,81 @@ fn add_f64(cell: &AtomicU64, delta: f64) {
 }
 
 /// Render a bucket bound the way it appears in an `le` label.
+///
+/// Byte-for-byte what `client_golang` writes, because a dashboard query
+/// (`histogram_quantile`) and a recording rule both match `le` as a *string*:
+/// Go formats it with `%g`, which switches to exponential notation outside
+/// `[1e-4, 1e21)` and pads the exponent to at least two digits with an
+/// explicit sign. Rust's `{}` never goes exponential and its `{:e}` never
+/// pads, so the two are combined here.
 fn format_bound(bound: f64) -> String {
-    bound.to_string()
+    let magnitude = bound.abs();
+    if magnitude == 0.0 || (1e-4..1e21).contains(&magnitude) {
+        return bound.to_string();
+    }
+    let rendered = format!("{bound:e}");
+    let Some((mantissa, exponent)) = rendered.split_once('e') else {
+        return rendered;
+    };
+    let (sign, digits) = exponent
+        .strip_prefix('-')
+        .map_or(("+", exponent), |rest| ("-", rest));
+    format!("{mantissa}e{sign}{digits:0>2}")
 }
 
-/// Truncate an over-long label value on a character boundary.
-fn truncate_label_value(value: &str) -> Box<str> {
-    // A string of at most `MAX_LABEL_VALUE_LEN` bytes can hold at most that
-    // many characters, so the common case never walks the string.
-    if value.len() <= MAX_LABEL_VALUE_LEN {
+/// Whether `c` must not survive into a label value or a `# HELP` line.
+///
+/// Covers the C0 range, `DEL` and the C1 range — everything that can move a
+/// terminal cursor, start an ANSI escape, or split one exposition line into
+/// two. Nothing legitimate in a label value or a description is a control
+/// character.
+fn is_forbidden_control(c: char) -> bool {
+    c.is_control()
+}
+
+/// Canonicalize a label value: control characters removed, then truncated to
+/// [`MAX_LABEL_VALUE_LEN`] characters.
+fn sanitize_label_value(value: &str) -> Box<str> {
+    // A string of at most `MAX_LABEL_VALUE_LEN` bytes holds at most that many
+    // characters, so the common case walks the string once and copies it once.
+    if value.len() <= MAX_LABEL_VALUE_LEN && !value.contains(is_forbidden_control) {
         return value.into();
     }
-    value
-        .chars()
-        .take(MAX_LABEL_VALUE_LEN)
-        .collect::<String>()
-        .into_boxed_str()
+    sanitized_chars(value, MAX_LABEL_VALUE_LEN).into_boxed_str()
+}
+
+/// [`sanitize_label_value`] for a value the caller already owns, reusing the
+/// allocation when nothing needs changing.
+fn sanitize_owned_label_value(value: String) -> String {
+    if value.len() <= MAX_LABEL_VALUE_LEN && !value.contains(is_forbidden_control) {
+        return value;
+    }
+    sanitized_chars(&value, MAX_LABEL_VALUE_LEN)
+}
+
+/// Canonicalize `# HELP` text: control characters removed (a `# HELP` line is
+/// one line, so an embedded newline cannot be kept), then truncated to
+/// [`MAX_HELP_LEN`] characters.
+fn sanitize_help(help: &str) -> Box<str> {
+    if help.len() <= MAX_HELP_LEN && !help.contains(is_forbidden_control) {
+        return help.into();
+    }
+    sanitized_chars(help, MAX_HELP_LEN).into_boxed_str()
+}
+
+/// Drop control characters from `text` and keep at most `limit` of what is
+/// left — always on a character boundary.
+fn sanitized_chars(text: &str, limit: usize) -> String {
+    text.chars()
+        .filter(|c| !is_forbidden_control(*c))
+        .take(limit)
+        .collect()
 }
 
 /// Whether `name` may be used as a label key on an app metric.
 fn is_acceptable_label_name(name: &str) -> bool {
-    crate::actuator::is_valid_label_name(name)
+    name.len() <= MAX_LABEL_NAME_LEN
+        && crate::actuator::is_valid_label_name(name)
         && !name.starts_with("__")
         && !RESERVED_LABEL_NAMES.contains(&name)
 }
@@ -507,6 +678,12 @@ fn is_acceptable_label_name(name: &str) -> bool {
 /// Stricter than Prometheus' own grammar: `:` is reserved for recording rules
 /// and the `autumn_` namespace belongs to the framework's built-in families.
 fn registration_rejection(name: &str) -> Option<&'static str> {
+    if name.len() > MAX_METRIC_NAME_LEN {
+        // Checked before the grammar so a pathological name is not scanned in
+        // full. Rejected, never truncated: two names sharing a 128-byte prefix
+        // would otherwise silently become one family.
+        return Some("longer than the metric name cap");
+    }
     if !crate::actuator::is_valid_metric_name(name) {
         return Some("not a valid Prometheus metric name");
     }
@@ -552,22 +729,55 @@ fn collides_with_registered(
     })
 }
 
-/// Bucket bounds to give a histogram named `name` at registration.
-fn bounds_for(name: &str) -> Box<[f64]> {
+/// Take the bucket bounds to give an instrument named `name` at registration.
+///
+/// The pending entry is removed whatever `kind` is: once *any* instrument owns
+/// the name, a bucket override stored against it can never apply, and leaving
+/// it behind would let the map grow past its cap with dead entries.
+///
+/// Called only with the `instruments` write lock held — see [`Registry`] for
+/// the lock order and why resolving the override there closes the race with
+/// [`set_histogram_buckets`].
+fn take_pending_bounds(name: &str, kind: InstrumentKind) -> Box<[f64]> {
     let pending = REGISTRY
         .pending_buckets
-        .read()
-        .unwrap_or_else(PoisonError::into_inner);
-    pending
-        .get(name)
-        .map_or_else(|| Box::from(DEFAULT_BUCKETS.as_slice()), Clone::clone)
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(name);
+    if matches!(kind, InstrumentKind::Histogram) {
+        pending.unwrap_or_else(|| Box::from(DEFAULT_BUCKETS))
+    } else {
+        Box::default()
+    }
+}
+
+/// Take the help text stashed by a `describe_*` call for `name`.
+///
+/// `Ok(None)` when nothing was described, `Ok(Some(help))` when the stashed
+/// description matches the kind being registered, and `Err(described_kind)`
+/// when it does not — the caller warns about that once the lock is released.
+///
+/// Called only with the `instruments` write lock held, like
+/// [`take_pending_bounds`].
+fn take_pending_help(name: &str, kind: InstrumentKind) -> Result<Option<Box<str>>, InstrumentKind> {
+    let entry = REGISTRY
+        .pending_help
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(name);
+    match entry {
+        None => Ok(None),
+        Some((described, help)) if described == kind => Ok(Some(help)),
+        Some((described, _)) => Err(described),
+    }
 }
 
 /// What happened under the registry's write lock, decided while the lock was
 /// held and acted on (warnings included) only after it was released.
 enum Registration {
-    /// This call registered the instrument.
-    Registered(Arc<Instrument>),
+    /// This call registered the instrument. The second field carries the kind
+    /// of a stashed description that was discarded for not matching.
+    Registered(Arc<Instrument>, Option<InstrumentKind>),
     /// Another thread won the race; this is its instrument.
     Existing(Arc<Instrument>),
     /// The registry is full.
@@ -611,13 +821,6 @@ fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
         }
     }
 
-    let bounds = if matches!(kind, InstrumentKind::Histogram) {
-        bounds_for(name)
-    } else {
-        Box::default()
-    };
-    let fresh = Arc::new(Instrument::new(name, kind, bounds));
-
     // Slow path: register. Every check is repeated under the write lock
     // because another thread may have won the race to this point.
     let outcome = {
@@ -635,8 +838,23 @@ fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
             None if at_capacity => Registration::OverCapacity,
             None if collides => Registration::Collision,
             None => {
+                // Both pending maps are resolved *inside* this critical
+                // section, so a `describe_*` or `set_histogram_buckets` call
+                // racing with a first use either lands before the instrument
+                // exists (and applies) or finds it registered (and says so) —
+                // never in between, silently losing the setting.
+                let bounds = take_pending_bounds(name, kind);
+                let fresh = Arc::new(Instrument::new(name, kind, bounds));
+                let discarded = match take_pending_help(name, kind) {
+                    Ok(Some(help)) => {
+                        *fresh.help.write().unwrap_or_else(PoisonError::into_inner) = help;
+                        None
+                    }
+                    Ok(None) => None,
+                    Err(described) => Some(described),
+                };
                 registered.insert(name.into(), Arc::clone(&fresh));
-                Registration::Registered(fresh)
+                Registration::Registered(fresh, discarded)
             }
         };
         drop(registered);
@@ -644,15 +862,15 @@ fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
     };
 
     match outcome {
-        Registration::Registered(instrument) => {
-            if matches!(kind, InstrumentKind::Histogram) {
-                // The bounds are frozen into the instrument now; drop the
-                // pending entry so the map cannot grow without bound.
-                let mut pending = REGISTRY
-                    .pending_buckets
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner);
-                pending.remove(name);
+        Registration::Registered(instrument, discarded_description) => {
+            if let Some(described) = discarded_description {
+                tracing::warn!(
+                    metric = %instrument.name,
+                    described = ?described,
+                    registered = ?kind,
+                    "app metric was described as a different kind before it was registered; \
+                     the description is ignored"
+                );
             }
             Some(instrument)
         }
@@ -676,15 +894,20 @@ fn matching_kind(existing: Arc<Instrument>, kind: InstrumentKind) -> Option<Arc<
     if existing.kind == kind {
         return Some(existing);
     }
+    warn_kind_conflict(&existing, kind);
+    None
+}
+
+/// Warn once per instrument that it was asked for as the wrong kind.
+fn warn_kind_conflict(existing: &Instrument, requested: InstrumentKind) {
     if !existing.kind_warned.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             metric = %existing.name,
             registered = ?existing.kind,
-            requested = ?kind,
+            requested = ?requested,
             "app metric is already registered as a different kind; recording through an inert handle"
         );
     }
-    None
 }
 
 // ── Handle constructors ────────────────────────────────────────
@@ -726,7 +949,21 @@ pub fn histogram(name: &str) -> Histogram {
 /// Get (or lazily register) the timer named `name`.
 ///
 /// A timer is a histogram of durations measured in seconds; name it
-/// `*_seconds` by convention.
+/// `*_seconds` by convention. The usual shape is a guard bound to a **named**
+/// variable, which records when the scope ends — including on an early `?`
+/// return or an unwinding panic:
+///
+/// ```rust
+/// use autumn_web::metrics;
+///
+/// fn render_report() -> Result<String, std::fmt::Error> {
+///     let _timing = metrics::timer("report_render_seconds").start();
+///     Ok("report".to_string())
+/// }
+/// # assert!(render_report().is_ok());
+/// ```
+///
+/// `let _ = ...` would drop the guard immediately and record roughly zero.
 pub fn timer(name: &str) -> Timer {
     Timer {
         histogram: histogram(name),
@@ -734,40 +971,133 @@ pub fn timer(name: &str) -> Timer {
 }
 
 /// Set the `# HELP` text of the counter named `name`.
+///
+/// Describing a metric does **not** register it: the description is stashed
+/// and applied when the first `counter(name)` call registers the instrument,
+/// so `describe_counter` and the first use may come in either order. An
+/// instrument that is described but never used stays out of the scrape
+/// output entirely.
+///
+/// Help text is stripped of control characters and truncated to
+/// [`MAX_HELP_LEN`] characters.
 pub fn describe_counter(name: &str, help: impl Into<String>) {
-    describe(name, InstrumentKind::Counter, help.into());
+    describe(name, InstrumentKind::Counter, &help.into());
 }
 
 /// Set the `# HELP` text of the gauge named `name`.
+///
+/// Like [`describe_counter`], this does not register the instrument.
 pub fn describe_gauge(name: &str, help: impl Into<String>) {
-    describe(name, InstrumentKind::Gauge, help.into());
+    describe(name, InstrumentKind::Gauge, &help.into());
 }
 
 /// Set the `# HELP` text of the histogram (or timer) named `name`.
+///
+/// Like [`describe_counter`], this does not register the instrument — which is
+/// what lets it be combined with [`set_histogram_buckets`] in either order.
 pub fn describe_histogram(name: &str, help: impl Into<String>) {
-    describe(name, InstrumentKind::Histogram, help.into());
+    describe(name, InstrumentKind::Histogram, &help.into());
 }
 
-/// Register `name` if needed and replace its help text.
-fn describe(name: &str, kind: InstrumentKind, help: String) {
-    if let Some(instrument) = instrument(name, kind) {
-        let mut slot = instrument
-            .help
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        *slot = help.into_boxed_str();
+/// What [`describe`] decided under the registry lock.
+enum Description {
+    /// Applied to an already-registered instrument, or stashed for one.
+    Recorded,
+    /// The name is registered as a different kind.
+    Mismatch(Arc<Instrument>),
+    /// Too many descriptions are already waiting for unregistered names.
+    Full,
+}
+
+/// Apply `help` to the instrument named `name`, or stash it until one is
+/// registered under that name.
+///
+/// Deliberately does **not** register the instrument. Registering here would
+/// freeze a histogram's bucket bounds, so `describe_histogram` followed by
+/// `set_histogram_buckets` would silently discard the custom bounds — a trap
+/// with no diagnostic at all, since both calls "succeed".
+fn describe(name: &str, kind: InstrumentKind, help: &str) {
+    if let Some(reason) = registration_rejection(name) {
+        REGISTRY.warn_once(name, reason);
+        return;
     }
+    let help = sanitize_help(help);
+
+    let outcome = {
+        // Lock order: `pending_help` nested under `instruments` (see
+        // `Registry`). Holding the read lock across both branches is what
+        // keeps a concurrent first use from registering between the lookup
+        // and the stash.
+        let registered = REGISTRY
+            .instruments
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        match registered.get(name) {
+            Some(existing) if existing.kind == kind => {
+                *existing
+                    .help
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = help;
+                Description::Recorded
+            }
+            Some(existing) => Description::Mismatch(Arc::clone(existing)),
+            None => {
+                let mut pending = REGISTRY
+                    .pending_help
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if pending.len() >= MAX_INSTRUMENTS && !pending.contains_key(name) {
+                    Description::Full
+                } else {
+                    pending.insert(name.into(), (kind, help));
+                    Description::Recorded
+                }
+            }
+        }
+    };
+
+    // Warnings only once the guards are gone: a `tracing` subscriber is user
+    // code and must never run under a facade lock.
+    match outcome {
+        Description::Recorded => {}
+        Description::Mismatch(existing) => warn_kind_conflict(&existing, kind),
+        Description::Full => REGISTRY.warn_pending_help_full(name),
+    }
+}
+
+/// What [`set_histogram_buckets`] decided under the registry lock.
+enum BucketOverride {
+    /// Stashed for the histogram's registration.
+    Stored,
+    /// The name is already registered; its bounds are frozen.
+    AlreadyRegistered,
+    /// Too many overrides are already waiting for unregistered names.
+    Full,
 }
 
 /// Override the bucket upper bounds of the histogram (or timer) named `name`.
 ///
-/// Only effective *before* that histogram is first used: the bounds are frozen
-/// into the instrument when it is registered, so a later call is ignored with a
-/// warning rather than moving bucket boundaries under a running scrape target.
-/// Call it during startup, next to the matching [`describe_histogram`].
+/// Only effective *before* that histogram is registered — that is, before the
+/// first `histogram(name)` / `timer(name)` call. The bounds are frozen into the
+/// instrument at registration, so a later call is ignored with a warning rather
+/// than moving bucket boundaries under a running scrape target.
 ///
-/// `upper_bounds` must hold 1..=20 finite, strictly ascending, positive values;
-/// anything else is ignored with a warning and the defaults are kept.
+/// [`describe_histogram`] does not register anything, so the two can be called
+/// in either order:
+///
+/// ```rust
+/// use autumn_web::metrics;
+///
+/// metrics::describe_histogram("upload_duration_seconds", "How long an upload took");
+/// metrics::set_histogram_buckets("upload_duration_seconds", &[0.1, 1.0, 10.0, 60.0]);
+///
+/// // The first use registers the histogram with both settings applied.
+/// metrics::timer("upload_duration_seconds").record(std::time::Duration::from_secs(2));
+/// ```
+///
+/// `upper_bounds` must hold 1..=[`MAX_BUCKET_BOUNDS`] finite, strictly
+/// ascending, positive values; anything else is ignored with a warning and the
+/// defaults are kept.
 pub fn set_histogram_buckets(name: &str, upper_bounds: &[f64]) {
     if let Some(reason) = registration_rejection(name) {
         REGISTRY.warn_once(name, reason);
@@ -775,43 +1105,47 @@ pub fn set_histogram_buckets(name: &str, upper_bounds: &[f64]) {
     }
     if !are_valid_bounds(upper_bounds) {
         tracing::warn!(
-            metric = %name,
+            metric = %sanitize_for_log(name),
             bounds = ?upper_bounds,
-            "histogram bucket bounds must be 1..=20 finite, positive, strictly ascending values; \
+            max = MAX_BUCKET_BOUNDS,
+            "histogram bucket bounds must be finite, positive, strictly ascending values; \
              keeping the defaults"
         );
         return;
     }
 
-    let already_registered = {
+    let outcome = {
+        // Lock order: `pending_buckets` nested under `instruments`. Holding the
+        // read lock across the check *and* the insert is what stops a
+        // concurrent first use from registering the histogram with the default
+        // bounds in between, which would drop this override on the floor.
         let registered = REGISTRY
             .instruments
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        registered.contains_key(name)
-    };
-    if already_registered {
-        tracing::warn!(
-            metric = %name,
-            "histogram bucket bounds are frozen once the histogram is first used; ignoring"
-        );
-        return;
-    }
-
-    let full = {
-        let mut pending = REGISTRY
-            .pending_buckets
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        if pending.len() >= MAX_INSTRUMENTS && !pending.contains_key(name) {
-            true
+        if registered.contains_key(name) {
+            BucketOverride::AlreadyRegistered
         } else {
-            pending.insert(name.into(), upper_bounds.into());
-            false
+            let mut pending = REGISTRY
+                .pending_buckets
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            if pending.len() >= MAX_INSTRUMENTS && !pending.contains_key(name) {
+                BucketOverride::Full
+            } else {
+                pending.insert(name.into(), upper_bounds.into());
+                BucketOverride::Stored
+            }
         }
     };
-    if full {
-        REGISTRY.warn_over_capacity(name);
+
+    match outcome {
+        BucketOverride::Stored => {}
+        BucketOverride::AlreadyRegistered => tracing::warn!(
+            metric = %sanitize_for_log(name),
+            "histogram bucket bounds are frozen once the histogram is registered; ignoring"
+        ),
+        BucketOverride::Full => REGISTRY.warn_pending_buckets_full(name),
     }
 }
 
@@ -822,6 +1156,66 @@ fn are_valid_bounds(bounds: &[f64]) -> bool {
         && bounds.iter().all(|b| b.is_finite() && *b > 0.0)
         && bounds.windows(2).all(|w| w[0] < w[1])
 }
+
+// ── Accepted numeric values ────────────────────────────────────
+
+/// Implementation detail of the [`IntoMetricValue`] seal.
+mod sealed {
+    /// Keeps [`super::IntoMetricValue`] closed to downstream implementations.
+    pub trait Sealed {}
+}
+
+/// A number a gauge or histogram will accept.
+///
+/// Covers every primitive that converts into `f64` losslessly, plus the three
+/// integer types call sites actually reach for — `usize`, `u64` and `i64`,
+/// almost always from a `len()` or a count — which
+/// [`impl Into<f64>`](Into) refuses. `gauge("queue_depth").set(queue.len())`
+/// compiles because of this trait.
+///
+/// Those three are **lossy above 2<sup>53</sup>**: the value is rounded to the
+/// nearest representable `f64`, the same way Prometheus itself would store it
+/// (its wire format is `f64` throughout), so nothing is lost that a scrape
+/// could have carried anyway.
+///
+/// Sealed: only this crate implements it.
+pub trait IntoMetricValue: sealed::Sealed {
+    /// Convert into the `f64` the facade stores.
+    #[must_use]
+    fn into_metric_value(self) -> f64;
+}
+
+/// Implement [`IntoMetricValue`] for types with a lossless `f64` conversion.
+macro_rules! impl_lossless_metric_value {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl sealed::Sealed for $ty {}
+        impl IntoMetricValue for $ty {
+            fn into_metric_value(self) -> f64 {
+                f64::from(self)
+            }
+        }
+    )+};
+}
+
+/// Implement [`IntoMetricValue`] for integer types wider than `f64`'s exact
+/// range; see the trait docs for the precision this gives up.
+macro_rules! impl_wide_metric_value {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl sealed::Sealed for $ty {}
+        impl IntoMetricValue for $ty {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "documented on IntoMetricValue: exact to 2^53, rounded above it"
+            )]
+            fn into_metric_value(self) -> f64 {
+                self as f64
+            }
+        }
+    )+};
+}
+
+impl_lossless_metric_value!(f32, f64, i8, i16, i32, u8, u16, u32);
+impl_wide_metric_value!(i64, u64, isize, usize);
 
 // ── Counter ────────────────────────────────────────────────────
 
@@ -839,13 +1233,25 @@ impl Counter {
     /// Attach a label to the series this handle records into.
     ///
     /// Label keys are canonicalized (sorted, deduplicated first-wins); an
-    /// invalid or reserved key drops that label, never the sample.
+    /// invalid or reserved key drops that label, never the sample. Values are
+    /// stripped of control characters and truncated to
+    /// [`MAX_LABEL_VALUE_LEN`] characters here, so an over-long value is never
+    /// carried around whole.
+    ///
+    /// An inert handle (one whose name was rejected) skips the work entirely.
     pub fn with_label(mut self, key: &str, value: impl Into<String>) -> Self {
-        self.labels.push((key.to_owned(), value.into()));
+        if self.instrument.is_some() {
+            self.labels
+                .push((key.to_owned(), sanitize_owned_label_value(value.into())));
+        }
         self
     }
 
     /// Add `amount` to this counter's series.
+    ///
+    /// The total saturates at [`u64::MAX`] rather than wrapping: a wrapped
+    /// total is indistinguishable from a counter reset, which would give
+    /// `PromQL`'s `rate()` an enormous phantom spike.
     pub fn increment(&self, amount: u64) {
         if let Some(instrument) = self.instrument.as_ref() {
             instrument.record(&self.labels, |series| series.add(amount));
@@ -865,33 +1271,68 @@ pub struct Gauge {
 
 impl Gauge {
     /// Attach a label to the series this handle records into.
+    ///
+    /// Canonicalized exactly like [`Counter::with_label`].
     pub fn with_label(mut self, key: &str, value: impl Into<String>) -> Self {
-        self.labels.push((key.to_owned(), value.into()));
+        if self.instrument.is_some() {
+            self.labels
+                .push((key.to_owned(), sanitize_owned_label_value(value.into())));
+        }
         self
     }
 
     /// Set this gauge's series to `value`.
-    pub fn set(&self, value: impl Into<f64>) {
-        let value = value.into();
-        if let Some(instrument) = self.instrument.as_ref() {
-            instrument.record(&self.labels, |series| series.set(value));
+    ///
+    /// Accepts any [`IntoMetricValue`], so the `usize` a `len()` hands you
+    /// needs no cast:
+    ///
+    /// ```rust
+    /// use autumn_web::metrics;
+    ///
+    /// let queue: Vec<u8> = vec![1, 2, 3];
+    /// metrics::gauge("worker_queue_depth").set(queue.len());
+    /// ```
+    ///
+    /// Non-finite values (`NaN`, `±Inf`) are rejected with a warning and the
+    /// gauge keeps its previous reading: they have no meaning to render, and
+    /// JSON has no way to express them, so accepting one would make the
+    /// scrape and the `/actuator/metrics` view disagree.
+    pub fn set(&self, value: impl IntoMetricValue) {
+        let value = value.into_metric_value();
+        let Some(instrument) = self.instrument.as_ref() else {
+            return;
+        };
+        if !value.is_finite() {
+            instrument.warn_value(value, "a gauge value must be finite");
+            return;
         }
+        instrument.record(&self.labels, |series| series.set(value));
     }
 
     /// Add `delta` to this gauge's series.
-    pub fn increment(&self, delta: impl Into<f64>) {
-        let delta = delta.into();
-        if let Some(instrument) = self.instrument.as_ref() {
-            instrument.record(&self.labels, |series| series.adjust(delta));
-        }
+    ///
+    /// A non-finite `delta` is rejected, as in [`Gauge::set`].
+    pub fn increment(&self, delta: impl IntoMetricValue) {
+        self.adjust(delta.into_metric_value());
     }
 
     /// Subtract `delta` from this gauge's series.
-    pub fn decrement(&self, delta: impl Into<f64>) {
-        let delta = delta.into();
-        if let Some(instrument) = self.instrument.as_ref() {
-            instrument.record(&self.labels, |series| series.adjust(-delta));
+    ///
+    /// A non-finite `delta` is rejected, as in [`Gauge::set`].
+    pub fn decrement(&self, delta: impl IntoMetricValue) {
+        self.adjust(-delta.into_metric_value());
+    }
+
+    /// Shared body of [`Gauge::increment`] and [`Gauge::decrement`].
+    fn adjust(&self, delta: f64) {
+        let Some(instrument) = self.instrument.as_ref() else {
+            return;
+        };
+        if !delta.is_finite() {
+            instrument.warn_value(delta, "a gauge delta must be finite");
+            return;
         }
+        instrument.record(&self.labels, |series| series.adjust(delta));
     }
 }
 
@@ -907,22 +1348,33 @@ pub struct Histogram {
 
 impl Histogram {
     /// Attach a label to the series this handle records into.
+    ///
+    /// Canonicalized exactly like [`Counter::with_label`].
     pub fn with_label(mut self, key: &str, value: impl Into<String>) -> Self {
-        self.labels.push((key.to_owned(), value.into()));
+        if self.instrument.is_some() {
+            self.labels
+                .push((key.to_owned(), sanitize_owned_label_value(value.into())));
+        }
         self
     }
 
     /// Record one observation.
     ///
+    /// Accepts any [`IntoMetricValue`], so `record(body.len())` compiles.
     /// Non-finite and negative values are rejected with a warning so `_sum`
-    /// can never become `NaN` and buckets stay meaningful.
-    pub fn record(&self, value: impl Into<f64>) {
-        let value = value.into();
+    /// can never become `NaN` and buckets stay meaningful. `_sum` is still an
+    /// `f64` accumulator: enough enormous observations will saturate it to
+    /// `+Inf`, permanently, since a histogram is never reset.
+    pub fn record(&self, value: impl IntoMetricValue) {
+        let value = value.into_metric_value();
         let Some(instrument) = self.instrument.as_ref() else {
             return;
         };
         if !value.is_finite() || value < 0.0 {
-            instrument.warn_value(value);
+            instrument.warn_value(
+                value,
+                "a histogram observation must be finite and non-negative",
+            );
             return;
         }
         instrument.record(&self.labels, |series| {
@@ -1009,9 +1461,12 @@ impl TimerGuard {
 
 impl Drop for TimerGuard {
     fn drop(&mut self) {
-        // `Instant::elapsed` is monotonic and saturating, and every step below
-        // is allocation-light and panic-free, so a guard dropped while
-        // unwinding cannot turn a panic into an abort.
+        // `Instant::elapsed` is monotonic and saturating, and nothing below
+        // unwraps, indexes or divides. It is not *provably* panic-free: a
+        // labelled guard canonicalizes its labels, which allocates, and a
+        // rejected value calls into the `tracing` subscriber — either can
+        // panic in principle. Neither is on the path a guard normally takes,
+        // which records a finite duration into an already-registered series.
         if let Some(timer) = self.timer.take() {
             timer.record(self.started.elapsed());
         }
@@ -1041,6 +1496,7 @@ pub fn snapshot() -> Vec<InstrumentSnapshot> {
 /// Which kind of instrument a snapshot describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum InstrumentKind {
     /// A monotonically increasing counter.
     Counter,
@@ -1052,6 +1508,7 @@ pub enum InstrumentKind {
 
 /// One instrument's data at snapshot time.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct InstrumentSnapshot {
     /// The instrument's metric name.
     pub name: String,
@@ -1061,15 +1518,21 @@ pub struct InstrumentSnapshot {
     pub kind: InstrumentKind,
     /// Every retained series, sorted by canonical label key.
     pub series: Vec<SeriesSnapshot>,
-    /// How many distinct label sets were dropped by the cardinality cap.
+    /// How many **samples** this instrument dropped because they carried a
+    /// label set it had no room for.
+    ///
+    /// Counts samples, not distinct label sets: a hot call site hammering an
+    /// over-cap label set is exactly what an operator needs to see, and a
+    /// distinct-set count would need unbounded memory to compute.
     pub dropped_series: u64,
-    /// Histogram bucket upper bounds (empty for counters and gauges).
-    #[serde(skip)]
-    pub buckets: Vec<f64>,
 }
+// A histogram's bucket bounds are deliberately *not* a field here: they appear
+// in every histogram series already, as the `le` strings of
+// [`SeriesValue::Histogram`], in the exact form the scrape renders.
 
 /// One labeled series of an instrument.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SeriesSnapshot {
     /// Canonical (sorted, deduplicated) labels of this series.
     pub labels: BTreeMap<String, String>,
@@ -1080,6 +1543,7 @@ pub struct SeriesSnapshot {
 /// The value carried by a [`SeriesSnapshot`].
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum SeriesValue {
     /// A counter total.
     Counter {
@@ -1123,12 +1587,23 @@ pub fn reset_for_tests() {
         .unwrap_or_else(PoisonError::into_inner)
         .clear();
     REGISTRY
+        .pending_help
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    REGISTRY
         .warned_names
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .clear();
     REGISTRY
         .over_capacity_warned
+        .store(false, Ordering::Relaxed);
+    REGISTRY
+        .pending_buckets_full_warned
+        .store(false, Ordering::Relaxed);
+    REGISTRY
+        .pending_help_full_warned
         .store(false, Ordering::Relaxed);
 }
 
@@ -1146,6 +1621,13 @@ pub mod testing {
     /// instrument names; this makes exact-value assertions safe under
     /// concurrent test execution. `prefix` must itself be a valid Prometheus
     /// metric name fragment.
+    ///
+    /// Those names are never reclaimed, and they share the process-wide
+    /// [`MAX_INSTRUMENTS`](super::MAX_INSTRUMENTS) budget with every other
+    /// test in the same binary. A test that registers a *handful* of unique
+    /// names is fine; one that registers hundreds in a loop will exhaust the
+    /// registry for whatever runs after it. Cap the loop, or reuse one name
+    /// with different labels (which is capped separately, per instrument).
     #[must_use]
     pub fn unique_name(prefix: &str) -> String {
         format!("{prefix}_{}", SEQUENCE.fetch_add(1, Ordering::Relaxed))
@@ -1190,6 +1672,22 @@ mod tests {
             SeriesValue::Gauge { value } => value,
             ref other => panic!("expected a gauge value, got {other:?}"),
         }
+    }
+
+    /// The `le` strings of an instrument's buckets, `+Inf` excluded — the
+    /// observable form of its configured upper bounds.
+    fn bucket_bounds(instrument: &InstrumentSnapshot) -> Vec<String> {
+        let (_count, _sum, buckets) = histogram_parts(only_series(instrument));
+        buckets
+            .into_iter()
+            .map(|(le, _)| le)
+            .filter(|le| le != "+Inf")
+            .collect()
+    }
+
+    /// [`DEFAULT_BUCKETS`] as the `le` strings a scrape would show.
+    fn default_bucket_strings() -> Vec<String> {
+        DEFAULT_BUCKETS.iter().map(|b| format_bound(*b)).collect()
     }
 
     fn histogram_parts(series: &SeriesSnapshot) -> (u64, f64, Vec<(String, u64)>) {
@@ -1617,6 +2115,30 @@ mod tests {
     }
 
     #[test]
+    fn dropped_series_counts_samples_not_distinct_label_sets() {
+        // The counter and its `# HELP` line both promise *samples*: a hot call
+        // site hammering one over-cap label set is the signal an operator
+        // needs, and counting distinct sets would mean remembering exactly the
+        // label sets the cap exists to stop remembering.
+        let name = unique_name("facade_dropped_counts_samples");
+        for i in 0..MAX_SERIES_PER_METRIC {
+            counter(&name)
+                .with_label("shard", i.to_string())
+                .increment(1);
+        }
+        for _ in 0..3 {
+            counter(&name).with_label("shard", "over-cap").increment(1);
+        }
+
+        let instrument = expect_instrument(&name);
+        assert_eq!(instrument.series.len(), MAX_SERIES_PER_METRIC);
+        assert_eq!(
+            instrument.dropped_series, 3,
+            "three samples for one over-cap label set must count as three"
+        );
+    }
+
+    #[test]
     fn label_count_beyond_the_cap_is_dropped_not_the_sample() {
         let name = unique_name("facade_label_cap");
         let mut handle = counter(&name);
@@ -1629,6 +2151,43 @@ mod tests {
         let series = only_series(&instrument);
         assert_eq!(counter_value(series), 1, "the sample is still recorded");
         assert_eq!(series.labels.len(), MAX_LABELS_PER_SERIES);
+    }
+
+    #[test]
+    fn label_subset_beyond_the_cap_does_not_depend_on_call_order() {
+        // Which labels survive the cap must be a function of the label *set*,
+        // never of the order `with_label` happened to be called in — otherwise
+        // the same ten labels applied two ways land in two distinct series.
+        let name = unique_name("facade_label_cap_order");
+        let keys: Vec<String> = (0..10).map(|i| format!("k{i}")).collect();
+
+        let mut ascending = counter(&name);
+        for key in &keys {
+            ascending = ascending.with_label(key, "v");
+        }
+        ascending.increment(1);
+
+        let mut descending = counter(&name);
+        for key in keys.iter().rev() {
+            descending = descending.with_label(key, "v");
+        }
+        descending.increment(1);
+
+        let instrument = expect_instrument(&name);
+        assert_eq!(
+            instrument.series.len(),
+            1,
+            "label order must not split the sample across two series: {:?}",
+            instrument.series
+        );
+        let series = only_series(&instrument);
+        assert_eq!(counter_value(series), 2);
+        let kept: Vec<&str> = series.labels.keys().map(String::as_str).collect();
+        assert_eq!(
+            kept,
+            vec!["k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7"],
+            "the retained subset is the lexicographically smallest {MAX_LABELS_PER_SERIES}"
+        );
     }
 
     // ── Name validation and kind conflicts ─────────────────────
@@ -1737,7 +2296,7 @@ mod tests {
         histogram(&name).record(2.5);
 
         let instrument = expect_instrument(&name);
-        assert_eq!(instrument.buckets, vec![1.0, 2.0, 3.0]);
+        assert_eq!(bucket_bounds(&instrument), vec!["1", "2", "3"]);
         let (_count, _sum, buckets) = histogram_parts(only_series(&instrument));
         assert_eq!(
             buckets,
@@ -1751,15 +2310,14 @@ mod tests {
     }
 
     #[test]
-    fn set_histogram_buckets_after_the_first_record_is_ignored() {
+    fn set_histogram_buckets_after_registration_is_ignored() {
         let name = unique_name("facade_buckets_after");
         histogram(&name).record(0.03);
         set_histogram_buckets(&name, &[1.0, 2.0, 3.0]);
 
-        let instrument = expect_instrument(&name);
         assert_eq!(
-            instrument.buckets,
-            DEFAULT_BUCKETS.to_vec(),
+            bucket_bounds(&expect_instrument(&name)),
+            default_bucket_strings(),
             "bucket boundaries must not move once a scrape target has seen them"
         );
     }
@@ -1780,13 +2338,100 @@ mod tests {
             set_histogram_buckets(&name, &bounds);
             histogram(&name).record(1.0);
 
-            let instrument = expect_instrument(&name);
             assert_eq!(
-                instrument.buckets,
-                DEFAULT_BUCKETS.to_vec(),
+                bucket_bounds(&expect_instrument(&name)),
+                default_bucket_strings(),
                 "invalid bounds {bounds:?} must be ignored in favour of the defaults"
             );
         }
+    }
+
+    #[test]
+    fn describe_histogram_then_set_histogram_buckets_keeps_both() {
+        // The trap this ordering used to spring: `describe_*` registered the
+        // instrument, freezing its bounds, so the custom buckets vanished with
+        // no diagnostic at all.
+        let name = unique_name("facade_describe_then_buckets");
+        describe_histogram(&name, "how long a thing took");
+        set_histogram_buckets(&name, &[1.0, 2.0, 3.0]);
+        histogram(&name).record(2.5);
+
+        let instrument = expect_instrument(&name);
+        assert_eq!(instrument.help, "how long a thing took");
+        assert_eq!(
+            bucket_bounds(&instrument),
+            vec!["1", "2", "3"],
+            "the custom bounds must survive an earlier describe_histogram"
+        );
+    }
+
+    #[test]
+    fn set_histogram_buckets_then_describe_histogram_keeps_both() {
+        let name = unique_name("facade_buckets_then_describe");
+        set_histogram_buckets(&name, &[1.0, 2.0, 3.0]);
+        describe_histogram(&name, "how long a thing took");
+        histogram(&name).record(2.5);
+
+        let instrument = expect_instrument(&name);
+        assert_eq!(instrument.help, "how long a thing took");
+        assert_eq!(bucket_bounds(&instrument), vec!["1", "2", "3"]);
+    }
+
+    // ── Describing ─────────────────────────────────────────────
+
+    #[test]
+    fn describe_alone_does_not_register_the_instrument() {
+        let name = unique_name("facade_describe_only");
+        describe_counter(&name, "never actually used");
+
+        assert!(
+            find(&name).is_none(),
+            "describing a metric must not register it — a described-but-unused \
+             metric stays out of the scrape entirely"
+        );
+    }
+
+    #[test]
+    fn describe_after_registration_still_applies() {
+        let name = unique_name("facade_describe_after");
+        counter(&name).increment(1);
+        describe_counter(&name, "described late");
+
+        assert_eq!(expect_instrument(&name).help, "described late");
+    }
+
+    #[test]
+    fn describing_as_the_wrong_kind_does_not_apply_the_help() {
+        let name = unique_name("facade_describe_wrong_kind");
+        describe_gauge(&name, "described as a gauge");
+        counter(&name).increment(1);
+
+        let instrument = expect_instrument(&name);
+        assert_eq!(instrument.kind, InstrumentKind::Counter);
+        assert_eq!(
+            instrument.help, "",
+            "a description written for another kind must not be applied"
+        );
+    }
+
+    #[test]
+    fn help_text_is_stripped_of_control_characters_and_truncated() {
+        let name = unique_name("facade_help_sanitized");
+        let help = format!("first\nsecond\x1b[31m{}", "x".repeat(MAX_HELP_LEN));
+        describe_counter(&name, help);
+        counter(&name).increment(1);
+
+        let help = expect_instrument(&name).help;
+        assert!(
+            !help.contains('\n') && !help.contains('\x1b'),
+            "control characters must not survive into a HELP line: {help:?}"
+        );
+        assert_eq!(
+            help.chars().count(),
+            MAX_HELP_LEN,
+            "help must be truncated to the cap"
+        );
+        assert!(help.starts_with("firstsecond[31m"));
     }
 
     // ── Snapshot shape ─────────────────────────────────────────
@@ -1828,6 +2473,186 @@ mod tests {
             .map(|s| s.labels.get("shard").map_or("", String::as_str))
             .collect();
         assert_eq!(shards, vec!["a", "b", "c"]);
+    }
+
+    // ── Length caps and sanitization ───────────────────────────
+
+    #[test]
+    fn over_long_metric_names_are_rejected_not_truncated() {
+        let stem = unique_name("facade_long_name");
+        let name = format!("{stem}_{}", "x".repeat(MAX_METRIC_NAME_LEN));
+        assert!(name.len() > MAX_METRIC_NAME_LEN);
+
+        counter(&name).increment(1);
+        assert!(find(&name).is_none(), "an over-long name must be rejected");
+        assert!(
+            snapshot().iter().all(|i| !i.name.starts_with(&stem)),
+            "a rejected name must not be truncated into a registration either"
+        );
+    }
+
+    #[test]
+    fn metric_names_at_the_cap_are_accepted() {
+        let stem = unique_name("facade_cap_name");
+        let name = format!("{stem}{}", "x".repeat(MAX_METRIC_NAME_LEN - stem.len()));
+        assert_eq!(name.len(), MAX_METRIC_NAME_LEN);
+
+        counter(&name).increment(1);
+        assert_eq!(counter_value(only_series(&expect_instrument(&name))), 1);
+    }
+
+    #[test]
+    fn over_long_label_names_are_dropped_not_the_sample() {
+        let name = unique_name("facade_long_label_name");
+        let long_key = "k".repeat(MAX_LABEL_NAME_LEN + 1);
+        counter(&name)
+            .with_label(&long_key, "x")
+            .with_label("status", "paid")
+            .increment(1);
+
+        let instrument = expect_instrument(&name);
+        let series = only_series(&instrument);
+        assert_eq!(
+            counter_value(series),
+            1,
+            "the sample must still be recorded"
+        );
+        assert_eq!(
+            series.labels.len(),
+            1,
+            "only `status` survives: {:?}",
+            series.labels
+        );
+    }
+
+    #[test]
+    fn control_characters_are_stripped_from_label_values() {
+        let name = unique_name("facade_label_control_chars");
+        counter(&name)
+            .with_label("status", "pa\rid\x1b[31m\nnext")
+            .increment(1);
+
+        let instrument = expect_instrument(&name);
+        let value = only_series(&instrument)
+            .labels
+            .get("status")
+            .expect("the label survives")
+            .clone();
+        assert_eq!(
+            value, "paid[31mnext",
+            "C0 control characters must not reach the exposition format"
+        );
+    }
+
+    #[test]
+    fn sanitize_for_log_escapes_and_truncates() {
+        let injected = sanitize_for_log("evil\nWARN forged log line");
+        assert!(
+            !injected.contains('\n'),
+            "a rejected name must not be able to forge a log line: {injected}"
+        );
+        assert_eq!(injected, "evil\\nWARN forged log line");
+
+        let long = sanitize_for_log(&"x".repeat(LOG_NAME_PREVIEW_LEN * 4));
+        assert_eq!(long.chars().count(), LOG_NAME_PREVIEW_LEN + 1);
+        assert!(long.ends_with('…'));
+    }
+
+    // ── Value validation and numeric ergonomics ────────────────
+
+    #[test]
+    fn gauge_rejects_non_finite_values() {
+        let name = unique_name("facade_gauge_non_finite");
+        let handle = gauge(&name);
+        handle.set(7.0);
+        handle.set(f64::NAN);
+        handle.set(f64::INFINITY);
+        handle.set(f64::NEG_INFINITY);
+        handle.increment(f64::NAN);
+        handle.decrement(f64::INFINITY);
+
+        let instrument = expect_instrument(&name);
+        let value = gauge_value(only_series(&instrument));
+        assert!(
+            (value - 7.0).abs() < f64::EPSILON,
+            "a rejected value must leave the gauge untouched, got {value}"
+        );
+        // The JSON view maps non-finite floats to `null`, so a gauge that
+        // accepted one would disagree with its own prometheus rendering.
+        let json = serde_json::to_value(&instrument).unwrap();
+        assert_eq!(json["series"][0]["value"]["value"].as_f64(), Some(7.0));
+    }
+
+    #[test]
+    fn gauge_and_histogram_accept_integer_types() {
+        let queue: Vec<u8> = vec![1, 2, 3];
+        let gauge_name = unique_name("facade_integer_gauge");
+        gauge(&gauge_name).set(queue.len()); // usize
+        gauge(&gauge_name).increment(2_u64);
+        gauge(&gauge_name).decrement(1_i64);
+
+        let value = gauge_value(only_series(&expect_instrument(&gauge_name)));
+        assert!((value - 4.0).abs() < f64::EPSILON, "got {value}");
+
+        let hist_name = unique_name("facade_integer_histogram");
+        histogram(&hist_name).record(2_048_usize);
+        let (count, sum, _buckets) = histogram_parts(only_series(&expect_instrument(&hist_name)));
+        assert_eq!(count, 1);
+        assert!((sum - 2048.0).abs() < f64::EPSILON, "got {sum}");
+    }
+
+    #[test]
+    fn counter_saturates_instead_of_wrapping() {
+        let name = unique_name("facade_counter_saturates");
+        let handle = counter(&name);
+        handle.increment(u64::MAX);
+        handle.increment(3);
+
+        assert_eq!(
+            counter_value(only_series(&expect_instrument(&name))),
+            u64::MAX,
+            "a wrapped counter would look like a reset and blow up rate()"
+        );
+    }
+
+    // ── Bucket bound formatting ────────────────────────────────
+
+    #[test]
+    fn format_bound_matches_go_g_formatting() {
+        // client_golang renders `le` with Go's %g: exponential outside
+        // [1e-4, 1e21), exponent signed and padded to two digits.
+        assert_eq!(format_bound(0.000_05), "5e-05");
+        assert_eq!(format_bound(0.000_025), "2.5e-05");
+        assert_eq!(format_bound(1e21), "1e+21");
+        assert_eq!(format_bound(1.5e22), "1.5e+22");
+        assert_eq!(format_bound(1e-7), "1e-07");
+        assert_eq!(format_bound(1e-100), "1e-100");
+        // Just inside the window: plain decimal, no exponent.
+        assert_eq!(format_bound(0.000_1), "0.0001");
+        assert_eq!(format_bound(1e20), "100000000000000000000");
+    }
+
+    #[test]
+    fn default_bucket_strings_are_unchanged() {
+        assert_eq!(
+            default_bucket_strings(),
+            vec![
+                "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10"
+            ],
+            "the default `le` strings are a scrape-visible contract"
+        );
+    }
+
+    #[test]
+    fn tiny_and_huge_bounds_render_in_exponential_form() {
+        let name = unique_name("facade_exponential_bounds");
+        set_histogram_buckets(&name, &[0.000_025, 0.000_05, 1e21]);
+        histogram(&name).record(1.0);
+
+        assert_eq!(
+            bucket_bounds(&expect_instrument(&name)),
+            vec!["2.5e-05", "5e-05", "1e+21"]
+        );
     }
 
     #[test]
