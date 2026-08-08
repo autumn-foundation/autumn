@@ -15004,4 +15004,323 @@ exempt_paths = [
             "a preexisting, user-owned exemption must not be claimed via a revert"
         );
     }
+
+    // ── bulk-select + delete-selected (issue #1312) ────────────────────────
+
+    /// The default `Post` field set used by the bulk-delete tests.
+    fn bulk_fields() -> Vec<String> {
+        vec![
+            "title:String".to_owned(),
+            "body:Text".to_owned(),
+            "published:bool".to_owned(),
+        ]
+    }
+
+    /// Plan a `Post` scaffold with `options` and return its routes file source.
+    fn bulk_routes(options: &ScaffoldOptions) -> String {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &bulk_fields(),
+            "20260427000000",
+            options,
+        )
+        .unwrap();
+        action_contents(&plan, "src/routes/posts.rs")
+    }
+
+    /// The default (non-live, non-sharded) `Post` scaffold's routes source.
+    fn bulk_routes_default() -> String {
+        bulk_routes(&ScaffoldOptions::default())
+    }
+
+    /// Slice out the body of a named `pub async fn` handler in a routes file:
+    /// everything from its signature up to the next top-level `pub async fn`.
+    fn handler_slice<'a>(routes: &'a str, name: &str) -> &'a str {
+        let needle = format!("pub async fn {name}(");
+        let start = routes.find(&needle).unwrap_or_else(|| {
+            panic!("routes file must emit `{needle}`:\n{routes}");
+        });
+        let rest = &routes[start + needle.len()..];
+        rest.split("pub async fn ").next().unwrap_or(rest)
+    }
+
+    #[test]
+    fn index_wraps_list_in_bulk_delete_form() {
+        let routes = bulk_routes_default();
+        assert!(routes.contains("bulk_actions_form("), "{routes}");
+        assert!(routes.contains("paths::bulk_delete()"), "{routes}");
+        let index = handler_slice(&routes, "index");
+        let form_at = index
+            .find("bulk_actions_form(")
+            .unwrap_or_else(|| panic!("index must wrap its list in the bulk form:\n{index}"));
+        let table_at = index
+            .find("data_table(")
+            .unwrap_or_else(|| panic!("index must still render the data_table:\n{index}"));
+        assert!(
+            form_at < table_at,
+            "the bulk form must wrap the data_table, not follow it:\n{index}"
+        );
+    }
+
+    #[test]
+    fn index_prepends_bulk_select_checkbox_column() {
+        let routes = bulk_routes_default();
+        let index = handler_slice(&routes, "index");
+        assert!(index.contains("columns.insert(0,"), "{index}");
+        assert!(index.contains("bulk_select_checkbox("), "{index}");
+    }
+
+    #[test]
+    fn index_handler_takes_csrf_for_bulk_form() {
+        let routes = bulk_routes_default();
+        let index = handler_slice(&routes, "index");
+        assert!(index.contains("csrf: Option<CsrfToken>"), "{index}");
+        assert!(
+            index.contains("csrf_field: Option<CsrfFormField>"),
+            "{index}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_handler_is_secured_and_routed() {
+        let routes = bulk_routes_default();
+        assert!(
+            routes.contains("#[secured]\n#[post(\"/posts/bulk_delete\")]"),
+            "the bulk delete route must be #[secured]: {routes}"
+        );
+        assert!(routes.contains("pub async fn bulk_delete("), "{routes}");
+    }
+
+    #[test]
+    fn bulk_delete_body_extractor_is_last() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        // Parameter list: everything up to the closing `)` of the signature.
+        let Some((params, _)) = bulk.split_once("\n)") else {
+            panic!("bulk_delete must have a parameter list:\n{bulk}");
+        };
+        assert!(params.contains("flash: Flash,"), "{params}");
+        let last = params
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .unwrap_or_else(|| panic!("bulk_delete must take parameters:\n{params}"));
+        // axum requires the body-consuming extractor to be the final argument.
+        assert!(
+            last.starts_with("body:") && last.contains("Bytes"),
+            "the Bytes body extractor must be the last parameter, got `{last}`:\n{params}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_calls_delete_many() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(bulk.contains(".delete_many(&"), "{bulk}");
+        assert!(
+            !bulk.contains("diesel::delete"),
+            "bulk delete must route through the repository, not a raw diesel::delete: {bulk}"
+        );
+        assert!(
+            !bulk.contains("deleted_at.eq("),
+            "bulk delete must not hand-roll the soft-delete update: {bulk}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_never_returns_bad_request() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(
+            !bulk.contains("bad_request"),
+            "an empty or malformed selection must never 400: {bulk}"
+        );
+        assert!(
+            !bulk.contains("StatusCode::BAD_REQUEST"),
+            "an empty or malformed selection must never 400: {bulk}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_empty_selection_redirects_without_deleting() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(bulk.contains("is_empty()"), "{bulk}");
+        let redirect_at = bulk
+            .find("Redirect::to(&paths::index())")
+            .unwrap_or_else(|| panic!("empty selection must redirect to the index:\n{bulk}"));
+        let delete_at = bulk
+            .find(".delete_many(&")
+            .unwrap_or_else(|| panic!("bulk delete must call delete_many:\n{bulk}"));
+        assert!(
+            redirect_at < delete_at,
+            "the empty-selection early return must precede the delete:\n{bulk}"
+        );
+    }
+
+    #[test]
+    fn bulk_ids_parser_accepts_bracket_form() {
+        let routes = bulk_routes_default();
+        assert!(routes.contains("fn parse_bulk_ids("), "{routes}");
+        let Some((_, rest)) = routes.split_once("fn parse_bulk_ids(") else {
+            panic!("routes must emit a parse_bulk_ids helper:\n{routes}");
+        };
+        let parser = rest.split("\npub ").next().unwrap_or(rest);
+        assert!(parser.contains("url::form_urlencoded::parse"), "{parser}");
+        assert!(parser.contains("\"ids\""), "{parser}");
+        assert!(parser.contains("\"ids[]\""), "{parser}");
+        assert!(
+            parser.contains(".contains(&"),
+            "the parser must dedupe selected ids: {parser}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_authorizes_each_selected_row() {
+        // An owner column (`user_id`) turns on the policy/authorize wiring.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "user_id:i64".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(
+            bulk.contains("for "),
+            "authorization must run per row: {bulk}"
+        );
+        assert!(bulk.contains("authorize::<Post>("), "{bulk}");
+        assert!(bulk.contains("\"delete\""), "{bulk}");
+    }
+
+    #[test]
+    fn bulk_delete_soft_delete_filters_already_deleted() {
+        let routes = bulk_routes(&ScaffoldOptions {
+            model: ModelOptions {
+                soft_delete: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(
+            bulk.contains("deleted_at.is_null()"),
+            "the soft-delete SELECT must skip already-deleted rows: {bulk}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_omitted_for_live_variant() {
+        let routes = bulk_routes(&ScaffoldOptions {
+            live: true,
+            ..Default::default()
+        });
+        assert!(!routes.contains("bulk_delete"), "{routes}");
+        assert!(!routes.contains("bulk_actions_form"), "{routes}");
+    }
+
+    #[test]
+    fn bulk_delete_omitted_for_live_validation_variant() {
+        let routes = bulk_routes(&ScaffoldOptions {
+            live_validation: true,
+            ..Default::default()
+        });
+        assert!(!routes.contains("bulk_delete"), "{routes}");
+        assert!(!routes.contains("bulk_actions_form"), "{routes}");
+    }
+
+    #[test]
+    fn bulk_delete_omitted_for_sharded_variant() {
+        let routes = bulk_routes(&ScaffoldOptions {
+            model: ModelOptions {
+                sharded: true,
+                shard_key: Some("title".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert!(!routes.contains("bulk_delete"), "{routes}");
+        assert!(!routes.contains("bulk_actions_form"), "{routes}");
+    }
+
+    #[test]
+    fn paths_macro_includes_bulk_delete() {
+        let routes = bulk_routes_default();
+        let Some((paths_block, _)) = routes
+            .split_once("autumn_web::paths![")
+            .and_then(|(_, rest)| rest.split_once("];"))
+        else {
+            panic!("routes must emit an autumn_web::paths! block:\n{routes}");
+        };
+        assert!(
+            paths_block.contains("bulk_delete"),
+            "paths! must export bulk_delete so paths::bulk_delete() resolves: {paths_block}"
+        );
+    }
+
+    #[test]
+    fn main_rs_registers_bulk_delete_after_destroy() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &bulk_fields(), "20260427000000").unwrap();
+        let main = action_contents(&plan, "src/main.rs");
+        assert!(main.contains("routes::posts::bulk_delete"), "{main}");
+        let destroy_at = main
+            .find("routes::posts::destroy")
+            .unwrap_or_else(|| panic!("main.rs must mount destroy:\n{main}"));
+        let bulk_at = main
+            .find("routes::posts::bulk_delete")
+            .unwrap_or_else(|| panic!("main.rs must mount bulk_delete:\n{main}"));
+        assert!(
+            destroy_at < bulk_at,
+            "bulk_delete must be registered immediately after destroy:\n{main}"
+        );
+    }
+
+    #[test]
+    fn write_path_test_covers_bulk_delete() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &bulk_fields(), "20260427000000").unwrap();
+        let test_file = action_contents(&plan, "tests/post.rs");
+        assert!(test_file.contains("/posts/bulk_delete"), "{test_file}");
+        assert!(test_file.contains("ids=1&ids=2"), "{test_file}");
+        assert!(
+            test_file.contains("0 row(s)"),
+            "the bulk delete must be observed to remove both rows: {test_file}"
+        );
+        // The empty-selection case is a 303 no-op, not a 400.
+        let Some((_, bulk_section)) = test_file.split_once("/posts/bulk_delete") else {
+            panic!("write-path test must exercise bulk_delete:\n{test_file}");
+        };
+        assert!(
+            bulk_section.contains(".form(\"\")") || bulk_section.contains("ids="),
+            "an empty-ids POST must be exercised: {bulk_section}"
+        );
+        assert!(
+            bulk_section.contains("assert_status(303)"),
+            "the empty-ids POST must still redirect with 303: {bulk_section}"
+        );
+        assert!(
+            !bulk_section.contains("assert_status(400)"),
+            "an empty selection must never 400: {bulk_section}"
+        );
+    }
+
+    #[test]
+    fn live_scaffold_output_contains_no_bulk_artifacts() {
+        let routes = bulk_routes(&ScaffoldOptions {
+            live: true,
+            ..Default::default()
+        });
+        for needle in ["bulk", "bulk_actions", "ids[]"] {
+            assert!(
+                !routes.contains(needle),
+                "the --live scaffold must carry no `{needle}` artifact: {routes}"
+            );
+        }
+    }
 }

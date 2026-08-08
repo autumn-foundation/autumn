@@ -816,6 +816,9 @@ fn generate_scaffold_full_e2e_post() {
         "routes::posts::create",
         "routes::posts::edit_form",
         "routes::posts::update",
+        // Issue #1312: the bulk delete-selected route is mounted alongside the
+        // per-row destroy for every non-live, non-sharded HTML scaffold.
+        "routes::posts::bulk_delete",
         "repositories::post::post_api_list",
         "repositories::post::post_api_get",
     ] {

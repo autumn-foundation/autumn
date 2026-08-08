@@ -1127,6 +1127,106 @@ pub fn data_table<T>(
     }
 }
 
+// ── bulk actions (#1312) ──────────────────────────────────────────────────
+
+/// Configuration for the bulk-select / bulk-actions widgets.
+///
+/// Build with [`BulkActionsConfig::new`] (the form `action` URL) and chain the
+/// builder methods for optional overrides.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct BulkActionsConfig<'a> {
+    /// Form `action` URL the bulk submit posts to (e.g. `/posts/bulk_delete`).
+    pub action: &'a str,
+    /// Name of the per-row checkbox field (default `"ids"`).
+    pub field_name: &'a str,
+    /// Label on the bulk submit button (default `"Delete selected"`).
+    pub submit_label: &'a str,
+    /// Prefix of each checkbox's `aria-label` (default `"Select row"`).
+    pub select_label: &'a str,
+    /// Optional confirmation prompt. `None` (the default) emits no `onclick`,
+    /// so the control keeps working with JavaScript disabled.
+    pub confirm: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> BulkActionsConfig<'a> {
+    /// Create a new config posting to `action`, with sensible defaults.
+    #[must_use]
+    pub const fn new(action: &'a str) -> Self {
+        Self {
+            action,
+            field_name: "ids",
+            submit_label: "Delete selected",
+            select_label: "Select row",
+            confirm: None,
+        }
+    }
+
+    /// Override the per-row checkbox field name (default `"ids"`).
+    #[must_use]
+    pub const fn field_name(mut self, field_name: &'a str) -> Self {
+        self.field_name = field_name;
+        self
+    }
+
+    /// Override the bulk submit button label (default `"Delete selected"`).
+    #[must_use]
+    pub const fn submit_label(mut self, submit_label: &'a str) -> Self {
+        self.submit_label = submit_label;
+        self
+    }
+
+    /// Override the checkbox `aria-label` prefix (default `"Select row"`).
+    #[must_use]
+    pub const fn select_label(mut self, select_label: &'a str) -> Self {
+        self.select_label = select_label;
+        self
+    }
+
+    /// Opt into a JavaScript confirmation prompt on the submit button.
+    #[must_use]
+    pub const fn confirm(mut self, confirm: &'a str) -> Self {
+        self.confirm = Some(confirm);
+        self
+    }
+}
+
+/// Render one row's bulk-select checkbox.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn bulk_select_checkbox(
+    value: impl std::fmt::Display,
+    config: &BulkActionsConfig<'_>,
+) -> maud::Markup {
+    // TODO(#1312): green phase
+    let _ = (value.to_string(), config);
+    maud::html! {}
+}
+
+/// Render the bulk-actions toolbar (the submit button).
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
+    // TODO(#1312): green phase
+    let _ = config;
+    maud::html! {}
+}
+
+/// Wrap `content` in the bulk-actions `<form>`, with a csrf field and toolbar.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn bulk_actions_form(
+    config: &BulkActionsConfig<'_>,
+    csrf_token: Option<&str>,
+    csrf_field: Option<&str>,
+    content: maud::Markup,
+) -> maud::Markup {
+    // TODO(#1312): green phase
+    let _ = (config, csrf_token, csrf_field, content);
+    maud::html! {}
+}
+
 // ── breadcrumb ────────────────────────────────────────────────────────────
 
 /// A single crumb in a [`breadcrumb`] navigation trail.
@@ -6223,6 +6323,123 @@ mod tests {
         assert!(html.contains("q=foo"), "{html}");
         // no duplicate old sort
         assert!(!html.contains("sort=old"), "{html}");
+    }
+
+    // ── bulk actions (#1312) ───────────────────────────────────────────
+
+    #[test]
+    fn bulk_actions_config_defaults() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        assert_eq!(cfg.action, "/posts/bulk_delete");
+        assert_eq!(cfg.field_name, "ids");
+        assert_eq!(cfg.submit_label, "Delete selected");
+        assert_eq!(cfg.select_label, "Select row");
+        assert!(cfg.confirm.is_none());
+    }
+
+    #[test]
+    fn bulk_actions_config_builders() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete")
+            .field_name("post_ids")
+            .submit_label("Archive selected")
+            .select_label("Select post")
+            .confirm("Archive these posts?");
+        assert_eq!(cfg.action, "/posts/bulk_delete");
+        assert_eq!(cfg.field_name, "post_ids");
+        assert_eq!(cfg.submit_label, "Archive selected");
+        assert_eq!(cfg.select_label, "Select post");
+        assert_eq!(cfg.confirm, Some("Archive these posts?"));
+    }
+
+    #[test]
+    fn bulk_select_checkbox_emits_name_value_and_aria_label() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_select_checkbox(42, &cfg).into_string();
+        assert!(html.contains(r#"type="checkbox""#), "{html}");
+        assert!(html.contains(r#"name="ids""#), "{html}");
+        assert!(html.contains(r#"value="42""#), "{html}");
+        assert!(html.contains("autumn-bulk-select"), "{html}");
+        assert!(html.contains(r#"aria-label="Select row 42""#), "{html}");
+    }
+
+    #[test]
+    fn bulk_select_checkbox_honours_custom_field_name() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete")
+            .field_name("post_ids")
+            .select_label("Select post");
+        let html = bulk_select_checkbox(7, &cfg).into_string();
+        assert!(html.contains(r#"name="post_ids""#), "{html}");
+        assert!(!html.contains(r#"name="ids""#), "{html}");
+        assert!(html.contains(r#"aria-label="Select post 7""#), "{html}");
+    }
+
+    #[test]
+    fn bulk_actions_form_renders_csrf_hidden_input() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_form(&cfg, Some("tok-123"), None, maud::html! {}).into_string();
+        assert!(html.contains(r#"type="hidden""#), "{html}");
+        // The csrf field name defaults to `_csrf` when none is supplied.
+        assert!(html.contains(r#"name="_csrf""#), "{html}");
+        assert!(html.contains(r#"value="tok-123""#), "{html}");
+        // A configured field name wins over the default.
+        let named = bulk_actions_form(&cfg, Some("tok-123"), Some("authenticity"), maud::html! {})
+            .into_string();
+        assert!(named.contains(r#"name="authenticity""#), "{named}");
+        assert!(!named.contains(r#"name="_csrf""#), "{named}");
+    }
+
+    #[test]
+    fn bulk_actions_form_omits_csrf_input_when_none() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_form(&cfg, None, None, maud::html! {}).into_string();
+        assert!(!html.contains(r#"type="hidden""#), "{html}");
+        assert!(!html.contains("_csrf"), "{html}");
+        // The form itself is still rendered.
+        assert!(html.contains("<form"), "{html}");
+    }
+
+    #[test]
+    fn bulk_actions_form_posts_to_action_and_wraps_content() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let content = maud::html! { p { "row-marker" } };
+        let html = bulk_actions_form(&cfg, None, None, content).into_string();
+        assert!(html.contains(r#"method="post""#), "{html}");
+        assert!(html.contains(r#"action="/posts/bulk_delete""#), "{html}");
+        assert!(html.contains("autumn-bulk-form"), "{html}");
+        assert!(html.contains("row-marker"), "{html}");
+        // The toolbar is rendered inside the form, after the content.
+        let content_at = html.find("row-marker").expect("content rendered");
+        let toolbar_at = html
+            .find("autumn-bulk-actions")
+            .expect("toolbar rendered inside the form");
+        assert!(
+            content_at < toolbar_at,
+            "toolbar must follow content: {html}"
+        );
+        assert!(html.trim_end().ends_with("</form>"), "{html}");
+    }
+
+    #[test]
+    fn bulk_actions_toolbar_button_is_submit_and_labelled() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_toolbar(&cfg).into_string();
+        assert!(html.contains("autumn-bulk-actions"), "{html}");
+        assert!(html.contains(r#"role="group""#), "{html}");
+        assert!(html.contains(r#"type="submit""#), "{html}");
+        assert!(html.contains("Delete selected"), "{html}");
+    }
+
+    #[test]
+    fn bulk_actions_toolbar_confirm_is_opt_in() {
+        // No-JS guarantee: the default toolbar carries no `onclick` handler.
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let plain = bulk_actions_toolbar(&cfg).into_string();
+        assert!(!plain.contains("onclick"), "{plain}");
+        // Opting in emits the confirmation prompt.
+        let confirmed =
+            bulk_actions_toolbar(&cfg.clone().confirm("Delete these rows?")).into_string();
+        assert!(confirmed.contains("onclick"), "{confirmed}");
+        assert!(confirmed.contains("Delete these rows?"), "{confirmed}");
     }
 
     // ── CardConfig builder ─────────────────────────────────────────────
