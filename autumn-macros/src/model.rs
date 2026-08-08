@@ -6922,6 +6922,612 @@ mod tests {
         );
     }
 
+    // ── Votable (#1362) parsing ───────────────────────────────────────────
+    //
+    // `#[votable(by = <Reactor>, ...)]` declares a reaction edge table plus an
+    // aggregate column maintained on the model. Every key except `by` is
+    // optional and inferred from conventions, so the defaults are the part
+    // most worth pinning down: they are what makes the attribute a one-liner
+    // on a conventionally-named schema.
+
+    #[test]
+    fn votable_defaults_map_onto_conventional_columns() {
+        // The canonical declaration on a conventionally-named schema: every
+        // column name is inferred, and the inference must land exactly on
+        // `votes(user_id, post_id, value)` + `posts.score`.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = sum)])];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.reactor.to_string(), "User");
+        assert_eq!(spec.aggregate, VoteAggregate::Sum);
+        assert_eq!(spec.name, "vote");
+        assert_eq!(spec.table, "votes");
+        assert_eq!(spec.reactor_fk, "user_id");
+        assert_eq!(spec.target_fk, "post_id");
+        assert_eq!(spec.value_column.as_deref(), Some("value"));
+        assert_eq!(spec.column, "score");
+    }
+
+    #[test]
+    fn votable_defaults_to_sum_when_aggregate_is_omitted() {
+        // The attribute is *votable* — a vote is signed, so `sum` is the
+        // default and `count` is the opt-in.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let bare: Vec<syn::Attribute> = vec![syn::parse_quote!(#[votable(by = User)])];
+        let explicit: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = sum)])];
+        let bare = resolve_votable(&model, &bare)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        let explicit = resolve_votable(&model, &explicit)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(bare.aggregate, VoteAggregate::Sum);
+        assert_eq!(bare.aggregate, explicit.aggregate);
+        assert_eq!(bare.table, explicit.table);
+        assert_eq!(bare.column, explicit.column);
+        assert_eq!(bare.value_column, explicit.value_column);
+    }
+
+    #[test]
+    fn votable_count_mode_infers_name_count_column() {
+        // `aggregate = count` is unary membership: the aggregate column is
+        // `{name}_count` and the edge table has no value column at all (its
+        // rows are pure membership, like an m2m join row).
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = count)])];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.aggregate, VoteAggregate::Count);
+        assert_eq!(spec.name, "vote");
+        assert_eq!(spec.table, "votes");
+        assert_eq!(spec.column, "vote_count");
+        assert_eq!(
+            spec.value_column, None,
+            "a count-mode edge table stores no value column"
+        );
+    }
+
+    #[test]
+    fn votable_name_override_drives_table_and_column() {
+        // `name` is the single knob a likes feature needs: it drives both the
+        // pluralized table name and the `{name}_count` aggregate column, so
+        // `name = like` yields `likes` / `like_count` with no other overrides.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = count, name = like)])];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.name, "like");
+        assert_eq!(spec.table, "likes");
+        assert_eq!(spec.column, "like_count");
+        assert_eq!(spec.reactor_fk, "user_id");
+        assert_eq!(spec.target_fk, "post_id");
+    }
+
+    #[test]
+    fn votable_explicit_overrides_win() {
+        // Every inferred name has an override for schemas that do not follow
+        // the convention; none of the defaults may leak through.
+        let model: syn::Ident = syn::parse_quote!(Article);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = Member, aggregate = sum, name = rating, table = ratings,
+                      reactor_fk = member_id, target_fk = piece_id,
+                      value_column = weight, column = rating_total)]
+        )];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.reactor.to_string(), "Member");
+        assert_eq!(spec.aggregate, VoteAggregate::Sum);
+        assert_eq!(spec.name, "rating");
+        assert_eq!(spec.table, "ratings");
+        assert_eq!(spec.reactor_fk, "member_id");
+        assert_eq!(spec.target_fk, "piece_id");
+        assert_eq!(spec.value_column.as_deref(), Some("weight"));
+        assert_eq!(spec.column, "rating_total");
+    }
+
+    #[test]
+    fn votable_accepts_string_literal_values() {
+        // Like the association attributes, each value may be spelled as a bare
+        // ident or as a string literal — the two must resolve identically.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let idents: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = User, name = vote, table = votes, reactor_fk = user_id,
+                      target_fk = post_id, value_column = value, column = score)]
+        )];
+        let literals: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = User, name = "vote", table = "votes", reactor_fk = "user_id",
+                      target_fk = "post_id", value_column = "value", column = "score")]
+        )];
+        let idents = resolve_votable(&model, &idents)
+            .expect("bare idents parse ok")
+            .expect("a #[votable] spec");
+        let literals = resolve_votable(&model, &literals)
+            .expect("string literals parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(idents.name, literals.name);
+        assert_eq!(idents.table, literals.table);
+        assert_eq!(idents.reactor_fk, literals.reactor_fk);
+        assert_eq!(idents.target_fk, literals.target_fk);
+        assert_eq!(idents.value_column, literals.value_column);
+        assert_eq!(idents.column, literals.column);
+    }
+
+    #[test]
+    fn votable_requires_by() {
+        // There is no positional head: the reactor model is always named, so a
+        // `#[votable]` with no `by =` must say exactly what to add.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[votable(aggregate = sum)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires `by = <ReactorModel>`"),
+            "expected the missing-`by` error to name the key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_unknown_key() {
+        // A typo'd key must enumerate the accepted vocabulary rather than
+        // being silently ignored.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregat = sum)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        for key in [
+            "by",
+            "aggregate",
+            "name",
+            "table",
+            "reactor_fk",
+            "target_fk",
+            "value_column",
+            "column",
+        ] {
+            assert!(
+                msg.contains(key),
+                "expected the unknown-key error to enumerate `{key}`, got: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("votable"),
+            "expected the unknown-key error to name the attribute, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_unknown_aggregate() {
+        // Only the two supported modes exist; `avg`/`star` style ratings are
+        // explicitly out of scope for #1362 and must not resolve to a default.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = avg)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown aggregate `avg`"),
+            "expected the offending aggregate quoted back, got: {msg}"
+        );
+        assert!(
+            msg.contains("sum") && msg.contains("count"),
+            "expected both supported modes named, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_value_column_in_count_mode() {
+        // A count-mode edge table has no value column, so `value_column = ...`
+        // is a category error rather than a harmless extra key.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = User, aggregate = count, value_column = value)]
+        )];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("value_column"),
+            "expected the offending key named, got: {msg}"
+        );
+        assert!(
+            msg.contains("aggregate = count"),
+            "expected the conflicting mode named, got: {msg}"
+        );
+        assert!(
+            msg.contains("aggregate = sum"),
+            "expected the fix (switch to sum, or drop the key) spelled out, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_duplicate_attribute() {
+        // At most one `#[votable]` per model: the emitted trait is
+        // `{Model}Reactions` with `react`/`reaction_of`, so a second
+        // declaration would generate colliding methods.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[votable(by = User, aggregate = sum)]),
+            syn::parse_quote!(#[votable(by = User, aggregate = count, name = like)]),
+        ];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("at most one `#[votable]` per model"),
+            "expected the one-per-model rule stated, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_aggregate_column_must_exist_on_model() {
+        // The hidden edge module declares the aggregate column regardless, so
+        // a missing field would otherwise only surface as a runtime `42703` on
+        // the first vote. Mirror the `shard_key` field-existence check.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "expected a compile error for the missing aggregate column, got: {generated}"
+        );
+        assert!(
+            generated.contains("votable aggregate column `score` not found on model `Post`"),
+            "expected the directed missing-column message, got: {generated}"
+        );
+        assert!(
+            generated.contains("column = "),
+            "expected the error to point at the `column = <field>` override, got: {generated}"
+        );
+    }
+
+    // ── Votable (#1362) codegen shape ─────────────────────────────────────
+    //
+    // These assert on the *shape* of the emitted token stream (substrings of
+    // `TokenStream::to_string()`, which space-separates tokens). Behaviour is
+    // covered by the Docker-gated integration tests; what matters here is that
+    // the race-safety primitives (immediate transaction, pg-only `FOR UPDATE`,
+    // explicit `ON CONFLICT` arbiter) are actually present in the codegen.
+
+    #[test]
+    fn votable_emits_hidden_edge_table_module() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("mod __autumn_votable_4_post_vote"),
+            "expected a length-prefixed hidden edge-table module, got: {generated}"
+        );
+        assert!(
+            generated.contains("votes (user_id , post_id)"),
+            "expected the edge table keyed on the composite (reactor, target) \
+             pair — the load-bearing ON CONFLICT arbiter, got: {generated}"
+        );
+        assert!(
+            generated.contains("user_id -> Int8") && generated.contains("post_id -> Int8"),
+            "expected non-nullable Int8 fk columns (a NULL target would defeat \
+             the unique arbiter), got: {generated}"
+        );
+        assert!(
+            generated.contains("value -> Int2"),
+            "expected the sum-mode value column typed SMALLINT, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_emits_target_projection_in_the_hidden_module() {
+        // Deliberately self-contained: the target table is projected inside the
+        // hidden module (id + aggregate [+ deleted_at]) rather than referencing
+        // the app's `crate::schema::*`, so the codegen cannot pick up a
+        // conflicting column type and needs no schema module in scope.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("posts (id)"),
+            "expected a minimal target-table projection, got: {generated}"
+        );
+        assert!(
+            generated.contains("score -> Int8"),
+            "expected the aggregate column projected as BIGINT, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_emits_reactions_trait_and_blanket_impl() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("trait PostReactions"),
+            "expected a per-model reactions trait, got: {generated}"
+        );
+        assert!(
+            generated.contains("fn react"),
+            "expected the react() helper, got: {generated}"
+        );
+        assert!(
+            generated.contains("fn reaction_of"),
+            "expected the reaction_of() accessor, got: {generated}"
+        );
+        assert!(
+            generated.contains("M2mConnSource < Model = Post >"),
+            "expected the trait blanket-implemented over the repository's \
+             connection source, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_runs_in_an_immediate_transaction() {
+        // The edge mutation and the aggregate recompute must commit together,
+        // and the SQLite arm needs `BEGIN IMMEDIATE` (single writer) rather
+        // than a deferred snapshot that upgrades mid-transaction.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("scoped_immediate_transaction"),
+            "expected react() to wrap its statements in the write-path \
+             transaction primitive, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_locks_the_target_row_on_pg_only() {
+        // `FOR UPDATE` is a parse error on SQLite, so the row lock lives in the
+        // `pg` arm of `backend_select!` (the unselected arm is never
+        // type-checked); SQLite gets its mutual exclusion from BEGIN IMMEDIATE.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("backend_select"),
+            "expected the per-backend split, got: {generated}"
+        );
+        assert!(
+            generated.contains("for_update"),
+            "expected an exclusive row lock on the target row, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_upserts_with_an_explicit_arbiter() {
+        // An `ON CONFLICT DO UPDATE` with no arbiter is a syntax error, and the
+        // wrong column list raises 42P10 on a table carrying more than one
+        // unique constraint (reddit-clone's `votes` has two).
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("on_conflict"),
+            "expected an upsert on the edge insert, got: {generated}"
+        );
+        assert!(
+            generated.contains("do_update"),
+            "expected ON CONFLICT DO UPDATE (not DO NOTHING), got: {generated}"
+        );
+        assert!(
+            generated.contains("excluded"),
+            "expected the conflicting row to take EXCLUDED.value, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_count_mode_react_has_no_value_parameter() {
+        // A count reaction is unary membership, so `react()` drops the `value`
+        // argument entirely rather than taking an ignored one.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = count)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub vote_count: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("trait PostReactions") && generated.contains("fn react"),
+            "expected the reactions trait in count mode too, got: {generated}"
+        );
+        assert!(
+            !generated.contains("value : i16"),
+            "count-mode react() must not take a value parameter, got: {generated}"
+        );
+        assert!(
+            !generated.contains("-> Int2"),
+            "a count-mode edge table has no value column, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_soft_delete_target_gates_the_lock_and_the_update() {
+        // AC6: when the model has a `deleted_at` field, both the locking SELECT
+        // and the aggregate UPDATE carry `deleted_at IS NULL`, so a
+        // soft-deleted target is NotFound and its aggregate is untouched. A
+        // model without the field pays nothing.
+        let soft = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                    pub deleted_at: Option<chrono::NaiveDateTime>,
+                }
+            },
+        )
+        .to_string();
+        let hard = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            soft.contains("deleted_at . is_null ()"),
+            "expected the soft-delete guard on a model with deleted_at, got: {soft}"
+        );
+        assert!(
+            soft.contains("deleted_at -> Nullable < Timestamp >"),
+            "expected deleted_at projected into the hidden target table, got: {soft}"
+        );
+        assert!(
+            !hard.contains("is_null"),
+            "a model without deleted_at must not emit a soft-delete guard, got: {hard}"
+        );
+    }
+
+    #[test]
+    fn votable_attribute_is_stripped_from_the_diesel_struct() {
+        // `#[votable]` is consumed by `#[model]`; re-emitting it onto the
+        // generated Diesel struct would fail with "cannot find attribute
+        // `votable` in this scope".
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("# [votable"),
+            "the votable attribute must not leak onto the emitted struct, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_without_votable_emits_no_reaction_items() {
+        // The reaction surface is opt-in: a model that never declares
+        // `#[votable]` must not gain a trait, a hidden module, or dead code.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("Reactions"),
+            "expected no reactions trait without #[votable], got: {generated}"
+        );
+        assert!(
+            !generated.contains("__autumn_votable"),
+            "expected no hidden edge module without #[votable], got: {generated}"
+        );
+    }
+
     #[test]
     fn lock_version_attr_detected_by_has_attr() {
         let field: syn::Field = syn::parse_quote! {

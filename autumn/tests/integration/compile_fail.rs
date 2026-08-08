@@ -46,6 +46,23 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_m2m_helper_collision.rs");
 
+    // Declarative reactions (#1362): every `#[votable(...)]` misuse is a
+    // directed compile error rather than a runtime surprise on the first vote.
+    // `by =` is required (no positional head); only one `#[votable]` per model
+    // (the `{Model}Reactions` methods would collide); `sum`/`count` are the
+    // only aggregates; the aggregate column must exist on the model (otherwise
+    // a runtime `42703`); and `value_column` is meaningless in count mode.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_votable_missing_by.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_votable_duplicate.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_votable_unknown_aggregate.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_votable_missing_aggregate_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_votable_value_column_in_count_mode.rs");
+
     // Declarative-schema markers (#1975, slice 3.5): the `#[model]` macro
     // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` but
     // rejects malformed shapes with a clear, actionable `compile_error!`.
@@ -160,6 +177,12 @@ fn compile_pass_tests() {
     // `helper = "..."` overrides — the followers/following pattern (#1785).
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_m2m_helper_override.rs");
+
+    // Declarative reactions (#1362): `#[votable]` with every override key set,
+    // and again on a soft-deleted target — both emitter branches build, and
+    // the attribute is stripped before the Diesel struct is emitted.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_votable_overrides.rs");
 
     // Model draft accessors (requires db feature)
     #[cfg(feature = "db")]
