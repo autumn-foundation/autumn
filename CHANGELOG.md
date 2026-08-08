@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **metrics:** new **call-site metrics facade** (`autumn_web::metrics`, #1378)
+  so application code can record its own counters, gauges, histograms and
+  timers in one line at the point the interesting thing happens — no trait to
+  implement, no type to define, nothing to register with `AppBuilder`:
+  `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`
+  registers the instrument in a process-global registry on first use and shows
+  up on the stock `/actuator/prometheus` scrape (and under a new top-level
+  `app` key on `/actuator/metrics`) with no wiring at all. `timer(..).start()`
+  returns a guard that records on every exit path including early `?` returns
+  and unwinding panics, plus `time()`/`time_async()`/`record()` for cases a
+  guard does not fit; histograms render as standard cumulative Prometheus
+  histograms whose `le="+Inf"` bucket is structurally derived from the same
+  slots as `_count`, so the two can never drift. The facade is designed to
+  degrade rather than take an app down: hard caps (100 series per instrument,
+  256 instruments, 8 labels, 128-char label values) drop excess rather than
+  grow without bound, with one warning per instrument and a scrapeable
+  `autumn_metrics_series_dropped_total{metric="..."}` counter so cardinality
+  mistakes are alertable; invalid, `autumn_`-prefixed, kind-conflicting and
+  derived-name-colliding registrations are rejected with a warning and an inert
+  handle rather than a panic or a malformed scrape. Recording is never gated —
+  `actuator.prometheus = false` removes only the scrape endpoint (the router
+  now logs that at startup, naming the config key). New guide:
+  `docs/guide/metrics.md`, including a facade-vs-`MetricsSource` comparison.
 - **sim-testing:** fix a genuine **job-backoff thundering herd** the
   deterministic simulation harness caught (W7, #1797): the local job
   runtime's retry backoff (`execute_local_job`, `job.rs`) computed a pure

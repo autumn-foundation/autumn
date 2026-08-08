@@ -2539,6 +2539,10 @@ fn render_labels(labels: &[(String, String)]) -> String {
     out
 }
 
+/// The family reporting how many label sets each app metric lost to its
+/// cardinality cap; emitted by `write_app_metrics` when any were dropped.
+pub(crate) const SERIES_DROPPED_FAMILY: &str = "autumn_metrics_series_dropped_total";
+
 /// Every metric family name the framework itself emits on `/actuator/prometheus`.
 ///
 /// Two callers share this list: `prometheus_endpoint` seeds its
@@ -2556,7 +2560,7 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 19] = [
     "autumn_requests_shed_total",
     "autumn_http_route_requests_total",
     "autumn_metrics_source_errors_total",
-    "autumn_metrics_series_dropped_total",
+    SERIES_DROPPED_FAMILY,
     "autumn_cache_read_through_hits_total",
     "autumn_cache_read_through_misses_total",
     "autumn_cache_read_through_coalesced_waits_total",
@@ -2928,108 +2932,133 @@ fn write_app_metrics(
     snapshot: &[crate::metrics::InstrumentSnapshot],
     emitted_families: &mut std::collections::HashSet<String>,
 ) {
-    use std::fmt::Write;
-
-    use crate::metrics::{InstrumentKind, SeriesValue};
-
     // Instruments that lost label sets to the cardinality cap, in the
     // snapshot's (name-sorted) order.
     let mut dropped: Vec<(&str, u64)> = Vec::new();
 
     for instrument in snapshot {
-        // Both conditions are enforced at registration; re-checked here so a
-        // scrape can never emit a malformed or duplicated family.
-        if !is_valid_metric_name(&instrument.name) {
-            tracing::warn!(name = %instrument.name, "app metric has an invalid metric name; skipping family");
+        if !claim_app_family_names(instrument, emitted_families) {
             continue;
         }
-        if !emitted_families.insert(instrument.name.clone()) {
-            tracing::warn!(name = %instrument.name, "app metric collides with an already-emitted family; skipping family");
-            continue;
-        }
-        let kind = match instrument.kind {
-            InstrumentKind::Counter => "counter",
-            InstrumentKind::Gauge => "gauge",
-            InstrumentKind::Histogram => {
-                for suffix in ["_bucket", "_sum", "_count"] {
-                    emitted_families.insert(format!("{}{suffix}", instrument.name));
-                }
-                "histogram"
-            }
-        };
         if instrument.dropped_series > 0 {
             dropped.push((&instrument.name, instrument.dropped_series));
         }
-
-        if !instrument.help.is_empty() {
-            let _ = writeln!(
-                out,
-                "# HELP {} {}",
-                instrument.name,
-                escape_help_text(&instrument.help)
-            );
-        }
-        let _ = writeln!(out, "# TYPE {} {kind}", instrument.name);
-
-        for series in &instrument.series {
-            // `labels` is a `BTreeMap`, so this is already sorted by key.
-            let labels: Vec<(String, String)> = series
-                .labels
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            match series.value {
-                SeriesValue::Counter { value } => {
-                    let _ = writeln!(out, "{}{} {value}", instrument.name, render_labels(&labels));
-                }
-                SeriesValue::Gauge { value } => {
-                    let _ = writeln!(
-                        out,
-                        "{}{} {}",
-                        instrument.name,
-                        render_labels(&labels),
-                        format_sample_value(value)
-                    );
-                }
-                SeriesValue::Histogram {
-                    count,
-                    sum,
-                    ref buckets,
-                } => {
-                    for (le, cumulative) in buckets {
-                        // `le` goes last, after the user's own labels.
-                        let mut bucket_labels = labels.clone();
-                        bucket_labels.push(("le".to_string(), le.clone()));
-                        let _ = writeln!(
-                            out,
-                            "{}_bucket{} {cumulative}",
-                            instrument.name,
-                            render_labels(&bucket_labels)
-                        );
-                    }
-                    let rendered = render_labels(&labels);
-                    let _ = writeln!(
-                        out,
-                        "{}_sum{rendered} {}",
-                        instrument.name,
-                        format_sample_value(sum)
-                    );
-                    let _ = writeln!(out, "{}_count{rendered} {count}", instrument.name);
-                }
-            }
-        }
+        write_app_instrument(out, instrument);
     }
 
-    if !dropped.is_empty() {
-        out.push_str(
-            "# HELP autumn_metrics_series_dropped_total \
-             App metric label sets dropped because the metric hit its series cardinality cap\n",
-        );
-        out.push_str("# TYPE autumn_metrics_series_dropped_total counter\n");
-        for (name, count) in dropped {
-            let labels = render_labels(&[("metric".to_string(), name.to_string())]);
-            let _ = writeln!(out, "autumn_metrics_series_dropped_total{labels} {count}");
+    write_app_dropped_family(out, &dropped);
+}
+
+/// Claim every family name `instrument` occupies, returning whether it may be
+/// rendered.
+///
+/// Both rejections are already enforced at registration; they are re-checked
+/// here so a scrape can never emit a malformed or duplicated family.
+fn claim_app_family_names(
+    instrument: &crate::metrics::InstrumentSnapshot,
+    emitted_families: &mut std::collections::HashSet<String>,
+) -> bool {
+    if !is_valid_metric_name(&instrument.name) {
+        tracing::warn!(name = %instrument.name, "app metric has an invalid metric name; skipping family");
+        return false;
+    }
+    if !emitted_families.insert(instrument.name.clone()) {
+        tracing::warn!(name = %instrument.name, "app metric collides with an already-emitted family; skipping family");
+        return false;
+    }
+    if matches!(instrument.kind, crate::metrics::InstrumentKind::Histogram) {
+        for suffix in crate::metrics::HISTOGRAM_SUFFIXES {
+            emitted_families.insert(format!("{}{suffix}", instrument.name));
         }
+    }
+    true
+}
+
+/// Write one app instrument's `# HELP`/`# TYPE` header and every sample line.
+fn write_app_instrument(out: &mut String, instrument: &crate::metrics::InstrumentSnapshot) {
+    use std::fmt::Write;
+
+    use crate::metrics::InstrumentKind;
+
+    if !instrument.help.is_empty() {
+        let _ = writeln!(
+            out,
+            "# HELP {} {}",
+            instrument.name,
+            escape_help_text(&instrument.help)
+        );
+    }
+    let kind = match instrument.kind {
+        InstrumentKind::Counter => "counter",
+        InstrumentKind::Gauge => "gauge",
+        InstrumentKind::Histogram => "histogram",
+    };
+    let _ = writeln!(out, "# TYPE {} {kind}", instrument.name);
+
+    for series in &instrument.series {
+        write_app_series(out, &instrument.name, series);
+    }
+}
+
+/// Write the sample line(s) for a single series of the app metric `name`.
+fn write_app_series(out: &mut String, name: &str, series: &crate::metrics::SeriesSnapshot) {
+    use std::fmt::Write;
+
+    use crate::metrics::SeriesValue;
+
+    // `series.labels` is a `BTreeMap`, so this is already sorted by key.
+    let labels: Vec<(String, String)> = series
+        .labels
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let rendered = render_labels(&labels);
+
+    match series.value {
+        SeriesValue::Counter { value } => {
+            let _ = writeln!(out, "{name}{rendered} {value}");
+        }
+        SeriesValue::Gauge { value } => {
+            let _ = writeln!(out, "{name}{rendered} {}", format_sample_value(value));
+        }
+        SeriesValue::Histogram {
+            count,
+            sum,
+            ref buckets,
+        } => {
+            for (le, cumulative) in buckets {
+                // `le` goes last, after the user's own labels.
+                let mut bucket_labels = labels.clone();
+                bucket_labels.push(("le".to_string(), le.clone()));
+                let _ = writeln!(
+                    out,
+                    "{name}_bucket{} {cumulative}",
+                    render_labels(&bucket_labels)
+                );
+            }
+            let _ = writeln!(out, "{name}_sum{rendered} {}", format_sample_value(sum));
+            let _ = writeln!(out, "{name}_count{rendered} {count}");
+        }
+    }
+}
+
+/// Write the cardinality-cap drop counter, one series per instrument that lost
+/// label sets. Writes nothing when `dropped` is empty.
+fn write_app_dropped_family(out: &mut String, dropped: &[(&str, u64)]) {
+    use std::fmt::Write;
+
+    if dropped.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "# HELP {SERIES_DROPPED_FAMILY} \
+         App metric label sets dropped because the metric hit its series cardinality cap"
+    );
+    let _ = writeln!(out, "# TYPE {SERIES_DROPPED_FAMILY} counter");
+    for (name, count) in dropped {
+        let labels = render_labels(&[("metric".to_string(), (*name).to_string())]);
+        let _ = writeln!(out, "{SERIES_DROPPED_FAMILY}{labels} {count}");
     }
 }
 

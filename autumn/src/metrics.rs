@@ -45,6 +45,13 @@
 //! families. Names starting with it — and names that are not valid Prometheus
 //! metric names — are rejected with a warning, yielding an inert handle that
 //! records nothing rather than panicking.
+//!
+//! A histogram additionally reserves its derived `_bucket`, `_sum` and
+//! `_count` names, and the first registration of a name fixes its kind: asking
+//! for the same name as a different kind is rejected the same way, so the
+//! scrape output always carries exactly one `# TYPE` line per family.
+//!
+//! Narrative guide: `docs/guide/metrics.md`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -83,7 +90,10 @@ const MAX_BUCKET_BOUNDS: usize = 20;
 const RESERVED_LABEL_NAMES: [&str; 2] = ["le", "quantile"];
 
 /// Suffixes of the families a histogram occupies besides its base name.
-const HISTOGRAM_SUFFIXES: [&str; 3] = ["_bucket", "_sum", "_count"];
+///
+/// Shared with [`crate::actuator`], which claims the same derived names when it
+/// renders a histogram so a plugin source cannot shadow one of them.
+pub(crate) const HISTOGRAM_SUFFIXES: [&str; 3] = ["_bucket", "_sum", "_count"];
 
 // ── Registry internals ─────────────────────────────────────────
 
