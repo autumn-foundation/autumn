@@ -1,0 +1,5 @@
+error: at most one `#[votable]` per model: the generated `{Model}Reactions` trait's `react`/`reaction_of` methods would otherwise collide (multiple reaction kinds per model are not yet supported — see https://github.com/autumn-foundation/autumn/issues/1362)
+  --> tests/compile-fail/model_votable_duplicate.rs:17:1
+   |
+17 | #[votable(by = User, aggregate = count, name = like)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
