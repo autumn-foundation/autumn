@@ -513,16 +513,22 @@ pub trait ModelPrimaryKey {
 /// than one m2m association) — each mutation trait is blanket-implemented
 /// only for `M2mConnSource<Model = TheAssociationsOwner>`.
 ///
+/// It also backs the `#[votable(by = ..., aggregate = sum|count)]` reaction
+/// helpers (#1362): the `{Model}Reactions` trait `#[model]` emits is
+/// blanket-implemented over `M2mConnSource<Model = TheVotableModel>`, and
+/// `react()` acquires its own connection through
+/// [`M2mConnSource::__autumn_m2m_write_conn`] exactly like an `add_*` does.
+///
 /// Not part of the public API; not implemented by hand.
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub trait M2mConnSource: Send + Sync {
-    /// The model whose `#[has_many(..., through = ...)]` associations this
-    /// repository's mutation helpers operate on.
+    /// The model whose `#[has_many(..., through = ...)]` associations (or
+    /// `#[votable]` reactions) this repository's mutation helpers operate on.
     type Model;
 
     /// Acquire a primary-pool connection for an `add_*`/`remove_*`/`set_*`
-    /// many-to-many mutation.
+    /// many-to-many mutation, or for a `#[votable]` `react()`/`reaction_of()`.
     ///
     /// Mirrors the write-connection acquisition every
     /// other mutating generated method uses (marks the read-your-writes pin
@@ -534,6 +540,82 @@ pub trait M2mConnSource: Send + Sync {
             diesel_async::pooled_connection::deadpool::Object<crate::db::RuntimeConnection>,
         >,
     > + Send;
+}
+
+/// Which of the three edge mutations a `#[votable]` `react()` call performed
+/// (#1362).
+///
+/// A reaction edge is a single `(reactor, target)` row in the edge table, so
+/// every `react()` resolves to exactly one of: create it, replace its value, or
+/// delete it. The discrimination is returned rather than inferred from
+/// [`Reaction::value`] so a route can tell "the user changed their mind"
+/// (`Flipped`) apart from "the user reacted for the first time" (`Inserted`)
+/// without a second query — useful for flash messages, analytics and
+/// notification fan-out.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_web::repository::ReactionOutcome;
+///
+/// // Only a signed (`aggregate = sum`) reaction can be flipped.
+/// assert_ne!(ReactionOutcome::Inserted, ReactionOutcome::Flipped);
+/// ```
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactionOutcome {
+    /// The reactor had no reaction on this target; one was created.
+    Inserted,
+    /// The reactor had the *opposite* reaction; its value was replaced in
+    /// place (no second edge row is ever created).
+    ///
+    /// Never produced by an `aggregate = count` reaction: a count edge carries
+    /// no value, so a repeat click can only toggle it off.
+    Flipped,
+    /// The reactor repeated its existing reaction, so the edge was deleted
+    /// (toggle-off).
+    Removed,
+}
+
+/// The post-commit state a `#[votable]` `react()` call leaves behind (#1362).
+///
+/// `react()` toggles/flips/inserts the `(reactor, target)` edge **and**
+/// recomputes the target's aggregate column from ground truth in the same
+/// transaction. Everything a caller needs to re-render the reaction control is
+/// therefore already known when the transaction commits, and is returned here —
+/// a route never has to issue a follow-up `SELECT` for the new score or for the
+/// viewer's own reaction.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_web::repository::{Reaction, ReactionOutcome};
+///
+/// // What `react(user_id, post_id, 1)` returns for a first upvote on a post
+/// // whose score was 6.
+/// let reaction = Reaction {
+///     value: Some(1),
+///     aggregate: 7,
+///     outcome: ReactionOutcome::Inserted,
+/// };
+/// assert_eq!(reaction.value, Some(1));
+/// assert_eq!(reaction.aggregate, 7);
+/// ```
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reaction {
+    /// The reactor's reaction *after* the call: `Some(value)` after an insert
+    /// or a flip, `None` after a toggle-off.
+    ///
+    /// An `aggregate = count` reaction reports `Some(1)` while the membership
+    /// row exists, so view code is mode-independent.
+    pub value: Option<i16>,
+    /// The target's newly persisted aggregate (`score` for `aggregate = sum`,
+    /// `{name}_count` for `aggregate = count`) — ground truth as of this
+    /// transaction's commit, not an accumulated delta.
+    pub aggregate: i64,
+    /// Which edge mutation ran.
+    pub outcome: ReactionOutcome,
 }
 
 /// Metadata trait implemented for model structs to expose FTS configuration.

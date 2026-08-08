@@ -218,6 +218,245 @@ struct ThroughSpec {
     target_fk: String,
 }
 
+/// How a `#[votable]` association aggregates its edges into the model's
+/// aggregate column (#1362).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoteAggregate {
+    /// Signed up/down votes: the aggregate is `SUM(value)` over the edge
+    /// table's `value_column`.
+    Sum,
+    /// Unary likes/bookmarks: the aggregate is `COUNT(*)` and the edge table
+    /// carries no value column at all.
+    Count,
+}
+
+/// A resolved `#[votable(by = <Reactor>, ...)]` declaration (#1362): the
+/// reaction edge table plus the aggregate column maintained on the model.
+///
+/// Every field except `reactor` has a convention-derived default, so the
+/// canonical declaration on a conventionally-named schema is the one-liner
+/// `#[votable(by = User, aggregate = sum)]` → `votes(user_id, post_id, value)`
+/// maintaining `posts.score`.
+struct VotableSpec {
+    /// The reactor model type named by `by = <Model>` (e.g. `User`).
+    reactor: syn::Ident,
+    /// `sum` (default) or `count`.
+    aggregate: VoteAggregate,
+    /// The reaction name, default `"vote"`. Drives `table` (pluralized) and,
+    /// in count mode, the `{name}_count` aggregate column.
+    name: String,
+    /// The edge table, default `pluralize(name)` → `votes` / `likes`.
+    table: String,
+    /// The edge column pointing at the reactor, default `{snake(by)}_id`.
+    reactor_fk: String,
+    /// The edge column pointing at this model, default `{snake(Model)}_id`.
+    target_fk: String,
+    /// The edge's signed value column, default `value` — `None` in count mode,
+    /// whose edge rows are pure membership and store no value.
+    value_column: Option<String>,
+    /// The aggregate column on *this* model, default `score` (sum) /
+    /// `{name}_count` (count).
+    column: String,
+}
+
+/// Parse a single `#[votable(...)]` attribute into a resolved [`VotableSpec`].
+///
+/// Grammar (a `key = value` loop, each value a bare ident or a string literal;
+/// there is deliberately **no** positional head — the reactor is always named,
+/// because a bare `#[votable(User)]` reads ambiguously next to
+/// `#[has_many(Comment)]`, where the positional argument is the association
+/// *target* rather than the actor):
+///
+/// ```text
+/// #[votable(by = User, aggregate = sum | count, name = vote, table = votes,
+///           reactor_fk = user_id, target_fk = post_id,
+///           value_column = value, column = score)]
+/// ```
+// Eight independent keys, each with its own parse + validation arm, plus the
+// convention-derived defaults for the seven optional ones.
+#[allow(clippy::too_many_lines)]
+fn parse_votable_attr(attr: &syn::Attribute, model_ident: &syn::Ident) -> syn::Result<VotableSpec> {
+    use syn::parse::ParseStream;
+
+    if matches!(attr.meta, syn::Meta::Path(_)) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[votable]` requires `by = <ReactorModel>` \
+             (e.g. `#[votable(by = User)]`)",
+        ));
+    }
+
+    let mut reactor: Option<syn::Ident> = None;
+    let mut aggregate: Option<VoteAggregate> = None;
+    let mut name: Option<String> = None;
+    let mut table: Option<String> = None;
+    let mut reactor_fk: Option<String> = None;
+    let mut target_fk: Option<String> = None;
+    let mut value_column: Option<syn::Ident> = None;
+    let mut value_column_value: Option<String> = None;
+    let mut column: Option<String> = None;
+
+    attr.parse_args_with(|input: ParseStream| {
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            // Accept either a bare identifier (`table = votes`) or a string
+            // literal (`table = "votes"`), exactly like the association attrs.
+            let (value_ident, value) = if input.peek(LitStr) {
+                let lit: LitStr = input.parse()?;
+                (None, lit.value())
+            } else {
+                let ident: syn::Ident = input.parse()?;
+                (Some(ident.clone()), ident.to_string())
+            };
+            if key == "by" {
+                reactor = Some(match value_ident {
+                    Some(ident) => ident,
+                    None => syn::parse_str::<syn::Ident>(&value).map_err(|_| {
+                        syn::Error::new_spanned(
+                            &key,
+                            format!("`by = \"{value}\"` is not a valid model type name"),
+                        )
+                    })?,
+                });
+            } else if key == "aggregate" {
+                aggregate = Some(match value.as_str() {
+                    "sum" => VoteAggregate::Sum,
+                    "count" => VoteAggregate::Count,
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            &key,
+                            format!(
+                                "unknown aggregate `{other}`; expected `sum` \
+                                 (signed up/down votes) or `count` (unary likes)"
+                            ),
+                        ));
+                    }
+                });
+            } else if key == "name" {
+                name = Some(value);
+            } else if key == "table" {
+                table = Some(value);
+            } else if key == "reactor_fk" {
+                reactor_fk = Some(value);
+            } else if key == "target_fk" {
+                target_fk = Some(value);
+            } else if key == "value_column" {
+                value_column = Some(key.clone());
+                value_column_value = Some(value);
+            } else if key == "column" {
+                column = Some(value);
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    "expected `by = <Model>`, `aggregate = sum|count`, \
+                     `name = <ident>`, `table = <table>`, \
+                     `reactor_fk = <column>`, `target_fk = <column>`, \
+                     `value_column = <column>`, or \
+                     `column = <aggregate_column>` in `#[votable]`",
+                ));
+            }
+            if input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    })?;
+
+    let Some(reactor) = reactor else {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[votable]` requires `by = <ReactorModel>` \
+             (e.g. `#[votable(by = User)]`)",
+        ));
+    };
+    let aggregate = aggregate.unwrap_or(VoteAggregate::Sum);
+
+    if aggregate == VoteAggregate::Count
+        && let Some(key) = value_column
+    {
+        return Err(syn::Error::new_spanned(
+            key,
+            "`value_column = ...` has no meaning with `aggregate = count`: a \
+             count reaction's edge table stores no value column, its rows are \
+             pure membership — use `aggregate = sum` (signed values) or drop \
+             the key",
+        ));
+    }
+
+    let name = name.unwrap_or_else(|| "vote".to_owned());
+    let table = table.unwrap_or_else(|| pluralize_word(&name));
+    let reactor_fk =
+        reactor_fk.unwrap_or_else(|| format!("{}_id", pascal_to_snake(&reactor.to_string())));
+    let target_fk =
+        target_fk.unwrap_or_else(|| format!("{}_id", pascal_to_snake(&model_ident.to_string())));
+    let value_column = match aggregate {
+        VoteAggregate::Sum => Some(value_column_value.unwrap_or_else(|| "value".to_owned())),
+        VoteAggregate::Count => None,
+    };
+    let column = column.unwrap_or_else(|| match aggregate {
+        VoteAggregate::Sum => "score".to_owned(),
+        VoteAggregate::Count => format!("{name}_count"),
+    });
+
+    Ok(VotableSpec {
+        reactor,
+        aggregate,
+        name,
+        table,
+        reactor_fk,
+        target_fk,
+        value_column,
+        column,
+    })
+}
+
+/// Resolve the (at most one) `#[votable]` declaration on a model's outer
+/// attributes.
+///
+/// A second `#[votable]` is a directed compile error rather than a silently
+/// dropped declaration: both would generate the same `{Model}Reactions` trait
+/// with the same `react`/`reaction_of` methods.
+///
+/// # Errors
+///
+/// Returns a [`syn::Error`] when more than one `#[votable]` is declared, or
+/// when the single declaration fails [`parse_votable_attr`]'s validation.
+fn resolve_votable(
+    model_ident: &syn::Ident,
+    attrs: &[syn::Attribute],
+) -> syn::Result<Option<VotableSpec>> {
+    let mut found: Option<&syn::Attribute> = None;
+    for attr in attrs {
+        if !is_votable_attr(attr) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "at most one `#[votable]` per model: the generated \
+                 `{Model}Reactions` trait's `react`/`reaction_of` methods would \
+                 otherwise collide (multiple reaction kinds per model are not \
+                 yet supported — see \
+                 https://github.com/autumn-foundation/autumn/issues/1362)",
+            ));
+        }
+        found = Some(attr);
+    }
+    found
+        .map(|attr| parse_votable_attr(attr, model_ident))
+        .transpose()
+}
+
+/// Whether an attribute is the `#[votable]` declaration consumed by `#[model]`
+/// (and therefore must not be re-emitted onto the Diesel struct, where it
+/// would fail with "cannot find attribute `votable` in this scope").
+fn is_votable_attr(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("votable")
+}
+
 /// Resolve the foreign-key column and accessor name for an association,
 /// applying autumn's conventions when the `fk` is not given explicitly.
 ///
@@ -1268,6 +1507,466 @@ fn emit_association_items(
         }
 
         #(#m2m_items)*
+    }
+}
+
+/// Emit everything a `#[votable]` declaration generates (#1362):
+///
+/// 1. a hidden, length-prefixed `mod __autumn_votable_{len}_{model}_{name}`
+///    declaring the reaction edge table *and* a minimal projection of the
+///    target table (`id`, the aggregate column, and `deleted_at` when the model
+///    soft-deletes). Projecting the target keeps the codegen self-contained: it
+///    needs no `crate::schema::*` in scope at the `#[model]` site and cannot
+///    pick up a conflicting column type;
+/// 2. a `{Model}Reactions` trait with `react` / `reaction_of`, blanket
+///    implemented over `M2mConnSource<Model = #model_ident>` exactly like the
+///    many-to-many mutation helpers, so method resolution stays unambiguous
+///    when several models' reaction traits are in scope.
+///
+/// `react()` runs S1–S5 (lock target → read edge → toggle/flip/insert →
+/// recompute the aggregate from ground truth → persist) inside one
+/// `scoped_immediate_transaction`. The Postgres `SELECT ... FOR UPDATE` row
+/// lock is held from before the edge is read until commit, so concurrent
+/// reactions on one target are serialized and the recomputed aggregate is
+/// exact; `SQLite` gets strictly stronger mutual exclusion from `BEGIN
+/// IMMEDIATE`, which is why `for_update()` lives only in the `pg` arm of
+/// `backend_select!` (it is a parse error on `SQLite`, and the unselected arm
+/// is never type-checked).
+#[allow(clippy::too_many_lines)]
+fn emit_votable_items(
+    model_ident: &syn::Ident,
+    table_ident: &syn::Ident,
+    vis: &syn::Visibility,
+    spec: &VotableSpec,
+    has_deleted_at: bool,
+) -> TokenStream {
+    let model_snake = pascal_to_snake(&model_ident.to_string());
+    // Length-prefixed for the same reason as the m2m join module: it keeps two
+    // different (model, reaction name) pairs from colliding.
+    let edge_mod = format_ident!(
+        "__autumn_votable_{}_{model_snake}_{}",
+        model_snake.len(),
+        spec.name
+    );
+    let edge_table = format_ident!("{}", spec.table);
+    let reactor_fk = format_ident!("{}", spec.reactor_fk);
+    let target_fk = format_ident!("{}", spec.target_fk);
+    let agg_column = format_ident!("{}", spec.column);
+    let trait_ident = format_ident!("{model_ident}Reactions");
+    let is_sum = spec.aggregate == VoteAggregate::Sum;
+
+    // ── The hidden module ────────────────────────────────────────────────
+    let value_column_decl = spec.value_column.as_ref().map(|value_column| {
+        let value_ident = format_ident!("{value_column}");
+        quote! { #value_ident -> Int2, }
+    });
+    let deleted_at_decl = has_deleted_at.then(|| {
+        quote! { deleted_at -> Nullable<Timestamp>, }
+    });
+    let hidden_module = quote! {
+        // Hidden Diesel declarations backing `#model_ident`'s `#[votable]`
+        // reactions: the `#edge_table` edge table (keyed on the composite
+        // `(#reactor_fk, #target_fk)` pair that is also the `ON CONFLICT`
+        // arbiter) and a minimal `#table_ident` projection. Scoped to its own
+        // module so it can never collide with the application's own
+        // `crate::schema::#edge_table`.
+        #[allow(
+            missing_docs,
+            unreachable_pub,
+            clippy::all,
+            clippy::pedantic,
+            clippy::nursery
+        )]
+        mod #edge_mod {
+            ::autumn_web::reexports::diesel::table! {
+                #edge_table (#reactor_fk, #target_fk) {
+                    #reactor_fk -> Int8,
+                    #target_fk -> Int8,
+                    #value_column_decl
+                }
+            }
+            ::autumn_web::reexports::diesel::table! {
+                #table_ident (id) {
+                    id -> Int8,
+                    #agg_column -> Int8,
+                    #deleted_at_decl
+                }
+            }
+        }
+    };
+
+    // ── Shared query fragments ───────────────────────────────────────────
+    // `AND deleted_at IS NULL`, emitted only when the model actually has the
+    // field — a model that does not soft-delete pays nothing (AC6).
+    let live_filter = has_deleted_at.then(|| {
+        quote! { .filter(#edge_mod::#table_ident::deleted_at.is_null()) }
+    });
+    let edge_of_reactor = quote! {
+        #edge_mod::#edge_table::table
+            .filter(#edge_mod::#edge_table::#reactor_fk.eq(reactor_id))
+            .filter(#edge_mod::#edge_table::#target_fk.eq(target_id))
+    };
+    let not_found_msg = format!("{model_ident} not found");
+
+    // ── S2: the reactor's current edge, S3: the three-way branch ─────────
+    let (react_value_param, read_current, branch, aggregate_query) = if is_sum {
+        let value_ident = format_ident!(
+            "{}",
+            spec.value_column
+                .as_ref()
+                .expect("sum mode always resolves a value column")
+        );
+        (
+            Some(quote! { value: i16, }),
+            quote! {
+                let __current: ::core::option::Option<i16> = #edge_of_reactor
+                    .select(#edge_mod::#edge_table::#value_ident)
+                    .first::<i16>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?;
+            },
+            quote! {
+                let (__new_value, __outcome) = match __current {
+                    // (a) toggle-off: the same value again removes the edge.
+                    ::core::option::Option::Some(__existing) if __existing == value => {
+                        ::autumn_web::reexports::diesel::delete(#edge_of_reactor)
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::None,
+                            ::autumn_web::repository::ReactionOutcome::Removed,
+                        )
+                    }
+                    // (b) flip: replace the value in place, never a second row.
+                    ::core::option::Option::Some(_) => {
+                        ::autumn_web::reexports::diesel::update(#edge_of_reactor)
+                            .set(#edge_mod::#edge_table::#value_ident.eq(value))
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::Some(value),
+                            ::autumn_web::repository::ReactionOutcome::Flipped,
+                        )
+                    }
+                    // (c) insert. The explicit `(reactor, target)` arbiter is
+                    // load-bearing: an edge table may carry more than one
+                    // unique constraint, and a bare `ON CONFLICT DO UPDATE`
+                    // is a syntax error. Under the target-row lock the
+                    // conflict arm is unreachable; it is emitted so that a
+                    // lock-bypassing writer produces an idempotent update
+                    // rather than a `23505` escaping to the caller.
+                    ::core::option::Option::None => {
+                        ::autumn_web::reexports::diesel::insert_into(
+                            #edge_mod::#edge_table::table
+                        )
+                        .values((
+                            #edge_mod::#edge_table::#reactor_fk.eq(reactor_id),
+                            #edge_mod::#edge_table::#target_fk.eq(target_id),
+                            #edge_mod::#edge_table::#value_ident.eq(value),
+                        ))
+                        .on_conflict((
+                            #edge_mod::#edge_table::#reactor_fk,
+                            #edge_mod::#edge_table::#target_fk,
+                        ))
+                        .do_update()
+                        .set(
+                            #edge_mod::#edge_table::#value_ident.eq(
+                                ::autumn_web::reexports::diesel::upsert::excluded(
+                                    #edge_mod::#edge_table::#value_ident
+                                )
+                            )
+                        )
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::Some(value),
+                            ::autumn_web::repository::ReactionOutcome::Inserted,
+                        )
+                    }
+                };
+            },
+            // `sum(SmallInt)` is typed `Nullable<BigInt>` by Diesel, so no
+            // backend-specific cast is needed; the `NULL` (no edges) case is
+            // coalesced in Rust rather than in SQL.
+            quote! {
+                let __total: ::core::option::Option<i64> = #edge_mod::#edge_table::table
+                    .filter(#edge_mod::#edge_table::#target_fk.eq(target_id))
+                    .select(::autumn_web::reexports::diesel::dsl::sum(
+                        #edge_mod::#edge_table::#value_ident
+                    ))
+                    .get_result::<::core::option::Option<i64>>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                let __aggregate: i64 = __total.unwrap_or(0);
+            },
+        )
+    } else {
+        (
+            None,
+            quote! {
+                let __current: ::core::option::Option<i64> = #edge_of_reactor
+                    .select(#edge_mod::#edge_table::#target_fk)
+                    .first::<i64>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?;
+            },
+            quote! {
+                let (__new_value, __outcome) = match __current {
+                    // Count mode is unary membership: a repeat click can only
+                    // toggle the row off, never flip it.
+                    ::core::option::Option::Some(_) => {
+                        ::autumn_web::reexports::diesel::delete(#edge_of_reactor)
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::None,
+                            ::autumn_web::repository::ReactionOutcome::Removed,
+                        )
+                    }
+                    ::core::option::Option::None => {
+                        ::autumn_web::reexports::diesel::insert_into(
+                            #edge_mod::#edge_table::table
+                        )
+                        .values((
+                            #edge_mod::#edge_table::#reactor_fk.eq(reactor_id),
+                            #edge_mod::#edge_table::#target_fk.eq(target_id),
+                        ))
+                        .on_conflict((
+                            #edge_mod::#edge_table::#reactor_fk,
+                            #edge_mod::#edge_table::#target_fk,
+                        ))
+                        .do_nothing()
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::Some(1i16),
+                            ::autumn_web::repository::ReactionOutcome::Inserted,
+                        )
+                    }
+                };
+            },
+            quote! {
+                let __aggregate: i64 = #edge_mod::#edge_table::table
+                    .filter(#edge_mod::#edge_table::#target_fk.eq(target_id))
+                    .count()
+                    .get_result::<i64>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+            },
+        )
+    };
+
+    let reaction_of_body = if is_sum {
+        let value_ident = format_ident!(
+            "{}",
+            spec.value_column
+                .as_ref()
+                .expect("sum mode always resolves a value column")
+        );
+        quote! {
+            #edge_of_reactor
+                .select(#edge_mod::#edge_table::#value_ident)
+                .first::<i16>(&mut conn)
+                .await
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)
+        }
+    } else {
+        quote! {
+            let __row: ::core::option::Option<i64> = #edge_of_reactor
+                .select(#edge_mod::#edge_table::#target_fk)
+                .first::<i64>(&mut conn)
+                .await
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?;
+            // Uniform `Option<i16>` in both modes: a present membership row
+            // reports `Some(1)`, so view/widget code is mode-independent.
+            ::core::result::Result::Ok(__row.map(|_| 1i16))
+        }
+    };
+
+    // ── Docs ─────────────────────────────────────────────────────────────
+    let aggregate_word = if is_sum { "SUM(value)" } else { "COUNT(*)" };
+    let trait_doc = format!(
+        "Reaction helpers for `{model_ident}`'s `#[votable(by = {}, aggregate \
+         = {})]` declaration: the `{}` edge table keyed on `({}, {})`, \
+         aggregated into `{}.{}`.",
+        spec.reactor,
+        if is_sum { "sum" } else { "count" },
+        spec.table,
+        spec.reactor_fk,
+        spec.target_fk,
+        table_ident,
+        spec.column,
+    );
+    let react_doc = format!(
+        "Toggle / flip / insert this reactor's reaction on `target_id`, and \
+         recompute `{}.{}` from ground truth in the **same** transaction, so a \
+         reader never observes edge/aggregate disagreement.\n\
+         \n\
+         Idempotent and race-safe: the target row is locked for the whole \
+         read-decide-write-recompute window, so N concurrent calls converge to \
+         at most one edge per `({}, {})` and the persisted aggregate always \
+         equals `{aggregate_word}`.\n\
+         \n\
+         Runs on its **own** pooled connection — it does not join an enclosing \
+         `Db::tx`. Do not hold a `Db` extractor across this call on a small \
+         pool.\n\
+         \n\
+         # Errors\n\
+         \n\
+         - `AutumnError::not_found` when `target_id` does not exist (or is \
+         soft-deleted).\n\
+         - Any database error from the enclosing transaction.",
+        table_ident, spec.column, spec.reactor_fk, spec.target_fk,
+    );
+    let reaction_of_doc = format!(
+        "This reactor's current reaction on `target_id`, or `None`.\n\
+         \n\
+         A single indexed lookup on `{}`; safe to call per-row on a detail \
+         page. For feed pages prefer rendering un-highlighted controls over an \
+         N+1 — a batch accessor is tracked as a follow-up.\n\
+         \n\
+         # Errors\n\
+         \n\
+         Any database error.",
+        spec.table,
+    );
+
+    quote! {
+        #hidden_module
+
+        #[doc = #trait_doc]
+        #vis trait #trait_ident {
+            #[doc = #react_doc]
+            fn react(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+                #react_value_param
+            ) -> impl ::std::future::Future<
+                Output = ::autumn_web::AutumnResult<::autumn_web::repository::Reaction>
+            > + Send;
+
+            #[doc = #reaction_of_doc]
+            fn reaction_of(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+            ) -> impl ::std::future::Future<
+                Output = ::autumn_web::AutumnResult<::core::option::Option<i16>>
+            > + Send;
+        }
+
+        impl<__R> #trait_ident for __R
+        where
+            __R: ::autumn_web::repository::M2mConnSource<Model = #model_ident>
+                + ::core::marker::Sync,
+        {
+            async fn react(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+                #react_value_param
+            ) -> ::autumn_web::AutumnResult<::autumn_web::repository::Reaction> {
+                use ::autumn_web::reexports::diesel::result::OptionalExtension as _;
+                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                let mut conn = self.__autumn_m2m_write_conn().await?;
+                ::autumn_web::__private::scoped_immediate_transaction::<
+                    ::autumn_web::repository::Reaction,
+                    ::autumn_web::AutumnError,
+                    _,
+                >(&mut *conn, |conn| {
+                    async move {
+                        // S1: take the exclusive lock on the target row before
+                        // anything is read, and use the same statement as the
+                        // existence/soft-delete guard. On SQLite the enclosing
+                        // `BEGIN IMMEDIATE` already serializes writers, so the
+                        // unsupported `FOR UPDATE` is redundant as well as
+                        // unemittable.
+                        let __target: ::core::option::Option<i64> =
+                            ::autumn_web::backend_select! {
+                                pg => {
+                                    #edge_mod::#table_ident::table
+                                        .filter(#edge_mod::#table_ident::id.eq(target_id))
+                                        #live_filter
+                                        .select(#edge_mod::#table_ident::id)
+                                        .for_update()
+                                        .first::<i64>(conn)
+                                        .await
+                                        .optional()
+                                        .map_err(::autumn_web::AutumnError::from)?
+                                },
+                                sqlite => {
+                                    #edge_mod::#table_ident::table
+                                        .filter(#edge_mod::#table_ident::id.eq(target_id))
+                                        #live_filter
+                                        .select(#edge_mod::#table_ident::id)
+                                        .first::<i64>(conn)
+                                        .await
+                                        .optional()
+                                        .map_err(::autumn_web::AutumnError::from)?
+                                },
+                            };
+                        if __target.is_none() {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::not_found_msg(#not_found_msg)
+                            );
+                        }
+
+                        // S2 — safe: the target lock is held.
+                        #read_current
+
+                        // S3 — exactly one of delete / update / upsert.
+                        #branch
+
+                        // S4 — ground truth, not an accumulated delta, so any
+                        // historical drift self-heals on the next reaction.
+                        #aggregate_query
+
+                        // S5 — persist, in the same transaction as S3.
+                        ::autumn_web::reexports::diesel::update(
+                            #edge_mod::#table_ident::table
+                                .filter(#edge_mod::#table_ident::id.eq(target_id))
+                                #live_filter
+                        )
+                        .set(#edge_mod::#table_ident::#agg_column.eq(__aggregate))
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+
+                        ::core::result::Result::Ok(::autumn_web::repository::Reaction {
+                            value: __new_value,
+                            aggregate: __aggregate,
+                            outcome: __outcome,
+                        })
+                    }
+                    .scope_boxed()
+                })
+                .await
+            }
+
+            async fn reaction_of(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+            ) -> ::autumn_web::AutumnResult<::core::option::Option<i16>> {
+                use ::autumn_web::reexports::diesel::result::OptionalExtension as _;
+                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                let mut conn = self.__autumn_m2m_write_conn().await?;
+                #reaction_of_body
+            }
+        }
     }
 }
 
@@ -3512,11 +4211,21 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let association_items = emit_association_items(name, &table_ident, vis, &associations);
     let dependents_impl = emit_dependents_impl(name, &associations);
 
+    // `#[votable(by = ..., ...)]` (#1362). Resolved here next to the
+    // associations; emitted below, once `all_fields` is known (the aggregate
+    // column must name a real field, and the soft-delete guard is emitted only
+    // when the model has a `deleted_at`).
+    let votable = match resolve_votable(name, outer_attrs) {
+        Ok(spec) => spec,
+        Err(err) => return err.to_compile_error(),
+    };
+
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
         .filter(|a| {
             !a.path().is_ident("searchable")
                 && !is_association_attr(a)
+                && !is_votable_attr(a)
                 && !a.path().is_ident("shard_key")
         })
         .collect();
@@ -3555,6 +4264,39 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error();
         }
     }
+
+    // Validate that `#[votable]`'s aggregate column names an existing field,
+    // mirroring the shard_key check above. Without it the hidden edge module
+    // declares the column regardless and the mistake only surfaces as a runtime
+    // `42703 column "score" does not exist` on the very first reaction.
+    let votable_items = match votable {
+        None => TokenStream::new(),
+        Some(ref spec) => {
+            let column_exists = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == &spec.column));
+            if !column_exists {
+                let attr = outer_attrs
+                    .iter()
+                    .find(|a| is_votable_attr(a))
+                    .expect("attribute was parsed above");
+                return syn::Error::new_spanned(
+                    attr,
+                    format!(
+                        "votable aggregate column `{}` not found on model `{name}`; \
+                         add the field (e.g. `pub {}: i64`) or override it with \
+                         `#[votable(..., column = <field>)]`",
+                        spec.column, spec.column,
+                    ),
+                )
+                .to_compile_error();
+            }
+            let has_deleted_at = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+            emit_votable_items(name, &table_ident, vis, spec, has_deleted_at)
+        }
+    };
 
     let mut search_field_names = Vec::new();
     let mut search_field_weights = Vec::new();
@@ -6074,6 +6816,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // ── Model-declared dependent cascade specs (#1738) ──────────────────
         #dependents_impl
+
+        // ── Votable reactions (#[votable], #1362) ───────────────────────────
+        #votable_items
     }
 }
 

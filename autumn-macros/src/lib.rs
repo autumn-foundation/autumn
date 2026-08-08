@@ -503,6 +503,100 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// pub struct User { /* ... */ }
 /// // -> add_follower/remove_follower and add_following/remove_following
 /// ```
+///
+/// # Votable (reactions)
+///
+/// `#[votable(by = <Reactor>)]` declares a reaction association (#1362): a
+/// `(reactor, target)`-unique edge table plus an aggregate column maintained on
+/// this model. It replaces the hand-written toggle/flip/upsert SQL and the
+/// score recompute that every voting, liking or bookmarking feature otherwise
+/// grows.
+///
+/// ```ignore
+/// #[model]
+/// #[votable(by = User, aggregate = sum)]   // signed up/down votes
+/// pub struct Post {
+///     #[id]
+///     pub id: i64,
+///     pub title: String,
+///     pub score: i64,                      // the aggregate column
+/// }
+/// ```
+///
+/// Two modes: `aggregate = sum` (the default — signed values, `score =
+/// SUM(value)`) and `aggregate = count` (unary likes — no value column,
+/// `{name}_count = COUNT(*)`). Every name is inferred and every inference has
+/// an override:
+///
+/// | Key | Default | Meaning |
+/// |---|---|---|
+/// | `by` | **required** | the reactor model, e.g. `User` |
+/// | `aggregate` | `sum` | `sum` \| `count` |
+/// | `name` | `vote` | reaction name; drives `table` and the count column |
+/// | `table` | `pluralize(name)` → `votes` | the edge table |
+/// | `reactor_fk` | `{snake(by)}_id` → `user_id` | edge column → reactor |
+/// | `target_fk` | `{snake(Model)}_id` → `post_id` | edge column → this model |
+/// | `value_column` | `value` (sum only) | the edge's signed value |
+/// | `column` | `score` (sum) / `{name}_count` (count) | aggregate column |
+///
+/// A likes feature is therefore `#[votable(by = User, aggregate = count, name
+/// = like)]` → table `likes`, column `like_count`. At most one `#[votable]` per
+/// model.
+///
+/// ## Required migration
+///
+/// The edge table is the user's to create, and its **composite `UNIQUE
+/// (reactor_fk, target_fk)` is load-bearing**: it is the `ON CONFLICT` arbiter
+/// the generated upsert names, and it is what makes "at most one edge per
+/// (reactor, target)" a database guarantee. Both foreign keys must be
+/// `BIGINT NOT NULL` (a nullable target would defeat the arbiter — `NULL`s are
+/// distinct in a unique constraint), the value column `SMALLINT`, and the
+/// aggregate column `BIGINT NOT NULL DEFAULT 0`:
+///
+/// ```sql
+/// CREATE TABLE votes (
+///     user_id BIGINT NOT NULL REFERENCES users(id),
+///     post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+///     value   SMALLINT NOT NULL CHECK (value IN (-1, 1)),
+///     UNIQUE (user_id, post_id)          -- the ON CONFLICT arbiter
+/// );
+/// ALTER TABLE posts ADD COLUMN score BIGINT NOT NULL DEFAULT 0;
+/// -- aggregate = count: drop the `value` column entirely.
+/// ```
+///
+/// ## Generated helpers
+///
+/// A `{Model}Reactions` trait, blanket-implemented for the model's
+/// `#[repository]`:
+///
+/// ```ignore
+/// use autumn_web::repository::{Reaction, ReactionOutcome};
+///
+/// // sum mode. (count mode: `react(reactor_id, target_id)` — no value.)
+/// let r: Reaction = posts.react(user_id, post_id, 1).await?;
+/// r.value;      // Option<i16>: the reactor's reaction AFTER the call
+/// r.aggregate;  // i64: the newly persisted score, ground truth at commit
+/// r.outcome;    // Inserted | Flipped | Removed
+///
+/// let mine: Option<i16> = posts.reaction_of(user_id, post_id).await?;
+/// ```
+///
+/// `react()` is idempotent and race-safe: the same value again toggles the edge
+/// off, a different value flips it in place, a new one inserts it — and the
+/// aggregate is recomputed from ground truth (`SUM`/`COUNT`) and persisted in
+/// the **same transaction**, so a reader never observes edge/aggregate
+/// disagreement. The target row is locked (`SELECT ... FOR UPDATE` on Postgres,
+/// `BEGIN IMMEDIATE` on `SQLite`) for the whole read-decide-write-recompute
+/// window, so concurrent reactions on one target converge to at most one edge
+/// per `(reactor, target)` and the persisted aggregate is exact even across
+/// *different* reactors.
+///
+/// When the model has a `deleted_at` field, reacting to a soft-deleted target
+/// is `NotFound` and leaves its aggregate untouched.
+///
+/// `react()` acquires its **own** pooled connection and does not join an
+/// enclosing `Db::tx` — do not hold a `Db` extractor across the call on a small
+/// connection pool.
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     model::model_macro(attr.into(), item.into()).into()
