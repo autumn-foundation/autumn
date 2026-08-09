@@ -35,6 +35,14 @@
 //! | Plain `GET` form is sufficient | `axum::extract::Query` |
 //! | You need unusual htmx wiring | Hand-write `hx-*` attributes |
 //!
+//! # Bulk actions
+//!
+//! | Widget | Use |
+//! |--------|-----|
+//! | `bulk_select_checkbox` | One row's `name="ids"` select checkbox (issue #1312) |
+//! | `bulk_actions_toolbar` | `role="group"` submit button applying the selection |
+//! | `bulk_actions_form` | `POST` form wrapping a list + toolbar, with the CSRF field |
+//!
 //! # Modals & confirmation
 //!
 //! | Situation | Use |
@@ -1192,39 +1200,208 @@ impl<'a> BulkActionsConfig<'a> {
     }
 }
 
-/// Render one row's bulk-select checkbox.
+/// Render one row's bulk-select checkbox (issue #1312).
+///
+/// One of these goes in the first cell of every row inside a
+/// [`bulk_actions_form`]. Every checkbox shares the same `name`
+/// ([`BulkActionsConfig::field_name`], default `"ids"`), so a browser submits
+/// the checked rows as repeated `ids=<value>` pairs — no JavaScript, no
+/// per-row form. The server side reads them back with any repeated-key form
+/// parser (the scaffold's generated `parse_bulk_ids` accepts both `ids` and
+/// the `ids[]` spelling some clients emit).
+///
+/// `value` is anything [`Display`](std::fmt::Display) — typically the row's
+/// primary key. It is HTML-escaped by Maud, both in `value` and in the
+/// `aria-label` (`"{select_label} {value}"`), so a screen reader announces
+/// which row each checkbox selects rather than a wall of unlabelled controls.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-bulk-select` | The per-row `<input type="checkbox">` |
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{BulkActionsConfig, Column, bulk_select_checkbox};
+///
+/// let action = paths::bulk_delete();
+/// let cfg = BulkActionsConfig::new(&action);
+/// let mut columns: Vec<Column<Post>> = post_columns();
+/// columns.insert(
+///     0,
+///     Column::new("", |row: &Post| maud::html! { (bulk_select_checkbox(row.id, &cfg)) }),
+/// );
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_select_checkbox};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+/// let html = bulk_select_checkbox(42, &cfg).into_string();
+/// assert!(html.contains(r#"type="checkbox""#));
+/// assert!(html.contains(r#"name="ids""#));
+/// assert!(html.contains(r#"value="42""#));
+/// assert!(html.contains(r#"aria-label="Select row 42""#));
+/// ```
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn bulk_select_checkbox(
     value: impl std::fmt::Display,
     config: &BulkActionsConfig<'_>,
 ) -> maud::Markup {
-    // TODO(#1312): green phase
-    let _ = (value.to_string(), config);
-    maud::html! {}
+    let value = value.to_string();
+    let aria_label = format!("{} {value}", config.select_label);
+    maud::html! {
+        input type="checkbox" name=(config.field_name) value=(value)
+            class="autumn-bulk-select" aria-label=(aria_label);
+    }
 }
 
-/// Render the bulk-actions toolbar (the submit button).
+/// Render the bulk-actions toolbar — the submit button that applies the
+/// selection (issue #1312).
+///
+/// Rendered automatically at the end of a [`bulk_actions_form`]; call it
+/// directly only when hand-building the surrounding `<form>`.
+///
+/// # No-JavaScript guarantee
+///
+/// The button is a plain `<button type="submit">`. An `onclick="return
+/// confirm(...)"` handler is emitted **only** when
+/// [`BulkActionsConfig::confirm`] opted in — so the default control still
+/// works with scripting disabled, and even with a confirmation configured the
+/// server remains the enforcement point.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-bulk-actions` | Grouping `<div role="group">` around the submit button |
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_toolbar};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete")
+///     .submit_label("Delete selected")
+///     .confirm("Delete the selected posts?");
+/// let toolbar = bulk_actions_toolbar(&cfg);
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_toolbar};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+/// let html = bulk_actions_toolbar(&cfg).into_string();
+/// assert!(html.contains(r#"class="autumn-bulk-actions""#));
+/// assert!(html.contains(r#"type="submit""#));
+/// assert!(html.contains("Delete selected"));
+/// // No confirmation was configured, so no inline handler is emitted.
+/// assert!(!html.contains("onclick"));
+/// ```
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
-    // TODO(#1312): green phase
-    let _ = config;
-    maud::html! {}
+    // Built as an owned string so Maud's attribute escaping applies to the
+    // caller-supplied prompt (a `'` in the message can't break out of the
+    // handler, and `<`/`&` can't break out of the attribute).
+    let onclick = config
+        .confirm
+        .map(|message| format!("return confirm('{message}')"));
+    maud::html! {
+        div class="autumn-bulk-actions" role="group" {
+            button type="submit" onclick=[onclick.as_deref()] { (config.submit_label) }
+        }
+    }
 }
 
-/// Wrap `content` in the bulk-actions `<form>`, with a csrf field and toolbar.
+/// Wrap a rendered list in the bulk-actions `<form>` (issue #1312).
+///
+/// This is the outer half of the no-JavaScript bulk-select flow: a plain
+/// `POST` form whose `action` is [`BulkActionsConfig::action`], containing (in
+/// order) the hidden CSRF field, the caller's `content` — a table, list, or
+/// anything else carrying one [`bulk_select_checkbox`] per row — and the
+/// [`bulk_actions_toolbar`] submit button.
+///
+/// Keep page furniture that is *not* part of the selection (a "New record"
+/// link, a search box) outside the form: anything inside is submitted with the
+/// selection.
+///
+/// # CSRF
+///
+/// Pass the handler's token as `csrf_token` and the configured field name as
+/// `csrf_field` (both `Option<&str>`, e.g.
+/// `csrf.as_ref().map(|t| t.token())` and
+/// `csrf_field.as_ref().map(|f| f.0.as_str())`). When `csrf_token` is `None`
+/// no hidden input is rendered at all; when it is `Some`, the field name
+/// defaults to `"_csrf"`.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-bulk-form` | The wrapping `<form method="post">` |
+/// | `.autumn-bulk-actions` | Grouping `<div role="group">` around the submit button |
+/// | `.autumn-bulk-select` | Each row's `<input type="checkbox">` |
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_form, data_table, DataTableConfig};
+///
+/// let action = paths::bulk_delete();
+/// let cfg = BulkActionsConfig::new(&action);
+/// Ok(layout("Posts", html! {
+///     a href=(paths::new()) { "New Post" } // outside the form
+///     (bulk_actions_form(
+///         &cfg,
+///         csrf.as_ref().map(|t| t.token()),
+///         csrf_field.as_ref().map(|f| f.0.as_str()),
+///         html! {
+///             (data_table(&page.content, &columns, &DataTableConfig::new("No posts yet.")))
+///         },
+///     ))
+/// }))
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_form};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+/// let html = bulk_actions_form(&cfg, Some("tok-123"), None, maud::html! { p { "rows" } })
+///     .into_string();
+/// assert!(html.contains(r#"method="post""#));
+/// assert!(html.contains(r#"action="/posts/bulk_delete""#));
+/// assert!(html.contains(r#"name="_csrf""#));
+/// assert!(html.contains(r#"value="tok-123""#));
+/// // Content first, toolbar last, all inside the form.
+/// assert!(html.find("rows") < html.find("autumn-bulk-actions"));
+/// assert!(html.trim_end().ends_with("</form>"));
+/// ```
+// `content` is taken by value so `bulk_actions_form(&cfg, .., html! { .. })`
+// reads without a `&` at the call site (matching `alert_with`); Maud renders it
+// by reference, hence the allow.
 #[cfg(feature = "maud")]
 #[must_use]
+#[allow(clippy::needless_pass_by_value)]
 pub fn bulk_actions_form(
     config: &BulkActionsConfig<'_>,
     csrf_token: Option<&str>,
     csrf_field: Option<&str>,
     content: maud::Markup,
 ) -> maud::Markup {
-    // TODO(#1312): green phase
-    let _ = (config, csrf_token, csrf_field, content);
-    maud::html! {}
+    let csrf_field_name = csrf_field.unwrap_or("_csrf");
+    maud::html! {
+        form method="post" action=(config.action) class="autumn-bulk-form" {
+            @if let Some(token) = csrf_token {
+                input type="hidden" name=(csrf_field_name) value=(token);
+            }
+            (content)
+            (bulk_actions_toolbar(config))
+        }
+    }
 }
 
 // ── breadcrumb ────────────────────────────────────────────────────────────

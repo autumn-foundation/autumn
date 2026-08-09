@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli,web:** `autumn generate scaffold` now ships a **no-JavaScript
+  bulk-select + delete-selected flow** on every standard HTML index list
+  (#1312). The `data_table` gains a leading
+  `bulk_select_checkbox` column, the list (and, with `--searchable`, the whole
+  htmx-swapped results container) is wrapped in a `bulk_actions_form` posting
+  to a new `#[secured] POST /{plural}/bulk_delete` handler, and `src/main.rs`
+  mounts that route immediately after `destroy`. The handler parses the
+  repeated checkboxes with a generated `parse_bulk_ids` helper, per-row
+  authorizes with the same `"delete"` action `destroy` uses when policy wiring
+  is on (an unauthorized row is dropped from the batch, not 403'd, so the
+  endpoint is no existence oracle), routes the delete through
+  `repo.delete_many` so soft-delete/hooks/`dependent(...)` cascades all apply,
+  flashes the deleted count, and 303s back to the index. An empty or malformed
+  selection redirects without error — a list-write endpoint never 400s on bad
+  params. The checkbox field is deliberately `name="ids"` (not `ids[]`),
+  matching `autumn-admin-plugin`'s existing bulk-action contract; the parser
+  accepts the `ids[]` spelling too, for clients that send it. Three reusable
+  widgets back it for hand-written views: `autumn_web::widgets::{
+  bulk_select_checkbox, bulk_actions_toolbar, bulk_actions_form}` plus a
+  `BulkActionsConfig` builder (opt-in `confirm(...)` prompt; off by default so
+  the control keeps working with scripting disabled). Gated off for
+  `--live`/`--live-validation`/`--sharded`/`--api`, whose output stays
+  byte-identical.
 - **sim-testing:** fix a genuine **job-backoff thundering herd** the
   deterministic simulation harness caught (W7, #1797): the local job
   runtime's retry backoff (`execute_local_job`, `job.rs`) computed a pure
