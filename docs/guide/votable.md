@@ -299,13 +299,20 @@ let reaction = posts_repo.react(user_id, post_id, value).await?;
 
 broadcast_post_update(post_id, state).await?;
 
-Ok(vote_controls(post_id, reaction.aggregate, reaction.value, Some(csrf)))
+if hx.is_htmx {
+    // htmx swaps the fragment in place.
+    Ok(vote_controls(post_id, reaction.aggregate, reaction.value, Some(csrf)).into_response())
+} else {
+    // A plain form POST (JavaScript off) navigates: hand back a full page,
+    // not a bare fragment.
+    Ok(Redirect::to(&format!("/posts/{post_id}")).into_response())
+}
 ```
 
 The vote mechanics are now a single statement: no transaction management, no
-reload to learn the new score, and none of the three defects above. The file
-went from 168 lines to 130, and — the claim worth being precise about — it now
-contains **zero raw SQL**. It is not diesel-free: the `broadcast_post_update`
+reload to learn the new score, and none of the three defects above. Roughly 90
+lines of hand-written vote mechanics are gone, and — the claim worth being
+precise about — the file now contains **zero raw SQL**. It is not diesel-free: the `broadcast_post_update`
 helper below still loads the post and its relations with diesel to build the
 SSE fragment. That is presentation, not vote logic, which is exactly why it
 lives in its own helper.

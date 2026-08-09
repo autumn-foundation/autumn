@@ -3,12 +3,15 @@
 //! Demonstrates: the declarative `#[votable(by = User, aggregate = sum)]`
 //! association (#1362) replacing ~90 lines of hand-written toggle/flip/upsert
 //! SQL and a raw `UPDATE posts SET score = (SELECT SUM(...))` recompute with a
-//! single race-safe `posts.react(...)` call (this file went from 168 lines to
-//! 130, and the vote logic itself is now three statements); htmx partial
-//! updates; session auth.
+//! single race-safe `posts.react(...)` call (the vote logic itself is now one
+//! statement); htmx partial updates with a full-page redirect for plain form
+//! POSTs; session auth.
 
+use autumn_web::Redirect;
 use autumn_web::extract::Path;
+use autumn_web::htmx::HxRequest;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
@@ -21,28 +24,32 @@ use crate::schema::{posts, subreddits, users};
 
 use super::layout::vote_controls;
 
-/// Upvote a post (+1). Returns updated vote controls HTML via htmx.
+/// Upvote a post (+1). htmx requests get the updated vote-controls fragment;
+/// a plain form POST (JavaScript off) is redirected back to the post.
 #[post("/posts/{post_id}/upvote")]
 pub async fn upvote(
     Path(post_id): Path<i64>,
+    hx: HxRequest,
     session: Session,
     csrf: CsrfToken,
     posts_repo: PgPostRepository,
     State(state): State<AppState>,
-) -> AutumnResult<Markup> {
-    cast_vote(post_id, 1, &session, &csrf, &posts_repo, &state).await
+) -> AutumnResult<Response> {
+    cast_vote(post_id, 1, &hx, &session, &csrf, &posts_repo, &state).await
 }
 
-/// Downvote a post (-1). Returns updated vote controls HTML via htmx.
+/// Downvote a post (-1). htmx requests get the updated vote-controls fragment;
+/// a plain form POST (JavaScript off) is redirected back to the post.
 #[post("/posts/{post_id}/downvote")]
 pub async fn downvote(
     Path(post_id): Path<i64>,
+    hx: HxRequest,
     session: Session,
     csrf: CsrfToken,
     posts_repo: PgPostRepository,
     State(state): State<AppState>,
-) -> AutumnResult<Markup> {
-    cast_vote(post_id, -1, &session, &csrf, &posts_repo, &state).await
+) -> AutumnResult<Response> {
+    cast_vote(post_id, -1, &hx, &session, &csrf, &posts_repo, &state).await
 }
 
 /// Cast a vote on a post: authenticate, `react`, re-render the control.
@@ -56,14 +63,22 @@ pub async fn downvote(
 ///
 /// The re-rendered control carries the viewer's CSRF token, so the buttons in
 /// the swapped-in fragment keep working with JavaScript off.
+///
+/// Response shape depends on the caller: htmx swaps the returned fragment in
+/// place, but a plain `<form method="post">` navigation would render that bare
+/// fragment as the whole page — so non-htmx requests get a `303 See Other`
+/// back to the post instead, where the updated score and the viewer's own
+/// vote are visible on a full page.
+#[allow(clippy::too_many_arguments)]
 async fn cast_vote(
     post_id: i64,
     value: i16,
+    hx: &HxRequest,
     session: &Session,
     csrf: &CsrfToken,
     posts_repo: &PgPostRepository,
     state: &AppState,
-) -> AutumnResult<Markup> {
+) -> AutumnResult<Response> {
     let user_id: i64 = session
         .get("user_id")
         .await
@@ -81,12 +96,12 @@ async fn cast_vote(
 
     broadcast_post_update(post_id, state).await?;
 
-    Ok(vote_controls(
-        post_id,
-        reaction.aggregate,
-        reaction.value,
-        Some(csrf),
-    ))
+    if hx.is_htmx {
+        Ok(vote_controls(post_id, reaction.aggregate, reaction.value, Some(csrf)).into_response())
+    } else {
+        // `/posts/{id}` canonicalizes to the post's full URL (`show_by_id`).
+        Ok(Redirect::to(&format!("/posts/{post_id}")).into_response())
+    }
 }
 
 /// Publish the updated post fragment to the global and per-subreddit SSE

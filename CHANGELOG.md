@@ -47,8 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `votes` / `user_id` / `post_id` / `value` / `score`, which is why
   `examples/reddit-clone` adopted it with **no migration and no overrides**,
   collapsing ~90 lines of hand-written toggle/flip/upsert SQL and a raw
-  `sql_query` score recompute in `src/routes/votes.rs` (168 lines to 130) to a
-  single `posts.react(...)` call, leaving zero raw SQL in that file. The
+  `sql_query` score recompute in `src/routes/votes.rs` to a single
+  `posts.react(...)` call, leaving zero raw SQL in that file. The
   composite `UNIQUE (reactor_fk, target_fk)` on the edge table is load-bearing
   (it is the `ON CONFLICT` arbiter) and remains the app's migration to write,
   as is a `CHECK` on the value column: `react()` does **not** validate `value`,

@@ -1600,8 +1600,10 @@ fn emit_association_items(
 /// is never type-checked).
 ///
 /// `pk_ident` is the model's primary-key field (resolved by the caller exactly
-/// as the CRUD codegen resolves it), used to emit the `i64`-primary-key
-/// compile-time guard.
+/// as the CRUD codegen resolves it). It is used both for the `i64`-primary-key
+/// compile-time guard and as the primary-key column of the hidden target
+/// projection — a model whose `#[id]` field is not named `id` (e.g. `memo_id`)
+/// has no `id` column for S1/S5 to lock and update.
 #[allow(clippy::too_many_lines)]
 fn emit_votable_items(
     model_ident: &syn::Ident,
@@ -1623,6 +1625,13 @@ fn emit_votable_items(
     let reactor_fk = format_ident!("{}", spec.reactor_fk);
     let target_fk = format_ident!("{}", spec.target_fk);
     let agg_column = format_ident!("{}", spec.column);
+    // The target projection must name the model's real primary-key column:
+    // `react()` locks and updates `WHERE #pk_column = $target_id`, and a
+    // hard-coded `id` would miss (or worse, hit an unrelated column on) a
+    // model whose `#[id]` field is named differently. `None` only happens for
+    // models the rest of the macro already refuses to generate CRUD for; keep
+    // the historical `id` there so the error surface is unchanged.
+    let pk_column = pk_ident.map_or_else(|| format_ident!("id"), ::std::clone::Clone::clone);
     let trait_ident = format_ident!("{model_ident}Reactions");
     let is_sum = spec.aggregate == VoteAggregate::Sum;
 
@@ -1681,8 +1690,8 @@ fn emit_votable_items(
                 }
             }
             ::autumn_web::reexports::diesel::table! {
-                #table_ident (id) {
-                    id -> Int8,
+                #table_ident (#pk_column) {
+                    #pk_column -> Int8,
                     #agg_column -> Int8,
                     #deleted_at_decl
                 }
@@ -2019,9 +2028,9 @@ fn emit_votable_items(
                             ::autumn_web::backend_select! {
                                 pg => {
                                     #edge_mod::#table_ident::table
-                                        .filter(#edge_mod::#table_ident::id.eq(target_id))
+                                        .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
                                         #live_filter
-                                        .select(#edge_mod::#table_ident::id)
+                                        .select(#edge_mod::#table_ident::#pk_column)
                                         .for_no_key_update()
                                         .first::<i64>(conn)
                                         .await
@@ -2030,9 +2039,9 @@ fn emit_votable_items(
                                 },
                                 sqlite => {
                                     #edge_mod::#table_ident::table
-                                        .filter(#edge_mod::#table_ident::id.eq(target_id))
+                                        .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
                                         #live_filter
-                                        .select(#edge_mod::#table_ident::id)
+                                        .select(#edge_mod::#table_ident::#pk_column)
                                         .first::<i64>(conn)
                                         .await
                                         .optional()
@@ -2058,7 +2067,7 @@ fn emit_votable_items(
                         // S5 — persist, in the same transaction as S3.
                         let __persisted: usize = ::autumn_web::reexports::diesel::update(
                             #edge_mod::#table_ident::table
-                                .filter(#edge_mod::#table_ident::id.eq(target_id))
+                                .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
                                 #live_filter
                         )
                         .set(#edge_mod::#table_ident::#agg_column.eq(__aggregate))
@@ -8341,6 +8350,46 @@ mod tests {
         assert!(
             generated.contains("score -> Int8"),
             "expected the aggregate column projected as BIGINT, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_target_projection_keys_on_the_models_real_primary_key() {
+        // PR #2177 review (P1): a model whose `#[id]` field is not named `id`
+        // (e.g. `memo_id`) has no `id` column at all — or worse, an unrelated
+        // one. The hidden projection, the S1 lock, and the S5 aggregate UPDATE
+        // must all key on the resolved primary-key column, never a hard-coded
+        // `id`.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Memo {
+                    #[id]
+                    pub memo_id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("memos (memo_id)"),
+            "expected the target projection keyed on the model's real primary \
+             key, got: {generated}"
+        );
+        assert!(
+            !generated.contains("memos (id)"),
+            "no hard-coded `id` primary key may survive on the target \
+             projection, got: {generated}"
+        );
+        assert!(
+            generated
+                .matches("memos :: memo_id . eq (target_id)")
+                .count()
+                >= 3,
+            "S1 (both backend arms) and S5 must filter the target table on the \
+             resolved primary key, got: {generated}"
         );
     }
 
