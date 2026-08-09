@@ -1727,6 +1727,12 @@ fn emit_votable_items(
                     #deleted_at_decl
                 }
             }
+            // Lets the tenant `EXISTS` subquery on the target appear inside a
+            // query on the edge table (and any future cross-table predicate).
+            ::autumn_web::reexports::diesel::allow_tables_to_appear_in_same_query!(
+                #edge_table,
+                #table_ident,
+            );
         }
     };
 
@@ -1849,30 +1855,23 @@ fn emit_votable_items(
         quote! { let __persisted: usize = #unscoped; }
     };
 
-    // `reaction_of`'s target probe. The edge table has no tenant column, so
-    // the target row *is* the tenant boundary: a target owned by another
-    // tenant has no visible reaction here, which is `Ok(None)` — not an error,
-    // matching what the reactor would see for a target that simply has no
-    // edge. Deliberately unlocked and NOT soft-delete filtered, mirroring
-    // `reaction_of`'s existing stance of reporting the edge regardless.
-    let reaction_of_tenant_probe = has_tenant_id.then(|| {
-        quote! {
-            if let ::core::option::Option::Some(ref __t) = __tenant {
-                let __in_tenant: ::core::option::Option<i64> =
-                    #edge_mod::#table_ident::table
-                        .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
-                        .filter(#edge_mod::#table_ident::tenant_id.eq(__t))
-                        .select(#edge_mod::#table_ident::#pk_column)
-                        .first::<i64>(&mut conn)
-                        .await
-                        .optional()
-                        .map_err(::autumn_web::AutumnError::from)?;
-                if __in_tenant.is_none() {
-                    return ::core::result::Result::Ok(::core::option::Option::None);
-                }
-            }
-        }
-    });
+    // `reaction_of`'s tenant boundary. The edge table has no tenant column, so
+    // the target row *is* the boundary: a target owned by another tenant has
+    // no visible reaction here, which is `Ok(None)` — not an error, matching
+    // what the reactor would see for a target that simply has no edge. The
+    // predicate is an `EXISTS` on the target projection folded into the edge
+    // lookup itself, NOT a separate probe statement: two statements under
+    // READ COMMITTED would be a TOCTOU window where a concurrent tenant
+    // reassignment lands between them and the foreign edge leaks anyway.
+    // Deliberately unlocked and NOT soft-delete filtered, mirroring
+    // `reaction_of`'s stance of reporting the edge regardless.
+    let reaction_of_tenant_exists = quote! {
+        .filter(::autumn_web::reexports::diesel::dsl::exists(
+            #edge_mod::#table_ident::table
+                .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
+                .filter(#edge_mod::#table_ident::tenant_id.eq(__t))
+        ))
+    };
 
     // ── S2: the reactor's current edge, S3: the three-way branch ─────────
     let (react_value_param, read_current, branch, aggregate_query) = if is_sum {
@@ -2029,33 +2028,56 @@ fn emit_votable_items(
         )
     };
 
-    let reaction_of_body = if is_sum {
-        let value_ident = format_ident!(
-            "{}",
-            spec.value_column
-                .as_ref()
-                .expect("sum mode always resolves a value column")
-        );
+    // One statically-typed lookup per (mode, scoped) combination, mirroring
+    // `target_probe`: the scoped arms carry the single-snapshot tenant
+    // `EXISTS`, the unscoped arms are byte-identical to the pre-tenant code.
+    let reaction_of_lookup = |scoped: bool| {
+        let tenant_predicate = scoped.then(|| reaction_of_tenant_exists.clone());
+        if is_sum {
+            let value_ident = format_ident!(
+                "{}",
+                spec.value_column
+                    .as_ref()
+                    .expect("sum mode always resolves a value column")
+            );
+            quote! {
+                #edge_of_reactor
+                    #tenant_predicate
+                    .select(#edge_mod::#edge_table::#value_ident)
+                    .first::<i16>(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)
+            }
+        } else {
+            quote! {
+                {
+                    let __row: ::core::option::Option<i64> = #edge_of_reactor
+                        #tenant_predicate
+                        .select(#edge_mod::#edge_table::#target_fk)
+                        .first::<i64>(&mut conn)
+                        .await
+                        .optional()
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    // Uniform `Option<i16>` in both modes: a present membership
+                    // row reports `Some(1)`, so view/widget code is
+                    // mode-independent.
+                    ::core::result::Result::Ok(__row.map(|_| 1i16))
+                }
+            }
+        }
+    };
+    let reaction_of_body = if has_tenant_id {
+        let scoped = reaction_of_lookup(true);
+        let unscoped = reaction_of_lookup(false);
         quote! {
-            #edge_of_reactor
-                .select(#edge_mod::#edge_table::#value_ident)
-                .first::<i16>(&mut conn)
-                .await
-                .optional()
-                .map_err(::autumn_web::AutumnError::from)
+            match __tenant {
+                ::core::option::Option::Some(ref __t) => #scoped,
+                ::core::option::Option::None => #unscoped,
+            }
         }
     } else {
-        quote! {
-            let __row: ::core::option::Option<i64> = #edge_of_reactor
-                .select(#edge_mod::#edge_table::#target_fk)
-                .first::<i64>(&mut conn)
-                .await
-                .optional()
-                .map_err(::autumn_web::AutumnError::from)?;
-            // Uniform `Option<i16>` in both modes: a present membership row
-            // reports `Some(1)`, so view/widget code is mode-independent.
-            ::core::result::Result::Ok(__row.map(|_| 1i16))
-        }
+        reaction_of_lookup(false)
     };
 
     // ── Docs ─────────────────────────────────────────────────────────────
@@ -2291,7 +2313,6 @@ fn emit_votable_items(
                 // A read: routed per the repository's `ReadRoute`, and it does
                 // not mark the read-your-writes pin.
                 let mut conn = self.__autumn_m2m_read_conn().await?;
-                #reaction_of_tenant_probe
                 #reaction_of_body
             }
         }
@@ -8927,7 +8948,7 @@ mod tests {
         //   1. S1, `pg` arm     — the locking existence guard,
         //   2. S1, `sqlite` arm — the same guard without the row lock,
         //   3. S5              — the aggregate UPDATE,
-        //   4. `reaction_of`   — the target-in-this-tenant probe.
+        //   4. `reaction_of`   — the tenant EXISTS folded into the edge lookup.
         //
         // The arms stay separate whole queries rather than one boxed query
         // with a conditional predicate, because S1's `pg` arm carries
@@ -8938,7 +8959,21 @@ mod tests {
             votable.matches("tenant_id . eq").count(),
             4,
             "expected exactly 4 tenant-filtered target sites (S1 pg, S1 sqlite, \
-             S5, reaction_of's probe), got: {votable}"
+             S5, reaction_of's EXISTS), got: {votable}"
+        );
+        // reaction_of's tenant boundary must be a single-snapshot predicate —
+        // an EXISTS on the target inside the edge lookup itself — never a
+        // separate probe statement, which under READ COMMITTED is a TOCTOU
+        // window: a concurrent tenant reassignment lands between probe and
+        // lookup and the foreign edge leaks anyway (PR #2177 review).
+        assert!(
+            votable.contains(":: dsl :: exists"),
+            "reaction_of's tenant check must be an EXISTS folded into the edge \
+             lookup, got: {votable}"
+        );
+        assert!(
+            !votable.contains("__in_tenant"),
+            "the two-statement tenant probe must not survive, got: {votable}"
         );
         assert!(
             votable.contains("for_no_key_update"),
