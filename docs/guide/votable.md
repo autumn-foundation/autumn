@@ -533,7 +533,10 @@ pub fn vote_controls(
 - `.current(...)` takes `reaction_of()`'s result and presses the matching
   button (`aria-pressed="true"` plus the `autumn-reaction-active` class);
   `None` presses neither, which is what feeds and signed-out viewers pass.
-- Each form carries `hx-post` / `hx-target` / `hx-swap="outerHTML"`, with
+- Each form carries `hx-post` / `hx-target` / `hx-swap="outerHTML"` and a
+  shared `hx-sync="#{dom_id}:replace"` — overlapping clicks from one viewer
+  abort the in-flight request, so only the last click's response repaints the
+  control — with
   `hx-target` defaulting to `#{dom_id}` — so the control replaces itself in
   place. `dom_id` is interpolated into that selector, so build it yourself
   (`format!("votes-{post_id}")`); never pass a request parameter.

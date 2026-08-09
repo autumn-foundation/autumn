@@ -345,6 +345,16 @@ fn emits_htmx_post_target_and_outer_html_swap() {
         2,
         "each form swaps the control in place: {html}"
     );
+    // Both forms share one `replace`-strategy sync scope, so a second click
+    // (up then down before the first response returns) aborts the in-flight
+    // request and only the LAST click's response repaints the control — an
+    // older response can never land second and press the stale direction
+    // (PR #2177 review).
+    assert_eq!(
+        html.matches(r##"hx-sync="#votes-42:replace""##).count(),
+        2,
+        "both forms must serialize through the control's sync scope: {html}"
+    );
 }
 
 #[test]

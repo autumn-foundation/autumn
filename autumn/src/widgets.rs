@@ -1064,7 +1064,10 @@ impl ReactionControls {
 ///   carrying a single `<button type="submit">` (plus the hidden CSRF input
 ///   when a token is threaded), so the control still submits with JavaScript
 ///   disabled. The same form also carries `hx-post` / `hx-target` /
-///   `hx-swap="outerHTML"`, so with htmx loaded the submit is intercepted and
+///   `hx-swap="outerHTML"` and a shared `hx-sync="#{dom_id}:replace"` (a
+///   second click aborts the in-flight request, so an older response can
+///   never repaint over a newer click), so with htmx loaded the submit is
+///   intercepted and
 ///   the response replaces the control in place.
 /// - **The widget emits `<form>` elements.** HTML forbids nesting a form
 ///   inside another form, so never render this widget inside one — the browser
@@ -1168,11 +1171,20 @@ pub fn reaction_controls(cfg: &ReactionControls) -> maud::Markup {
     };
     let down_button_id = format!("{}-down", cfg.dom_id);
     let preserve = cfg.preserve_pressed_state.then_some("true");
+    // Both forms share one sync scope with the `replace` strategy: a second
+    // click (up then down before the first response lands) aborts the
+    // in-flight request, so only the LAST click's response repaints the
+    // control. Without this the two independent forms race and the older
+    // response can land second, leaving the stale direction pressed even
+    // though the database holds the newer vote — the commits themselves are
+    // already serialized by the target-row lock; this orders the *responses*.
+    let hx_sync = format!("#{}:replace", cfg.dom_id);
 
     maud::html! {
         div id=(cfg.dom_id) class="autumn-reaction-controls" role="group" aria-label=(cfg.label) {
             form method="post" action=(cfg.up_action) class=(primary_form_class)
-                hx-post=(cfg.up_action) hx-target=(cfg.hx_target) hx-swap="outerHTML" {
+                hx-post=(cfg.up_action) hx-target=(cfg.hx_target) hx-swap="outerHTML"
+                hx-sync=(hx_sync) {
                 @if let Some(token) = &cfg.csrf_token {
                     input type="hidden" name=(cfg.csrf_field) value=(token);
                 }
@@ -1185,7 +1197,8 @@ pub fn reaction_controls(cfg: &ReactionControls) -> maud::Markup {
             span class="autumn-reaction-count" aria-live="polite" { (cfg.aggregate) }
             @if let Some(down_action) = &cfg.down_action {
                 form method="post" action=(down_action) class="autumn-reaction autumn-reaction-down"
-                    hx-post=(down_action) hx-target=(cfg.hx_target) hx-swap="outerHTML" {
+                    hx-post=(down_action) hx-target=(cfg.hx_target) hx-swap="outerHTML"
+                    hx-sync=(hx_sync) {
                     @if let Some(token) = &cfg.csrf_token {
                         input type="hidden" name=(cfg.csrf_field) value=(token);
                     }
