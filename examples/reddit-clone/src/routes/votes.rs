@@ -99,12 +99,24 @@ async fn cast_vote(
     // *undoes* the vote — exactly the hazard `react()`'s docs warn about. The
     // viewer still sees the fresh score from the fragment/redirect below;
     // only other subscribers' live tiles go stale until the next update.
-    if let Err(error) = broadcast_post_update(post_id, state).await {
-        tracing::warn!(post_id, error = %error, "vote committed but SSE fan-out failed");
-    }
+    //
+    // Render the targeted fragment from the score the broadcast loaded under
+    // `BROADCAST_ORDER`, not from `reaction.aggregate`: the broadcast's reload
+    // happens after this vote's commit, so it is at least as new — while
+    // `reaction.aggregate` is this commit's value and would swap an *older*
+    // score back into this viewer's page if a concurrent vote committed and
+    // broadcast in between. `reaction.aggregate` is only the fallback when the
+    // fan-out failed (nothing newer was published to be overwritten).
+    let score = match broadcast_post_update(post_id, state).await {
+        Ok(score) => score,
+        Err(error) => {
+            tracing::warn!(post_id, error = %error, "vote committed but SSE fan-out failed");
+            reaction.aggregate
+        }
+    };
 
     if hx.is_htmx {
-        Ok(vote_controls(post_id, reaction.aggregate, reaction.value, Some(csrf)).into_response())
+        Ok(vote_controls(post_id, score, reaction.value, Some(csrf)).into_response())
     } else {
         // `/posts/{id}` canonicalizes to the post's full URL (`show_by_id`).
         Ok(Redirect::to(&format!("/posts/{post_id}")).into_response())
@@ -122,13 +134,15 @@ async fn cast_vote(
 static BROADCAST_ORDER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Publish the updated post fragment to the global and per-subreddit SSE
-/// topics (presentation, not vote logic).
+/// topics (presentation, not vote logic), returning the score it loaded —
+/// read after the caller's commit and under [`BROADCAST_ORDER`], so it is the
+/// newest published value and safe for the caller's own fragment to render.
 ///
 /// Pool discipline: `react()` released its connection before returning, and
 /// this helper's checkout is short-lived and dropped before the fan-out, so a
 /// request never holds two connections at once — which is exactly what keeps
 /// the pool from deadlocking under concurrent votes.
-async fn broadcast_post_update(post_id: i64, state: &AppState) -> AutumnResult<()> {
+async fn broadcast_post_update(post_id: i64, state: &AppState) -> AutumnResult<i64> {
     let _publish_in_load_order = BROADCAST_ORDER.lock().await;
     let pool = state
         .pool()
@@ -154,6 +168,7 @@ async fn broadcast_post_update(post_id: i64, state: &AppState) -> AutumnResult<(
     let sse_state = state.clone();
     let sse_post = post;
     let sse_sub_slug = sub.slug;
+    let loaded_score = sse_post.score;
     crate::repositories::CURRENT_POST_RELATIONS
         .scope(lookup, async move {
             let _ = sse_state.broadcast().publish_oob(
@@ -172,7 +187,7 @@ async fn broadcast_post_update(post_id: i64, state: &AppState) -> AutumnResult<(
         })
         .await;
 
-    Ok(())
+    Ok(loaded_score)
 }
 
 autumn_web::paths![upvote, downvote];
