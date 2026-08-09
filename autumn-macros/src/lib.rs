@@ -543,6 +543,13 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// = like)]` → table `likes`, column `like_count`. At most one `#[votable]` per
 /// model.
 ///
+/// `by` may name a hand-written struct — it is name-resolved at compile time
+/// but carries no trait bound, so the reactor's `i64` primary key is
+/// documented contract, not a compile check (the edge table binds the reactor
+/// FK as `BIGINT`; a UUID-keyed reactor fails on first use with a database
+/// type error). The **target** model's `#[id]` and aggregate column *are*
+/// compile-checked as `i64`.
+///
 /// **Write `#[votable]` *below* `#[model]`.** It is consumed by `#[model]`, not
 /// registered as an attribute in its own right, so an attribute macro written
 /// above it never sees it — an error reading `cannot find attribute `votable`

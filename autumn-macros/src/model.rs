@@ -1660,6 +1660,14 @@ fn emit_votable_items(
     // edge table stores a bare `i64` reactor fk), so a typo'd model name would
     // compile silently. Force its name resolution the way every other
     // association attribute does.
+    //
+    // Deliberately name-resolution only — NOT a `ModelPrimaryKey<IdType =
+    // i64>` bound: `by` accepts hand-written reactor structs (reddit-clone's
+    // `User` keeps `password_hash` out of `#[model]`'s generated surface on
+    // purpose), and those implement no framework trait to constrain. The
+    // reactor's `i64`-primary-key requirement is documented contract; a
+    // non-BIGINT reactor fk fails loudly on first use with a database type
+    // error, not silent corruption.
     let reactor_ident = &spec.reactor;
     let reactor_guard = quote! {
         const _: ::core::marker::PhantomData<#reactor_ident> =

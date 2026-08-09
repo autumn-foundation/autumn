@@ -119,7 +119,12 @@ without them), and the column types are fixed:
    value column `SMALLINT NOT NULL`. The types are fixed by the generated code:
    the value is `i16`, the aggregate `i64`. A model whose aggregate field is
    not `i64` is a compile error, not a run-time surprise, and so is a model
-   whose `#[id]` is not `i64`.
+   whose `#[id]` is not `i64`. The **reactor's** primary key must be `i64`
+   too, but that one is documented contract rather than a compile check:
+   `by =` accepts hand-written reactor structs (reddit-clone's `User` stays
+   out of `#[model]` deliberately, to keep `password_hash` off the generated
+   surface), which implement no framework trait the macro could constrain. A
+   UUID-keyed reactor fails on first use with a database type error.
 4. **Both foreign keys `BIGINT`, and `NOT NULL` strongly recommended.** The
    generated hidden `table!` declares the target FK non-nullable, so nothing
    `react()` writes can ever be `NULL`. A *nullable* target column in the DDL
