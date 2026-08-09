@@ -2689,6 +2689,12 @@ fn mount_actuator_endpoints(
         prefix = %config.actuator.prefix,
         "Mounted actuator endpoints"
     );
+    if !actuator_prometheus {
+        tracing::info!(
+            config_key = "actuator.prometheus",
+            "Prometheus scrape endpoint is disabled; app metrics recorded through autumn_web::metrics are still collected, and still visible as JSON under the `app` key of the actuator's metrics endpoint — only the Prometheus scrape format is gated. Set actuator.prometheus = true to expose it"
+        );
+    }
     Ok(router)
 }
 

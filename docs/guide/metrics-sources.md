@@ -9,6 +9,13 @@ engine, an application-level queue — contribute additional families to the
 This is the metrics analogue of the pluggable `HealthIndicator` model and
 mirrors Spring Boot's `MeterRegistry` pattern.
 
+> **Which one do I want?** `MetricsSource` is for a subsystem that already owns
+> its numbers and can report them on demand at scrape time. To record an event
+> from ordinary application code — a counter bumped in a handler, a timer around
+> a call — use the one-line `autumn_web::metrics` facade instead: see
+> [App Metrics](metrics.md), which includes a
+> [side-by-side comparison](metrics.md#facade-vs-metricssource-which-one-do-i-want).
+
 ---
 
 ## Quick start

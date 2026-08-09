@@ -88,7 +88,11 @@ pub struct MetricFamily {
     pub name: String,
     /// One-line description emitted as `# HELP` in the Prometheus output.
     pub help: String,
-    /// Metric type: counter, gauge, or histogram.
+    /// Metric type: counter or gauge.
+    ///
+    /// For histograms, record through [`crate::metrics::histogram`] (or
+    /// [`crate::metrics::timer`]) instead — a [`MetricsSource`] cannot express
+    /// one.
     pub kind: MetricKind,
     /// Current samples.  Each sample produces one line in the scrape output.
     pub samples: Vec<MetricSample>,
@@ -2415,6 +2419,8 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
         }
     }
 
+    insert_app_metrics(&mut result);
+
     // Include plugin-contributed sources under the "sources" key
     if let Some(registry) = state.metrics_source_registry() {
         let all = registry.collect_all();
@@ -2491,6 +2497,34 @@ pub(crate) async fn circuitbreakers_endpoint<S: ProvideActuatorState + Send + Sy
     Json(responses)
 }
 
+/// Add app-defined [`crate::metrics`] facade instruments to the JSON metrics
+/// document under the top-level `app` key — the same snapshot the Prometheus
+/// endpoint renders.
+///
+/// The key is absent (rather than an empty array) when the app has recorded
+/// nothing.
+fn insert_app_metrics(result: &mut serde_json::Value) {
+    let app_metrics = crate::metrics::snapshot();
+    if app_metrics.is_empty() {
+        return;
+    }
+    let serde_json::Value::Object(map) = result else {
+        return;
+    };
+    // On the (unreachable) serialization failure, skip the key rather than emit
+    // `"app": null`: absent already means "nothing recorded", while a null
+    // would look like a metric that exists and has no data.
+    match serde_json::to_value(&app_metrics) {
+        Ok(value) => {
+            map.insert("app".to_string(), value);
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "failed to serialize app metrics; omitting the `app` key"
+        ),
+    }
+}
+
 // ── Prometheus ─────────────────────────────────────────────────
 
 /// Render label set `{k="v",...}` or empty string for no labels.
@@ -2522,15 +2556,55 @@ fn render_labels(labels: &[(String, String)]) -> String {
     out
 }
 
+/// The family reporting how many label sets each app metric lost to its
+/// cardinality cap; emitted by `write_app_metrics` when any were dropped.
+pub(crate) const SERIES_DROPPED_FAMILY: &str = "autumn_metrics_series_dropped_total";
+
+/// Every metric family name the framework itself emits on `/actuator/prometheus`.
+///
+/// Two callers share this list: `prometheus_endpoint` seeds its
+/// `emitted_families` set with it so a plugin [`MetricsSource`] cannot shadow a
+/// built-in family, and [`crate::metrics`] refuses to register an app metric
+/// under any of these names.
+pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 21] = [
+    "autumn_http_requests_total",
+    "autumn_http_requests_active",
+    "autumn_http_responses_total",
+    // `autumn_http_request_duration_seconds` is a **summary**, and a summary
+    // owns the derived `_sum`/`_count` family names the same way a histogram
+    // owns `_bucket`/`_sum`/`_count` — even though this exporter emits only
+    // quantile lines for it. A second family under either derived name gives
+    // the document two `# HELP` lines for one family, which makes Prometheus'
+    // own parser reject the *whole* scrape, not just that family.
+    "autumn_http_request_duration_seconds",
+    "autumn_http_request_duration_seconds_sum",
+    "autumn_http_request_duration_seconds_count",
+    "autumn_shutdown_aborted_requests_total",
+    "autumn_request_timeouts_total",
+    "autumn_read_your_writes_pins_total",
+    "autumn_requests_shed_total",
+    "autumn_http_route_requests_total",
+    "autumn_metrics_source_errors_total",
+    SERIES_DROPPED_FAMILY,
+    "autumn_cache_read_through_hits_total",
+    "autumn_cache_read_through_misses_total",
+    "autumn_cache_read_through_coalesced_waits_total",
+    "autumn_cache_read_through_fills_total",
+    "autumn_cache_read_through_fill_failures_total",
+    "autumn_cache_read_through_stale_serves_total",
+    "autumn_cache_fill_lock_acquires_total",
+    "autumn_cache_fill_lock_contended_total",
+];
+
 /// Returns true if `s` is a valid Prometheus metric name (`[a-zA-Z_:][a-zA-Z0-9_:]*`).
-fn is_valid_metric_name(s: &str) -> bool {
+pub(crate) fn is_valid_metric_name(s: &str) -> bool {
     let mut it = s.chars();
     matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':')
         && it.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
 }
 
 /// Returns true if `s` is a valid Prometheus label name (`[a-zA-Z_][a-zA-Z0-9_]*`).
-fn is_valid_label_name(s: &str) -> bool {
+pub(crate) fn is_valid_label_name(s: &str) -> bool {
     let mut it = s.chars();
     matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -2866,6 +2940,156 @@ fn write_builtin_cache_metrics(
     }
 }
 
+/// Render the app-defined [`crate::metrics`] facade instruments into `out`.
+///
+/// Every family name written here is inserted into `emitted_families` —
+/// including a histogram's derived `_bucket`/`_sum`/`_count` families — so a
+/// plugin [`MetricsSource`] cannot later shadow one of them.
+///
+/// Deliberately unlike the built-in families, app metrics carry **no implicit
+/// `version` label**: the label set belongs entirely to the call site, so the
+/// framework cannot collide with a `version` label an app chose itself.
+///
+/// An empty snapshot writes zero bytes, keeping the facade invisible in the
+/// scrape output until an app actually records something.
+fn write_app_metrics(
+    out: &mut String,
+    snapshot: &[crate::metrics::InstrumentSnapshot],
+    emitted_families: &mut std::collections::HashSet<String>,
+) {
+    // Instruments that dropped samples at the cardinality cap, in the
+    // snapshot's (name-sorted) order.
+    let mut dropped: Vec<(&str, u64)> = Vec::new();
+
+    for instrument in snapshot {
+        if !claim_app_family_names(instrument, emitted_families) {
+            continue;
+        }
+        if instrument.dropped_series > 0 {
+            dropped.push((&instrument.name, instrument.dropped_series));
+        }
+        write_app_instrument(out, instrument);
+    }
+
+    write_app_dropped_family(out, &dropped);
+}
+
+/// Claim every family name `instrument` occupies, returning whether it may be
+/// rendered.
+///
+/// Both rejections are already enforced at registration; they are re-checked
+/// here so a scrape can never emit a malformed or duplicated family.
+fn claim_app_family_names(
+    instrument: &crate::metrics::InstrumentSnapshot,
+    emitted_families: &mut std::collections::HashSet<String>,
+) -> bool {
+    if !is_valid_metric_name(&instrument.name) {
+        tracing::warn!(name = %instrument.name, "app metric has an invalid metric name; skipping family");
+        return false;
+    }
+    if !emitted_families.insert(instrument.name.clone()) {
+        tracing::warn!(name = %instrument.name, "app metric collides with an already-emitted family; skipping family");
+        return false;
+    }
+    if matches!(instrument.kind, crate::metrics::InstrumentKind::Histogram) {
+        for suffix in crate::metrics::HISTOGRAM_SUFFIXES {
+            emitted_families.insert(format!("{}{suffix}", instrument.name));
+        }
+    }
+    true
+}
+
+/// Write one app instrument's `# HELP`/`# TYPE` header and every sample line.
+fn write_app_instrument(out: &mut String, instrument: &crate::metrics::InstrumentSnapshot) {
+    use std::fmt::Write;
+
+    use crate::metrics::InstrumentKind;
+
+    if !instrument.help.is_empty() {
+        let _ = writeln!(
+            out,
+            "# HELP {} {}",
+            instrument.name,
+            escape_help_text(&instrument.help)
+        );
+    }
+    let kind = match instrument.kind {
+        InstrumentKind::Counter => "counter",
+        InstrumentKind::Gauge => "gauge",
+        InstrumentKind::Histogram => "histogram",
+    };
+    let _ = writeln!(out, "# TYPE {} {kind}", instrument.name);
+
+    for series in &instrument.series {
+        write_app_series(out, &instrument.name, series);
+    }
+}
+
+/// Write the sample line(s) for a single series of the app metric `name`.
+fn write_app_series(out: &mut String, name: &str, series: &crate::metrics::SeriesSnapshot) {
+    use std::fmt::Write;
+
+    use crate::metrics::SeriesValue;
+
+    // `series.labels` is a `BTreeMap`, so this is already sorted by key. The
+    // rendered label set is built once per series, not once per output line.
+    let labels: Vec<(String, String)> = series
+        .labels
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let rendered = render_labels(&labels);
+
+    match series.value {
+        SeriesValue::Counter { value } => {
+            let _ = writeln!(out, "{name}{rendered} {value}");
+        }
+        SeriesValue::Gauge { value } => {
+            let _ = writeln!(out, "{name}{rendered} {}", format_sample_value(value));
+        }
+        SeriesValue::Histogram {
+            count,
+            sum,
+            ref buckets,
+        } => {
+            // Every bucket line carries the same user labels with `le` appended
+            // last, so the shared prefix — everything up to but not including
+            // the closing brace — is rendered once and reused. `rendered` is
+            // either empty or ends in the ASCII `}`, so the slice is always on
+            // a character boundary. `le` values are generated by the facade
+            // (decimal bounds and the literal `+Inf`) and need no escaping.
+            let prefix = rendered
+                .strip_suffix('}')
+                .map_or_else(|| "{le=\"".to_string(), |inner| format!("{inner},le=\""));
+            for (le, cumulative) in buckets {
+                let _ = writeln!(out, "{name}_bucket{prefix}{le}\"}} {cumulative}");
+            }
+            let _ = writeln!(out, "{name}_sum{rendered} {}", format_sample_value(sum));
+            let _ = writeln!(out, "{name}_count{rendered} {count}");
+        }
+    }
+}
+
+/// Write the cardinality-cap drop counter, one series per instrument that
+/// dropped samples. Writes nothing when `dropped` is empty.
+fn write_app_dropped_family(out: &mut String, dropped: &[(&str, u64)]) {
+    use std::fmt::Write;
+
+    if dropped.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "# HELP {SERIES_DROPPED_FAMILY} \
+         App metric samples dropped because the metric had already hit its series cardinality cap"
+    );
+    let _ = writeln!(out, "# TYPE {SERIES_DROPPED_FAMILY} counter");
+    for (name, count) in dropped {
+        let labels = render_labels(&[("metric".to_string(), (*name).to_string())]);
+        let _ = writeln!(out, "{SERIES_DROPPED_FAMILY}{labels} {count}");
+    }
+}
+
 /// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
 pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -2884,32 +3108,15 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
         &crate::cache::read_through_metrics().snapshot(),
     );
 
-    // Plugin-contributed metric families — seed with built-in names so
-    // plugins cannot shadow or duplicate them.
-    if let Some(registry) = state.metrics_source_registry() {
-        let mut emitted_families: std::collections::HashSet<String> = [
-            "autumn_http_requests_total",
-            "autumn_http_requests_active",
-            "autumn_http_responses_total",
-            "autumn_http_request_duration_seconds",
-            "autumn_shutdown_aborted_requests_total",
-            "autumn_request_timeouts_total",
-            "autumn_read_your_writes_pins_total",
-            "autumn_requests_shed_total",
-            "autumn_http_route_requests_total",
-            "autumn_metrics_source_errors_total",
-            "autumn_cache_read_through_hits_total",
-            "autumn_cache_read_through_misses_total",
-            "autumn_cache_read_through_coalesced_waits_total",
-            "autumn_cache_read_through_fills_total",
-            "autumn_cache_read_through_fill_failures_total",
-            "autumn_cache_read_through_stale_serves_total",
-            "autumn_cache_fill_lock_acquires_total",
-            "autumn_cache_fill_lock_contended_total",
-        ]
+    // Name ownership, in precedence order: built-in families first, then the
+    // app-metrics facade, then plugin-contributed sources — so neither the
+    // facade nor a plugin can shadow or duplicate a name already emitted.
+    let mut emitted_families: std::collections::HashSet<String> = BUILTIN_METRIC_FAMILY_NAMES
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+    write_app_metrics(&mut out, &crate::metrics::snapshot(), &mut emitted_families);
+    if let Some(registry) = state.metrics_source_registry() {
         render_plugin_sources(registry, &mut out, &mut emitted_families);
     }
 
@@ -7265,6 +7472,392 @@ mod tests {
         assert_eq!(first.target, "myapp::orders");
         assert_eq!(first.fields["order_id"].as_str().unwrap(), "A-1001");
         assert_eq!(first.request_id.as_deref(), Some("req-abc"));
+    }
+
+    // ── App-metrics facade exposition (issue #1378) ───────────────────────
+    //
+    // The facade registry is process-global, so every test here records into
+    // instrument names built with `metrics::testing::unique_name` and asserts
+    // with `contains()` on those names. Never assert whole-body equality or
+    // the absence of unrelated families.
+
+    /// Fetch a body from the actuator router mounted at `/actuator`.
+    async fn actuator_body(uri: &str) -> String {
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_renders_facade_counter_gauge_and_histogram() {
+        use crate::metrics::testing::unique_name;
+
+        let counter_name = unique_name("facade_expo_orders_total");
+        crate::metrics::describe_counter(&counter_name, "Orders placed");
+        crate::metrics::counter(&counter_name)
+            .with_label("status", "paid")
+            .with_label("region", "eu")
+            .increment(3);
+
+        let gauge_name = unique_name("facade_expo_queue_depth");
+        crate::metrics::describe_gauge(&gauge_name, "Queue depth");
+        crate::metrics::gauge(&gauge_name).set(2.5);
+
+        let hist_name = unique_name("facade_expo_work_seconds");
+        crate::metrics::describe_histogram(&hist_name, "Work duration");
+        let hist = crate::metrics::histogram(&hist_name).with_label("route", "/x");
+        hist.record(0.25);
+        hist.record(0.75);
+
+        let text = actuator_body("/actuator/prometheus").await;
+
+        // Counter: HELP/TYPE plus an integer-rendered sample with sorted labels.
+        assert!(
+            text.contains(&format!("# HELP {counter_name} Orders placed")),
+            "missing counter HELP in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("# TYPE {counter_name} counter")),
+            "missing counter TYPE in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{counter_name}{{region=\"eu\",status=\"paid\"}} 3"
+            )),
+            "counter must render as an integer with sorted labels in:\n{text}"
+        );
+
+        // Gauge.
+        assert!(
+            text.contains(&format!("# TYPE {gauge_name} gauge")),
+            "missing gauge TYPE in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("{gauge_name} 2.5")),
+            "missing gauge sample in:\n{text}"
+        );
+
+        // Histogram: one TYPE line for the base name, cumulative buckets with
+        // `le` appended after the user labels, then `_sum` and `_count`.
+        assert!(
+            text.contains(&format!("# HELP {hist_name} Work duration")),
+            "missing histogram HELP in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("# TYPE {hist_name} histogram")),
+            "missing histogram TYPE in:\n{text}"
+        );
+        for (le, value) in [
+            ("0.005", 0),
+            ("0.01", 0),
+            ("0.025", 0),
+            ("0.05", 0),
+            ("0.1", 0),
+            ("0.25", 1),
+            ("0.5", 1),
+            ("1", 2),
+            ("2.5", 2),
+            ("5", 2),
+            ("10", 2),
+            ("+Inf", 2),
+        ] {
+            let line = format!("{hist_name}_bucket{{route=\"/x\",le=\"{le}\"}} {value}");
+            assert!(
+                text.contains(&line),
+                "missing bucket line `{line}` in:\n{text}"
+            );
+        }
+        assert!(
+            text.contains(&format!("{hist_name}_sum{{route=\"/x\"}} 1")),
+            "missing histogram sum in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("{hist_name}_count{{route=\"/x\"}} 2")),
+            "missing histogram count in:\n{text}"
+        );
+        // `le="+Inf"` must structurally equal `_count`.
+        assert!(
+            text.contains(&format!("{hist_name}_bucket{{route=\"/x\",le=\"+Inf\"}} 2")),
+            "+Inf bucket must equal _count in:\n{text}"
+        );
+        // Exactly one TYPE block per family, no duplicates.
+        assert_eq!(
+            text.matches(&format!("# TYPE {counter_name} counter"))
+                .count(),
+            1,
+            "duplicate TYPE line for {counter_name} in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_prefers_facade_over_colliding_plugin_family() {
+        use crate::metrics::testing::unique_name;
+
+        struct CollidingSource(String);
+        impl MetricsSource for CollidingSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: self.0.clone(),
+                    help: "From the plugin".to_string(),
+                    kind: MetricKind::Gauge,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 99.0,
+                    }],
+                }]
+            }
+        }
+
+        let name = unique_name("facade_expo_collision_total");
+        crate::metrics::describe_counter(&name, "From the facade");
+        crate::metrics::counter(&name).increment(1);
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("colliding_plugin", Arc::new(CollidingSource(name.clone())))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains(&format!("# HELP {name} From the facade")),
+            "the facade family must win the name in:\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("# HELP {name} From the plugin")),
+            "the plugin family must be skipped in:\n{text}"
+        );
+        assert_eq!(
+            text.matches(&format!("# TYPE {name} ")).count(),
+            1,
+            "exactly one TYPE line for {name} in:\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("{name} 99")),
+            "the plugin sample must not be emitted in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_plugin_family_colliding_with_facade_histogram_count() {
+        use crate::metrics::testing::unique_name;
+
+        struct DerivedSource(String);
+        impl MetricsSource for DerivedSource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: self.0.clone(),
+                    help: "Plugin shadowing a derived name".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 77.0,
+                    }],
+                }]
+            }
+        }
+
+        let base = unique_name("facade_expo_derived_seconds");
+        crate::metrics::histogram(&base).record(0.25);
+        let derived = format!("{base}_count");
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("derived_plugin", Arc::new(DerivedSource(derived.clone())))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            !text.contains("Plugin shadowing a derived name"),
+            "a plugin family named after a facade histogram's derived family must be skipped in:\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("{derived} 77")),
+            "the plugin sample must not be emitted in:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("{derived} 1")),
+            "the facade's own derived count must still be present in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prometheus_endpoint_skips_plugin_family_colliding_with_builtin_summary_derived_name() {
+        // `autumn_http_request_duration_seconds` is a summary, so it owns
+        // `_sum` and `_count` too. A plugin family under either name would put
+        // a second `# HELP` line for that family into the document, and
+        // Prometheus' own parser rejects the whole scrape when that happens.
+        struct DerivedSummarySource(&'static str);
+        impl MetricsSource for DerivedSummarySource {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: self.0.to_string(),
+                    help: "Plugin shadowing a builtin summary's derived family".to_string(),
+                    kind: MetricKind::Counter,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 4242.0,
+                    }],
+                }]
+            }
+        }
+
+        for derived in [
+            "autumn_http_request_duration_seconds_sum",
+            "autumn_http_request_duration_seconds_count",
+        ] {
+            let state = test_state();
+            state
+                .metrics_source_registry
+                .register(
+                    "derived_summary_plugin",
+                    Arc::new(DerivedSummarySource(derived)),
+                )
+                .unwrap();
+
+            let app = actuator_router(true).with_state(state);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/actuator/prometheus")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+
+            assert!(
+                !text.contains(&format!("# HELP {derived} ")),
+                "a plugin family named `{derived}` must be skipped in:\n{text}"
+            );
+            assert!(
+                !text.contains("4242"),
+                "the plugin sample must not be emitted in:\n{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_includes_app_section_for_facade_metrics() {
+        use crate::metrics::testing::unique_name;
+
+        let counter_name = unique_name("facade_json_orders_total");
+        crate::metrics::describe_counter(&counter_name, "Orders placed");
+        crate::metrics::counter(&counter_name)
+            .with_label("status", "paid")
+            .increment(3);
+
+        let hist_name = unique_name("facade_json_work_seconds");
+        crate::metrics::histogram(&hist_name).record(0.25);
+        crate::metrics::histogram(&hist_name).record(0.75);
+
+        let text = actuator_body("/actuator/metrics").await;
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let app = json
+            .get("app")
+            .unwrap_or_else(|| panic!("missing top-level `app` key in:\n{text}"));
+        let instruments = app
+            .as_array()
+            .unwrap_or_else(|| panic!("`app` must be an array in:\n{text}"));
+
+        let entry = instruments
+            .iter()
+            .find(|i| i["name"] == serde_json::json!(counter_name))
+            .unwrap_or_else(|| panic!("missing {counter_name} in:\n{text}"));
+        assert_eq!(entry["kind"], serde_json::json!("counter"));
+        assert_eq!(entry["help"], serde_json::json!("Orders placed"));
+        assert_eq!(entry["dropped_series"], serde_json::json!(0));
+        assert_eq!(
+            entry["series"][0]["labels"]["status"],
+            serde_json::json!("paid")
+        );
+        assert_eq!(
+            entry["series"][0]["value"]["value"].as_u64(),
+            Some(3),
+            "the JSON view must match the prometheus view"
+        );
+
+        let hist = instruments
+            .iter()
+            .find(|i| i["name"] == serde_json::json!(hist_name))
+            .unwrap_or_else(|| panic!("missing {hist_name} in:\n{text}"));
+        assert_eq!(hist["kind"], serde_json::json!("histogram"));
+        let value = &hist["series"][0]["value"];
+        assert_eq!(value["count"].as_u64(), Some(2));
+        assert!(
+            (value["sum"].as_f64().unwrap() - 1.0).abs() < f64::EPSILON,
+            "unexpected histogram sum in:\n{text}"
+        );
+        let buckets = value["buckets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing histogram buckets in:\n{text}"));
+        let last = buckets.last().unwrap();
+        assert_eq!(last[0], serde_json::json!("+Inf"));
+        assert_eq!(last[1].as_u64(), Some(2), "+Inf must equal count");
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_disabled_hides_facade_metrics() {
+        use crate::metrics::testing::unique_name;
+
+        // Recording always works; only exposure is gated. With the scrape
+        // endpoint disabled there must be no route that leaks the facade.
+        let name = unique_name("facade_gated_total");
+        crate::metrics::counter(&name).increment(1);
+
+        let app = actuator_router_with_prefix("/actuator", false, false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
 

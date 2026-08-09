@@ -104,6 +104,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reasoning and the rejected lock-free/CTE/delta designs. Purely additive; no
   existing association, model, or repository behaviour changes; minor version
   bump. See the new `docs/guide/votable.md`.
+- **metrics:** new **call-site metrics facade** (`autumn_web::metrics`, #1378)
+  so application code can record its own counters, gauges, histograms and
+  timers in one line at the point the interesting thing happens — no trait to
+  implement, no type to define, nothing to register with `AppBuilder`:
+  `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`
+  registers the instrument in a process-global registry on first use and shows
+  up on the stock `/actuator/prometheus` scrape (and under a new top-level
+  `app` key on `/actuator/metrics`) with no wiring at all. `timer(..).start()`
+  returns a guard that records on every exit path including early `?` returns
+  and unwinding panics, plus `time()`/`time_async()`/`record()` for cases a
+  guard does not fit; histograms render as standard cumulative Prometheus
+  histograms whose `le="+Inf"` bucket is structurally derived from the same
+  slots as `_count`, so the two can never drift. The facade is designed to
+  degrade rather than take an app down: hard caps (100 labeled series per
+  instrument, 256 instruments, 8 labels, 128-char label values, 128-byte
+  names) drop or reject the excess rather than grow without bound, with one
+  warning per instrument and a scrapeable
+  `autumn_metrics_series_dropped_total{metric="..."}` counter so cardinality
+  mistakes are alertable; invalid, `autumn_`-prefixed, kind-conflicting and
+  derived-name-colliding registrations are rejected with a warning and an inert
+  handle rather than a panic or a malformed scrape. Recording is never gated —
+  `actuator.prometheus = false` removes only the *scrape endpoint*, and
+  `/actuator/metrics` still carries the `app` key (the router now logs that at
+  startup, naming the config key). Startup configuration is order-free:
+  `describe_*` does **not** register the instrument, it stashes the help text
+  until the first use does, so `describe_histogram` can no longer freeze a
+  histogram's bounds out from under a later `set_histogram_buckets` (the cost
+  is that a described-but-never-recorded metric stays out of the scrape
+  entirely). Gauges and histograms accept `usize`/`u64`/`i64` as well as the
+  `Into<f64>` primitives through a sealed `IntoMetricValue`, so
+  `gauge("q").set(queue.len())` compiles without a cast; counters saturate at
+  `u64::MAX` rather than wrapping (a wrapped total is indistinguishable from a
+  reset and would hand `rate()` a phantom spike); and non-finite values are
+  rejected on gauges as well as histograms, so the Prometheus and JSON views
+  can never disagree. The exposition output is hardened to match Prometheus'
+  own parser and `client_golang`: bucket `le` values render byte-for-byte as Go
+  `%g` does (`5e-05`, `1e+21`), the built-in request-duration summary reserves
+  its derived `_sum`/`_count` names against plugin families, label values and
+  `# HELP` text are stripped of control characters, over-long names are
+  rejected instead of truncated into a collision, rejected names are escaped
+  before they reach a log line, and which labels survive the 8-label cap is a
+  function of the label *set* rather than the order `with_label` was called in.
+  New guide: `docs/guide/metrics.md`, including a facade-vs-`MetricsSource`
+  comparison.
 - **sim-testing:** fix a genuine **job-backoff thundering herd** the
   deterministic simulation harness caught (W7, #1797): the local job
   runtime's retry backoff (`execute_local_job`, `job.rs`) computed a pure

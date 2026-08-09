@@ -9,6 +9,7 @@ mod api_versioning_integration;
 mod api_versioning_openapi;
 mod api_versioning_unit;
 mod app_builder;
+mod app_metrics_facade;
 mod authorization_integration;
 mod auto_broadcast;
 mod bot_protection_pipeline;
