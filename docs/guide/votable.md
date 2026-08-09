@@ -302,7 +302,11 @@ let user_id: i64 = session
 
 let reaction = posts_repo.react(user_id, post_id, value).await?;
 
-broadcast_post_update(post_id, state).await?;
+// Best-effort: the vote is committed, and failing the request over a lost
+// SSE refresh would invite a retry — which, on a toggle, undoes the vote.
+if let Err(error) = broadcast_post_update(post_id, state).await {
+    tracing::warn!(post_id, error = %error, "vote committed but SSE fan-out failed");
+}
 
 if hx.is_htmx {
     // htmx swaps the fragment in place.

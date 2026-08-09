@@ -94,7 +94,14 @@ async fn cast_vote(
     // query.
     let reaction = posts_repo.react(user_id, post_id, value).await?;
 
-    broadcast_post_update(post_id, state).await?;
+    // Best-effort from here on: the vote is committed. Failing the request
+    // over a lost SSE refresh would invite a retry, and a retried toggle
+    // *undoes* the vote — exactly the hazard `react()`'s docs warn about. The
+    // viewer still sees the fresh score from the fragment/redirect below;
+    // only other subscribers' live tiles go stale until the next update.
+    if let Err(error) = broadcast_post_update(post_id, state).await {
+        tracing::warn!(post_id, error = %error, "vote committed but SSE fan-out failed");
+    }
 
     if hx.is_htmx {
         Ok(vote_controls(post_id, reaction.aggregate, reaction.value, Some(csrf)).into_response())
