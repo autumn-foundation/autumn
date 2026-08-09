@@ -589,7 +589,17 @@ impl Series {
 /// Add `delta` to the `f64` held as a bit pattern in `cell`, atomically.
 fn add_f64(cell: &AtomicU64, delta: f64) {
     let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
-        Some((f64::from_bits(bits) + delta).to_bits())
+        // Both operands are finite (deltas and observations are validated,
+        // and this clamp keeps the stored value finite), so the sum can
+        // overflow to ±Inf but never be NaN. Clamp so a gauge near
+        // `f64::MAX` nudged by a finite delta — or a `_sum` fed enormous
+        // observations — saturates instead of permanently storing a
+        // non-finite value the JSON view would render as `null`.
+        Some(
+            (f64::from_bits(bits) + delta)
+                .clamp(f64::MIN, f64::MAX)
+                .to_bits(),
+        )
     });
 }
 
@@ -597,13 +607,14 @@ fn add_f64(cell: &AtomicU64, delta: f64) {
 ///
 /// Byte-for-byte what `client_golang` writes, because a dashboard query
 /// (`histogram_quantile`) and a recording rule both match `le` as a *string*:
-/// Go formats it with `%g`, which switches to exponential notation outside
-/// `[1e-4, 1e21)` and pads the exponent to at least two digits with an
-/// explicit sign. Rust's `{}` never goes exponential and its `{:e}` never
-/// pads, so the two are combined here.
+/// Go formats it with shortest-`%g`, which caps the precision decision at 6
+/// and therefore switches to exponential notation outside `[1e-4, 1e6)`
+/// (`1000000.0` renders as `1e+06`), padding the exponent to at least two
+/// digits with an explicit sign. Rust's `{}` never goes exponential and its
+/// `{:e}` never pads, so the two are combined here.
 fn format_bound(bound: f64) -> String {
     let magnitude = bound.abs();
-    if magnitude == 0.0 || (1e-4..1e21).contains(&magnitude) {
+    if magnitude == 0.0 || (1e-4..1e6).contains(&magnitude) {
         return bound.to_string();
     }
     let rendered = format!("{bound:e}");
@@ -2602,6 +2613,44 @@ mod tests {
     }
 
     #[test]
+    fn gauge_adjustments_saturate_instead_of_overflowing_to_infinity() {
+        let name = unique_name("facade_gauge_saturating");
+        let handle = gauge(&name);
+        handle.set(f64::MAX);
+        handle.increment(f64::MAX); // finite delta, but MAX + MAX == +Inf
+
+        let instrument = expect_instrument(&name);
+        let value = gauge_value(only_series(&instrument));
+        assert!(
+            value.is_finite(),
+            "a finite adjustment must never store a non-finite gauge, got {value}"
+        );
+        assert!((value - f64::MAX).abs() < f64::EPSILON * f64::MAX);
+
+        handle.set(f64::MIN);
+        handle.decrement(f64::MAX);
+        let instrument = expect_instrument(&name);
+        let value = gauge_value(only_series(&instrument));
+        assert!(value.is_finite(), "saturation must hold downward too");
+    }
+
+    #[test]
+    fn histogram_sum_saturates_instead_of_overflowing_to_infinity() {
+        let name = unique_name("facade_histogram_sum_saturating");
+        let handle = histogram(&name);
+        handle.record(f64::MAX);
+        handle.record(f64::MAX);
+
+        let instrument = expect_instrument(&name);
+        let (count, sum, _buckets) = histogram_parts(only_series(&instrument));
+        assert_eq!(count, 2);
+        assert!(
+            sum.is_finite(),
+            "_sum must saturate at f64::MAX, not poison to +Inf, got {sum}"
+        );
+    }
+
+    #[test]
     fn gauge_and_histogram_accept_integer_types() {
         let queue: Vec<u8> = vec![1, 2, 3];
         let gauge_name = unique_name("facade_integer_gauge");
@@ -2637,17 +2686,22 @@ mod tests {
 
     #[test]
     fn format_bound_matches_go_g_formatting() {
-        // client_golang renders `le` with Go's %g: exponential outside
-        // [1e-4, 1e21), exponent signed and padded to two digits.
+        // client_golang renders `le` with Go's shortest %g: exponential
+        // outside [1e-4, 1e6), exponent signed and padded to two digits.
+        // (Go caps the %g precision decision at 6 for shortest formatting,
+        // which is why `1000000.0` famously prints as `1e+06`.)
         assert_eq!(format_bound(0.000_05), "5e-05");
         assert_eq!(format_bound(0.000_025), "2.5e-05");
+        assert_eq!(format_bound(1e6), "1e+06");
+        assert_eq!(format_bound(2_500_000.0), "2.5e+06");
+        assert_eq!(format_bound(1e20), "1e+20");
         assert_eq!(format_bound(1e21), "1e+21");
         assert_eq!(format_bound(1.5e22), "1.5e+22");
         assert_eq!(format_bound(1e-7), "1e-07");
         assert_eq!(format_bound(1e-100), "1e-100");
-        // Just inside the window: plain decimal, no exponent.
+        // Just inside the window at both edges: plain decimal, no exponent.
         assert_eq!(format_bound(0.000_1), "0.0001");
-        assert_eq!(format_bound(1e20), "100000000000000000000");
+        assert_eq!(format_bound(999_999.0), "999999");
     }
 
     #[test]

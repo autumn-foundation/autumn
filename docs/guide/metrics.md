@@ -196,7 +196,7 @@ the histogram has been registered is ignored with a warning too.
 
 Bounds are rendered into `le` exactly as `client_golang` renders them, so a
 recording rule that matches `le` as a string keeps working: plain decimal inside
-`[1e-4, 1e21)` and exponential outside it (`5e-05`, `1e+21`).
+`[1e-4, 1e6)` and exponential outside it (`5e-05`, `1e+06`, `1e+21`).
 
 A timer renders as a standard Prometheus histogram — cumulative `_bucket` lines
 ending at `le="+Inf"`, which always equals `_count`:
@@ -215,10 +215,11 @@ payment_duration_seconds_count 4
 ```
 
 Non-finite and negative observations are rejected with a warning, so `_sum` can
-never become `NaN`. `_sum` is still an `f64` accumulator that is never reset, so
-a long-lived process recording astronomically large observations can eventually
-saturate it to `+Inf` — permanently. Recording seconds (what `timer` does) keeps
-you many orders of magnitude away from that.
+never become `NaN`. `_sum` is still an `f64` accumulator that is never reset; a
+long-lived process recording astronomically large observations saturates it at
+`f64::MAX` rather than overflowing to `+Inf`, and gauge adjustments saturate the
+same way. Recording seconds (what `timer` does) keeps you many orders of
+magnitude away from that.
 
 ---
 
