@@ -3007,6 +3007,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // when the model has no `through =` associations (nothing calls it) —
     // so it doesn't need to know which associations exist, only its own
     // model and write-connection helper.
+    // The tenant a `#[votable]` `react()` / `reaction_of()` must filter its
+    // *target* lookup on. Resolved with exactly the idiom the derived queries
+    // use: `across_tenants()` opts out, a missing context fails closed.
+    let m2m_tenant_scope_body = if config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                ::core::result::Result::Ok(::core::option::Option::None)
+            } else {
+                match ::autumn_web::tenancy::CURRENT_TENANT
+                    .try_with(|t| t.clone())
+                    .ok()
+                    .flatten()
+                {
+                    ::core::option::Option::Some(t) => {
+                        ::core::result::Result::Ok(::core::option::Option::Some(t))
+                    }
+                    ::core::option::Option::None => {
+                        ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::internal_server_error_msg(
+                                "no tenant context was established"
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    } else {
+        quote! { ::core::result::Result::Ok(::core::option::Option::None) }
+    };
+
     let m2m_conn_source_impl = quote! {
         impl ::autumn_web::repository::M2mConnSource for #pg_name {
             type Model = #model_name;
@@ -3033,6 +3063,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 >,
             > {
                 self.__autumn_acquire_read_conn().await
+            }
+
+            // `#[votable]` target scoping: `Some(tenant)` for a tenant_scoped
+            // repository in a tenant context, `None` for a non-scoped one and
+            // for `across_tenants()`, `Err` when scoped with no context.
+            fn __autumn_m2m_tenant_scope(
+                &self,
+            ) -> ::autumn_web::AutumnResult<::core::option::Option<::std::string::String>> {
+                #m2m_tenant_scope_body
             }
         }
     };

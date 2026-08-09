@@ -15,6 +15,13 @@
 //! | `VotableLikeTarget` | `… aggregate = count, name = like` | `likes` | `like_count` |
 //! | `VotableSoftLikeTarget` | `… aggregate = count, name = soft_like` | `soft_likes` | `soft_like_count` |
 //! | `VotableXorTarget` | `… aggregate = sum, table = votable_xor_votes` | `votable_xor_votes` (nullable target FK) | `score` (default) |
+//! | `VotableTenantTarget` | `… aggregate = sum, table = votable_tenant_votes` | `votable_tenant_votes` | `score` (default) |
+//!
+//! `VotableTenantTarget` is the tenant-isolation fixture (PR #2177 review, P1):
+//! a model with a `tenant_id` column behind a `#[repository(...,
+//! tenant_scoped)]`. Reacting through it must be confined to the ambient
+//! `CURRENT_TENANT`, because an unscoped `react()` is a *write* (edge insert
+//! plus aggregate `UPDATE`) against a row a caller only had to guess the id of.
 //!
 //! `VotableTarget` deliberately exercises **pure defaults** — `table` resolves
 //! to `pluralize("vote") == "votes"`, `reactor_fk` to `votable_reactor_id`,
@@ -50,6 +57,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use autumn_web::repository::{Reaction, ReactionOutcome};
+use autumn_web::tenancy::CURRENT_TENANT;
 use axum::http::StatusCode;
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -211,6 +219,34 @@ pub trait VotableXorTargetRepository {
     fn find_by_title(title: String) -> Vec<VotableXorTarget>;
 }
 
+// ── Sum mode + tenant scoping (PR #2177 review, P1) ───────────────────────────
+
+diesel::table! {
+    votable_tenant_targets (id) {
+        id -> Int8,
+        title -> Text,
+        tenant_id -> Text,
+        score -> Int8,
+    }
+}
+
+#[autumn_web::model(table = "votable_tenant_targets")]
+#[votable(by = VotableReactor, aggregate = sum, table = votable_tenant_votes)]
+pub struct VotableTenantTarget {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub tenant_id: String,
+    #[default]
+    pub score: i64,
+}
+
+/// Deliberately `tenant_scoped` **and** deliberately without `soft_delete`, so
+/// the tenant predicate is the only thing narrowing the target: a regression
+/// cannot hide behind a `deleted_at IS NULL` that happens to also miss.
+#[autumn_web::repository(VotableTenantTarget, table = "votable_tenant_targets", tenant_scoped)]
+pub trait VotableTenantTargetRepository {}
+
 // ── Setup & helpers ───────────────────────────────────────────────────────────
 
 /// Every DDL statement the fixtures need. The edge tables differ on purpose:
@@ -280,6 +316,18 @@ const DDL: &[&str] = &[
         UNIQUE (votable_reactor_id, votable_xor_target_id), \
       CONSTRAINT votable_xor_votes_unique_other \
         UNIQUE (votable_reactor_id, votable_xor_other_id))",
+    // Two tenants share one physical table — the shape the tenant predicate
+    // has to separate.
+    "CREATE TABLE IF NOT EXISTS votable_tenant_targets \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, tenant_id TEXT NOT NULL, \
+      score BIGINT NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS votable_tenant_votes \
+     (votable_reactor_id BIGINT NOT NULL REFERENCES votable_reactors(id), \
+      votable_tenant_target_id BIGINT NOT NULL \
+        REFERENCES votable_tenant_targets(id) ON DELETE CASCADE, \
+      value SMALLINT NOT NULL CHECK (value IN (-1, 1)), \
+      CONSTRAINT votable_tenant_votes_unique_pair \
+        UNIQUE (votable_reactor_id, votable_tenant_target_id))",
 ];
 
 async fn setup_pool() -> (
@@ -431,6 +479,31 @@ async fn soft_target_score(conn: &mut AsyncPgConnection, target_id: i64) -> i64 
         .count
 }
 
+/// The edge table has no tenant column, so a tenant-bearing target must be
+/// seeded explicitly — the tenant boundary lives entirely on the target row.
+async fn seed_tenant_target(conn: &mut AsyncPgConnection, tenant: &str, title: &str) -> i64 {
+    diesel::sql_query(
+        "INSERT INTO votable_tenant_targets (title, tenant_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind::<diesel::sql_types::Text, _>(title)
+    .bind::<diesel::sql_types::Text, _>(tenant)
+    .get_result::<IdRow>(conn)
+    .await
+    .expect("seed tenant target")
+    .id
+}
+
+/// `votable_tenant_targets.score`, read with raw SQL so the assertion never
+/// goes back through the tenant-scoped repository under test.
+async fn tenant_target_score(conn: &mut AsyncPgConnection, target_id: i64) -> i64 {
+    diesel::sql_query("SELECT score AS count FROM votable_tenant_targets WHERE id = $1")
+        .bind::<BigInt, _>(target_id)
+        .get_result::<CountRow>(conn)
+        .await
+        .expect("read tenant target score")
+        .count
+}
+
 async fn edge_count(
     conn: &mut AsyncPgConnection,
     table: &str,
@@ -489,6 +562,10 @@ fn votable_methods_are_generated() {
     // Sum mode over an edge table whose target FK is nullable in the DDL.
     assert_is_fn(<PgVotableXorTargetRepository as VotableXorTargetReactions>::react);
     assert_is_fn(<PgVotableXorTargetRepository as VotableXorTargetReactions>::reaction_of);
+    // Tenant-scoped: proves the tenant-filtered arms of S1/S5 and
+    // `reaction_of`'s probe monomorphize.
+    assert_is_fn(<PgVotableTenantTargetRepository as VotableTenantTargetReactions>::react);
+    assert_is_fn(<PgVotableTenantTargetRepository as VotableTenantTargetReactions>::reaction_of);
 }
 
 // ── AC2: toggle / flip / insert (require Docker) ──────────────────────────────
@@ -1111,6 +1188,195 @@ async fn count_mode_react_on_soft_deleted_target_is_not_found() {
         .await,
         0,
         "no membership row is created against a soft-deleted target"
+    );
+}
+
+// ── Tenant isolation (PR #2177 review, P1) ────────────────────────────────────
+
+/// The headline fix: through a `tenant_scoped` repository, `react()` reaches
+/// only targets in the ambient tenant.
+///
+/// Both halves matter. A same-tenant reaction must still work exactly as
+/// before — the predicate is not allowed to break the ordinary path — and a
+/// target belonging to another tenant must be `NotFound` *before any write*,
+/// which is asserted at all three places a leak would show: the caller's
+/// error, the edge table (no row), and the victim's persisted aggregate
+/// (untouched).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn react_through_a_tenant_scoped_repository_cannot_reach_another_tenants_target() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgVotableTenantTargetRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let ada = seed_reactor(&mut conn, "ada").await;
+    let mine = seed_tenant_target(&mut conn, "t1", "mine").await;
+    let theirs = seed_tenant_target(&mut conn, "t2", "theirs").await;
+
+    // Seed a reaction on t2's target from inside t2, so the "untouched"
+    // assertion below has a non-zero value to be untouched at.
+    let seeded = CURRENT_TENANT
+        .scope(Some("t2".to_string()), repo.react(ada, theirs, 1))
+        .await
+        .expect("t2 reacts to its own target");
+    assert_eq!(seeded.aggregate, 1);
+
+    // Same tenant: an ordinary reaction, unaffected by the new predicate.
+    let ok = CURRENT_TENANT
+        .scope(Some("t1".to_string()), repo.react(ada, mine, 1))
+        .await
+        .expect("same-tenant react must still succeed");
+    assert_eq!(ok.outcome, ReactionOutcome::Inserted);
+    assert_eq!(ok.value, Some(1));
+    assert_eq!(ok.aggregate, 1);
+    assert_eq!(tenant_target_score(&mut conn, mine).await, 1);
+
+    // Cross tenant: t1 guesses t2's target id.
+    let err = CURRENT_TENANT
+        .scope(Some("t1".to_string()), repo.react(ada, theirs, -1))
+        .await
+        .expect_err("a foreign-tenant target must not accept reactions");
+    assert_eq!(err.status(), StatusCode::NOT_FOUND);
+
+    assert_eq!(
+        edge_count(
+            &mut conn,
+            "votable_tenant_votes",
+            "votable_tenant_target_id",
+            ada,
+            theirs,
+        )
+        .await,
+        1,
+        "the cross-tenant call must not have added (or replaced) an edge — \
+         only t2's own seeded edge may remain"
+    );
+    assert_eq!(
+        tenant_target_score(&mut conn, theirs).await,
+        1,
+        "the victim tenant's aggregate is untouched by the rejected call"
+    );
+    assert_eq!(
+        tenant_target_score(&mut conn, mine).await,
+        1,
+        "the caller's own target is untouched by its failed call too"
+    );
+}
+
+/// `across_tenants()` remains the explicit escape hatch, exactly as it is for
+/// every derived finder: it opts out of the predicate rather than being
+/// blocked by it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn react_across_tenants_still_reaches_a_foreign_tenant_target() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgVotableTenantTargetRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let ada = seed_reactor(&mut conn, "ada").await;
+    let theirs = seed_tenant_target(&mut conn, "t2", "theirs").await;
+
+    let reacted = CURRENT_TENANT
+        .scope(
+            Some("t1".to_string()),
+            repo.across_tenants().react(ada, theirs, 1),
+        )
+        .await
+        .expect("across_tenants() opts out of the tenant predicate");
+    assert_eq!(reacted.outcome, ReactionOutcome::Inserted);
+    assert_eq!(reacted.aggregate, 1);
+    assert_eq!(tenant_target_score(&mut conn, theirs).await, 1);
+
+    // And the read half follows the same escape hatch.
+    assert_eq!(
+        CURRENT_TENANT
+            .scope(
+                Some("t1".to_string()),
+                repo.across_tenants().reaction_of(ada, theirs),
+            )
+            .await
+            .expect("across_tenants() read"),
+        Some(1)
+    );
+}
+
+/// Fail closed: a `tenant_scoped` repository used with no tenant context errors
+/// rather than writing unscoped — the same stance its derived finders take.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn react_without_a_tenant_context_fails_closed_and_writes_nothing() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgVotableTenantTargetRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let ada = seed_reactor(&mut conn, "ada").await;
+    let target = seed_tenant_target(&mut conn, "t1", "orphaned").await;
+
+    // No `CURRENT_TENANT.scope(..)` anywhere around this call.
+    let err = repo
+        .react(ada, target, 1)
+        .await
+        .expect_err("a tenant_scoped repository must not react without a tenant");
+    assert!(
+        err.to_string().to_lowercase().contains("tenant"),
+        "error should name the missing tenant context, got: {err}"
+    );
+
+    assert_eq!(
+        edge_count(
+            &mut conn,
+            "votable_tenant_votes",
+            "votable_tenant_target_id",
+            ada,
+            target,
+        )
+        .await,
+        0,
+        "nothing may be written when the tenant context is missing"
+    );
+    assert_eq!(tenant_target_score(&mut conn, target).await, 0);
+
+    // The read half fails closed identically.
+    let err = repo
+        .reaction_of(ada, target)
+        .await
+        .expect_err("reaction_of must fail closed too");
+    assert!(
+        err.to_string().to_lowercase().contains("tenant"),
+        "error should name the missing tenant context, got: {err}"
+    );
+}
+
+/// `reaction_of()` on a foreign-tenant target is `Ok(None)`, not that tenant's
+/// reaction: the target row is the boundary (the edge table has no tenant
+/// column), and "no visible reaction" is the same answer a reactor gets for a
+/// target it simply never reacted to.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn reaction_of_reports_none_for_a_foreign_tenant_target() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgVotableTenantTargetRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let ada = seed_reactor(&mut conn, "ada").await;
+    let theirs = seed_tenant_target(&mut conn, "t2", "theirs").await;
+
+    CURRENT_TENANT
+        .scope(Some("t2".to_string()), repo.react(ada, theirs, -1))
+        .await
+        .expect("t2 reacts to its own target");
+
+    // In t2 the reaction is visible …
+    assert_eq!(
+        CURRENT_TENANT
+            .scope(Some("t2".to_string()), repo.reaction_of(ada, theirs))
+            .await
+            .expect("t2 read"),
+        Some(-1)
+    );
+    // … and from t1 it does not exist.
+    assert_eq!(
+        CURRENT_TENANT
+            .scope(Some("t1".to_string()), repo.reaction_of(ada, theirs))
+            .await
+            .expect("a foreign-tenant target is not an error, just absent"),
+        None
     );
 }
 

@@ -25,6 +25,13 @@
 //!   select carries the same `deleted_at IS NULL` guard as the `pg` arm.
 //! * **Count mode.** Unary membership toggles and `like_count` tracks
 //!   `COUNT(*)`.
+//! * **Tenant isolation (PR #2177 review, P1).** The tenant-filtered halves of
+//!   S1 / S5 / `reaction_of`'s probe are emitted *per backend arm*, so the
+//!   `sqlite` S1 arm gains a second query that nothing else in the workspace
+//!   type-checks. `TenantPost` compiles it and then exercises it: a
+//!   `tenant_scoped` repository reacts inside its own tenant, is `NotFound`
+//!   against a foreign-tenant target, reports `None` from `reaction_of` there,
+//!   and still reaches it through `across_tenants()`.
 //!
 //! Uses an in-memory shared-cache `SQLite` database — no Docker.
 //!
@@ -38,6 +45,7 @@ use autumn_web::config::DatabaseConfig;
 use autumn_web::db::{RuntimeConnection, create_pool};
 use autumn_web::reexports::{diesel, diesel_async};
 use autumn_web::repository::ReactionOutcome;
+use autumn_web::tenancy::CURRENT_TENANT;
 use axum::http::StatusCode;
 
 use diesel::sql_types::BigInt;
@@ -72,9 +80,18 @@ mod schema {
             like_count -> Int8,
         }
     }
+
+    autumn_web::reexports::diesel::table! {
+        votable_tenant_posts (id) {
+            id -> Int8,
+            title -> Text,
+            tenant_id -> Text,
+            score -> Int8,
+        }
+    }
 }
 
-use schema::{votable_like_posts, votable_vote_posts, votable_voters};
+use schema::{votable_like_posts, votable_tenant_posts, votable_vote_posts, votable_voters};
 
 #[autumn_web::model(table = "votable_voters")]
 pub struct Voter {
@@ -131,6 +148,31 @@ pub struct LikePost {
 #[autumn_web::repository(LikePost, table = "votable_like_posts")]
 pub trait VotePostLikeRepository {}
 
+// ── Sum mode + tenant scoping ─────────────────────────────────────────────────
+
+#[autumn_web::model(table = "votable_tenant_posts")]
+#[votable(
+    by = Voter,
+    aggregate = sum,
+    table = votable_tenant_post_votes,
+    reactor_fk = voter_id,
+    target_fk = post_id
+)]
+pub struct TenantPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub tenant_id: String,
+    #[default]
+    pub score: i64,
+}
+
+/// `tenant_scoped` and deliberately *not* `soft_delete`: the tenant predicate
+/// is then the only thing narrowing the target, so the `sqlite` S1 arm's
+/// tenant-filtered half is what this fixture actually type-checks and runs.
+#[autumn_web::repository(TenantPost, table = "votable_tenant_posts", tenant_scoped)]
+pub trait TenantPostRepository {}
+
 // ── Setup & helpers ───────────────────────────────────────────────────────────
 
 /// The composite `UNIQUE (voter_id, post_id)` on each edge table is
@@ -165,6 +207,21 @@ const DDL: &[&str] = &[
          voter_id BIGINT NOT NULL, \
          post_id BIGINT NOT NULL, \
          PRIMARY KEY (voter_id, post_id)\
+     )",
+    // Two tenants share one physical table — the shape the tenant predicate
+    // has to separate. The edge table has no tenant column: the target row is
+    // the boundary.
+    "CREATE TABLE votable_tenant_posts (\
+         id INTEGER PRIMARY KEY AUTOINCREMENT, \
+         title TEXT NOT NULL, \
+         tenant_id TEXT NOT NULL, \
+         score BIGINT NOT NULL DEFAULT 0\
+     )",
+    "CREATE TABLE votable_tenant_post_votes (\
+         voter_id BIGINT NOT NULL, \
+         post_id BIGINT NOT NULL, \
+         value SMALLINT NOT NULL CHECK (value IN (-1, 1)), \
+         UNIQUE (voter_id, post_id)\
      )",
 ];
 
@@ -243,6 +300,37 @@ async fn edge_count(pool: &SqlitePool, table: &str, voter: i64, post: i64) -> i6
     .count
 }
 
+/// `votable_tenant_posts.score`, read with raw SQL — the tenant-scoped
+/// repository under test is deliberately kept out of the assertion path.
+async fn tenant_post_score(pool: &SqlitePool, id: i64) -> i64 {
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query("SELECT score FROM votable_tenant_posts WHERE id = ?")
+        .bind::<BigInt, _>(id)
+        .get_result::<ScoreRow>(&mut *conn)
+        .await
+        .expect("read tenant post score")
+        .score
+}
+
+/// Seeded with raw SQL rather than through the repository: a `tenant_scoped`
+/// `save()` would stamp the tenant from the ambient context, and this fixture
+/// needs rows belonging to a tenant the caller is *not* in.
+async fn seed_tenant_post(pool: &SqlitePool, tenant: &str, title: &str) -> i64 {
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query("INSERT INTO votable_tenant_posts (title, tenant_id) VALUES (?, ?)")
+        .bind::<diesel::sql_types::Text, _>(title)
+        .bind::<diesel::sql_types::Text, _>(tenant)
+        .execute(&mut *conn)
+        .await
+        .expect("seed tenant post");
+    // Same pooled connection, so `last_insert_rowid()` is this INSERT's.
+    diesel::sql_query("SELECT last_insert_rowid() AS count")
+        .get_result::<CountRow>(&mut *conn)
+        .await
+        .expect("read seeded id")
+        .count
+}
+
 async fn seed_voter(repo: &PgVoterRepository, name: &str) -> i64 {
     repo.save(&NewVoter {
         name: name.to_owned(),
@@ -269,6 +357,10 @@ fn votable_methods_monomorphize_on_sqlite() {
     assert_is_fn(<PgVotePostRepository as VotePostReactions>::reaction_of);
     assert_is_fn(<PgVotePostLikeRepository as LikePostReactions>::react);
     assert_is_fn(<PgVotePostLikeRepository as LikePostReactions>::reaction_of);
+    // The tenant-filtered halves of the `sqlite` S1 arm, S5 and
+    // `reaction_of`'s probe: nowhere else in the workspace type-checks them.
+    assert_is_fn(<PgTenantPostRepository as TenantPostReactions>::react);
+    assert_is_fn(<PgTenantPostRepository as TenantPostReactions>::reaction_of);
 }
 
 // ── Behaviour ─────────────────────────────────────────────────────────────────
@@ -415,6 +507,86 @@ async fn react_on_a_missing_target_is_not_found_on_sqlite() {
         .await
         .expect_err("missing target must be NotFound");
     assert_eq!(err.status(), StatusCode::NOT_FOUND);
+}
+
+/// Tenant isolation on `SQLite` (PR #2177 review, P1): through a
+/// `tenant_scoped` repository the target lookup carries `tenant_id = $t` in the
+/// `sqlite` S1 arm too, so a foreign-tenant target is `NotFound` before any
+/// write, `reaction_of` reports `None` for it, and `across_tenants()` is still
+/// the explicit way through.
+#[tokio::test]
+async fn react_is_tenant_isolated_on_sqlite() {
+    let pool = boot_pool("votable_tenant").await;
+    let voters = PgVoterRepository::with_pool_untracked(pool.clone());
+    let posts = PgTenantPostRepository::with_pool_untracked(pool.clone());
+    let ada = seed_voter(&voters, "ada").await;
+    let mine = seed_tenant_post(&pool, "t1", "mine").await;
+    let theirs = seed_tenant_post(&pool, "t2", "theirs").await;
+
+    // Same tenant: unchanged behaviour.
+    let ok = CURRENT_TENANT
+        .scope(Some("t1".to_owned()), posts.react(ada, mine, 1))
+        .await
+        .expect("same-tenant react must still succeed");
+    assert_eq!(ok.outcome, ReactionOutcome::Inserted);
+    assert_eq!(ok.aggregate, 1);
+    assert_eq!(tenant_post_score(&pool, mine).await, 1);
+
+    // Cross tenant: t1 guesses t2's target id.
+    let err = CURRENT_TENANT
+        .scope(Some("t1".to_owned()), posts.react(ada, theirs, 1))
+        .await
+        .expect_err("a foreign-tenant target must not accept reactions");
+    assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        edge_count(&pool, "votable_tenant_post_votes", ada, theirs).await,
+        0,
+        "no edge may be written across the tenant boundary"
+    );
+    assert_eq!(
+        tenant_post_score(&pool, theirs).await,
+        0,
+        "the victim tenant's aggregate is untouched"
+    );
+
+    // `reaction_of` follows the same boundary: visible in t1, absent from t2.
+    assert_eq!(
+        CURRENT_TENANT
+            .scope(Some("t1".to_owned()), posts.reaction_of(ada, mine))
+            .await
+            .expect("t1 read"),
+        Some(1)
+    );
+    assert_eq!(
+        CURRENT_TENANT
+            .scope(Some("t2".to_owned()), posts.reaction_of(ada, mine))
+            .await
+            .expect("a foreign-tenant target is absent, not an error"),
+        None
+    );
+
+    // `across_tenants()` opts out of the predicate, as it does for finders.
+    let escaped = CURRENT_TENANT
+        .scope(
+            Some("t1".to_owned()),
+            posts.across_tenants().react(ada, theirs, 1),
+        )
+        .await
+        .expect("across_tenants() reaches the foreign-tenant target");
+    assert_eq!(escaped.outcome, ReactionOutcome::Inserted);
+    assert_eq!(tenant_post_score(&pool, theirs).await, 1);
+
+    // And with no tenant context at all a tenant_scoped repository fails
+    // closed rather than writing unscoped.
+    let err = posts
+        .react(ada, mine, -1)
+        .await
+        .expect_err("no tenant context must fail closed");
+    assert!(
+        err.to_string().to_lowercase().contains("tenant"),
+        "error should name the missing tenant context, got: {err}"
+    );
+    assert_eq!(tenant_post_score(&pool, mine).await, 1);
 }
 
 /// Count mode on `SQLite`: `react()` takes no value, a repeat click can only

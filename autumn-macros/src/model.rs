@@ -1604,6 +1604,12 @@ fn emit_association_items(
 /// compile-time guard and as the primary-key column of the hidden target
 /// projection — a model whose `#[id]` field is not named `id` (e.g. `memo_id`)
 /// has no `id` column for S1/S5 to lock and update.
+///
+/// `has_tenant_id` mirrors `has_deleted_at`: when the model carries a
+/// `tenant_id` column the projection declares it and S1/S5 (and
+/// `reaction_of`'s target probe) gain a second, tenant-filtered arm, selected
+/// at runtime from `M2mConnSource::__autumn_m2m_tenant_scope()`. A model
+/// without the column emits none of it and is byte-for-byte unchanged.
 #[allow(clippy::too_many_lines)]
 fn emit_votable_items(
     model_ident: &syn::Ident,
@@ -1611,6 +1617,7 @@ fn emit_votable_items(
     vis: &syn::Visibility,
     spec: &VotableSpec,
     has_deleted_at: bool,
+    has_tenant_id: bool,
     pk_ident: Option<&syn::Ident>,
 ) -> TokenStream {
     let model_snake = pascal_to_snake(&model_ident.to_string());
@@ -1667,6 +1674,11 @@ fn emit_votable_items(
     let deleted_at_decl = has_deleted_at.then(|| {
         quote! { deleted_at -> Nullable<Timestamp>, }
     });
+    // Projected for the same reason `deleted_at` is: S1/S5 filter on it, so
+    // the column has to exist in the hidden target `table!`.
+    let tenant_id_decl = has_tenant_id.then(|| {
+        quote! { tenant_id -> Text, }
+    });
     let hidden_module = quote! {
         // Hidden Diesel declarations backing `#model_ident`'s `#[votable]`
         // reactions: the `#edge_table` edge table (keyed on the composite
@@ -1693,6 +1705,7 @@ fn emit_votable_items(
                 #table_ident (#pk_column) {
                     #pk_column -> Int8,
                     #agg_column -> Int8,
+                    #tenant_id_decl
                     #deleted_at_decl
                 }
             }
@@ -1711,6 +1724,126 @@ fn emit_votable_items(
             .filter(#edge_mod::#edge_table::#target_fk.eq(target_id))
     };
     let not_found_msg = format!("{model_ident} not found");
+
+    // ── Tenant isolation (PR #2177 review, P1) ───────────────────────────
+    // Through a `#[repository(..., tenant_scoped)]` repository, filtering the
+    // target by primary key alone lets a caller who can guess an id react to
+    // ANOTHER tenant's row — an edge insert plus an aggregate UPDATE across
+    // the tenant boundary. So when the model carries a `tenant_id` column the
+    // predicate the repository's own finders would apply is resolved once, up
+    // front, and threaded through S1 (the locking existence guard), S5 (the
+    // aggregate UPDATE) and `reaction_of`'s target probe.
+    //
+    // `__autumn_m2m_tenant_scope()` is three-valued and matches the finders
+    // exactly: `Some(tenant)` scopes, `None` (non-`tenant_scoped` repository,
+    // or `across_tenants()`) does not, and a `tenant_scoped` repository with
+    // no tenant context is an error before anything is read or written.
+    //
+    // Both arms stay whole, statically-typed queries rather than one boxed
+    // query with a conditional predicate: the `pg` arm of S1 carries
+    // `.for_no_key_update()`, which a `into_boxed()` query cannot express.
+    let resolve_tenant = has_tenant_id.then(|| {
+        quote! {
+            let __tenant: ::core::option::Option<::std::string::String> =
+                self.__autumn_m2m_tenant_scope()?;
+        }
+    });
+    let tenant_filter = quote! {
+        .filter(#edge_mod::#table_ident::tenant_id.eq(__t))
+    };
+
+    // S1's existence/soft-delete guard: `lock` adds the Postgres row lock,
+    // `scoped` the tenant predicate.
+    let target_probe = |scoped: bool, lock: bool| {
+        let tenant_predicate = scoped.then(|| tenant_filter.clone());
+        let lock_clause = lock.then(|| quote! { .for_no_key_update() });
+        quote! {
+            #edge_mod::#table_ident::table
+                .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
+                #tenant_predicate
+                #live_filter
+                .select(#edge_mod::#table_ident::#pk_column)
+                #lock_clause
+                .first::<i64>(conn)
+                .await
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?
+        }
+    };
+    let s1_arm = |lock: bool| {
+        let unscoped = target_probe(false, lock);
+        if has_tenant_id {
+            let scoped = target_probe(true, lock);
+            quote! {
+                match __tenant {
+                    ::core::option::Option::Some(ref __t) => { #scoped }
+                    ::core::option::Option::None => { #unscoped }
+                }
+            }
+        } else {
+            unscoped
+        }
+    };
+    let s1_pg = s1_arm(true);
+    let s1_sqlite = s1_arm(false);
+
+    // S5: persist the recomputed aggregate. Tenant-filtered on the same terms
+    // as S1 — belt and braces, since S1 already proved the target is in this
+    // tenant and holds its lock, but a zero-row S5 is the loud failure the
+    // `__persisted == 0` guard below is there for.
+    let aggregate_update = |scoped: bool| {
+        let tenant_predicate = scoped.then(|| tenant_filter.clone());
+        quote! {
+            ::autumn_web::reexports::diesel::update(
+                #edge_mod::#table_ident::table
+                    .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
+                    #tenant_predicate
+                    #live_filter
+            )
+            .set(#edge_mod::#table_ident::#agg_column.eq(__aggregate))
+            .execute(conn)
+            .await
+            .map_err(::autumn_web::AutumnError::from)?
+        }
+    };
+    let s5_persist = if has_tenant_id {
+        let scoped = aggregate_update(true);
+        let unscoped = aggregate_update(false);
+        quote! {
+            let __persisted: usize = match __tenant {
+                ::core::option::Option::Some(ref __t) => { #scoped }
+                ::core::option::Option::None => { #unscoped }
+            };
+        }
+    } else {
+        let unscoped = aggregate_update(false);
+        quote! { let __persisted: usize = #unscoped; }
+    };
+
+    // `reaction_of`'s target probe. The edge table has no tenant column, so
+    // the target row *is* the tenant boundary: a target owned by another
+    // tenant has no visible reaction here, which is `Ok(None)` — not an error,
+    // matching what the reactor would see for a target that simply has no
+    // edge. Deliberately unlocked and NOT soft-delete filtered, mirroring
+    // `reaction_of`'s existing stance of reporting the edge regardless.
+    let reaction_of_tenant_probe = has_tenant_id.then(|| {
+        quote! {
+            if let ::core::option::Option::Some(ref __t) = __tenant {
+                let __in_tenant: ::core::option::Option<i64> =
+                    #edge_mod::#table_ident::table
+                        .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
+                        .filter(#edge_mod::#table_ident::tenant_id.eq(__t))
+                        .select(#edge_mod::#table_ident::#pk_column)
+                        .first::<i64>(&mut conn)
+                        .await
+                        .optional()
+                        .map_err(::autumn_web::AutumnError::from)?;
+                if __in_tenant.is_none() {
+                    return ::core::result::Result::Ok(::core::option::Option::None);
+                }
+            }
+        }
+    });
 
     // ── S2: the reactor's current edge, S3: the three-way branch ─────────
     let (react_value_param, read_current, branch, aggregate_query) = if is_sum {
@@ -1898,6 +2031,34 @@ fn emit_votable_items(
 
     // ── Docs ─────────────────────────────────────────────────────────────
     let aggregate_word = if is_sum { "SUM(value)" } else { "COUNT(*)" };
+    // Only documented where it can apply. A model without a `tenant_id`
+    // column emits no tenant scoping at all, so promising it there would be a
+    // lie — and the shape tests use exactly that to prove the zero-cost path.
+    let (react_tenant_doc, react_tenant_not_found, react_tenant_error) = if has_tenant_id {
+        (
+            "This model has a `tenant_id` column, so a `tenant_scoped` \
+             repository matches the target on it too: another tenant's \
+             `target_id` is `NotFound` before any write. `across_tenants()` \
+             opts out; a `tenant_scoped` repository with no tenant context is \
+             an error.\n\n",
+            ", or belongs to another tenant",
+            "- An error when this repository is `tenant_scoped` and no tenant \
+             context was established.\n",
+        )
+    } else {
+        ("", "", "")
+    };
+    let (reaction_of_tenant_doc, reaction_of_tenant_error) = if has_tenant_id {
+        (
+            "Tenant-isolated on the same terms as `react()`: through a \
+             `tenant_scoped` repository, a target belonging to another tenant \
+             reports `None` rather than that tenant's reaction.\n\n",
+            "- An error when this repository is `tenant_scoped` and no tenant \
+             context was established.\n",
+        )
+    } else {
+        ("", "")
+    };
     let trait_doc = format!(
         "Reaction helpers for `{model_ident}`'s `#[votable(by = {}, aggregate \
          = {})]` declaration: the `{}` edge table keyed on `({}, {})`, \
@@ -1935,10 +2096,12 @@ fn emit_votable_items(
          given, so the edge table's `CHECK` constraint is what keeps the sum \
          meaningful. Never bind it straight from a request body.\n\
          \n\
+         {react_tenant_doc}\
          # Errors\n\
          \n\
          - `AutumnError::not_found` when `target_id` does not exist (or is \
-         soft-deleted).\n\
+         soft-deleted{react_tenant_not_found}).\n\
+         {react_tenant_error}\
          - Any database error from the enclosing transaction.",
         table_ident, spec.column, spec.reactor_fk, spec.target_fk,
     );
@@ -1955,9 +2118,11 @@ fn emit_votable_items(
          from the `Reaction` that `react()` returned instead of re-reading, or \
          use a `primary_reads` / `on_primary()` repository.\n\
          \n\
+         {reaction_of_tenant_doc}\
          # Errors\n\
          \n\
-         Any database error.",
+         {reaction_of_tenant_error}\
+         - Any database error.",
         spec.table,
     );
 
@@ -2004,6 +2169,10 @@ fn emit_votable_items(
                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                // Resolved before the connection is taken, so a tenant_scoped
+                // repository with no tenant context fails closed without
+                // occupying a pooled connection.
+                #resolve_tenant
                 let mut conn = self.__autumn_m2m_write_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<
                     ::autumn_web::repository::Reaction,
@@ -2026,27 +2195,8 @@ fn emit_votable_items(
                         // locking clause is redundant as well as unemittable.
                         let __target: ::core::option::Option<i64> =
                             ::autumn_web::backend_select! {
-                                pg => {
-                                    #edge_mod::#table_ident::table
-                                        .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
-                                        #live_filter
-                                        .select(#edge_mod::#table_ident::#pk_column)
-                                        .for_no_key_update()
-                                        .first::<i64>(conn)
-                                        .await
-                                        .optional()
-                                        .map_err(::autumn_web::AutumnError::from)?
-                                },
-                                sqlite => {
-                                    #edge_mod::#table_ident::table
-                                        .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
-                                        #live_filter
-                                        .select(#edge_mod::#table_ident::#pk_column)
-                                        .first::<i64>(conn)
-                                        .await
-                                        .optional()
-                                        .map_err(::autumn_web::AutumnError::from)?
-                                },
+                                pg => { #s1_pg },
+                                sqlite => { #s1_sqlite },
                             };
                         if __target.is_none() {
                             return ::core::result::Result::Err(
@@ -2065,15 +2215,7 @@ fn emit_votable_items(
                         #aggregate_query
 
                         // S5 — persist, in the same transaction as S3.
-                        let __persisted: usize = ::autumn_web::reexports::diesel::update(
-                            #edge_mod::#table_ident::table
-                                .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
-                                #live_filter
-                        )
-                        .set(#edge_mod::#table_ident::#agg_column.eq(__aggregate))
-                        .execute(conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
+                        #s5_persist
 
                         // Defense in depth: unreachable while S1's lock holds —
                         // the target existed and was live when we locked it, and
@@ -2108,9 +2250,11 @@ fn emit_votable_items(
                 use ::autumn_web::reexports::diesel::result::OptionalExtension as _;
                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                #resolve_tenant
                 // A read: routed per the repository's `ReadRoute`, and it does
                 // not mark the read-your-writes pin.
                 let mut conn = self.__autumn_m2m_read_conn().await?;
+                #reaction_of_tenant_probe
                 #reaction_of_body
             }
         }
@@ -4461,6 +4605,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let has_deleted_at = all_fields
                 .iter()
                 .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+            // Same field-presence precedent as `deleted_at`: the column has to
+            // exist for S1/S5 to filter on it. Whether it is actually *applied*
+            // is the repository's call, resolved at runtime through
+            // `M2mConnSource::__autumn_m2m_tenant_scope()`.
+            let has_tenant_id = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "tenant_id"));
             let pk_ident = all_fields
                 .iter()
                 .find(|f| has_attr(f, "id"))
@@ -4471,7 +4622,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                 })
                 .and_then(|f| f.ident.as_ref());
-            emit_votable_items(name, &table_ident, vis, spec, has_deleted_at, pk_ident)
+            emit_votable_items(
+                name,
+                &table_ident,
+                vis,
+                spec,
+                has_deleted_at,
+                has_tenant_id,
+                pk_ident,
+            )
         }
     };
 
@@ -8631,6 +8790,117 @@ mod tests {
         assert!(
             !hard.contains("is_null"),
             "a model without deleted_at must not emit a soft-delete guard, got: {hard}"
+        );
+    }
+
+    /// The hidden `__autumn_votable_*` module and everything the `#[votable]`
+    /// declaration emits after it. Scoping the tenant assertions to this slice
+    /// keeps them from matching the *rest* of `#[model]`'s codegen, which
+    /// legitimately mentions `tenant_id` for a model that has the column
+    /// (`HasTenantIdColumn`, the insertable selector, …).
+    fn votable_slice(generated: &str) -> &str {
+        let start = generated
+            .find("mod __autumn_votable_")
+            .expect("the votable codegen starts at its hidden module");
+        &generated[start..]
+    }
+
+    #[test]
+    fn votable_tenant_scoped_target_is_filtered_in_s1_s5_and_reaction_of() {
+        // PR #2177 review (P1): through a `#[repository(..., tenant_scoped)]`
+        // repository, filtering the target by primary key alone lets a caller
+        // react to ANOTHER tenant's row — an edge insert plus an aggregate
+        // UPDATE across the tenant boundary. When the model carries a
+        // `tenant_id` column the codegen must project it and emit a
+        // tenant-filtered arm everywhere the target is touched.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub tenant_id: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+        let votable = votable_slice(&generated);
+
+        assert!(
+            votable.contains("tenant_id -> Text"),
+            "expected tenant_id projected into the hidden target table, got: {votable}"
+        );
+        assert!(
+            votable.contains("self . __autumn_m2m_tenant_scope ()"),
+            "expected the tenant predicate resolved through the repository's \
+             M2mConnSource, not read from the task-local directly, got: {votable}"
+        );
+
+        // Exactly four tenant-filtered sites, each load-bearing and each the
+        // *scoped* half of a two-arm match (the other arm is today's unfiltered
+        // query, taken for a non-tenant_scoped repository or `across_tenants()`):
+        //
+        //   1. S1, `pg` arm     — the locking existence guard,
+        //   2. S1, `sqlite` arm — the same guard without the row lock,
+        //   3. S5              — the aggregate UPDATE,
+        //   4. `reaction_of`   — the target-in-this-tenant probe.
+        //
+        // The arms stay separate whole queries rather than one boxed query
+        // with a conditional predicate, because S1's `pg` arm carries
+        // `.for_no_key_update()`. Pinned exactly: a fifth would mean a
+        // duplicated statement, a fourth-minus-one that some path lost its
+        // filter and can write across the tenant boundary again.
+        assert_eq!(
+            votable.matches("tenant_id . eq").count(),
+            4,
+            "expected exactly 4 tenant-filtered target sites (S1 pg, S1 sqlite, \
+             S5, reaction_of's probe), got: {votable}"
+        );
+        assert!(
+            votable.contains("for_no_key_update"),
+            "the tenant-filtered pg arm must keep the row lock, got: {votable}"
+        );
+        // Both halves of each match survive: the unfiltered arm is what a
+        // non-tenant_scoped repository (and `across_tenants()`) still takes.
+        // Both halves of every match survive. The unfiltered arm is what a
+        // non-`tenant_scoped` repository — and `across_tenants()` — still
+        // takes, so the target lookup appears twice at each of S1's two
+        // backend arms and at S5, plus once in `reaction_of`'s probe: 3 * 2 + 1.
+        assert_eq!(
+            votable.matches("posts :: id . eq (target_id)").count(),
+            7,
+            "expected a tenant-filtered AND an unfiltered arm at S1 (both \
+             backends) and S5, plus reaction_of's probe, got: {votable}"
+        );
+    }
+
+    #[test]
+    fn votable_model_without_tenant_id_emits_no_tenant_scoping() {
+        // AC: zero cost. A model with no `tenant_id` column can have no
+        // meaningful `tenant_scoped` repository (its own derived queries would
+        // not compile), so the reaction codegen must be byte-identical to what
+        // it emitted before tenant isolation existed — no projection, no
+        // runtime branch, not even a doc paragraph promising it.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+        let votable = votable_slice(&generated);
+
+        assert!(
+            !votable.contains("tenant"),
+            "a model without tenant_id must emit no tenant token anywhere in \
+             the votable items, got: {votable}"
         );
     }
 

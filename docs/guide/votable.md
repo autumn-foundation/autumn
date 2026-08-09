@@ -575,11 +575,22 @@ Styling hooks (`.autumn-reaction-controls`, `.autumn-reaction`,
   model hooks fire, no validation runs, and the target's `updated_at` is left
   alone (a vote is not an edit of the post). Anything that must happen on every
   vote belongs in the calling route.
-- **`tenant_scoped` repositories are not tenant-filtered inside `react()` /
-  `reaction_of()`.** Both are scoped by id only — exactly like the m2m mutation
-  helpers. In a multi-tenant app, do an authorizing lookup through the
-  tenant-scoped repository first and only then react, or a caller who can guess
-  an id can vote across the tenant boundary.
+- **Tenant isolation is enforced, but only when the model has the column.**
+  When the target `#[model]` has a `tenant_id` field *and* the repository is
+  `#[repository(..., tenant_scoped)]`, `react()`'s target lock (S1) and its
+  aggregate `UPDATE` (S5) both carry `tenant_id = <current tenant>`, so a
+  caller who guesses another tenant's `target_id` gets `NotFound` before
+  anything is written, and `reaction_of()` returns `None` for it rather than
+  that tenant's reaction. A `tenant_scoped` repository used with **no** tenant
+  context is an error, exactly like its derived finders, and `across_tenants()`
+  opts out of the predicate the same way. A model without a `tenant_id` column
+  (or a repository that is not `tenant_scoped`) emits and pays for none of
+  this. The tenant boundary lives on the *target* row — the edge table needs no
+  tenant column.
+
+  The many-to-many `add_*` / `remove_*` / `set_*` helpers are **not** covered by
+  this: they are still id-scoped only. That is pre-existing and tracked
+  separately.
 - **One `#[votable]` per model.** A model that wants both votes *and* bookmarks
   cannot express it yet; a second attribute is a compile error, because
   `{Model}Reactions` / `react` / `reaction_of` would be ambiguous.

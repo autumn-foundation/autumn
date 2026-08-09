@@ -74,9 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the recompute is O(edges per target), writes to one target serialise, READ
   COMMITTED is assumed (a contended locking read blocks first and then fails
   with `40001` rather than corrupting), `react()` bypasses model hooks and does
-  not touch `updated_at`, `tenant_scoped` repositories are not tenant-filtered
-  inside `react()`/`reaction_of()` (id-scoped only, the same caveat as the m2m
-  helpers), every edge *write* must go through `react()` for the aggregate to
+  not touch `updated_at`, every edge *write* must go through `react()` for the aggregate to
   stay exact, and — like the m2m mutation helpers — `react()` acquires its
   **own** pooled connection and does not join an enclosing `Db::tx`, so a
   handler must not hold a `Db` extractor across the call (that needs two
@@ -84,6 +82,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reaction_of()` is a read and routes through the repository's read route, so
   it is replica-eligible and does not pin read-your-writes — re-render from the
   `Reaction` the write returned.
+  Tenant isolation is **enforced**, not left to the caller: when the target
+  model has a `tenant_id` column and the repository is
+  `#[repository(..., tenant_scoped)]`, the target lock (S1) and the aggregate
+  `UPDATE` (S5) both carry `tenant_id = <current tenant>`, so a caller who
+  guesses another tenant's `target_id` gets `NotFound` before any edge insert or
+  aggregate write, and `reaction_of()` returns `None` for a foreign-tenant
+  target instead of that tenant's reaction. A `tenant_scoped` repository with no
+  tenant context fails closed with the same "no tenant context was established"
+  error its derived finders raise, and `across_tenants()` opts out of the
+  predicate exactly as it does for a finder — resolved through a new hidden
+  `M2mConnSource::__autumn_m2m_tenant_scope()` so the repository's own scoping
+  decision (not field presence) is what applies. A model without a `tenant_id`
+  column emits no tenant branch at all and is unchanged. The many-to-many
+  `add_*`/`remove_*`/`set_*` helpers keep the old id-only scoping (pre-existing,
+  tracked separately).
   Contrary to the issue's parenthetical suggestion, the recompute does **not**
   reuse `repository_commit_hooks`: that is a durable post-commit queue running
   on a different connection, which structurally cannot be atomic with the edge

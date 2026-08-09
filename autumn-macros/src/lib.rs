@@ -623,6 +623,15 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// When the model has a `deleted_at` field, reacting to a soft-deleted target
 /// is `NotFound` and leaves its aggregate untouched.
 ///
+/// Tenant-isolated on the same terms: when the model has a `tenant_id` field
+/// **and** the repository is `#[repository(..., tenant_scoped)]`, both the
+/// target lock and the aggregate `UPDATE` carry `tenant_id = <current
+/// tenant>`, so another tenant's `target_id` is `NotFound` before any write and
+/// `reaction_of()` reports `None` for it. No tenant context is an error (as for
+/// any derived query) and `across_tenants()` opts out. A model without the
+/// column emits none of this. The m2m `add_*` / `remove_*` helpers are not
+/// covered — they remain id-scoped.
+///
 /// `react()` acquires its **own** pooled connection and does not join an
 /// enclosing `Db::tx` — do not hold a `Db` extractor across the call on a small
 /// connection pool.

@@ -519,7 +519,9 @@ pub trait ModelPrimaryKey {
 /// `react()` acquires its own connection through
 /// [`M2mConnSource::__autumn_m2m_write_conn`] exactly like an `add_*` does,
 /// while the read-only `reaction_of()` uses
-/// [`M2mConnSource::__autumn_m2m_read_conn`].
+/// [`M2mConnSource::__autumn_m2m_read_conn`]. Both scope their **target**
+/// lookups with [`M2mConnSource::__autumn_m2m_tenant_scope`] when the target
+/// model carries a `tenant_id` column.
 ///
 /// Not part of the public API; not implemented by hand.
 #[cfg(feature = "db")]
@@ -563,6 +565,33 @@ pub trait M2mConnSource: Send + Sync {
             diesel_async::pooled_connection::deadpool::Object<crate::db::RuntimeConnection>,
         >,
     > + Send;
+
+    /// The tenant this repository would scope its queries to, for the
+    /// `#[votable]` reaction helpers to apply to their **target** lookups.
+    ///
+    /// Synchronous (it only reads the `CURRENT_TENANT` task-local) and
+    /// deliberately three-valued, mirroring what a derived finder on the same
+    /// repository would do:
+    ///
+    /// - `Ok(Some(tenant))` — a `#[repository(..., tenant_scoped)]` repository
+    ///   used inside a tenant context: `react()` / `reaction_of()` must filter
+    ///   the target on `tenant_id`, so a foreign-tenant target id is `NotFound`
+    ///   (respectively `None`) before any write.
+    /// - `Ok(None)` — a repository that is not `tenant_scoped`, or one used via
+    ///   `across_tenants()`: no tenant predicate, exactly like its finders.
+    /// - `Err(..)` — a `tenant_scoped` repository with no tenant context: the
+    ///   same "no tenant context was established" failure the derived queries
+    ///   raise, so the reaction surface fails closed rather than writing
+    ///   unscoped.
+    ///
+    /// Only the codegen for a model that actually has a `tenant_id` column
+    /// calls it; a model without one pays nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the repository is `tenant_scoped`, is not in
+    /// `across_tenants()` mode, and no tenant context was established.
+    fn __autumn_m2m_tenant_scope(&self) -> crate::AutumnResult<::core::option::Option<String>>;
 }
 
 /// Which of the three edge mutations a `#[votable]` `react()` call performed

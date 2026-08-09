@@ -306,7 +306,11 @@ post, are not blocked; `BEGIN IMMEDIATE` on SQLite) held across the whole
 read-decide-write-recompute window. Concurrent callers therefore converge to
 at most one edge per `(reactor, target)` with no `23505` escaping, and the
 persisted aggregate is exact even across different reactors. A missing or
-soft-deleted target is `NotFound`. **`react()` does not validate `value`** —
+soft-deleted target is `NotFound`. Tenant-isolated: with a `tenant_id` column
+on the model and a `tenant_scoped` repository, S1/S5 filter on the current
+tenant, so a foreign-tenant `target_id` is `NotFound` (and `reaction_of`
+returns `None`); no tenant context is an error, `across_tenants()` opts out.
+**`react()` does not validate `value`** —
 it writes whatever `i16` you pass, so branch on the route and put a
 `CHECK (value IN (-1, 1))` on the column; never bind it from a request. A
 toggle is not idempotent: a blind retry of a timed-out call inverts it, so use
