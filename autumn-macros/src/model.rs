@@ -1656,6 +1656,16 @@ fn emit_votable_items(
             };
         }
     });
+    // The aggregate field must *be* `i64`, whatever it is spelled as
+    // (`std::primitive::i64`, a type alias, …). The macro-level check only
+    // rejects the definitely-wrong spellings with a directed message; this
+    // guard is what actually enforces the type, by name resolution rather than
+    // token text.
+    let agg_ty_guard = quote! {
+        const _: fn(&#model_ident) -> i64 = |__autumn_votable_model| {
+            __autumn_votable_model.#agg_column
+        };
+    };
     // `by = <Reactor>` is otherwise never mentioned in the generated code (the
     // edge table stores a bare `i64` reactor fk), so a typo'd model name would
     // compile silently. Force its name resolution the way every other
@@ -2156,6 +2166,7 @@ fn emit_votable_items(
         #hidden_module
 
         #pk_guard
+        #agg_ty_guard
         #reactor_guard
 
         #[doc = #trait_doc]
@@ -4613,9 +4624,21 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
             // The aggregate is `SUM(value)` / `COUNT(*)` — both `BIGINT` — and
             // the generated `Reaction::aggregate` is `i64`, so anything else is
-            // a schema mismatch, not a convenience to be coerced.
+            // a schema mismatch, not a convenience to be coerced. Two layers
+            // (PR #2177 review): a *directed* error here for the spellings that
+            // are definitely wrong (a bare non-`i64` primitive, an `Option`),
+            // and a generated `const` type guard (emit_votable_items) for
+            // everything else — so `std::primitive::i64` and aliases that
+            // really are `i64` compile, while a wrong alias still fails at the
+            // guard rather than at runtime.
             let aggregate_ty = aggregate_field.ty.to_token_stream().to_string();
-            if aggregate_ty != "i64" {
+            let definitely_not_i64: &[&str] = &[
+                "i8", "i16", "i32", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
+                "f32", "f64", "bool", "String",
+            ];
+            if definitely_not_i64.contains(&aggregate_ty.as_str())
+                || aggregate_ty.starts_with("Option <")
+            {
                 return syn::Error::new_spanned(
                     &aggregate_field.ty,
                     format!(
@@ -8460,6 +8483,39 @@ mod tests {
             assert!(
                 generated.contains(&format!("found `{rendered}`")),
                 "expected the offending type quoted back, got: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn votable_aggregate_accepts_equivalent_i64_spellings_via_typed_guard() {
+        // PR #2177 review: the macro-level check must only reject spellings
+        // that are *definitely* wrong. `std::primitive::i64` (or an alias) IS
+        // `i64`; token-text equality would reject it. Such spellings pass the
+        // macro and are enforced by the emitted `const` guard instead — which
+        // must also be present in the plain-`i64` case as the backstop for
+        // wrong aliases.
+        for ty in [quote! { std::primitive::i64 }, quote! { i64 }] {
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    #[votable(by = User, aggregate = sum)]
+                    pub struct Post {
+                        #[id]
+                        pub id: i64,
+                        pub score: #ty,
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                !generated.contains("compile_error"),
+                "an i64-equivalent spelling must not be rejected, got: {generated}"
+            );
+            assert!(
+                generated.contains("__autumn_votable_model . score"),
+                "expected the aggregate-field type guard to be emitted, got: {generated}"
             );
         }
     }
