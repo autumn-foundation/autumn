@@ -386,3 +386,55 @@ fn degrades_to_a_plain_post_form() {
     assert!(!html.contains("<script"), "{html}");
     assert!(!html.contains("style="), "no inline styles: {html}");
 }
+
+#[test]
+fn buttons_carry_stable_ids_derived_from_dom_id() {
+    // The ids are what `hx-preserve` matches on (see
+    // `preserve_pressed_state_marks_the_buttons`), so they must be stable and
+    // derived from the caller's `dom_id`, per direction and per mode.
+    let votes = reaction_controls(
+        &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote").aggregate(0),
+    )
+    .into_string();
+    assert!(votes.contains(r#"id="votes-42-up""#), "{votes}");
+    assert!(votes.contains(r#"id="votes-42-down""#), "{votes}");
+
+    let likes =
+        reaction_controls(&ReactionControls::likes("likes-7", "/bookmarks/7/like").aggregate(0))
+            .into_string();
+    assert!(likes.contains(r#"id="likes-7-like""#), "{likes}");
+    assert!(!likes.contains(r#"id="likes-7-up""#), "{likes}");
+}
+
+#[test]
+fn preserve_pressed_state_marks_the_buttons() {
+    // Broadcast fragments (SSE fan-out, `current` necessarily `None`) opt in
+    // to `hx-preserve` so a shared card swap keeps each viewer's own live
+    // button elements — pressed state included — while still refreshing the
+    // aggregate and the rest of the card.
+    let broadcast = reaction_controls(
+        &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+            .aggregate(7)
+            .preserve_pressed_state(true),
+    )
+    .into_string();
+    assert_eq!(
+        broadcast.matches(r#"hx-preserve="true""#).count(),
+        2,
+        "both buttons must be preserved on a broadcast fragment: {broadcast}"
+    );
+
+    // The direct vote response must NOT preserve: it exists to repaint the
+    // pressed state it just computed, and `hx-preserve` would resurrect the
+    // stale buttons instead.
+    let direct = reaction_controls(
+        &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+            .aggregate(7)
+            .current(Some(1)),
+    )
+    .into_string();
+    assert!(
+        !direct.contains("hx-preserve"),
+        "the default (direct-response) rendering must not preserve: {direct}"
+    );
+}

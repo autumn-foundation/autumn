@@ -860,6 +860,9 @@ pub struct ReactionControls {
     csrf_token: Option<String>,
     /// CSRF hidden-input name; defaults to `_csrf`.
     csrf_field: String,
+    /// Emit `hx-preserve="true"` on the buttons, for shared/broadcast
+    /// fragments that must not clobber a viewer's own pressed state.
+    preserve_pressed_state: bool,
 }
 
 #[cfg(feature = "maud")]
@@ -880,6 +883,7 @@ impl ReactionControls {
             hx_target,
             csrf_token: None,
             csrf_field: "_csrf".to_owned(),
+            preserve_pressed_state: false,
         }
     }
 
@@ -981,6 +985,26 @@ impl ReactionControls {
     #[must_use]
     pub fn csrf_field(mut self, field: impl Into<String>) -> Self {
         self.csrf_field = field.into();
+        self
+    }
+
+    /// Emit `hx-preserve="true"` on the buttons, so an htmx swap that replaces
+    /// this control keeps the *live* button elements — and with them the
+    /// viewer's own `aria-pressed` / `.autumn-reaction-active` state.
+    ///
+    /// For **shared/broadcast fragments only** (an SSE fan-out re-rendering a
+    /// card for every subscriber, where `current` is necessarily `None`): the
+    /// swap then updates the aggregate and the rest of the card without
+    /// un-pressing the viewer's buttons. Each button carries a stable id
+    /// derived from `dom_id` (`{dom_id}-up` / `-down` / `-like`), which is
+    /// what `hx-preserve` matches on.
+    ///
+    /// Never set this on a control returned from the vote route itself — the
+    /// direct response *wants* to repaint the pressed state it just computed,
+    /// and `hx-preserve` would resurrect the stale buttons instead.
+    #[must_use]
+    pub const fn preserve_pressed_state(mut self, preserve: bool) -> Self {
+        self.preserve_pressed_state = preserve;
         self
     }
 
@@ -1135,6 +1159,15 @@ pub fn reaction_controls(cfg: &ReactionControls) -> maud::Markup {
     };
     let primary_pressed = if up_pressed { "true" } else { "false" };
     let down_pressed_attr = if down_pressed { "true" } else { "false" };
+    // Stable per-direction button ids: what `hx-preserve` matches on when a
+    // shared/broadcast fragment must not clobber the viewer's pressed state.
+    let primary_button_id = if like_mode {
+        format!("{}-like", cfg.dom_id)
+    } else {
+        format!("{}-up", cfg.dom_id)
+    };
+    let down_button_id = format!("{}-down", cfg.dom_id);
+    let preserve = cfg.preserve_pressed_state.then_some("true");
 
     maud::html! {
         div id=(cfg.dom_id) class="autumn-reaction-controls" role="group" aria-label=(cfg.label) {
@@ -1143,8 +1176,9 @@ pub fn reaction_controls(cfg: &ReactionControls) -> maud::Markup {
                 @if let Some(token) = &cfg.csrf_token {
                     input type="hidden" name=(cfg.csrf_field) value=(token);
                 }
-                button type="submit" class=(primary_button_class)
-                    aria-pressed=(primary_pressed) aria-label=(primary_label) {
+                button type="submit" id=(primary_button_id) class=(primary_button_class)
+                    aria-pressed=(primary_pressed) aria-label=(primary_label)
+                    hx-preserve=[preserve] {
                     span aria-hidden="true" { (primary_glyph) }
                 }
             }
@@ -1155,8 +1189,9 @@ pub fn reaction_controls(cfg: &ReactionControls) -> maud::Markup {
                     @if let Some(token) = &cfg.csrf_token {
                         input type="hidden" name=(cfg.csrf_field) value=(token);
                     }
-                    button type="submit" class=(down_button_class)
-                        aria-pressed=(down_pressed_attr) aria-label=(cfg.down_label) {
+                    button type="submit" id=(down_button_id) class=(down_button_class)
+                        aria-pressed=(down_pressed_attr) aria-label=(cfg.down_label)
+                        hx-preserve=[preserve] {
                         span aria-hidden="true" { "▼" }
                     }
                 }

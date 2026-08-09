@@ -210,6 +210,28 @@ pub fn vote_controls(
     )
 }
 
+/// The vote control as rendered inside a fragment **broadcast to every
+/// subscriber** (the SSE post-card fan-out).
+///
+/// Same shape as [`vote_controls`] with `current = None` / no CSRF (see the
+/// rationale there), plus `preserve_pressed_state`: the broadcast card swap
+/// arrives on viewers who may have a vote pressed — including the voter
+/// themself, racing their own targeted response — and `hx-preserve` on the
+/// buttons keeps each viewer's live pressed state while the swap still
+/// refreshes the aggregate and the rest of the card.
+pub fn broadcast_vote_controls(post_id: i64, score: i64) -> Markup {
+    reaction_controls(
+        &ReactionControls::votes(
+            format!("votes-{post_id}"),
+            super::votes::__autumn_path_upvote(post_id),
+            super::votes::__autumn_path_downvote(post_id),
+        )
+        .aggregate(score)
+        .preserve_pressed_state(true)
+        .label("Post score"),
+    )
+}
+
 /// Timestamp display helper.
 pub fn time_ago(dt: &chrono::NaiveDateTime) -> String {
     let now = chrono::Utc::now().naive_utc();
