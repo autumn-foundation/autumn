@@ -700,8 +700,15 @@ pub async fn show(
     // (#1362). One indexed lookup on the edge table, and only here — feeds pass
     // `None` to avoid an N+1. `db` was dropped above and `preload` has already
     // returned, so this is this request's only live checkout.
+    //
+    // `on_primary()`: the no-JS vote flow lands here via a 303 redirect — a
+    // fresh GET with no read-your-writes pin — so on a lagging replica the
+    // viewer's *own just-cast* vote could render unpressed. Their own vote is
+    // the one read on this page where staleness is user-visible and wrong;
+    // it is a single point lookup, and every heavy read above stays
+    // replica-routed.
     let current_vote = match viewer_id {
-        Some(uid) => repo.reaction_of(uid, post.id).await?,
+        Some(uid) => repo.on_primary().reaction_of(uid, post.id).await?,
         None => None,
     };
 
