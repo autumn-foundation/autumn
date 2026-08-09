@@ -111,6 +111,16 @@ async fn cast_vote(
     }
 }
 
+/// Serializes the reload-and-publish window below. `react()`'s row lock is
+/// released at commit, so two near-simultaneous votes could otherwise reload
+/// in one order and publish in the other — the *older* score broadcast last,
+/// every SSE subscriber showing a regressed aggregate until the next update.
+/// Holding this across load→publish makes publish order equal load order, and
+/// each load happens after its own vote's commit, so the published score never
+/// goes backwards. One global lock is plenty at example scale; a hot
+/// production app would shard it per post id.
+static BROADCAST_ORDER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Publish the updated post fragment to the global and per-subreddit SSE
 /// topics (presentation, not vote logic).
 ///
@@ -119,6 +129,7 @@ async fn cast_vote(
 /// request never holds two connections at once — which is exactly what keeps
 /// the pool from deadlocking under concurrent votes.
 async fn broadcast_post_update(post_id: i64, state: &AppState) -> AutumnResult<()> {
+    let _publish_in_load_order = BROADCAST_ORDER.lock().await;
     let pool = state
         .pool()
         .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
