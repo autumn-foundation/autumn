@@ -588,10 +588,13 @@ Styling hooks (`.autumn-reaction-controls`, `.autumn-reaction`,
   anything is written, and `reaction_of()` returns `None` for it rather than
   that tenant's reaction. A `tenant_scoped` repository used with **no** tenant
   context is an error, exactly like its derived finders, and `across_tenants()`
-  opts out of the predicate the same way. A model without a `tenant_id` column
-  (or a repository that is not `tenant_scoped`) emits and pays for none of
-  this. The tenant boundary lives on the *target* row — the edge table needs no
-  tenant column.
+  opts out of the predicate the same way — except on a **sharded** repository,
+  where `across_tenants()` reactions are rejected outright (there is no single
+  right shard for the write to land on, and a one-shard read would return a
+  false `None`), matching the repository's other cross-shard write guards. A
+  model without a `tenant_id` column (or a repository that is not
+  `tenant_scoped`) emits and pays for none of this. The tenant boundary lives
+  on the *target* row — the edge table needs no tenant column.
 
   The many-to-many `add_*` / `remove_*` / `set_*` helpers are **not** covered by
   this: they are still id-scoped only. That is pre-existing and tracked

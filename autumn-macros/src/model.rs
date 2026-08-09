@@ -1750,12 +1750,23 @@ fn emit_votable_items(
     // Both arms stay whole, statically-typed queries rather than one boxed
     // query with a conditional predicate: the `pg` arm of S1 carries
     // `.for_no_key_update()`, which a `into_boxed()` query cannot express.
-    let resolve_tenant = has_tenant_id.then(|| {
+    //
+    // The call is emitted UNCONDITIONALLY — even for a model with no
+    // `tenant_id` column, where the returned scope is unused — because the
+    // method also carries the cross-shard reject: on a sharded repository in
+    // `across_tenants()` mode there is no single right shard for a reaction to
+    // land on, and the guard errors before any connection is acquired.
+    let resolve_tenant = if has_tenant_id {
         quote! {
             let __tenant: ::core::option::Option<::std::string::String> =
                 self.__autumn_m2m_tenant_scope()?;
         }
-    });
+    } else {
+        quote! {
+            let _: ::core::option::Option<::std::string::String> =
+                self.__autumn_m2m_tenant_scope()?;
+        }
+    };
     let tenant_filter = quote! {
         .filter(#edge_mod::#table_ident::tenant_id.eq(__t))
     };
@@ -2056,6 +2067,11 @@ fn emit_votable_items(
     } else {
         ("", "", "")
     };
+    // Applies regardless of `has_tenant_id`: the scope call carrying the
+    // reject is emitted unconditionally.
+    let cross_shard_error = "- `AutumnError::bad_request` when this repository is sharded and in \
+                             `across_tenants()` mode: there is no single right shard for a \
+                             reaction, so cross-shard reactions are rejected.\n";
     let (reaction_of_tenant_doc, reaction_of_tenant_error) = if has_tenant_id {
         (
             "Tenant-isolated on the same terms as `react()`: through a \
@@ -2110,6 +2126,7 @@ fn emit_votable_items(
          - `AutumnError::not_found` when `target_id` does not exist (or is \
          soft-deleted{react_tenant_not_found}).\n\
          {react_tenant_error}\
+         {cross_shard_error}\
          - Any database error from the enclosing transaction.",
         table_ident, spec.column, spec.reactor_fk, spec.target_fk,
     );
@@ -2130,6 +2147,7 @@ fn emit_votable_items(
          # Errors\n\
          \n\
          {reaction_of_tenant_error}\
+         {cross_shard_error}\
          - Any database error.",
         spec.table,
     );
@@ -8886,11 +8904,15 @@ mod tests {
 
     #[test]
     fn votable_model_without_tenant_id_emits_no_tenant_scoping() {
-        // AC: zero cost. A model with no `tenant_id` column can have no
+        // AC: zero query cost. A model with no `tenant_id` column can have no
         // meaningful `tenant_scoped` repository (its own derived queries would
-        // not compile), so the reaction codegen must be byte-identical to what
-        // it emitted before tenant isolation existed — no projection, no
-        // runtime branch, not even a doc paragraph promising it.
+        // not compile), so the reaction queries must carry no tenant
+        // projection, predicate, or runtime branch. The ONE tenant token that
+        // must still appear is the discarded `__autumn_m2m_tenant_scope()?`
+        // call in each method: it carries the cross-shard reject (PR #2177 —
+        // across_tenants() on a sharded repository has no single right shard
+        // for a reaction), and on a plain repository it is a constant
+        // `Ok(None)`.
         let generated = model_macro(
             quote! {},
             quote! {
@@ -8906,9 +8928,23 @@ mod tests {
         let votable = votable_slice(&generated);
 
         assert!(
-            !votable.contains("tenant"),
-            "a model without tenant_id must emit no tenant token anywhere in \
-             the votable items, got: {votable}"
+            !votable.contains("tenant_id"),
+            "a model without tenant_id must emit no tenant column, predicate, \
+             or projection anywhere in the votable items, got: {votable}"
+        );
+        assert_eq!(
+            votable
+                .matches("self . __autumn_m2m_tenant_scope ()")
+                .count(),
+            2,
+            "react() and reaction_of() must each still call the tenant-scope \
+             method (discarded) so the cross-shard reject fires before any \
+             connection is acquired, got: {votable}"
+        );
+        assert!(
+            !votable.contains("__tenant"),
+            "no tenant runtime branch may survive on a tenant-less model, \
+             got: {votable}"
         );
     }
 
