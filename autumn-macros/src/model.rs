@@ -4682,6 +4682,38 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let has_tenant_id = all_fields
                 .iter()
                 .any(|f| f.ident.as_ref().is_some_and(|i| i == "tenant_id"));
+            // A composite key cannot back a reaction: `react(target_id)`
+            // identifies the target by ONE value, so with two `#[id]` fields
+            // S1 would lock whichever rows share the first component and S5
+            // would update all of them. Reject rather than silently keying on
+            // the first component (PR #2177 review).
+            let id_fields: Vec<&syn::Ident> = all_fields
+                .iter()
+                .filter(|f| has_attr(f, "id"))
+                .filter_map(|f| f.ident.as_ref())
+                .collect();
+            if id_fields.len() > 1 {
+                let attr = outer_attrs
+                    .iter()
+                    .find(|a| is_votable_attr(a))
+                    .expect("attribute was parsed above");
+                let listed = id_fields
+                    .iter()
+                    .map(|i| format!("`{i}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return syn::Error::new_spanned(
+                    attr,
+                    format!(
+                        "`#[votable]` requires a single `i64` primary key: model \
+                         `{name}` declares a composite key ({listed}), and \
+                         `react(reactor_id, target_id)` identifies its target by \
+                         one id — the edge table and the aggregate UPDATE cannot \
+                         address a composite-keyed row"
+                    ),
+                )
+                .to_compile_error();
+            }
             let pk_ident = all_fields
                 .iter()
                 .find(|f| has_attr(f, "id"))
@@ -8324,6 +8356,41 @@ mod tests {
         assert!(
             msg.contains("at most one `#[votable]` per model"),
             "expected the one-per-model rule stated, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_composite_primary_keys() {
+        // PR #2177 review (P1): with two `#[id]` fields the pk resolution
+        // would silently take the first component — S1 could lock, and S5
+        // update, every row sharing it, and distinct targets would collapse
+        // onto one edge key. A composite-keyed model must be a directed
+        // compile error, not a wrong-row runtime hazard.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Enrollment {
+                    #[id]
+                    pub course_id: i64,
+                    #[id]
+                    pub student_id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "expected a compile error for a composite-keyed votable model, \
+             got: {generated}"
+        );
+        assert!(
+            generated.contains("requires a single `i64` primary key")
+                && generated.contains("`course_id`, `student_id`"),
+            "expected the directed composite-key message naming both key \
+             components, got: {generated}"
         );
     }
 
