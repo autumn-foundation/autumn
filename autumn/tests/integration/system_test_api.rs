@@ -16,7 +16,6 @@ use autumn_web::system_test::{BrowserCheck, SystemTest, SystemTestError};
 #[test]
 fn browser_check_reports_result() {
     let result = BrowserCheck::run();
-    // Always returns a result; variant depends on whether Chrome is installed.
     match result {
         BrowserCheck::Found { path, version } => {
             assert!(!path.as_os_str().is_empty());
@@ -29,6 +28,28 @@ fn browser_check_reports_result() {
             );
         }
     }
+}
+
+/// #1456: a host that *has* a browser at one of the searched paths must never
+/// report `NotFound`. Without this the whole check passes in both directions,
+/// so the reported bug — a false `BrowserNotFound` on a Windows box with
+/// Chrome installed — would stay green on the very runner that reproduces it.
+#[test]
+fn an_installed_browser_is_never_reported_as_missing() {
+    let installed: Vec<_> = autumn_web::browser_detect::browser_candidates()
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect();
+    if installed.is_empty() {
+        return; // genuinely no browser on this host; nothing to assert
+    }
+
+    let check = BrowserCheck::run();
+    assert!(
+        check.is_found(),
+        "these browser binaries exist on this host but the check reported \
+         them missing: {installed:?}\n{check}"
+    );
 }
 
 #[test]
@@ -74,6 +95,39 @@ fn system_test_builder_has_expected_methods() {
             .hx_settle_timeout(std::time::Duration::from_millis(500));
         // We don't call .build().await here to avoid needing a browser.
     }
+}
+
+// ── Custom middleware layers (#1456, issue 3) ──────────────────────────────
+//
+// Apps whose routes depend on global middleware (e.g. a database
+// tenant-scoping layer) previously had no way to register it on the runner,
+// forcing callers to clone and map layers onto individual handlers before
+// passing them to `.routes()`. `SystemTest::layer` must accept any Tower
+// layer that `AppBuilder::layer` accepts, and be chainable with the rest of
+// the builder in any order.
+
+// Compile-only: this asserts the public `.layer()` surface exists, takes the
+// same `IntoAppLayer` values as `AppBuilder::layer`, is chainable with the
+// other builder methods, and can be called more than once. It is deliberately
+// *not* a `#[test]` — rustc type-checks the body whether or not it ever runs,
+// so wrapping it would only inflate the passing count with an assertion-free
+// test that reads like behavioural coverage.
+#[expect(dead_code, reason = "compile-time API-shape assertion; never called")]
+fn assert_layer_api_shape() {
+    async fn passthrough(
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        next.run(req).await
+    }
+
+    let _builder = SystemTest::new()
+        .layer(axum::middleware::from_fn(passthrough))
+        .artifact_dir("/tmp/artifacts")
+        // Not just `from_fn`: an off-the-shelf tower-http layer must satisfy
+        // the same bound, as it does on `AppBuilder::layer`.
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .hx_settle_timeout(std::time::Duration::from_millis(500));
 }
 
 // ── SystemTestError formatting ─────────────────────────────────────────────
@@ -251,6 +305,47 @@ async fn click_triggering_full_page_navigation_does_not_break_polling() {
     page.expect_text("Navigated successfully").await.expect(
         "text on the post-redirect page must be visible without the poll \
          aborting on a transient destroyed-execution-context error",
+    );
+}
+
+/// End-to-end proof for #1456 issue 3: a layer registered with
+/// `SystemTest::layer` runs inside the served stack and its request
+/// extensions reach the route handlers, so a real browser sees middleware
+/// output rendered in the page — the exact shape of the reporter's
+/// tenant-scoping middleware.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn custom_layer_is_visible_to_route_handlers_in_the_browser() {
+    use autumn_web::prelude::*;
+
+    #[derive(Clone)]
+    struct TenantId(&'static str);
+
+    async fn scope_to_tenant(
+        mut req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        req.extensions_mut().insert(TenantId("acme-corp"));
+        next.run(req).await
+    }
+
+    #[get("/")]
+    async fn index(axum::Extension(tenant): axum::Extension<TenantId>) -> String {
+        format!("<html><body><h1>Tenant: {}</h1></body></html>", tenant.0)
+    }
+
+    let runner = SystemTest::new()
+        .routes(routes![index])
+        .layer(axum::middleware::from_fn(scope_to_tenant))
+        .build()
+        .await
+        .expect("start runner");
+
+    let page = runner.page().await.expect("open page");
+    page.visit("/").await.expect("visit");
+    page.expect_text("Tenant: acme-corp").await.expect(
+        "the handler must observe the extension inserted by the layer \
+         registered via SystemTest::layer",
     );
 }
 

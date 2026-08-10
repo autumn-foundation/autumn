@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **system-tests:** `SystemTest::layer(...)` registers app-wide Tower
+  middleware on the router a browser test serves (#1456). Applications whose
+  routes depend on a global layer — tenant scoping bound to a database pool,
+  an auth shim, request enrichment — previously had no way to install it on
+  the runner, and the workaround (cloning the layer onto each handler before
+  passing them to `.routes()`) exercises a stack the real app never serves.
+  The method takes the same `IntoAppLayer` values as `AppBuilder::layer` (any
+  `tower::Layer` whose service is `Infallible` — `from_fn` middleware and
+  off-the-shelf tower-http layers alike) and routes them through the *same*
+  router-assembly path, so the layer lands in the identical position — inside
+  `RequestId` and the session layer, outside CSRF/CORS — and middleware that
+  reads the request ID or session finds them under test exactly as in
+  production. Multiple calls compose with `AppBuilder`'s ordering contract:
+  the first registration is the outermost layer on ingress. Layers apply on
+  both the default-state path and the `.state(...)` override path. See
+  `docs/guide/system-tests.md`.
+
 - **model:** declarative votable/reaction association via `#[votable(by =
   ..., aggregate = sum|count)]` (#1362). Votes, likes and favourites are the
   same shape every time — a `(reactor, target)`-unique edge table, a
@@ -1346,6 +1363,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schedule / zero rate installs nothing, so a default `Chaos` is unchanged. This
   is W5.a; it stacks on W5.0 and is a sibling of W5.b (item 6). [no-plugin]
 ### Fixed
+
+- **system-tests:** `SystemTest` and `autumn doctor` no longer report
+  "no browser" on a Windows host that has Chrome installed (#1456), for three
+  separate reasons that all had to go. (1) The candidate list contained no
+  Windows locations at all — only Unix paths, plus a `PATH` scan that looked
+  for a bare `chrome` (`Path::is_file` does not apply `PATHEXT`, so it could
+  never match `chrome.exe`) — so unless `AUTUMN_CHROMIUM` or
+  `PLAYWRIGHT_BROWSERS_PATH` was set, nothing was ever probed. Chrome's real
+  install locations under `%ProgramFiles%`, `%ProgramFiles(x86)%` and
+  `%LOCALAPPDATA%` are now searched, and the `PATH` scan asks for `.exe`.
+  (2) The `--version` probe is no longer executed on Windows: `chrome.exe` is
+  a GUI-subsystem binary that writes nothing to the parent console, and
+  `--version` is not an early-exit switch there, so running it proceeds into
+  real browser startup — which is how the report saw exit code 21 (the
+  already-running instance being notified) instead of a version string.
+  Handing it a private profile would only have replaced that abort with a
+  visible browser window and a `Command::output()` call blocking until every
+  child closed its stdout. An existing `.exe` is now accepted on file
+  evidence — the issue's own suggested fix — and reported as `version
+  unavailable`. The extension check is what keeps a mistyped
+  `AUTUMN_CHROMIUM` from shadowing a browser that would have worked. (3) On
+  Linux/macOS the probe now runs against its own throwaway `--user-data-dir`,
+  so it can never rendezvous with a Chrome holding the real profile, and a
+  binary that exits 0 without printing (a launcher shim) is still accepted,
+  while a spawn failure or non-zero exit still rejects the candidate. The
+  platform-dependent decisions live in pure functions taking the platform as
+  an argument, so both branches are unit-tested on every host rather than
+  being dead code behind `#[cfg(windows)]` on the Linux CI runner.
+- **system-tests:** `autumn doctor`'s browser check and the `SystemTest`
+  harness now share one implementation (`autumn_web::browser_detect`, not
+  behind the `system-tests` feature) instead of keeping separate copies of the
+  candidate list and version probe (#1456). The duplicates had already
+  drifted, so the CLI could report no browser on a host where the harness
+  found one.
+- **system-tests:** assertion polling survives more of the CDP errors a page
+  transition produces (#1456). `expect_text` / `expect_url` /
+  `expect_attribute` / the implicit htmx-settle wait already retried "cannot
+  find context with specified id" when a redirect destroyed the JS execution
+  context mid-poll; they now also retry `"Inspected target navigated or
+  closed"` — the same navigation race, under a name that never contained the
+  word "context" — recognise these in chromiumoxide's untyped `ChromeMessage`
+  variant as well as the typed one, and match case-insensitively. The match
+  is an explicit phrase list, not a bare `contains("context")` and not "any
+  Chrome error is transient": a real failure such as `"No node with given id
+  found"` (or a JS `"ReferenceError: context is not defined"`) still aborts
+  immediately instead of decaying into a five-second timeout with a worse
+  message, and `"Target closed"` / `"Session with given id not found"` are
+  deliberately excluded because Chrome emits them for a dead renderer too —
+  swallowing those would let a crashed page pass the settle fence. The retry
+  loop itself is now one shared function with unit tests covering retry,
+  fail-fast, and deadline behaviour, so the fix is no longer provable only by
+  a browser test.
 
 - **sim-testing:** the op-driver's embedded proptest runners
   (`Sim::gen_ops_with`, `Sim::run_proptest`, #1797) no longer inherit ambient

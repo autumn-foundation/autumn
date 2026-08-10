@@ -7450,64 +7450,23 @@ pub fn check_maintenance_mode() -> CheckResult {
 // ── System-test browser check ─────────────────────────────────────────────
 
 /// Candidate paths probed for a Chromium binary, in resolution order.
+///
+/// Delegates to `autumn_web::browser_detect` so `autumn doctor` and the
+/// `SystemTest` harness can never disagree about whether this host can run
+/// system tests — they used to keep separate copies of this list and did
+/// (#1456).
 pub fn browser_candidate_paths() -> Vec<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-
-    if let Ok(p) = std::env::var("AUTUMN_CHROMIUM") {
-        candidates.push(std::path::PathBuf::from(p));
-    }
-
-    if let Ok(base) = std::env::var("PLAYWRIGHT_BROWSERS_PATH") {
-        let base = std::path::PathBuf::from(base);
-        if let Ok(entries) = std::fs::read_dir(&base) {
-            let mut pw_paths: Vec<_> = entries
-                .flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("chromium-"))
-                .map(|e| {
-                    if cfg!(target_os = "macos") {
-                        e.path()
-                            .join("chrome-mac")
-                            .join("Chromium.app")
-                            .join("Contents")
-                            .join("MacOS")
-                            .join("Chromium")
-                    } else if cfg!(target_os = "windows") {
-                        e.path().join("chrome-win").join("chrome.exe")
-                    } else {
-                        e.path().join("chrome-linux").join("chrome")
-                    }
-                })
-                .collect();
-            pw_paths.sort();
-            pw_paths.reverse();
-            candidates.extend(pw_paths);
-        }
-    }
-
-    candidates.extend(
-        [
-            "/usr/bin/chromium-browser",
-            "/usr/bin/chromium",
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/snap/bin/chromium",
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ]
-        .map(std::path::PathBuf::from),
-    );
-
-    candidates
+    autumn_web::browser_detect::browser_candidates()
 }
 
-/// Run `<path> --version` and return the trimmed output on success.
+/// Probe `path` for a browser version, using the same rules as the harness.
+///
+/// Returns `None` when the candidate is not usable, and
+/// `autumn_web::browser_detect::UNKNOWN_VERSION` when it is usable but cannot
+/// report a version (Windows `chrome.exe` is a GUI-subsystem binary that
+/// prints nothing to the parent console).
 fn probe_browser_version(path: &std::path::Path) -> Option<String> {
-    std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    autumn_web::browser_detect::probe_version(path)
 }
 
 /// Check whether a Chromium binary is available for system tests.
@@ -7556,9 +7515,11 @@ fn cargo_toml_features_has_key(cargo_toml: &str, key: &str) -> bool {
 pub fn check_system_test_browser() -> CheckResult {
     let candidates = browser_candidate_paths();
     for path in &candidates {
-        if path.is_file()
-            && let Some(version) = probe_browser_version(path)
-        {
+        // No `is_file()` pre-check: `probe_browser_version` owns that
+        // decision, and on Windows "the file exists" *is* the answer — a
+        // GUI-subsystem `chrome.exe` can never report a version, so gating on
+        // one here is what produced the false "no browser installed" (#1456).
+        if let Some(version) = probe_browser_version(path) {
             return CheckResult {
                 name: "system_test_browser",
                 status: CheckStatus::Pass,
