@@ -711,6 +711,73 @@ concession, not a routing one. CSRF protection still treats the
 overridden mutation as unsafe and rejects submissions without a valid
 token with `403 Forbidden`.
 
+### Bulk select and delete selected
+
+Every standard HTML scaffold's index list ships a no-JavaScript
+bulk-delete flow (issue #1312):
+
+- The `data_table` gains a leading checkbox column. Each row renders
+  `autumn_web::widgets::bulk_select_checkbox(row.id, &bulk_cfg)` —
+  `<input type="checkbox" name="ids" value="…">` with an
+  `aria-label="Select row <id>"`, so a screen reader announces which row
+  each control selects.
+- The list (and, with `--searchable`, the whole
+  `#<plural>-search-results` container htmx swaps) is wrapped in
+  `autumn_web::widgets::bulk_actions_form(...)`: a plain
+  `POST /<plural>/bulk_delete` form carrying the CSRF hidden field and a
+  **Delete selected** submit button. The "New …" link and the search box
+  stay outside the form — they are page furniture, not part of the
+  selection.
+- A `#[secured] #[post("/<plural>/bulk_delete")]` handler is emitted and
+  mounted in `src/main.rs` right after `destroy`.
+
+Contract of the generated handler:
+
+| Situation | Behaviour |
+| --------- | --------- |
+| Checked rows | Deleted through the repository's `delete_many`, then a `Deleted N <plural>` flash and a 303 back to the index. |
+| Field name | `name="ids"` (matching `autumn-admin-plugin`); the parser also accepts the `ids[]` spelling some clients send. |
+| Empty selection | Info flash + 303 redirect. **Never** a 400 — a list-write endpoint doesn't fail on missing params. |
+| Malformed id (`ids=abc`) | Silently dropped, same as above. Duplicates are collapsed. |
+| `--soft-delete` | The pre-flight `SELECT` filters `deleted_at IS NULL`, and `delete_many` applies the soft-delete update — no hand-rolled `deleted_at` write. |
+| Record policy wiring on (an owner column, the default) | Each selected row is authorized with the same `"delete"` action `destroy` uses. A row the actor may not delete is dropped from the batch rather than 403'ing the request, so the endpoint is not an existence oracle. |
+| `dependent(restrict)` child rows | `delete_many` probes first and aborts the **whole** batch with a 409, rolling back — no partial delete. |
+| Connection use | The handler `drop`s its `Db` extractor after the pre-flight `SELECT` and before `delete_many`, which checks out a connection of its own. It therefore holds **one** pooled connection at a time, which cannot stall on `database.pool.max_size = 1` or deadlock at any concurrency. |
+
+Not emitted for `--live`, `--live-validation`, or `--sharded` (their list
+DOM is owned by an SSE/htmx swap contract, or has no cross-shard
+`delete_many`), and `--api` scaffolds render no HTML at all. Those
+variants' output is byte-identical to their pre-#1312 shape.
+
+The three widgets are ordinary public helpers — use them in hand-written
+list views too:
+
+```rust,ignore
+use autumn_web::widgets::{BulkActionsConfig, bulk_actions_form, bulk_select_checkbox};
+
+let action = paths::bulk_delete();
+let cfg = BulkActionsConfig::new(&action)
+    .submit_label("Archive selected")
+    .confirm("Don't archive these posts?"); // opt-in; omit to stay 100% no-JS
+html! {
+    (bulk_actions_form(
+        &cfg,
+        csrf.as_ref().map(|t| t.token()),
+        csrf_field.as_ref().map(|f| f.0.as_str()),
+        html! { (my_list(&rows, &cfg)) },
+    ))
+}
+```
+
+`confirm(...)` is off by default, so the control works with scripting
+disabled. When you do opt in, the message is escaped for the JavaScript
+string literal it lands in (`\`, `'`, and line terminators) before Maud
+escapes it for the attribute — the browser HTML-decodes an `onclick`
+attribute *before* the JavaScript parser sees it, so HTML escaping alone
+would let an apostrophe close the literal. A prompt built from user text
+therefore cannot break out into script; the server stays the enforcement
+point regardless.
+
 Metadata flags let you keep common model and repository polish in the
 generation step:
 

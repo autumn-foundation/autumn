@@ -36,6 +36,14 @@
 //! | Plain `GET` form is sufficient | `axum::extract::Query` |
 //! | You need unusual htmx wiring | Hand-write `hx-*` attributes |
 //!
+//! # Bulk actions
+//!
+//! | Widget | Use |
+//! |--------|-----|
+//! | `bulk_select_checkbox` | One row's `name="ids"` select checkbox (issue #1312) |
+//! | `bulk_actions_toolbar` | `role="group"` submit button applying the selection |
+//! | `bulk_actions_form` | `POST` form wrapping a list + toolbar, with the CSRF field |
+//!
 //! # Modals & confirmation
 //!
 //! | Situation | Use |
@@ -1538,6 +1546,327 @@ pub fn data_table<T>(
                     }
                 }
             }
+        }
+    }
+}
+
+// ── bulk actions (#1312) ──────────────────────────────────────────────────
+
+/// Configuration for the bulk-select / bulk-actions widgets.
+///
+/// Build with [`BulkActionsConfig::new`] (the form `action` URL) and chain the
+/// builder methods for optional overrides.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct BulkActionsConfig<'a> {
+    /// Form `action` URL the bulk submit posts to (e.g. `/posts/bulk_delete`).
+    pub action: &'a str,
+    /// Name of the per-row checkbox field (default `"ids"`).
+    pub field_name: &'a str,
+    /// Label on the bulk submit button (default `"Delete selected"`).
+    pub submit_label: &'a str,
+    /// Prefix of each checkbox's `aria-label` (default `"Select row"`).
+    pub select_label: &'a str,
+    /// Optional confirmation prompt. `None` (the default) emits no `onclick`,
+    /// so the control keeps working with JavaScript disabled.
+    pub confirm: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> BulkActionsConfig<'a> {
+    /// Create a new config posting to `action`, with sensible defaults.
+    #[must_use]
+    pub const fn new(action: &'a str) -> Self {
+        Self {
+            action,
+            field_name: "ids",
+            submit_label: "Delete selected",
+            select_label: "Select row",
+            confirm: None,
+        }
+    }
+
+    /// Override the per-row checkbox field name (default `"ids"`).
+    #[must_use]
+    pub const fn field_name(mut self, field_name: &'a str) -> Self {
+        self.field_name = field_name;
+        self
+    }
+
+    /// Override the bulk submit button label (default `"Delete selected"`).
+    #[must_use]
+    pub const fn submit_label(mut self, submit_label: &'a str) -> Self {
+        self.submit_label = submit_label;
+        self
+    }
+
+    /// Override the checkbox `aria-label` prefix (default `"Select row"`).
+    #[must_use]
+    pub const fn select_label(mut self, select_label: &'a str) -> Self {
+        self.select_label = select_label;
+        self
+    }
+
+    /// Opt into a JavaScript confirmation prompt on the submit button.
+    ///
+    /// The message is escaped for the JavaScript string literal it lands in
+    /// (see [`bulk_actions_toolbar`]), so an apostrophe or backslash is safe.
+    /// The server stays the enforcement point either way — a client with
+    /// scripting disabled never sees the prompt.
+    #[must_use]
+    pub const fn confirm(mut self, confirm: &'a str) -> Self {
+        self.confirm = Some(confirm);
+        self
+    }
+}
+
+/// Escape `message` for embedding in a single-quoted JavaScript string
+/// literal.
+///
+/// Needed because the confirmation prompt ends up inside an `onclick`
+/// attribute, which is parsed in two stages: the HTML parser decodes character
+/// references first, then the JavaScript parser reads what is left. Maud only
+/// handles the first stage, so `'`, `\` and line terminators must be escaped
+/// here or a prompt like `Don't delete?` produces a syntax error — and a prompt
+/// built from untrusted text could close the literal and inject script.
+///
+/// U+2028/U+2029 are legal inside string literals from ES2019 on, but are
+/// escaped anyway so the handler stays valid under older parsers.
+#[cfg(feature = "maud")]
+fn escape_js_single_quoted(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    for ch in message.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Render one row's bulk-select checkbox (issue #1312).
+///
+/// One of these goes in the first cell of every row inside a
+/// [`bulk_actions_form`]. Every checkbox shares the same `name`
+/// ([`BulkActionsConfig::field_name`], default `"ids"`), so a browser submits
+/// the checked rows as repeated `ids=<value>` pairs — no JavaScript, no
+/// per-row form. The server side reads them back with any repeated-key form
+/// parser (the scaffold's generated `parse_bulk_ids` accepts both `ids` and
+/// the `ids[]` spelling some clients emit).
+///
+/// `value` is anything [`Display`](std::fmt::Display) — typically the row's
+/// primary key. It is HTML-escaped by Maud, both in `value` and in the
+/// `aria-label` (`"{select_label} {value}"`), so a screen reader announces
+/// which row each checkbox selects rather than a wall of unlabelled controls.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-bulk-select` | The per-row `<input type="checkbox">` |
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{BulkActionsConfig, Column, bulk_select_checkbox};
+///
+/// let action = paths::bulk_delete();
+/// let cfg = BulkActionsConfig::new(&action);
+/// let mut columns: Vec<Column<Post>> = post_columns();
+/// columns.insert(
+///     0,
+///     Column::new("", |row: &Post| maud::html! { (bulk_select_checkbox(row.id, &cfg)) }),
+/// );
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_select_checkbox};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+/// let html = bulk_select_checkbox(42, &cfg).into_string();
+/// assert!(html.contains(r#"type="checkbox""#));
+/// assert!(html.contains(r#"name="ids""#));
+/// assert!(html.contains(r#"value="42""#));
+/// assert!(html.contains(r#"aria-label="Select row 42""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn bulk_select_checkbox(
+    value: impl std::fmt::Display,
+    config: &BulkActionsConfig<'_>,
+) -> maud::Markup {
+    let value = value.to_string();
+    let aria_label = format!("{} {value}", config.select_label);
+    maud::html! {
+        input type="checkbox" name=(config.field_name) value=(value)
+            class="autumn-bulk-select" aria-label=(aria_label);
+    }
+}
+
+/// Render the bulk-actions toolbar — the submit button that applies the
+/// selection (issue #1312).
+///
+/// Rendered automatically at the end of a [`bulk_actions_form`]; call it
+/// directly only when hand-building the surrounding `<form>`.
+///
+/// # No-JavaScript guarantee
+///
+/// The button is a plain `<button type="submit">`. An `onclick="return
+/// confirm(...)"` handler is emitted **only** when
+/// [`BulkActionsConfig::confirm`] opted in — so the default control still
+/// works with scripting disabled, and even with a confirmation configured the
+/// server remains the enforcement point.
+///
+/// # Confirmation escaping
+///
+/// The prompt is embedded in a single-quoted JavaScript string literal inside
+/// an attribute, and the browser HTML-decodes that attribute *before* the
+/// JavaScript parser reads it — so HTML escaping alone cannot keep a `'` from
+/// closing the literal. The message is therefore escaped for JavaScript first
+/// (`\`, `'`, and line terminators), then by Maud for the attribute. A prompt
+/// containing an apostrophe renders correctly, and one built from untrusted
+/// text cannot break out into script.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-bulk-actions` | Grouping `<div role="group">` around the submit button |
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_toolbar};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete")
+///     .submit_label("Delete selected")
+///     .confirm("Delete the selected posts?");
+/// let toolbar = bulk_actions_toolbar(&cfg);
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_toolbar};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+/// let html = bulk_actions_toolbar(&cfg).into_string();
+/// assert!(html.contains(r#"class="autumn-bulk-actions""#));
+/// assert!(html.contains(r#"type="submit""#));
+/// assert!(html.contains("Delete selected"));
+/// // No confirmation was configured, so no inline handler is emitted.
+/// assert!(!html.contains("onclick"));
+///
+/// // An apostrophe in the prompt stays inside the JavaScript string literal.
+/// let confirming = BulkActionsConfig::new("/posts/bulk_delete").confirm("Don't delete?");
+/// let html = bulk_actions_toolbar(&confirming).into_string();
+/// assert!(html.contains(r"confirm('Don\'t delete?')"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
+    // Maud escapes the attribute *value*, but the browser decodes character
+    // references before the JavaScript parser ever sees the handler — so HTML
+    // escaping alone would leave `Don't delete?` closing the string literal
+    // early (and, for a prompt built from untrusted text, allow arbitrary
+    // script). Escape for the JavaScript string first, then let Maud escape
+    // for the attribute; the two passes compose correctly in that order.
+    let onclick = config
+        .confirm
+        .map(|message| format!("return confirm('{}')", escape_js_single_quoted(message)));
+    maud::html! {
+        div class="autumn-bulk-actions" role="group" {
+            button type="submit" onclick=[onclick.as_deref()] { (config.submit_label) }
+        }
+    }
+}
+
+/// Wrap a rendered list in the bulk-actions `<form>` (issue #1312).
+///
+/// This is the outer half of the no-JavaScript bulk-select flow: a plain
+/// `POST` form whose `action` is [`BulkActionsConfig::action`], containing (in
+/// order) the hidden CSRF field, the caller's `content` — a table, list, or
+/// anything else carrying one [`bulk_select_checkbox`] per row — and the
+/// [`bulk_actions_toolbar`] submit button.
+///
+/// Keep page furniture that is *not* part of the selection (a "New record"
+/// link, a search box) outside the form: anything inside is submitted with the
+/// selection.
+///
+/// # CSRF
+///
+/// Pass the handler's token as `csrf_token` and the configured field name as
+/// `csrf_field` (both `Option<&str>`, e.g.
+/// `csrf.as_ref().map(|t| t.token())` and
+/// `csrf_field.as_ref().map(|f| f.0.as_str())`). When `csrf_token` is `None`
+/// no hidden input is rendered at all; when it is `Some`, the field name
+/// defaults to `"_csrf"`.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-bulk-form` | The wrapping `<form method="post">` |
+/// | `.autumn-bulk-actions` | Grouping `<div role="group">` around the submit button |
+/// | `.autumn-bulk-select` | Each row's `<input type="checkbox">` |
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_form, data_table, DataTableConfig};
+///
+/// let action = paths::bulk_delete();
+/// let cfg = BulkActionsConfig::new(&action);
+/// Ok(layout("Posts", html! {
+///     a href=(paths::new()) { "New Post" } // outside the form
+///     (bulk_actions_form(
+///         &cfg,
+///         csrf.as_ref().map(|t| t.token()),
+///         csrf_field.as_ref().map(|f| f.0.as_str()),
+///         html! {
+///             (data_table(&page.content, &columns, &DataTableConfig::new("No posts yet.")))
+///         },
+///     ))
+/// }))
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_form};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+/// let html = bulk_actions_form(&cfg, Some("tok-123"), None, maud::html! { p { "rows" } })
+///     .into_string();
+/// assert!(html.contains(r#"method="post""#));
+/// assert!(html.contains(r#"action="/posts/bulk_delete""#));
+/// assert!(html.contains(r#"name="_csrf""#));
+/// assert!(html.contains(r#"value="tok-123""#));
+/// // Content first, toolbar last, all inside the form.
+/// assert!(html.find("rows") < html.find("autumn-bulk-actions"));
+/// assert!(html.trim_end().ends_with("</form>"));
+/// ```
+// `content` is taken by value so `bulk_actions_form(&cfg, .., html! { .. })`
+// reads without a `&` at the call site (matching `alert_with`); Maud renders it
+// by reference, hence the allow.
+#[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn bulk_actions_form(
+    config: &BulkActionsConfig<'_>,
+    csrf_token: Option<&str>,
+    csrf_field: Option<&str>,
+    content: maud::Markup,
+) -> maud::Markup {
+    let csrf_field_name = csrf_field.unwrap_or("_csrf");
+    maud::html! {
+        form method="post" action=(config.action) class="autumn-bulk-form" {
+            @if let Some(token) = csrf_token {
+                input type="hidden" name=(csrf_field_name) value=(token);
+            }
+            (content)
+            (bulk_actions_toolbar(config))
         }
     }
 }
@@ -6687,6 +7016,171 @@ mod tests {
         assert!(html.contains("q=foo"), "{html}");
         // no duplicate old sort
         assert!(!html.contains("sort=old"), "{html}");
+    }
+
+    // ── bulk actions (#1312) ───────────────────────────────────────────
+
+    #[test]
+    fn bulk_actions_config_defaults() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        assert_eq!(cfg.action, "/posts/bulk_delete");
+        assert_eq!(cfg.field_name, "ids");
+        assert_eq!(cfg.submit_label, "Delete selected");
+        assert_eq!(cfg.select_label, "Select row");
+        assert!(cfg.confirm.is_none());
+    }
+
+    #[test]
+    fn bulk_actions_config_builders() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete")
+            .field_name("post_ids")
+            .submit_label("Archive selected")
+            .select_label("Select post")
+            .confirm("Archive these posts?");
+        assert_eq!(cfg.action, "/posts/bulk_delete");
+        assert_eq!(cfg.field_name, "post_ids");
+        assert_eq!(cfg.submit_label, "Archive selected");
+        assert_eq!(cfg.select_label, "Select post");
+        assert_eq!(cfg.confirm, Some("Archive these posts?"));
+    }
+
+    #[test]
+    fn bulk_select_checkbox_emits_name_value_and_aria_label() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_select_checkbox(42, &cfg).into_string();
+        assert!(html.contains(r#"type="checkbox""#), "{html}");
+        assert!(html.contains(r#"name="ids""#), "{html}");
+        assert!(html.contains(r#"value="42""#), "{html}");
+        assert!(html.contains("autumn-bulk-select"), "{html}");
+        assert!(html.contains(r#"aria-label="Select row 42""#), "{html}");
+    }
+
+    #[test]
+    fn bulk_select_checkbox_honours_custom_field_name() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete")
+            .field_name("post_ids")
+            .select_label("Select post");
+        let html = bulk_select_checkbox(7, &cfg).into_string();
+        assert!(html.contains(r#"name="post_ids""#), "{html}");
+        assert!(!html.contains(r#"name="ids""#), "{html}");
+        assert!(html.contains(r#"aria-label="Select post 7""#), "{html}");
+    }
+
+    #[test]
+    fn bulk_actions_form_renders_csrf_hidden_input() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_form(&cfg, Some("tok-123"), None, maud::html! {}).into_string();
+        assert!(html.contains(r#"type="hidden""#), "{html}");
+        // The csrf field name defaults to `_csrf` when none is supplied.
+        assert!(html.contains(r#"name="_csrf""#), "{html}");
+        assert!(html.contains(r#"value="tok-123""#), "{html}");
+        // A configured field name wins over the default.
+        let named = bulk_actions_form(&cfg, Some("tok-123"), Some("authenticity"), maud::html! {})
+            .into_string();
+        assert!(named.contains(r#"name="authenticity""#), "{named}");
+        assert!(!named.contains(r#"name="_csrf""#), "{named}");
+    }
+
+    #[test]
+    fn bulk_actions_form_omits_csrf_input_when_none() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_form(&cfg, None, None, maud::html! {}).into_string();
+        assert!(!html.contains(r#"type="hidden""#), "{html}");
+        assert!(!html.contains("_csrf"), "{html}");
+        // The form itself is still rendered.
+        assert!(html.contains("<form"), "{html}");
+    }
+
+    #[test]
+    fn bulk_actions_form_posts_to_action_and_wraps_content() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let content = maud::html! { p { "row-marker" } };
+        let html = bulk_actions_form(&cfg, None, None, content).into_string();
+        assert!(html.contains(r#"method="post""#), "{html}");
+        assert!(html.contains(r#"action="/posts/bulk_delete""#), "{html}");
+        assert!(html.contains("autumn-bulk-form"), "{html}");
+        assert!(html.contains("row-marker"), "{html}");
+        // The toolbar is rendered inside the form, after the content.
+        let content_at = html.find("row-marker").expect("content rendered");
+        let toolbar_at = html
+            .find("autumn-bulk-actions")
+            .expect("toolbar rendered inside the form");
+        assert!(
+            content_at < toolbar_at,
+            "toolbar must follow content: {html}"
+        );
+        assert!(html.trim_end().ends_with("</form>"), "{html}");
+    }
+
+    #[test]
+    fn bulk_actions_toolbar_button_is_submit_and_labelled() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_toolbar(&cfg).into_string();
+        assert!(html.contains("autumn-bulk-actions"), "{html}");
+        assert!(html.contains(r#"role="group""#), "{html}");
+        assert!(html.contains(r#"type="submit""#), "{html}");
+        assert!(html.contains("Delete selected"), "{html}");
+    }
+
+    #[test]
+    fn bulk_actions_toolbar_confirm_is_opt_in() {
+        // No-JS guarantee: the default toolbar carries no `onclick` handler.
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let plain = bulk_actions_toolbar(&cfg).into_string();
+        assert!(!plain.contains("onclick"), "{plain}");
+        // Opting in emits the confirmation prompt.
+        let confirmed =
+            bulk_actions_toolbar(&cfg.clone().confirm("Delete these rows?")).into_string();
+        assert!(confirmed.contains("onclick"), "{confirmed}");
+        assert!(confirmed.contains("Delete these rows?"), "{confirmed}");
+    }
+
+    /// The prompt lands inside an `onclick` attribute, which the browser
+    /// HTML-decodes *before* the JavaScript parser reads it — so Maud's
+    /// attribute escaping alone cannot keep a quote inside the string literal.
+    /// (Maud escapes `&`, `<`, `>` and `"`; `'` passes through untouched, and
+    /// would close the literal even if it did not.)
+    #[test]
+    fn bulk_actions_toolbar_confirm_escapes_javascript_syntax() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        // An apostrophe must not close the single-quoted literal.
+        let html = bulk_actions_toolbar(&cfg.clone().confirm("Don't delete?")).into_string();
+        assert!(
+            html.contains(r"confirm('Don\'t delete?')"),
+            "the apostrophe must be backslash-escaped for JavaScript: {html}"
+        );
+        // A backslash must not escape the closing quote.
+        let html = bulk_actions_toolbar(&cfg.clone().confirm(r"back\slash")).into_string();
+        assert!(
+            html.contains(r"back\\slash"),
+            "a literal backslash must be doubled: {html}"
+        );
+        // A newline is a line terminator inside a JS string literal.
+        let html = bulk_actions_toolbar(&cfg.clone().confirm("two\nlines")).into_string();
+        assert!(
+            html.contains(r"two\nlines") && !html.contains("two\nlines"),
+            "a newline must be escaped, not emitted raw: {html}"
+        );
+        // The escape must not let a crafted prompt break out and inject script.
+        let html = bulk_actions_toolbar(&cfg.clone().confirm("');alert(document.cookie);//"))
+            .into_string();
+        assert!(
+            html.contains(r"confirm('\');alert(document.cookie);//')"),
+            "the injected terminator must stay inside the string literal: {html}"
+        );
+    }
+
+    #[test]
+    fn escape_js_single_quoted_leaves_ordinary_text_alone() {
+        assert_eq!(
+            escape_js_single_quoted("Delete these rows?"),
+            "Delete these rows?"
+        );
+        assert_eq!(escape_js_single_quoted("it's"), r"it\'s");
+        assert_eq!(escape_js_single_quoted("a\\b"), r"a\\b");
+        assert_eq!(escape_js_single_quoted("a\r\nb"), r"a\r\nb");
+        assert_eq!(escape_js_single_quoted("a\u{2028}b"), r"a\u2028b");
+        assert_eq!(escape_js_single_quoted("a\u{2029}b"), r"a\u2029b");
     }
 
     // ── CardConfig builder ─────────────────────────────────────────────
