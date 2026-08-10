@@ -150,6 +150,30 @@ fn scaffolds_without_bulk_delete_keep_plain_index_signatures() {
     }
 }
 
+/// `eq_any` binds one parameter per id, and the handler parses a raw body
+/// rather than a page-sized selection — so a crafted POST can carry more ids
+/// than the backend's placeholder ceiling (`MAX_BIND_PARAMS`, 32766 on
+/// SQLite). A single unbounded `eq_any` would fail the request with "too many
+/// SQL variables" before reaching the already-chunked `delete_many`.
+#[test]
+fn bulk_delete_preflight_chunks_its_id_query() {
+    for (name, flags) in [
+        ("bulk-chunk-plain", &[][..]),
+        ("bulk-chunk-soft", &["--soft-delete"][..]),
+    ] {
+        let (_tmp, routes) = scaffold_routes(name, flags);
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(
+            bulk.contains("for chunk in ids.chunks(1000)"),
+            "`{name}` must chunk the pre-flight id query:\n{bulk}"
+        );
+        assert!(
+            bulk.contains(".eq_any(chunk)") && !bulk.contains(".eq_any(&ids)"),
+            "`{name}` must bind one chunk at a time, not the whole selection:\n{bulk}"
+        );
+    }
+}
+
 #[test]
 fn soft_delete_scaffold_routes_bulk_through_delete_many() {
     let (_tmp, routes) = scaffold_routes("bulk-soft", &["--soft-delete"]);

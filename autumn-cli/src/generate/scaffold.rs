@@ -3621,8 +3621,9 @@ mod attachment_read_back_tests {
         // stay out of the selection too (matching `destroy`'s `deleted_at IS NULL`
         // filter). The actual delete still routes through `delete_many`, which
         // applies the repository's soft-delete + `dependent(...)` cascade rules.
+        // Trailing indent lines the chained call up inside the chunk loop below.
         let soft_delete_filter = if soft_delete {
-            format!(".filter({plural}::deleted_at.is_null())\n        ")
+            format!(".filter({plural}::deleted_at.is_null())\n            ")
         } else {
             String::new()
         };
@@ -3668,11 +3669,26 @@ mod attachment_read_back_tests {
              flash.info(\"No {plural} selected\").await;\n        \
              return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
              }}\n    \
-             let rows: Vec<{pascal_name}> = {plural}::table\n        \
-             .filter({plural}::id.eq_any(&ids))\n        \
-             {soft_delete_filter}.select({pascal_name}::as_select())\n        \
-             .load(&mut *db)\n        \
-             .await?;\n    \
+             // Chunk the pre-flight the way the repository chunks its own id\n    \
+             // queries. `eq_any` binds one parameter per id, and this reads a raw\n    \
+             // body rather than a page-sized selection, so a crafted POST can carry\n    \
+             // far more ids than a backend's placeholder ceiling\n    \
+             // (`autumn_web::repository::MAX_BIND_PARAMS` — 32766 on SQLite). A\n    \
+             // single `eq_any` would then fail the request outright with \"too many\n    \
+             // SQL variables\", never reaching the already-chunked `delete_many`.\n    \
+             // Grown from what the database actually returns, never sized from\n    \
+             // `ids.len()`: that count comes straight off the request body, so\n    \
+             // pre-allocating from it would let a body full of ids that match no\n    \
+             // row reserve memory for rows that do not exist.\n    \
+             let mut rows: Vec<{pascal_name}> = Vec::new();\n    \
+             for chunk in ids.chunks(1000) {{\n        \
+             let mut batch: Vec<{pascal_name}> = {plural}::table\n            \
+             .filter({plural}::id.eq_any(chunk))\n            \
+             {soft_delete_filter}.select({pascal_name}::as_select())\n            \
+             .load(&mut *db)\n            \
+             .await?;\n        \
+             rows.append(&mut batch);\n    \
+             }}\n    \
              // Release the `Db` extractor's connection before `delete_many` checks out\n    \
              // its own. `Db` acquires eagerly at extraction and holds until dropped —\n    \
              // not just for the `&mut *db` borrow above — so keeping it alive here would\n    \
