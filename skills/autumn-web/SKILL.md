@@ -1952,6 +1952,42 @@ touches a database — it only reverses generated files/migrations.
 production defaults, missing primaries, stale replica migrations, missing
 signing secrets, and other config problems without printing credentials.
 
+## System tests (browser, feature `system-tests`)
+
+`SystemTest` boots the app on an ephemeral port, launches managed headless
+Chromium, and hands back a `Page` with htmx-aware auto-waiting assertions. Add
+`autumn-web = { features = ["system-tests"] }` as a **dev-dependency** only.
+
+```rust
+let runner = SystemTest::new()
+    .routes(routes![index, create_todo])
+    .state(state)                                       // real pool/policies
+    .layer(axum::middleware::from_fn(scope_to_tenant))  // unreleased
+    .build().await.unwrap();
+
+let page = runner.page().await.unwrap();
+page.visit("/").await?;
+page.click("Add").await?;          // auto-waits for htmx settle
+page.expect_text("Saved").await?;
+page.expect_no_console_errors().await?;
+```
+
+- `.layer(...)` (**unreleased**) takes the same layers as `AppBuilder::layer`
+  and puts them in the same stack position, so middleware that reads the
+  request ID or session behaves as in production. Use it whenever the routes
+  under test need global middleware — mapping layers onto individual handlers
+  instead tests a stack the real app never serves.
+- `expect_*` assertions poll to a deadline and ignore the transient CDP errors
+  a mid-poll navigation (e.g. a redirecting form submit) produces; `evaluate`
+  is a single raw call that does not.
+- Generated tests are `#[ignore]`d — run with `-- --include-ignored`. Failures
+  write a `.png` + `.html` to `target/system-tests/<test>/`.
+- `autumn doctor` reports whether a usable browser was found, using the same
+  resolution as the harness (`AUTUMN_CHROMIUM` overrides it).
+
+Full API: `skills/autumn-web/references/api-reference.md`; guide:
+`docs/guide/system-tests.md`.
+
 ## 0.5.0 release traps
 
 - `AUTUMN_SECURITY__SIGNING_SECRET` is required in `prod` / `production`.

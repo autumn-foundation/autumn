@@ -754,6 +754,38 @@ double-submits and replays.
 | `with_shard_router(router)` | Sharding router (**unreleased**) |
 | `run()` | Start server |
 
+## SystemTest builder (`autumn_web::system_test`, feature `system-tests`)
+
+Browser-driven tests: boots the app on an ephemeral port, launches managed
+headless Chromium, returns a `Page` with htmx-aware auto-waiting assertions.
+Dev-dependency only.
+
+| Method | Notes |
+|---|---|
+| `SystemTest::new()` | Builder; `test` profile with CSRF disabled |
+| `.routes(routes![...])` | Routes to serve; additive across calls |
+| `.state(AppState)` | Supply a pre-built state (real DB pool, policies); its embedded config wins |
+| `.layer(layer)` | App-wide Tower middleware, same `IntoAppLayer` bound and stack position as `AppBuilder::layer` — first call is outermost on ingress (**unreleased**) |
+| `.artifact_dir(path)` | Where failure screenshots/HTML go (default `target/system-tests/<test>/`) |
+| `.browser_timeout(d)` / `.hx_settle_timeout(d)` | Launch and htmx-settle deadlines |
+| `.build()` | Boot server + browser → `SystemTestRunner` |
+| `SystemTest::attach(base_url)` | Browser only, against an already-running app (`attach_with_timeout` for a custom deadline) |
+| `runner.page()` / `runner.base_url()` | Open a `Page`; the app's base URL |
+| `BrowserCheck::run()` | Probe the host for Chromium; also what `autumn doctor` reports |
+
+Reach for `.layer(...)` whenever the routes under test depend on global
+middleware (tenant scoping, an auth shim, request enrichment) — mapping the
+layer onto individual handlers instead tests a stack the real app never
+serves.
+
+`Page`: `visit`, `fill`, `click`, `expect_text`, `expect_url`,
+`expect_attribute`, `expect_hx_settle`, `expect_sse_event`,
+`expect_no_console_errors`, `console_errors`, `snapshot`, `evaluate`. The
+`expect_*` assertions poll to a deadline and ignore the transient CDP errors a
+mid-poll navigation produces; `evaluate` is a single raw call that does not.
+
+See `docs/guide/system-tests.md`.
+
 ## Cargo features
 
 ```toml
