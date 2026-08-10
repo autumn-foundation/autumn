@@ -485,20 +485,28 @@ Per-primitive setters (in addition to the shared set):
   bulk-select + delete-selected flow. `BulkActionsConfig::new(action_url)`
   then `.field_name(s)` (default `"ids"`), `.submit_label(s)` (default
   `"Delete selected"`), `.select_label(s)` (the `aria-label` prefix, default
-  `"Select row"`), `.confirm(s)` (opt-in `confirm(...)` prompt; omitted by
+  `"Select row"`), `.confirm(s)` (opt-in confirmation prompt; omitted by
   default so the control works with scripting disabled). Render with
-  `bulk_actions_form(&cfg, csrf_token, csrf_field, content) -> Markup` — a
-  plain `<form method="post" action=..>` holding the hidden CSRF input, your
+  `bulk_actions_form(&cfg, csrf_token, csrf_field, submit_token,
+  submit_field, content) -> Markup` — a plain `<form method="post"
+  action=..>` holding the hidden submit-token and CSRF inputs, your
   `content`, then the `bulk_actions_toolbar` submit button — and put one
   `bulk_select_checkbox(row.id, &cfg)` in each row's first cell (typically
   `columns.insert(0, Column::new("", ..))` ahead of a `data_table`). Checked
   rows submit as repeated `ids=<id>` pairs; the server reads them with any
   repeated-key form parser. Keep non-selection page furniture (a "New …"
   link, a search box) outside the form — anything inside is submitted with
-  the selection. The `confirm` prompt is escaped for the JavaScript string
-  literal it lands in (an `onclick` attribute is HTML-decoded before the JS
-  parser sees it, so Maud's escaping alone is not enough), making an
-  apostrophe safe and blocking script injection from untrusted prompt text.
+  the selection. Pass the submit-token pair (`SubmitToken` /
+  `SubmitFormField`, same extractors the generated create/update forms take):
+  `SubmitTokenLayer` waves a tokenless request straight through, so omitting
+  it gives up double-submit protection on a destructive endpoint. Both hidden
+  fields lead the form body because the layer only scans its first chunk, and
+  a long selection would otherwise push the token past the scan cap. The
+  `confirm` prompt rides as a `data-autumn-confirm` attribute wired up by the
+  same-origin `/static/js/autumn-widgets.js` runtime, **not** an inline
+  `onclick` — the default `script-src 'self'` CSP blocks inline handlers, so
+  an `onclick` prompt would never fire and the form would submit
+  unconfirmed; as a plain attribute value Maud's escaping is all it needs.
   CSS hooks `.autumn-bulk-form` / `.autumn-bulk-actions` /
   `.autumn-bulk-select`. `autumn generate scaffold` emits the whole wiring —
   checkbox column, form, `POST /{plural}/bulk_delete` handler — for standard
