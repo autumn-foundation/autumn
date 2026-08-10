@@ -758,8 +758,7 @@ use autumn_web::widgets::{BulkActionsConfig, bulk_actions_form, bulk_select_chec
 
 let action = paths::bulk_delete();
 let cfg = BulkActionsConfig::new(&action)
-    .submit_label("Archive selected")
-    .confirm("Don't archive these posts?"); // opt-in; omit to stay 100% no-JS
+    .submit_label("Archive selected");
 html! {
     (bulk_actions_form(
         &cfg,
@@ -777,21 +776,16 @@ carries no `_submit_token` passes through `SubmitTokenLayer` unguarded,
 so omitting it silently gives up double-submit protection on exactly the
 endpoint that most needs it.
 
-`confirm(...)` is off by default, so the control works with scripting
-disabled. When you do opt in, the message rides as a
-`data-autumn-confirm` attribute wired up by the framework's same-origin
-`/static/js/autumn-widgets.js` runtime — **not** an inline `onclick`.
-Autumn's default CSP is `script-src 'self'` with no `'unsafe-inline'`,
-which blocks inline handlers outright, so an `onclick` prompt would never
-fire and the destructive form would submit unconfirmed. As a plain
-attribute value the message needs only Maud's HTML escaping, so a prompt
-built from user text cannot break out into markup or script; the server
-stays the enforcement point regardless. Include the widgets runtime in
-your layout for the prompt to appear:
-
-```html
-<script src="/static/js/autumn-widgets.js" defer></script>
-```
+The bulk toolbar emits **no** confirmation prompt, and the flow needs no
+JavaScript at all. Autumn's default CSP is `script-src 'self'` with no
+`'unsafe-inline'`, so an inline `onclick="return confirm(..)"` is blocked
+by the browser — the form would submit with no prompt, which is worse
+than not promising one. The framework's server-rendered replacement for
+`window.confirm()`, [`confirm_action`](../reference/widgets.md), submits
+its own single-action form and so cannot carry a bulk form's checkbox
+selection (HTML forbids nesting forms). To confirm a batch, post the
+selection to an interstitial page that lists the affected rows and asks
+for a second, explicit submit.
 
 Metadata flags let you keep common model and repository polish in the
 generation step:

@@ -1567,10 +1567,6 @@ pub struct BulkActionsConfig<'a> {
     pub submit_label: &'a str,
     /// Prefix of each checkbox's `aria-label` (default `"Select row"`).
     pub select_label: &'a str,
-    /// Optional confirmation prompt. `None` (the default) emits no
-    /// `data-autumn-confirm` attribute, so the control keeps working with
-    /// JavaScript disabled.
-    pub confirm: Option<&'a str>,
 }
 
 #[cfg(feature = "maud")]
@@ -1583,7 +1579,6 @@ impl<'a> BulkActionsConfig<'a> {
             field_name: "ids",
             submit_label: "Delete selected",
             select_label: "Select row",
-            confirm: None,
         }
     }
 
@@ -1605,19 +1600,6 @@ impl<'a> BulkActionsConfig<'a> {
     #[must_use]
     pub const fn select_label(mut self, select_label: &'a str) -> Self {
         self.select_label = select_label;
-        self
-    }
-
-    /// Opt into a confirmation prompt on the submit button.
-    ///
-    /// The message rides as a `data-autumn-confirm` attribute wired up by the
-    /// `autumn-widgets.js` runtime rather than an inline handler, so it still
-    /// fires under Autumn's default `script-src 'self'` CSP (see
-    /// [`bulk_actions_toolbar`]). The server stays the enforcement point either
-    /// way — a client with scripting disabled never sees the prompt.
-    #[must_use]
-    pub const fn confirm(mut self, confirm: &'a str) -> Self {
-        self.confirm = Some(confirm);
         self
     }
 }
@@ -1689,21 +1671,25 @@ pub fn bulk_select_checkbox(
 ///
 /// # No-JavaScript guarantee
 ///
-/// The button is a plain `<button type="submit">`. A `data-autumn-confirm`
-/// attribute is emitted **only** when [`BulkActionsConfig::confirm`] opted in —
-/// so the default control still works with scripting disabled, and even with a
-/// confirmation configured the server remains the enforcement point.
+/// The button is a plain `<button type="submit">` — no inline handler, no
+/// scripting of any kind, so the control works with JavaScript disabled and
+/// the server stays the enforcement point.
 ///
-/// # Confirmation prompts are CSP-safe
+/// # Confirming a bulk action
 ///
-/// The prompt is carried as a `data-autumn-confirm` attribute and wired up by
-/// the `/static/js/autumn-widgets.js` runtime, **not** by an inline `onclick`.
-/// Autumn's default CSP is `script-src 'self'` with no `'unsafe-inline'`, which
-/// blocks inline event handlers outright — an `onclick` prompt would be
-/// silently dropped and the destructive form would submit with no confirmation
-/// at all. Routing through the same-origin script keeps the prompt working
-/// under the default policy, and leaves the message a plain attribute value
-/// that Maud escapes, with no JavaScript string literal to break out of.
+/// This widget deliberately emits **no** confirmation prompt. The framework's
+/// answer to `window.confirm()` is [`confirm_action`], whose dialog is
+/// server-rendered and therefore assertable from a
+/// [`TestClient`](crate::test::TestClient) test — but it submits its own
+/// single-action `<form>`, so it cannot carry a bulk form's checkbox
+/// selection (HTML forbids nesting one form in another). An inline
+/// `onclick="return confirm(..)"` is not an option either: Autumn's default
+/// CSP is `script-src 'self'` with no `'unsafe-inline'`, so the browser
+/// blocks inline handlers and the destructive form would submit with no
+/// prompt at all — worse than not promising one.
+///
+/// To confirm a batch, post the selection to an interstitial page that lists
+/// the affected rows and asks for a second, explicit submit.
 ///
 /// # CSS hooks
 ///
@@ -1717,8 +1703,7 @@ pub fn bulk_select_checkbox(
 /// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_toolbar};
 ///
 /// let cfg = BulkActionsConfig::new("/posts/bulk_delete")
-///     .submit_label("Delete selected")
-///     .confirm("Delete the selected posts?");
+///     .submit_label("Delete selected");
 /// let toolbar = bulk_actions_toolbar(&cfg);
 /// ```
 ///
@@ -1730,28 +1715,15 @@ pub fn bulk_select_checkbox(
 /// assert!(html.contains(r#"class="autumn-bulk-actions""#));
 /// assert!(html.contains(r#"type="submit""#));
 /// assert!(html.contains("Delete selected"));
-/// // No confirmation was configured, so no prompt hook is emitted.
-/// assert!(!html.contains("data-autumn-confirm"));
-///
-/// // The prompt is a plain attribute value — no inline handler, so it
-/// // survives the default `script-src 'self'` CSP.
-/// let confirming = BulkActionsConfig::new("/posts/bulk_delete").confirm("Delete these rows?");
-/// let html = bulk_actions_toolbar(&confirming).into_string();
-/// assert!(html.contains(r#"data-autumn-confirm="Delete these rows?""#));
+/// // Nothing scripted: no inline handler and no prompt hook.
 /// assert!(!html.contains("onclick"));
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
-    // The prompt rides as a data attribute wired up by autumn-widgets.js, not
-    // an inline `onclick`: the default `script-src 'self'` CSP blocks inline
-    // handlers, so an `onclick` prompt would never fire and the destructive
-    // form would submit unconfirmed. As a plain attribute value the message
-    // needs only Maud's HTML escaping — there is no JavaScript string literal
-    // for an apostrophe (or untrusted text) to break out of.
     maud::html! {
         div class="autumn-bulk-actions" role="group" {
-            button type="submit" data-autumn-confirm=[config.confirm] { (config.submit_label) }
+            button type="submit" { (config.submit_label) }
         }
     }
 }
@@ -7037,7 +7009,6 @@ mod tests {
         assert_eq!(cfg.field_name, "ids");
         assert_eq!(cfg.submit_label, "Delete selected");
         assert_eq!(cfg.select_label, "Select row");
-        assert!(cfg.confirm.is_none());
     }
 
     #[test]
@@ -7045,13 +7016,11 @@ mod tests {
         let cfg = BulkActionsConfig::new("/posts/bulk_delete")
             .field_name("post_ids")
             .submit_label("Archive selected")
-            .select_label("Select post")
-            .confirm("Archive these posts?");
+            .select_label("Select post");
         assert_eq!(cfg.action, "/posts/bulk_delete");
         assert_eq!(cfg.field_name, "post_ids");
         assert_eq!(cfg.submit_label, "Archive selected");
         assert_eq!(cfg.select_label, "Select post");
-        assert_eq!(cfg.confirm, Some("Archive these posts?"));
     }
 
     #[test]
@@ -7189,68 +7158,17 @@ mod tests {
         assert!(html.contains("Delete selected"), "{html}");
     }
 
+    /// The framework bans `window.confirm()` in its runtime (see
+    /// `confirm_action`, the server-rendered replacement), and the default
+    /// `script-src 'self'` CSP blocks inline handlers — so this toolbar
+    /// promises no confirmation rather than one that silently never fires.
     #[test]
-    fn bulk_actions_toolbar_confirm_is_opt_in() {
-        // No-JS guarantee: the default toolbar carries no prompt hook.
+    fn bulk_actions_toolbar_emits_nothing_scripted() {
         let cfg = BulkActionsConfig::new("/posts/bulk_delete");
-        let plain = bulk_actions_toolbar(&cfg).into_string();
-        assert!(!plain.contains("data-autumn-confirm"), "{plain}");
-        // Opting in emits the confirmation prompt.
-        let confirmed =
-            bulk_actions_toolbar(&cfg.clone().confirm("Delete these rows?")).into_string();
-        assert!(
-            confirmed.contains(r#"data-autumn-confirm="Delete these rows?""#),
-            "{confirmed}"
-        );
-    }
-
-    /// Autumn's default CSP is `script-src 'self'` with no `'unsafe-inline'`,
-    /// so an inline `onclick` prompt is blocked outright by the browser and the
-    /// destructive form submits with no confirmation at all. The prompt must
-    /// therefore ride as a data attribute wired up by the same-origin
-    /// `autumn-widgets.js` runtime.
-    #[test]
-    fn bulk_actions_toolbar_confirm_uses_no_inline_handler() {
-        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
-        let html = bulk_actions_toolbar(&cfg.clone().confirm("Delete these rows?")).into_string();
-        assert!(
-            !html.contains("onclick"),
-            "an inline handler would be CSP-blocked: {html}"
-        );
+        let html = bulk_actions_toolbar(&cfg).into_string();
+        assert!(!html.contains("onclick"), "{html}");
+        assert!(!html.contains("data-autumn-confirm"), "{html}");
         assert!(!html.contains("<script"), "{html}");
-    }
-
-    /// As a plain attribute value the message needs only Maud's HTML escaping —
-    /// there is no JavaScript string literal for a quote or a crafted prompt to
-    /// break out of. A double quote (which would close the attribute) must be
-    /// entity-escaped; an apostrophe is harmless inside a double-quoted
-    /// attribute and reads back verbatim.
-    #[test]
-    fn bulk_actions_toolbar_confirm_escapes_attribute_syntax() {
-        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
-        // An apostrophe is safe unescaped and round-trips to the exact prompt.
-        let html = bulk_actions_toolbar(&cfg.clone().confirm("Don't delete?")).into_string();
-        assert!(
-            html.contains(r#"data-autumn-confirm="Don't delete?""#),
-            "{html}"
-        );
-        // A double quote must not close the attribute early.
-        let html = bulk_actions_toolbar(&cfg.clone().confirm(r#"say "hi""#)).into_string();
-        assert!(
-            html.contains("say &quot;hi&quot;"),
-            "the quote must be entity-escaped: {html}"
-        );
-        // A crafted prompt cannot break out into markup or script.
-        let html = bulk_actions_toolbar(
-            &cfg.clone()
-                .confirm(r#""><script>alert(document.cookie)</script>"#),
-        )
-        .into_string();
-        assert!(
-            !html.contains("<script"),
-            "the prompt must not break out of the attribute: {html}"
-        );
-        assert!(html.contains("&lt;script&gt;"), "{html}");
     }
 
     // ── CardConfig builder ─────────────────────────────────────────────

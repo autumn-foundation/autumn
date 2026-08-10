@@ -174,13 +174,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepts the `ids[]` spelling too, for clients that send it. Three reusable
   widgets back it for hand-written views: `autumn_web::widgets::{
   bulk_select_checkbox, bulk_actions_toolbar, bulk_actions_form}` plus a
-  `BulkActionsConfig` builder (opt-in `confirm(...)` prompt; off by default so
-  the control keeps working with scripting disabled, and carried as a
-  `data-autumn-confirm` attribute wired up by the same-origin
-  `autumn-widgets.js` runtime rather than an inline `onclick` — Autumn's
-  default CSP is `script-src 'self'` with no `'unsafe-inline'`, so an inline
-  handler would be blocked outright and the destructive form would submit with
-  no prompt at all). The bulk form also carries a one-time `_submit_token`
+  `BulkActionsConfig` builder. The toolbar deliberately emits no confirmation
+  prompt: an inline `onclick="return confirm(..)"` is blocked by Autumn's
+  default `script-src 'self'` CSP (the form would submit with no prompt, worse
+  than not promising one), and `confirm_action` — the framework's
+  server-rendered `window.confirm()` replacement — posts its own single-action
+  form, so it cannot carry a bulk form's checkbox selection. Confirm a batch
+  with an interstitial page instead. The bulk form carries a one-time `_submit_token`
   (#1360) ahead of the checkboxes, so a double-click or Back→resubmit replays
   the first response instead of re-running the batch: `SubmitTokenLayer` passes
   a tokenless request straight through, and it only scans the body's first

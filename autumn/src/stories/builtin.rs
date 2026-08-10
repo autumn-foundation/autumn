@@ -500,10 +500,9 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 ];
 
                 // `action` is the bulk endpoint -- `paths::bulk_delete()` in a
-                // scaffolded app. `confirm(...)` is opt-in; leave it off and the
-                // control still works with scripting disabled.
-                let config = BulkActionsConfig::new("/posts/bulk_delete")
-                    .confirm("Delete the selected posts?");
+                // scaffolded app. The flow is entirely unscripted, so it works
+                // with JavaScript disabled.
+                let config = BulkActionsConfig::new("/posts/bulk_delete");
 
                 // The checkbox goes in the row's first cell, so every row can be
                 // selected. Each one submits as a repeated `ids=<id>` pair.

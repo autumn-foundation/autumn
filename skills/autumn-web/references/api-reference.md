@@ -485,8 +485,7 @@ Per-primitive setters (in addition to the shared set):
   bulk-select + delete-selected flow. `BulkActionsConfig::new(action_url)`
   then `.field_name(s)` (default `"ids"`), `.submit_label(s)` (default
   `"Delete selected"`), `.select_label(s)` (the `aria-label` prefix, default
-  `"Select row"`), `.confirm(s)` (opt-in confirmation prompt; omitted by
-  default so the control works with scripting disabled). Render with
+  `"Select row"`). Render with
   `bulk_actions_form(&cfg, csrf_token, csrf_field, submit_token,
   submit_field, content) -> Markup` — a plain `<form method="post"
   action=..>` holding the hidden submit-token and CSRF inputs, your
@@ -502,11 +501,13 @@ Per-primitive setters (in addition to the shared set):
   it gives up double-submit protection on a destructive endpoint. Both hidden
   fields lead the form body because the layer only scans its first chunk, and
   a long selection would otherwise push the token past the scan cap. The
-  `confirm` prompt rides as a `data-autumn-confirm` attribute wired up by the
-  same-origin `/static/js/autumn-widgets.js` runtime, **not** an inline
-  `onclick` — the default `script-src 'self'` CSP blocks inline handlers, so
-  an `onclick` prompt would never fire and the form would submit
-  unconfirmed; as a plain attribute value Maud's escaping is all it needs.
+  toolbar emits no confirmation prompt: an inline `onclick="return
+  confirm(..)"` is blocked by the default `script-src 'self'` CSP (the form
+  would submit with no prompt), and `confirm_action` — the framework's
+  server-rendered `window.confirm()` replacement — posts its own
+  single-action form, so it cannot carry the checkbox selection. Confirm a
+  batch with an interstitial page that lists the rows and asks for a second
+  submit.
   CSS hooks `.autumn-bulk-form` / `.autumn-bulk-actions` /
   `.autumn-bulk-select`. `autumn generate scaffold` emits the whole wiring —
   checkbox column, form, `POST /{plural}/bulk_delete` handler — for standard
