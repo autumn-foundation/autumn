@@ -739,6 +739,8 @@ Contract of the generated handler:
 | Field name | `name="ids"` (matching `autumn-admin-plugin`); the parser also accepts the `ids[]` spelling some clients send. |
 | Empty selection | Info flash + 303 redirect. **Never** a 400 — a list-write endpoint doesn't fail on missing params. |
 | Malformed id (`ids=abc`) | Silently dropped, same as above. Duplicates are collapsed through a `HashSet`, so parsing a crafted body full of distinct ids stays linear rather than quadratic. |
+| Oversized selection | Capped at `MAX_BULK_IDS` (5000). A real selection is page-sized, so this only bites on a hand-crafted body — the default 32 MiB request limit otherwise leaves room for over a million ids. The parser stops one past the cap, and the handler refuses the batch with an error flash rather than truncating it: a silently partial destructive batch is worse than a refused one. |
+| Large selection | The pre-flight `SELECT` is chunked at 1000 ids. `eq_any` binds one parameter per id, and `autumn_web::repository::MAX_BIND_PARAMS` is 32766 on SQLite, so one unbounded `eq_any` would fail with "too many SQL variables" before reaching the already-chunked `delete_many`. |
 | `--soft-delete` | The pre-flight `SELECT` filters `deleted_at IS NULL`, and `delete_many` applies the soft-delete update — no hand-rolled `deleted_at` write. |
 | Record policy wiring on (an owner column, the default) | Each selected row is authorized with the same `"delete"` action `destroy` uses. A row the actor may not delete is dropped from the batch rather than 403'ing the request, so the endpoint is not an existence oracle. |
 | `dependent(restrict)` child rows | `delete_many` probes first and aborts the **whole** batch with a 409, rolling back — no partial delete. |

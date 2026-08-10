@@ -150,11 +150,48 @@ fn scaffolds_without_bulk_delete_keep_plain_index_signatures() {
     }
 }
 
+/// Chunking keeps a huge selection from blowing the placeholder limit, but on
+/// its own it turns that into query amplification: the default 32 MiB body cap
+/// leaves room for over a million ids, i.e. a long run of sequential `SELECT`s
+/// holding a pooled connection for a batch that may match no rows. The count
+/// must be capped before the pre-flight runs, and the parser must stop early
+/// rather than collect a body's worth of ids it will never use.
+#[test]
+fn bulk_delete_caps_the_selection_size() {
+    let (_tmp, routes) = scaffold_routes("bulk-cap", &[]);
+    assert!(
+        routes.contains("const MAX_BULK_IDS: usize = 5000;"),
+        "a selection cap must be emitted:\n{routes}"
+    );
+    // The parser stops one past the cap instead of draining the whole body.
+    assert!(
+        routes.contains("if ids.len() > MAX_BULK_IDS {") && routes.contains("break;"),
+        "the parser must stop collecting once past the cap:\n{routes}"
+    );
+    let bulk = handler_slice(&routes, "bulk_delete");
+    let guard_at = bulk
+        .find("if ids.len() > MAX_BULK_IDS {")
+        .unwrap_or_else(|| panic!("the handler must reject an oversized selection:\n{bulk}"));
+    let query_at = bulk
+        .find("for chunk in ids.chunks(1000)")
+        .unwrap_or_else(|| panic!("the handler must chunk the pre-flight:\n{bulk}"));
+    assert!(
+        guard_at < query_at,
+        "the cap must be enforced before any query runs:\n{bulk}"
+    );
+    // Refused, not silently truncated — a partial destructive batch is worse.
+    assert!(
+        bulk.contains("Select at most") && bulk.contains(".error("),
+        "an oversized selection must be refused with an error flash:\n{bulk}"
+    );
+}
+
 /// `eq_any` binds one parameter per id, and the handler parses a raw body
-/// rather than a page-sized selection — so a crafted POST can carry more ids
-/// than the backend's placeholder ceiling (`MAX_BIND_PARAMS`, 32766 on
-/// SQLite). A single unbounded `eq_any` would fail the request with "too many
-/// SQL variables" before reaching the already-chunked `delete_many`.
+/// rather than a page-sized selection — so even a capped selection can carry
+/// more ids than the backend's placeholder ceiling on a small enough limit
+/// (`MAX_BIND_PARAMS`, 32766 on `SQLite`). A single unbounded `eq_any` would
+/// fail the request with "too many SQL variables" before reaching the
+/// already-chunked `delete_many`.
 #[test]
 fn bulk_delete_preflight_chunks_its_id_query() {
     for (name, flags) in [

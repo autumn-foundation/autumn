@@ -157,7 +157,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mounts that route immediately after `destroy`. The handler parses the
   repeated checkboxes with a generated `parse_bulk_ids` helper (deduping through
   a `HashSet`, so a crafted body carrying many distinct `ids` parses in linear
-  rather than quadratic time), per-row
+  rather than quadratic time, and stopping one past a `MAX_BULK_IDS` cap of
+  5000 — a real selection is page-sized, but the default 32 MiB request limit
+  otherwise leaves room for over a million ids; an oversized batch is refused
+  with an error flash rather than truncated, since a silently partial
+  destructive batch is worse than a refused one), chunks its pre-flight
+  `SELECT` at 1000 ids (`eq_any` binds one parameter per id and
+  `MAX_BIND_PARAMS` is 32766 on SQLite, so one unbounded `eq_any` would fail
+  with "too many SQL variables" before reaching the already-chunked
+  `delete_many`), per-row
   authorizes with the same `"delete"` action `destroy` uses when policy wiring
   is on (an unauthorized row is dropped from the batch, not 403'd, so the
   endpoint is no existence oracle), routes the delete through

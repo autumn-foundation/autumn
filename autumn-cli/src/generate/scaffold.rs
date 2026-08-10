@@ -3576,7 +3576,18 @@ mod attachment_read_back_tests {
     // only when the bulk gate is on, so the `--live`/`--sharded` output is
     // byte-identical.
     let bulk_ids_parser = if bulk_delete_enabled {
-        "\n/// Parse the bulk-select checkboxes out of a URL-encoded form body.\n\
+        "\n/// Most rows one bulk submit may touch.\n\
+         ///\n\
+         /// The checkboxes come from a single rendered page, so a real selection is\n\
+         /// page-sized; this cap only bites on a hand-crafted body. Without it the\n\
+         /// selection is bounded solely by the request-size limit (32 MiB by\n\
+         /// default), which is room for over a million ids — enough that even the\n\
+         /// chunked pre-flight below would issue a long run of sequential `SELECT`s,\n\
+         /// holding a pooled connection the whole time, for a batch that may match\n\
+         /// no rows at all.\n\
+         const MAX_BULK_IDS: usize = 5000;\n\
+         \n\
+         /// Parse the bulk-select checkboxes out of a URL-encoded form body.\n\
          ///\n\
          /// Accepts both the plain `ids=1&ids=2` spelling the generated checkboxes\n\
          /// submit and the `ids[]=1&ids[]=2` spelling some clients send. A value\n\
@@ -3597,7 +3608,14 @@ mod attachment_read_back_tests {
          if key == \"ids\" || key == \"ids[]\" {\n            \
          if let Ok(id) = value.parse::<i64>() {\n                \
          if seen.insert(id) {\n                    \
-         ids.push(id);\n                \
+         ids.push(id);\n                    \
+         // Stop one past the cap. The handler refuses anything longer, so\n                    \
+         // parsing the rest would burn CPU on a body already destined for\n                    \
+         // rejection — and collecting it would let the request size alone\n                    \
+         // decide how much memory this allocates.\n                    \
+         if ids.len() > MAX_BULK_IDS {\n                        \
+         break;\n                    \
+         }\n                \
          }\n            \
          }\n        \
          }\n    \
@@ -3667,6 +3685,15 @@ mod attachment_read_back_tests {
              let ids = parse_bulk_ids(&body);\n    \
              if ids.is_empty() {{\n        \
              flash.info(\"No {plural} selected\").await;\n        \
+             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
+             }}\n    \
+             // Refuse an oversized selection outright rather than truncating it: a\n    \
+             // silently partial destructive batch is worse than a refused one. Like\n    \
+             // the empty case this redirects with a flash instead of 400ing.\n    \
+             if ids.len() > MAX_BULK_IDS {{\n        \
+             flash\n            \
+             .error(format!(\"Select at most {{MAX_BULK_IDS}} {plural} at once\"))\n            \
+             .await;\n        \
              return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
              }}\n    \
              // Chunk the pre-flight the way the repository chunks its own id\n    \
