@@ -268,6 +268,61 @@ returning a per-shard-partial answer. `DateBucket` and the `GroupedAggregate`
 builder live in `autumn_web::aggregate`. See "Grouped aggregate queries" in
 `docs/guide/repositories.md`.
 
+**(unreleased)** — `#[votable]` reaction helpers (#1362): declaring
+`#[votable(by = User, aggregate = sum|count)]` on a `#[model]` emits a
+`{Model}Reactions` trait blanket-implemented for that model's repository (no
+`#[repository]` attribute needed — it rides the same `M2mConnSource<Model =
+M>` bound as the m2m mutation helpers). Import the trait as `_`, then:
+
+```rust
+use crate::models::PostReactions as _;
+use autumn_web::repository::{Reaction, ReactionOutcome};
+
+// sum mode
+async fn react(&self, reactor_id: i64, target_id: i64, value: i16)
+    -> AutumnResult<Reaction>;
+// count mode — no `value` parameter
+async fn react(&self, reactor_id: i64, target_id: i64) -> AutumnResult<Reaction>;
+// both modes
+async fn reaction_of(&self, reactor_id: i64, target_id: i64)
+    -> AutumnResult<Option<i16>>;
+
+pub struct Reaction { pub value: Option<i16>, pub aggregate: i64,
+                      pub outcome: ReactionOutcome }
+pub enum ReactionOutcome { Inserted, Flipped, Removed }
+```
+
+`#[votable]` must be written **below** `#[model]` (attribute macros are
+consumed top-down; above it, the error is `cannot find attribute votable`).
+The model's `#[id]` and aggregate fields must both be `i64` — both are
+compile-checked.
+
+`react()` toggles (same value again removes the edge), flips (different value
+replaces it), or inserts, and recomputes the target's aggregate column from
+ground truth (`SUM(value)` / `COUNT(*)`) and persists it **in the same
+transaction**, under a row lock on the target (`SELECT … FOR NO KEY UPDATE` on
+Postgres — weak enough that referencing inserts, e.g. a comment on the same
+post, are not blocked; `BEGIN IMMEDIATE` on SQLite) held across the whole
+read-decide-write-recompute window. Concurrent callers therefore converge to
+at most one edge per `(reactor, target)` with no `23505` escaping, and the
+persisted aggregate is exact even across different reactors. A missing or
+soft-deleted target is `NotFound`. Tenant-isolated: with a `tenant_id` column
+on the model and a `tenant_scoped` repository, S1/S5 filter on the current
+tenant, so a foreign-tenant `target_id` is `NotFound` (and `reaction_of`
+returns `None`); no tenant context is an error, `across_tenants()` opts out.
+**`react()` does not validate `value`** —
+it writes whatever `i16` you pass, so branch on the route and put a
+`CHECK (value IN (-1, 1))` on the column; never bind it from a request. A
+toggle is not idempotent: a blind retry of a timed-out call inverts it, so use
+an HTTP-layer idempotency key if you need retry safety. `reaction_of` is a
+single indexed lookup on a **read** connection (replica-eligible, does not pin
+read-your-writes — re-render from the `Reaction` the write returned; and no
+batch form yet, so feed pages should pass `None` to the widget rather than
+issue an N+1). **`react()` acquires its own pooled connection and does not
+join an enclosing `Db::tx`** — never hold a `Db` extractor across the call, or
+the handler needs two connections at once and deadlocks once concurrency
+reaches the pool size. See `docs/guide/votable.md`.
+
 **(unreleased)** — `ListQuery` extractor + `SortDir` (#1126): an `Infallible`
 query extractor parsing `?sort=<col>`, `?dir=asc|desc`, and
 `?filter[<col>]=<val>`. It **never rejects** — an empty or unknown `sort` falls
@@ -403,6 +458,28 @@ Per-primitive setters (in addition to the shared set):
   Option<guard>)]`) and `can` is `|to| record.can_transition_<field>_to(to)`;
   a legal edge whose guard currently fails still renders but as a `disabled`
   button. CSS hooks `.autumn-transition-controls` / `.autumn-transition`.
+- `autumn_web::widgets::{ReactionControls, reaction_controls}` (#1362) — the
+  view half of `#[votable]`. `ReactionControls::votes(dom_id, up_action,
+  down_action)` (signed up/down, `aggregate = sum`) or
+  `ReactionControls::likes(dom_id, action)` (single toggle, `aggregate =
+  count`), then `.aggregate(i64)` (the target's persisted `score` /
+  `{name}_count`), `.current(Option<i16>)` (`reaction_of()`'s result —
+  `Some(1)` presses up/like, `Some(-1)` down, `None` neither), `.label(s)` /
+  `.up_label(s)` / `.down_label(s)` / `.like_label(s)` (accessible names),
+  `.hx_target(s)` (defaults `#{dom_id}`), `.csrf(Option<&CsrfToken>,
+  Option<&CsrfFormField>)` or the `.csrf_token(s)` / `.csrf_field(s)`
+  primitives; render with `reaction_controls(&cfg) -> Markup`. Emits one
+  no-JS `<form method="post">` per direction carrying `hx-post` / `hx-target`
+  / `hx-swap="outerHTML"`, ARIA toggle buttons (`aria-pressed`, explicit
+  `aria-label`, glyph in `aria-hidden` span) and an `aria-live="polite"`
+  aggregate. Thread `.csrf(...)` on any page a no-JS visitor can reach — the
+  hidden input is what makes the plain form POST pass CSRF (the htmx path is
+  covered by the header shim either way). `dom_id` is interpolated into the
+  default `hx-target` selector, so build it yourself; never nest the widget
+  inside another `<form>`. CSS hooks `.autumn-reaction-controls` / `.autumn-reaction` /
+  `.autumn-reaction-up` / `.autumn-reaction-down` / `.autumn-reaction-like` /
+  `.autumn-reaction-button` / `.autumn-reaction-active` /
+  `.autumn-reaction-count`. Prelude re-exported.
 - `autumn_web::widgets` display atoms: `badge(label, BadgeVariant)` /
   `badge_with(..., &BadgeConfig)` / `status_tag(label)` with
   `BadgeVariant::{Neutral,Info,Success,Warning,Danger}` and

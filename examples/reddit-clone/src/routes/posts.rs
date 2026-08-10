@@ -18,7 +18,8 @@ use scoped_futures::ScopedFutureExt;
 
 use crate::jobs::{PostPublicationArgs, PostPublicationJob};
 use crate::models::{
-    Comment, CommentAssociations, NewTag, Post, PostAssociations, PostTagsMutations, Subreddit, Tag,
+    Comment, CommentAssociations, NewTag, Post, PostAssociations, PostReactions as _,
+    PostTagsMutations, Subreddit, Tag,
 };
 use crate::repositories::{PgPostRepository, PgVoteRepository, PostRepository};
 use crate::schema::{posts, subreddits, tags};
@@ -70,11 +71,13 @@ pub async fn front_page(
     // Release the `Db` extractor's connection now, before any other pooled
     // checkout. `Db` acquires its connection eagerly at extraction and holds it
     // until it is dropped (not just for the duration of a `&mut *db` borrow), so
-    // on a single-connection pool (max_size = 1, no read replica) the
-    // leaderboard aggregate below — and the `preload` further down — would block
-    // forever waiting for a second connection that can never free up while `db`
-    // is still alive. Dropping `db` here lets each step below check out the one
-    // connection in turn.
+    // keeping it alive across the leaderboard aggregate below — or the `preload`
+    // further down — would make this handler hold *two* connections at once.
+    // That is invisible in dev and fatal under load: this app runs the default
+    // pool (10 connections, no read replica), so once ten requests are in this
+    // handler simultaneously, each holding `db` and waiting for a second
+    // checkout, none can ever proceed. Dropping `db` here keeps the handler at
+    // one connection at a time, which cannot deadlock at any concurrency.
     drop(db);
 
     // "Top posts by votes" leaderboard (#1364, AC3): a single typed
@@ -107,8 +110,8 @@ pub async fn front_page(
     } else {
         // Use a fresh, short-lived pool checkout — not the `Db` extractor, which
         // was dropped above — so this lookup never overlaps another live
-        // connection on a single-connection pool. The `conn` guard is released
-        // at the end of this block, before `preload` checks one out.
+        // connection held by this request. The `conn` guard is released at the
+        // end of this block, before `preload` checks one out.
         let pool = state
             .pool()
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
@@ -125,8 +128,8 @@ pub async fn front_page(
     // The base rows were read from the primary via `Db`, so pin the preload to
     // the primary too (`on_primary`) — otherwise, under replica lag, an
     // author/subreddit just written may be missing on the replica and the post
-    // would be skipped. `db` was already released above, so this checkout can
-    // never contend with it on a single-connection pool.
+    // would be skipped. `db` was already released above, so this checkout never
+    // overlaps it — the handler still holds at most one connection.
     let hot_posts = repo
         .on_primary()
         .preload(hot_posts, Post::preload().author().subreddit())
@@ -245,7 +248,12 @@ pub async fn front_page(
                             li id=(format!("post-{}", post.id)) class="posts-feed-item transition-all" {
                                 div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
                                     div class="flex items-start gap-3 p-4" {
-                                        (vote_controls(post.id, post.score))
+                                        // Feed: `None` current rather than one
+                                        // `reaction_of` per row (an N+1). A
+                                        // batch accessor is the follow-up. The
+                                        // CSRF token *is* threaded, so the
+                                        // buttons work with JavaScript off.
+                                        (vote_controls(post.id, post.score, None, Some(&csrf)))
                                         div class="flex-1 min-w-0" {
                                             a href=(paths::show(&sub.slug, &post.slug))
                                                class="text-lg font-medium text-gray-900 hover:text-orange-600 line-clamp-2" {
@@ -683,10 +691,26 @@ pub async fn show(
         .collect();
     post_comments.sort_by_key(|c| std::cmp::Reverse(c.score));
 
-    let is_author = current_user_id
+    let viewer_id = current_user_id
         .as_ref()
-        .and_then(|id| id.parse::<i64>().ok())
-        .is_some_and(|id| id == post.author_id);
+        .and_then(|id| id.parse::<i64>().ok());
+    let is_author = viewer_id.is_some_and(|id| id == post.author_id);
+
+    // The viewer's own vote, so the detail page's control renders pressed
+    // (#1362). One indexed lookup on the edge table, and only here — feeds pass
+    // `None` to avoid an N+1. `db` was dropped above and `preload` has already
+    // returned, so this is this request's only live checkout.
+    //
+    // `on_primary()`: the no-JS vote flow lands here via a 303 redirect — a
+    // fresh GET with no read-your-writes pin — so on a lagging replica the
+    // viewer's *own just-cast* vote could render unpressed. Their own vote is
+    // the one read on this page where staleness is user-visible and wrong;
+    // it is a single point lookup, and every heavy read above stays
+    // replica-routed.
+    let current_vote = match viewer_id {
+        Some(uid) => repo.on_primary().reaction_of(uid, post.id).await?,
+        None => None,
+    };
 
     // Consume the flash only after all fallible work above.
     let flash_html = flash.render().await;
@@ -707,7 +731,7 @@ pub async fn show(
             // Post card
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mb-6" {
                 div class="flex items-start gap-4" {
-                    (vote_controls(post.id, post.score))
+                    (vote_controls(post.id, post.score, current_vote, Some(&csrf)))
                     div class="flex-1" {
                         h1 class="text-2xl font-bold text-gray-900 mb-2" { (post.title) }
                         div class="text-xs text-gray-400 mb-4" {

@@ -62,9 +62,22 @@ pub trait PostRepository {
 // `(post_id, Option<sum>)` pair per post. The front-page "Top posts by votes"
 // leaderboard (`routes::posts::front_page`) chains
 // `.order_by_aggregate_desc().limit(5)` for a top-N roll-up in a single call —
-// a *read*, so it is replica-eligible via the repository's read route. Note the
-// score-maintenance path in `routes::votes` is deliberately NOT this API: score
-// upkeep is an atomic primary-side `UPDATE`, not a read-then-write.
+// a *read*, so it is replica-eligible via the repository's read route.
+//
+// Score maintenance is deliberately NOT this API. Since #1362 it is owned
+// entirely by `Post`'s `#[votable(by = User, aggregate = sum)]`: every
+// `posts.react(...)` locks the target post row, rewrites the edge, recomputes
+// `SUM(value)` from ground truth and persists `posts.score` — all inside one
+// transaction on the primary, so a reader never sees the edge and the score
+// disagree. No route hand-writes that `UPDATE` any more (see `routes::votes`).
+//
+// This leaderboard is untouched by that and must stay so. `#[votable]` declares
+// its own edge `table!` in a hidden private module, so `crate::schema::votes`,
+// the `Vote` model and this grouped aggregate keep their nullable `post_id` —
+// which is exactly what the codegen's `IS NOT NULL` group guard uses to exclude
+// comment votes from the top-N. Regression-guarded by
+// `leaderboard_grouped_aggregate_still_works_after_react` in
+// `tests/votable_pg_integration.rs`.
 #[autumn_web::repository(Vote, table = "votes")]
 pub trait VoteRepository {
     /// SUM(value) GROUP BY post_id -> `Vec<(post_id, Option<sum>)>`.
@@ -117,7 +130,14 @@ impl autumn_web::live::LiveFragment for Post {
                 // 1. Card Layout Version
                 div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
                     div class="flex items-start gap-3 p-4" {
-                        (crate::routes::layout::vote_controls(self.id, self.score))
+                        // The broadcast variant: no per-viewer state (there is
+                        // no "current viewer" for a fragment fanned out to
+                        // every subscriber), no CSRF input (SSE only reaches
+                        // htmx clients, whose requests carry the token as a
+                        // header via `autumn-htmx-csrf.js`), and `hx-preserve`
+                        // on the buttons so this card swap never un-presses a
+                        // viewer's own vote.
+                        (crate::routes::layout::broadcast_vote_controls(self.id, self.score))
                         div class="flex-1 min-w-0" {
                             a href=(card_url)
                                class="text-lg font-medium text-gray-900 hover:text-orange-600 line-clamp-2" {

@@ -252,7 +252,10 @@ pub async fn show(
                         div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
                             div class="flex items-start gap-3 p-4" {
                                 // Vote controls
-                                (super::layout::vote_controls(*post_id, *score))
+                                // Feed: `None` current (see the front page) —
+                                // no per-row `reaction_of` lookup. The CSRF
+                                // token is threaded so the no-JS form POSTs.
+                                (super::layout::vote_controls(*post_id, *score, None, Some(&csrf)))
 
                                 // Post info
                                 div class="flex-1 min-w-0" {

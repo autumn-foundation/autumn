@@ -3007,6 +3007,61 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // when the model has no `through =` associations (nothing calls it) —
     // so it doesn't need to know which associations exist, only its own
     // model and write-connection helper.
+    // The tenant a `#[votable]` `react()` / `reaction_of()` must filter its
+    // *target* lookup on. Resolved with exactly the idiom the derived queries
+    // use: `across_tenants()` opts out, a missing context fails closed.
+    // §1d parity for reactions: on a sharded repository, across_tenants()
+    // cannot target a single shard's connection, so `react()` would mutate —
+    // and `reaction_of()` silently read — whichever shard happens to back the
+    // routed pool. Reject like the derived-write / preload guards, but key off
+    // the runtime `across_tenants` flag ALONE (the grouped-aggregate stance,
+    // not the older `__autumn_shards.is_some()` conjunction): a repo built
+    // without shard context (`with_pool_untracked`) would otherwise slip past
+    // and silently hit whichever single pool backs it. Empty (zero-cost)
+    // unless sharded + tenant_scoped.
+    let m2m_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard reactions are not supported: across_tenants() on a \
+                         sharded repository cannot target a single shard; scope to a \
+                         tenant first"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let m2m_tenant_scope_body = if config.tenant_scoped {
+        quote! {
+            #m2m_cross_shard_guard
+            if self.across_tenants {
+                ::core::result::Result::Ok(::core::option::Option::None)
+            } else {
+                match ::autumn_web::tenancy::CURRENT_TENANT
+                    .try_with(|t| t.clone())
+                    .ok()
+                    .flatten()
+                {
+                    ::core::option::Option::Some(t) => {
+                        ::core::result::Result::Ok(::core::option::Option::Some(t))
+                    }
+                    ::core::option::Option::None => {
+                        ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::internal_server_error_msg(
+                                "no tenant context was established"
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    } else {
+        quote! { ::core::result::Result::Ok(::core::option::Option::None) }
+    };
+
     let m2m_conn_source_impl = quote! {
         impl ::autumn_web::repository::M2mConnSource for #pg_name {
             type Model = #model_name;
@@ -3019,6 +3074,29 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 >,
             > {
                 self.__autumn_acquire_conn().await
+            }
+
+            // Read-only association/reaction accessors (`#[votable]`'s
+            // `reaction_of()`) route exactly like every other generated read:
+            // through the repository's `ReadRoute` snapshot, without marking
+            // the read-your-writes pin.
+            async fn __autumn_m2m_read_conn(
+                &self,
+            ) -> ::autumn_web::AutumnResult<
+                ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
+                    ::autumn_web::RuntimeConnection,
+                >,
+            > {
+                self.__autumn_acquire_read_conn().await
+            }
+
+            // `#[votable]` target scoping: `Some(tenant)` for a tenant_scoped
+            // repository in a tenant context, `None` for a non-scoped one and
+            // for `across_tenants()`, `Err` when scoped with no context.
+            fn __autumn_m2m_tenant_scope(
+                &self,
+            ) -> ::autumn_web::AutumnResult<::core::option::Option<::std::string::String>> {
+                #m2m_tenant_scope_body
             }
         }
     };
@@ -15940,6 +16018,60 @@ mod tests {
             !guard_cond.contains("__autumn_shards . is_some")
                 && !guard_cond.contains("__autumn_shards.is_some"),
             "aggregate guard condition must not depend on __autumn_shards being Some: {guard_cond}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_m2m_tenant_scope_rejects_across_tenants_on_sharded_repo() {
+        // PR #2177: `#[votable]`'s react()/reaction_of() resolve their tenant
+        // scope through `M2mConnSource::__autumn_m2m_tenant_scope()` before
+        // acquiring any connection. On a sharded repository there is no single
+        // right shard for an `across_tenants()` reaction to land on — a write
+        // would mutate whichever shard backs the routed pool, and a read would
+        // silently return `None` for edges on other shards — so the scope
+        // method itself must reject, keyed off the runtime `across_tenants`
+        // flag alone (the grouped-aggregate stance: no `__autumn_shards`
+        // conjunct, or `with_pool_untracked` repos slip past).
+        let generated = repository_macro(
+            quote! { Event, table = "events", tenant_scoped, sharded },
+            quote! {
+                pub trait EventRepository {}
+            },
+        )
+        .to_string();
+
+        let pos = generated
+            .find("fn __autumn_m2m_tenant_scope")
+            .expect("sharded+tenant_scoped repo must implement __autumn_m2m_tenant_scope");
+        let section = &generated[pos..];
+        let guard_end = section
+            .find("cross-shard reactions are not supported")
+            .expect("sharded+tenant_scoped tenant scope must carry the cross-shard reject");
+        let guard_cond = &section[..guard_end];
+        assert!(
+            guard_cond.contains("across_tenants"),
+            "reaction guard must key off the across_tenants flag: {guard_cond}"
+        );
+        assert!(
+            !guard_cond.contains("__autumn_shards . is_some")
+                && !guard_cond.contains("__autumn_shards.is_some"),
+            "reaction guard condition must not depend on __autumn_shards being \
+             Some: {guard_cond}"
+        );
+
+        // A non-sharded tenant_scoped repo must NOT carry the reject — its
+        // across_tenants() mode legitimately reads/writes the single pool.
+        let unsharded = repository_macro(
+            quote! { Event, table = "events", tenant_scoped },
+            quote! {
+                pub trait EventRepository {}
+            },
+        )
+        .to_string();
+        assert!(
+            !unsharded.contains("cross-shard reactions are not supported"),
+            "non-sharded tenant_scoped repo must not reject across_tenants \
+             reactions"
         );
     }
 

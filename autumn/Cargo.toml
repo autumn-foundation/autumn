@@ -537,6 +537,20 @@ path = "tests/sqlite_field_conversions.rs"
 name = "sqlite_upsert_isolation"
 path = "tests/sqlite_upsert_isolation.rs"
 
+# `#[votable]` on the SQLite runtime backend (issue #1362). The Postgres
+# behaviour suite is Docker-gated and never compiles the `sqlite` arm of the
+# generated `react()`, so this is the only place that arm is type-checked at
+# all: it proves `react`/`reaction_of` monomorphize against `SqliteConnection`
+# in both aggregate modes, and runs the toggle/re-insert, flip, soft-delete
+# NotFound and count-mode behaviours against an in-memory SQLite pool (no
+# Docker). Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an
+# empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_votable`.
+[[test]]
+name = "sqlite_votable"
+path = "tests/sqlite_votable.rs"
+
 # SQLite version-history end-to-end proof (issue #1996). Drives a
 # `versioned = true` repository against an in-memory SQLite pool: a create +
 # update + delete each append a `_autumn_version_history` row, `version_history()`

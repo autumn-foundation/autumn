@@ -1,0 +1,5 @@
+error: `value_column = ...` has no meaning with `aggregate = count`: a count reaction's edge table stores no value column, its rows are pure membership — use `aggregate = sum` (signed values) or drop the key
+  --> tests/compile-fail/model_votable_value_column_in_count_mode.rs:15:41
+   |
+15 | #[votable(by = User, aggregate = count, value_column = value)]
+   |                                         ^^^^^^^^^^^^

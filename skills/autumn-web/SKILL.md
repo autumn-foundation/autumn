@@ -422,6 +422,63 @@ See `examples/reddit-clone` (`Post` ↔ `Tag` via `post_tags`) for a full
 worked example, and `docs/adr/0008-associations-and-eager-loading.md` for
 the design.
 
+**Never hand-roll a votes/likes table.** `#[votable(by = <Reactor>)]` on a
+`#[model]` declares a `(reactor, target)`-unique edge table plus a
+denormalised aggregate column on the target **(unreleased — trunk-dev,
+#1362)**:
+
+```rust
+#[autumn_web::model]
+#[votable(by = User, aggregate = sum)]   // or: aggregate = count, name = like
+                                         // — always BELOW #[model]
+pub struct Post {
+    #[id]
+    pub id: i64,             // must be i64
+    pub score: i64,          // the aggregate column, must be i64
+}
+```
+
+`aggregate = sum` (default) → edge `value SMALLINT`, target `score =
+SUM(value)`; `aggregate = count` → no value column, target `{name}_count =
+COUNT(*)`. Defaults: `name = vote`, `table = pluralize(name)`, `reactor_fk =
+{snake(by)}_id`, `target_fk = {snake(Model)}_id`, `value_column = value`,
+`column = score` / `{name}_count` — each overridable. At most one `#[votable]`
+per model. The edge table is the app's migration to write, and its composite
+`UNIQUE (reactor_fk, target_fk)` is **load-bearing** (it is the `ON CONFLICT`
+arbiter), as is a `CHECK` on the value column — `react()` does **not** validate
+`value`, so never bind it from a request. The aggregate column must be `BIGINT
+NOT NULL DEFAULT 0`; both FKs should be `BIGINT NOT NULL` (a nullable target FK
+is tolerated — the unique constraint then covers only the non-`NULL` rows,
+which are exactly the ones `react()` writes).
+
+The model emits a `{Model}Reactions` trait blanket-implemented for that
+model's repository — import it as `_`, no repository attribute needed:
+
+```rust
+use crate::models::PostReactions as _;
+
+let r = posts.react(user_id, post_id, 1).await?;  // count mode: no `value` arg
+r.value;      // Option<i16> — this reactor's reaction AFTER the call
+r.aggregate;  // i64 — the newly persisted score, exact as of commit
+r.outcome;    // ReactionOutcome::{Inserted, Flipped, Removed}
+let mine: Option<i16> = posts.reaction_of(user_id, post_id).await?;
+```
+
+`react()` is a race-safe toggle: same value again removes the edge, a
+different value flips it, a new one inserts it — and the aggregate is
+recomputed from ground truth and persisted in the **same transaction** under a
+`FOR NO KEY UPDATE` lock on the target row, so concurrent reactions converge to
+at most one edge per pair and a reader never sees edge/aggregate disagreement.
+A toggle is not idempotent — never blindly retry a timed-out call.
+Soft-deleted targets are `NotFound`. `reaction_of()` is a read and is
+replica-eligible (no read-your-writes pin — re-render from the `Reaction` the
+write returned). **Like the m2m helpers, `react()` takes its own pooled
+connection — never hold a `Db` extractor across the call, or the handler needs
+two connections at once and deadlocks at pool-size concurrency.** Pair it with
+the `reaction_controls` widget (see the widgets section), threading the CSRF
+token so the no-JS form POST works. See `docs/guide/votable.md` and `examples/reddit-clone`
+(`src/routes/votes.rs`).
+
 Deleting a parent can cascade to its children in one transaction — declare
 `dependent(...)` on the parent's `#[repository]` instead of hand-writing the
 child cleanup **(unreleased — trunk-dev)**:

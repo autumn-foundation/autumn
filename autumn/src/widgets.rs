@@ -18,6 +18,7 @@
 //! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
 //! | `tabs` | No-JS `tablist`/`tab`/`tabpanel` switcher with `:target` deep-linking |
 //! | `infinite_feed` | htmx infinite-scroll / "Load more" feed from a `CursorPage` |
+//! | `reaction_controls` | No-JS vote/like toggle buttons + live aggregate for `#[votable]` |
 //! | `locale_switcher` | Path-preserving language switcher for locale-prefixed routing (issue #1251) |
 //!
 //! # Feedback widgets
@@ -791,6 +792,420 @@ pub fn transition_controls(
                         }
                         input type="hidden" name=(field) value=(to);
                         button type="submit" disabled[!can(to)] { (format!("Mark as {to}")) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── reaction_controls ──────────────────────────────────────────────────────
+
+/// Configuration for a [`reaction_controls`] widget.
+///
+/// Build with [`ReactionControls::votes`] (signed up/down voting, the
+/// `#[votable(… aggregate = sum)]` shape) or [`ReactionControls::likes`] (a
+/// single membership toggle, the `aggregate = count` shape), then chain the
+/// builder methods for optional overrides.
+///
+/// The struct owns every string it renders (no lifetimes), so a handler can
+/// build it from borrowed request data and hand it straight to the widget.
+///
+/// # `dom_id` is trusted
+///
+/// `dom_id` is rendered as the container's `id` **and** interpolated into the
+/// default `hx-target` (`#{dom_id}`), where it is read as a CSS selector
+/// fragment. Pass a value you construct — `format!("votes-{post_id}")` from a
+/// typed id is the intended shape — never a raw request parameter or any other
+/// attacker-controlled string. Maud escapes the attribute value, so this is not
+/// an injection hole; it is a correctness one: a value containing whitespace,
+/// `#`, `.` or a quote yields a selector that matches nothing and an htmx swap
+/// that silently does not land.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::ReactionControls;
+///
+/// let config = ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+///     .aggregate(7)          // the target's persisted `score`
+///     .current(Some(1))      // `repo.reaction_of(user_id, post_id).await?`
+///     .label("Post score");
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionControls {
+    /// `id` of the grouping container, and the default `hx-target`.
+    dom_id: String,
+    /// Form action for the up (vote mode) or like (count mode) control.
+    up_action: String,
+    /// Form action for the down control. `None` selects like/count mode, in
+    /// which only the single `up_action` control is rendered.
+    down_action: Option<String>,
+    /// The target's persisted aggregate (`score` / `{name}_count`).
+    aggregate: i64,
+    /// The viewer's own current reaction, as returned by `reaction_of()`.
+    current: Option<i16>,
+    /// `aria-label` of the `role="group"` container.
+    label: String,
+    /// Accessible name of the up button.
+    up_label: String,
+    /// Accessible name of the down button.
+    down_label: String,
+    /// Accessible name of the like button (count mode).
+    like_label: String,
+    /// `hx-target` every form swaps; defaults to `#{dom_id}`.
+    hx_target: String,
+    /// CSRF token value; `None` renders no hidden input.
+    csrf_token: Option<String>,
+    /// CSRF hidden-input name; defaults to `_csrf`.
+    csrf_field: String,
+    /// Emit `hx-preserve="true"` on the buttons, for shared/broadcast
+    /// fragments that must not clobber a viewer's own pressed state.
+    preserve_pressed_state: bool,
+}
+
+#[cfg(feature = "maud")]
+impl ReactionControls {
+    /// Shared constructor: `down_action = None` selects like/count mode.
+    fn new(dom_id: String, up_action: String, down_action: Option<String>) -> Self {
+        let hx_target = format!("#{dom_id}");
+        Self {
+            dom_id,
+            up_action,
+            down_action,
+            aggregate: 0,
+            current: None,
+            label: "Reactions".to_owned(),
+            up_label: "Upvote".to_owned(),
+            down_label: "Downvote".to_owned(),
+            like_label: "Like".to_owned(),
+            hx_target,
+            csrf_token: None,
+            csrf_field: "_csrf".to_owned(),
+            preserve_pressed_state: false,
+        }
+    }
+
+    /// Signed up/down controls — the `#[votable(…, aggregate = sum)]` shape.
+    ///
+    /// `dom_id` names the container the control replaces on submit;
+    /// `up_action` / `down_action` are the `POST` routes for each direction
+    /// (typically the generated `__autumn_path_*` helpers).
+    #[must_use]
+    pub fn votes(
+        dom_id: impl Into<String>,
+        up_action: impl Into<String>,
+        down_action: impl Into<String>,
+    ) -> Self {
+        Self::new(dom_id.into(), up_action.into(), Some(down_action.into()))
+    }
+
+    /// A single toggle control — the `#[votable(…, aggregate = count)]` shape.
+    ///
+    /// One `POST` route serves both directions: the generated `react()` is a
+    /// toggle, so re-submitting removes the reaction.
+    #[must_use]
+    pub fn likes(dom_id: impl Into<String>, action: impl Into<String>) -> Self {
+        Self::new(dom_id.into(), action.into(), None)
+    }
+
+    /// Set the target's aggregate — its `score` (sum) or `{name}_count`
+    /// (count). Rendered verbatim, so a downvoted target shows a negative.
+    #[must_use]
+    pub const fn aggregate(mut self, n: i64) -> Self {
+        self.aggregate = n;
+        self
+    }
+
+    /// Set the viewer's own current reaction (`reaction_of()`'s result).
+    ///
+    /// The rendered domain is `{None, Some(1), Some(-1)}`: `Some(1)` presses
+    /// the up/like button, `Some(-1)` the down button, and `None` (the
+    /// default — what a feed or a signed-out viewer passes) presses neither.
+    /// Any other value presses nothing, and in like/count mode `Some(-1)`
+    /// presses nothing either, since that mode renders no down direction.
+    /// (`reaction_of()` only ever yields those three, so this matters just for
+    /// hand-built configs.)
+    #[must_use]
+    pub const fn current(mut self, v: Option<i16>) -> Self {
+        self.current = v;
+        self
+    }
+
+    /// Set the container's `aria-label`. Default: `"Reactions"`.
+    #[must_use]
+    pub fn label(mut self, s: impl Into<String>) -> Self {
+        self.label = s.into();
+        self
+    }
+
+    /// Set the up button's accessible name. Default: `"Upvote"`.
+    #[must_use]
+    pub fn up_label(mut self, s: impl Into<String>) -> Self {
+        self.up_label = s.into();
+        self
+    }
+
+    /// Set the down button's accessible name. Default: `"Downvote"`.
+    #[must_use]
+    pub fn down_label(mut self, s: impl Into<String>) -> Self {
+        self.down_label = s.into();
+        self
+    }
+
+    /// Set the like button's accessible name. Default: `"Like"`.
+    #[must_use]
+    pub fn like_label(mut self, s: impl Into<String>) -> Self {
+        self.like_label = s.into();
+        self
+    }
+
+    /// Set the `hx-target` each form swaps. Default: `#{dom_id}` — the control
+    /// replaces itself in place. The value is a CSS selector, so it is subject
+    /// to the same "must not be attacker-controlled" rule as `dom_id`.
+    #[must_use]
+    pub fn hx_target(mut self, s: impl Into<String>) -> Self {
+        self.hx_target = s.into();
+        self
+    }
+
+    /// Set the CSRF token value rendered as a hidden input in every form.
+    ///
+    /// This is the primitive; [`ReactionControls::csrf`] is the sugar that
+    /// takes the handler's extractors. Without a token no hidden input is
+    /// rendered at all.
+    #[must_use]
+    pub fn csrf_token(mut self, token: impl Into<String>) -> Self {
+        self.csrf_token = Some(token.into());
+        self
+    }
+
+    /// Set the CSRF hidden input's `name`. Default: `"_csrf"`.
+    #[must_use]
+    pub fn csrf_field(mut self, field: impl Into<String>) -> Self {
+        self.csrf_field = field.into();
+        self
+    }
+
+    /// Emit `hx-preserve="true"` on the buttons, so an htmx swap that replaces
+    /// this control keeps the *live* button elements — and with them the
+    /// viewer's own `aria-pressed` / `.autumn-reaction-active` state.
+    ///
+    /// For **shared/broadcast fragments only** (an SSE fan-out re-rendering a
+    /// card for every subscriber, where `current` is necessarily `None`): the
+    /// swap then updates the aggregate and the rest of the card without
+    /// un-pressing the viewer's buttons. Each button carries a stable id
+    /// derived from `dom_id` (`{dom_id}-up` / `-down` / `-like`), which is
+    /// what `hx-preserve` matches on.
+    ///
+    /// Never set this on a control returned from the vote route itself — the
+    /// direct response *wants* to repaint the pressed state it just computed,
+    /// and `hx-preserve` would resurrect the stale buttons instead.
+    #[must_use]
+    pub const fn preserve_pressed_state(mut self, preserve: bool) -> Self {
+        self.preserve_pressed_state = preserve;
+        self
+    }
+
+    /// Thread the handler's `Option<&CsrfToken>` / `Option<&CsrfFormField>`
+    /// through unchanged — sugar over [`ReactionControls::csrf_token`] and
+    /// [`ReactionControls::csrf_field`].
+    ///
+    /// Both values are copied out, so the config keeps no borrow. A `None`
+    /// token renders no hidden input; a `None` field keeps the `"_csrf"`
+    /// default. Mirrors `transition_controls`' CSRF parameters.
+    #[must_use]
+    pub fn csrf(
+        mut self,
+        token: Option<&crate::security::CsrfToken>,
+        field: Option<&crate::security::CsrfFormField>,
+    ) -> Self {
+        if let Some(tok) = token {
+            self = self.csrf_token(tok.token());
+        }
+        if let Some(name) = field {
+            self = self.csrf_field(name.0.as_str());
+        }
+        self
+    }
+}
+
+/// Render a no-JS reaction control: one `POST` form per direction (CSRF-
+/// protected when a token is threaded) plus the target's live aggregate,
+/// upgraded in place by htmx.
+///
+/// This is the view half of the `#[votable]` association (issue #1362). The
+/// generated `repo.react(reactor_id, target_id, value)` returns a `Reaction`
+/// carrying everything the widget needs, so a route re-renders with no extra
+/// query:
+///
+/// ```rust,ignore
+/// let reaction = posts.react(user_id, post_id, 1).await?;
+/// Ok(reaction_controls(
+///     &ReactionControls::votes(
+///         format!("votes-{post_id}"),
+///         format!("/posts/{post_id}/upvote"),
+///         format!("/posts/{post_id}/downvote"),
+///     )
+///     .aggregate(reaction.aggregate)
+///     .current(reaction.value),
+/// ))
+/// ```
+///
+/// # Behavior
+///
+/// - The container is a `<div role="group">` carrying the config's `dom_id`
+///   and `aria-label`, so assistive tech announces the buttons as one control.
+/// - [`ReactionControls::votes`] renders an up form, the aggregate, and a down
+///   form; [`ReactionControls::likes`] renders a single like form and the
+///   aggregate.
+/// - Each direction is an independent `<form method="post" action=(action)>`
+///   carrying a single `<button type="submit">` (plus the hidden CSRF input
+///   when a token is threaded), so the control still submits with JavaScript
+///   disabled. The same form also carries `hx-post` / `hx-target` /
+///   `hx-swap="outerHTML"` and a shared `hx-sync="#{dom_id}:replace"` (a
+///   second click aborts the in-flight request, so an older response can
+///   never repaint over a newer click), so with htmx loaded the submit is
+///   intercepted and
+///   the response replaces the control in place.
+/// - **The widget emits `<form>` elements.** HTML forbids nesting a form
+///   inside another form, so never render this widget inside one — the browser
+///   drops the inner form and the buttons submit the outer one instead. Place
+///   it as a sibling.
+/// - Each button is an ARIA toggle: `aria-pressed="true"` exactly on the
+///   direction matching `current` (`Some(1)` → up/like, `Some(-1)` → down),
+///   which also gets the `autumn-reaction-active` class. `current(None)` —
+///   and, in like/count mode, `current(Some(-1))`, which has no direction to
+///   match — presses neither.
+/// - The glyph (`▲` / `▼` / `♥`) lives in a `<span aria-hidden="true">`, so
+///   the button's accessible name comes from its explicit `aria-label` — a
+///   screen reader never announces a nameless icon button.
+/// - The aggregate is rendered verbatim (negatives are not clamped) inside an
+///   `aria-live="polite"` span, so an htmx swap announces the new total.
+/// - No JavaScript, no inline styles: plain HTML forms and buttons only.
+///
+/// # CSRF — required for the no-JS path
+///
+/// Call [`ReactionControls::csrf`] with the handler's `Option<&CsrfToken>` and
+/// `Option<&CsrfFormField>` (or the [`ReactionControls::csrf_token`] /
+/// [`ReactionControls::csrf_field`] string primitives). When a token is set,
+/// every form gets a hidden `<input type="hidden">` named after the field
+/// (defaulting to `"_csrf"`), exactly like scaffolded forms. With no token,
+/// no hidden input is rendered.
+///
+/// **This is what makes the JavaScript-off fallback actually work.** With CSRF
+/// protection enabled and no token threaded, the htmx path still succeeds —
+/// the framework's `autumn-htmx-csrf.js` shim adds the token as a request
+/// header — but the plain form POST carries no token and is rejected with
+/// `403`. A control rendered without `.csrf(...)` is therefore htmx-only in a
+/// CSRF-protected app. Thread the token on every page a no-JS visitor can
+/// reach; the one place it is legitimately omitted is a fragment that only
+/// reaches JS-enabled clients (an SSE/live payload).
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-reaction-controls` | Grouping `<div role="group">` |
+/// | `.autumn-reaction` | Each per-direction `<form>` |
+/// | `.autumn-reaction-up` | The upvote `<form>` |
+/// | `.autumn-reaction-down` | The downvote `<form>` |
+/// | `.autumn-reaction-like` | The like `<form>` (count mode) |
+/// | `.autumn-reaction-button` | Each submit `<button>` |
+/// | `.autumn-reaction-active` | The button matching the viewer's reaction |
+/// | `.autumn-reaction-count` | The `aria-live` aggregate `<span>` |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{ReactionControls, reaction_controls};
+///
+/// let markup = reaction_controls(
+///     &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+///         .aggregate(7)
+///         .current(Some(1))
+///         .label("Post score"),
+/// );
+/// let html = markup.into_string();
+/// assert!(html.contains(r#"id="votes-42""#));
+/// assert!(html.contains(r#"class="autumn-reaction-controls""#));
+/// assert!(html.contains(r##"hx-target="#votes-42""##));
+/// assert!(html.contains(r#"aria-label="Upvote""#));
+/// assert!(html.contains(r#"aria-pressed="true""#));  // the up button is the current reaction
+/// assert!(html.contains(r#"aria-pressed="false""#)); // the down button is not
+/// assert!(html.contains(">7<"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn reaction_controls(cfg: &ReactionControls) -> maud::Markup {
+    // Every class is a plain string literal (never `format!`), so the
+    // widget-CSS coverage gate can extract it and prove `widgets.css` backs it.
+    let up_pressed = cfg.current == Some(1);
+    let down_pressed = cfg.current == Some(-1);
+    let like_mode = cfg.down_action.is_none();
+
+    let (primary_form_class, primary_glyph, primary_label) = if like_mode {
+        ("autumn-reaction autumn-reaction-like", "♥", &cfg.like_label)
+    } else {
+        ("autumn-reaction autumn-reaction-up", "▲", &cfg.up_label)
+    };
+    let primary_button_class = if up_pressed {
+        "autumn-reaction-button autumn-reaction-active"
+    } else {
+        "autumn-reaction-button"
+    };
+    let down_button_class = if down_pressed {
+        "autumn-reaction-button autumn-reaction-active"
+    } else {
+        "autumn-reaction-button"
+    };
+    let primary_pressed = if up_pressed { "true" } else { "false" };
+    let down_pressed_attr = if down_pressed { "true" } else { "false" };
+    // Stable per-direction button ids: what `hx-preserve` matches on when a
+    // shared/broadcast fragment must not clobber the viewer's pressed state.
+    let primary_button_id = if like_mode {
+        format!("{}-like", cfg.dom_id)
+    } else {
+        format!("{}-up", cfg.dom_id)
+    };
+    let down_button_id = format!("{}-down", cfg.dom_id);
+    let preserve = cfg.preserve_pressed_state.then_some("true");
+    // Both forms share one sync scope with the `replace` strategy: a second
+    // click (up then down before the first response lands) aborts the
+    // in-flight request, so only the LAST click's response repaints the
+    // control. Without this the two independent forms race and the older
+    // response can land second, leaving the stale direction pressed even
+    // though the database holds the newer vote — the commits themselves are
+    // already serialized by the target-row lock; this orders the *responses*.
+    let hx_sync = format!("#{}:replace", cfg.dom_id);
+
+    maud::html! {
+        div id=(cfg.dom_id) class="autumn-reaction-controls" role="group" aria-label=(cfg.label) {
+            form method="post" action=(cfg.up_action) class=(primary_form_class)
+                hx-post=(cfg.up_action) hx-target=(cfg.hx_target) hx-swap="outerHTML"
+                hx-sync=(hx_sync) {
+                @if let Some(token) = &cfg.csrf_token {
+                    input type="hidden" name=(cfg.csrf_field) value=(token);
+                }
+                button type="submit" id=(primary_button_id) class=(primary_button_class)
+                    aria-pressed=(primary_pressed) aria-label=(primary_label)
+                    hx-preserve=[preserve] {
+                    span aria-hidden="true" { (primary_glyph) }
+                }
+            }
+            span class="autumn-reaction-count" aria-live="polite" { (cfg.aggregate) }
+            @if let Some(down_action) = &cfg.down_action {
+                form method="post" action=(down_action) class="autumn-reaction autumn-reaction-down"
+                    hx-post=(down_action) hx-target=(cfg.hx_target) hx-swap="outerHTML"
+                    hx-sync=(hx_sync) {
+                    @if let Some(token) = &cfg.csrf_token {
+                        input type="hidden" name=(cfg.csrf_field) value=(token);
+                    }
+                    button type="submit" id=(down_button_id) class=(down_button_class)
+                        aria-pressed=(down_pressed_attr) aria-label=(cfg.down_label)
+                        hx-preserve=[preserve] {
+                        span aria-hidden="true" { "▼" }
                     }
                 }
             }
@@ -4836,6 +5251,55 @@ mod tests {
             |_to| true,
             Some(&token),
             Some(&field),
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"<input type="hidden" name="csrf_custom" value="secret-token">"#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    // ── reaction_controls CSRF sugar ───────────────────────────────────
+
+    /// The `.csrf(Option<&CsrfToken>, Option<&CsrfFormField>)` sugar is the
+    /// path every real handler uses (a `CsrfToken` cannot be constructed
+    /// outside this crate, so the integration tests can only exercise the
+    /// `.csrf_token(&str)` primitive). reddit-clone's `vote_controls` calls it
+    /// with the page's extractor, which is what puts the hidden input in the
+    /// post-detail markup and makes the no-JS form POST pass CSRF.
+    #[test]
+    fn reaction_controls_csrf_sugar_renders_the_hidden_input_in_every_form() {
+        let token = crate::security::CsrfToken::new("secret-token".to_string());
+        let html = reaction_controls(
+            &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+                .aggregate(7)
+                .csrf(Some(&token), None),
+        )
+        .into_string();
+        assert_eq!(
+            html.matches(r#"<input type="hidden" name="_csrf" value="secret-token">"#)
+                .count(),
+            2,
+            "{html}"
+        );
+
+        // `None` is the SSE-fragment case: htmx-only, no hidden input.
+        let anonymous = reaction_controls(
+            &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+                .aggregate(7)
+                .csrf(None, None),
+        )
+        .into_string();
+        assert!(!anonymous.contains("_csrf"), "{anonymous}");
+    }
+
+    #[test]
+    fn reaction_controls_csrf_sugar_honors_a_custom_field_name() {
+        let token = crate::security::CsrfToken::new("secret-token".to_string());
+        let field = crate::security::CsrfFormField("csrf_custom".to_string());
+        let html = reaction_controls(
+            &ReactionControls::likes("likes-42", "/posts/42/like").csrf(Some(&token), Some(&field)),
         )
         .into_string();
         assert!(

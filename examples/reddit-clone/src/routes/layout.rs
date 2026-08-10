@@ -2,6 +2,7 @@
 
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::http;
+use autumn_web::widgets::{ReactionControls, reaction_controls};
 use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_SSE_JS_PATH, Markup, PreEscaped, html};
 
 /// Redirect that works for both regular and htmx requests.
@@ -167,28 +168,68 @@ pub fn layout(
     }
 }
 
-/// Score display with upvote/downvote buttons (htmx-powered).
-pub fn vote_controls(post_id: i64, score: i64) -> Markup {
-    html! {
-        div id=(format!("votes-{post_id}"))
-            class="flex flex-col items-center gap-0.5 text-sm select-none" {
-            button
-                hx-post=(super::votes::__autumn_path_upvote(post_id))
-                hx-target=(format!("#votes-{post_id}"))
-                hx-swap="outerHTML"
-                class="text-gray-400 hover:text-orange-500 cursor-pointer text-lg leading-none" {
-                "\u{25B2}"
-            }
-            span class="font-semibold text-gray-700" { (score) }
-            button
-                hx-post=(super::votes::__autumn_path_downvote(post_id))
-                hx-target=(format!("#votes-{post_id}"))
-                hx-swap="outerHTML"
-                class="text-gray-400 hover:text-blue-500 cursor-pointer text-lg leading-none" {
-                "\u{25BC}"
-            }
-        }
-    }
+/// Score display with upvote/downvote buttons.
+///
+/// A thin delegation to the framework's `reaction_controls` widget (#1362) —
+/// the view half of `Post`'s `#[votable]` association. The widget renders one
+/// no-JS `POST` form per direction (upgraded in place by htmx), ARIA toggle
+/// buttons with real accessible names, and the `#votes-{id}` outerHTML
+/// self-replacement contract this example's routes already rely on.
+///
+/// `current` is the viewer's own vote from `posts.reaction_of(user, post)`:
+/// `Some(1)` / `Some(-1)` press the matching button, `None` presses neither.
+/// Feeds and live fragments pass `None` deliberately — highlighting every row
+/// would cost one query per post (a batch accessor is the tracked follow-up).
+///
+/// `csrf` is the handler's own `CsrfToken` extractor. CSRF protection is
+/// **enabled** in this app (`autumn.toml`), so it is load-bearing for the no-JS
+/// path: the hidden `_csrf` input is what lets a plain form POST through when
+/// JavaScript is off. The htmx path would survive without it — the framework's
+/// `autumn-htmx-csrf.js` shim sends the token as a header — so a missing token
+/// fails only for the visitors least able to work around it. `None` is
+/// therefore correct in exactly one place: fragments broadcast over SSE, which
+/// by construction only reach clients that are running htmx.
+pub fn vote_controls(
+    post_id: i64,
+    score: i64,
+    current: Option<i16>,
+    csrf: Option<&autumn_web::security::CsrfToken>,
+) -> Markup {
+    reaction_controls(
+        &ReactionControls::votes(
+            format!("votes-{post_id}"),
+            super::votes::__autumn_path_upvote(post_id),
+            super::votes::__autumn_path_downvote(post_id),
+        )
+        .aggregate(score)
+        .current(current)
+        // The form-field name stays the default `_csrf`, which is what the
+        // app's CSRF layer expects.
+        .csrf(csrf, None)
+        .label("Post score"),
+    )
+}
+
+/// The vote control as rendered inside a fragment **broadcast to every
+/// subscriber** (the SSE post-card fan-out).
+///
+/// Same shape as [`vote_controls`] with `current = None` / no CSRF (see the
+/// rationale there), plus `preserve_pressed_state`: the broadcast card swap
+/// arrives on viewers who may have a vote pressed — including the voter
+/// themself, racing their own targeted response — and `hx-preserve` on the
+/// buttons keeps each viewer's live pressed state while the swap still
+/// refreshes the aggregate and the rest of the card.
+pub fn broadcast_vote_controls(post_id: i64, score: i64) -> Markup {
+    reaction_controls(
+        &ReactionControls::votes(
+            format!("votes-{post_id}"),
+            super::votes::__autumn_path_upvote(post_id),
+            super::votes::__autumn_path_downvote(post_id),
+        )
+        .aggregate(score)
+        .preserve_pressed_state(true)
+        .label("Post score"),
+    )
 }
 
 /// Timestamp display helper.
