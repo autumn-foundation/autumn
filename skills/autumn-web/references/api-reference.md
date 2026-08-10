@@ -480,6 +480,29 @@ Per-primitive setters (in addition to the shared set):
   `.autumn-reaction-up` / `.autumn-reaction-down` / `.autumn-reaction-like` /
   `.autumn-reaction-button` / `.autumn-reaction-active` /
   `.autumn-reaction-count`. Prelude re-exported.
+- `autumn_web::widgets::{BulkActionsConfig, bulk_actions_form,
+  bulk_select_checkbox, bulk_actions_toolbar}` (#1312) — the no-JavaScript
+  bulk-select + delete-selected flow. `BulkActionsConfig::new(action_url)`
+  then `.field_name(s)` (default `"ids"`), `.submit_label(s)` (default
+  `"Delete selected"`), `.select_label(s)` (the `aria-label` prefix, default
+  `"Select row"`), `.confirm(s)` (opt-in `confirm(...)` prompt; omitted by
+  default so the control works with scripting disabled). Render with
+  `bulk_actions_form(&cfg, csrf_token, csrf_field, content) -> Markup` — a
+  plain `<form method="post" action=..>` holding the hidden CSRF input, your
+  `content`, then the `bulk_actions_toolbar` submit button — and put one
+  `bulk_select_checkbox(row.id, &cfg)` in each row's first cell (typically
+  `columns.insert(0, Column::new("", ..))` ahead of a `data_table`). Checked
+  rows submit as repeated `ids=<id>` pairs; the server reads them with any
+  repeated-key form parser. Keep non-selection page furniture (a "New …"
+  link, a search box) outside the form — anything inside is submitted with
+  the selection. The `confirm` prompt is escaped for the JavaScript string
+  literal it lands in (an `onclick` attribute is HTML-decoded before the JS
+  parser sees it, so Maud's escaping alone is not enough), making an
+  apostrophe safe and blocking script injection from untrusted prompt text.
+  CSS hooks `.autumn-bulk-form` / `.autumn-bulk-actions` /
+  `.autumn-bulk-select`. `autumn generate scaffold` emits the whole wiring —
+  checkbox column, form, `POST /{plural}/bulk_delete` handler — for standard
+  HTML scaffolds.
 - `autumn_web::widgets` display atoms: `badge(label, BadgeVariant)` /
   `badge_with(..., &BadgeConfig)` / `status_tag(label)` with
   `BadgeVariant::{Neutral,Info,Success,Warning,Danger}` and
