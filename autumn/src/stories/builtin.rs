@@ -481,5 +481,56 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 }
             }
         },
+        story! {
+            "Display",
+            "Bulk actions",
+            {
+                use autumn_web::widgets::{
+                    BulkActionsConfig, Column, DataTableConfig, bulk_actions_form,
+                    bulk_actions_toolbar, bulk_select_checkbox, data_table,
+                };
+
+                struct Post {
+                    id: i64,
+                    title: &'static str,
+                }
+                let rows = vec![
+                    Post { id: 1, title: "First post" },
+                    Post { id: 2, title: "Second post" },
+                ];
+
+                // `action` is the bulk endpoint -- `paths::bulk_delete()` in a
+                // scaffolded app. `confirm(...)` is opt-in; leave it off and the
+                // control still works with scripting disabled.
+                let config = BulkActionsConfig::new("/posts/bulk_delete")
+                    .confirm("Delete the selected posts?");
+
+                // The checkbox goes in the row's first cell, so every row can be
+                // selected. Each one submits as a repeated `ids=<id>` pair.
+                let columns: Vec<Column<Post>> = vec![
+                    Column::new("", |row: &Post| {
+                        maud::html! { (bulk_select_checkbox(row.id, &config)) }
+                    }),
+                    Column::new("Title", |row: &Post| maud::html! { (row.title) }),
+                ];
+
+                maud::html! {
+                    // Page furniture stays OUTSIDE the form -- anything inside is
+                    // submitted along with the selection.
+                    a href="/posts/new" { "New Post" }
+                    (bulk_actions_form(
+                        &config,
+                        Some("demo-csrf-token"),
+                        None,
+                        maud::html! {
+                            (data_table(&rows, &columns, &DataTableConfig::new("No posts yet.")))
+                        },
+                    ))
+                    // Call the toolbar directly only when hand-building the
+                    // surrounding <form>; `bulk_actions_form` already appends it.
+                    (bulk_actions_toolbar(&config))
+                }
+            }
+        },
     ]
 }

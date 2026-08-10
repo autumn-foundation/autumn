@@ -1552,6 +1552,60 @@
     outline-offset: 2px;
 }
 
+/* ── Bulk actions (autumn-bulk-*, issue #1312) ────────────────────────────── */
+
+/* The wrapping `<form method="post">` around a list and its toolbar. It carries
+   no geometry of its own: it must not disturb the layout of whatever list it
+   wraps (a `data_table`, a `<ul>`, a card grid), so it stays a plain block and
+   only strips the default form margin. */
+.autumn-bulk-form {
+    margin: 0;
+}
+
+/* The `role="group"` holding the submit button, below the list it applies to.
+   Aligned to the start so it reads as an action on the selection above rather
+   than as page-level navigation. */
+.autumn-bulk-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    margin-top: 0.75rem;
+}
+
+.autumn-bulk-actions button {
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+}
+
+.autumn-bulk-actions button:hover {
+    border-color: var(--primary);
+}
+
+.autumn-bulk-actions button:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+/* One per row, in the list's leading cell. Sized up slightly from the browser
+   default: this is the primary hit target for the whole flow, and a row is
+   selected by hitting a single small checkbox. */
+.autumn-bulk-select {
+    width: 1rem;
+    height: 1rem;
+    cursor: pointer;
+    vertical-align: middle;
+}
+
+.autumn-bulk-select:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
 /* Visually hidden but still exposed to assistive technology — the standard
    clip pattern (never `display:none`, which removes it from the a11y tree). */
 .autumn-visually-hidden {
