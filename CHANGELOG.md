@@ -155,7 +155,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   htmx-swapped results container) is wrapped in a `bulk_actions_form` posting
   to a new `#[secured] POST /{plural}/bulk_delete` handler, and `src/main.rs`
   mounts that route immediately after `destroy`. The handler parses the
-  repeated checkboxes with a generated `parse_bulk_ids` helper, per-row
+  repeated checkboxes with a generated `parse_bulk_ids` helper (deduping through
+  a `HashSet`, so a crafted body carrying many distinct `ids` parses in linear
+  rather than quadratic time), per-row
   authorizes with the same `"delete"` action `destroy` uses when policy wiring
   is on (an unauthorized row is dropped from the batch, not 403'd, so the
   endpoint is no existence oracle), routes the delete through

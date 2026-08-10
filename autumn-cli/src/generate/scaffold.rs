@@ -3583,12 +3583,20 @@ mod attachment_read_back_tests {
          /// that isn't an integer is dropped rather than rejected — a list-write\n\
          /// endpoint never 400s on a hand-edited form — and repeats are collapsed\n\
          /// so the same row is never queued for deletion twice.\n\
+         ///\n\
+         /// Dedup goes through a `HashSet` rather than a linear `Vec::contains`\n\
+         /// scan: this parses the raw body, not a page-sized selection, so a\n\
+         /// hand-crafted POST can carry as many distinct `ids` as the request body\n\
+         /// limit allows. A linear scan per value would make that Θ(n²) — a cheap\n\
+         /// request burning real CPU before the handler ever reaches the database.\n\
+         /// The `Vec` still carries insertion order; the set only answers \"seen?\".\n\
          fn parse_bulk_ids(body: &Bytes) -> Vec<i64> {\n    \
          let mut ids: Vec<i64> = Vec::new();\n    \
+         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();\n    \
          for (key, value) in url::form_urlencoded::parse(body.as_ref()) {\n        \
          if key == \"ids\" || key == \"ids[]\" {\n            \
          if let Ok(id) = value.parse::<i64>() {\n                \
-         if !ids.contains(&id) {\n                    \
+         if seen.insert(id) {\n                    \
          ids.push(id);\n                \
          }\n            \
          }\n        \
@@ -15516,8 +15524,29 @@ exempt_paths = [
         assert!(parser.contains("\"ids\""), "{parser}");
         assert!(parser.contains("\"ids[]\""), "{parser}");
         assert!(
-            parser.contains(".contains(&"),
+            parser.contains("seen.insert("),
             "the parser must dedupe selected ids: {parser}"
+        );
+    }
+
+    /// The parser reads the raw body, not a page-sized selection, so a crafted
+    /// POST can carry as many distinct ids as the body limit allows. Dedup must
+    /// stay O(1) per value — a `Vec::contains` scan would make it Θ(n²) and let
+    /// a small request burn real CPU before the handler reaches the database.
+    #[test]
+    fn bulk_ids_parser_dedupes_in_linear_time() {
+        let routes = bulk_routes_default();
+        let Some((_, rest)) = routes.split_once("fn parse_bulk_ids(") else {
+            panic!("routes must emit a parse_bulk_ids helper:\n{routes}");
+        };
+        let parser = rest.split("\npub ").next().unwrap_or(rest);
+        assert!(
+            parser.contains("HashSet"),
+            "dedup must go through a hash set, not a linear scan: {parser}"
+        );
+        assert!(
+            !parser.contains("ids.contains(&"),
+            "a per-value Vec::contains scan makes parsing quadratic: {parser}"
         );
     }
 
