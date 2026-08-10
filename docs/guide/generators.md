@@ -724,10 +724,10 @@ bulk-delete flow (issue #1312):
 - The list (and, with `--searchable`, the whole
   `#<plural>-search-results` container htmx swaps) is wrapped in
   `autumn_web::widgets::bulk_actions_form(...)`: a plain
-  `POST /<plural>/bulk_delete` form carrying the CSRF hidden field and a
-  **Delete selected** submit button. The "New …" link and the search box
-  stay outside the form — they are page furniture, not part of the
-  selection.
+  `POST /<plural>/bulk_delete` form carrying the CSRF hidden field, the
+  one-time submit-token hidden field, and a **Delete selected** submit
+  button. The "New …" link and the search box stay outside the form —
+  they are page furniture, not part of the selection.
 - A `#[secured] #[post("/<plural>/bulk_delete")]` handler is emitted and
   mounted in `src/main.rs` right after `destroy`.
 
@@ -743,6 +743,7 @@ Contract of the generated handler:
 | Record policy wiring on (an owner column, the default) | Each selected row is authorized with the same `"delete"` action `destroy` uses. A row the actor may not delete is dropped from the batch rather than 403'ing the request, so the endpoint is not an existence oracle. |
 | `dependent(restrict)` child rows | `delete_many` probes first and aborts the **whole** batch with a 409, rolling back — no partial delete. |
 | Connection use | The handler `drop`s its `Db` extractor after the pre-flight `SELECT` and before `delete_many`, which checks out a connection of its own. It therefore holds **one** pooled connection at a time, which cannot stall on `database.pool.max_size = 1` or deadlock at any concurrency. |
+| Double-click / Back→resubmit | The form carries a one-time `_submit_token` (issue #1360), so `SubmitTokenLayer` consumes it once and replays the first response instead of re-running the batch — hooks and dependent deletes included. The field leads the form body, ahead of the checkboxes, because the layer only scans the body's first chunk and a long selection would otherwise push it past the scan cap. |
 
 Not emitted for `--live`, `--live-validation`, or `--sharded` (their list
 DOM is owned by an SSE/htmx swap contract, or has no cross-shard
@@ -764,19 +765,33 @@ html! {
         &cfg,
         csrf.as_ref().map(|t| t.token()),
         csrf_field.as_ref().map(|f| f.0.as_str()),
+        submit_token.as_ref().map(|t| t.token()),
+        submit_field.as_ref().map(|f| f.0.as_str()),
         html! { (my_list(&rows, &cfg)) },
     ))
 }
 ```
 
+Pass the submit-token pair on any destructive bulk form. A request that
+carries no `_submit_token` passes through `SubmitTokenLayer` unguarded,
+so omitting it silently gives up double-submit protection on exactly the
+endpoint that most needs it.
+
 `confirm(...)` is off by default, so the control works with scripting
-disabled. When you do opt in, the message is escaped for the JavaScript
-string literal it lands in (`\`, `'`, and line terminators) before Maud
-escapes it for the attribute — the browser HTML-decodes an `onclick`
-attribute *before* the JavaScript parser sees it, so HTML escaping alone
-would let an apostrophe close the literal. A prompt built from user text
-therefore cannot break out into script; the server stays the enforcement
-point regardless.
+disabled. When you do opt in, the message rides as a
+`data-autumn-confirm` attribute wired up by the framework's same-origin
+`/static/js/autumn-widgets.js` runtime — **not** an inline `onclick`.
+Autumn's default CSP is `script-src 'self'` with no `'unsafe-inline'`,
+which blocks inline handlers outright, so an `onclick` prompt would never
+fire and the destructive form would submit unconfirmed. As a plain
+attribute value the message needs only Maud's HTML escaping, so a prompt
+built from user text cannot break out into markup or script; the server
+stays the enforcement point regardless. Include the widgets runtime in
+your layout for the prompt to appear:
+
+```html
+<script src="/static/js/autumn-widgets.js" defer></script>
+```
 
 Metadata flags let you keep common model and repository polish in the
 generation step:

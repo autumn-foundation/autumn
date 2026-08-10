@@ -3813,18 +3813,25 @@ mod attachment_read_back_tests {
     } else {
         index_columns_labeled
     };
-    // Issue #1312: the CSRF pair the index/search handlers thread into
-    // `bulk_actions_form`'s hidden field. Injected after `flash: Flash,` in the
-    // signatures that render the bulk form; empty (so byte-identical) otherwise.
+    // Issue #1312: the CSRF pair and the one-time submit-token pair (#1360) the
+    // index/search handlers thread into `bulk_actions_form`'s hidden fields.
+    // Injected after `flash: Flash,` in the signatures that render the bulk
+    // form; empty (so byte-identical) otherwise. The submit token matters here
+    // for the same reason it does on create/update: `SubmitTokenLayer` waves a
+    // tokenless request straight through, so without it a double-clicked
+    // "Delete selected" runs the whole destructive path — hooks and dependent
+    // deletes included — twice instead of replaying the first response.
     let bulk_csrf_params = if bulk_delete_enabled {
-        "\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,"
+        "\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    \
+         submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,"
     } else {
         ""
     };
     // The `Option<&str>` conversions `bulk_actions_form` takes for its hidden
-    // CSRF input, matching the `csrf_input` helper's field-name default.
-    let bulk_csrf_args =
-        "csrf.as_ref().map(|t| t.token()), csrf_field.as_ref().map(|f| f.0.as_str())";
+    // CSRF and submit-token inputs, matching the `csrf_input` /
+    // `submit_token_input` helpers' field-name defaults.
+    let bulk_csrf_args = "csrf.as_ref().map(|t| t.token()), csrf_field.as_ref().map(|f| f.0.as_str()), \
+         submit_token.as_ref().map(|t| t.token()), submit_field.as_ref().map(|f| f.0.as_str())";
     // #1126: the data_table config is wired symmetrically with what the server
     // applies — `.query(..)` preserves the current filters on sort links,
     // `.active_sort`/`.active_dir` mark the column the repository ordered by, and

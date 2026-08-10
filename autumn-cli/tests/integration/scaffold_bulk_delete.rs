@@ -106,6 +106,50 @@ fn plain_scaffold_emits_bulk_form_checkbox_and_handler() {
     );
 }
 
+/// `SubmitTokenLayer` passes a request carrying no token straight through, so
+/// a bulk form without the hidden field gives up double-submit protection
+/// entirely: a double-clicked "Delete selected" would run the whole destructive
+/// path — hooks and dependent deletes included — a second time instead of
+/// replaying the first response, as generated create/update forms do.
+#[test]
+fn bulk_form_carries_a_one_time_submit_token() {
+    // The plain scaffold has only `index`; the searchable one also renders the
+    // bulk form from its `search` fragment, so both must carry the token.
+    let (_plain_tmp, plain) = scaffold_routes("bulk-submit-token", &[]);
+    let (_search_tmp, searchable) =
+        scaffold_routes("bulk-submit-token-search", &["--searchable", "title,body"]);
+    for (routes, handler) in [(&plain, "index"), (&searchable, "search")] {
+        let slice = handler_slice(routes, handler);
+        assert!(
+            slice.contains("submit_token: Option<SubmitToken>")
+                && slice.contains("submit_field: Option<SubmitFormField>"),
+            "`{handler}` must extract the submit-token pair:\n{slice}"
+        );
+        assert!(
+            slice.contains("submit_token.as_ref().map(|t| t.token())")
+                && slice.contains("submit_field.as_ref().map(|f| f.0.as_str())"),
+            "`{handler}` must thread the submit token into the bulk form:\n{slice}"
+        );
+    }
+}
+
+/// Non-bulk variants keep their byte-identical signatures — the submit-token
+/// pair rides in only alongside the bulk form.
+#[test]
+fn scaffolds_without_bulk_delete_keep_plain_index_signatures() {
+    for (name, flags) in [
+        ("bulk-none-live", &["--live"][..]),
+        ("bulk-none-sharded", &["--sharded"][..]),
+    ] {
+        let (_tmp, routes) = scaffold_routes(name, flags);
+        let index = handler_slice(&routes, "index");
+        assert!(
+            !index.contains("submit_token: Option<SubmitToken>"),
+            "`{name}` has no bulk form, so `index` must not take a submit token:\n{index}"
+        );
+    }
+}
+
 #[test]
 fn soft_delete_scaffold_routes_bulk_through_delete_many() {
     let (_tmp, routes) = scaffold_routes("bulk-soft", &["--soft-delete"]);

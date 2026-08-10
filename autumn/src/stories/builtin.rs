@@ -522,6 +522,8 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                         &config,
                         Some("demo-csrf-token"),
                         None,
+                        Some("demo-submit-token"),
+                        None,
                         maud::html! {
                             (data_table(&rows, &columns, &DataTableConfig::new("No posts yet.")))
                         },

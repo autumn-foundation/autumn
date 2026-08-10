@@ -175,10 +175,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   widgets back it for hand-written views: `autumn_web::widgets::{
   bulk_select_checkbox, bulk_actions_toolbar, bulk_actions_form}` plus a
   `BulkActionsConfig` builder (opt-in `confirm(...)` prompt; off by default so
-  the control keeps working with scripting disabled, and escaped for the
-  JavaScript string literal it lands in — the browser HTML-decodes an `onclick`
-  attribute before the JavaScript parser reads it, so Maud's attribute escaping
-  alone would let an apostrophe close the literal). Gated off for
+  the control keeps working with scripting disabled, and carried as a
+  `data-autumn-confirm` attribute wired up by the same-origin
+  `autumn-widgets.js` runtime rather than an inline `onclick` — Autumn's
+  default CSP is `script-src 'self'` with no `'unsafe-inline'`, so an inline
+  handler would be blocked outright and the destructive form would submit with
+  no prompt at all). The bulk form also carries a one-time `_submit_token`
+  (#1360) ahead of the checkboxes, so a double-click or Back→resubmit replays
+  the first response instead of re-running the batch: `SubmitTokenLayer` passes
+  a tokenless request straight through, and it only scans the body's first
+  chunk, so a long selection must not be able to push the field past the scan
+  cap. Gated off for
   `--live`/`--live-validation`/`--sharded`/`--api`, whose output stays
   byte-identical.
 - **sim-testing:** fix a genuine **job-backoff thundering herd** the

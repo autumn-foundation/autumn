@@ -1567,8 +1567,9 @@ pub struct BulkActionsConfig<'a> {
     pub submit_label: &'a str,
     /// Prefix of each checkbox's `aria-label` (default `"Select row"`).
     pub select_label: &'a str,
-    /// Optional confirmation prompt. `None` (the default) emits no `onclick`,
-    /// so the control keeps working with JavaScript disabled.
+    /// Optional confirmation prompt. `None` (the default) emits no
+    /// `data-autumn-confirm` attribute, so the control keeps working with
+    /// JavaScript disabled.
     pub confirm: Option<&'a str>,
 }
 
@@ -1607,46 +1608,18 @@ impl<'a> BulkActionsConfig<'a> {
         self
     }
 
-    /// Opt into a JavaScript confirmation prompt on the submit button.
+    /// Opt into a confirmation prompt on the submit button.
     ///
-    /// The message is escaped for the JavaScript string literal it lands in
-    /// (see [`bulk_actions_toolbar`]), so an apostrophe or backslash is safe.
-    /// The server stays the enforcement point either way — a client with
-    /// scripting disabled never sees the prompt.
+    /// The message rides as a `data-autumn-confirm` attribute wired up by the
+    /// `autumn-widgets.js` runtime rather than an inline handler, so it still
+    /// fires under Autumn's default `script-src 'self'` CSP (see
+    /// [`bulk_actions_toolbar`]). The server stays the enforcement point either
+    /// way — a client with scripting disabled never sees the prompt.
     #[must_use]
     pub const fn confirm(mut self, confirm: &'a str) -> Self {
         self.confirm = Some(confirm);
         self
     }
-}
-
-/// Escape `message` for embedding in a single-quoted JavaScript string
-/// literal.
-///
-/// Needed because the confirmation prompt ends up inside an `onclick`
-/// attribute, which is parsed in two stages: the HTML parser decodes character
-/// references first, then the JavaScript parser reads what is left. Maud only
-/// handles the first stage, so `'`, `\` and line terminators must be escaped
-/// here or a prompt like `Don't delete?` produces a syntax error — and a prompt
-/// built from untrusted text could close the literal and inject script.
-///
-/// U+2028/U+2029 are legal inside string literals from ES2019 on, but are
-/// escaped anyway so the handler stays valid under older parsers.
-#[cfg(feature = "maud")]
-fn escape_js_single_quoted(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    for ch in message.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 /// Render one row's bulk-select checkbox (issue #1312).
@@ -1716,21 +1689,21 @@ pub fn bulk_select_checkbox(
 ///
 /// # No-JavaScript guarantee
 ///
-/// The button is a plain `<button type="submit">`. An `onclick="return
-/// confirm(...)"` handler is emitted **only** when
-/// [`BulkActionsConfig::confirm`] opted in — so the default control still
-/// works with scripting disabled, and even with a confirmation configured the
-/// server remains the enforcement point.
+/// The button is a plain `<button type="submit">`. A `data-autumn-confirm`
+/// attribute is emitted **only** when [`BulkActionsConfig::confirm`] opted in —
+/// so the default control still works with scripting disabled, and even with a
+/// confirmation configured the server remains the enforcement point.
 ///
-/// # Confirmation escaping
+/// # Confirmation prompts are CSP-safe
 ///
-/// The prompt is embedded in a single-quoted JavaScript string literal inside
-/// an attribute, and the browser HTML-decodes that attribute *before* the
-/// JavaScript parser reads it — so HTML escaping alone cannot keep a `'` from
-/// closing the literal. The message is therefore escaped for JavaScript first
-/// (`\`, `'`, and line terminators), then by Maud for the attribute. A prompt
-/// containing an apostrophe renders correctly, and one built from untrusted
-/// text cannot break out into script.
+/// The prompt is carried as a `data-autumn-confirm` attribute and wired up by
+/// the `/static/js/autumn-widgets.js` runtime, **not** by an inline `onclick`.
+/// Autumn's default CSP is `script-src 'self'` with no `'unsafe-inline'`, which
+/// blocks inline event handlers outright — an `onclick` prompt would be
+/// silently dropped and the destructive form would submit with no confirmation
+/// at all. Routing through the same-origin script keeps the prompt working
+/// under the default policy, and leaves the message a plain attribute value
+/// that Maud escapes, with no JavaScript string literal to break out of.
 ///
 /// # CSS hooks
 ///
@@ -1757,29 +1730,28 @@ pub fn bulk_select_checkbox(
 /// assert!(html.contains(r#"class="autumn-bulk-actions""#));
 /// assert!(html.contains(r#"type="submit""#));
 /// assert!(html.contains("Delete selected"));
-/// // No confirmation was configured, so no inline handler is emitted.
-/// assert!(!html.contains("onclick"));
+/// // No confirmation was configured, so no prompt hook is emitted.
+/// assert!(!html.contains("data-autumn-confirm"));
 ///
-/// // An apostrophe in the prompt stays inside the JavaScript string literal.
-/// let confirming = BulkActionsConfig::new("/posts/bulk_delete").confirm("Don't delete?");
+/// // The prompt is a plain attribute value — no inline handler, so it
+/// // survives the default `script-src 'self'` CSP.
+/// let confirming = BulkActionsConfig::new("/posts/bulk_delete").confirm("Delete these rows?");
 /// let html = bulk_actions_toolbar(&confirming).into_string();
-/// assert!(html.contains(r"confirm('Don\'t delete?')"));
+/// assert!(html.contains(r#"data-autumn-confirm="Delete these rows?""#));
+/// assert!(!html.contains("onclick"));
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
-    // Maud escapes the attribute *value*, but the browser decodes character
-    // references before the JavaScript parser ever sees the handler — so HTML
-    // escaping alone would leave `Don't delete?` closing the string literal
-    // early (and, for a prompt built from untrusted text, allow arbitrary
-    // script). Escape for the JavaScript string first, then let Maud escape
-    // for the attribute; the two passes compose correctly in that order.
-    let onclick = config
-        .confirm
-        .map(|message| format!("return confirm('{}')", escape_js_single_quoted(message)));
+    // The prompt rides as a data attribute wired up by autumn-widgets.js, not
+    // an inline `onclick`: the default `script-src 'self'` CSP blocks inline
+    // handlers, so an `onclick` prompt would never fire and the destructive
+    // form would submit unconfirmed. As a plain attribute value the message
+    // needs only Maud's HTML escaping — there is no JavaScript string literal
+    // for an apostrophe (or untrusted text) to break out of.
     maud::html! {
         div class="autumn-bulk-actions" role="group" {
-            button type="submit" onclick=[onclick.as_deref()] { (config.submit_label) }
+            button type="submit" data-autumn-confirm=[config.confirm] { (config.submit_label) }
         }
     }
 }
@@ -1788,9 +1760,10 @@ pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
 ///
 /// This is the outer half of the no-JavaScript bulk-select flow: a plain
 /// `POST` form whose `action` is [`BulkActionsConfig::action`], containing (in
-/// order) the hidden CSRF field, the caller's `content` — a table, list, or
-/// anything else carrying one [`bulk_select_checkbox`] per row — and the
-/// [`bulk_actions_toolbar`] submit button.
+/// order) the hidden one-time submit-token field, the hidden CSRF field, the
+/// caller's `content` — a table, list, or anything else carrying one
+/// [`bulk_select_checkbox`] per row — and the [`bulk_actions_toolbar`] submit
+/// button.
 ///
 /// Keep page furniture that is *not* part of the selection (a "New record"
 /// link, a search box) outside the form: anything inside is submitted with the
@@ -1804,6 +1777,22 @@ pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
 /// `csrf_field.as_ref().map(|f| f.0.as_str())`). When `csrf_token` is `None`
 /// no hidden input is rendered at all; when it is `Some`, the field name
 /// defaults to `"_csrf"`.
+///
+/// # Double-submit protection
+///
+/// Pass the handler's [`SubmitToken`](crate::security::SubmitToken) as
+/// `submit_token` and the configured field name as `submit_field` (again both
+/// `Option<&str>`). `SubmitTokenLayer` consumes the token once and replays the
+/// first response for any repeat, so a double-click or a Back→resubmit deletes
+/// the batch once instead of running the whole destructive path — including
+/// hooks and dependent deletes — twice. A request carrying *no* token passes
+/// through unguarded, so omitting this on a destructive form silently gives up
+/// the protection.
+///
+/// The token input is emitted at the very front of the form, ahead of the
+/// per-row checkboxes: `SubmitTokenLayer` only scans the first chunk of the
+/// URL-encoded body, and a large selection could otherwise push a trailing
+/// token past the scan cap.
 ///
 /// # CSS hooks
 ///
@@ -1826,6 +1815,8 @@ pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
 ///         &cfg,
 ///         csrf.as_ref().map(|t| t.token()),
 ///         csrf_field.as_ref().map(|f| f.0.as_str()),
+///         submit_token.as_ref().map(|t| t.token()),
+///         submit_field.as_ref().map(|f| f.0.as_str()),
 ///         html! {
 ///             (data_table(&page.content, &columns, &DataTableConfig::new("No posts yet.")))
 ///         },
@@ -1837,13 +1828,23 @@ pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
 /// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_form};
 ///
 /// let cfg = BulkActionsConfig::new("/posts/bulk_delete");
-/// let html = bulk_actions_form(&cfg, Some("tok-123"), None, maud::html! { p { "rows" } })
-///     .into_string();
+/// let html = bulk_actions_form(
+///     &cfg,
+///     Some("tok-123"),
+///     None,
+///     Some("submit-456"),
+///     None,
+///     maud::html! { p { "rows" } },
+/// )
+/// .into_string();
 /// assert!(html.contains(r#"method="post""#));
 /// assert!(html.contains(r#"action="/posts/bulk_delete""#));
 /// assert!(html.contains(r#"name="_csrf""#));
 /// assert!(html.contains(r#"value="tok-123""#));
-/// // Content first, toolbar last, all inside the form.
+/// assert!(html.contains(r#"name="_submit_token""#));
+/// assert!(html.contains(r#"value="submit-456""#));
+/// // Tokens ahead of the rows, content next, toolbar last, all inside the form.
+/// assert!(html.find("_submit_token") < html.find("rows"));
 /// assert!(html.find("rows") < html.find("autumn-bulk-actions"));
 /// assert!(html.trim_end().ends_with("</form>"));
 /// ```
@@ -1857,11 +1858,20 @@ pub fn bulk_actions_form(
     config: &BulkActionsConfig<'_>,
     csrf_token: Option<&str>,
     csrf_field: Option<&str>,
+    submit_token: Option<&str>,
+    submit_field: Option<&str>,
     content: maud::Markup,
 ) -> maud::Markup {
     let csrf_field_name = csrf_field.unwrap_or("_csrf");
+    let submit_field_name = submit_field.unwrap_or("_submit_token");
     maud::html! {
         form method="post" action=(config.action) class="autumn-bulk-form" {
+            // Both hidden fields lead the body: `SubmitTokenLayer` only scans
+            // its first chunk, so a long selection of checkboxes must not be
+            // able to push the token past the scan cap.
+            @if let Some(token) = submit_token {
+                input type="hidden" name=(submit_field_name) value=(token);
+            }
             @if let Some(token) = csrf_token {
                 input type="hidden" name=(csrf_field_name) value=(token);
             }
@@ -7069,14 +7079,22 @@ mod tests {
     #[test]
     fn bulk_actions_form_renders_csrf_hidden_input() {
         let cfg = BulkActionsConfig::new("/posts/bulk_delete");
-        let html = bulk_actions_form(&cfg, Some("tok-123"), None, maud::html! {}).into_string();
+        let html = bulk_actions_form(&cfg, Some("tok-123"), None, None, None, maud::html! {})
+            .into_string();
         assert!(html.contains(r#"type="hidden""#), "{html}");
         // The csrf field name defaults to `_csrf` when none is supplied.
         assert!(html.contains(r#"name="_csrf""#), "{html}");
         assert!(html.contains(r#"value="tok-123""#), "{html}");
         // A configured field name wins over the default.
-        let named = bulk_actions_form(&cfg, Some("tok-123"), Some("authenticity"), maud::html! {})
-            .into_string();
+        let named = bulk_actions_form(
+            &cfg,
+            Some("tok-123"),
+            Some("authenticity"),
+            None,
+            None,
+            maud::html! {},
+        )
+        .into_string();
         assert!(named.contains(r#"name="authenticity""#), "{named}");
         assert!(!named.contains(r#"name="_csrf""#), "{named}");
     }
@@ -7084,18 +7102,67 @@ mod tests {
     #[test]
     fn bulk_actions_form_omits_csrf_input_when_none() {
         let cfg = BulkActionsConfig::new("/posts/bulk_delete");
-        let html = bulk_actions_form(&cfg, None, None, maud::html! {}).into_string();
+        let html = bulk_actions_form(&cfg, None, None, None, None, maud::html! {}).into_string();
         assert!(!html.contains(r#"type="hidden""#), "{html}");
         assert!(!html.contains("_csrf"), "{html}");
         // The form itself is still rendered.
         assert!(html.contains("<form"), "{html}");
     }
 
+    /// `SubmitTokenLayer` passes a tokenless request straight through, so the
+    /// hidden field is what stands between a double-clicked bulk delete and a
+    /// second run of the whole destructive path.
+    #[test]
+    fn bulk_actions_form_renders_submit_token_hidden_input() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_form(&cfg, None, None, Some("submit-456"), None, maud::html! {})
+            .into_string();
+        // The field name defaults to `_submit_token` when none is supplied.
+        assert!(html.contains(r#"name="_submit_token""#), "{html}");
+        assert!(html.contains(r#"value="submit-456""#), "{html}");
+        // A configured field name wins over the default, matching whatever
+        // `security.submit_token.field_name` the layer scans for.
+        let named = bulk_actions_form(
+            &cfg,
+            None,
+            None,
+            Some("submit-456"),
+            Some("_once"),
+            maud::html! {},
+        )
+        .into_string();
+        assert!(named.contains(r#"name="_once""#), "{named}");
+        assert!(!named.contains(r#"name="_submit_token""#), "{named}");
+        // Omitted entirely when the handler has no token.
+        let without = bulk_actions_form(&cfg, None, None, None, None, maud::html! {}).into_string();
+        assert!(!without.contains("_submit_token"), "{without}");
+    }
+
+    /// The layer only scans the first chunk of the URL-encoded body, so a long
+    /// selection must not be able to push the token past the scan cap.
+    #[test]
+    fn bulk_actions_form_puts_submit_token_ahead_of_the_rows() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let rows = maud::html! {
+            @for id in 1..200 {
+                (bulk_select_checkbox(id, &cfg))
+            }
+        };
+        let html = bulk_actions_form(&cfg, Some("csrf-1"), None, Some("submit-456"), None, rows)
+            .into_string();
+        let token_at = html.find("_submit_token").expect("token rendered");
+        let first_row_at = html.find("autumn-bulk-select").expect("rows rendered");
+        assert!(
+            token_at < first_row_at,
+            "the submit token must lead the body: {html}"
+        );
+    }
+
     #[test]
     fn bulk_actions_form_posts_to_action_and_wraps_content() {
         let cfg = BulkActionsConfig::new("/posts/bulk_delete");
         let content = maud::html! { p { "row-marker" } };
-        let html = bulk_actions_form(&cfg, None, None, content).into_string();
+        let html = bulk_actions_form(&cfg, None, None, None, None, content).into_string();
         assert!(html.contains(r#"method="post""#), "{html}");
         assert!(html.contains(r#"action="/posts/bulk_delete""#), "{html}");
         assert!(html.contains("autumn-bulk-form"), "{html}");
@@ -7124,63 +7191,66 @@ mod tests {
 
     #[test]
     fn bulk_actions_toolbar_confirm_is_opt_in() {
-        // No-JS guarantee: the default toolbar carries no `onclick` handler.
+        // No-JS guarantee: the default toolbar carries no prompt hook.
         let cfg = BulkActionsConfig::new("/posts/bulk_delete");
         let plain = bulk_actions_toolbar(&cfg).into_string();
-        assert!(!plain.contains("onclick"), "{plain}");
+        assert!(!plain.contains("data-autumn-confirm"), "{plain}");
         // Opting in emits the confirmation prompt.
         let confirmed =
             bulk_actions_toolbar(&cfg.clone().confirm("Delete these rows?")).into_string();
-        assert!(confirmed.contains("onclick"), "{confirmed}");
-        assert!(confirmed.contains("Delete these rows?"), "{confirmed}");
+        assert!(
+            confirmed.contains(r#"data-autumn-confirm="Delete these rows?""#),
+            "{confirmed}"
+        );
     }
 
-    /// The prompt lands inside an `onclick` attribute, which the browser
-    /// HTML-decodes *before* the JavaScript parser reads it — so Maud's
-    /// attribute escaping alone cannot keep a quote inside the string literal.
-    /// (Maud escapes `&`, `<`, `>` and `"`; `'` passes through untouched, and
-    /// would close the literal even if it did not.)
+    /// Autumn's default CSP is `script-src 'self'` with no `'unsafe-inline'`,
+    /// so an inline `onclick` prompt is blocked outright by the browser and the
+    /// destructive form submits with no confirmation at all. The prompt must
+    /// therefore ride as a data attribute wired up by the same-origin
+    /// `autumn-widgets.js` runtime.
     #[test]
-    fn bulk_actions_toolbar_confirm_escapes_javascript_syntax() {
+    fn bulk_actions_toolbar_confirm_uses_no_inline_handler() {
         let cfg = BulkActionsConfig::new("/posts/bulk_delete");
-        // An apostrophe must not close the single-quoted literal.
+        let html = bulk_actions_toolbar(&cfg.clone().confirm("Delete these rows?")).into_string();
+        assert!(
+            !html.contains("onclick"),
+            "an inline handler would be CSP-blocked: {html}"
+        );
+        assert!(!html.contains("<script"), "{html}");
+    }
+
+    /// As a plain attribute value the message needs only Maud's HTML escaping —
+    /// there is no JavaScript string literal for a quote or a crafted prompt to
+    /// break out of. A double quote (which would close the attribute) must be
+    /// entity-escaped; an apostrophe is harmless inside a double-quoted
+    /// attribute and reads back verbatim.
+    #[test]
+    fn bulk_actions_toolbar_confirm_escapes_attribute_syntax() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        // An apostrophe is safe unescaped and round-trips to the exact prompt.
         let html = bulk_actions_toolbar(&cfg.clone().confirm("Don't delete?")).into_string();
         assert!(
-            html.contains(r"confirm('Don\'t delete?')"),
-            "the apostrophe must be backslash-escaped for JavaScript: {html}"
+            html.contains(r#"data-autumn-confirm="Don't delete?""#),
+            "{html}"
         );
-        // A backslash must not escape the closing quote.
-        let html = bulk_actions_toolbar(&cfg.clone().confirm(r"back\slash")).into_string();
+        // A double quote must not close the attribute early.
+        let html = bulk_actions_toolbar(&cfg.clone().confirm(r#"say "hi""#)).into_string();
         assert!(
-            html.contains(r"back\\slash"),
-            "a literal backslash must be doubled: {html}"
+            html.contains("say &quot;hi&quot;"),
+            "the quote must be entity-escaped: {html}"
         );
-        // A newline is a line terminator inside a JS string literal.
-        let html = bulk_actions_toolbar(&cfg.clone().confirm("two\nlines")).into_string();
+        // A crafted prompt cannot break out into markup or script.
+        let html = bulk_actions_toolbar(
+            &cfg.clone()
+                .confirm(r#""><script>alert(document.cookie)</script>"#),
+        )
+        .into_string();
         assert!(
-            html.contains(r"two\nlines") && !html.contains("two\nlines"),
-            "a newline must be escaped, not emitted raw: {html}"
+            !html.contains("<script"),
+            "the prompt must not break out of the attribute: {html}"
         );
-        // The escape must not let a crafted prompt break out and inject script.
-        let html = bulk_actions_toolbar(&cfg.clone().confirm("');alert(document.cookie);//"))
-            .into_string();
-        assert!(
-            html.contains(r"confirm('\');alert(document.cookie);//')"),
-            "the injected terminator must stay inside the string literal: {html}"
-        );
-    }
-
-    #[test]
-    fn escape_js_single_quoted_leaves_ordinary_text_alone() {
-        assert_eq!(
-            escape_js_single_quoted("Delete these rows?"),
-            "Delete these rows?"
-        );
-        assert_eq!(escape_js_single_quoted("it's"), r"it\'s");
-        assert_eq!(escape_js_single_quoted("a\\b"), r"a\\b");
-        assert_eq!(escape_js_single_quoted("a\r\nb"), r"a\r\nb");
-        assert_eq!(escape_js_single_quoted("a\u{2028}b"), r"a\u2028b");
-        assert_eq!(escape_js_single_quoted("a\u{2029}b"), r"a\u2029b");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
     }
 
     // ── CardConfig builder ─────────────────────────────────────────────

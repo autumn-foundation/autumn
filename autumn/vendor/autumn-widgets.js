@@ -238,6 +238,26 @@
     if (t.matches && t.matches('dialog[closedby="any"][open]')) t.close();
   });
 
+  // ── Confirmation prompts ──────────────────────────────────────────────────
+  // Destructive controls opt in with data-autumn-confirm="Are you sure?".
+  // Delegated from the document so the prompt is wired by this same-origin
+  // script rather than an inline onclick — inline handlers are blocked by the
+  // framework's default `script-src 'self'` CSP, which would let a destructive
+  // form submit with no prompt at all. Delegation also means htmx-swapped
+  // content works with no re-initialization.
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    var el = t.closest('[data-autumn-confirm]');
+    if (!el) return;
+    var message = el.getAttribute('data-autumn-confirm');
+    if (!message) return;
+    if (!window.confirm(message)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  });
+
   function initAll() {
     document.querySelectorAll('[data-ac-value-id]').forEach(initAutocomplete);
     document.querySelectorAll('[data-autumn-nav]').forEach(initNav);
