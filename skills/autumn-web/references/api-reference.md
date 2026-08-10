@@ -480,6 +480,38 @@ Per-primitive setters (in addition to the shared set):
   `.autumn-reaction-up` / `.autumn-reaction-down` / `.autumn-reaction-like` /
   `.autumn-reaction-button` / `.autumn-reaction-active` /
   `.autumn-reaction-count`. Prelude re-exported.
+- `autumn_web::widgets::{BulkActionsConfig, bulk_actions_form,
+  bulk_select_checkbox, bulk_actions_toolbar}` (#1312) — the no-JavaScript
+  bulk-select + delete-selected flow. `BulkActionsConfig::new(action_url)`
+  then `.field_name(s)` (default `"ids"`), `.submit_label(s)` (default
+  `"Delete selected"`), `.select_label(s)` (the `aria-label` prefix, default
+  `"Select row"`). Render with
+  `bulk_actions_form(&cfg, csrf_token, csrf_field, submit_token,
+  submit_field, content) -> Markup` — a plain `<form method="post"
+  action=..>` holding the hidden submit-token and CSRF inputs, your
+  `content`, then the `bulk_actions_toolbar` submit button — and put one
+  `bulk_select_checkbox(row.id, &cfg)` in each row's first cell (typically
+  `columns.insert(0, Column::new("", ..))` ahead of a `data_table`). Checked
+  rows submit as repeated `ids=<id>` pairs; the server reads them with any
+  repeated-key form parser. Keep non-selection page furniture (a "New …"
+  link, a search box) outside the form — anything inside is submitted with
+  the selection. Pass the submit-token pair (`SubmitToken` /
+  `SubmitFormField`, same extractors the generated create/update forms take):
+  `SubmitTokenLayer` waves a tokenless request straight through, so omitting
+  it gives up double-submit protection on a destructive endpoint. Both hidden
+  fields lead the form body because the layer only scans its first chunk, and
+  a long selection would otherwise push the token past the scan cap. The
+  toolbar emits no confirmation prompt: an inline `onclick="return
+  confirm(..)"` is blocked by the default `script-src 'self'` CSP (the form
+  would submit with no prompt), and `confirm_action` — the framework's
+  server-rendered `window.confirm()` replacement — posts its own
+  single-action form, so it cannot carry the checkbox selection. Confirm a
+  batch with an interstitial page that lists the rows and asks for a second
+  submit.
+  CSS hooks `.autumn-bulk-form` / `.autumn-bulk-actions` /
+  `.autumn-bulk-select`. `autumn generate scaffold` emits the whole wiring —
+  checkbox column, form, `POST /{plural}/bulk_delete` handler — for standard
+  HTML scaffolds.
 - `autumn_web::widgets` display atoms: `badge(label, BadgeVariant)` /
   `badge_with(..., &BadgeConfig)` / `status_tag(label)` with
   `BadgeVariant::{Neutral,Info,Success,Warning,Danger}` and

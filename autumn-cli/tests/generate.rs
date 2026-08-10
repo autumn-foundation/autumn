@@ -816,6 +816,9 @@ fn generate_scaffold_full_e2e_post() {
         "routes::posts::create",
         "routes::posts::edit_form",
         "routes::posts::update",
+        // Issue #1312: the bulk delete-selected route is mounted alongside the
+        // per-row destroy for every non-live, non-sharded HTML scaffold.
+        "routes::posts::bulk_delete",
         "repositories::post::post_api_list",
         "repositories::post::post_api_get",
     ] {
@@ -4399,9 +4402,17 @@ fn generate_scaffold_index_uses_paginated_repo_method() {
         routes.contains(".page(") || routes.contains(".list("),
         "scaffold index must call a paginated repository method (page()/list()): {routes}"
     );
+    // Scoped to the `index` handler body: since issue #1312 the module also
+    // emits a `bulk_delete` handler whose SELECT is bounded by the submitted id
+    // list (`WHERE id = ANY($1)`), which is not an unpaginated index load.
+    let index = routes
+        .split_once("pub async fn index(")
+        .expect("scaffold must emit an index handler")
+        .1;
+    let index = index.split("pub async fn ").next().unwrap_or(index);
     assert!(
-        !routes.contains(".load(&mut *db)"),
-        "scaffold index must not load every row without pagination: {routes}"
+        !index.contains(".load(&mut *db)"),
+        "scaffold index must not load every row without pagination: {index}"
     );
     // The repository trait must be imported so `repo.list()`/`repo.page()` (trait
     // methods) resolve at compile time — without it the generated code fails with E0599.

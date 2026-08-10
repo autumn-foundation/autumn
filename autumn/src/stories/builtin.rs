@@ -481,5 +481,79 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 }
             }
         },
+        story! {
+            "Display",
+            "Bulk actions",
+            {
+                use autumn_web::widgets::{
+                    BulkActionsConfig, Column, DataTableConfig, bulk_actions_form,
+                    bulk_actions_toolbar, bulk_select_checkbox, data_table,
+                };
+
+                struct Post {
+                    id: i64,
+                    title: &'static str,
+                }
+                let rows = vec![
+                    Post { id: 1, title: "First post" },
+                    Post { id: 2, title: "Second post" },
+                ];
+
+                // `action` is the bulk endpoint -- `paths::bulk_delete()` in a
+                // scaffolded app. The flow is entirely unscripted, so it works
+                // with JavaScript disabled.
+                let config = BulkActionsConfig::new("/posts/bulk_delete");
+
+                // The checkbox goes in the row's first cell, so every row can be
+                // selected. Each one submits as a repeated `ids=<id>` pair.
+                let columns: Vec<Column<Post>> = vec![
+                    Column::new("", |row: &Post| {
+                        maud::html! { (bulk_select_checkbox(row.id, &config)) }
+                    }),
+                    Column::new("Title", |row: &Post| maud::html! { (row.title) }),
+                ];
+
+                // A second bulk action, driving a hand-rolled list instead of a
+                // `data_table`. `bulk_actions_form` already appends a toolbar, so
+                // `bulk_actions_toolbar` is called directly only here, where the
+                // surrounding <form> is hand-built -- a bare toolbar outside any
+                // form would render a submit button that does nothing.
+                let archive = BulkActionsConfig::new("/posts/bulk_archive")
+                    .submit_label("Archive selected");
+
+                maud::html! {
+                    // Page furniture stays OUTSIDE the form -- anything inside is
+                    // submitted along with the selection.
+                    a href="/posts/new" { "New Post" }
+                    (bulk_actions_form(
+                        &config,
+                        Some("demo-csrf-token"),
+                        None,
+                        Some("demo-submit-token"),
+                        None,
+                        maud::html! {
+                            (data_table(&rows, &columns, &DataTableConfig::new("No posts yet.")))
+                        },
+                    ))
+                    form method="post" action="/posts/bulk_archive" class="autumn-bulk-form" {
+                        // Hand-built forms carry the same hidden fields
+                        // `bulk_actions_form` emits, and for the same reason: both
+                        // lead the body, ahead of the checkboxes, because
+                        // `SubmitTokenLayer` only scans its first chunk.
+                        input type="hidden" name="_submit_token" value="demo-archive-token";
+                        input type="hidden" name="_csrf" value="demo-csrf-token";
+                        ul {
+                            @for row in &rows {
+                                li {
+                                    (bulk_select_checkbox(row.id, &archive))
+                                    " " (row.title)
+                                }
+                            }
+                        }
+                        (bulk_actions_toolbar(&archive))
+                    }
+                }
+            }
+        },
     ]
 }

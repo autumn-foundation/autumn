@@ -711,6 +711,84 @@ concession, not a routing one. CSRF protection still treats the
 overridden mutation as unsafe and rejects submissions without a valid
 token with `403 Forbidden`.
 
+### Bulk select and delete selected
+
+Every standard HTML scaffold's index list ships a no-JavaScript
+bulk-delete flow (issue #1312):
+
+- The `data_table` gains a leading checkbox column. Each row renders
+  `autumn_web::widgets::bulk_select_checkbox(row.id, &bulk_cfg)` —
+  `<input type="checkbox" name="ids" value="…">` with an
+  `aria-label="Select row <id>"`, so a screen reader announces which row
+  each control selects.
+- The list (and, with `--searchable`, the whole
+  `#<plural>-search-results` container htmx swaps) is wrapped in
+  `autumn_web::widgets::bulk_actions_form(...)`: a plain
+  `POST /<plural>/bulk_delete` form carrying the CSRF hidden field, the
+  one-time submit-token hidden field, and a **Delete selected** submit
+  button. The "New …" link and the search box stay outside the form —
+  they are page furniture, not part of the selection.
+- A `#[secured] #[post("/<plural>/bulk_delete")]` handler is emitted and
+  mounted in `src/main.rs` right after `destroy`.
+
+Contract of the generated handler:
+
+| Situation | Behaviour |
+| --------- | --------- |
+| Checked rows | Deleted through the repository's `delete_many`, then a `Deleted N <plural>` flash and a 303 back to the index. |
+| Field name | `name="ids"` (matching `autumn-admin-plugin`); the parser also accepts the `ids[]` spelling some clients send. |
+| Empty selection | Info flash + 303 redirect. **Never** a 400 — a list-write endpoint doesn't fail on missing params. |
+| Malformed id (`ids=abc`) | Silently dropped, same as above. Duplicates are collapsed through a `HashSet`, so parsing a crafted body full of distinct ids stays linear rather than quadratic. |
+| Oversized selection | Capped at `MAX_BULK_IDS` (5000). A real selection is page-sized, so this only bites on a hand-crafted body — the default 32 MiB request limit otherwise leaves room for over a million ids. The parser stops one past the cap, and the handler refuses the batch with an error flash rather than truncating it: a silently partial destructive batch is worse than a refused one. |
+| Large selection | The pre-flight `SELECT` is chunked at 1000 ids. `eq_any` binds one parameter per id, and `autumn_web::repository::MAX_BIND_PARAMS` is 32766 on SQLite, so one unbounded `eq_any` would fail with "too many SQL variables" before reaching the already-chunked `delete_many`. |
+| `--soft-delete` | The pre-flight `SELECT` filters `deleted_at IS NULL`, and `delete_many` applies the soft-delete update — no hand-rolled `deleted_at` write. |
+| Record policy wiring on (an owner column, the default) | Each selected row is authorized with the same `"delete"` action `destroy` uses. A row the actor may not delete is dropped from the batch rather than 403'ing the request, so the endpoint is not an existence oracle. |
+| `dependent(restrict)` child rows | `delete_many` probes first and aborts the **whole** batch with a 409, rolling back — no partial delete. |
+| Connection use | The handler `drop`s its `Db` extractor after the pre-flight `SELECT` and before `delete_many`, which checks out a connection of its own. It therefore holds **one** pooled connection at a time, which cannot stall on `database.pool.max_size = 1` or deadlock at any concurrency. |
+| Double-click / Back→resubmit | The form carries a one-time `_submit_token` (issue #1360), so `SubmitTokenLayer` consumes it once and replays the first response instead of re-running the batch — hooks and dependent deletes included. The field leads the form body, ahead of the checkboxes, because the layer only scans the body's first chunk and a long selection would otherwise push it past the scan cap. |
+
+Not emitted for `--live`, `--live-validation`, or `--sharded` (their list
+DOM is owned by an SSE/htmx swap contract, or has no cross-shard
+`delete_many`), and `--api` scaffolds render no HTML at all. Those
+variants' output is byte-identical to their pre-#1312 shape.
+
+The three widgets are ordinary public helpers — use them in hand-written
+list views too:
+
+```rust,ignore
+use autumn_web::widgets::{BulkActionsConfig, bulk_actions_form, bulk_select_checkbox};
+
+let action = paths::bulk_delete();
+let cfg = BulkActionsConfig::new(&action)
+    .submit_label("Archive selected");
+html! {
+    (bulk_actions_form(
+        &cfg,
+        csrf.as_ref().map(|t| t.token()),
+        csrf_field.as_ref().map(|f| f.0.as_str()),
+        submit_token.as_ref().map(|t| t.token()),
+        submit_field.as_ref().map(|f| f.0.as_str()),
+        html! { (my_list(&rows, &cfg)) },
+    ))
+}
+```
+
+Pass the submit-token pair on any destructive bulk form. A request that
+carries no `_submit_token` passes through `SubmitTokenLayer` unguarded,
+so omitting it silently gives up double-submit protection on exactly the
+endpoint that most needs it.
+
+The bulk toolbar emits **no** confirmation prompt, and the flow needs no
+JavaScript at all. Autumn's default CSP is `script-src 'self'` with no
+`'unsafe-inline'`, so an inline `onclick="return confirm(..)"` is blocked
+by the browser — the form would submit with no prompt, which is worse
+than not promising one. The framework's server-rendered replacement for
+`window.confirm()`, [`confirm_action`](../reference/widgets.md), submits
+its own single-action form and so cannot carry a bulk form's checkbox
+selection (HTML forbids nesting forms). To confirm a batch, post the
+selection to an interstitial page that lists the affected rows and asks
+for a second, explicit submit.
+
 Metadata flags let you keep common model and repository polish in the
 generation step:
 

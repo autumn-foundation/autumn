@@ -148,6 +148,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function of the label *set* rather than the order `with_label` was called in.
   New guide: `docs/guide/metrics.md`, including a facade-vs-`MetricsSource`
   comparison.
+- **cli,web:** `autumn generate scaffold` now ships a **no-JavaScript
+  bulk-select + delete-selected flow** on every standard HTML index list
+  (#1312). The `data_table` gains a leading
+  `bulk_select_checkbox` column, the list (and, with `--searchable`, the whole
+  htmx-swapped results container) is wrapped in a `bulk_actions_form` posting
+  to a new `#[secured] POST /{plural}/bulk_delete` handler, and `src/main.rs`
+  mounts that route immediately after `destroy`. The handler parses the
+  repeated checkboxes with a generated `parse_bulk_ids` helper (deduping through
+  a `HashSet`, so a crafted body carrying many distinct `ids` parses in linear
+  rather than quadratic time, and stopping one past a `MAX_BULK_IDS` cap of
+  5000 — a real selection is page-sized, but the default 32 MiB request limit
+  otherwise leaves room for over a million ids; an oversized batch is refused
+  with an error flash rather than truncated, since a silently partial
+  destructive batch is worse than a refused one), chunks its pre-flight
+  `SELECT` at 1000 ids (`eq_any` binds one parameter per id and
+  `MAX_BIND_PARAMS` is 32766 on SQLite, so one unbounded `eq_any` would fail
+  with "too many SQL variables" before reaching the already-chunked
+  `delete_many`), per-row
+  authorizes with the same `"delete"` action `destroy` uses when policy wiring
+  is on (an unauthorized row is dropped from the batch, not 403'd, so the
+  endpoint is no existence oracle), routes the delete through
+  `repo.delete_many` so soft-delete/hooks/`dependent(...)` cascades all apply,
+  flashes the deleted count, and 303s back to the index. The handler `drop`s
+  its `Db` extractor between the pre-flight `SELECT` and `delete_many` — `Db`
+  holds its connection until dropped and `delete_many` checks out one of its
+  own, so keeping both would stall every bulk delete on
+  `database.pool.max_size = 1` and deadlock a larger pool under enough
+  concurrency. An empty or malformed
+  selection redirects without error — a list-write endpoint never 400s on bad
+  params. The checkbox field is deliberately `name="ids"` (not `ids[]`),
+  matching `autumn-admin-plugin`'s existing bulk-action contract; the parser
+  accepts the `ids[]` spelling too, for clients that send it. Three reusable
+  widgets back it for hand-written views: `autumn_web::widgets::{
+  bulk_select_checkbox, bulk_actions_toolbar, bulk_actions_form}` plus a
+  `BulkActionsConfig` builder. The toolbar deliberately emits no confirmation
+  prompt: an inline `onclick="return confirm(..)"` is blocked by Autumn's
+  default `script-src 'self'` CSP (the form would submit with no prompt, worse
+  than not promising one), and `confirm_action` — the framework's
+  server-rendered `window.confirm()` replacement — posts its own single-action
+  form, so it cannot carry a bulk form's checkbox selection. Confirm a batch
+  with an interstitial page instead. The bulk form carries a one-time `_submit_token`
+  (#1360) ahead of the checkboxes, so a double-click or Back→resubmit replays
+  the first response instead of re-running the batch: `SubmitTokenLayer` passes
+  a tokenless request straight through, and it only scans the body's first
+  chunk, so a long selection must not be able to push the field past the scan
+  cap. Gated off for
+  `--live`/`--live-validation`/`--sharded`/`--api`, whose output stays
+  byte-identical.
 - **sim-testing:** fix a genuine **job-backoff thundering herd** the
   deterministic simulation harness caught (W7, #1797): the local job
   runtime's retry backoff (`execute_local_job`, `job.rs`) computed a pure

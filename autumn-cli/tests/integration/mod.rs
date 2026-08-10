@@ -17,6 +17,7 @@ mod migrate_sqlite;
 mod offsite_backup;
 mod repo_hygiene;
 mod scaffold_belongs_to;
+mod scaffold_bulk_delete;
 mod scaffold_form_for;
 mod scaffold_rich_text;
 mod scaffold_search;

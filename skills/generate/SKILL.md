@@ -222,6 +222,18 @@ non-owner-scoped `GET /<plural>` index wires allowlisted sort/filter through the
 `?filter[col]=`), rendering sortable `data_table` headers (blob/attachment/enum
 columns excluded). Owner-scoped and `--live` indexes opt out (issue #1126).
 
+**Scaffold bulk select + delete selected (trunk-dev)**: every standard HTML
+index list ships a no-JavaScript bulk-delete flow — a leading
+`bulk_select_checkbox` column, the list (and, with `--searchable`, the whole
+htmx-swapped results container) wrapped in a `bulk_actions_form`, and a
+`#[secured] POST /<plural>/bulk_delete` handler mounted right after `destroy`.
+The handler drops malformed ids and redirects on an empty selection (a
+list-write endpoint never 400s), per-row authorizes with the same `"delete"`
+action `destroy` uses when policy wiring is on (an unauthorized row is dropped
+from the batch, not 403'd), and deletes through `repo.delete_many` so
+soft-delete, hooks and `dependent(...)` cascades all apply. Not emitted for
+`--live`, `--live-validation`, `--sharded`, or `--api` (issue #1312).
+
 **Scaffold no-JS uploads (trunk-dev)**: `Attachment` fields produce working
 `multipart/form-data` uploads without JS — the create/update handlers take a
 `Multipart` extractor and stream to the blob store via `save_to_blob_store`
