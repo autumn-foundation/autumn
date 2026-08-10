@@ -1,7 +1,8 @@
 //! Locating a usable Chromium/Chrome binary on the host.
 //!
-//! Shared by the [`system_test`](crate::system_test) harness (which launches
-//! the browser it finds) and `autumn doctor` (which only reports on it).
+//! Shared by the `system_test` harness (which launches the browser it finds;
+//! feature `system-tests`, so this always-compiled module cannot link to it)
+//! and `autumn doctor` (which only reports on it).
 //! Both used to carry their own copy of this logic and drifted — a fix in one
 //! left the other reporting the opposite answer on the same machine — so the
 //! resolution order, the version probe, and its platform quirks live here
@@ -338,8 +339,18 @@ fn version_from_probe(probe: &VersionProbe) -> Option<String> {
 /// Probe `path` for a browser version.
 ///
 /// Returns `None` when the candidate is not a usable browser binary, and
-/// [`UNKNOWN_VERSION`] when it is usable but cannot report a version (see
-/// [`run_version_probe`]).
+/// [`UNKNOWN_VERSION`] when it is usable but cannot report a version.
+///
+/// On Linux and macOS "usable" means `<path> --version` ran and exited 0
+/// (against a throwaway `--user-data-dir`, so it can never rendezvous with a
+/// Chrome holding the real profile); empty output is still accepted, since a
+/// launcher shim may print elsewhere.
+///
+/// On **Windows** the candidate is never executed: `chrome.exe` is a
+/// GUI-subsystem binary that writes nothing to the parent console, and
+/// `--version` is not an early-exit switch there, so running it starts a real
+/// browser instead of answering (#1456). An existing file with an `.exe`
+/// extension is accepted on that evidence alone.
 #[must_use]
 pub fn probe_version(path: &Path) -> Option<String> {
     version_from_probe(&run_version_probe(path))

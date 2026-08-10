@@ -90,8 +90,9 @@ pub mod authorization;
 pub mod batches;
 /// Locating a usable Chromium/Chrome binary on the host.
 ///
-/// Shared by the [`system_test`] harness and `autumn doctor`; deliberately not
-/// behind the `system-tests` feature so the CLI can report on browser
+/// Shared by the `system_test` harness (feature `system-tests`, hence no
+/// intra-doc link from this always-compiled item) and `autumn doctor`;
+/// deliberately not behind that feature so the CLI can report on browser
 /// availability without depending on a headless-browser stack.
 pub mod browser_detect;
 pub mod build_info;

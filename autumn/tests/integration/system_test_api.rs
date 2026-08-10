@@ -30,25 +30,33 @@ fn browser_check_reports_result() {
     }
 }
 
-/// #1456: a host that *has* a browser at one of the searched paths must never
+/// #1456: a host where a candidate path holds a *usable* browser must never
 /// report `NotFound`. Without this the whole check passes in both directions,
-/// so the reported bug — a false `BrowserNotFound` on a Windows box with
-/// Chrome installed — would stay green on the very runner that reproduces it.
+/// so the reported bug — a false `BrowserNotFound` on a box with Chrome
+/// installed — would stay green on the very runner that reproduces it.
+///
+/// Usability is decided by `probe_version`, not by `is_file()`: on POSIX an
+/// existing candidate may be non-executable, a stale wrapper, or exit
+/// non-zero, all of which the probe rejects on purpose, so `NotFound` is the
+/// correct answer there. (On Windows the probe *is* file existence plus an
+/// `.exe` extension, which is exactly the #1456 behaviour this pins.) What is
+/// asserted is the invariant that binds the two together: if any candidate
+/// probes successfully, the check that walks those candidates must find it.
 #[test]
-fn an_installed_browser_is_never_reported_as_missing() {
-    let installed: Vec<_> = autumn_web::browser_detect::browser_candidates()
+fn a_usable_browser_is_never_reported_as_missing() {
+    let usable: Vec<_> = autumn_web::browser_detect::browser_candidates()
         .into_iter()
-        .filter(|p| p.is_file())
+        .filter(|p| autumn_web::browser_detect::probe_version(p).is_some())
         .collect();
-    if installed.is_empty() {
-        return; // genuinely no browser on this host; nothing to assert
+    if usable.is_empty() {
+        return; // genuinely no usable browser on this host; nothing to assert
     }
 
     let check = BrowserCheck::run();
     assert!(
         check.is_found(),
-        "these browser binaries exist on this host but the check reported \
-         them missing: {installed:?}\n{check}"
+        "these browser binaries probe successfully on this host but the check \
+         reported them missing: {usable:?}\n{check}"
     );
 }
 
