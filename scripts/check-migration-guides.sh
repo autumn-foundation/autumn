@@ -182,7 +182,11 @@ findings="$(
     # The suppression is for entries that talk *about* breaking changes. It
     # must never override an explicit declaration: one comment on a parent
     # bullet would otherwise silence every nested `**Breaking:**` under it.
-    if (!marked && entry ~ /<!--[[:space:]]*migration-guide-gate:/) {
+    # Read the suppression from the raw entry with code spans removed: it is
+    # an HTML comment, so it cannot come from `entry_visible` (comments are
+    # stripped there) — but an entry that merely *displays* the token in
+    # backticks is documenting the escape hatch, not using it.
+    if (!marked && strip_code_spans(entry) ~ /<!--[[:space:]]*migration-guide-gate:/) {
       entry = ""
       entry_visible = ""
       return
@@ -698,9 +702,48 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
       guide_ok=false
       die "$index_file is missing — guides are only findable through the index."
     elif ! awk -v want="]($base)" '
-            /^##[[:space:]]+Index[[:space:]]*$/ { in_index = 1; next }
-            /^##[[:space:]]/                    { in_index = 0 }
-            in_index && index($0, want) > 0     { found = 1 }
+            function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
+              # Third copy of this helper: the two awk programs above are
+              # separate processes and awk has no include. Keep them in step.
+              out = ""; i = 1; n = length(text)
+              while (i <= n) {
+                ch = substr(text, i, 1)
+                if (ch != "`") { out = out ch; i++; continue }
+                run = 0
+                while (i + run <= n && substr(text, i + run, 1) == "`") run++
+                j = i + run; found = 0
+                while (j <= n) {
+                  if (substr(text, j, 1) != "`") { j++; continue }
+                  run2 = 0
+                  while (j + run2 <= n && substr(text, j + run2, 1) == "`") run2++
+                  if (run2 == run) { found = 1; break }
+                  j += run2
+                }
+                if (found) { out = out " "; i = j + run } else { out = out substr(text, i, run); i += run }
+              }
+              return out
+            }
+            # Only a link the reader can click counts. A bullet inside an HTML
+            # comment, a code span or a fenced sample renders as anything but a
+            # link, so the guide stays undiscoverable.
+            {
+              visible = $0
+              if (in_comment) {
+                if (index(visible, "-->") > 0) { visible = substr(visible, index(visible, "-->") + 3); in_comment = 0 }
+                else { visible = "" }
+              }
+              while (match(visible, /<!--/)) {
+                head = substr(visible, 1, RSTART - 1); tail = substr(visible, RSTART)
+                if (match(tail, /-->/)) { visible = head substr(tail, RSTART + 3) }
+                else { visible = head; in_comment = 1; break }
+              }
+              if (visible ~ /^[[:space:]]*(```|~~~)/) { in_fence = !in_fence; visible = "" }
+              else if (in_fence) { visible = "" }
+              visible = strip_code_spans(visible)
+            }
+            visible ~ /^##[[:space:]]+Index[[:space:]]*$/ { in_index = 1; next }
+            visible ~ /^##[[:space:]]/                    { in_index = 0 }
+            in_index && index(visible, want) > 0          { found = 1 }
             END { exit found ? 0 : 1 }
           ' "$index_file"; then
       guide_ok=false

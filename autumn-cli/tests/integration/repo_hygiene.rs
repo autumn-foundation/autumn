@@ -2854,3 +2854,78 @@ fn migration_guide_gate_skips_commented_out_changelog_bullets() {
         "the same bullet outside a comment must still demand a guide",
     );
 }
+
+// --- Review round 8: only rendered markup counts --------------------------
+
+#[test]
+fn migration_guide_gate_ignores_a_suppression_shown_as_code() {
+    // The suppression is read from the raw entry because it *is* an HTML
+    // comment. That let an entry which merely *displays* the token in
+    // backticks — documentation of the escape hatch — silence a real break.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** this is breaking for anyone calling it. Silence a mention \
+           with `<!-- migration-guide-gate: reason -->`.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a suppression rendered as code is documentation, not a suppression\n{}",
+        gate_report(&output),
+    );
+
+    // The real thing still works.
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** this is breaking for anyone calling it. \
+           <!-- migration-guide-gate: explains the gate -->\n",
+    )
+    .expect("changelog");
+    assert!(
+        run_migration_gate(tmp.path()).status.success(),
+        "a real suppression comment must still clear the entry",
+    );
+}
+
+#[test]
+fn migration_guide_gate_ignores_index_entries_that_do_not_render() {
+    // An index entry the reader cannot click is not an index entry, however
+    // it came to be invisible.
+    for hidden in [
+        "<!-- - [`0.7.0.md`](0.7.0.md) -->",
+        "Write it as `- [`0.7.0.md`](0.7.0.md)`",
+        "```markdown\n- [`0.7.0.md`](0.7.0.md)\n```",
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        let migrations = tmp.path().join("docs/migrations");
+        std::fs::write(migrations.join("0.7.0.md"), valid_migration_guide("0.7.0")).expect("guide");
+        std::fs::write(
+            migrations.join("README.md"),
+            format!("# Migration Guides\n\n## Index\n\n- [`next.md`](next.md)\n{hidden}\n"),
+        )
+        .expect("index");
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            "# Changelog\n\n\
+             ## [0.7.0] - 2026-09-01\n\n\
+             ### Changed\n\n\
+             - **db:** **Breaking:** `with_pool` renamed. See the \
+               [migration guide](docs/migrations/0.7.0.md).\n",
+        )
+        .expect("changelog");
+
+        assert!(
+            !run_migration_gate(tmp.path()).status.success(),
+            "an index entry that does not render is not discoverable: {hidden}",
+        );
+    }
+}
