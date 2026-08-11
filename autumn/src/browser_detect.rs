@@ -155,6 +155,36 @@ pub fn browser_candidates() -> Vec<PathBuf> {
     // 3. PATH-based lookup — covers CI setups like browser-actions/setup-chrome
     //    that install a `chrome` or `google-chrome` binary on PATH rather than
     //    at a well-known fixed location.
+    candidates.extend(path_candidates(std::env::var_os("PATH").as_deref()));
+
+    // 4. Well-known system paths.
+    candidates.extend(well_known_paths());
+
+    // A duplicate can only waste a probe and clutter the searched-paths list
+    // in the not-found error (duplicate PATH entries are common).
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|p| seen.insert(p.clone()));
+
+    candidates
+}
+
+/// Every `PATH` directory holding one of [`PATH_BINARY_NAMES`], in `PATH`
+/// order, for each name in preference order.
+///
+/// Returns **all** matches rather than the first per name. Existence is not
+/// usability — [`probe_version`] is what decides — so a stale or
+/// non-executable `chrome` early in `PATH` must not mask a working one a CI
+/// setup action installed later. The extra entries cost one stat each.
+///
+/// Takes `PATH` as an argument rather than reading the environment so it is
+/// testable without mutating process-wide state (which this crate forbids:
+/// `unsafe_code = "forbid"`).
+fn path_candidates(path_var: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let Some(path_var) = path_var else {
+        return Vec::new();
+    };
+
+    let mut found = Vec::new();
     for name in PATH_BINARY_NAMES {
         // `Path::is_file` stats the literal path and does *not* apply
         // Windows' PATHEXT resolution, so a bare `chrome` never matches
@@ -164,19 +194,13 @@ pub fn browser_candidates() -> Vec<PathBuf> {
         } else {
             (*name).to_owned()
         };
-        if let Some(p) = std::env::var_os("PATH").and_then(|path_var| {
-            std::env::split_paths(&path_var)
+        found.extend(
+            std::env::split_paths(path_var)
                 .map(|dir| dir.join(&file_name))
-                .find(|p| p.is_file())
-        }) {
-            candidates.push(p);
-        }
+                .filter(|p| p.is_file()),
+        );
     }
-
-    // 4. Well-known system paths.
-    candidates.extend(well_known_paths());
-
-    candidates
+    found
 }
 
 /// Per-platform install locations, checked after `PATH`.
@@ -261,15 +285,34 @@ fn unique_probe_dir() -> PathBuf {
     std::env::temp_dir().join(format!("autumn-browser-probe-{}-{n}", std::process::id()))
 }
 
-/// `true` when `path` carries a Windows executable extension.
+/// `true` when `path` names something that plausibly *is* a Chrome/Chromium
+/// binary, judged from the filename alone.
 ///
-/// The Windows path accepts a candidate on file evidence alone, so this is the
-/// only filter standing between a mistyped `AUTUMN_CHROMIUM` (a README, a
-/// `.lnk` shortcut) and it shadowing a browser that would actually have
-/// worked.
-fn has_windows_executable_extension(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+/// The Windows branch accepts a candidate without running it, so this is the
+/// only filter standing between a stale or mistyped `AUTUMN_CHROMIUM` and it
+/// **ending discovery**: it is the first candidate, so accepting it stops
+/// `find_chromium` from ever reaching a real Chrome further down the list, and
+/// turns a clear `BrowserNotFound` (which prints every searched path and the
+/// remediation hint) into an opaque failure later, inside `Browser::launch`.
+///
+/// Requiring `.exe` alone is not enough — every discovery source *except* the
+/// env override already constrains the filename (`chrome.exe` under the
+/// well-known install roots and the Playwright layout, the `PATH_BINARY_NAMES`
+/// on `PATH`), so the override is the one place an arbitrary path can enter.
+/// Matching on `chrom` keeps the real-world variants that people legitimately
+/// point at — `chrome.exe`, `chromium.exe`, `chrome-headless-shell.exe`,
+/// `google-chrome.exe` — while rejecting a wrong turn like `notepad.exe`.
+fn looks_like_a_browser_binary(path: &Path) -> bool {
+    let has_exe_extension = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+
+    let named_like_chrome = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.to_ascii_lowercase().contains("chrom"));
+
+    has_exe_extension && named_like_chrome
 }
 
 /// Ask `path` for its version, or decide not to ask.
@@ -290,7 +333,7 @@ fn run_version_probe(path: &Path) -> VersionProbe {
     }
 
     if cfg!(target_os = "windows") {
-        return if has_windows_executable_extension(path) {
+        return if looks_like_a_browser_binary(path) {
             VersionProbe::Skipped
         } else {
             VersionProbe::Failed
@@ -384,6 +427,59 @@ mod tests {
                 .any(|s| s.contains("chromium") || s.contains("chrome")),
             "should have at least one chrome path; got {as_strings:?}"
         );
+    }
+
+    #[test]
+    fn path_scan_keeps_every_match_not_just_the_first() {
+        // A stale, non-executable `chrome` early in PATH must not mask a
+        // working one installed later (e.g. by a CI setup action): existence
+        // is not usability, and `probe_version` — not this scan — is what
+        // decides. Both must survive into the candidate list, in PATH order.
+        let base = std::env::temp_dir().join(format!(
+            "autumn-path-scan-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let stale = base.join("stale");
+        let good = base.join("good");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&good).unwrap();
+        let binary = if cfg!(target_os = "windows") {
+            "chrome.exe"
+        } else {
+            "chrome"
+        };
+        std::fs::write(stale.join(binary), b"stale").unwrap();
+        std::fs::write(good.join(binary), b"good").unwrap();
+
+        let joined = std::env::join_paths([&stale, &good]).unwrap();
+        let found = path_candidates(Some(joined.as_os_str()));
+
+        assert_eq!(
+            found,
+            vec![stale.join(binary), good.join(binary)],
+            "both PATH hits must be candidates, in PATH order"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn path_scan_without_a_path_variable_is_empty() {
+        assert!(path_candidates(None).is_empty());
+    }
+
+    #[test]
+    fn candidates_are_deduplicated() {
+        let candidates = browser_candidates();
+        let mut seen = std::collections::HashSet::new();
+        for path in &candidates {
+            assert!(
+                seen.insert(path.clone()),
+                "duplicate candidate {path:?} wastes a probe and clutters the \
+                 searched-paths list in the not-found error"
+            );
+        }
     }
 
     #[test]
@@ -544,18 +640,34 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_accepts_an_existing_exe_without_running_it() {
-        // The running test binary is a real, existing `.exe` that is
-        // emphatically not Chrome — and must still resolve, because on
-        // Windows file existence is the only signal available and executing
-        // the candidate is exactly what #1456 says not to do.
-        let me = std::env::current_exe().expect("test binary path");
-        assert_eq!(probe_version(&me), Some(UNKNOWN_VERSION.to_owned()));
+        // A file that exists and is named like Chrome must resolve without
+        // being executed — running the candidate is exactly what #1456 says
+        // not to do on Windows. The file's *contents* are irrelevant here,
+        // which is the point: we never launch it.
+        let dir = std::env::temp_dir().join("autumn-browser-detect-test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let fake_chrome = dir.join("chrome.exe");
+        std::fs::write(&fake_chrome, b"not really chrome").expect("write fake binary");
+
+        assert_eq!(
+            probe_version(&fake_chrome),
+            Some(UNKNOWN_VERSION.to_owned()),
+            "an existing chrome.exe must resolve as found, not BrowserNotFound"
+        );
+
+        // Same directory, same existence, wrong program: must NOT end
+        // discovery (see `looks_like_a_browser_binary`).
+        let not_chrome = dir.join("notepad.exe");
+        std::fs::write(&not_chrome, b"not a browser").expect("write decoy");
+        assert_eq!(probe_version(&not_chrome), None);
 
         assert_eq!(
             probe_version(Path::new(r"C:\definitely\not\here\chrome.exe")),
             None,
             "a path that does not exist is still not a browser"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -571,19 +683,37 @@ mod tests {
     }
 
     #[test]
-    fn windows_candidates_must_look_like_executables() {
-        assert!(has_windows_executable_extension(Path::new(
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-        )));
-        assert!(
-            has_windows_executable_extension(Path::new("chrome.EXE")),
-            "the extension check must be case-insensitive"
-        );
-        for not_a_binary in ["chrome.lnk", "README.md", "chrome"] {
+    fn windows_candidates_must_look_like_a_browser() {
+        for real in [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Users\me\AppData\Local\Chromium\Application\chrome.exe",
+            "chrome.EXE",   // case-insensitive extension
+            "CHROMIUM.exe", // case-insensitive name
+            "chrome-headless-shell.exe",
+            "google-chrome.exe",
+        ] {
             assert!(
-                !has_windows_executable_extension(Path::new(not_a_binary)),
-                "{not_a_binary:?} must not be accepted as a browser binary, or a \
-                 mistyped AUTUMN_CHROMIUM would shadow one that works"
+                looks_like_a_browser_binary(Path::new(real)),
+                "{real:?} is a browser people legitimately point AUTUMN_CHROMIUM at"
+            );
+        }
+
+        for not_a_browser in [
+            // Right extension, wrong program. Accepting this would end
+            // discovery at a stale/mistyped override and hide an installed
+            // Chrome further down the candidate list.
+            "notepad.exe",
+            r"C:\Windows\System32\cmd.exe",
+            // Right name, not an executable.
+            "chrome.lnk",
+            "chrome",
+            "README.md",
+        ] {
+            assert!(
+                !looks_like_a_browser_binary(Path::new(not_a_browser)),
+                "{not_a_browser:?} must not end discovery — a wrong override has \
+                 to fall through to the real candidates, and failing that yield \
+                 BrowserNotFound with its searched-paths list"
             );
         }
     }
