@@ -232,6 +232,36 @@ fn export_is_bounded_by_a_row_cap_and_reads_in_pages() {
     );
 }
 
+#[test]
+fn export_reads_past_the_cap_so_truncation_is_detectable() {
+    // Breaking on `rows.len() >= MAX_EXPORT_ROWS` fills the cap EXACTLY and so
+    // never observes a row beyond it: `truncated` stays false, no warning is
+    // logged and no `x-export-truncated` header is set, while the rows past the
+    // cap are dropped anyway. Every over-cap export would then be silently
+    // short — the precise failure the truncation signal exists to prevent. The
+    // loop must read past the cap and decide truncation strictly.
+    let (_tmp, routes) = scaffold_routes("csv-truncation", &[]);
+    let export = handler_slice(&routes, "export_csv");
+    assert!(
+        !export.contains(">= MAX_EXPORT_ROWS"),
+        "stopping once the cap is filled cannot distinguish a complete export \
+         from a truncated one:\n{export}"
+    );
+    assert!(
+        export.contains("if exhausted || rows.len() > MAX_EXPORT_ROWS"),
+        "the export loop must read past the cap before stopping:\n{export}"
+    );
+    assert!(
+        export.contains("let truncated = rows.len() > MAX_EXPORT_ROWS;"),
+        "truncation must be decided by a strict over-cap comparison:\n{export}"
+    );
+    assert!(
+        export.contains("rows.truncate(MAX_EXPORT_ROWS);"),
+        "the surplus read past the cap must be trimmed before the CSV is \
+         written:\n{export}"
+    );
+}
+
 // ── AC3: the index renders an "Export CSV" link ───────────────────────────────
 
 #[test]

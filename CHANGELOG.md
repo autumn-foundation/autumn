@@ -29,7 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string, so *filter → sort → export* downloads exactly the rows on screen.
   `?page=`/`?size=` are ignored: an export spans every page of the current
   filter. Rows are read in `MAX_PAGE_SIZE` batches and capped at
-  `MAX_EXPORT_ROWS` (10 000), a constant in the generated file.
+  `MAX_EXPORT_ROWS` (10 000), a constant in the generated file. An export that
+  hits the cap is truncated rather than failed, but never silently: it logs a
+  `warn!` and sets `x-export-truncated: true`. Distinguishing a complete export
+  of exactly `MAX_EXPORT_ROWS` rows from a truncated one takes evidence a row
+  exists past the cap, so the loop reads one batch beyond it and trims the
+  surplus before writing the CSV.
 
   Row-set posture mirrors the index exactly, so no new data path is opened: an
   owner-scoped scaffold's export is `#[secured]` and reads through the

@@ -3938,7 +3938,11 @@ mod attachment_read_back_tests {
         };
         format!(
             "{schema_impl}\n\
-             /// The most rows one `GET /{plural}/export.csv` will read.\n\
+             /// The most rows one `GET /{plural}/export.csv` will return.\n\
+             ///\n\
+             /// The handler reads up to one batch PAST this so it can tell a full\n\
+             /// export from a truncated one; the surplus is trimmed before the CSV is\n\
+             /// written.\n\
              ///\n\
              /// This bounds the ROW COUNT, which bounds memory only as far as your\n\
              /// widest row: the response is collected in memory before it is sent, so\n\
@@ -3957,7 +3961,8 @@ mod attachment_read_back_tests {
              /// page of the current filter.\n\
              ///\n\
              /// Rows are read in `MAX_PAGE_SIZE` batches (so no single query loads the\n\
-             /// table) and capped at `MAX_EXPORT_ROWS`. `Content-Type`,\n\
+             /// table) and capped at `MAX_EXPORT_ROWS`, plus one batch past the cap to\n\
+             /// detect truncation. `Content-Type`,\n\
              /// `Content-Disposition` and `Content-Length` come from `Download`, which\n\
              /// infers `text/csv` from the `.csv` filename and sanitizes the name.\n\
              ///\n\
@@ -3992,7 +3997,11 @@ mod attachment_read_back_tests {
              // A short batch is the last one: nothing after it to ask for.\n        \
              let exhausted = batch.content.len() < batch_size as usize;\n        \
              rows.extend(batch.content);\n        \
-             if exhausted || rows.len() >= MAX_EXPORT_ROWS {{\n            \
+             // `>`, not `>=`: stopping the moment the cap is FILLED cannot tell a\n        \
+             // result set of exactly MAX_EXPORT_ROWS from a larger one, so the\n        \
+             // truncation warning below would never fire and over-cap exports would\n        \
+             // drop rows silently. Read past the cap and trim the surplus off.\n        \
+             if exhausted || rows.len() > MAX_EXPORT_ROWS {{\n            \
              break;\n        \
              }}\n        \
              page += 1;\n    \
