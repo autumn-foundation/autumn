@@ -248,6 +248,7 @@ findings="$(
       } else {
         visible = comment_head
         in_comment = 1
+        comment_opened_at = FNR
         break
       }
     }
@@ -351,6 +352,7 @@ findings="$(
   END {
     flush_entry()
     if (in_fence) printf "UNCLOSED\t-\t%d\tcode fence opened here is never closed\n", fence_opened_at
+    if (in_comment) printf "UNCLOSED\t-\t%d\tHTML comment opened here is never closed\n", comment_opened_at
   }
   ' "$CHANGELOG"
 )"
@@ -389,8 +391,8 @@ while IFS=$'\t' read -r kind _ line text; do
       ;;
     UNCLOSED)
       die "$CHANGELOG:$line: $text.
-       Everything after it is read as part of one entry, which hides whole
-       release sections from the gate. Close the fence."
+       Everything after it is swallowed — headings, entries and all — which
+       hides whole release sections from every check below. Close it."
       ;;
     AMBIGUOUS)
       die "$CHANGELOG:$line: a '**Breaking:**' marker survives only inside a code span:
@@ -575,8 +577,12 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
               in_fence = 0
             }
           }
-          if (fence_hit || in_fence) {
-            if (current != "") content[current] = 1
+          # The delimiters themselves are not migration instructions: an
+          # empty block under every heading renders as nothing at all. Only
+          # lines *inside* the fence count.
+          if (fence_hit) next
+          if (in_fence) {
+            if (current != "" && $0 ~ /[^[:space:]]/) content[current] = 1
             next
           }
         }

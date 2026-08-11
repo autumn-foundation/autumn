@@ -2929,3 +2929,81 @@ fn migration_guide_gate_ignores_index_entries_that_do_not_render() {
         );
     }
 }
+
+// --- Review round 9: unclosed comments, empty fences ----------------------
+
+#[test]
+fn migration_guide_gate_rejects_an_unclosed_html_comment() {
+    // The same fail-closed rule the unclosed *fence* already had: a stuck
+    // comment state silently discards every heading and entry after it, so a
+    // breaking release with no guide disappears from the gate entirely.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Added\n\n\
+         - **api:** an addition.\n\n\
+         <!-- parked, forgot to close\n\n\
+         ## [0.6.0] - 2026-08-01\n\n\
+         ### Breaking Changes\n\n\
+         - **db:** **Breaking:** renamed, with no guide anywhere.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an unclosed comment hides every section below it — the gate must say \
+         so rather than report OK on a changelog it stopped reading\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("comment"),
+        "the failure must name the unclosed comment\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_count_empty_fences_as_content() {
+    // Fence delimiters are not migration instructions. An empty block under
+    // every required heading renders as nothing at all.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(
+        &tmp,
+        "0.7.0",
+        &valid_migration_guide("0.7.0").replace(
+            "### Area: the thing that broke\n\nBefore / after.",
+            "```rust\n```",
+        ),
+    );
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an empty fenced block is not content",
+    );
+
+    // A fence with something in it still is.
+    write_fixture_guide(
+        &tmp,
+        "0.7.0",
+        &valid_migration_guide("0.7.0").replace(
+            "### Area: the thing that broke\n\nBefore / after.",
+            "```rust\nlet repo = PostRepository::with_pool_untracked(pool);\n```",
+        ),
+    );
+    assert!(
+        run_migration_gate(tmp.path()).status.success(),
+        "a fenced example with a line in it is perfectly good content",
+    );
+}
