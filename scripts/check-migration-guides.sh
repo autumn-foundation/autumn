@@ -140,6 +140,14 @@ function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
   return out
 }
 
+function dedent3(text,   n) {
+  # Markdown permits up to three leading spaces on a block-level construct; a
+  # fourth makes the line an indented code block, i.e. literal text.
+  n = 0
+  while (n < 3 && substr(text, n + 1, 1) == " ") n++
+  return substr(text, n + 1)
+}
+
 function links_to(text, path,   needle, pos, at, i, ch, start) {
   # A complete inline link `[label](path)`, not a bare `](path)`: the second
   # renders as literal text, so the reader has nothing to click.
@@ -195,8 +203,9 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
 
   # Fences first. A closing fence uses the same character and is at least as
   # long as its opener, so a ````markdown block may contain a ``` sample.
-  body = line
-  sub(/^[[:space:]]*/, "", body)
+  # Four or more leading spaces makes these backticks literal text, not a
+  # fence — an over-indented example of a fence marker must not open one.
+  body = dedent3(line)
   ch = substr(body, 1, 1)
   if (ch == "`" || ch == "~") {
     run = 0
@@ -361,15 +370,16 @@ findings="$(
     if (md_fence_hit || md_in_fence) next
   }
 
-  visible ~ /^## / {
+  dedent3(visible) ~ /^## / {
     flush_entry()
     breaking_heading = 0
-    if (tolower($0) ~ /^##[[:space:]]+\[?unreleased\]?[[:space:]]*$/) {
+    heading = dedent3(visible)
+    if (tolower(heading) ~ /^##[[:space:]]+\[?unreleased\]?[[:space:]]*$/) {
       section = "Unreleased"
       guide_path = unreleased_guide
       in_scope = 1
-    } else if (match($0, /\[[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\][[:space:]]*(-|$)/)) {
-      section = substr($0, RSTART + 1, RLENGTH - 2)
+    } else if (match(heading, /\[[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\][[:space:]]*(-|$)/)) {
+      section = substr(heading, RSTART + 1, RLENGTH - 2)
       sub(/\].*$/, "", section)
       # A release candidate is gated against its release`s guide.
       release = section
@@ -380,7 +390,7 @@ findings="$(
       # Fail closed. An unreadable heading used to emit no record at all, so
       # the section was not merely un-gated -- it was invisible, including to
       # --list, which is the operator`s only sanity check.
-      printf "UNPARSED\t-\t%d\t%s\n", FNR, $0
+      printf "UNPARSED\t-\t%d\t%s\n", FNR, heading
       section = ""
       guide_path = ""
       in_scope = 0
@@ -390,17 +400,19 @@ findings="$(
     next
   }
 
-  visible ~ /^### / {
+  dedent3(visible) ~ /^### / {
     flush_entry()
     # Only the documented heading declares a break. A `breaking` *prefix* match
     # turned `### Breaking down request latency` into a section where every
     # additive bullet demanded a migration guide.
-    breaking_heading = (tolower(visible) ~ /^###[[:space:]]+breaking[[:space:]]+changes[[:space:]]*$/)
+    breaking_heading = (tolower(dedent3(visible)) ~ /^###[[:space:]]+breaking[[:space:]]+changes[[:space:]]*$/)
     next
   }
 
-  # `-` and `*` are both legal markdown bullets.
-  visible ~ /^[-*] / {
+  # `-`, `*` and `+` are all legal markdown bullets. Indentation is NOT
+  # dedented here: an indented bullet is a nested list item, part of the entry
+  # above it, not an entry of its own.
+  visible ~ /^[-*+] / {
     flush_entry()
     entry_line = FNR
     entry_breaking_heading = breaking_heading
@@ -609,12 +621,12 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             next
           }
         }
-        visible ~ /^#+ / {
-          level = heading_level(visible)
+        dedent3(visible) ~ /^#+ / {
+          level = heading_level(dedent3(visible))
           # A deeper heading is content for the section it sits under.
           if (current != "" && level > current_level) content[current] = 1
           flush_section()
-          current = visible
+          current = dedent3(visible)
           sub(/[[:space:]]+$/, "", current)
           current_level = level
           seen[current] = 1
@@ -709,8 +721,8 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             # comment, a code span or a fenced sample renders as anything but a
             # link, so the guide stays undiscoverable.
             { visible = strip_code_spans(visible_text($0)) }
-            visible ~ /^##[[:space:]]+Index[[:space:]]*$/ { in_index = 1; next }
-            visible ~ /^##[[:space:]]/                    { in_index = 0 }
+            dedent3(visible) ~ /^##[[:space:]]+Index[[:space:]]*$/ { in_index = 1; next }
+            dedent3(visible) ~ /^##[[:space:]]/                    { in_index = 0 }
             in_index && links_to(visible, want_path) > 0  { found = 1 }
             END { exit found ? 0 : 1 }
           ' "$index_file"; then

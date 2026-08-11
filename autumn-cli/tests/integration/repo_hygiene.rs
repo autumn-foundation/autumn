@@ -3177,3 +3177,66 @@ fn migration_guide_gate_reads_the_breaking_heading_as_rendered() {
          are breaking entries",
     );
 }
+
+// --- Review round 13: markdown's permitted leniency -----------------------
+
+#[test]
+fn migration_guide_gate_accepts_indented_release_headings() {
+    // Up to three leading spaces is a valid ATX heading. An unrecognised
+    // heading emitted no UNPARSED finding either, so the section vanished.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        // The indentation has to sit after an explicit `\n` on the same source
+        // line: a trailing `\` continuation would swallow it.
+        "# Changelog\n\n   ## [0.7.0] - 2026-09-01\n\n  ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed, with no guide anywhere.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an indented heading is still a heading",
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_plus_bullets() {
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         + **api:** **Breaking:** removed, with no guide anywhere.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "`+` is a legal markdown bullet",
+    );
+}
+
+#[test]
+fn migration_guide_gate_ignores_over_indented_fence_markers() {
+    // Four spaces makes a line an indented code block, so those backticks are
+    // literal text, not a fence. Treating them as one swallowed the entries
+    // between two such displayed markers.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **docs:** a fence is written as:\n\n    ```\n\n\
+         - **db:** **Breaking:** `with_pool` renamed, with no guide anywhere.\n\n\
+         - **docs:** and closed with:\n\n    ```\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "four-space-indented backticks are literal text, not a fence",
+    );
+}
