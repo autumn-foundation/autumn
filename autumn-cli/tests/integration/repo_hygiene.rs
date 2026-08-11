@@ -1128,3 +1128,422 @@ fn deployment_guide_references_build_and_boot_gate() {
          behind the documented 10-minute deploy promise",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Migration guide coverage gate (issue #1588)
+//
+// Autumn ships every 2–4 weeks and, pre-1.0, most releases can break existing
+// apps. `docs/migrations/` is the documented upgrade path, but nothing forced
+// a guide to exist: the only automated check keyed off a `### Breaking`
+// CHANGELOG heading this repo has never used, so it never fired. These tests
+// pin the replacement gate — `scripts/check-migration-guides.sh` — and the
+// backfilled guides it protects.
+// ---------------------------------------------------------------------------
+
+/// Guides that must exist for already-published releases (issue #1588 AC2).
+/// Floored at 0.4.0: earlier releases are explicitly out of scope.
+const BACKFILLED_MIGRATION_GUIDES: &[&str] = &["0.4.0", "0.5.0", "0.6.0"];
+
+/// Build a self-contained repo skeleton the migration-guide gate can run
+/// against, with `scripts/check-migration-guides.sh` copied in from the real
+/// workspace. Returns the tempdir; the caller writes `CHANGELOG.md` and any
+/// guides it needs.
+fn migration_gate_fixture(workspace_version: &str) -> tempfile::TempDir {
+    let root = workspace_root();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let scripts_dir = tmp.path().join("scripts");
+    let migrations_dir = tmp.path().join("docs/migrations");
+    std::fs::create_dir_all(&scripts_dir).expect("scripts dir");
+    std::fs::create_dir_all(&migrations_dir).expect("migrations dir");
+    std::fs::copy(
+        root.join("scripts/check-migration-guides.sh"),
+        scripts_dir.join("check-migration-guides.sh"),
+    )
+    .expect("copy migration-guide script");
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        format!("[workspace.package]\nversion = \"{workspace_version}\"\n"),
+    )
+    .expect("workspace manifest");
+    std::fs::write(
+        migrations_dir.join("README.md"),
+        "# Migration Guides\n\n## Index\n",
+    )
+    .expect("migrations index");
+    tmp
+}
+
+/// A minimal guide that satisfies the gate's shape requirements, so shape
+/// failures never masquerade as coverage failures in these tests.
+fn valid_migration_guide(version: &str) -> String {
+    format!(
+        "# Migrating from Autumn `0.x` to `{version}`\n\n\
+         ## At a glance\n\n\
+         - **Old version:** `autumn-web 0.x`\n\
+         - **New version:** `autumn-web {version}`\n\n\
+         ## Summary\n\n\
+         Why this release breaks.\n\n\
+         ## Before you start\n\n\
+         Pin the old version and get green.\n\n\
+         ## Breaking changes\n\n\
+         ### Area: the thing that broke\n\n\
+         Before / after.\n\n\
+         ## How to verify\n\n\
+         Run `cargo check`.\n\n\
+         ### Guide-only upgrade walkthrough\n\n\
+         - **Status:** performed 2026-01-01\n"
+    )
+}
+
+/// Register a guide in the fixture and index it, mirroring what the real
+/// `docs/migrations/README.md` does.
+fn write_fixture_guide(tmp: &tempfile::TempDir, version: &str, body: &str) {
+    let migrations = tmp.path().join("docs/migrations");
+    std::fs::write(migrations.join(format!("{version}.md")), body).expect("guide");
+    let index_path = migrations.join("README.md");
+    let mut index = std::fs::read_to_string(&index_path).expect("index");
+    writeln!(index, "- [`{version}.md`]({version}.md)").expect("index entry");
+    std::fs::write(&index_path, index).expect("write index");
+}
+
+fn run_migration_gate(dir: &Path) -> Output {
+    bash_command()
+        .arg("scripts/check-migration-guides.sh")
+        .current_dir(dir)
+        .output()
+        .expect("run migration-guide gate")
+}
+
+fn gate_report(output: &Output) -> String {
+    format!(
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+#[test]
+fn migration_guide_gate_passes_for_this_repository() {
+    let root = workspace_root();
+    let output = run_migration_gate(&root);
+    assert!(
+        output.status.success(),
+        "scripts/check-migration-guides.sh must pass on this repository — every \
+         breaking CHANGELOG entry needs a linked migration guide (issue #1588).\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guides_are_backfilled_for_published_releases() {
+    let root = workspace_root();
+    for version in BACKFILLED_MIGRATION_GUIDES {
+        let guide = root.join(format!("docs/migrations/{version}.md"));
+        assert!(
+            guide.is_file(),
+            "issue #1588 AC2 requires a backfilled migration guide at {}",
+            guide.display(),
+        );
+    }
+
+    // The 0.6.0 cycle renamed the generated repository constructor `with_pool`
+    // to `with_pool_untracked` (#1273). The guide is the only place a user
+    // upgrading onto that release can learn the new name.
+    let guide_060 = std::fs::read_to_string(root.join("docs/migrations/0.6.0.md"))
+        .expect("read docs/migrations/0.6.0.md");
+    assert!(
+        guide_060.contains("with_pool_untracked"),
+        "docs/migrations/0.6.0.md must document the `with_pool` -> \
+         `with_pool_untracked` rename (issue #1588 AC2)",
+    );
+}
+
+#[test]
+fn migration_guides_are_indexed_and_record_a_walkthrough() {
+    let root = workspace_root();
+    let migrations = root.join("docs/migrations");
+    let index = std::fs::read_to_string(migrations.join("README.md")).expect("read index");
+
+    for entry in std::fs::read_dir(&migrations).expect("read docs/migrations") {
+        let path = entry.expect("dir entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !name.ends_with(".md") || name == "README.md" || name == "TEMPLATE.md" {
+            continue;
+        }
+
+        assert!(
+            index.contains(&name),
+            "docs/migrations/README.md must index {name} (issue #1588 AC1)",
+        );
+
+        let guide = std::fs::read_to_string(&path).expect("read guide");
+        assert!(
+            guide.contains("## How to verify"),
+            "{name} must tell the reader how to verify the upgrade (issue #1588 AC1)",
+        );
+        assert!(
+            guide.contains("### Guide-only upgrade walkthrough"),
+            "{name} must record the guide-only upgrade walkthrough (issue #1588 AC5)",
+        );
+    }
+}
+
+#[test]
+fn migration_guide_gate_requires_a_guide_for_a_breaking_release() {
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-08-01\n\n\
+         ### Changed\n\n\
+         - **api:** **Breaking:** `App::run` takes a config argument. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a breaking release with no migration guide must fail the gate\n{}",
+        gate_report(&output),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("docs/migrations/0.7.0.md"),
+        "the failure must name the missing guide path\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_requires_breaking_entries_to_link_their_guide() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-08-01\n\n\
+         ### Changed\n\n\
+         - **api:** **Breaking:** `App::run` takes a config argument.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a breaking entry that does not link its guide must fail the gate \
+         (issue #1588 AC3)\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_flags_unmarked_breaking_prose() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-08-01\n\n\
+         ### Changed\n\n\
+         - **api:** the response shape changed. Breaking for code that matches\n  \
+           on the old variant.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "breaking prose without the `**Breaking:**` marker must fail the gate — \
+         an unmarked break is invisible to the coverage check\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_non_breaking_prose() {
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-08-01\n\n\
+         ### Added\n\n\
+         - **notify:** a new store. All additions are additive — no\n  \
+           breaking change to existing surfaces.\n\
+         - **search:** a new backend is a new `impl` rather than a breaking change.\n\
+         - **jobs:** Additive and non-breaking: jobs without the attribute are unchanged.\n\
+         - **mcp:** `Origin` validation defends against DNS-rebinding without\n  \
+           breaking agent clients.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "explicitly non-breaking prose must not trip the gate — false positives \
+         would push contributors to spam the marker\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_stub_guides() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(
+        &tmp,
+        "0.7.0",
+        "# Migrating from Autumn `0.6` to `0.7`\n\nTODO.\n",
+    );
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-08-01\n\n\
+         ### Changed\n\n\
+         - **api:** **Breaking:** `App::run` takes a config argument. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a guide that only exists to satisfy the file check must fail the shape \
+         check — an empty stub strands the reader just as hard as no guide\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_ignores_releases_before_the_backfill_floor() {
+    let tmp = migration_gate_fixture("0.3.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.3.0] - 2026-04-27\n\n\
+         ### Changed\n\n\
+         - **api:** **Breaking:** an ancient break with no guide.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "guides for releases before 0.4.0 are explicitly out of scope (issue \
+         #1588) — the gate must not demand them\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_survives_a_long_changelog() {
+    // Regression guard mirroring `release_notes_script_detects_breaking_section_
+    // with_long_changelog_entry`: `awk | grep -q` under `pipefail` drops the
+    // rest of a long entry on SIGPIPE and reports a false negative.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+
+    let mut changelog = String::from(
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-08-01\n\n\
+         ### Changed\n\n\
+         - **api:** **Breaking:** `App::run` takes a config argument. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n\n\
+         ### Added\n\n",
+    );
+    for i in 0..200_000 {
+        writeln!(changelog, "- filler line {i}").expect("write filler line");
+    }
+    changelog.push_str("\n## [0.3.0] - 2026-04-27\n\n- Previous release.\n");
+    std::fs::write(tmp.path().join("CHANGELOG.md"), changelog).expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "the gate must classify a long changelog entry correctly\n{}",
+        gate_report(&output),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("docs/migrations/0.7.0.md"),
+        "the gate must report the guide it matched\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_covers_unreleased_breaking_entries() {
+    let tmp = migration_gate_fixture("0.6.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [Unreleased]\n\n\
+         ### Changed\n\n\
+         - **routing:** **Breaking:** `Route` gained a field.\n\n\
+         ## [0.6.0] - 2026-07-18\n\n- Released.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an unreleased breaking entry must require the rolling \
+         docs/migrations/next.md draft (issue #1588 AC3)\n{}",
+        gate_report(&output),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("next.md"),
+        "the failure must point at the rolling next.md draft\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn release_checklist_gates_publication_on_the_migration_guide() {
+    let root = workspace_root();
+    let checklist_path = root.join("docs/release-checklist.md");
+    let checklist = std::fs::read_to_string(&checklist_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", checklist_path.display()));
+
+    assert!(
+        checklist.contains("scripts/check-migration-guides.sh"),
+        "the release checklist must run the migration-guide gate before \
+         publishing to crates.io (issue #1588 AC4)",
+    );
+    assert!(
+        checklist.contains("autumn new"),
+        "the release checklist must require the guide-only upgrade walk-through \
+         of an `autumn new` app from the previous release (issue #1588 AC5)",
+    );
+    assert!(
+        checklist.to_lowercase().contains("walk-through")
+            || checklist.to_lowercase().contains("walkthrough"),
+        "the release checklist must name the recorded upgrade walk-through \
+         (issue #1588 AC5)",
+    );
+}
+
+#[test]
+fn ci_runs_the_migration_guide_gate_on_every_pull_request() {
+    let root = workspace_root();
+    let workflow_path = root.join(".github/workflows/ci.yml");
+    let workflow = std::fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+
+    assert!(
+        workflow.contains("check-migration-guides.sh"),
+        "{} must run the migration-guide gate so a breaking change without a \
+         guide fails CI on the PR, not at tag time (issue #1588 AC4)",
+        workflow_path.display(),
+    );
+    assert!(
+        workflow.contains("pull_request"),
+        "{} must run on pull requests",
+        workflow_path.display(),
+    );
+}
