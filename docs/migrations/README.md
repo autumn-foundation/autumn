@@ -95,12 +95,20 @@ It fails when:
   `TEMPLATE.md`'s banner or placeholders, or is not indexed above;
 - a released guide's walk-through is not recorded as `performed YYYY-MM-DD`
   (or explicitly `backfilled`); `pending` is allowed only on `next.md`;
+
+  `next.md` is a **draft**, so it is also exempt from the placeholder and
+  empty-section checks — the release checklist recreates it from
+  `TEMPLATE.md` after every release, and the template ships placeholders by
+  design. Every exemption lapses the moment it is renamed to `<version>.md`.
 - it cannot read the changelog: a `## ` heading it fails to parse and an
   unclosed code fence are hard errors, because either one silently removes
   whole sections from every check above.
 
 Details that save a round trip: `**Breaking:**` is matched case-insensitively,
 `- ` and `* ` are both bullets, and a marker inside a code span is a mention.
+Fenced code blocks (``` or `~~~`) are skipped wholesale in both the changelog
+and the guides — a `breaking` key in a config sample is not a breaking change,
+and a guide cannot satisfy its own required headings from inside an example.
 
 The lint is textual, so it removes the *silent* failure mode rather than
 replacing review: a break described without the word "breaking" and without the

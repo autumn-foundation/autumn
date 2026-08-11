@@ -171,7 +171,7 @@ findings="$(
       # real breaks; entries that need more latitude use the suppression, which
       # is visible in the diff.
       for (i = 0; i < 3; i++) {
-        gsub(/ (non breaking|no breaking|not a breaking|without breaking|rather than a breaking) /, " ", lower)
+        gsub(/ (non breaking|no breaking|nothing breaking|not a breaking|without breaking|rather than a breaking) /, " ", lower)
       }
       if (lower ~ / breaking /) {
         printf "UNMARKED\t%s\t%d\t%s\n", section, entry_line, excerpt(entry)
@@ -182,25 +182,43 @@ findings="$(
 
   # Fenced code blocks hold TOML/YAML samples whose lines start with "- ".
   # They are part of the entry that opened them, never entries themselves.
-  # CommonMark: a closing fence is at least as long as its opener, so a
-  # ````markdown block may contain a ``` sample. A naive toggle read that as an
-  # odd number of flips and swallowed the whole rest of the file.
-  /^[[:space:]]*```/ {
-    fence_line = $0
-    sub(/^[[:space:]]*/, "", fence_line)
-    fence_ticks = 0
-    while (substr(fence_line, fence_ticks + 1, 1) == "`") fence_ticks++
-    if (!in_fence) {
-      in_fence = 1
-      fence_len = fence_ticks
-      fence_opened_at = FNR
-    } else if (fence_ticks >= fence_len && substr(fence_line, fence_ticks + 1) ~ /^[[:space:]]*$/) {
-      in_fence = 0
+  #
+  # CommonMark rules that matter here, each of which a naive toggle got wrong:
+  # a fence may be ``` or ~~~; a closing fence uses the same character and is
+  # at least as long as its opener (so a ````markdown block may contain a ```
+  # sample); and a line with an info string is an opener, never a closer.
+  # Getting any of them wrong leaves the parser stuck inside a fence, which
+  # swallows every section below it. Keep in sync with scan_fence in the guide
+  # parser further down this script.
+  {
+    fence_hit = 0
+    fence_body = $0
+    sub(/^[[:space:]]*/, "", fence_body)
+    fence_char = substr(fence_body, 1, 1)
+    if (fence_char == "`" || fence_char == "~") {
+      fence_run = 0
+      while (substr(fence_body, fence_run + 1, 1) == fence_char) fence_run++
+      if (fence_run >= 3) fence_hit = 1
     }
-    if (entry != "") entry = entry " " $0
-    next
+
+    if (fence_hit) {
+      if (!in_fence) {
+        in_fence = 1
+        fence_len = fence_run
+        fence_open_char = fence_char
+        fence_opened_at = FNR
+      } else if (fence_char == fence_open_char && fence_run >= fence_len &&
+                 substr(fence_body, fence_run + 1) ~ /^[[:space:]]*$/) {
+        in_fence = 0
+      }
+    }
+    # Fence content is deliberately NOT appended to the entry. It is a code
+    # sample: a `**Breaking:**` in it is a mention, a guide path in it is not a
+    # link the reader can click, and a TOML comment mentioning "breaking" is
+    # not a breaking change. Appending it and then trying to reason about the
+    # text is how a config example turned a docs PR red.
+    if (fence_hit || in_fence) next
   }
-  in_fence { if (entry != "") entry = entry " " $0; next }
 
   /^## / {
     flush_entry()
@@ -363,20 +381,51 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
     [[ "$guide" == "$UNRELEASED_GUIDE" ]] && allow_pending=1
 
     guide_findings="$(
-      awk -v required="$REQUIRED_SECTIONS" -v allow_pending="$allow_pending" '
+      awk -v required="$REQUIRED_SECTIONS" -v allow_pending="$allow_pending" \
+          -v is_draft="$allow_pending" '
         function heading_level(line,   n) {
           n = 0
           while (substr(line, n + 1, 1) == "#") n++
           return n
         }
         function flush_section() {
-          if (current != "" && (current in want) && !content[current]) {
+          if (current != "" && (current in want) && !content[current] && !is_draft) {
             printf "EMPTY\t%s\n", current
           }
         }
         BEGIN {
           split(required, list, "|")
           for (i in list) want[list[i]] = 1
+        }
+        # A guide illustrating what a guide looks like must not satisfy its own
+        # structure from inside the sample. Fence lines and their contents count
+        # as *content* for the enclosing section, but never as headings, as the
+        # walk-through status, or as placeholders. Mirrors the changelog
+        # parsers fence handling above.
+        {
+          fence_hit = 0
+          fence_body = $0
+          sub(/^[[:space:]]*/, "", fence_body)
+          fence_char = substr(fence_body, 1, 1)
+          if (fence_char == "`" || fence_char == "~") {
+            fence_run = 0
+            while (substr(fence_body, fence_run + 1, 1) == fence_char) fence_run++
+            if (fence_run >= 3) fence_hit = 1
+          }
+          if (fence_hit) {
+            if (!in_fence) {
+              in_fence = 1
+              fence_len = fence_run
+              fence_open_char = fence_char
+            } else if (fence_char == fence_open_char && fence_run >= fence_len &&
+                       substr(fence_body, fence_run + 1) ~ /^[[:space:]]*$/) {
+              in_fence = 0
+            }
+          }
+          if (fence_hit || in_fence) {
+            if (current != "") content[current] = 1
+            next
+          }
         }
         /^#+ / {
           level = heading_level($0)
@@ -395,6 +444,11 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
         END {
           flush_section()
           for (h in want) if (!(h in seen)) printf "MISSING\t%s\n", h
+          # The rolling draft is a skeleton by design: docs/release-checklist.md
+          # recreates it from TEMPLATE.md after every release so the links to it
+          # keep resolving, and the template carries placeholders. Both checks
+          # apply the moment it is renamed to <version>.md.
+          if (is_draft) placeholder = 0
           if (status == "") {
             printf "NOSTATUS\t-\n"
           } else if (!allow_pending &&

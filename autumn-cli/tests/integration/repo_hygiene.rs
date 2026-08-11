@@ -2196,3 +2196,126 @@ fn migration_guide_gate_requires_a_dated_or_backfilled_walkthrough() {
         );
     }
 }
+
+// --- Review round: fenced content and the rolling draft's lifecycle ---------
+
+#[test]
+fn migration_guide_gate_rejects_a_guide_whose_structure_is_only_a_code_sample() {
+    // The guide parser did not track fences, so a guide could satisfy every
+    // required heading — and the walk-through record — from inside a markdown
+    // code sample. Same bug class as the changelog parser's, one file over.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(
+        &tmp,
+        "0.7.0",
+        &format!(
+            "# Migrating to 0.7.0\n\n\
+             Here is what a guide looks like:\n\n\
+             ````markdown\n{}````\n",
+            valid_migration_guide("0.7.0")
+        ),
+    );
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "headings inside a code sample are an illustration, not the guide's \
+         own structure",
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_tilde_fenced_changelog_examples() {
+    // `~~~` is a legal markdown fence. Recognising only backticks meant a
+    // tilde-fenced config sample leaked into the entry, so a `breaking` key or
+    // comment inside it tripped the unmarked-break lint on valid docs.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Added\n\n\
+         - **config:** a new sample:\n\n  \
+           ~~~toml\n  \
+           # set this before breaking out the load balancer\n  \
+           - not a bullet\n  \
+           ~~~\n\n\
+         - **api:** an unrelated addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a tilde-fenced example must be part of its entry, not parsed as \
+         prose and bullets\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_a_freshly_recreated_rolling_draft() {
+    // docs/release-checklist.md requires recreating `next.md` from TEMPLATE.md
+    // after every release so the links to it keep resolving. The template
+    // carries `{X.Y.Z}`-style placeholders by design, so the placeholder and
+    // empty-section checks must not apply to the draft — otherwise following
+    // the documented procedure leaves the gate red until someone invents
+    // details for a release that has no changes yet.
+    let root = workspace_root();
+    let template = std::fs::read_to_string(root.join("docs/migrations/TEMPLATE.md"))
+        .expect("read TEMPLATE.md");
+    // The checklist says "banner deleted": drop the leading blockquote.
+    let recreated: String = template
+        .lines()
+        .skip_while(|line| !line.starts_with("> ") && !line.starts_with('#'))
+        .filter(|line| !line.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        recreated.contains("{X.Y.Z}"),
+        "this test is only meaningful while TEMPLATE.md still has placeholders",
+    );
+
+    let tmp = migration_gate_fixture("0.6.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## [Unreleased]\n\n- Nothing breaking yet.\n",
+    )
+    .expect("changelog");
+    write_fixture_guide(&tmp, "next", &recreated);
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a rolling draft recreated from the template must pass — this is the \
+         documented post-release step\n{}",
+        gate_report(&output),
+    );
+
+    // The same content under a released version must still be rejected: the
+    // exemption is for the draft, not a licence to ship placeholders.
+    std::fs::remove_file(tmp.path().join("docs/migrations/next.md")).expect("remove draft");
+    write_fixture_guide(&tmp, "0.6.0", &recreated);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.6.0] - 2026-07-18\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.6.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a released guide full of template placeholders must fail",
+    );
+}

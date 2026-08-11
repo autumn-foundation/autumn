@@ -27,7 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   section (`## [0.7.0-rc.1]`) is gated against its release's guide. The gate
   fails closed on anything it cannot read — an unparseable `## ` heading and an
   unclosed code fence are hard errors, since either silently removes whole
-  sections from every check. It runs as its own `ci.yml` job on every pull
+  sections from every check. Fenced code blocks — backtick or tilde, of any
+  fence length — are skipped wholesale in both the changelog and the guides
+  (CommonMark closing rules included), so a config sample cannot
+  turn a docs PR red and a guide cannot satisfy its own required headings from
+  inside an example; the rolling `next.md` draft is exempt from the placeholder
+  and empty-section checks, since the checklist recreates it from `TEMPLATE.md`
+  after every release. It runs as its own `ci.yml` job on every pull
   request, so the guide is written by the author of the break while the change
   is still in review, and again in the publish gate for tags pushed outside a
   PR. Docs-only and free of any Rust build, it reports in seconds.

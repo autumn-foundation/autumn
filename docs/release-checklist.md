@@ -219,7 +219,10 @@ guide** — the guide is a gate, not a courtesy (issue #1588). See
   always exists. [`docs/migrations/README.md`](migrations/README.md) and
   [`STABILITY.md`](../STABILITY.md) both link it by name, and nothing in this
   repo checks markdown links — a missing `next.md` 404s silently until the next
-  breaking PR happens to recreate it.
+  breaking PR happens to recreate it. Leave the template's `{X.Y.Z}`
+  placeholders in place: the gate treats `next.md` as a draft and accepts them
+  (and empty sections) there, so you are not inventing details for a release
+  that has no changes yet.
 - [ ] Update the index in [`docs/migrations/README.md`](migrations/README.md):
   add `X.Y.Z.md`, keep `next.md`.
 
