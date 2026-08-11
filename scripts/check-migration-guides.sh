@@ -148,7 +148,17 @@ function dedent3(text,   n) {
   return substr(text, n + 1)
 }
 
-function links_to(text, path,   needle, pos, at, i, ch, start) {
+function heading_text(line,   h) {
+  # The rendered text of an ATX heading: markdown allows a tab after the
+  # marker, and an optional trailing run of hashes is a closing sequence, not
+  # part of the heading.
+  h = dedent3(line)
+  sub(/[[:space:]]+#+[[:space:]]*$/, "", h)
+  sub(/[[:space:]]+$/, "", h)
+  return h
+}
+
+function links_to(text, path,   needle, pos, at, i, ch, start, slashes) {
   # A complete inline link `[label](path)`, not a bare `](path)`: the second
   # renders as literal text, so the reader has nothing to click.
   needle = "](" path ")"
@@ -158,7 +168,13 @@ function links_to(text, path,   needle, pos, at, i, ch, start) {
     for (i = at - 1; i >= 1; i--) {
       ch = substr(text, i, 1)
       if (ch == "]") break
-      if (ch == "[") return 1
+      # An escaped bracket renders as literal text: `\[label](path)` is not a
+      # link. Odd run of backslashes before it means escaped.
+      if (ch == "[") {
+        slashes = 0
+        while (i - slashes - 1 >= 1 && substr(text, i - slashes - 1, 1) == "\\") slashes++
+        if (slashes % 2 == 0) return 1
+      }
     }
     start = at + 1
   }
@@ -211,6 +227,12 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     run = 0
     while (substr(body, run + 1, 1) == ch) run++
     if (run >= 3) md_fence_hit = 1
+  }
+  # The info string of a backtick fence may not itself contain a backtick, so
+  # a line opens nothing. Treating it as a fence hid every entry until a later
+  # literal run "closed" it, with the unclosed-fence guard never firing.
+  if (md_fence_hit && ch == "`" && !md_in_fence && index(substr(body, run + 1), "`") > 0) {
+    md_fence_hit = 0
   }
   if (md_fence_hit) {
     if (!md_in_fence) {
@@ -370,10 +392,10 @@ findings="$(
     if (md_fence_hit || md_in_fence) next
   }
 
-  dedent3(visible) ~ /^## / {
+  heading_text(visible) ~ /^##[ \t]/ {
     flush_entry()
     breaking_heading = 0
-    heading = dedent3(visible)
+    heading = heading_text(visible)
     if (tolower(heading) ~ /^##[[:space:]]+\[?unreleased\]?[[:space:]]*$/) {
       section = "Unreleased"
       guide_path = unreleased_guide
@@ -400,12 +422,12 @@ findings="$(
     next
   }
 
-  dedent3(visible) ~ /^### / {
+  heading_text(visible) ~ /^###[ \t]/ {
     flush_entry()
     # Only the documented heading declares a break. A `breaking` *prefix* match
     # turned `### Breaking down request latency` into a section where every
     # additive bullet demanded a migration guide.
-    breaking_heading = (tolower(dedent3(visible)) ~ /^###[[:space:]]+breaking[[:space:]]+changes[[:space:]]*$/)
+    breaking_heading = (tolower(heading_text(visible)) ~ /^###[[:space:]]+breaking[[:space:]]+changes$/)
     next
   }
 
@@ -621,13 +643,12 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             next
           }
         }
-        dedent3(visible) ~ /^#+ / {
-          level = heading_level(dedent3(visible))
+        heading_text(visible) ~ /^#+[ \t]/ {
+          level = heading_level(heading_text(visible))
           # A deeper heading is content for the section it sits under.
           if (current != "" && level > current_level) content[current] = 1
           flush_section()
-          current = dedent3(visible)
-          sub(/[[:space:]]+$/, "", current)
+          current = heading_text(visible)
           current_level = level
           seen[current] = 1
           next
@@ -721,8 +742,8 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             # comment, a code span or a fenced sample renders as anything but a
             # link, so the guide stays undiscoverable.
             { visible = strip_code_spans(visible_text($0)) }
-            dedent3(visible) ~ /^##[[:space:]]+Index[[:space:]]*$/ { in_index = 1; next }
-            dedent3(visible) ~ /^##[[:space:]]/                    { in_index = 0 }
+            heading_text(visible) ~ /^##[[:space:]]+Index$/ { in_index = 1; next }
+            heading_text(visible) ~ /^##[[:space:]]/          { in_index = 0 }
             in_index && links_to(visible, want_path) > 0  { found = 1 }
             END { exit found ? 0 : 1 }
           ' "$index_file"; then

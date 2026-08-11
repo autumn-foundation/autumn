@@ -3240,3 +3240,82 @@ fn migration_guide_gate_ignores_over_indented_fence_markers() {
         "four-space-indented backticks are literal text, not a fence",
     );
 }
+
+// --- Review round 14: escapes, closing hashes, tabs, fence info strings ----
+
+#[test]
+fn migration_guide_gate_rejects_an_escaped_link_bracket() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See \\[migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an escaped bracket renders as literal text, so there is no link",
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_a_closed_atx_breaking_heading() {
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes ###\n\n\
+         - **db:** `with_pool` is renamed, with no guide anywhere.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "trailing hashes are an ATX closing sequence, not heading text",
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_tab_separated_headings() {
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n##\t[0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no guide anywhere.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a tab after `##` still opens an ATX heading",
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_an_invalid_backtick_info_string() {
+    // A backtick fence's info string cannot contain a backtick, so this line
+    // opens nothing. Treating it as a fence hid the entries after it, and the
+    // later literal run "closed" the synthetic fence so the unclosed guard
+    // never fired.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **docs:** an example follows.\n\n```foo`bar\n\n\
+         - **db:** **Breaking:** renamed, with no guide anywhere.\n\n```\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an invalid info string does not open a fence",
+    );
+}
