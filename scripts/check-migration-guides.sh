@@ -508,14 +508,23 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   if (md_in_fence) return ""
 
   # A raw HTML block leaves its contents literal, so a link written inside one
-  # is not clickable. Two end conditions, and using the wrong one rejects
-  # correct changelogs: a `<script>`, `<style>`, `<pre>` or `<textarea>` block
-  # (CommonMark type 1) ends on the line carrying an end tag, while everything
-  # else (type 6/7) runs to the next blank line. The end-condition line is part
-  # of the block, so text sharing a line with `</script>` stays literal too.
+  # is not clickable. The end condition varies by kind, and using the wrong one
+  # rejects correct changelogs: a `<script>`, `<style>`, `<pre>` or `<textarea>`
+  # block (CommonMark type 1) ends on the line carrying an end tag; a processing
+  # instruction, declaration or CDATA section (types 3-5) on the line carrying
+  # its own terminator; a tag-opened block (types 6/7) at the next blank line.
+  # The end-condition line is part of the block, so text sharing a line with
+  # `</script>` stays literal too.
+  #
+  # Openers are measured from `body`, not the raw line: markdown strips a list
+  # item indentation before interpreting the blocks inside it, so four spaces
+  # under a `- ` item is a two-space indent and opens a block. This is the same
+  # measurement the fence rule above uses.
   if (md_in_html_block) {
     if (md_html_type == 1) {
       if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
+    } else if (md_html_end != "") {
+      if (index(line, md_html_end) > 0) md_in_html_block = 0
     } else if (line ~ /^[[:space:]]*$/) {
       md_in_html_block = 0
     }
@@ -523,10 +532,34 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   }
   # Type 1 opens on its tag name alone: the rest of the line may be anything,
   # which is why `<pre>x</pre>` both opens and closes here.
-  if (tolower(dedent3(line)) ~ /^<(script|style|pre|textarea)([[:space:]>]|$)/) {
+  if (tolower(body) ~ /^<(script|style|pre|textarea)([[:space:]>]|$)/) {
     md_in_html_block = 1
     md_html_type = 1
+    md_html_end = ""
     if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
+    return ""
+  }
+  # Types 5, 3 and 4: CDATA, a processing instruction, and a declaration. None
+  # is a tag, so none was recognised before and their bodies were scanned as
+  # markdown. CDATA is tested first only for readability — `<!` followed by `[`
+  # is not the letter type 4 wants, and `<!--` is a comment, handled below.
+  md_html_end = ""
+  if (substr(body, 1, 9) == "<![CDATA[") {
+    md_html_end = "]]>"
+    md_html_type = 5
+  } else if (substr(body, 1, 2) == "<?") {
+    md_html_end = "?>"
+    md_html_type = 3
+  } else if (body ~ /^<![a-zA-Z]/) {
+    md_html_end = ">"
+    md_html_type = 4
+  }
+  if (md_html_end != "") {
+    md_in_html_block = 1
+    # The terminator may sit on the opening line, after the opener itself —
+    # `<?demo ?>` is a complete block. Searched past the opener so a `>` inside
+    # `<!DOCTYPE` is not mistaken for the end of the declaration.
+    if (index(substr(body, md_html_type == 5 ? 10 : 3), md_html_end) > 0) md_in_html_block = 0
     return ""
   }
   # Type 6 opens on one of a fixed list of block tag names followed by
@@ -534,7 +567,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # anything — `<div>example` opens a block just as `<div>` does. The list is
   # what keeps this narrow: any-tag-name would swallow `Vec<Route>` and
   # `<MyWidget>` in prose along with the entries the lint reads there.
-  if (tolower(dedent3(line)) ~ /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([[:space:]/>]|$)/) {
+  if (tolower(body) ~ /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([[:space:]/>]|$)/) {
     md_in_html_block = 1
     md_html_type = 6
     return ""
@@ -542,7 +575,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # Type 7 is any other complete tag standing alone on its line; content after
   # it would make the line a paragraph instead. `<!` is excluded because
   # comments are handled below with their own escape rules.
-  if (dedent3(line) ~ /^<\/?[a-zA-Z][^<>]*>[[:space:]]*$/ && dedent3(line) !~ /^<!/) {
+  if (body ~ /^<\/?[a-zA-Z][^<>]*>[[:space:]]*$/ && body !~ /^<!/) {
     md_in_html_block = 1
     md_html_type = 6
     return ""

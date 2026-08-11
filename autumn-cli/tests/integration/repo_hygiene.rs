@@ -4344,3 +4344,122 @@ fn migration_guide_gate_closes_a_type_one_block_on_any_type_one_end_tag() {
         gate_report(&output),
     );
 }
+
+// --- Review round 28: list-relative openers, non-tag HTML blocks ----------
+
+#[test]
+fn migration_guide_gate_opens_an_html_block_at_the_list_content_column() {
+    // Markdown strips a list item's content indentation before interpreting
+    // the blocks inside it, so four spaces under a `- ` item is a two-space
+    // indent — a valid HTML block opener. Measuring from column 0 left it
+    // looking like over-indented text and the link inside it looking
+    // clickable. The fence rule already measures this way.
+    //
+    // Reference implementation: the `<div>` body, link included, renders
+    // literally with no anchor element.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n    \
+         <div>\n    See the [migration guide](docs/migrations/0.7.0.md).\n    </div>\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "four spaces inside a `- ` item is a two-space indent",
+    );
+}
+
+#[test]
+fn migration_guide_gate_treats_a_processing_instruction_block_as_literal() {
+    // CommonMark type 3: `<?` opens a raw block that runs to `?>`.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <?demo\n  See the [migration guide](docs/migrations/0.7.0.md).\n  ?>\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a processing instruction leaves its body literal",
+    );
+}
+
+#[test]
+fn migration_guide_gate_treats_a_cdata_block_as_literal() {
+    // CommonMark type 5: `<![CDATA[` runs to `]]>`.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <![CDATA[\n  See the [migration guide](docs/migrations/0.7.0.md).\n  ]]>\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a CDATA section leaves its body literal",
+    );
+}
+
+#[test]
+fn migration_guide_gate_treats_a_declaration_block_as_literal() {
+    // CommonMark type 4: `<!` plus a letter runs to the next `>`.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <!DOCTYPE demo\n  See the [migration guide](docs/migrations/0.7.0.md).\n  >\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a declaration leaves its body literal",
+    );
+}
+
+#[test]
+fn migration_guide_gate_closes_a_non_tag_html_block_on_its_own_line() {
+    // The counterpart guard: these blocks end on the line carrying their
+    // terminator, including the opening line. Holding one open would swallow
+    // the entry's real link on a later line and fail a correct changelog.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed.\n  \
+         <?demo ?>\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a one-line `<? ?>` block ends on its own line\n{}",
+        gate_report(&output),
+    );
+}

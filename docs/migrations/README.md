@@ -133,11 +133,17 @@ and the guides — a `breaking` key in a config sample is not a breaking change,
 and a guide cannot satisfy its own required headings from inside an example.
 Raw HTML blocks are skipped for the same reason. They open on one of
 CommonMark's block tag names — with or without trailing content, so `<div>` and
-`<div>example` both start one — or on any other complete tag standing alone on
-its line, which leaves `Vec<Route>` and `<MyWidget>` in prose as prose. They end
-where CommonMark ends them: a `<script>`, `<style>`, `<pre>` or `<textarea>`
-block at its end tag, anything else at the next blank line. So a link on the
-line after `</script>` counts, and one sharing that line with it does not.
+`<div>example` both start one — on any other complete tag standing alone on its
+line, which leaves `Vec<Route>` and `<MyWidget>` in prose as prose, or on the
+non-tag forms `<?`, `<!CDATA[`-style sections and `<!DECLARATION`. Indentation
+is measured from the enclosing list item content column, so four spaces under a
+`- ` item is a two-space indent and opens a block, exactly as for a fence.
+
+They end where CommonMark ends them: a `<script>`, `<style>`, `<pre>` or
+`<textarea>` block at its end tag (any of the four — the spec says it need not
+match the opener), a non-tag block at its own terminator, anything else at the
+next blank line. The end-condition line belongs to the block, so a link on the
+line after `</script>` counts and one sharing that line with it does not.
 
 The lint is textual, so it removes the *silent* failure mode rather than
 replacing review: a break described without the word "breaking" and without the
