@@ -3814,3 +3814,49 @@ fn migration_guide_gate_keeps_lazy_continuation_lines() {
         "after a blank line the paragraph is outside the item again",
     );
 }
+
+#[test]
+fn migration_guide_gate_ignores_links_inside_html_attributes() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. \
+           <span title=\"[migration guide](docs/migrations/0.7.0.md)\">details</span>\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "markdown does not render a link inside an HTML attribute",
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_mistake_generics_for_html() {
+    // The counterpart, and the reason the mask is narrow: this changelog is
+    // full of `Option<String>` and `Vec<Route>`. Masking every `<...>` would
+    // silently delete prose the marker and the lint both read.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `Option<String>` becomes \
+           `Option<SecretString>` for every `Vec<Route>` builder. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "generic type parameters are not HTML tags\n{}",
+        gate_report(&output),
+    );
+}

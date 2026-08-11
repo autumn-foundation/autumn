@@ -238,6 +238,25 @@ function heading_text(line,   h) {
   return h
 }
 
+function mask_html_attributes(text,   out, rest, at) {
+  # Markdown does not render a link inside an HTML attribute, so
+  # `<span title="[guide](path)">` supplies no clickable path.
+  #
+  # The mask is deliberately narrow: only a tag that actually carries an
+  # attribute (`<name ... = ... >`). Masking every `<...>` would delete
+  # `Option<String>` and `Vec<Route>` from prose the marker and the lint both
+  # read — this changelog is full of them — turning a fail-open hole into a
+  # fail-open hole somewhere else.
+  out = ""
+  rest = text
+  while (match(rest, /<[a-zA-Z\/][^<>]*=[^<>]*>/)) {
+    out = out substr(rest, 1, RSTART - 1)
+    for (at = 0; at < RLENGTH; at++) out = out " "
+    rest = substr(rest, RSTART + RLENGTH)
+  }
+  return out rest
+}
+
 function links_to(text, path,   needle, pos, at, i, ch, start, slashes) {
   # A complete inline link `[label](path)`, not a bare `](path)`: the second
   # renders as literal text, so the reader has nothing to click.
@@ -465,7 +484,7 @@ findings="$(
       # A markdown link, not a mention: `](<guide>)`. Read the same code-span
       # stripped text the marker was read from — a path inside backticks
       # renders as code, so it is not a link the reader can follow.
-      has_link = links_to(prose, guide_path)
+      has_link = links_to(mask_html_attributes(prose), guide_path)
       printf "BREAKING\t%s\t%d\t%d\t%s\n", section, entry_line, has_link, guide_path
     } else {
       # Fold to alpha-only words so "non-breaking" and "non breaking" are the
@@ -901,7 +920,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             { visible = strip_code_spans(visible_text($0)) }
             heading_text(visible) ~ /^##[[:space:]]+Index$/ { in_index = 1; next }
             heading_text(visible) ~ /^##[[:space:]]/          { in_index = 0 }
-            in_index && links_to(visible, want_path) > 0  { found = 1 }
+            in_index && links_to(mask_html_attributes(visible), want_path) > 0 { found = 1 }
             END { exit found ? 0 : 1 }
           ' "$index_file"; then
       guide_ok=false
