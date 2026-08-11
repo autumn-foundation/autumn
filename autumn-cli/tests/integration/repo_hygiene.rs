@@ -1570,8 +1570,12 @@ fn release_checklist_gates_publication_on_the_migration_guide() {
 fn ci_runs_the_migration_guide_gate_on_every_pull_request() {
     let root = workspace_root();
     let workflow_path = root.join(".github/workflows/ci.yml");
+    // `.gitattributes` forces LF for `*.sh` but not for workflows, so on a
+    // Windows checkout this file arrives with CRLF and every `\n`-anchored
+    // split below would miss.
     let workflow = std::fs::read_to_string(&workflow_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()))
+        .replace("\r\n", "\n");
 
     // `contains("pull_request")` over the whole file is not evidence: the
     // string also appears in the `concurrency:` expression. Check the `on:`
@@ -2441,4 +2445,119 @@ fn migration_guide_gate_rejects_a_negated_walkthrough_status() {
             gate_report(&output),
         );
     }
+}
+
+// --- Review round 3: placeholders, code-span runs, status placement --------
+
+#[test]
+fn migration_guide_gate_rejects_any_unresolved_template_placeholder() {
+    // The placeholder check listed a handful of tokens by name, so a guide
+    // copied from TEMPLATE.md with only the version fields filled in — and
+    // `{Area}`, `{old MSRV}`, `{Short description}` still in place — certified
+    // as finished.
+    for placeholder in ["{Area}", "{old MSRV}", "{Short description}"] {
+        let tmp = migration_gate_fixture("0.7.0");
+        write_fixture_guide(
+            &tmp,
+            "0.7.0",
+            &valid_migration_guide("0.7.0").replace(
+                "### Area: the thing that broke",
+                &format!("### {placeholder}: broke"),
+            ),
+        );
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            "# Changelog\n\n\
+             ## [0.7.0] - 2026-09-01\n\n\
+             ### Changed\n\n\
+             - **db:** **Breaking:** `with_pool` renamed. See the \
+               [migration guide](docs/migrations/0.7.0.md).\n",
+        )
+        .expect("changelog");
+
+        assert!(
+            !run_migration_gate(tmp.path()).status.success(),
+            "an unresolved {placeholder} must not certify as a finished guide",
+        );
+    }
+}
+
+#[test]
+fn migration_guide_gate_disambiguates_a_marker_only_inside_a_code_span() {
+    // A multi-backtick span is valid CommonMark, so ``**Breaking:**`` is a
+    // mention. But a stray backtick can also swallow a real marker into what
+    // *looks* like a span. The two are textually indistinguishable, and the
+    // costs are not symmetric — a missed break strands users — so the gate
+    // asks for one explicit token instead of guessing.
+    let entry_with_span = "- **release:** the gate reads the ``**Breaking:**`` marker.";
+
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        format!("# Changelog\n\n## [0.7.0] - 2026-09-01\n\n### Added\n\n{entry_with_span}\n"),
+    )
+    .expect("changelog");
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a marker that survives only inside a code span is ambiguous and must \
+         be called out\n{}",
+        gate_report(&output),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("code span"),
+        "the failure must name the ambiguity, not just demand a guide\n{}",
+        gate_report(&output),
+    );
+
+    // The documented resolution: say it is a mention.
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        format!(
+            "# Changelog\n\n## [0.7.0] - 2026-09-01\n\n### Added\n\n{entry_with_span} \
+             <!-- migration-guide-gate: documents the marker -->\n"
+        ),
+    )
+    .expect("changelog");
+    assert!(
+        run_migration_gate(tmp.path()).status.success(),
+        "an acknowledged mention must pass",
+    );
+}
+
+#[test]
+fn migration_guide_gate_requires_the_status_under_the_walkthrough_heading() {
+    // A status recorded anywhere in the file satisfied the walk-through
+    // requirement, so the section the release process actually points at could
+    // hold nothing but prose.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(
+        &tmp,
+        "0.7.0",
+        &valid_migration_guide("0.7.0")
+            .replace(
+                "Why this release breaks.",
+                "Why this release breaks.\n\n- **Status:** performed 2026-09-01",
+            )
+            .replace(
+                "- **Status:** performed 2026-01-01",
+                "We will get to this soon.",
+            ),
+    );
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "the walk-through result must be recorded under its own heading, not \
+         anywhere in the guide",
+    );
 }

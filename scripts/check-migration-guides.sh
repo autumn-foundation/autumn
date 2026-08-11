@@ -126,6 +126,34 @@ findings="$(
     return 1
   }
 
+  # Remove inline code spans, CommonMark-style: a span opens on a run of N
+  # backticks and closes on the next run of exactly N. Matching only
+  # single-backtick pairs left the contents of a ``double-backtick`` span
+  # behind, and pairing backticks positionally let one stray backtick swallow
+  # a sentence. An unclosed run is left in place — never guessed at.
+  function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
+    out = ""
+    i = 1
+    n = length(text)
+    while (i <= n) {
+      ch = substr(text, i, 1)
+      if (ch != "`") { out = out ch; i++; continue }
+      run = 0
+      while (i + run <= n && substr(text, i + run, 1) == "`") run++
+      j = i + run
+      found = 0
+      while (j <= n) {
+        if (substr(text, j, 1) != "`") { j++; continue }
+        run2 = 0
+        while (j + run2 <= n && substr(text, j + run2, 1) == "`") run2++
+        if (run2 == run) { found = 1; break }
+        j += run2
+      }
+      if (found) { out = out " "; i = j + run } else { out = out substr(text, i, run); i += run }
+    }
+    return out
+  }
+
   function excerpt(text,   flat) {
     flat = text
     gsub(/[[:space:]]+/, " ", flat)
@@ -137,22 +165,30 @@ findings="$(
     if (!in_scope) { entry = ""; return }
 
     # Inline code spans hold *mentions* of the marker, not declarations, so an
-    # entry documenting the convention must not declare itself breaking. Strip
-    # them only when the backticks pair up: with an odd backtick the pairing is
-    # guesswork, and guessing here once made a real `**Breaking:**` vanish
-    # along with the word that would have tripped the lint.
-    scratch = entry
-    ticks = gsub(/`/, "x", scratch)
-    prose = entry
-    if (ticks % 2 == 0) gsub(/`[^`]*`/, " ", prose)
+    # entry documenting the convention must not declare itself breaking.
+    prose = strip_code_spans(entry)
 
     lower = tolower(prose)
     marked = (lower ~ /\*\*breaking(:\*\*|\*\*:)/) || entry_breaking_heading
+
+    # A marker that exists in the raw text but not after stripping is either a
+    # deliberate mention or a real marker a stray backtick swallowed. Those are
+    # textually identical and the costs are not: a missed break strands every
+    # downstream app. Ask for one token rather than guess — the suppression
+    # below settles it for a mention, fixing the backticks settles it for a
+    # declaration.
+    marker_in_span = (!marked && tolower(entry) ~ /\*\*breaking(:\*\*|\*\*:)/)
 
     # The suppression is for entries that talk *about* breaking changes. It
     # must never override an explicit declaration: one comment on a parent
     # bullet would otherwise silence every nested `**Breaking:**` under it.
     if (!marked && entry ~ /<!--[[:space:]]*migration-guide-gate:/) {
+      entry = ""
+      return
+    }
+
+    if (marker_in_span) {
+      printf "AMBIGUOUS\t%s\t%d\t%s\n", section, entry_line, excerpt(entry)
       entry = ""
       return
     }
@@ -310,6 +346,15 @@ while IFS=$'\t' read -r kind _ line text; do
        Everything after it is read as part of one entry, which hides whole
        release sections from the gate. Close the fence."
       ;;
+    AMBIGUOUS)
+      die "$CHANGELOG:$line: a '**Breaking:**' marker survives only inside a code span:
+       $text
+       That reads two ways and the gate will not guess between them:
+         * you are *mentioning* the marker — append the suppression:
+             <!-- migration-guide-gate: <reason> -->
+         * it is a real declaration a stray backtick swallowed — fix the
+           backticks so the marker sits in the prose."
+      ;;
   esac
 done <<<"$findings"
 
@@ -382,7 +427,31 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
 
     guide_findings="$(
       awk -v required="$REQUIRED_SECTIONS" -v allow_pending="$allow_pending" \
-          -v is_draft="$allow_pending" '
+          -v is_draft="$allow_pending" \
+          -v walkthrough_heading="### Guide-only upgrade walkthrough" '
+        function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
+          # Keep in step with the identical helper in the changelog parser.
+          out = ""
+          i = 1
+          n = length(text)
+          while (i <= n) {
+            ch = substr(text, i, 1)
+            if (ch != "`") { out = out ch; i++; continue }
+            run = 0
+            while (i + run <= n && substr(text, i + run, 1) == "`") run++
+            j = i + run
+            found = 0
+            while (j <= n) {
+              if (substr(text, j, 1) != "`") { j++; continue }
+              run2 = 0
+              while (j + run2 <= n && substr(text, j + run2, 1) == "`") run2++
+              if (run2 == run) { found = 1; break }
+              j += run2
+            }
+            if (found) { out = out " "; i = j + run } else { out = out substr(text, i, run); i += run }
+          }
+          return out
+        }
         function heading_level(line,   n) {
           n = 0
           while (substr(line, n + 1, 1) == "#") n++
@@ -427,6 +496,13 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             next
           }
         }
+        # Any `{...}` left over from the template, not a hand-listed few:
+        # `{Area}`, `{old MSRV}` and `{Short description}` all used to pass —
+        # and `{Area}` lives in a heading, so this has to run before the
+        # heading rule below claims the line. Code spans are stripped first so
+        # a `{:?}` in prose is not mistaken for a placeholder.
+        { if (strip_code_spans($0) ~ /\{[^{}]*\}/) placeholder = 1 }
+
         /^#+ / {
           level = heading_level($0)
           # A deeper heading is content for the section it sits under.
@@ -438,7 +514,9 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           seen[current] = 1
           next
         }
-        /^-[[:space:]]+\*\*Status:\*\*/ {
+        # Only under the heading the release process points at — a status
+        # recorded under Summary is not a recorded walk-through.
+        current == walkthrough_heading && /^-[[:space:]]+\*\*Status:\*\*/ {
           status = $0
           # Validate the *whole* value, not "does it contain the word
           # performed" — "not performed 2026-08-11" says the opposite of what
@@ -447,7 +525,6 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           sub(/^-[[:space:]]+\*\*status:\*\*[[:space:]]*/, "", status_value)
           sub(/[[:space:]]+$/, "", status_value)
         }
-        /\{(X\.|Y\.|placeholder|YYYY-|minutes|performed |none, or)/ { placeholder = 1 }
         { if (current != "" && $0 ~ /[^[:space:]]/) content[current] = 1 }
         END {
           flush_section()

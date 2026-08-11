@@ -92,7 +92,8 @@ It fails when:
 - a guide is missing a required section — *At a glance*, *Summary*, *Before you
   start*, *Breaking changes*, *How to verify*, and *Guide-only upgrade
   walkthrough* — or has a heading with nothing under it, still carries
-  `TEMPLATE.md`'s banner or placeholders, or is not indexed above;
+  `TEMPLATE.md`'s banner or **any** `{...}` placeholder, or is not linked from
+  the Index above (a mention elsewhere in this file is not an index entry);
 - a released guide's walk-through status does not **begin** with
   `performed YYYY-MM-DD` or `backfilled`; `pending` is allowed only on
   `next.md`. The whole value is checked, not searched — `not performed
@@ -107,7 +108,11 @@ It fails when:
   whole sections from every check above.
 
 Details that save a round trip: `**Breaking:**` is matched case-insensitively,
-`- ` and `* ` are both bullets, and a marker inside a code span is a mention.
+and `- ` and `* ` are both bullets. A marker inside an inline code span (any
+backtick-run length) is a mention — but if a marker survives *only* inside a
+span, the gate stops and asks, because a stray backtick swallowing a real
+marker looks exactly the same. Add the suppression to say "mention", or fix the
+backticks to say "declaration".
 Fenced code blocks (``` or `~~~`) are skipped wholesale in both the changelog
 and the guides — a `breaking` key in a config sample is not a breaking change,
 and a guide cannot satisfy its own required headings from inside an example.
