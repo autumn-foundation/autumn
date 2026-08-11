@@ -1108,6 +1108,17 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // so any user must reach them through that path — fully qualified or
         // via a `use autumn_web::markdown::{…};` import line.
         "markdown" => &["autumn_web::markdown::"],
+        // A scaffolded CSV export (issue #1315) enables `csv` for the
+        // `CsvSchema` impl and `export_csv` call its `export.csv` route emits,
+        // but a hand-written route, job or task can use the same module —
+        // `import_csv` has no generator at all, so an author wiring an upload
+        // form is doing it by hand by definition. Destroying the last
+        // scaffolded resource must not strip the feature out from under them.
+        // The prelude re-exports nothing from `data::csv`, so every spelling —
+        // fully qualified, or a `use autumn_web::data::csv::{…};` import —
+        // goes through this path. Trailing `::` so a doc comment naming the
+        // module (`autumn_web::data::csv`) does not count as usage.
+        "csv" => &["autumn_web::data::csv::"],
         _ => &[],
     }
 }

@@ -1751,6 +1751,32 @@ fn generated_policy_scaffold_cargo_checks() {
         "expected the cross-user test to pass:\n{}",
         String::from_utf8_lossy(&cross_user.stdout)
     );
+
+    // Issue #1315: the generated CSV download test needs no database either.
+    // Running it here is the only place the repo proves the emitted test
+    // actually passes against the real `export_csv` + `Download` pair, rather
+    // than merely type-checking.
+    let export_csv = Command::new("cargo")
+        .args([
+            "test",
+            "--test",
+            "post",
+            "posts_export_csv_downloads_a_spreadsheet",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        export_csv.status.success(),
+        "generated CSV export test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&export_csv.stdout),
+        String::from_utf8_lossy(&export_csv.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&export_csv.stdout).contains("1 passed"),
+        "expected the CSV export test to run and pass:\n{}",
+        String::from_utf8_lossy(&export_csv.stdout)
+    );
 }
 
 /// Companion to [`generated_policy_scaffold_cargo_checks`] proving the

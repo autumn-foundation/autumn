@@ -246,12 +246,17 @@ database-free generated test. The planner auto-enables autumn-web's `csv`
 feature, so the scaffold compiles with no manual edits. The export honours the
 same allowlisted `?sort=`/`?filter[col]=` params as the index via the same
 `ListQuery` + `repo.list` pair (`?page=`/`?size=` are ignored — an export
-spans every page), reads in `MAX_PAGE_SIZE` batches capped at
-`MAX_EXPORT_ROWS` (10 000), and mirrors the index's security posture exactly:
-an owner-scoped scaffold's export is `#[secured]` and goes through
-`list_scoped`, never the unscoped `list`. `NULL` columns become empty cells,
-not the string `None`. Not emitted for `--live`, `--sharded`, owner-scoped
-`--live-validation`, or `--api` (issue #1315).
+spans every page; `?q=` is NOT honoured, since `ListQuery` carries no
+full-text term), reads in `MAX_PAGE_SIZE` batches capped at `MAX_EXPORT_ROWS`
+(10 000), and mirrors the index's security posture exactly: an owner-scoped
+scaffold's export is `#[secured]` and goes through `list_scoped`, never the
+unscoped `list`. It additionally carries `#[throttle(limit = 6, per = "1m",
+key = "ip")]` the index does not — same row set, ~100x the cost per request.
+`NULL` columns become empty cells, not the string `None`, and text columns
+pass through an emitted `csv_text_cell` guard against spreadsheet formula
+injection (numeric/date/bool/enum columns are not guarded — guarding them
+would corrupt a negative number). Not emitted for `--live`, `--sharded`,
+owner-scoped `--live-validation`, or `--api` (issue #1315).
 
 **Scaffold no-JS uploads (trunk-dev)**: `Attachment` fields produce working
 `multipart/form-data` uploads without JS — the create/update handlers take a

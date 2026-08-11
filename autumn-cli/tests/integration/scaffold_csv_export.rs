@@ -252,13 +252,24 @@ fn index_renders_an_export_csv_link() {
 fn export_link_preserves_the_active_sort_and_filter() {
     let (_tmp, routes) = scaffold_routes("csv-link-query", &[]);
     let index = handler_slice(&routes, "index");
+    // The href is built FROM the raw query, not merely near a `pager_query`
+    // binding (which every generated index has carried since the pager landed).
     assert!(
-        index.contains("let export_href ="),
-        "the index must build the export href from the active query:\n{index}"
+        index.contains(r#"format!("{}?{}", paths::export_csv(), pager_query)"#),
+        "the export href must append the current sort/filter query string:\n{index}"
     );
+    // ...and stays clean when there is no query to carry.
     assert!(
-        index.contains("pager_query"),
-        "the export href must carry the current sort/filter query string:\n{index}"
+        index.contains("if pager_query.is_empty() {"),
+        "an unfiltered index must link at the bare export path:\n{index}"
+    );
+    // Maud drops template whitespace, so the two links need an explicit
+    // separator or they render as one glued run ("New PostExport CSV").
+    assert!(
+        index.contains(
+            "\"New Post\"))\n        \" \"\n        (autumn_web::a11y::Link::new(export_href, \"Export CSV\"))"
+        ),
+        "the Export CSV link must be separated from the New Post link:\n{index}"
     );
 }
 
@@ -295,11 +306,117 @@ fn export_mirrors_the_index_security_posture() {
     // No owner column: the generated index carries no `#[secured]`, so neither
     // does the export — it opens no new public data path either way.
     let (_tmp, routes) = scaffold_routes("csv-posture", &[]);
+    // Pin the export's existence FIRST: without this the two `contains` bools
+    // below are both `false` when the feature is deleted, and the equality
+    // passes vacuously.
+    assert!(
+        routes.contains("#[get(\"/posts/export.csv\")]"),
+        "the export route must exist for its posture to mean anything:\n{routes}"
+    );
     let index_secured = routes.contains("#[secured]\n#[get(\"/posts\")]");
     let export_secured = routes.contains("#[secured]\n#[get(\"/posts/export.csv\")]");
+    assert!(
+        !index_secured,
+        "a no-owner scaffold's index is expected to be unsecured; if that changed, \
+         this test's premise needs revisiting:\n{routes}"
+    );
     assert_eq!(
         index_secured, export_secured,
         "the export must carry exactly the index's #[secured] posture:\n{routes}"
+    );
+}
+
+#[test]
+fn export_carries_a_per_ip_throttle_the_index_does_not_need() {
+    // One export reads up to MAX_EXPORT_ROWS rows over ~100 queries where one
+    // index page reads 100 rows over two, so on an unsecured scaffold the route
+    // is a large cost amplifier on traffic the index already accepts.
+    let (_tmp, routes) = scaffold_routes("csv-throttle", &[]);
+    assert!(
+        routes.contains("#[autumn_web::throttle(limit = 6, per = \"1m\", key = \"ip\")]"),
+        "the export must carry a per-IP throttle:\n{routes}"
+    );
+    // Fully qualified so no import is needed — a bare `#[throttle]` would not
+    // resolve in the generated module.
+    assert!(
+        !routes.contains("\n#[throttle("),
+        "the throttle attribute must be fully qualified:\n{routes}"
+    );
+}
+
+#[test]
+fn text_columns_are_guarded_against_spreadsheet_formula_injection() {
+    // RFC 4180 (which `export_csv` implements) governs commas/quotes/newlines
+    // and says nothing about formulas; Excel evaluates a leading `=` even
+    // inside quotes.
+    let (_tmp, project) = scaffold_project(
+        "csv-formula",
+        &["title:String", "views:i64", "at:DateTime"],
+        &[],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("fn csv_text_cell(value: String) -> String {"),
+        "a formula guard helper must be emitted:\n{routes}"
+    );
+    assert!(
+        routes.contains("value.starts_with(['=', '+', '-', '@', '\\t', '\\r'])"),
+        "{routes}"
+    );
+    let schema = csv_schema_impl(&routes);
+    assert!(
+        schema.contains("csv_text_cell(self.title.clone())"),
+        "a text column must go through the guard:\n{schema}"
+    );
+    // Typed columns cannot carry a formula, and guarding them would prefix a
+    // legitimate negative number.
+    assert!(
+        schema.contains("            self.views.to_string(),"),
+        "a numeric column must NOT be guarded:\n{schema}"
+    );
+    assert!(
+        schema.contains("            self.at.to_string(),"),
+        "a timestamp column must NOT be guarded:\n{schema}"
+    );
+}
+
+#[test]
+fn scaffold_without_text_columns_omits_the_unused_guard_helper() {
+    // An unused `fn` is a `dead_code` warning, and generated code must compile
+    // warning-free.
+    let (_tmp, project) = scaffold_project("csv-no-text", &["views:i64", "ok:bool"], &[]);
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("#[get(\"/posts/export.csv\")]"),
+        "the export is still emitted:\n{routes}"
+    );
+    assert!(
+        !routes.contains("fn csv_text_cell"),
+        "no text column means no guard helper:\n{routes}"
+    );
+}
+
+#[test]
+fn soft_delete_scaffold_keeps_deleted_at_out_of_the_export() {
+    // `list`/`list_scoped` filter `deleted_at IS NULL`, so the column is NULL
+    // for every row that can reach the export — an always-blank spreadsheet
+    // column is noise.
+    let (_tmp, project) = scaffold_project("csv-soft", &default_cols(), &["--soft-delete"]);
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("deleted_at"),
+        "premise: --soft-delete puts deleted_at on the model:\n{model}"
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    let schema = csv_schema_impl(&routes);
+    assert!(
+        !schema.contains("deleted_at"),
+        "deleted_at must not be an exported column:\n{schema}"
+    );
+    let test = fs::read_to_string(project.join("tests/post.rs")).unwrap();
+    assert!(
+        !test.contains("\"deleted_at\""),
+        "the generated CSV test's header must match the impl:\n{test}"
     );
 }
 
@@ -353,6 +470,66 @@ fn destroy_removes_the_csv_feature_again() {
     );
 }
 
+#[test]
+fn destroy_keeps_the_csv_feature_when_hand_written_code_still_uses_it() {
+    // `import_csv` has no generator at all, so an author wiring an upload form
+    // is doing it by hand by definition. Destroying the last scaffolded
+    // resource must not strip the feature out from under them — the same rule
+    // `storage`/`multipart` got in #1867.
+    let (_tmp, project) = scaffold_project("csv-destroy-keep", &default_cols(), &[]);
+    fs::write(
+        project.join("src/reports.rs"),
+        "use autumn_web::data::csv::export_csv;\n\
+         pub fn write_report(out: &mut Vec<u8>) {\n    \
+         let _ = export_csv(Vec::<crate::models::post::Post>::new(), out);\n\
+         }\n",
+    )
+    .unwrap();
+    run_autumn_ok(&project, &["destroy", "scaffold", "Post", "--force"]);
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"csv\""),
+        "destroy must keep a feature hand-written code still references:\n{cargo}"
+    );
+}
+
+#[test]
+fn destroy_removes_the_csv_feature_when_the_surviving_resource_has_no_export() {
+    // "some routes file still exists" is the wrong question for `csv`: only an
+    // EXPORT-ENABLED resource needs it, so a surviving `--live` module must not
+    // pin the feature (and the `csv` crate) in the graph forever.
+    let (_tmp, project) = scaffold_project("csv-destroy-live", &default_cols(), &[]);
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Item", "name:String", "--live"],
+    );
+    run_autumn_ok(&project, &["destroy", "scaffold", "Post", "--force"]);
+    assert!(
+        project.join("src/routes/items.rs").exists(),
+        "premise: the --live resource survives"
+    );
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        !cargo.contains("\"csv\""),
+        "a surviving export-less resource must not pin the csv feature:\n{cargo}"
+    );
+}
+
+#[test]
+fn destroy_keeps_the_csv_feature_while_another_export_survives() {
+    let (_tmp, project) = scaffold_project("csv-destroy-two", &default_cols(), &[]);
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Article", "headline:String"],
+    );
+    run_autumn_ok(&project, &["destroy", "scaffold", "Post", "--force"]);
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"csv\""),
+        "the surviving Article export still needs the csv feature:\n{cargo}"
+    );
+}
+
 // ── AC6: the generated test asserts the download contract ─────────────────────
 
 #[test]
@@ -374,27 +551,66 @@ fn generated_test_asserts_the_csv_download_contract() {
             "generated CSV test must assert `{needle}`:\n{test}"
         );
     }
-    // AC7, asserted rather than assumed: RFC 4180 quoting and the empty cell.
+    // AC7, asserted rather than assumed. The stand-in row's cells are
+    // `Option<String>` with real `None`s, so the "not `None`" assertion has
+    // failure power over the cell expression rather than being a tautology.
     assert!(
-        test.contains("assert_no_literal_none") || test.contains("\"None\""),
+        test.contains("cells: Vec<Option<String>>,"),
+        "the generated test's rows must model NULL columns as None:\n{test}"
+    );
+    assert!(
+        test.contains("cell.clone().unwrap_or_default()"),
+        "the generated test must use the same empty-cell expression as the impl:\n{test}"
+    );
+    assert!(
+        test.contains("!body.contains(\"None\")"),
         "generated CSV test must prove a NULL is not exported as `None`:\n{test}"
+    );
+    // RFC 4180 escaping and the formula guard, both asserted against the real
+    // response body.
+    assert!(
+        test.contains(r#"body.contains("\"\"q\"\"")"#),
+        "generated CSV test must prove RFC 4180 quote escaping:\n{test}"
+    );
+    assert!(
+        test.contains(r#"body.contains("'=HYPERLINK")"#),
+        "generated CSV test must prove the formula guard reaches the body:\n{test}"
     );
 }
 
 // ── Gated-off variants stay byte-identical to their pre-#1315 output ──────────
 
-#[test]
-fn live_scaffold_omits_csv_export() {
-    let (_tmp, routes) = scaffold_routes("csv-live", &["--live"]);
+/// A gated-off variant must omit the export from the routes module, the
+/// `main.rs` mount AND the Cargo feature — all three or none. The failure the
+/// two "must agree exactly" gate comments exist to prevent is precisely a
+/// `main.rs` entry for a handler the module never emitted, which is a compile
+/// error in the user's project, so checking only the routes file would miss it.
+fn assert_no_export_anywhere(project: &Path, routes_file: &str) {
+    let routes = fs::read_to_string(project.join(routes_file)).unwrap_or_default();
     assert!(!routes.contains("export.csv"), "{routes}");
     assert!(!routes.contains("CsvSchema"), "{routes}");
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        !main.contains("routes::posts::export_csv"),
+        "main.rs must not mount an export the module never emitted:\n{main}"
+    );
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        !cargo.contains("\"csv\""),
+        "no export means no csv feature:\n{cargo}"
+    );
+}
+
+#[test]
+fn live_scaffold_omits_csv_export() {
+    let (_tmp, project) = scaffold_project("csv-live", &default_cols(), &["--live"]);
+    assert_no_export_anywhere(&project, "src/routes/posts.rs");
 }
 
 #[test]
 fn sharded_scaffold_omits_csv_export() {
-    let (_tmp, routes) = scaffold_routes("csv-sharded", &["--sharded"]);
-    assert!(!routes.contains("export.csv"), "{routes}");
-    assert!(!routes.contains("CsvSchema"), "{routes}");
+    let (_tmp, project) = scaffold_project("csv-sharded", &default_cols(), &["--sharded"]);
+    assert_no_export_anywhere(&project, "src/routes/posts.rs");
 }
 
 #[test]
@@ -407,27 +623,24 @@ fn owner_scoped_live_validation_scaffold_omits_csv_export() {
         &["title:String", "user:references"],
         &["--live-validation"],
     );
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    assert!(!routes.contains("export.csv"), "{routes}");
-    assert!(!routes.contains("CsvSchema"), "{routes}");
+    assert_no_export_anywhere(&project, "src/routes/posts.rs");
 }
 
 #[test]
 fn plain_live_validation_scaffold_keeps_csv_export() {
     // Without an owner column `--live-validation` renders the standard
     // data_table index on `repo.list`, so the export applies unchanged.
-    let (_tmp, routes) = scaffold_routes("csv-lv-plain", &["--live-validation"]);
+    let (_tmp, project) = scaffold_project("csv-lv-plain", &default_cols(), &["--live-validation"]);
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(routes.contains("#[get(\"/posts/export.csv\")]"), "{routes}");
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main.contains("routes::posts::export_csv"), "{main}");
 }
 
 #[test]
 fn api_scaffold_omits_csv_export() {
+    // `--api` emits no routes module at all, so there is no file to read.
     let (_tmp, project) = scaffold_project("csv-api", &default_cols(), &["--api"]);
-    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
-    assert!(!main.contains("export_csv"), "{main}");
-    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
-    assert!(
-        !cargo.contains("\"csv\""),
-        "an --api scaffold emits no export, so it must not enable the csv feature:\n{cargo}"
-    );
+    assert!(!project.join("src/routes/posts.rs").exists());
+    assert_no_export_anywhere(&project, "src/routes/posts.rs");
 }

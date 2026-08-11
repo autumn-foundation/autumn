@@ -31,19 +31,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filter. Rows are read in `MAX_PAGE_SIZE` batches and capped at
   `MAX_EXPORT_ROWS` (10 000), a constant in the generated file.
 
-  Security posture mirrors the index exactly, so no new public data path is
-  opened: an owner-scoped scaffold's export is `#[secured]` and reads through
-  the repository's owner-scoped `list_scoped`, never the unscoped `list`; a
-  scaffold whose index carries no `#[secured]` gets an export that carries
-  none either. `NULL` columns serialize to an empty cell rather than the
-  literal `None`, and commas/quotes/newlines are RFC 4180 quoted by
-  `export_csv`.
+  Row-set posture mirrors the index exactly, so no new data path is opened: an
+  owner-scoped scaffold's export is `#[secured]` and reads through the
+  repository's owner-scoped `list_scoped`, never the unscoped `list`; a
+  scaffold whose index carries no `#[secured]` gets an export that carries none
+  either. COST does not mirror the index, so the handler additionally carries
+  `#[throttle(limit = 6, per = "1m", key = "ip")]`: one export reads up to
+  10 000 rows over ~100 queries where one index page reads 100 over two, and an
+  inline throttle applies regardless of `security.rate_limit.enabled`.
+
+  `NULL` columns serialize to an empty cell rather than the literal `None`, and
+  commas/quotes/newlines are RFC 4180 quoted by `export_csv`. Text-backed
+  columns additionally pass through an emitted `csv_text_cell` guard that
+  prefixes an apostrophe to a value starting `=`, `+`, `-`, `@`, TAB or CR —
+  RFC 4180 says nothing about formulas, and Excel executes them even inside
+  quotes, so a row one user typed could otherwise exfiltrate the sheet when a
+  colleague opens the download. Numeric, boolean, UUID, timestamp and enum
+  columns are deliberately not guarded: they render from typed values and
+  guarding them would corrupt a negative number.
 
   Emitted wherever the index's row set is a repository call the export can
   reuse verbatim — the plain `repo.list` index (including
   `--live-validation`) and the owner-scoped `list_scoped` one. Gated off for
   `--live`, `--sharded`, owner-scoped `--live-validation` and `--api`, whose
-  output stays byte-identical. See `docs/guide/generators.md`.
+  output stays byte-identical. Two documented non-mirrors: a `--searchable`
+  scaffold's export does not honour the search term (`ListQuery` carries no
+  full-text query and the search box swaps results without changing the URL),
+  and a `references` column exports the raw foreign key rather than the parent
+  label the views resolve. See `docs/guide/generators.md`.
+
+  `examples/bookmarks` drops its hand-rolled RFC 4180 quoting for the same
+  `CsvSchema` + `export_csv` pair, keeping its range-capable `Download` demo.
 
 - **system-tests:** `SystemTest::layer(...)` registers app-wide Tower
   middleware on the router a browser test serves (#1456). Applications whose

@@ -800,7 +800,7 @@ download (issue #1315) — zero lines of user code:
   renders. It is ordinary editable Rust: drop a sensitive column from the
   export by deleting one entry from `csv_columns` and its matching slot in
   `to_csv_record`.
-- A `#[get("/<plural>/export.csv")]` handler streams those rows through
+- A `#[get("/<plural>/export.csv")]` handler feeds those rows through
   `autumn_web::data::csv::export_csv` and answers with a
   [`Download`](downloads.md), which derives
   `Content-Type: text/csv; charset=utf-8`,
@@ -810,10 +810,12 @@ download (issue #1315) — zero lines of user code:
   index's current query string — so *filter → sort → export* downloads
   exactly the rows on screen.
 - `autumn-web`'s `csv` feature is added to `Cargo.toml` (and removed again
-  by `autumn destroy scaffold`).
+  by `autumn destroy scaffold`, unless hand-written code still uses
+  `autumn_web::data::csv`).
 - The generated `tests/<name>.rs` gains a database-free test asserting the
-  download contract: 200, `text/csv`, an `attachment` disposition, and the
-  model's header row.
+  download contract: 200, `text/csv`, an `attachment` disposition, the
+  model's header row, RFC 4180 quoting, empty cells for NULLs, and the
+  formula guard below.
 
 Contract of the generated handler:
 
@@ -821,13 +823,20 @@ Contract of the generated handler:
 | --------- | --------- |
 | `?sort=`/`?filter[col]=` | Honoured through the same `ListQuery` extractor and the same `repo.list` call the index uses, so the file reflects the filtered view rather than the whole table. Unknown or malicious keys are ignored against the model's column allowlist. |
 | `?page=`/`?size=` | Ignored. An export spans every page of the current filter. |
-| Row volume | Read in `MAX_PAGE_SIZE` (100) batches, so no single query loads the table, and capped at `MAX_EXPORT_ROWS` (10 000) — the response is built in memory, so that constant is the ceiling on what one request can cost. Raise it in the generated file, or stream the batches straight into the body for a genuinely unbounded export. |
+| `?q=` (`--searchable`) | **Not** honoured — `ListQuery` carries no full-text term, so the export cannot reproduce a `/<plural>/search` result set. The search page renders no Export CSV link for that reason. Filter with `?filter[col]=` instead, or add a `q` param to the handler yourself. |
+| Row volume | Read in `MAX_PAGE_SIZE` (100) batches, so no single query loads the table, and capped at `MAX_EXPORT_ROWS` (10 000). That caps the **row count**, not bytes: the response is collected in memory, so a model with an unbounded `Text` column can still build a large body. Put a `{max}` length on such columns, lower the constant, or stream with `Download::from_stream` for a genuinely unbounded export. |
+| Hitting the cap | The file is truncated to `MAX_EXPORT_ROWS` and a `warn!` is logged. There is no in-band marker in the CSV, so narrow the filter (or raise the cap) rather than trusting a capped export for reconciliation. |
+| Request cost | The handler carries `#[throttle(limit = 6, per = "1m", key = "ip")]` that the index does not: one export reads up to 10 000 rows over ~100 queries where one index page reads 100 rows over two, so without a per-IP bucket the route is a large cost amplifier on traffic the index already accepts. Inline throttles apply regardless of `security.rate_limit.enabled` (that flag governs the *global* limiter); raise the limit freely for an internal back-office. |
 | `NULL` column | An **empty cell**, never the literal string `None`. |
 | Commas, quotes, newlines | Quoted and escaped per RFC 4180 by `export_csv`. Do not pre-quote values in `to_csv_record` — it would double-escape them. |
-| `Attachment` column | Exports the blob's storage **key**, the one value that finds the file again (the index's "attachment" presence marker is useless in a spreadsheet). |
+| Values that look like formulas | Text-backed columns pass through an emitted `csv_text_cell` helper that prefixes an apostrophe to a value starting `=`, `+`, `-`, `@`, TAB or CR. Numeric, boolean, UUID, timestamp and enum columns are **not** guarded — they render from typed values and cannot carry a formula, and guarding them would corrupt a negative number. |
+| `Attachment` column | Exports the blob's storage **key**, not the signed, time-bounded URL the `show` view renders (a spreadsheet cell has no use for a URL that expires). Drop the column from `csv_columns` if those keys should not leave the app. |
+| `references` column | Exports the raw **foreign key**, not the parent label the index and `show` views resolve. An id round-trips back through `import_csv`; a label does not, and resolving one per row would be an N+1 inside the export loop. |
+| `--default`ed column | **Included.** It is dropped from the form and the index table, but it is model data the `show` view already renders, and a spreadsheet wants it. |
+| `--soft-delete`'s `deleted_at` | Excluded. `list`/`list_scoped` filter `deleted_at IS NULL`, so the column is blank for every exportable row. |
 | Record policy wiring on (an owner column, the default) | The handler is `#[secured]` and reads through the repository's owner-scoped `list_scoped` — the same method the index uses. It never calls the unscoped `list`, so the download cannot contain another user's rows. |
 | No owner column | No `#[secured]`, exactly matching the generated index. The export opens no data path the list view did not already open. |
-| Route vs `/<plural>/{id}` | The static `export.csv` segment outranks the `{id}` parameter in the router, the same way `/<plural>/new` already does. |
+| Route vs `/<plural>/{id}` | The static `export.csv` segment outranks the `{id}` parameter in the router, the same way `/<plural>/new` already does. With a `slug` route key that also means a record whose slug is literally `export.csv` is unreachable at its canonical URL — the same caveat `new` already carries. |
 
 The export is emitted wherever the index's row set is a repository call it
 can reuse verbatim: the plain `repo.list` index (including
