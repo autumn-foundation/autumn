@@ -3073,3 +3073,46 @@ fn migration_guide_gate_index_scan_handles_nested_fences() {
         "a link inside a nested fenced sample is not an index entry",
     );
 }
+
+#[test]
+fn migration_guide_gate_does_not_read_comment_delimiters_inside_code_spans() {
+    // Round 10 stopped fenced bodies from opening comments. The same shape one
+    // level down — `<!--` and `-->` shown in separate *inline* spans — still
+    // did, and because the later span cleared the state the unclosed-comment
+    // guard never fired either.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Added\n\n\
+         - **docs:** a suppression opens with `<!--` on its own line.\n\
+         - **db:** **Breaking:** `with_pool` renamed, with no guide anywhere.\n\
+         - **docs:** and closes with `-->`.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "delimiters displayed as code are not comment state\n{}",
+        gate_report(&output),
+    );
+
+    // A real comment spanning those same entries still hides them.
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Added\n\n\
+         - **api:** an addition.\n\n\
+         <!--\n\
+         - **db:** **Breaking:** parked, no guide.\n\
+         -->\n",
+    )
+    .expect("changelog");
+    assert!(
+        run_migration_gate(tmp.path()).status.success(),
+        "a genuine comment must still hide the entries inside it",
+    );
+}

@@ -140,7 +140,40 @@ function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
   return out
 }
 
-function visible_text(line,   body, ch, run, out, head, tail) {
+function mask_code_spans(text,   out, i, n, ch, run, j, run2, found, k) {
+  # Same scan as strip_code_spans, but each span becomes an equal-length run of
+  # spaces so offsets still line up with the original text. visible_text needs
+  # that: it has to know *where* a real `<!--` sits in `line`, while ignoring
+  # any that are merely displayed as code.
+  out = ""
+  i = 1
+  n = length(text)
+  while (i <= n) {
+    ch = substr(text, i, 1)
+    if (ch != "`") { out = out ch; i++; continue }
+    run = 0
+    while (i + run <= n && substr(text, i + run, 1) == "`") run++
+    j = i + run
+    found = 0
+    while (j <= n) {
+      if (substr(text, j, 1) != "`") { j++; continue }
+      run2 = 0
+      while (j + run2 <= n && substr(text, j + run2, 1) == "`") run2++
+      if (run2 == run) { found = 1; break }
+      j += run2
+    }
+    if (found) {
+      for (k = i; k < j + run; k++) out = out " "
+      i = j + run
+    } else {
+      out = out substr(text, i, run)
+      i += run
+    }
+  }
+  return out
+}
+
+function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close_at) {
   md_fence_hit = 0
 
   # Fences first. A closing fence uses the same character and is at least as
@@ -167,26 +200,30 @@ function visible_text(line,   body, ch, run, out, head, tail) {
   }
   if (md_in_fence) return ""
 
-  # Then HTML comments, which may span lines.
+  # Then HTML comments, which may span lines. Delimiters are located in a
+  # code-span-masked copy so that prose *showing* `<!--` does not open one —
+  # the same rule as fenced bodies above, one level down. Offsets are preserved
+  # by the mask, so the slices below still apply to the original line.
   out = line
+  masked = mask_code_spans(out)
   if (md_in_comment) {
-    if (index(out, "-->") > 0) {
-      out = substr(out, index(out, "-->") + 3)
-      md_in_comment = 0
-    } else {
-      return ""
-    }
+    pos = index(masked, "-->")
+    if (pos == 0) return ""
+    out = substr(out, pos + 3)
+    masked = mask_code_spans(out)
+    md_in_comment = 0
   }
-  while (match(out, /<!--/)) {
-    head = substr(out, 1, RSTART - 1)
-    tail = substr(out, RSTART)
-    if (match(tail, /-->/)) {
-      out = head substr(tail, RSTART + 3)
-    } else {
+  while ((pos = index(masked, "<!--")) > 0) {
+    head = substr(out, 1, pos - 1)
+    tail = substr(out, pos)
+    close_at = index(substr(masked, pos), "-->")
+    if (close_at == 0) {
       md_in_comment = 1
       md_comment_opened_at = FNR
       return head
     }
+    out = head substr(tail, close_at + 3)
+    masked = mask_code_spans(out)
   }
   return out
 }
