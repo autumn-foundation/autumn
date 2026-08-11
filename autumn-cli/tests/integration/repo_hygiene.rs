@@ -3914,3 +3914,108 @@ fn migration_guide_gate_requires_the_guide_template() {
         gate_report(&output),
     );
 }
+
+// --- Review round 24: HTML block end conditions ---------------------------
+
+#[test]
+fn migration_guide_gate_ends_a_script_block_at_its_closing_tag() {
+    // CommonMark closes a `<script>`/`<style>`/`<pre>`/`<textarea>` block (type
+    // 1) on the line carrying the end tag, not at the next blank line like a
+    // `<div>` (type 6). Holding the block open past `</script>` swallowed a
+    // link that renders and is clickable, failing an entry that is correct.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed.\n  \
+         <script>\n  var demo = 1;\n  </script>\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "the line after `</script>` is a paragraph again, so its link counts\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_keeps_text_after_a_closing_script_tag_literal() {
+    // The end-condition line is *part of* the block, so a link sharing that
+    // line with `</script>` is raw HTML and renders as text. Closing the block
+    // mid-line instead would count a link the reader cannot click.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed.\n  \
+         <script>\n  var demo = 1;\n  \
+         </script>See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "text sharing the closing-tag line is still inside the HTML block",
+    );
+}
+
+#[test]
+fn migration_guide_gate_closes_a_single_line_pre_block() {
+    // `<pre>x</pre>` opens and closes on one line: the block must not stay
+    // open and eat the entry's link on the line below.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed.\n  \
+         <pre>old_name</pre>\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a one-line `<pre>` block ends on its own line\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_holds_a_div_block_open_to_the_blank_line() {
+    // The counterpart guard: type 6 keeps its blank-line end condition, so the
+    // type-1 fix must not be applied to every tag. A `**Breaking:**` marker
+    // parked inside a `<div>` renders as literal text, declaring nothing, so
+    // the section has no breaking entry and needs no guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         <div>\n\
+         - **db:** **Breaking:** renamed, with no guide.\n\
+         </div>\n\
+         - **api:** an addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a `<div>` block runs to the blank line, so nothing inside it declares\n{}",
+        gate_report(&output),
+    );
+}

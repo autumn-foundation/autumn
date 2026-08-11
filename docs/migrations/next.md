@@ -109,10 +109,14 @@ None so far.
 
 1. `cargo check` — clean, with no `missing field `seo`` error.
 2. `cargo test` — your suite is green.
-3. Plugins: `autumn plugin-check` passes.
-4. Serve the app and view-source a page whose route declares `seo(...)` —
-   the declared `<title>` / `<meta>` values render.
-5. `curl /sitemap.xml` — no `robots = "noindex"` static route is listed.
+3. Plugins: `autumn plugin-check --plugin-name <your-plugin>` passes
+   (`--plugin-name` is required).
+4. Serve the app (`cargo run`, default `http://127.0.0.1:3000`) and view-source
+   a page whose route declares `seo(...)` — the declared `<title>` / `<meta>`
+   values render.
+5. `curl http://127.0.0.1:3000/sitemap.xml` — no `robots = "noindex"` static
+   route is listed. Substitute your own address if you changed `[server] host`
+   or `[server] port`.
 
 ### Guide-only upgrade walkthrough
 

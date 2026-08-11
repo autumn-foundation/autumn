@@ -128,6 +128,10 @@ backticks to say "declaration".
 Fenced code blocks (``` or `~~~`) are skipped wholesale in both the changelog
 and the guides — a `breaking` key in a config sample is not a breaking change,
 and a guide cannot satisfy its own required headings from inside an example.
+Raw HTML blocks are skipped for the same reason, and end where CommonMark ends
+them: a `<script>`, `<style>`, `<pre>` or `<textarea>` block at its end tag, and
+anything else at the next blank line. So a link on the line after `</script>`
+counts, and one sharing that line with it does not.
 
 The lint is textual, so it removes the *silent* failure mode rather than
 replacing review: a break described without the word "breaking" and without the

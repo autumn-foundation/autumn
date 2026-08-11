@@ -111,6 +111,8 @@ ok() {
 #   md_fence_hit   this line is a fence delimiter
 #   md_in_fence    we are inside a fenced block
 #   md_in_comment  we are inside an HTML comment
+#   md_in_html_block / md_html_type  we are inside a raw HTML block, and which
+#                  CommonMark kind it is (1 ends at its end tag, 6 at a blank line)
 #   md_fence_opened_at / md_comment_opened_at  where an unclosed one started
 # ---------------------------------------------------------------------------
 AWK_MARKDOWN_LIB='
@@ -377,16 +379,34 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   }
   if (md_in_fence) return ""
 
-  # A raw HTML block leaves its contents literal until a blank line, so a link
-  # written inside one is not clickable. Scoped to a tag alone on its line so
-  # inline HTML and `Vec<Route>` in prose are untouched; `<!` is excluded
-  # because comments are handled below with their own escape rules.
+  # A raw HTML block leaves its contents literal, so a link written inside one
+  # is not clickable. Two end conditions, and using the wrong one rejects
+  # correct changelogs: a `<script>`, `<style>`, `<pre>` or `<textarea>` block
+  # (CommonMark type 1) ends on the line carrying an end tag, while everything
+  # else (type 6/7) runs to the next blank line. The end-condition line is part
+  # of the block, so text sharing a line with `</script>` stays literal too.
   if (md_in_html_block) {
-    if (line ~ /^[[:space:]]*$/) md_in_html_block = 0
+    if (md_html_type == 1) {
+      if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
+    } else if (line ~ /^[[:space:]]*$/) {
+      md_in_html_block = 0
+    }
     return ""
   }
+  # Type 1 opens on its tag name alone: the rest of the line may be anything,
+  # which is why `<pre>x</pre>` both opens and closes here.
+  if (tolower(dedent3(line)) ~ /^<(script|style|pre|textarea)([[:space:]>]|$)/) {
+    md_in_html_block = 1
+    md_html_type = 1
+    if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
+    return ""
+  }
+  # Type 6/7 is scoped to a tag alone on its line so inline HTML and
+  # `Vec<Route>` in prose are untouched; `<!` is excluded because comments are
+  # handled below with their own escape rules.
   if (dedent3(line) ~ /^<\/?[a-zA-Z][^<>]*>[[:space:]]*$/ && dedent3(line) !~ /^<!/) {
     md_in_html_block = 1
+    md_html_type = 6
     return ""
   }
 
