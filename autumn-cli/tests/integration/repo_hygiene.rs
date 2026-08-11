@@ -1607,3 +1607,50 @@ fn migration_guide_gate_honours_an_explicit_suppression() {
         gate_report(&output),
     );
 }
+
+#[test]
+fn workflow_referenced_scripts_are_tracked_by_git() {
+    // `.gitignore` carries a blanket `*.sh`, so a newly added gate script is
+    // untracked by default: it runs locally, passes review, and then fails on
+    // a clean CI clone with "No such file or directory". Assert every
+    // `scripts/*.sh` a workflow invokes is actually in the index.
+    let root = workspace_root();
+
+    let tracked = Command::new("git")
+        .args(["ls-files", "scripts/"])
+        .current_dir(&root)
+        .output()
+        .expect("run git ls-files");
+    assert!(tracked.status.success(), "git ls-files scripts/ failed");
+    let tracked = String::from_utf8_lossy(&tracked.stdout).into_owned();
+
+    let workflows = root.join(".github/workflows");
+    for entry in std::fs::read_dir(&workflows)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflows.display()))
+    {
+        let path = entry.expect("workflow entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("yml") {
+            continue;
+        }
+        let workflow = std::fs::read_to_string(&path).expect("read workflow");
+
+        for (index, _) in workflow.match_indices("scripts/") {
+            let name: String = workflow[index + "scripts/".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+                .collect();
+            if !name.ends_with(".sh") {
+                continue;
+            }
+            assert!(
+                tracked
+                    .lines()
+                    .any(|line| line == format!("scripts/{name}")),
+                "{} runs scripts/{name}, but git does not track it — the blanket \
+                 `*.sh` entry in .gitignore swallowed it, so CI would fail on a \
+                 clean clone. Add it with `git add -f scripts/{name}`.",
+                path.display(),
+            );
+        }
+    }
+}
