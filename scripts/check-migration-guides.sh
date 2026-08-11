@@ -167,6 +167,28 @@ function suppressed_by_comment(text,   t, at) {
   return 0
 }
 
+function list_marker_width(text,   body, n, ch) {
+  # Width of a list marker at the start of `text` (already dedented), counting
+  # the marker and the whitespace after it; 0 when this is not a list item.
+  # Markdown allows `-`, `*`, `+` and ordered markers such as `1.` or `1)`.
+  body = text
+  n = 0
+  ch = substr(body, 1, 1)
+  if (ch == "-" || ch == "*" || ch == "+") {
+    n = 1
+  } else {
+    while (substr(body, n + 1, 1) ~ /^[0-9]$/) n++
+    if (n == 0) return 0
+    ch = substr(body, n + 1, 1)
+    if (ch != "." && ch != ")") return 0
+    n++
+  }
+  ch = substr(body, n + 1, 1)
+  if (ch != " " && ch != "\t") return 0
+  while (substr(body, n + 1, 1) == " " || substr(body, n + 1, 1) == "\t") n++
+  return n
+}
+
 function leading_spaces(text,   n) {
   n = 0
   while (substr(text, n + 1, 1) == " ") n++
@@ -501,7 +523,7 @@ findings="$(
   # top-level item) and starts its own entry. Comparing against the *marker*
   # column instead left a middle band — deeper than the marker, left of the
   # content — where the bullet was neither, and the line was dropped outright.
-  dedent3(visible) ~ /^[-*+][ \t]/ &&
+  list_marker_width(dedent3(visible)) > 0 &&
   (entry == "" || leading_spaces(visible) < entry_content_indent) {
     flush_entry()
     entry_line = FNR
@@ -510,12 +532,7 @@ findings="$(
     entry_visible = visible
     entry_indent = leading_spaces(visible)
     # Where this item content starts: past the marker and the space after it.
-    entry_content_indent = entry_indent + 1
-    marker_rest = substr(dedent3(visible), 2)
-    while (substr(marker_rest, 1, 1) == " " || substr(marker_rest, 1, 1) == "\t") {
-      entry_content_indent++
-      marker_rest = substr(marker_rest, 2)
-    }
+    entry_content_indent = entry_indent + list_marker_width(dedent3(visible))
     item_content_indent = entry_content_indent
     next
   }
@@ -530,16 +547,9 @@ findings="$(
       } else {
         # A nested bullet opens an item of its own; blocks after it are
         # measured from *its* content column, not the outer one.
-        if (visible ~ /^[[:space:]]*[-*+][ \t]/) {
-          inner_indent = leading_spaces(visible)
-          inner_content = inner_indent + 1
-          marker_rest = substr(visible, inner_indent + 2)
-          while (substr(marker_rest, 1, 1) == " " || substr(marker_rest, 1, 1) == "\t") {
-            inner_content++
-            marker_rest = substr(marker_rest, 2)
-          }
-          item_content_indent = inner_content
-        }
+        inner_indent = leading_spaces(visible)
+        inner_width = list_marker_width(substr(visible, inner_indent + 1))
+        if (inner_width > 0) item_content_indent = inner_indent + inner_width
         # Four columns past the innermost item content is an indented code
         # block: literal text, so it neither adds prose nor supplies a link.
         if (visible ~ /[^[:space:]]/ && leading_spaces(visible) >= item_content_indent + 4) next
@@ -697,11 +707,6 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           while (substr(line, n + 1, 1) == "#") n++
           return n
         }
-        function flush_section() {
-          if (current != "" && (current in want) && !content[current] && !is_draft) {
-            printf "EMPTY\t%s\n", current
-          }
-        }
         BEGIN {
           split(required, list, "|")
           for (i in list) want[list[i]] = 1
@@ -738,18 +743,25 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           visible = visible_text($0)
           if (md_fence_hit) next
           if (md_in_fence) {
-            if (current != "" && $0 ~ /[^[:space:]]/) content[current] = 1
+            if ($0 ~ /[^[:space:]]/) {
+              for (lvl = 1; lvl <= 6; lvl++) {
+                if (open_heading[lvl] != "") content[open_heading[lvl]] = 1
+              }
+            }
             next
           }
         }
         heading_text(visible) ~ /^#+[ \t]/ {
           level = heading_level(heading_text(visible))
-          # A deeper heading is content for the section it sits under.
-          if (current != "" && level > current_level) content[current] = 1
-          flush_section()
           current = heading_text(visible)
           current_level = level
           seen[current] = 1
+          # Remember the open heading chain. A deeper heading does NOT make its
+          # parent non-empty by existing — a tree of empty headings is not
+          # migration guidance — so content propagates up from real content
+          # instead, below.
+          for (lvl = level; lvl <= 6; lvl++) open_heading[lvl] = ""
+          open_heading[level] = current
           next
         }
         # Only under the heading the release process points at — a status
@@ -763,10 +775,23 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           sub(/^-[[:space:]]+\*\*status:\*\*[[:space:]]*/, "", status_value)
           sub(/[[:space:]]+$/, "", status_value)
         }
-        { if (current != "" && visible ~ /[^[:space:]]/) content[current] = 1 }
+        {
+          if (visible ~ /[^[:space:]]/) {
+            for (lvl = 1; lvl <= 6; lvl++) {
+              if (open_heading[lvl] != "") content[open_heading[lvl]] = 1
+            }
+          }
+        }
         END {
-          flush_section()
-          for (h in want) if (!(h in seen)) printf "MISSING\t%s\n", h
+          for (h in want) {
+            if (!(h in seen)) {
+              printf "MISSING\t%s\n", h
+            } else if (!content[h] && !is_draft) {
+              # Judged at END, not at the next heading: a required section may
+              # take its content from a child heading further down the file.
+              printf "EMPTY\t%s\n", h
+            }
+          }
           # The rolling draft is a skeleton by design: docs/release-checklist.md
           # recreates it from TEMPLATE.md after every release so the links to it
           # keep resolving, and the template carries placeholders. Both checks

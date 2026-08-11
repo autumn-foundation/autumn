@@ -3674,3 +3674,80 @@ fn migration_guide_gate_ignores_links_in_indented_code_blocks() {
         "an indented code block renders as literal text, not a link",
     );
 }
+
+// --- Review round 20: empty child headings, ordered lists ------------------
+
+#[test]
+fn migration_guide_gate_requires_content_under_child_headings() {
+    // A deeper heading counts as content for its parent only once the child
+    // itself has some: otherwise a tree of empty headings reads as a complete
+    // guide while containing no instructions at all.
+    let tmp = migration_gate_fixture("0.7.0");
+    let mut guide = String::from("# Migrating to 0.7.0\n\n");
+    for heading in [
+        "## At a glance",
+        "## Summary",
+        "## Before you start",
+        "## Breaking changes",
+        "## How to verify",
+    ] {
+        writeln!(guide, "{heading}\n\n#### Placeholder\n").expect("write guide");
+    }
+    guide.push_str("### Guide-only upgrade walkthrough\n\n- **Status:** performed 2026-09-01\n");
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an empty child heading is not migration guidance",
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_ordered_list_entries() {
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         1. **api:** **Breaking:** removed, with no guide anywhere.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "`1.` is a legal list marker, so this is a declared break",
+    );
+}
+
+#[test]
+fn migration_guide_gate_nests_under_ordered_items() {
+    // The counterpart: content indented under an ordered marker belongs to it.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         1. **api:** **Breaking:** removed. See the\n   \
+            [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "the continuation line belongs to the ordered item\n{}",
+        gate_report(&output),
+    );
+}
