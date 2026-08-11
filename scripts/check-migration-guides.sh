@@ -447,7 +447,7 @@ findings="$(
   # in a code sample is a mention. The suppression token is the one comment the
   # gate reads, and flush_entry takes it from the raw entry instead.
   {
-    md_block_indent = (entry == "") ? 0 : entry_content_indent
+    md_block_indent = (entry == "") ? 0 : item_content_indent
     visible = visible_text($0)
     if (md_fence_hit || md_in_fence) next
   }
@@ -494,14 +494,15 @@ findings="$(
   # `-`, `*` and `+` are all legal markdown bullets, and markdown allows a tab
   # after the marker.
   #
-  # Indentation is the subtle half, and the rule is list *depth*. A bullet
-  # indented deeper than the open entry is a nested item belonging to it —
-  # which is how this changelog writes multi-part entries, with the marker
-  # often on a sub-bullet. A bullet at the same depth or shallower is a
-  # sibling, and starts its own entry: merging siblings once let one bullet
-  # cover another breaking bullet with its link.
+  # Indentation is the subtle half, and the boundary is the open item content
+  # column. A bullet starting at or past that column is nested inside the
+  # entry — which is how this changelog writes multi-part entries, with the
+  # marker often on a sub-bullet. A bullet left of it is a sibling (or a new
+  # top-level item) and starts its own entry. Comparing against the *marker*
+  # column instead left a middle band — deeper than the marker, left of the
+  # content — where the bullet was neither, and the line was dropped outright.
   dedent3(visible) ~ /^[-*+][ \t]/ &&
-  (entry == "" || leading_spaces(visible) <= entry_indent) {
+  (entry == "" || leading_spaces(visible) < entry_content_indent) {
     flush_entry()
     entry_line = FNR
     entry_breaking_heading = breaking_heading
@@ -515,6 +516,7 @@ findings="$(
       entry_content_indent++
       marker_rest = substr(marker_rest, 2)
     }
+    item_content_indent = entry_content_indent
     next
   }
 
@@ -526,6 +528,21 @@ findings="$(
       if (visible ~ /[^[:space:]]/ && leading_spaces(visible) < entry_content_indent) {
         flush_entry()
       } else {
+        # A nested bullet opens an item of its own; blocks after it are
+        # measured from *its* content column, not the outer one.
+        if (visible ~ /^[[:space:]]*[-*+][ \t]/) {
+          inner_indent = leading_spaces(visible)
+          inner_content = inner_indent + 1
+          marker_rest = substr(visible, inner_indent + 2)
+          while (substr(marker_rest, 1, 1) == " " || substr(marker_rest, 1, 1) == "\t") {
+            inner_content++
+            marker_rest = substr(marker_rest, 2)
+          }
+          item_content_indent = inner_content
+        }
+        # Four columns past the innermost item content is an indented code
+        # block: literal text, so it neither adds prose nor supplies a link.
+        if (visible ~ /[^[:space:]]/ && leading_spaces(visible) >= item_content_indent + 4) next
         entry = entry " " $0
         entry_visible = entry_visible " " visible
       }

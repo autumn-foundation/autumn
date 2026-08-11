@@ -3602,3 +3602,75 @@ fn migration_guide_gate_reads_fences_relative_to_their_list_item() {
         "a link displayed inside a fenced example is not the entry's link",
     );
 }
+
+// --- Review round 19: sibling reprocessing, nested columns, indented code --
+
+#[test]
+fn migration_guide_gate_does_not_drop_a_sibling_at_a_different_indent() {
+    // Round 18 regression: ` - x` after `- y` is deeper than the previous
+    // entry's marker but left of its content column, so the bullet rule
+    // rejected it and the continuation path flushed without reprocessing it.
+    // The entry vanished entirely — the worst possible outcome for a gate.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **api:** an addition.\n \
+         - **db:** **Breaking:** renamed, with no link.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "the sibling is an entry and must be checked, not discarded\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_fences_inside_nested_items() {
+    // A fence is measured from the *innermost* open item's content column.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n  \
+           - link entries like this:\n\n       \
+           ~~~markdown\n       See the [migration guide](docs/migrations/0.7.0.md).\n       ~~~\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a link shown inside a fenced sample in a nested item is not a link",
+    );
+}
+
+#[test]
+fn migration_guide_gate_ignores_links_in_indented_code_blocks() {
+    // Four spaces past the item's content column is an indented code block, so
+    // the link renders as literal text.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n      \
+           See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an indented code block renders as literal text, not a link",
+    );
+}
