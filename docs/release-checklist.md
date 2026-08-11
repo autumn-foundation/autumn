@@ -242,8 +242,11 @@ success metric is under 30 minutes.
   section pass.
 - [ ] Record the outcome in the guide's `### Guide-only upgrade walkthrough`
   section: status, from → to versions, elapsed minutes, and any gap the
-  walk-through exposed. `check-migration-guides.sh` requires the `- **Status:**`
-  line to be present; a release must not ship it as `pending`.
+  walk-through exposed. `check-migration-guides.sh` enforces this — a versioned
+  guide must record `- **Status:** performed YYYY-MM-DD`. `pending` is accepted
+  only on the rolling `next.md` draft, and the one other accepted value,
+  `backfilled`, means "this guide was written after its release shipped" and is
+  a visible claim in the diff.
 
 ## Version Alignment
 

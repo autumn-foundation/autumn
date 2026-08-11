@@ -105,6 +105,23 @@ fn git(root: &Path, args: &[&str]) -> Output {
         .expect("failed to run git")
 }
 
+/// Every `*.sh` under `dir`, recursively.
+fn shell_scripts(dir: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display()))
+    {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            shell_scripts(&path, found);
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
+        {
+            found.push(path);
+        }
+    }
+}
+
 fn bash_command() -> Command {
     #[cfg(windows)]
     {
@@ -1686,22 +1703,6 @@ fn every_repository_script_is_tracked_by_git() {
         .expect("run git ls-files");
     assert!(tracked.status.success(), "git ls-files scripts/ failed");
     let tracked = String::from_utf8_lossy(&tracked.stdout).into_owned();
-
-    fn shell_scripts(dir: &Path, found: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display()))
-        {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                shell_scripts(&path, found);
-            } else if path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
-            {
-                found.push(path);
-            }
-        }
-    }
 
     let mut scripts = Vec::new();
     shell_scripts(&root.join("scripts"), &mut scripts);

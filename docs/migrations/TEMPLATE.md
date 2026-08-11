@@ -166,7 +166,8 @@ only this guide — no changelog, no source reading — and record the result he
 before publishing to crates.io. See
 [`docs/release-checklist.md`](../release-checklist.md), *Migration Guide Gate*.
 
-- **Status:** {performed {YYYY-MM-DD} / pending}
+- **Status:** {`performed YYYY-MM-DD` once done — `pending` is accepted only
+  while this file is still `next.md`}
 - **From → to:** `autumn-cli {X.Y.Z}` app upgraded to `autumn-web {X.Z.0}`
 - **Elapsed:** {minutes — the success metric is under 30}
 - **Gaps found and fixed in this guide:** {none, or what the walk-through
