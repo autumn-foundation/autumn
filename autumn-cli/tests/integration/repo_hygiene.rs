@@ -3446,3 +3446,108 @@ fn migration_guide_gate_treats_fences_inside_comments_as_comment_content() {
         "a fence delimiter inside a comment is comment content, not a fence",
     );
 }
+
+// --- Review round 17: sibling bullets, literal comment bodies -------------
+
+#[test]
+fn migration_guide_gate_splits_indented_sibling_bullets() {
+    // Round 15's `entry == ""` guard let the *first* indented bullet start an
+    // entry and then swallowed its siblings as if they were nested, so a
+    // sibling's link covered a breaking entry that had none.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## [0.7.0] - 2026-09-01\n\n### Changed\n\n  \
+         - **db:** **Breaking:** renamed, with no link of its own.\n  \
+         - **docs:** see the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "sibling bullets are separate entries; one cannot carry another's link",
+    );
+}
+
+#[test]
+fn migration_guide_gate_closes_comments_on_a_backticked_terminator() {
+    // Code spans are not parsed inside an HTML comment, so a backtick-wrapped
+    // `-->` still closes it. Masking it away kept the comment open and hid a
+    // visible breaking entry until a later stray terminator tidied up.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         <!-- parked, terminator shown as `-->` `\n\n\
+         - **db:** **Breaking:** renamed, with no guide anywhere.\n\n-->\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "the comment ends at the first `-->`, so the entry after it is visible",
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_an_escaped_closing_bracket() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide\\](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an escaped `]` does not close a link label",
+    );
+}
+
+#[test]
+fn migration_guide_gate_validates_the_drafts_status_value() {
+    // The draft exemption widened the accepted set to "anything", so a typo or
+    // an explicitly unsuccessful record certified as a walk-through.
+    for (status, should_pass) in [
+        ("pending — recorded at release", true),
+        ("performed 2026-09-01", true),
+        ("failed", false),
+        ("pendign", false),
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        let draft = std::fs::read_to_string(tmp.path().join("docs/migrations/next.md"))
+            .expect("read draft");
+        let updated = draft
+            .lines()
+            .map(|line| {
+                if line.starts_with("- **Status:**") {
+                    format!("- **Status:** {status}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(tmp.path().join("docs/migrations/next.md"), updated).expect("write draft");
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            "# Changelog\n\n## [Unreleased]\n\n- **api:** an addition.\n",
+        )
+        .expect("changelog");
+
+        assert_eq!(
+            run_migration_gate(tmp.path()).status.success(),
+            should_pass,
+            "draft status {status:?} should {} the gate",
+            if should_pass { "pass" } else { "fail" },
+        );
+    }
+}

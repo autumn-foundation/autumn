@@ -167,6 +167,12 @@ function suppressed_by_comment(text,   t, at) {
   return 0
 }
 
+function leading_spaces(text,   n) {
+  n = 0
+  while (substr(text, n + 1, 1) == " ") n++
+  return n
+}
+
 function dedent3(text,   n) {
   # Markdown permits up to three leading spaces on a block-level construct; a
   # fourth makes the line an indented code block, i.e. literal text.
@@ -192,6 +198,10 @@ function links_to(text, path,   needle, pos, at, i, ch, start, slashes) {
   start = 1
   while ((pos = index(substr(text, start), needle)) > 0) {
     at = start + pos - 1
+    # An escaped `]` does not close the label, so this is not a link either.
+    slashes = 0
+    while (at - slashes - 1 >= 1 && substr(text, at - slashes - 1, 1) == "\\") slashes++
+    if (slashes % 2 == 1) { start = at + 1; continue }
     for (i = at - 1; i >= 1; i--) {
       ch = substr(text, i, 1)
       if (ch == "]") break
@@ -253,9 +263,10 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # example of `<!--` inside a fence must not comment out the document, and an
   # example of a fence inside a comment must not open one.
   if (md_in_comment) {
+    # Code spans are not parsed inside an HTML comment, so a backtick-wrapped
+    # terminator still closes it. Search the raw text, not the masked copy.
     out = line
-    masked = mask_code_spans(out)
-    pos = index(masked, "-->")
+    pos = index(out, "-->")
     if (pos == 0) return ""
     out = substr(out, pos + 3)
     md_in_comment = 0
@@ -305,7 +316,7 @@ function scan_comments(text,   out, masked, pos, close_at, head, tail) {
   while ((pos = unescaped_index(masked, "<!--", 1)) > 0) {
     head = substr(out, 1, pos - 1)
     tail = substr(out, pos)
-    close_at = index(substr(masked, pos), "-->")
+    close_at = index(substr(out, pos), "-->")
     if (close_at == 0) {
       md_in_comment = 1
       md_comment_opened_at = FNR
@@ -475,18 +486,20 @@ findings="$(
   # `-`, `*` and `+` are all legal markdown bullets, and markdown allows a tab
   # after the marker.
   #
-  # Indentation is the subtle half. Up to three leading spaces still starts a
-  # top-level item — but the *same* indentation under an open entry is a nested
-  # list item belonging to it, which is how this changelog writes multi-part
-  # entries (the marker often sits on a sub-bullet). So an indented bullet
-  # starts an entry only when no entry is currently open; otherwise it stays
-  # part of the one above it.
-  visible ~ /^[-*+][ \t]/ || (entry == "" && dedent3(visible) ~ /^[-*+][ \t]/) {
+  # Indentation is the subtle half, and the rule is list *depth*. A bullet
+  # indented deeper than the open entry is a nested item belonging to it —
+  # which is how this changelog writes multi-part entries, with the marker
+  # often on a sub-bullet. A bullet at the same depth or shallower is a
+  # sibling, and starts its own entry: merging siblings once let one bullet
+  # cover another breaking bullet with its link.
+  dedent3(visible) ~ /^[-*+][ \t]/ &&
+  (entry == "" || leading_spaces(visible) <= entry_indent) {
     flush_entry()
     entry_line = FNR
     entry_breaking_heading = breaking_heading
     entry = $0
     entry_visible = visible
+    entry_indent = leading_spaces(visible)
     next
   }
 
@@ -722,9 +735,11 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           if (is_draft) placeholder = 0
           if (status == "") {
             printf "NOSTATUS\t-\n"
-          } else if (!allow_pending &&
-                     status_value !~ /^performed[[:space:]]+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ &&
-                     status_value !~ /^backfilled([[:space:]]|$)/) {
+          } else if (status_value !~ /^performed[[:space:]]+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ &&
+                     status_value !~ /^backfilled([[:space:]]|$)/ &&
+                     !(allow_pending && status_value ~ /^pending([[:space:]]|$)/)) {
+            # The draft widens the accepted set by one value; it does not turn
+            # the check off. `failed`, or a typo, is not a walk-through record.
             printf "PENDING\t%s\n", status
           }
           if (placeholder) printf "PLACEHOLDER\t-\n"
