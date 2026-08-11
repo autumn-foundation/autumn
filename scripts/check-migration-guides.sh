@@ -478,9 +478,12 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # markdown strips a list item indentation before interpreting the blocks
   # inside it: a four-space-indented fence within a `- ` item is a fence.
   # md_block_indent is 0 outside a list item, leaving this as it was.
+  # Sliced from the *expanded* line: leading_spaces counts visual columns, so
+  # feeding that count to substr on a tab-indented line started the slice
+  # mid-marker and the fence went unseen.
   strip = leading_spaces(line)
   if (strip > md_block_indent) strip = md_block_indent
-  body = dedent3(substr(line, strip + 1))
+  body = dedent3(substr(expand_tabs(line), strip + 1))
   ch = substr(body, 1, 1)
   if (ch == "`" || ch == "~") {
     run = 0
@@ -536,6 +539,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     md_in_html_block = 1
     md_html_type = 1
     md_html_end = ""
+    md_html_opened_at = FNR
     if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
     return ""
   }
@@ -556,6 +560,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   }
   if (md_html_end != "") {
     md_in_html_block = 1
+    md_html_opened_at = FNR
     # The terminator may sit on the opening line, after the opener itself —
     # `<?demo ?>` is a complete block. Searched past the opener so a `>` inside
     # `<!DOCTYPE` is not mistaken for the end of the declaration.
@@ -570,6 +575,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   if (tolower(body) ~ /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([[:space:]/>]|$)/) {
     md_in_html_block = 1
     md_html_type = 6
+    md_html_opened_at = FNR
     return ""
   }
   # Type 7 is any other complete tag standing alone on its line; content after
@@ -578,6 +584,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   if (body ~ /^<\/?[a-zA-Z][^<>]*>[[:space:]]*$/ && body !~ /^<!/) {
     md_in_html_block = 1
     md_html_type = 6
+    md_html_opened_at = FNR
     return ""
   }
 
@@ -817,6 +824,15 @@ findings="$(
     flush_entry()
     if (md_in_fence) printf "UNCLOSED\t-\t%d\tcode fence opened here is never closed\n", md_fence_opened_at
     if (md_in_comment) printf "UNCLOSED\t-\t%d\tHTML comment opened here is never closed\n", md_comment_opened_at
+    # Same failure as the two above: everything after the opener is treated as
+    # literal, so whole sections and their entries vanish from every check.
+    #
+    # Only the kinds that *require* a terminator — `<script>`, `<?`, `<!` and
+    # CDATA. A tag-opened block (type 6/7) ends at a blank line or at end of
+    # document, so reaching EOF inside one is ordinary markdown, not a sign the
+    # file was misread, and failing it would reject valid changelogs.
+    if (md_in_html_block && md_html_type != 6)
+      printf "UNCLOSED\t-\t%d\traw HTML block opened here is never closed\n", md_html_opened_at
   }
   ' "$CHANGELOG"
 )"
@@ -1003,6 +1019,20 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
         # nothing so it is not migration instructions. Fence delimiters are not
         # content either; the lines inside one are.
         {
+          # The changelog parser tracks the enclosing list item content column
+          # and this one did not, so a fence indented four spaces under a `- `
+          # item was invisible while the headings displayed inside it were not
+          # — letting a sample of a guide stand in for the guide. One level is
+          # enough here: guides put their real headings in column 0, and that
+          # is what closes the item.
+          if (!md_in_fence) {
+            item_width = list_marker_width(dedent3($0))
+            if (item_width > 0) {
+              md_block_indent = leading_spaces($0) + item_width
+            } else if ($0 ~ /^[^[:space:]]/) {
+              md_block_indent = 0
+            }
+          }
           visible = visible_text($0)
           if (md_fence_hit) next
           if (md_in_fence) {

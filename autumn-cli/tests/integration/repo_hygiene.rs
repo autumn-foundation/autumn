@@ -4463,3 +4463,141 @@ fn migration_guide_gate_closes_a_non_tag_html_block_on_its_own_line() {
         gate_report(&output),
     );
 }
+
+// --- Review round 29: tab columns, unclosed blocks, guide list indent -----
+
+#[test]
+fn migration_guide_gate_strips_tab_indentation_by_column_not_character() {
+    // `leading_spaces` counts visual columns, so a tab reads as four. Feeding
+    // that count to `substr` on the *unexpanded* line started the slice in the
+    // middle of the fence marker, and the fence was missed — leaving a link
+    // that renders as code text looking like a clickable guide.
+    //
+    // Reference implementation: the fence body renders inside `<pre><code>`,
+    // link included, with no anchor element.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\
+         \t~~~\n\tSee the [migration guide](docs/migrations/0.7.0.md).\n\t~~~\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a tab-indented fence inside a list item is a fence",
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_an_unclosed_raw_html_block() {
+    // An unclosed block swallows the rest of the file, exactly as an unclosed
+    // fence or comment does — every section and entry after it disappears from
+    // all four checks. Those two already fail closed; this one has to as well.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         <script>\n\n\
+         ## [Unreleased]\n\n\
+         - **db:** **Breaking:** renamed, with no guide.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an unclosed HTML block hides every entry after it\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("never closed"),
+        "the failure must name the unclosed opener\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_guide_fences_at_the_list_content_column() {
+    // The guide validator never tracked list indentation, so a fence indented
+    // four spaces under a `- ` item was missed and the headings *displayed*
+    // inside that sample were counted as the guide's own sections. A guide can
+    // then satisfy every shape check while containing no instructions at all.
+    //
+    // The uneven indentation is the point, and is what a column-blind parser
+    // gets wrong: the fence marker sits at four spaces, which `dedent3` alone
+    // cannot see past, while the sample body sits at two, which it can. Both
+    // are inside the item, so CommonMark reads the whole sample as code — the
+    // reference implementation renders `## How to verify` within
+    // `<pre><code>`, not as a heading.
+    // This guide has no `## How to verify` section of its own — only one
+    // *displayed* inside the sample — and every other required section for
+    // real, so the sample is the only thing that can satisfy the check.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = "# Migrating from Autumn `0.x` to `0.7.0`\n\n\
+         ## At a glance\n\n\
+         - **New version:** `autumn-web 0.7.0`\n\n\
+         ## Summary\n\n\
+         Why this release breaks.\n\n\
+         ## Before you start\n\n\
+         Pin the old version and get green.\n\n\
+         ## Breaking changes\n\n\
+         ### Area: the thing that broke\n\n\
+         Before / after.\n\n\
+         - The verification section is expected to look like this:\n\n    \
+         ```markdown\n  ## How to verify\n\n  Run `cargo check`.\n    ```\n\n\
+         ### Guide-only upgrade walkthrough\n\n\
+         - **Status:** performed 2026-01-01\n";
+    write_fixture_guide(&tmp, "0.7.0", guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a displayed sample is not the guide's own structure\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_a_guide_showing_a_fenced_sample_in_a_list() {
+    // The counterpart guard: tracking list indentation must not start failing
+    // guides that legitimately show a fenced example under a bullet while
+    // carrying every required section for real.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = format!(
+        "{}\n## Appendix\n\n\
+         - A config sample, shown under a bullet:\n\n    \
+         ```toml\n    [server]\n    port = 3000\n    ```\n",
+        valid_migration_guide("0.7.0")
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a fenced sample under a bullet is normal guide writing\n{}",
+        gate_report(&output),
+    );
+}

@@ -118,9 +118,11 @@ It fails when:
 - `next.md` is missing. The rolling draft is permanent, not conditional on
   there being an unreleased break: this file and `STABILITY.md` both link it by
   name, and nothing here checks markdown links;
-- it cannot read the changelog: a `## ` heading it fails to parse and an
-  unclosed code fence are hard errors, because either one silently removes
-  whole sections from every check above.
+- it cannot read the changelog: a `## ` heading it fails to parse, an unclosed
+  code fence, an unclosed HTML comment, and an unclosed `<script>`, `<?`, `<!`
+  or CDATA block are all hard errors, because each one silently removes whole
+  sections from every check above. A `<div>` still open at end of file is not
+  an error — that kind of block legitimately ends there.
 
 Details that save a round trip: `**Breaking:**` is matched case-insensitively,
 and `- ` and `* ` are both bullets. A marker inside an inline code span (any
