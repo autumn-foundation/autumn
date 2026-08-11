@@ -167,11 +167,33 @@ function suppressed_by_comment(text,   t, at) {
   return 0
 }
 
+function expand_tabs(text,   out, i, n, ch, col) {
+  # Markdown measures indentation in visual columns, and a tab advances to the
+  # next multiple of four. Counting it as one column made a `-\t` item look two
+  # columns narrower than it renders, which merged its siblings into it.
+  # Almost every line is tab-free; rebuilding each one character by character
+  # tripled the suite runtime, so leave those untouched.
+  if (index(text, "\t") == 0) return text
+  out = ""
+  col = 0
+  n = length(text)
+  for (i = 1; i <= n; i++) {
+    ch = substr(text, i, 1)
+    if (ch == "\t") {
+      do { out = out " "; col++ } while (col % 4 != 0)
+    } else {
+      out = out ch
+      col++
+    }
+  }
+  return out
+}
+
 function list_marker_width(text,   body, n, ch) {
   # Width of a list marker at the start of `text` (already dedented), counting
   # the marker and the whitespace after it; 0 when this is not a list item.
   # Markdown allows `-`, `*`, `+` and ordered markers such as `1.` or `1)`.
-  body = text
+  body = expand_tabs(text)
   n = 0
   ch = substr(body, 1, 1)
   if (ch == "-" || ch == "*" || ch == "+") {
@@ -189,18 +211,21 @@ function list_marker_width(text,   body, n, ch) {
   return n
 }
 
-function leading_spaces(text,   n) {
+function leading_spaces(text,   n, expanded) {
+  # Visual columns, not characters: see expand_tabs.
+  expanded = expand_tabs(text)
   n = 0
-  while (substr(text, n + 1, 1) == " ") n++
+  while (substr(expanded, n + 1, 1) == " ") n++
   return n
 }
 
-function dedent3(text,   n) {
+function dedent3(text,   n, expanded) {
   # Markdown permits up to three leading spaces on a block-level construct; a
   # fourth makes the line an indented code block, i.e. literal text.
+  expanded = expand_tabs(text)
   n = 0
-  while (n < 3 && substr(text, n + 1, 1) == " ") n++
-  return substr(text, n + 1)
+  while (n < 3 && substr(expanded, n + 1, 1) == " ") n++
+  return substr(expanded, n + 1)
 }
 
 function heading_text(line,   h) {
@@ -534,6 +559,7 @@ findings="$(
     # Where this item content starts: past the marker and the space after it.
     entry_content_indent = entry_indent + list_marker_width(dedent3(visible))
     item_content_indent = entry_content_indent
+    entry_paragraph_open = 1
     next
   }
 
@@ -542,7 +568,8 @@ findings="$(
       # A non-blank line indented less than the item content column sits
       # outside the list item — markdown renders it as a sibling block, so it
       # is not part of this entry and must not supply its guide link.
-      if (visible ~ /[^[:space:]]/ && leading_spaces(visible) < entry_content_indent) {
+      if (visible ~ /[^[:space:]]/ && leading_spaces(visible) < entry_content_indent &&
+          entry_paragraph_open == 0) {
         flush_entry()
       } else {
         # A nested bullet opens an item of its own; blocks after it are
@@ -557,6 +584,10 @@ findings="$(
         entry_visible = entry_visible " " visible
       }
     }
+    # CommonMark lazy continuation: while the item paragraph is still open, an
+    # unindented line continues it. A blank line closes the paragraph, after
+    # which the same line would sit outside the item.
+    entry_paragraph_open = (visible ~ /[^[:space:]]/) ? 1 : 0
   }
 
   END {

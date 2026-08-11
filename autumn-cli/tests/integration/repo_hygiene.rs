@@ -3751,3 +3751,66 @@ fn migration_guide_gate_nests_under_ordered_items() {
         gate_report(&output),
     );
 }
+
+// --- Review round 21: tab stops, lazy continuation ------------------------
+
+#[test]
+fn migration_guide_gate_expands_tabs_when_measuring_columns() {
+    // A tab advances to the next 4-column stop, so `-\t` puts content at
+    // column 4 and a two-space bullet after it is a *sibling*, not nested.
+    // Counting the tab as one column merged them and let the sibling's link
+    // cover the breaking entry.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         -\t**db:** **Breaking:** renamed, with no link of its own.\n  \
+         - **docs:** see the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "the two items are siblings; one cannot supply the other's link",
+    );
+}
+
+#[test]
+fn migration_guide_gate_keeps_lazy_continuation_lines() {
+    // CommonMark lets an unindented line immediately after a list item's first
+    // line continue its paragraph. Flushing there dropped the marker entirely.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** API removal details follow\n\
+         **Breaking:** `with_pool` is removed, with no guide anywhere.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a lazy continuation line is part of the entry, marker and all",
+    );
+
+    // A blank line ends the paragraph, so the same line is then outside it.
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n\
+         Everything here is in the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "after a blank line the paragraph is outside the item again",
+    );
+}
