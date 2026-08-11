@@ -130,10 +130,13 @@ backticks to say "declaration".
 Fenced code blocks (``` or `~~~`) are skipped wholesale in both the changelog
 and the guides — a `breaking` key in a config sample is not a breaking change,
 and a guide cannot satisfy its own required headings from inside an example.
-Raw HTML blocks are skipped for the same reason, and end where CommonMark ends
-them: a `<script>`, `<style>`, `<pre>` or `<textarea>` block at its end tag, and
-anything else at the next blank line. So a link on the line after `</script>`
-counts, and one sharing that line with it does not.
+Raw HTML blocks are skipped for the same reason. They open on one of
+CommonMark's block tag names — with or without trailing content, so `<div>` and
+`<div>example` both start one — or on any other complete tag standing alone on
+its line, which leaves `Vec<Route>` and `<MyWidget>` in prose as prose. They end
+where CommonMark ends them: a `<script>`, `<style>`, `<pre>` or `<textarea>`
+block at its end tag, anything else at the next blank line. So a link on the
+line after `</script>` counts, and one sharing that line with it does not.
 
 The lint is textual, so it removes the *silent* failure mode rather than
 replacing review: a break described without the word "breaking" and without the

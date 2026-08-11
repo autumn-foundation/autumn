@@ -4116,3 +4116,105 @@ fn migration_guide_gate_rejects_a_guide_link_with_an_unclosed_title() {
         "an unclosed title leaves the whole construct as literal text",
     );
 }
+
+// --- Review round 26: link labels, titles, type-6 openers -----------------
+
+#[test]
+fn migration_guide_gate_requires_whitespace_before_a_link_title() {
+    // CommonMark separates an optional title from the destination with
+    // whitespace. `(<path>"title")` therefore closes nothing and renders as
+    // literal text, so an entry written that way has no clickable guide —
+    // skipping optional whitespace without recording that any was there
+    // accepted it.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](<docs/migrations/0.7.0.md>\"upgrade\").\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a title jammed against an angle destination does not make a link",
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_balanced_brackets_in_a_link_label() {
+    // A link label may contain balanced brackets. Stopping the backward scan
+    // at the first `]` mistook the inner label's bracket for the end of a
+    // previous link and rejected a link that is clickable.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See \
+           [the [migration guide]](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "balanced brackets are allowed inside a link label\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_opens_a_type_six_block_with_trailing_content() {
+    // CommonMark type 6 starts on a known block tag followed by whitespace,
+    // `>`, `/>` or end of line — the rest of the line may be anything. Requiring
+    // the tag to stand alone let `<div>example` slip through, leaving the link
+    // on the next line inside the block scanned as if it were clickable.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <div>example\n  See the [migration guide](docs/migrations/0.7.0.md).\n  </div>\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "text inside a raw HTML block is literal however the block opened",
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_treat_an_unknown_tag_as_a_block_opener() {
+    // The counterpart guard: type 6 is a fixed list of block tags. Loosening it
+    // to any tag name would swallow prose — `<MyWidget>` in a sentence, or a
+    // generic like `<Route>` — and delete entries the marker and lint read.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed.\n  \
+         <MyWidget>renders differently now.\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an unknown tag name does not open a raw HTML block\n{}",
+        gate_report(&output),
+    );
+}

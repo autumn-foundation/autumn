@@ -259,7 +259,7 @@ function mask_html_attributes(text,   out, rest, at) {
   return out rest
 }
 
-function link_destination(text, p,   n, ch, dest, depth, closer, sq) {
+function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
   # Parse an inline link destination starting just inside the `(`, and return
   # it only if the construct closes as a link. The destination is parsed rather
   # than pattern-matched because a link may carry an optional title —
@@ -302,9 +302,14 @@ function link_destination(text, p,   n, ch, dest, depth, closer, sq) {
     }
     if (depth != 0) return ""
   }
-  while (p <= n && (substr(text, p, 1) == " " || substr(text, p, 1) == "\t")) p++
+  # A title must be separated from the destination by whitespace, so
+  # `(<path>"why")` closes nothing and is literal text, not a link. Only the
+  # angle form can reach here without a gap — a bare destination swallows the
+  # quote instead, and then no longer matches the guide path.
+  gap = 0
+  while (p <= n && (substr(text, p, 1) == " " || substr(text, p, 1) == "\t")) { p++; gap = 1 }
   ch = substr(text, p, 1)
-  if (ch == "\"" || ch == sq || ch == "(") {
+  if (gap && (ch == "\"" || ch == sq || ch == "(")) {
     closer = ch == "(" ? ")" : ch
     p++
     while (p <= n) {
@@ -321,7 +326,7 @@ function link_destination(text, p,   n, ch, dest, depth, closer, sq) {
   return dest
 }
 
-function links_to(text, path,   pos, at, i, ch, start, slashes) {
+function links_to(text, path,   pos, at, i, ch, start, slashes, depth) {
   # A complete inline link `[label](path)`, not a bare `](path)`: the second
   # renders as literal text, so the reader has nothing to click.
   start = 1
@@ -332,19 +337,24 @@ function links_to(text, path,   pos, at, i, ch, start, slashes) {
     slashes = 0
     while (at - slashes - 1 >= 1 && substr(text, at - slashes - 1, 1) == "\\") slashes++
     if (slashes % 2 == 1) { start = at + 1; continue }
+    # Walk back to the `[` that opens the label. Brackets nest — the label of
+    # `[the [migration guide]](path)` contains a balanced pair — so an inner
+    # `]` is counted, not treated as the end of some earlier link.
+    depth = 0
     for (i = at - 1; i >= 1; i--) {
       ch = substr(text, i, 1)
-      if (ch == "]") break
+      if (ch != "[" && ch != "]") continue
       # An escaped bracket renders as literal text: `\[label](path)` is not a
-      # link. Odd run of backslashes before it means escaped.
-      if (ch == "[") {
-        slashes = 0
-        while (i - slashes - 1 >= 1 && substr(text, i - slashes - 1, 1) == "\\") slashes++
-        # An unescaped `!` before the bracket makes this an image, which renders
-        # a picture rather than a path the reader can follow.
-        if (slashes % 2 == 0 &&
-            !(i > 1 && substr(text, i - 1, 1) == "!")) return 1
-      }
+      # link, and `\]` does not nest. Odd run of backslashes means escaped.
+      slashes = 0
+      while (i - slashes - 1 >= 1 && substr(text, i - slashes - 1, 1) == "\\") slashes++
+      if (slashes % 2 == 1) continue
+      if (ch == "]") { depth++; continue }
+      if (depth > 0) { depth--; continue }
+      # An unescaped `!` before the bracket makes this an image, which renders
+      # a picture rather than a path the reader can follow.
+      if (!(i > 1 && substr(text, i - 1, 1) == "!")) return 1
+      break
     }
     start = at + 1
   }
@@ -463,9 +473,19 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
     return ""
   }
-  # Type 6/7 is scoped to a tag alone on its line so inline HTML and
-  # `Vec<Route>` in prose are untouched; `<!` is excluded because comments are
-  # handled below with their own escape rules.
+  # Type 6 opens on one of a fixed list of block tag names followed by
+  # whitespace, `>`, `/>` or end of line, and the rest of the line may be
+  # anything — `<div>example` opens a block just as `<div>` does. The list is
+  # what keeps this narrow: any-tag-name would swallow `Vec<Route>` and
+  # `<MyWidget>` in prose along with the entries the lint reads there.
+  if (tolower(dedent3(line)) ~ /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([[:space:]/>]|$)/) {
+    md_in_html_block = 1
+    md_html_type = 6
+    return ""
+  }
+  # Type 7 is any other complete tag standing alone on its line; content after
+  # it would make the line a paragraph instead. `<!` is excluded because
+  # comments are handled below with their own escape rules.
   if (dedent3(line) ~ /^<\/?[a-zA-Z][^<>]*>[[:space:]]*$/ && dedent3(line) !~ /^<!/) {
     md_in_html_block = 1
     md_html_type = 6
