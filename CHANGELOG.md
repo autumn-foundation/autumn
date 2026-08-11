@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generate scaffold:** the generated list view ships a working **Export
+  CSV** download (#1315). Autumn already had the hard half — `export_csv` +
+  the `CsvSchema` trait, landed in #808 — but the generator never wired it,
+  so every app author had to discover the trait, hand-write an impl, add a
+  route, get the `Content-Disposition` quoting right and add a link, for
+  every single model. `autumn generate scaffold` now emits all four: a
+  `CsvSchema` impl covering `id`, every scaffolded column in declaration
+  order and `created_at` (the `show` view's column set); a
+  `#[get("/<plural>/export.csv")]` handler; an **Export CSV** link on the
+  index; and a database-free generated test asserting 200, `text/csv`, an
+  `attachment` disposition and the model's header row. `autumn-web`'s `csv`
+  feature is enabled automatically (and removed again by `autumn destroy
+  scaffold`).
+
+  The export honours the **same** allowlisted `?sort=`/`?filter[col]=`
+  params as the index, through the same `ListQuery` extractor and the same
+  `repo.list` call (#1126) — and the index's link carries the current query
+  string, so *filter → sort → export* downloads exactly the rows on screen.
+  `?page=`/`?size=` are ignored: an export spans every page of the current
+  filter. Rows are read in `MAX_PAGE_SIZE` batches and capped at
+  `MAX_EXPORT_ROWS` (10 000), a constant in the generated file.
+
+  Security posture mirrors the index exactly, so no new public data path is
+  opened: an owner-scoped scaffold's export is `#[secured]` and reads through
+  the repository's owner-scoped `list_scoped`, never the unscoped `list`; a
+  scaffold whose index carries no `#[secured]` gets an export that carries
+  none either. `NULL` columns serialize to an empty cell rather than the
+  literal `None`, and commas/quotes/newlines are RFC 4180 quoted by
+  `export_csv`.
+
+  Emitted wherever the index's row set is a repository call the export can
+  reuse verbatim — the plain `repo.list` index (including
+  `--live-validation`) and the owner-scoped `list_scoped` one. Gated off for
+  `--live`, `--sharded`, owner-scoped `--live-validation` and `--api`, whose
+  output stays byte-identical. See `docs/guide/generators.md`.
+
 - **system-tests:** `SystemTest::layer(...)` registers app-wide Tower
   middleware on the router a browser test serves (#1456). Applications whose
   routes depend on a global layer — tenant scoping bound to a database pool,
