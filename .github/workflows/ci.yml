@@ -111,6 +111,19 @@ jobs:
           cargo test -p autumn-web --features markdown --test integration_tests rich_text
           cargo test -p autumn-web --features markdown --lib markdown::
           cargo test -p autumn-web --features markdown --doc markdown::
+      - name: Run system-test harness (non-browser) tests
+        # `system-tests` is not a default feature. The `cargo test --workspace`
+        # above happens to compile it today only because `example-e2e` depends
+        # on `autumn-web` with that feature and workspace feature unification
+        # turns it on — accidental coverage that would vanish silently if that
+        # one dependency were ever dev-scoped or dropped. Name it explicitly so
+        # the harness's own tests (browser resolution, transient-CDP retry
+        # loop, `SystemTest::layer`) stay covered on purpose. The `#[ignore]`d
+        # browser tests need Chromium and run in publish-gate.yml's
+        # browser-provisioned job.
+        run: |
+          cargo test -p autumn-web --features system-tests --lib system_test::
+          cargo test -p autumn-web --features system-tests --test integration_tests system_test_api
       - name: Install Postgres client tools (Linux)
         if: runner.os == 'Linux'
         run: |

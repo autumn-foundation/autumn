@@ -292,6 +292,32 @@ pub fn try_build_router(
     config: &AutumnConfig,
     state: AppState,
 ) -> Result<axum::Router, RouterBuildError> {
+    try_build_router_with_layers(route_list, config, state, Vec::new())
+}
+
+/// [`try_build_router`] plus caller-supplied app-wide Tower layers.
+///
+/// The layers are handed to the same [`RouterContext::custom_layers`] slot
+/// that [`AppBuilder::layer`](crate::app::AppBuilder::layer) uses, so they
+/// land in the identical stack position (inside `RequestId` and the session
+/// layer, outside CSRF/CORS) and compose with the identical ordering
+/// contract — the first registration is the outermost layer on ingress.
+///
+/// Exists for `SystemTest::layer` (feature `system-tests`, hence no intra-doc
+/// link from this always-compiled module): a browser test that registers its
+/// app's middleware must observe exactly the stack the real app serves,
+/// otherwise the harness lies about what production does.
+///
+/// # Errors
+///
+/// Returns [`RouterBuildError`] when router assembly encounters invalid
+/// framework configuration, such as an unusable session backend.
+pub fn try_build_router_with_layers(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
     let router = try_build_router_inner(
         route_list,
@@ -302,7 +328,7 @@ pub fn try_build_router(
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
-            custom_layers: Vec::new(),
+            custom_layers,
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
             error_page_renderer: None,

@@ -28,8 +28,20 @@ package = "autumn-web"
 # `router::extract_path_params`, the path-parameter extraction seam).
 features = ["inbound-mail", "multipart", "openapi"]
 
+# cargo-fuzz builds in release mode with ASAN instrumentation, which is the
+# repo's heaviest build; debug info is a large share of that footprint and is
+# what pushes the runner over its ceiling (see the "Free disk space" step in
+# .github/workflows/fuzz.yml). `line-tables-only` keeps stack traces
+# symbolicated — all a crash reproducer needs, since the input is replayed
+# locally with full debug info — while dropping the type/variable DWARF nobody
+# reads from a CI log. Build scripts and proc macros never appear in a fuzz
+# backtrace, so they need none at all. Mirrors the root workspace's
+# `[profile.test]` / `[profile.test.build-override]` pairing.
 [profile.release]
-debug = 1
+debug = "line-tables-only"
+
+[profile.release.build-override]
+debug = 0
 
 # Keep fuzz-target builds from tripping the "unused `main`" style lints and to
 # match cargo-fuzz conventions.
