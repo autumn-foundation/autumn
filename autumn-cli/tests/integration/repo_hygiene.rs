@@ -3221,17 +3221,20 @@ fn migration_guide_gate_reads_plus_bullets() {
 #[test]
 fn migration_guide_gate_ignores_over_indented_fence_markers() {
     // Four spaces makes a line an indented code block, so those backticks are
-    // literal text, not a fence. Treating them as one swallowed the entries
+    // literal text, not a fence. Treating them as one swallowed the entry
     // between two such displayed markers.
+    //
+    // The markers sit at top level on purpose: indentation is measured from
+    // the enclosing list item content column (see the round-18 test), so the
+    // same four spaces *inside* a `- ` item would only be two relative — and
+    // that genuinely is a fence.
     let tmp = migration_gate_fixture("0.7.0");
     std::fs::write(
         tmp.path().join("CHANGELOG.md"),
         "# Changelog\n\n\
          ## [0.7.0] - 2026-09-01\n\n\
-         ### Changed\n\n\
-         - **docs:** a fence is written as:\n\n    ```\n\n\
-         - **db:** **Breaking:** `with_pool` renamed, with no guide anywhere.\n\n\
-         - **docs:** and closed with:\n\n    ```\n",
+         ### Changed\n\n    ```\n\n\
+         - **db:** **Breaking:** `with_pool` renamed, with no guide anywhere.\n\n    ```\n",
     )
     .expect("changelog");
 
@@ -3550,4 +3553,52 @@ fn migration_guide_gate_validates_the_drafts_status_value() {
             if should_pass { "pass" } else { "fail" },
         );
     }
+}
+
+// --- Review round 18: list-item containers --------------------------------
+
+#[test]
+fn migration_guide_gate_ends_an_entry_when_its_list_item_ends() {
+    // A blank line then an unindented paragraph is outside the list item, so a
+    // release-wide link in that paragraph is not the bullet's link.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n\
+         Everything in this release is covered by the \
+         [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a paragraph outside the list item does not supply the bullet's link",
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_fences_relative_to_their_list_item() {
+    // Markdown strips the list item's indentation before interpreting blocks
+    // inside it, so a four-space-indented fence within a `- ` item really is a
+    // fence — and a link displayed in it is a code sample, not a link.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. Link entries like this:\n\n    \
+           ~~~markdown\n    See the [migration guide](docs/migrations/0.7.0.md).\n    ~~~\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a link displayed inside a fenced example is not the entry's link",
+    );
 }

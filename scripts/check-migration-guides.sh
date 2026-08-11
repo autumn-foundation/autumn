@@ -254,7 +254,7 @@ function mask_code_spans(text,   out, i, n, ch, run, j, run2, found, k) {
   return out
 }
 
-function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close_at) {
+function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close_at, strip) {
   md_fence_hit = 0
 
   # Whichever construct opened first wins, and while one is open the other is
@@ -277,7 +277,14 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # long as its opener, so a ````markdown block may contain a ``` sample.
   # Four or more leading spaces makes these backticks literal text, not a
   # fence — an over-indented example of a fence marker must not open one.
-  body = dedent3(line)
+  #
+  # "Leading" is measured from the enclosing list item content column, because
+  # markdown strips a list item indentation before interpreting the blocks
+  # inside it: a four-space-indented fence within a `- ` item is a fence.
+  # md_block_indent is 0 outside a list item, leaving this as it was.
+  strip = leading_spaces(line)
+  if (strip > md_block_indent) strip = md_block_indent
+  body = dedent3(substr(line, strip + 1))
   ch = substr(body, 1, 1)
   if (ch == "`" || ch == "~") {
     run = 0
@@ -440,6 +447,7 @@ findings="$(
   # in a code sample is a mention. The suppression token is the one comment the
   # gate reads, and flush_entry takes it from the raw entry instead.
   {
+    md_block_indent = (entry == "") ? 0 : entry_content_indent
     visible = visible_text($0)
     if (md_fence_hit || md_in_fence) next
   }
@@ -500,13 +508,27 @@ findings="$(
     entry = $0
     entry_visible = visible
     entry_indent = leading_spaces(visible)
+    # Where this item content starts: past the marker and the space after it.
+    entry_content_indent = entry_indent + 1
+    marker_rest = substr(dedent3(visible), 2)
+    while (substr(marker_rest, 1, 1) == " " || substr(marker_rest, 1, 1) == "\t") {
+      entry_content_indent++
+      marker_rest = substr(marker_rest, 2)
+    }
     next
   }
 
   {
     if (entry != "") {
-      entry = entry " " $0
-      entry_visible = entry_visible " " visible
+      # A non-blank line indented less than the item content column sits
+      # outside the list item — markdown renders it as a sibling block, so it
+      # is not part of this entry and must not supply its guide link.
+      if (visible ~ /[^[:space:]]/ && leading_spaces(visible) < entry_content_indent) {
+        flush_entry()
+      } else {
+        entry = entry " " $0
+        entry_visible = entry_visible " " visible
+      }
     }
   }
 
