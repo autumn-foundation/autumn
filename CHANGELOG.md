@@ -28,7 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `repo.list` call (#1126) — and the index's link carries the current query
   string, so *filter → sort → export* downloads exactly the rows on screen.
   `?page=`/`?size=` are ignored: an export spans every page of the current
-  filter. Rows are read in `MAX_PAGE_SIZE` batches and capped at
+  filter. On a `--searchable` scaffold the link renders **inside** the
+  `#<plural>-search-results` container rather than beside "New …", so the htmx
+  swap that shows search results takes the link away with them: the search box
+  pushes no URL and `ListQuery` has no full-text field, so a link left outside
+  would survive the swap still pointing at the unsearched set and hand back the
+  rows the user had just excluded. Searched results offer no export; clearing
+  the search restores the list and its link. Rows are read in `MAX_PAGE_SIZE` batches and capped at
   `MAX_EXPORT_ROWS` (10 000), a constant in the generated file. An export that
   hits the cap is truncated rather than failed, but never silently: it logs a
   `warn!` and sets `x-export-truncated: true`. Distinguishing a complete export

@@ -304,6 +304,55 @@ fn export_link_preserves_the_active_sort_and_filter() {
 }
 
 #[test]
+fn searchable_index_puts_the_export_link_inside_the_swapped_results_container() {
+    // `active_search_input` swaps `#posts-search-results` and pushes no URL, so
+    // a search term never reaches `pager_query` and `ListQuery` has no field for
+    // one. A link rendered as page furniture would therefore survive the swap
+    // still pointing at the UNSEARCHED row set: narrow the list, click "Export
+    // CSV" beside the rows you kept, download the rows you excluded. Rendering
+    // it inside the container makes the swap take it away with the rows it
+    // described.
+    let (_tmp, routes) = scaffold_routes("csv-searchable-link", &["--searchable", "title"]);
+    let index = handler_slice(&routes, "index");
+    assert!(
+        index.contains("\"Export CSV\""),
+        "a searchable scaffold still exports its unsearched list:\n{index}"
+    );
+    let container = index
+        .find(r#"div id="posts-search-results""#)
+        .expect("premise: a searchable index renders the results container");
+    let link = index
+        .find("\"Export CSV\"")
+        .expect("checked non-empty above");
+    assert!(
+        link > container,
+        "the Export CSV link must sit inside the swapped results container, \
+         not above it as page furniture:\n{index}"
+    );
+    // ...and specifically NOT glued to the "New Post" anchor, which lives
+    // outside the container and survives every swap.
+    assert!(
+        !index.contains(
+            "\"New Post\"))\n        \" \"\n        (autumn_web::a11y::Link::new(export_href"
+        ),
+        "a searchable index must not render the export link as furniture:\n{index}"
+    );
+}
+
+#[test]
+fn searchable_results_fragment_renders_no_export_link() {
+    // The other half of the contract: the fragment that REPLACES the container
+    // carries no link, so searched results offer no export rather than a wrong
+    // one. This is what docs/guide/generators.md promises.
+    let (_tmp, routes) = scaffold_routes("csv-searchable-frag", &["--searchable", "title"]);
+    let search = handler_slice(&routes, "search");
+    assert!(
+        !search.contains("Export CSV"),
+        "the search results fragment must not offer an export it cannot scope:\n{search}"
+    );
+}
+
+#[test]
 fn paths_module_exposes_the_export_helper() {
     let (_tmp, routes) = scaffold_routes("csv-paths", &[]);
     let paths = routes

@@ -3921,9 +3921,19 @@ mod attachment_read_back_tests {
                  /// NOT included: the `/{plural}/search` term. `ListQuery` carries sort\n\
                  /// and column filters, not a full-text query, and the search box swaps\n\
                  /// its results in without changing the URL — so a search on screen does\n\
-                 /// not narrow this download. Filter with `?filter[col]=` instead, or\n\
-                 /// extend this handler to take `q` and call the repository's\n\
-                 /// `search_page`.\n"
+                 /// not narrow this download.\n\
+                 ///\n\
+                 /// The index therefore renders its \"Export CSV\" link INSIDE the\n\
+                 /// `#{plural}-search-results` container, not beside \"New …\": the swap\n\
+                 /// that shows search results removes the link along with the rows it\n\
+                 /// described. Left outside, it would survive the swap still pointing\n\
+                 /// here, and a user who had narrowed the list would download the rows\n\
+                 /// they just excluded. If you move that link back out to page\n\
+                 /// furniture, wire `q` through to this handler in the same change.\n\
+                 ///\n\
+                 /// To offer an export of searched rows, take `q` here and call the\n\
+                 /// repository's `search_page`, then render a link carrying the term\n\
+                 /// from the search fragment as well as the index.\n"
             )
         } else {
             String::new()
@@ -4205,9 +4215,27 @@ mod attachment_read_back_tests {
     // extracts no `PageRequest`. Both are empty for a gated-off variant, so its
     // index stays byte-identical to its pre-#1315 output.
     //
-    // Rendered as page furniture next to "New {pascal_name}", deliberately
-    // OUTSIDE the #1312 bulk-actions `<form>`: a nested `<form>` is invalid HTML,
-    // and an export is not a selection action.
+    // Rendered deliberately OUTSIDE the #1312 bulk-actions `<form>`: a nested
+    // `<form>` is invalid HTML, and an export is not a selection action.
+    //
+    // WHERE it sits depends on `--searchable`, because the link must never
+    // outlive the row set it describes:
+    //
+    //   * Not searchable — page furniture next to "New {pascal_name}". The only
+    //     things that narrow the list are `?sort=`/`?filter[col]=`, both of which
+    //     live in the URL that `pager_query` copies into the href, so a link
+    //     rendered once with the page stays accurate for as long as the page does.
+    //
+    //   * Searchable — INSIDE the `#{plural}-search-results` container instead.
+    //     `active_search_input` swaps that container and pushes no URL, so the
+    //     search term never reaches `pager_query` and `ListQuery` has no field to
+    //     put it in. A link left outside the container would survive the swap
+    //     pointing at the UNSEARCHED set: the user narrows the list, clicks
+    //     "Export CSV" next to the rows they filtered down to, and silently
+    //     downloads the rows they just excluded. Rendering it inside means the
+    //     swap replaces it — the search fragment emits no link, so searched
+    //     results simply offer no export, which is what the generators guide
+    //     already documents. Clearing the search restores the list and its link.
     let (export_href_let, export_link) = if export_enabled {
         (
             "    let export_href = if pager_query.is_empty() {\n        \
@@ -4225,6 +4253,18 @@ mod attachment_read_back_tests {
     } else {
         ("", "")
     };
+    // The furniture slot takes the link only when there is no search box to
+    // invalidate it; otherwise `index_list_block` places it inside the container.
+    // The two slots differ only in indentation — furniture is a direct child of
+    // the `html! {` block (8 spaces), the in-results copy is one level deeper
+    // inside the container `div` (12) — so the generated file stays readable.
+    let export_link_furniture = if search_enabled { "" } else { export_link };
+    let export_link_in_results = if search_enabled {
+        "\n            \" \"\n            \
+         (autumn_web::a11y::Link::new(export_href, \"Export CSV\"))"
+    } else {
+        ""
+    };
     // Issue #1312: the list itself (data_table + pager) is wrapped in the
     // bulk-actions `<form>` so each row's checkbox submits with the
     // delete-selected button. The "New {pascal_name}" link, the htmx `<script>`,
@@ -4238,15 +4278,22 @@ mod attachment_read_back_tests {
     // parser silently drops). Form-inside-container means every swap replaces
     // the form wholesale and the checkboxes always have their submit button.
     let index_list_block = if search_enabled {
+        // `export_link_in_results` is the "Export CSV" anchor (empty unless this
+        // variant emits an export). It goes inside the swapped container but
+        // outside the bulk-actions `<form>` — an `<a>` nested in a `<form>` is
+        // legal, but the export is not a selection action and #1312 kept it out
+        // on purpose. Indentation matches the container's other children; the
+        // leading `" "` separator inside the fragment is harmless here, where the
+        // link opens the run rather than following the "New …" anchor.
         let inner = if bulk_delete_enabled {
             format!(
                 "div id=\"{plural}-search-results\" {{\n            \
                  (autumn_web::widgets::bulk_actions_form(&bulk_cfg, {bulk_csrf_args}, html! {{\n                \
-                 {list_render}\n                {pager_line}\n            }}))\n        }}"
+                 {list_render}\n                {pager_line}\n            }})){export_link_in_results}\n        }}"
             )
         } else {
             format!(
-                "div id=\"{plural}-search-results\" {{\n            {list_render}\n            {pager_line}\n        }}"
+                "div id=\"{plural}-search-results\" {{\n            {list_render}\n            {pager_line}{export_link_in_results}\n        }}"
             )
         };
         format!(
@@ -4315,7 +4362,7 @@ pub async fn index(
     let pager_query = raw_query.as_deref().unwrap_or("");
 {export_href_let}{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href=(paths::new()) {{ "New {pascal_name}" }}{export_link}
+        a href=(paths::new()) {{ "New {pascal_name}" }}{export_link_furniture}
         {index_list_block}
     }}))
 }}"#
@@ -4461,7 +4508,7 @@ pub async fn index(
     let pager_query = raw_query.as_deref().unwrap_or("");
 {export_href_let}{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}")){export_link}
+        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}")){export_link_furniture}
         {index_list_block}
     }}))
 }}"#
