@@ -4721,3 +4721,104 @@ fn migration_guide_gate_rejects_a_reference_link_with_no_definition() {
         "an undefined label is not a link",
     );
 }
+
+// --- Review round 31: type-7 vs open paragraphs, definition indentation ---
+
+#[test]
+fn migration_guide_gate_keeps_a_type_seven_tag_inline_inside_a_paragraph() {
+    // CommonMark types 1-6 may interrupt a paragraph; type 7 may not. A custom
+    // tag on the line after an entry's first line is therefore inline HTML,
+    // the paragraph continues, and the link below it is a real anchor —
+    // confirmed against the reference implementation. Opening a block here
+    // discarded a link the reader can click and failed a correct entry.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed.\n  \
+         <x-widget>\n  See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a type-7 tag cannot interrupt a paragraph\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_opens_a_type_seven_block_after_a_blank_line() {
+    // The counterpart: with no paragraph open, the same tag *does* start a
+    // block, and the link inside it is literal. Both halves have to hold, or
+    // "type 7 never opens" becomes a hole rather than a fix.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <x-widget>\n  See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "with no paragraph open the tag starts a raw block",
+    );
+}
+
+#[test]
+fn migration_guide_gate_lets_a_type_six_tag_interrupt_a_paragraph() {
+    // The other counterpart, and the reason the rule is scoped to type 7:
+    // `<div>` is a block tag and *may* interrupt a paragraph, so the link
+    // below it stays literal.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n  \
+         <div>\n  See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a type-6 block tag does interrupt a paragraph",
+    );
+}
+
+#[test]
+fn migration_guide_gate_collects_definitions_indented_under_a_wide_marker() {
+    // A `100. ` marker puts its content column at five, so a definition
+    // indented five spaces sits inside the item and is a real definition. The
+    // collection pass only stripped three columns and missed it, rejecting a
+    // reference link that resolves and renders.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         100. **Breaking:** renamed. See the [migration guide][upgrade].\n\n     \
+         [upgrade]: docs/migrations/0.7.0.md\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a definition inside a wide list item still defines\n{}",
+        gate_report(&output),
+    );
+}

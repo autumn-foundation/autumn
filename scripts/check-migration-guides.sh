@@ -290,11 +290,21 @@ function mask_html_attributes(text,   out, n, i, j, k, ch, quote, has_eq, endpos
   return out
 }
 
+function block_body(text,   strip) {
+  # The line as a block parser sees it: the enclosing list item indentation
+  # removed first, then the up-to-three spaces markdown allows on a block
+  # construct. Sliced from the expanded line because md_block_indent and
+  # leading_spaces are both visual columns.
+  strip = leading_spaces(text)
+  if (strip > md_block_indent) strip = md_block_indent
+  return dedent3(substr(expand_tabs(text), strip + 1))
+}
+
 function is_link_definition(text,   body, close_at) {
   # `[label]: destination "title"` renders nothing at all, so a required
   # section holding only these is empty to a reader — which is the whole thing
   # the shape check exists to catch.
-  body = dedent3(text)
+  body = block_body(text)
   if (substr(body, 1, 1) != "[") return 0
   close_at = unescaped_index(body, "]", 2)
   if (close_at < 3) return 0
@@ -528,9 +538,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # Sliced from the *expanded* line: leading_spaces counts visual columns, so
   # feeding that count to substr on a tab-indented line started the slice
   # mid-marker and the fence went unseen.
-  strip = leading_spaces(line)
-  if (strip > md_block_indent) strip = md_block_indent
-  body = dedent3(substr(expand_tabs(line), strip + 1))
+  body = block_body(line)
   ch = substr(body, 1, 1)
   if (ch == "`" || ch == "~") {
     run = 0
@@ -555,7 +563,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     }
     return ""
   }
-  if (md_in_fence) return ""
+  if (md_in_fence) { md_paragraph_open = 0; return "" }
 
   # A raw HTML block leaves its contents literal, so a link written inside one
   # is not clickable. The end condition varies by kind, and using the wrong one
@@ -628,13 +636,23 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # Type 7 is any other complete tag standing alone on its line; content after
   # it would make the line a paragraph instead. `<!` is excluded because
   # comments are handled below with their own escape rules.
-  if (body ~ /^<\/?[a-zA-Z][^<>]*>[[:space:]]*$/ && body !~ /^<!/) {
+  #
+  # Unlike types 1-6 it may NOT interrupt a paragraph: a custom tag on the line
+  # after the first line of an entry is inline HTML, the paragraph continues,
+  # and the markdown below it still renders. Opening a block there discarded
+  # links the reader can click.
+  if (!md_paragraph_open && body ~ /^<\/?[a-zA-Z][^<>]*>[[:space:]]*$/ && body !~ /^<!/) {
     md_in_html_block = 1
     md_html_type = 6
     md_html_opened_at = FNR
     return ""
   }
 
+  # A paragraph is open once a line of ordinary text has been seen, and closes
+  # on a blank line or a block-level construct. Headings count as closing it:
+  # a type-7 tag directly under one does open a block, which is why "was the
+  # previous line blank" is not the same question.
+  md_paragraph_open = (body ~ /[^[:space:]]/ && heading_text(body) !~ /^#+[ \t]/) ? 1 : 0
   return scan_comments(line)
 }
 
@@ -697,10 +715,15 @@ collect_link_defs() {
   [[ -f "$src" ]] || return 0
   awk "$AWK_MARKDOWN_LIB"'
     {
+      if (!md_in_fence) {
+        item_width = list_marker_width(dedent3($0))
+        if (item_width > 0) md_block_indent = leading_spaces($0) + item_width
+        else if ($0 ~ /^[^[:space:]]/) md_block_indent = 0
+      }
       visible = visible_text($0)
       if (md_fence_hit || md_in_fence) next
       if (!is_link_definition(visible)) next
-      body = dedent3(visible)
+      body = block_body(visible)
       close_at = unescaped_index(body, "]", 2)
       label = substr(body, 2, close_at - 2)
       dest = substr(body, close_at + 2)

@@ -139,8 +139,10 @@ and a guide cannot satisfy its own required headings from inside an example.
 Raw HTML blocks are skipped for the same reason. They open on one of
 CommonMark's block tag names — with or without trailing content, so `<div>` and
 `<div>example` both start one — on any other complete tag standing alone on its
-line, which leaves `Vec<Route>` and `<MyWidget>` in prose as prose, or on the
-non-tag forms `<?`, `<!CDATA[`-style sections and `<!DECLARATION`. Indentation
+line — but that last kind cannot interrupt an open paragraph, so `<MyWidget>`
+directly under an entry's first line stays inline and the markdown below it
+still counts — or on the non-tag forms `<?`, `<!CDATA[`-style sections and
+`<!DECLARATION`. Indentation
 is measured from the enclosing list item content column, so four spaces under a
 `- ` item is a two-space indent and opens a block, exactly as for a fence.
 
