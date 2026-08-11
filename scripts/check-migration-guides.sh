@@ -140,6 +140,23 @@ function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
   return out
 }
 
+function links_to(text, path,   needle, pos, at, i, ch, start) {
+  # A complete inline link `[label](path)`, not a bare `](path)`: the second
+  # renders as literal text, so the reader has nothing to click.
+  needle = "](" path ")"
+  start = 1
+  while ((pos = index(substr(text, start), needle)) > 0) {
+    at = start + pos - 1
+    for (i = at - 1; i >= 1; i--) {
+      ch = substr(text, i, 1)
+      if (ch == "]") break
+      if (ch == "[") return 1
+    }
+    start = at + 1
+  }
+  return 0
+}
+
 function mask_code_spans(text,   out, i, n, ch, run, j, run2, found, k) {
   # Same scan as strip_code_spans, but each span becomes an equal-length run of
   # spaces so offsets still line up with the original text. visible_text needs
@@ -311,7 +328,7 @@ findings="$(
       # A markdown link, not a mention: `](<guide>)`. Read the same code-span
       # stripped text the marker was read from — a path inside backticks
       # renders as code, so it is not a link the reader can follow.
-      has_link = (index(prose, "](" guide_path ")") > 0)
+      has_link = links_to(prose, guide_path)
       printf "BREAKING\t%s\t%d\t%d\t%s\n", section, entry_line, has_link, guide_path
     } else {
       # Fold to alpha-only words so "non-breaking" and "non breaking" are the
@@ -378,7 +395,7 @@ findings="$(
     # Only the documented heading declares a break. A `breaking` *prefix* match
     # turned `### Breaking down request latency` into a section where every
     # additive bullet demanded a migration guide.
-    breaking_heading = (tolower($0) ~ /^###[[:space:]]+breaking[[:space:]]+changes[[:space:]]*$/)
+    breaking_heading = (tolower(visible) ~ /^###[[:space:]]+breaking[[:space:]]+changes[[:space:]]*$/)
     next
   }
 
@@ -687,14 +704,14 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
     if [[ ! -f "$index_file" ]]; then
       guide_ok=false
       die "$index_file is missing — guides are only findable through the index."
-    elif ! awk -v want="]($base)" "$AWK_MARKDOWN_LIB"'
+    elif ! awk -v want_path="$base" "$AWK_MARKDOWN_LIB"'
             # Only a link the reader can click counts. A bullet inside an HTML
             # comment, a code span or a fenced sample renders as anything but a
             # link, so the guide stays undiscoverable.
             { visible = strip_code_spans(visible_text($0)) }
             visible ~ /^##[[:space:]]+Index[[:space:]]*$/ { in_index = 1; next }
             visible ~ /^##[[:space:]]/                    { in_index = 0 }
-            in_index && index(visible, want) > 0          { found = 1 }
+            in_index && links_to(visible, want_path) > 0  { found = 1 }
             END { exit found ? 0 : 1 }
           ' "$index_file"; then
       guide_ok=false

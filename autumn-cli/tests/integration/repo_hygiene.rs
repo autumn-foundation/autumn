@@ -3116,3 +3116,64 @@ fn migration_guide_gate_does_not_read_comment_delimiters_inside_code_spans() {
         "a genuine comment must still hide the entries inside it",
     );
 }
+
+// --- Review round 12: complete links, rendered heading --------------------
+
+#[test]
+fn migration_guide_gate_requires_a_complete_markdown_link() {
+    // `](path)` on its own renders as literal text, not a link, so a typo that
+    // drops the `[label]` leaves the reader with no way to reach the guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See \
+           ](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a bracket typo is not a link",
+    );
+
+    // The complete form still passes.
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+    assert!(
+        run_migration_gate(tmp.path()).status.success(),
+        "a complete inline link must still satisfy the check",
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_the_breaking_heading_as_rendered() {
+    // The heading rule matches the rendered text, but the breaking-heading
+    // test still read the raw line, so an invisible trailing comment took a
+    // whole section out of the breaking inventory.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes <!-- release note -->\n\n\
+         - **db:** `with_pool` is renamed, with no guide anywhere.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "the heading renders as `### Breaking Changes`, so the bullets under it \
+         are breaking entries",
+    );
+}
