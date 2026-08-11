@@ -287,7 +287,10 @@ findings="$(
 
   /^### / {
     flush_entry()
-    breaking_heading = (tolower($0) ~ /^###[[:space:]]+breaking/)
+    # Only the documented heading declares a break. A `breaking` *prefix* match
+    # turned `### Breaking down request latency` into a section where every
+    # additive bullet demanded a migration guide.
+    breaking_heading = (tolower($0) ~ /^###[[:space:]]+breaking[[:space:]]+changes[[:space:]]*$/)
     next
   }
 
@@ -428,6 +431,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
     guide_findings="$(
       awk -v required="$REQUIRED_SECTIONS" -v allow_pending="$allow_pending" \
           -v is_draft="$allow_pending" \
+          -v template="$MIGRATIONS_DIR/TEMPLATE.md" \
           -v walkthrough_heading="### Guide-only upgrade walkthrough" '
         function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
           # Keep in step with the identical helper in the changelog parser.
@@ -465,6 +469,30 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
         BEGIN {
           split(required, list, "|")
           for (i in list) want[list[i]] = 1
+
+          # The placeholder vocabulary is read from TEMPLATE.md rather than
+          # guessed at. Listing tokens by hand missed `{Area}` and `{old MSRV}`;
+          # matching any `{...}` instead flagged `{:?}`, `Route { .. }` and
+          # `format!("{addr}")`, which guides are full of. The template is the
+          # only authority on what a placeholder looks like, and it stays
+          # correct as the template changes.
+          while ((getline template_line < template) > 0) {
+            rest = template_line
+            while (match(rest, /\{[^{}]*\}/)) {
+              tokens[substr(rest, RSTART, RLENGTH)] = 1
+              rest = substr(rest, RSTART + RLENGTH)
+            }
+          }
+          close(template)
+        }
+
+        # Runs before the fence rule below: a placeholder left in a fenced
+        # snippet (`autumn-web = "{X.Y.Z}"`) or an inline span is exactly the
+        # unresolved release data this catches, and both used to be skipped.
+        {
+          for (token in tokens) {
+            if (index($0, token) > 0) { placeholder = 1; break }
+          }
         }
         # A guide illustrating what a guide looks like must not satisfy its own
         # structure from inside the sample. Fence lines and their contents count
@@ -496,13 +524,6 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             next
           }
         }
-        # Any `{...}` left over from the template, not a hand-listed few:
-        # `{Area}`, `{old MSRV}` and `{Short description}` all used to pass —
-        # and `{Area}` lives in a heading, so this has to run before the
-        # heading rule below claims the line. Code spans are stripped first so
-        # a `{:?}` in prose is not mistaken for a placeholder.
-        { if (strip_code_spans($0) ~ /\{[^{}]*\}/) placeholder = 1 }
-
         /^#+ / {
           level = heading_level($0)
           # A deeper heading is content for the section it sits under.

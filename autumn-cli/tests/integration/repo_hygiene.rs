@@ -1188,6 +1188,13 @@ fn migration_gate_fixture(workspace_version: &str) -> tempfile::TempDir {
         "# Migration Guides\n\n## Index\n",
     )
     .expect("migrations index");
+    // The gate reads its placeholder vocabulary from the real TEMPLATE.md, so
+    // the fixture needs the actual file rather than a stand-in.
+    std::fs::copy(
+        root.join("docs/migrations/TEMPLATE.md"),
+        migrations_dir.join("TEMPLATE.md"),
+    )
+    .expect("copy migration guide template");
     tmp
 }
 
@@ -2559,5 +2566,110 @@ fn migration_guide_gate_requires_the_status_under_the_walkthrough_heading() {
         !run_migration_gate(tmp.path()).status.success(),
         "the walk-through result must be recorded under its own heading, not \
          anywhere in the guide",
+    );
+}
+
+// --- Review round 4: placeholder vocabulary, heading anchoring -------------
+
+#[test]
+fn migration_guide_gate_rejects_placeholders_inside_code_spans_and_fences() {
+    // Stripping code spans before looking for `{...}` — done to stop `{:?}`
+    // from reading as a placeholder — hid the placeholders that matter most:
+    // TEMPLATE.md puts its version fields in code spans and fenced snippets.
+    for guide_body in [
+        // Inline code span.
+        valid_migration_guide("0.7.0").replace(
+            "- **New version:** `autumn-web 0.7.0`",
+            "- **New version:** `autumn-web {X.Y.Z}`",
+        ),
+        // Fenced snippet.
+        valid_migration_guide("0.7.0").replace(
+            "Pin the old version and get green.",
+            "```toml\nautumn-web = \"{X.Y.Z}\"\n```",
+        ),
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        write_fixture_guide(&tmp, "0.7.0", &guide_body);
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            "# Changelog\n\n\
+             ## [0.7.0] - 2026-09-01\n\n\
+             ### Changed\n\n\
+             - **db:** **Breaking:** `with_pool` renamed. See the \
+               [migration guide](docs/migrations/0.7.0.md).\n",
+        )
+        .expect("changelog");
+
+        assert!(
+            !run_migration_gate(tmp.path()).status.success(),
+            "an unresolved template placeholder must be caught wherever it \
+             hides:\n{guide_body}",
+        );
+    }
+}
+
+#[test]
+fn migration_guide_gate_does_not_treat_rust_braces_as_placeholders() {
+    // The flip side: guides are full of `{:?}`, `Route { .. }` and
+    // `format!("{addr}")`. Only the tokens TEMPLATE.md actually emits count.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(
+        &tmp,
+        "0.7.0",
+        // Braces come in as arguments: a literal `{:?}` in the source trips
+        // clippy::literal_string_with_formatting_args, and escaping it instead
+        // would leave `format!` with nothing to substitute.
+        &valid_migration_guide("0.7.0").replace(
+            "Before / after.",
+            &format!(
+                "Logs that formatted the config with `{open}:?{close}` now show \
+                 it redacted, and `Route {open} .. {close}` literals need the \
+                 new field:\n\n```rust,ignore\nlet route = Route {open} seo: \
+                 SeoRouteDefaults::EMPTY {close};\nprintln!(\"{open}addr{close}\");\n```",
+                open = '{',
+                close = '}',
+            ),
+        ),
+    );
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "ordinary Rust and format braces are not template placeholders\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_only_reads_the_documented_breaking_heading() {
+    // `### Breaking Changes` declares a break. A heading that merely starts
+    // with the word — `### Breaking down request latency` — marked every
+    // bullet under it, failing an additive section for missing guides.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking down request latency\n\n\
+         - **perf:** the access log now records a p99 bucket.\n\
+         - **perf:** connection reuse is reported separately.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "only `### Breaking Changes` declares a break — a heading that starts \
+         with the word does not\n{}",
+        gate_report(&output),
     );
 }

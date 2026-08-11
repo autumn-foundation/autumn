@@ -26,8 +26,9 @@ Guides are not backfilled for releases earlier than `0.4.0`.
 ## Declaring a breaking change in the CHANGELOG
 
 A breaking change is declared **either** with the inline `**Breaking:**` token
-**or** under a `### Breaking Changes` heading. Nothing else counts — the gate
-reads the changelog, and prose it cannot see strands users:
+**or** under a `### Breaking Changes` heading — that exact heading, not any
+heading starting with the word. Nothing else counts: the gate reads the
+changelog, and prose it cannot see strands users.
 
 ```markdown
 - **repository:** **Breaking:** `with_pool` is renamed to `with_pool_untracked`.
@@ -92,7 +93,9 @@ It fails when:
 - a guide is missing a required section — *At a glance*, *Summary*, *Before you
   start*, *Breaking changes*, *How to verify*, and *Guide-only upgrade
   walkthrough* — or has a heading with nothing under it, still carries
-  `TEMPLATE.md`'s banner or **any** `{...}` placeholder, or is not linked from
+  `TEMPLATE.md`'s banner or any placeholder token `TEMPLATE.md` itself emits
+  (the vocabulary is read from the template, so `{:?}` and `Route { .. }` in a
+  guide are fine and `{X.Y.Z}` in a code sample is not), or is not linked from
   the Index above (a mention elsewhere in this file is not an index entry);
 - a released guide's walk-through status does not **begin** with
   `performed YYYY-MM-DD` or `backfilled`; `pending` is allowed only on
