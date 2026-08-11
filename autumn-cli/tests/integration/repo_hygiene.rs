@@ -2162,11 +2162,16 @@ fn release_notes_and_migration_gates_agree_on_what_is_breaking() {
 #[test]
 fn migration_guide_gate_requires_a_dated_or_backfilled_walkthrough() {
     // "not yet performed" is a free pass a new release could write. A versioned
-    // guide records either a dated run or an explicit `backfilled` claim, which
-    // is visible in the diff.
+    // guide's status must *begin* with a dated run or an explicit `backfilled`
+    // claim, which is visible in the diff — a negated form that merely contains
+    // one of those words says the opposite of what it would be read as.
     for (status, should_pass) in [
         ("performed 2026-09-01, 18 minutes", true),
-        ("not performed — record backfilled by #1588", true),
+        (
+            "backfilled — record written after the release shipped",
+            true,
+        ),
+        ("not performed — record backfilled by #1588", false),
         ("not yet performed", false),
         ("pending", false),
     ] {
@@ -2318,4 +2323,122 @@ fn migration_guide_gate_accepts_a_freshly_recreated_rolling_draft() {
         !run_migration_gate(tmp.path()).status.success(),
         "a released guide full of template placeholders must fail",
     );
+}
+
+// --- Review round 2: rc paths, index entries, negated statuses -------------
+
+#[test]
+fn release_notes_gate_normalizes_release_candidate_guide_paths() {
+    // The migration gate maps `## [0.7.0-rc.1]` to `docs/migrations/0.7.0.md`,
+    // but check-release-notes.sh built the path straight from the workspace
+    // version — so the rc guide the policy prescribes satisfied one gate and
+    // blocked the other. Two gates, one answer.
+    let root = workspace_root();
+    let tmp = migration_gate_fixture("0.7.0-rc.1");
+    std::fs::copy(
+        root.join("scripts/check-release-notes.sh"),
+        tmp.path().join("scripts/check-release-notes.sh"),
+    )
+    .expect("copy release-notes script");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0-rc.1] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let gate = run_migration_gate(tmp.path());
+    assert!(
+        gate.status.success(),
+        "the rc section must be satisfied by its release's guide\n{}",
+        gate_report(&gate),
+    );
+
+    let notes = bash_command()
+        .arg("scripts/check-release-notes.sh")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run release-notes check");
+    assert!(
+        notes.status.success(),
+        "check-release-notes.sh must look for the same guide the migration \
+         gate prescribes for a release candidate\n{}",
+        gate_report(&notes),
+    );
+}
+
+#[test]
+fn migration_guide_gate_requires_an_index_entry_not_a_mention() {
+    // The index check matched the filename anywhere in README.md, and the
+    // process text names `next.md` repeatedly — so deleting its Index bullet
+    // during the documented release rename went unnoticed.
+    let tmp = migration_gate_fixture("0.7.0");
+    let migrations = tmp.path().join("docs/migrations");
+    std::fs::write(migrations.join("0.7.0.md"), valid_migration_guide("0.7.0")).expect("guide");
+    std::fs::write(
+        migrations.join("README.md"),
+        "# Migration Guides\n\n\
+         ## Index\n\n\
+         - [`0.6.0.md`](0.6.0.md)\n\n\
+         ## Process\n\n\
+         Rename the draft to `0.7.0.md` when the release ships.\n",
+    )
+    .expect("index");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a filename mentioned in the process prose is not an index entry — the \
+         reader has to be able to find the guide from the Index",
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_a_negated_walkthrough_status() {
+    // The status was a substring search, so a status that explicitly says the
+    // walk-through was NOT done satisfied the requirement that it was.
+    for (status, should_pass) in [
+        ("performed 2026-09-01, 18 minutes", true),
+        ("backfilled — written after 0.7.0 shipped", true),
+        ("not performed 2026-09-01", false),
+        ("pending — performed 2026-09-01", false),
+        ("we intend this to be performed 2026-09-01", false),
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        write_fixture_guide(
+            &tmp,
+            "0.7.0",
+            &valid_migration_guide("0.7.0").replace("performed 2026-01-01", status),
+        );
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            "# Changelog\n\n\
+             ## [0.7.0] - 2026-09-01\n\n\
+             ### Changed\n\n\
+             - **db:** **Breaking:** `with_pool` renamed. See the \
+               [migration guide](docs/migrations/0.7.0.md).\n",
+        )
+        .expect("changelog");
+
+        let output = run_migration_gate(tmp.path());
+        assert_eq!(
+            output.status.success(),
+            should_pass,
+            "walk-through status {status:?} should {} the gate\n{}",
+            if should_pass { "pass" } else { "fail" },
+            gate_report(&output),
+        );
+    }
 }

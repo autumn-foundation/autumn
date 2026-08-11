@@ -438,7 +438,15 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           seen[current] = 1
           next
         }
-        /^-[[:space:]]+\*\*Status:\*\*/ { status = $0 }
+        /^-[[:space:]]+\*\*Status:\*\*/ {
+          status = $0
+          # Validate the *whole* value, not "does it contain the word
+          # performed" — "not performed 2026-08-11" says the opposite of what
+          # a substring search concluded from it.
+          status_value = tolower($0)
+          sub(/^-[[:space:]]+\*\*status:\*\*[[:space:]]*/, "", status_value)
+          sub(/[[:space:]]+$/, "", status_value)
+        }
         /\{(X\.|Y\.|placeholder|YYYY-|minutes|performed |none, or)/ { placeholder = 1 }
         { if (current != "" && $0 ~ /[^[:space:]]/) content[current] = 1 }
         END {
@@ -452,8 +460,8 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           if (status == "") {
             printf "NOSTATUS\t-\n"
           } else if (!allow_pending &&
-                     tolower(status) !~ /performed[[:space:]]+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ &&
-                     tolower(status) !~ /backfilled/) {
+                     status_value !~ /^performed[[:space:]]+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ &&
+                     status_value !~ /^backfilled([[:space:]]|$)/) {
             printf "PENDING\t%s\n", status
           }
           if (placeholder) printf "PLACEHOLDER\t-\n"
@@ -506,12 +514,22 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
       die "$guide still carries the TEMPLATE.md banner — delete the banner block."
     fi
 
+    # The entry has to be a link in the Index section, not the filename
+    # appearing somewhere in the process prose — `next.md` is named there
+    # repeatedly, so a substring match would have let the release rename delete
+    # its index bullet unnoticed.
     if [[ ! -f "$index_file" ]]; then
       guide_ok=false
       die "$index_file is missing — guides are only findable through the index."
-    elif ! grep -qF -- "$base" "$index_file"; then
+    elif ! awk -v want="]($base)" '
+            /^##[[:space:]]+Index[[:space:]]*$/ { in_index = 1; next }
+            /^##[[:space:]]/                    { in_index = 0 }
+            in_index && index($0, want) > 0     { found = 1 }
+            END { exit found ? 0 : 1 }
+          ' "$index_file"; then
       guide_ok=false
-      die "$index_file does not index $base. Add it so readers can find it."
+      die "$index_file does not link $base from its '## Index' section.
+       Add a bullet: - [\`$base\`]($base) — <from> -> <to>"
     fi
 
     if $guide_ok; then

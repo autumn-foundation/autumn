@@ -117,7 +117,12 @@ else
 fi
 
 if $is_breaking; then
-  migration_file="docs/migrations/${workspace_version}.md"
+  # A release candidate is gated against its release's guide: `0.7.0-rc.1`
+  # wants `docs/migrations/0.7.0.md`. Keep this in step with the same mapping
+  # in scripts/check-migration-guides.sh — a prerelease that satisfies one gate
+  # and blocks the other is worse than either gate alone.
+  release_version="${workspace_version%%-*}"
+  migration_file="docs/migrations/${release_version}.md"
   if [[ ! -f "$migration_file" ]]; then
     die "breaking release detected but no migration guide found at $migration_file. Create the stub before tagging."
   fi

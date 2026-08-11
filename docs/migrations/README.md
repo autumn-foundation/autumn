@@ -93,8 +93,10 @@ It fails when:
   start*, *Breaking changes*, *How to verify*, and *Guide-only upgrade
   walkthrough* — or has a heading with nothing under it, still carries
   `TEMPLATE.md`'s banner or placeholders, or is not indexed above;
-- a released guide's walk-through is not recorded as `performed YYYY-MM-DD`
-  (or explicitly `backfilled`); `pending` is allowed only on `next.md`;
+- a released guide's walk-through status does not **begin** with
+  `performed YYYY-MM-DD` or `backfilled`; `pending` is allowed only on
+  `next.md`. The whole value is checked, not searched — `not performed
+  2026-08-11` says the opposite of what a substring match would conclude;
 
   `next.md` is a **draft**, so it is also exempt from the placeholder and
   empty-section checks — the release checklist recreates it from
