@@ -95,6 +95,104 @@ ok() {
 }
 
 # ---------------------------------------------------------------------------
+# Shared markdown state machine, injected into every awk program below.
+#
+# awk has no include, and this script runs three separate awk processes over
+# three different files. Hand-maintaining a copy of these rules in each is what
+# produced this gate's whole tail of review findings: a fix would land in one
+# parser and not its sibling, or land without the fail-closed guard the sibling
+# already had. One text, three programs, no drift.
+#
+# visible_text(line) returns what a reader actually sees on that line, and
+# maintains fence and comment state across calls. Order matters and is the
+# point: a fenced body is literal, so it is never scanned for HTML comment
+# delimiters — an example that merely *shows* `<!--` must not comment out the
+# document. Callers read these globals after each call:
+#   md_fence_hit   this line is a fence delimiter
+#   md_in_fence    we are inside a fenced block
+#   md_in_comment  we are inside an HTML comment
+#   md_fence_opened_at / md_comment_opened_at  where an unclosed one started
+# ---------------------------------------------------------------------------
+AWK_MARKDOWN_LIB='
+function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
+  # CommonMark: a span opens on a run of N backticks and closes on the next run
+  # of exactly N. An unclosed run is left in place — never guessed at, so a
+  # stray backtick cannot silently swallow a marker.
+  out = ""
+  i = 1
+  n = length(text)
+  while (i <= n) {
+    ch = substr(text, i, 1)
+    if (ch != "`") { out = out ch; i++; continue }
+    run = 0
+    while (i + run <= n && substr(text, i + run, 1) == "`") run++
+    j = i + run
+    found = 0
+    while (j <= n) {
+      if (substr(text, j, 1) != "`") { j++; continue }
+      run2 = 0
+      while (j + run2 <= n && substr(text, j + run2, 1) == "`") run2++
+      if (run2 == run) { found = 1; break }
+      j += run2
+    }
+    if (found) { out = out " "; i = j + run } else { out = out substr(text, i, run); i += run }
+  }
+  return out
+}
+
+function visible_text(line,   body, ch, run, out, head, tail) {
+  md_fence_hit = 0
+
+  # Fences first. A closing fence uses the same character and is at least as
+  # long as its opener, so a ````markdown block may contain a ``` sample.
+  body = line
+  sub(/^[[:space:]]*/, "", body)
+  ch = substr(body, 1, 1)
+  if (ch == "`" || ch == "~") {
+    run = 0
+    while (substr(body, run + 1, 1) == ch) run++
+    if (run >= 3) md_fence_hit = 1
+  }
+  if (md_fence_hit) {
+    if (!md_in_fence) {
+      md_in_fence = 1
+      md_fence_len = run
+      md_fence_char = ch
+      md_fence_opened_at = FNR
+    } else if (ch == md_fence_char && run >= md_fence_len &&
+               substr(body, run + 1) ~ /^[[:space:]]*$/) {
+      md_in_fence = 0
+    }
+    return ""
+  }
+  if (md_in_fence) return ""
+
+  # Then HTML comments, which may span lines.
+  out = line
+  if (md_in_comment) {
+    if (index(out, "-->") > 0) {
+      out = substr(out, index(out, "-->") + 3)
+      md_in_comment = 0
+    } else {
+      return ""
+    }
+  }
+  while (match(out, /<!--/)) {
+    head = substr(out, 1, RSTART - 1)
+    tail = substr(out, RSTART)
+    if (match(tail, /-->/)) {
+      out = head substr(tail, RSTART + 3)
+    } else {
+      md_in_comment = 1
+      md_comment_opened_at = FNR
+      return head
+    }
+  }
+  return out
+}
+'
+
+# ---------------------------------------------------------------------------
 # Parse CHANGELOG.md into machine-readable findings.
 #
 # Deliberately a single awk process. `awk | grep -q` is flaky under `pipefail`:
@@ -115,7 +213,8 @@ ok() {
 findings="$(
   awk -v floor="$MIGRATION_GUIDE_FLOOR" \
       -v migrations_dir="$MIGRATIONS_DIR" \
-      -v unreleased_guide="$UNRELEASED_GUIDE" '
+      -v unreleased_guide="$UNRELEASED_GUIDE" \
+      "$AWK_MARKDOWN_LIB"'
   function version_ge(a, b,   pa, pb, i, na, nb) {
     na = split(a, pa, ".")
     nb = split(b, pb, ".")
@@ -124,34 +223,6 @@ findings="$(
       if ((i <= na ? pa[i] + 0 : 0) < (i <= nb ? pb[i] + 0 : 0)) return 0
     }
     return 1
-  }
-
-  # Remove inline code spans, CommonMark-style: a span opens on a run of N
-  # backticks and closes on the next run of exactly N. Matching only
-  # single-backtick pairs left the contents of a ``double-backtick`` span
-  # behind, and pairing backticks positionally let one stray backtick swallow
-  # a sentence. An unclosed run is left in place — never guessed at.
-  function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
-    out = ""
-    i = 1
-    n = length(text)
-    while (i <= n) {
-      ch = substr(text, i, 1)
-      if (ch != "`") { out = out ch; i++; continue }
-      run = 0
-      while (i + run <= n && substr(text, i + run, 1) == "`") run++
-      j = i + run
-      found = 0
-      while (j <= n) {
-        if (substr(text, j, 1) != "`") { j++; continue }
-        run2 = 0
-        while (j + run2 <= n && substr(text, j + run2, 1) == "`") run2++
-        if (run2 == run) { found = 1; break }
-        j += run2
-      }
-      if (found) { out = out " "; i = j + run } else { out = out substr(text, i, run); i += run }
-    }
-    return out
   }
 
   function excerpt(text,   flat) {
@@ -225,73 +296,15 @@ findings="$(
     entry_visible = ""
   }
 
-  # A bullet parked inside `<!-- ... -->` renders nowhere, so it is not a
-  # changelog entry and must not demand a guide. The suppression token is
-  # itself an HTML comment, though, so the raw line is kept alongside: markers,
-  # links and the prose lint read the visible text, while the suppression is
-  # read from the raw entry. See flush_entry.
+  # One call keeps fence and comment state; see AWK_MARKDOWN_LIB above for
+  # why the ordering (fences before comments) is load-bearing. Fenced bodies
+  # and commented-out text are dropped from the entry: a bullet parked inside
+  # `<!-- ... -->` renders nowhere and declares nothing, and a `**Breaking:**`
+  # in a code sample is a mention. The suppression token is the one comment the
+  # gate reads, and flush_entry takes it from the raw entry instead.
   {
-    visible = $0
-    if (in_comment) {
-      if (index(visible, "-->") > 0) {
-        visible = substr(visible, index(visible, "-->") + 3)
-        in_comment = 0
-      } else {
-        visible = ""
-      }
-    }
-    while (match(visible, /<!--/)) {
-      comment_head = substr(visible, 1, RSTART - 1)
-      comment_tail = substr(visible, RSTART)
-      if (match(comment_tail, /-->/)) {
-        visible = comment_head substr(comment_tail, RSTART + 3)
-      } else {
-        visible = comment_head
-        in_comment = 1
-        comment_opened_at = FNR
-        break
-      }
-    }
-  }
-
-  # Fenced code blocks hold TOML/YAML samples whose lines start with "- ".
-  # They are part of the entry that opened them, never entries themselves.
-  #
-  # CommonMark rules that matter here, each of which a naive toggle got wrong:
-  # a fence may be ``` or ~~~; a closing fence uses the same character and is
-  # at least as long as its opener (so a ````markdown block may contain a ```
-  # sample); and a line with an info string is an opener, never a closer.
-  # Getting any of them wrong leaves the parser stuck inside a fence, which
-  # swallows every section below it. Keep in sync with scan_fence in the guide
-  # parser further down this script.
-  {
-    fence_hit = 0
-    fence_body = $0
-    sub(/^[[:space:]]*/, "", fence_body)
-    fence_char = substr(fence_body, 1, 1)
-    if (fence_char == "`" || fence_char == "~") {
-      fence_run = 0
-      while (substr(fence_body, fence_run + 1, 1) == fence_char) fence_run++
-      if (fence_run >= 3) fence_hit = 1
-    }
-
-    if (fence_hit) {
-      if (!in_fence) {
-        in_fence = 1
-        fence_len = fence_run
-        fence_open_char = fence_char
-        fence_opened_at = FNR
-      } else if (fence_char == fence_open_char && fence_run >= fence_len &&
-                 substr(fence_body, fence_run + 1) ~ /^[[:space:]]*$/) {
-        in_fence = 0
-      }
-    }
-    # Fence content is deliberately NOT appended to the entry. It is a code
-    # sample: a `**Breaking:**` in it is a mention, a guide path in it is not a
-    # link the reader can click, and a TOML comment mentioning "breaking" is
-    # not a breaking change. Appending it and then trying to reason about the
-    # text is how a config example turned a docs PR red.
-    if (fence_hit || in_fence) next
+    visible = visible_text($0)
+    if (md_fence_hit || md_in_fence) next
   }
 
   visible ~ /^## / {
@@ -351,8 +364,8 @@ findings="$(
 
   END {
     flush_entry()
-    if (in_fence) printf "UNCLOSED\t-\t%d\tcode fence opened here is never closed\n", fence_opened_at
-    if (in_comment) printf "UNCLOSED\t-\t%d\tHTML comment opened here is never closed\n", comment_opened_at
+    if (md_in_fence) printf "UNCLOSED\t-\t%d\tcode fence opened here is never closed\n", md_fence_opened_at
+    if (md_in_comment) printf "UNCLOSED\t-\t%d\tHTML comment opened here is never closed\n", md_comment_opened_at
   }
   ' "$CHANGELOG"
 )"
@@ -490,30 +503,8 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
       awk -v required="$REQUIRED_SECTIONS" -v allow_pending="$allow_pending" \
           -v is_draft="$allow_pending" \
           -v template="$MIGRATIONS_DIR/TEMPLATE.md" \
-          -v walkthrough_heading="### Guide-only upgrade walkthrough" '
-        function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
-          # Keep in step with the identical helper in the changelog parser.
-          out = ""
-          i = 1
-          n = length(text)
-          while (i <= n) {
-            ch = substr(text, i, 1)
-            if (ch != "`") { out = out ch; i++; continue }
-            run = 0
-            while (i + run <= n && substr(text, i + run, 1) == "`") run++
-            j = i + run
-            found = 0
-            while (j <= n) {
-              if (substr(text, j, 1) != "`") { j++; continue }
-              run2 = 0
-              while (j + run2 <= n && substr(text, j + run2, 1) == "`") run2++
-              if (run2 == run) { found = 1; break }
-              j += run2
-            }
-            if (found) { out = out " "; i = j + run } else { out = out substr(text, i, run); i += run }
-          }
-          return out
-        }
+          -v walkthrough_heading="### Guide-only upgrade walkthrough" \
+          "$AWK_MARKDOWN_LIB"'
         function heading_level(line,   n) {
           n = 0
           while (substr(line, n + 1, 1) == "#") n++
@@ -553,63 +544,15 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           }
         }
         # A guide illustrating what a guide looks like must not satisfy its own
-        # structure from inside the sample. Fence lines and their contents count
-        # as *content* for the enclosing section, but never as headings, as the
-        # walk-through status, or as placeholders. Mirrors the changelog
-        # parsers fence handling above.
+        # structure from inside the sample, and `<!-- TODO -->` renders as
+        # nothing so it is not migration instructions. Fence delimiters are not
+        # content either; the lines inside one are.
         {
-          fence_hit = 0
-          fence_body = $0
-          sub(/^[[:space:]]*/, "", fence_body)
-          fence_char = substr(fence_body, 1, 1)
-          if (fence_char == "`" || fence_char == "~") {
-            fence_run = 0
-            while (substr(fence_body, fence_run + 1, 1) == fence_char) fence_run++
-            if (fence_run >= 3) fence_hit = 1
-          }
-          if (fence_hit) {
-            if (!in_fence) {
-              in_fence = 1
-              fence_len = fence_run
-              fence_open_char = fence_char
-            } else if (fence_char == fence_open_char && fence_run >= fence_len &&
-                       substr(fence_body, fence_run + 1) ~ /^[[:space:]]*$/) {
-              in_fence = 0
-            }
-          }
-          # The delimiters themselves are not migration instructions: an
-          # empty block under every heading renders as nothing at all. Only
-          # lines *inside* the fence count.
-          if (fence_hit) next
-          if (in_fence) {
+          visible = visible_text($0)
+          if (md_fence_hit) next
+          if (md_in_fence) {
             if (current != "" && $0 ~ /[^[:space:]]/) content[current] = 1
             next
-          }
-        }
-
-        # `<!-- TODO -->` is the canonical stub marker and renders as nothing,
-        # so it must not satisfy "this section has content". Comments may span
-        # lines, so track the open state rather than matching one line.
-        {
-          visible = $0
-          if (in_comment) {
-            if (index(visible, "-->") > 0) {
-              visible = substr(visible, index(visible, "-->") + 3)
-              in_comment = 0
-            } else {
-              visible = ""
-            }
-          }
-          while (match(visible, /<!--/)) {
-            head = substr(visible, 1, RSTART - 1)
-            tail = substr(visible, RSTART)
-            if (match(tail, /-->/)) {
-              visible = head substr(tail, RSTART + 3)
-            } else {
-              visible = head
-              in_comment = 1
-              break
-            }
           }
         }
         visible ~ /^#+ / {
@@ -707,46 +650,11 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
     if [[ ! -f "$index_file" ]]; then
       guide_ok=false
       die "$index_file is missing — guides are only findable through the index."
-    elif ! awk -v want="]($base)" '
-            function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
-              # Third copy of this helper: the two awk programs above are
-              # separate processes and awk has no include. Keep them in step.
-              out = ""; i = 1; n = length(text)
-              while (i <= n) {
-                ch = substr(text, i, 1)
-                if (ch != "`") { out = out ch; i++; continue }
-                run = 0
-                while (i + run <= n && substr(text, i + run, 1) == "`") run++
-                j = i + run; found = 0
-                while (j <= n) {
-                  if (substr(text, j, 1) != "`") { j++; continue }
-                  run2 = 0
-                  while (j + run2 <= n && substr(text, j + run2, 1) == "`") run2++
-                  if (run2 == run) { found = 1; break }
-                  j += run2
-                }
-                if (found) { out = out " "; i = j + run } else { out = out substr(text, i, run); i += run }
-              }
-              return out
-            }
+    elif ! awk -v want="]($base)" "$AWK_MARKDOWN_LIB"'
             # Only a link the reader can click counts. A bullet inside an HTML
             # comment, a code span or a fenced sample renders as anything but a
             # link, so the guide stays undiscoverable.
-            {
-              visible = $0
-              if (in_comment) {
-                if (index(visible, "-->") > 0) { visible = substr(visible, index(visible, "-->") + 3); in_comment = 0 }
-                else { visible = "" }
-              }
-              while (match(visible, /<!--/)) {
-                head = substr(visible, 1, RSTART - 1); tail = substr(visible, RSTART)
-                if (match(tail, /-->/)) { visible = head substr(tail, RSTART + 3) }
-                else { visible = head; in_comment = 1; break }
-              }
-              if (visible ~ /^[[:space:]]*(```|~~~)/) { in_fence = !in_fence; visible = "" }
-              else if (in_fence) { visible = "" }
-              visible = strip_code_spans(visible)
-            }
+            { visible = strip_code_spans(visible_text($0)) }
             visible ~ /^##[[:space:]]+Index[[:space:]]*$/ { in_index = 1; next }
             visible ~ /^##[[:space:]]/                    { in_index = 0 }
             in_index && index(visible, want) > 0          { found = 1 }

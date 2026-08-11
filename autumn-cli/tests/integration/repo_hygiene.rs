@@ -3007,3 +3007,69 @@ fn migration_guide_gate_does_not_count_empty_fences_as_content() {
         "a fenced example with a line in it is perfectly good content",
     );
 }
+
+// --- Review round 10: fenced examples of markup ---------------------------
+
+#[test]
+fn migration_guide_gate_does_not_read_comment_delimiters_inside_fences() {
+    // A fenced example that *shows* `<!--` and `-->` on separate lines is a
+    // code sample, not a comment. Scanning its body for comment delimiters
+    // marked every entry between the two lines as commented out — including a
+    // real break with no guide.
+    // A single fence that opens *and* closes the comment does not reproduce
+    // it, and one that only opens it is caught by the unclosed-comment rule.
+    // The shape that hides a break is two samples: one showing the opener, one
+    // showing the closer, with a real entry between them.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Added\n\n\
+         - **docs:** a suppression opens like this:\n\n  \
+           ```markdown\n  <!--\n  ```\n\n\
+         - **db:** **Breaking:** `with_pool` renamed, with no guide anywhere.\n\n\
+         - **docs:** and closes like this:\n\n  \
+           ```markdown\n  -->\n  ```\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a fenced example of comment syntax must not comment out the entries \
+         after it",
+    );
+}
+
+#[test]
+fn migration_guide_gate_index_scan_handles_nested_fences() {
+    // The index scan used a plain toggle rather than the CommonMark run-length
+    // rule the other parsers use, so an inner ``` inside a ````markdown sample
+    // "closed" the fence and the rendered code sample counted as an entry.
+    let tmp = migration_gate_fixture("0.7.0");
+    let migrations = tmp.path().join("docs/migrations");
+    std::fs::write(migrations.join("0.7.0.md"), valid_migration_guide("0.7.0")).expect("guide");
+    std::fs::write(
+        migrations.join("README.md"),
+        "# Migration Guides\n\n\
+         ## Index\n\n\
+         - [`next.md`](next.md)\n\n\
+         Add a bullet shaped like this:\n\n\
+         ````markdown\n```\n- [`0.7.0.md`](0.7.0.md)\n```\n````\n",
+    )
+    .expect("index");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a link inside a nested fenced sample is not an index entry",
+    );
+}
