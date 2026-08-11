@@ -3399,3 +3399,50 @@ fn migration_guide_gate_rejects_an_image_as_a_guide_link() {
         "`![...](path)` renders an image, not a link the reader can follow",
     );
 }
+
+// --- Review round 16: escaped openers, fences inside comments -------------
+
+#[test]
+fn migration_guide_gate_rejects_an_escaped_suppression_opener() {
+    // `\<!-- ... -->` renders as literal text, so it is a displayed example of
+    // the escape hatch rather than a use of it.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** this is breaking for every caller. Silence a mention with \
+           \\<!-- migration-guide-gate: rendered example -->\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an escaped opener is not a suppression",
+    );
+}
+
+#[test]
+fn migration_guide_gate_treats_fences_inside_comments_as_comment_content() {
+    // Round 10 put fences before comments so a fenced example of `<!--` could
+    // not comment out the file. The mirror case then broke: a fence displayed
+    // *inside* a comment opened a real fence, swallowed the entries after the
+    // comment closed, and a later rendered fence closed the synthetic one — so
+    // both states ended clear and no unclosed guard fired.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         <!--\n```\n-->\n\n\
+         - **db:** **Breaking:** renamed, with no guide anywhere.\n\n```\n-->\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a fence delimiter inside a comment is comment content, not a fence",
+    );
+}

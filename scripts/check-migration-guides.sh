@@ -140,6 +140,33 @@ function strip_code_spans(text,   out, i, n, ch, run, j, run2, found) {
   return out
 }
 
+function unescaped_index(text, needle, start,   pos, at, slashes) {
+  # First occurrence of needle at or after start that is not backslash-escaped.
+  # A `\<!--` renders as literal text, so it neither opens a comment nor acts
+  # as a suppression.
+  if (start < 1) start = 1
+  while ((pos = index(substr(text, start), needle)) > 0) {
+    at = start + pos - 1
+    slashes = 0
+    while (at - slashes - 1 >= 1 && substr(text, at - slashes - 1, 1) == "\\") slashes++
+    if (slashes % 2 == 0) return at
+    start = at + 1
+  }
+  return 0
+}
+
+function suppressed_by_comment(text,   t, at) {
+  # The suppression must be a real HTML comment: not inside a code span (that
+  # is a demonstration) and not escaped (that is a rendered example).
+  t = strip_code_spans(text)
+  at = 1
+  while ((at = unescaped_index(t, "<!--", at)) > 0) {
+    if (substr(t, at) ~ /^<!--[[:space:]]*migration-guide-gate:/) return 1
+    at += 4
+  }
+  return 0
+}
+
 function dedent3(text,   n) {
   # Markdown permits up to three leading spaces on a block-level construct; a
   # fourth makes the line an indented code block, i.e. literal text.
@@ -220,6 +247,21 @@ function mask_code_spans(text,   out, i, n, ch, run, j, run2, found, k) {
 function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close_at) {
   md_fence_hit = 0
 
+  # Whichever construct opened first wins, and while one is open the other is
+  # inert: comment bodies and fenced bodies are both literal. Neither a fixed
+  # "fences first" nor "comments first" ordering is correct on its own — an
+  # example of `<!--` inside a fence must not comment out the document, and an
+  # example of a fence inside a comment must not open one.
+  if (md_in_comment) {
+    out = line
+    masked = mask_code_spans(out)
+    pos = index(masked, "-->")
+    if (pos == 0) return ""
+    out = substr(out, pos + 3)
+    md_in_comment = 0
+    return scan_comments(out)
+  }
+
   # Fences first. A closing fence uses the same character and is at least as
   # long as its opener, so a ````markdown block may contain a ``` sample.
   # Four or more leading spaces makes these backticks literal text, not a
@@ -251,20 +293,16 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   }
   if (md_in_fence) return ""
 
-  # Then HTML comments, which may span lines. Delimiters are located in a
-  # code-span-masked copy so that prose *showing* `<!--` does not open one —
-  # the same rule as fenced bodies above, one level down. Offsets are preserved
-  # by the mask, so the slices below still apply to the original line.
-  out = line
+  return scan_comments(line)
+}
+
+function scan_comments(text,   out, masked, pos, close_at, head, tail) {
+  # Comment delimiters are located in a code-span-masked copy so prose that
+  # *shows* `<!--` does not open one, and escaped openers are skipped. Offsets
+  # are preserved by the mask, so the slices apply to the original text.
+  out = text
   masked = mask_code_spans(out)
-  if (md_in_comment) {
-    pos = index(masked, "-->")
-    if (pos == 0) return ""
-    out = substr(out, pos + 3)
-    masked = mask_code_spans(out)
-    md_in_comment = 0
-  }
-  while ((pos = index(masked, "<!--")) > 0) {
+  while ((pos = unescaped_index(masked, "<!--", 1)) > 0) {
     head = substr(out, 1, pos - 1)
     tail = substr(out, pos)
     close_at = index(substr(masked, pos), "-->")
@@ -345,7 +383,7 @@ findings="$(
     # an HTML comment, so it cannot come from `entry_visible` (comments are
     # stripped there) — but an entry that merely *displays* the token in
     # backticks is documenting the escape hatch, not using it.
-    if (!marked && strip_code_spans(entry) ~ /<!--[[:space:]]*migration-guide-gate:/) {
+    if (!marked && suppressed_by_comment(entry)) {
       entry = ""
       entry_visible = ""
       return
