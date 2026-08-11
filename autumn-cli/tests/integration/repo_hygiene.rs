@@ -1195,7 +1195,23 @@ fn migration_gate_fixture(workspace_version: &str) -> tempfile::TempDir {
         migrations_dir.join("TEMPLATE.md"),
     )
     .expect("copy migration guide template");
+    // Every real checkout has a rolling draft: the release checklist recreates
+    // it after each release so the links to it keep resolving.
+    write_fixture_guide(&tmp, "next", &template_draft());
     tmp
+}
+
+/// `TEMPLATE.md` with its banner removed — what the release checklist tells
+/// the operator to recreate `next.md` from.
+fn template_draft() -> String {
+    let template = std::fs::read_to_string(workspace_root().join("docs/migrations/TEMPLATE.md"))
+        .expect("read TEMPLATE.md");
+    template
+        .lines()
+        .skip_while(|line| !line.starts_with("> ") && !line.starts_with('#'))
+        .filter(|line| !line.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A minimal guide that satisfies the gate's shape requirements, so shape
@@ -2285,16 +2301,7 @@ fn migration_guide_gate_accepts_a_freshly_recreated_rolling_draft() {
     // empty-section checks must not apply to the draft — otherwise following
     // the documented procedure leaves the gate red until someone invents
     // details for a release that has no changes yet.
-    let root = workspace_root();
-    let template = std::fs::read_to_string(root.join("docs/migrations/TEMPLATE.md"))
-        .expect("read TEMPLATE.md");
-    // The checklist says "banner deleted": drop the leading blockquote.
-    let recreated: String = template
-        .lines()
-        .skip_while(|line| !line.starts_with("> ") && !line.starts_with('#'))
-        .filter(|line| !line.starts_with('>'))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let recreated = template_draft();
     assert!(
         recreated.contains("{X.Y.Z}"),
         "this test is only meaningful while TEMPLATE.md still has placeholders",
@@ -2318,7 +2325,6 @@ fn migration_guide_gate_accepts_a_freshly_recreated_rolling_draft() {
 
     // The same content under a released version must still be rejected: the
     // exemption is for the draft, not a licence to ship placeholders.
-    std::fs::remove_file(tmp.path().join("docs/migrations/next.md")).expect("remove draft");
     write_fixture_guide(&tmp, "0.6.0", &recreated);
     std::fs::write(
         tmp.path().join("CHANGELOG.md"),
@@ -2330,9 +2336,16 @@ fn migration_guide_gate_accepts_a_freshly_recreated_rolling_draft() {
     )
     .expect("changelog");
 
+    let output = run_migration_gate(tmp.path());
     assert!(
-        !run_migration_gate(tmp.path()).status.success(),
-        "a released guide full of template placeholders must fail",
+        !output.status.success(),
+        "a released guide full of template placeholders must fail\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("0.6.0.md"),
+        "the finding must be about the released guide, not the draft\n{}",
+        gate_report(&output),
     );
 }
 
@@ -2695,5 +2708,65 @@ fn migration_guide_gate_ignores_a_guide_link_inside_a_code_span() {
         !run_migration_gate(tmp.path()).status.success(),
         "a link that only exists inside a code span renders as code, not as a \
          link the reader can follow",
+    );
+}
+
+// --- Review round 6: the draft must exist; comments are not content -------
+
+#[test]
+fn migration_guide_gate_requires_the_rolling_draft_to_exist() {
+    // docs/release-checklist.md requires recreating next.md after every
+    // release so the links to it from README.md and STABILITY.md keep
+    // resolving — but with no breaking entries under Unreleased there was
+    // nothing to validate, so forgetting it passed silently and 404'd.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::remove_file(tmp.path().join("docs/migrations/next.md")).expect("remove draft");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## [Unreleased]\n\n- **api:** a non-breaking addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "the rolling draft must exist between releases\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("next.md"),
+        "the failure must name the missing draft\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_count_html_comments_as_content() {
+    // `<!-- TODO -->` is the canonical stub marker and renders as nothing, so
+    // a guide using it under every heading has no reader-visible instructions.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(
+        &tmp,
+        "0.7.0",
+        // The whole required section, not a subsection under it: a nested
+        // heading is itself content for its parent.
+        &valid_migration_guide("0.7.0").replace(
+            "### Area: the thing that broke\n\nBefore / after.",
+            "<!-- TODO: write this before release -->",
+        ),
+    );
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an HTML comment renders as nothing — it is not migration instructions",
     );
 }

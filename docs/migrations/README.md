@@ -94,6 +94,7 @@ It fails when:
   start*, *Breaking changes*, *How to verify*, and *Guide-only upgrade
   walkthrough* — or has a heading with nothing under it, still carries
   `TEMPLATE.md`'s banner or any placeholder token `TEMPLATE.md` itself emits
+  (an HTML comment is not content — `<!-- TODO -->` under a heading is a stub)
   (the vocabulary is read from the template, so `{:?}` and `Route { .. }` in a
   guide are fine and `{X.Y.Z}` in a code sample is not), or is not linked from
   the Index above (a mention elsewhere in this file is not an index entry);
@@ -106,6 +107,9 @@ It fails when:
   empty-section checks — the release checklist recreates it from
   `TEMPLATE.md` after every release, and the template ships placeholders by
   design. Every exemption lapses the moment it is renamed to `<version>.md`.
+- `next.md` is missing. The rolling draft is permanent, not conditional on
+  there being an unreleased break: this file and `STABILITY.md` both link it by
+  name, and nothing here checks markdown links;
 - it cannot read the changelog: a `## ` heading it fails to parse and an
   unclosed code fence are hard errors, because either one silently removes
   whole sections from every check above.

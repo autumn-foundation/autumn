@@ -419,6 +419,19 @@ done <<<"$findings"
 # walk-through, and is indexed.
 # ---------------------------------------------------------------------------
 index_file="$MIGRATIONS_DIR/README.md"
+
+# The rolling draft is permanent, not conditional on there being an unreleased
+# break: docs/migrations/README.md and STABILITY.md both link it by name, and
+# nothing in this repo checks markdown links, so a release that renames it away
+# and forgets to recreate it leaves those links 404ing until the next breaking
+# PR happens to notice.
+if [[ ! -f "$UNRELEASED_GUIDE" ]]; then
+  die "$UNRELEASED_GUIDE is missing.
+       The rolling draft always exists between releases — recreate it from
+       $MIGRATIONS_DIR/TEMPLATE.md with the banner deleted (docs/release-checklist.md,
+       Migration Guide Gate). Its placeholders are fine; it is a draft."
+fi
+
 if [[ -d "$MIGRATIONS_DIR" ]]; then
   shopt -s nullglob
   for guide in "$MIGRATIONS_DIR"/*.md; do
@@ -526,6 +539,32 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             next
           }
         }
+
+        # `<!-- TODO -->` is the canonical stub marker and renders as nothing,
+        # so it must not satisfy "this section has content". Comments may span
+        # lines, so track the open state rather than matching one line.
+        {
+          visible = $0
+          if (in_comment) {
+            if (index(visible, "-->") > 0) {
+              visible = substr(visible, index(visible, "-->") + 3)
+              in_comment = 0
+            } else {
+              visible = ""
+            }
+          }
+          while (match(visible, /<!--/)) {
+            head = substr(visible, 1, RSTART - 1)
+            tail = substr(visible, RSTART)
+            if (match(tail, /-->/)) {
+              visible = head substr(tail, RSTART + 3)
+            } else {
+              visible = head
+              in_comment = 1
+              break
+            }
+          }
+        }
         /^#+ / {
           level = heading_level($0)
           # A deeper heading is content for the section it sits under.
@@ -548,7 +587,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           sub(/^-[[:space:]]+\*\*status:\*\*[[:space:]]*/, "", status_value)
           sub(/[[:space:]]+$/, "", status_value)
         }
-        { if (current != "" && $0 ~ /[^[:space:]]/) content[current] = 1 }
+        { if (current != "" && visible ~ /[^[:space:]]/) content[current] = 1 }
         END {
           flush_section()
           for (h in want) if (!(h in seen)) printf "MISSING\t%s\n", h
