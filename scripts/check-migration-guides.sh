@@ -377,6 +377,19 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   }
   if (md_in_fence) return ""
 
+  # A raw HTML block leaves its contents literal until a blank line, so a link
+  # written inside one is not clickable. Scoped to a tag alone on its line so
+  # inline HTML and `Vec<Route>` in prose are untouched; `<!` is excluded
+  # because comments are handled below with their own escape rules.
+  if (md_in_html_block) {
+    if (line ~ /^[[:space:]]*$/) md_in_html_block = 0
+    return ""
+  }
+  if (dedent3(line) ~ /^<\/?[a-zA-Z][^<>]*>[[:space:]]*$/ && dedent3(line) !~ /^<!/) {
+    md_in_html_block = 1
+    return ""
+  }
+
   return scan_comments(line)
 }
 
@@ -722,6 +735,15 @@ done <<<"$findings"
 # walk-through, and is indexed.
 # ---------------------------------------------------------------------------
 index_file="$MIGRATIONS_DIR/README.md"
+
+# The placeholder vocabulary is read from the template at run time, so a
+# missing template would silently switch that check off rather than fail — and
+# it is also the file docs/release-checklist.md recreates next.md from.
+if [[ ! -f "$MIGRATIONS_DIR/TEMPLATE.md" ]]; then
+  die "$MIGRATIONS_DIR/TEMPLATE.md is missing.
+       It is the source of the placeholder vocabulary this gate checks guides
+       against, and the file the release checklist copies to recreate next.md."
+fi
 
 # The rolling draft is permanent, not conditional on there being an unreleased
 # break: docs/migrations/README.md and STABILITY.md both link it by name, and

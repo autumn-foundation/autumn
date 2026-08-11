@@ -3860,3 +3860,57 @@ fn migration_guide_gate_does_not_mistake_generics_for_html() {
         gate_report(&output),
     );
 }
+
+// --- Review round 23: raw HTML blocks, template presence ------------------
+
+#[test]
+fn migration_guide_gate_ignores_links_inside_raw_html_blocks() {
+    // CommonMark leaves the contents of a raw HTML block literal, so a link
+    // written inside one is not clickable.
+    //
+    // The block has to sit *inside* the list item to reproduce: an unindented
+    // one after a blank line is already outside the entry, by the round-18
+    // item-end rule, so its link was never the entry link in the first place.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <div>\n  See the [migration guide](docs/migrations/0.7.0.md).\n  </div>\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "text inside a raw HTML block is literal, not a link",
+    );
+}
+
+#[test]
+fn migration_guide_gate_requires_the_guide_template() {
+    // The placeholder vocabulary is read from TEMPLATE.md. If the file goes
+    // missing the loop reads nothing, placeholder validation silently switches
+    // off, and the release workflow loses the file it recreates next.md from.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::remove_file(tmp.path().join("docs/migrations/TEMPLATE.md")).expect("remove template");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## [Unreleased]\n\n- **api:** an addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a missing template must fail loudly, not disable a check\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("TEMPLATE.md"),
+        "the failure must name the missing template\n{}",
+        gate_report(&output),
+    );
+}
