@@ -31,7 +31,7 @@ structs with a literal — which in practice means plugins assembling a
 1. Pin your current dependency (`autumn-web = "=0.6.0"`) and commit.
 2. Make sure your tests are green on 0.6.x.
 3. If you maintain a plugin, have its conformance check to hand
-   (`autumn plugin-check`).
+   (`autumn plugin-check --plugin-name <your-plugin>`).
 
 ## Step-by-step
 

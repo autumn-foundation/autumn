@@ -290,6 +290,20 @@ function mask_html_attributes(text,   out, n, i, j, k, ch, quote, has_eq, endpos
   return out
 }
 
+function track_block_indent(text,   width) {
+  # The content column of the innermost open list item, which is where markdown
+  # measures the blocks inside it from. One level is enough for these files:
+  # real headings and top-level bullets sit in column 0, and that closes the
+  # item. Never called while a fence is open — a bullet in a code sample is not
+  # a list item.
+  width = list_marker_width(dedent3(text))
+  if (width > 0) {
+    md_block_indent = leading_spaces(text) + width
+  } else if (text ~ /^[^[:space:]]/) {
+    md_block_indent = 0
+  }
+}
+
 function block_body(text,   strip) {
   # The line as a block parser sees it: the enclosing list item indentation
   # removed first, then the up-to-three spaces markdown allows on a block
@@ -323,6 +337,19 @@ function is_orphan_title(text,   body, first, last, sq) {
   first = substr(body, 1, 1)
   last = substr(body, length(body), 1)
   return (first == "\"" || first == sq) && last == first
+}
+
+function is_standalone_tag(text,   masked) {
+  # A complete tag alone on its line. Quoting matters: `<x-widget title=">">`
+  # ends at the *last* `>`, so a naive `[^<>]*` rejects a real opener and the
+  # lines it should have made literal get scanned as markdown instead.
+  #
+  # mask_html_attributes already parses quoted values, so a tag *with*
+  # attributes is recognised by it having masked the whole line. A tag without
+  # any cannot contain a quoted `>` and needs no parsing.
+  if (text ~ /^<\/?[a-zA-Z][a-zA-Z0-9-]*[[:space:]]*\/?>[[:space:]]*$/) return 1
+  masked = mask_html_attributes(text)
+  return (masked ~ /^[[:space:]]*$/ && text ~ /^</)
 }
 
 function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
@@ -641,7 +668,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # after the first line of an entry is inline HTML, the paragraph continues,
   # and the markdown below it still renders. Opening a block there discarded
   # links the reader can click.
-  if (!md_paragraph_open && body ~ /^<\/?[a-zA-Z][^<>]*>[[:space:]]*$/ && body !~ /^<!/) {
+  if (!md_paragraph_open && is_standalone_tag(body) && body !~ /^<!/) {
     md_in_html_block = 1
     md_html_type = 6
     md_html_opened_at = FNR
@@ -715,11 +742,7 @@ collect_link_defs() {
   [[ -f "$src" ]] || return 0
   awk "$AWK_MARKDOWN_LIB"'
     {
-      if (!md_in_fence) {
-        item_width = list_marker_width(dedent3($0))
-        if (item_width > 0) md_block_indent = leading_spaces($0) + item_width
-        else if ($0 ~ /^[^[:space:]]/) md_block_indent = 0
-      }
+      if (!md_in_fence) track_block_indent($0)
       visible = visible_text($0)
       if (md_fence_hit || md_in_fence) next
       if (!is_link_definition(visible)) next
@@ -1136,14 +1159,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           # — letting a sample of a guide stand in for the guide. One level is
           # enough here: guides put their real headings in column 0, and that
           # is what closes the item.
-          if (!md_in_fence) {
-            item_width = list_marker_width(dedent3($0))
-            if (item_width > 0) {
-              md_block_indent = leading_spaces($0) + item_width
-            } else if ($0 ~ /^[^[:space:]]/) {
-              md_block_indent = 0
-            }
-          }
+          if (!md_in_fence) track_block_indent($0)
           visible = visible_text($0)
           if (md_fence_hit) next
           if (md_in_fence) {
@@ -1281,7 +1297,10 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             # comment, a code span or a fenced sample renders as anything but a
             # link, so the guide stays undiscoverable.
             BEGIN { load_link_defs(link_defs) }
-            { visible = strip_code_spans(visible_text($0)) }
+            {
+              if (!md_in_fence) track_block_indent($0)
+              visible = strip_code_spans(visible_text($0))
+            }
             heading_text(visible) ~ /^##[[:space:]]+Index$/ { in_index = 1; next }
             heading_text(visible) ~ /^##[[:space:]]/          { in_index = 0 }
             in_index && links_to(mask_html_attributes(visible), want_path) > 0 { found = 1 }

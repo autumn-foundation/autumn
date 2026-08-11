@@ -4822,3 +4822,100 @@ fn migration_guide_gate_collects_definitions_indented_under_a_wide_marker() {
         gate_report(&output),
     );
 }
+
+// --- Review round 32: quoted attrs in type-7, index list indentation ------
+
+#[test]
+fn migration_guide_gate_opens_a_type_seven_tag_with_a_quoted_bracket() {
+    // A `>` inside a quoted attribute value does not end the tag, so
+    // `<x-widget title=">">` is still a complete tag standing alone on its
+    // line and still opens a raw block. Rejecting it left the link below
+    // looking clickable when the reference implementation renders it as text.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n  \
+         <x-widget title=\">\">\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a quoted `>` does not close the tag, so the block still opens",
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_index_fences_at_the_list_content_column() {
+    // The index scan was the last parser measuring indentation from column 0.
+    // A fence inside an Index list item went unrecognised, so an entry merely
+    // *displayed* in a sample counted as the guide being indexed — and the
+    // index is the only way a reader finds a guide at all.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("docs/migrations/0.7.0.md"),
+        valid_migration_guide("0.7.0"),
+    )
+    .expect("guide");
+    std::fs::write(
+        tmp.path().join("docs/migrations/README.md"),
+        "# Migration Guides\n\n\
+         ## Index\n\n\
+         - [`next.md`](next.md)\n\
+         - An entry is written like this:\n\n    \
+         ```markdown\n  - [`0.7.0.md`](0.7.0.md)\n    ```\n",
+    )
+    .expect("index");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an entry shown inside a code sample does not index the guide\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guides_never_show_plugin_check_without_its_required_flag() {
+    // `--plugin-name` is a required argument, so a bare `autumn plugin-check`
+    // exits during argument parsing. The guide-only walk-through is performed
+    // by following a guide literally from its first step, which makes an
+    // unrunnable command a defect wherever it appears — not only under
+    // `## How to verify`.
+    let root = workspace_root();
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir(root.join("docs/migrations")).expect("migrations dir") {
+        let path = entry.expect("dir entry").path();
+        if path
+            .extension()
+            .is_none_or(|ext| !ext.eq_ignore_ascii_case("md"))
+        {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).expect("read guide");
+        for (idx, line) in body.lines().enumerate() {
+            if line.contains("autumn plugin-check") && !line.contains("--plugin-name") {
+                offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "`autumn plugin-check` needs --plugin-name to run at all:\n{}",
+        offenders.join("\n"),
+    );
+}
