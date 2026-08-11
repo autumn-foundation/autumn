@@ -525,6 +525,51 @@ fn destroy_keeps_the_csv_feature_when_hand_written_code_still_uses_it() {
 }
 
 #[test]
+fn destroy_keeps_the_csv_feature_for_a_module_level_import() {
+    // The sibling test above imports an ITEM (`…::csv::export_csv`), so its
+    // `use` line carries the `autumn_web::data::csv::` prefix. Importing the
+    // MODULE instead is just as ordinary — and that line ends at the module
+    // name, with no trailing `::` — so a marker requiring the separator would
+    // read this file as "csv unused", strip the feature, and leave
+    // `reports.rs` unable to compile.
+    let (_tmp, project) = scaffold_project("csv-destroy-mod", &default_cols(), &[]);
+    fs::write(
+        project.join("src/reports.rs"),
+        "use autumn_web::data::csv;\n\
+         pub fn write_report(out: &mut Vec<u8>) {\n    \
+         let _ = csv::export_csv(Vec::<crate::models::post::Post>::new(), out);\n\
+         }\n",
+    )
+    .unwrap();
+    run_autumn_ok(&project, &["destroy", "scaffold", "Post", "--force"]);
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"csv\""),
+        "a module-level `use autumn_web::data::csv;` still needs the feature:\n{cargo}"
+    );
+}
+
+#[test]
+fn destroy_keeps_the_csv_feature_for_a_renamed_module_import() {
+    // `use … as data_csv;` ends at the rename, not at `::` either.
+    let (_tmp, project) = scaffold_project("csv-destroy-alias", &default_cols(), &[]);
+    fs::write(
+        project.join("src/reports.rs"),
+        "use autumn_web::data::csv as data_csv;\n\
+         pub fn write_report(out: &mut Vec<u8>) {\n    \
+         let _ = data_csv::export_csv(Vec::<crate::models::post::Post>::new(), out);\n\
+         }\n",
+    )
+    .unwrap();
+    run_autumn_ok(&project, &["destroy", "scaffold", "Post", "--force"]);
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"csv\""),
+        "a renamed module import still needs the feature:\n{cargo}"
+    );
+}
+
+#[test]
 fn destroy_removes_the_csv_feature_when_the_surviving_resource_has_no_export() {
     // "some routes file still exists" is the wrong question for `csv`: only an
     // EXPORT-ENABLED resource needs it, so a surviving `--live` module must not

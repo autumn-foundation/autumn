@@ -1114,11 +1114,18 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // `import_csv` has no generator at all, so an author wiring an upload
         // form is doing it by hand by definition. Destroying the last
         // scaffolded resource must not strip the feature out from under them.
-        // The prelude re-exports nothing from `data::csv`, so every spelling —
-        // fully qualified, or a `use autumn_web::data::csv::{…};` import —
-        // goes through this path. Trailing `::` so a doc comment naming the
-        // module (`autumn_web::data::csv`) does not count as usage.
-        "csv" => &["autumn_web::data::csv::"],
+        // The prelude re-exports nothing from `data::csv`, so every spelling
+        // goes through this path. Deliberately NO trailing `::`: an author can
+        // import the MODULE (`use autumn_web::data::csv;` or `… as data_csv;`)
+        // and then call `csv::export_csv(…)`, and that import line ends at the
+        // module name. A `autumn_web::data::csv::` marker misses it, and
+        // destroying the last export-enabled scaffold would then strip a
+        // feature the surviving code needs — a build break. Dropping the `::`
+        // costs only over-retention (a doc comment naming the module now
+        // counts as usage, leaving the feature enabled), which is the same
+        // harmless direction `multipart` already accepts above; under-retention
+        // is the one that does not compile.
+        "csv" => &["autumn_web::data::csv"],
         _ => &[],
     }
 }
