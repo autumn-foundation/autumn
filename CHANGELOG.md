@@ -34,7 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `warn!` and sets `x-export-truncated: true`. Distinguishing a complete export
   of exactly `MAX_EXPORT_ROWS` rows from a truncated one takes evidence a row
   exists past the cap, so the loop reads one batch beyond it and trims the
-  surplus before writing the CSV.
+  surplus before writing the CSV. Consistency is per batch, not per export —
+  offset batches take no shared snapshot, so a concurrent insert or delete can
+  duplicate or skip a row — and the emitted docs say so rather than let the
+  file imply a point-in-time read.
 
   Row-set posture mirrors the index exactly, so no new data path is opened: an
   owner-scoped scaffold's export is `#[secured]` and reads through the

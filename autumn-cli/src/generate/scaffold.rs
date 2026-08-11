@@ -3966,6 +3966,18 @@ mod attachment_read_back_tests {
              /// `Content-Disposition` and `Content-Length` come from `Download`, which\n\
              /// infers `text/csv` from the `.csv` filename and sanitizes the name.\n\
              ///\n\
+             /// CONSISTENCY is per batch, not per export. Each batch is an independent\n\
+             /// `LIMIT`/`OFFSET` query on its own pooled connection, so a row inserted\n\
+             /// or deleted mid-export shifts the offsets under the batches still to\n\
+             /// come: a row can land in the file twice, or not at all. The index has\n\
+             /// the same property — an export just spans more pages, and more\n\
+             /// wall-clock, so it is likelier to notice. For a point-in-time exact\n\
+             /// download, read the batches by hand inside\n\
+             /// `Db::tx_with(TxOptions::repeatable_read().read_only(), ..)`; the\n\
+             /// repository's pooled reads cannot be routed through a caller's\n\
+             /// transaction today, so that path means writing the query yourself —\n\
+             /// including this one's sort/filter allowlist and any owner scoping.\n\
+             ///\n\
              /// COST, not row-set, is why this carries a `#[throttle]` the index does\n\
              /// not: one export reads up to `MAX_EXPORT_ROWS` rows over ~100 queries\n\
              /// where one index page reads 100 rows over two, so without a per-IP\n\
