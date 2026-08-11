@@ -4601,3 +4601,123 @@ fn migration_guide_gate_accepts_a_guide_showing_a_fenced_sample_in_a_list() {
         gate_report(&output),
     );
 }
+
+// --- Review round 30: reference-style guide links -------------------------
+
+/// A changelog whose breaking entry links its guide in `link_markup`, plus
+/// whatever `tail` adds after it (usually the reference definition).
+fn reference_link_changelog(link_markup: &str, tail: &str) -> String {
+    format!(
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See {link_markup}.\n\n{tail}"
+    )
+}
+
+#[test]
+fn migration_guide_gate_accepts_a_full_reference_style_guide_link() {
+    // `[text][label]` with the definition elsewhere is a normal markdown link
+    // and renders as a real anchor; rejecting it blocks CI on valid writing.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        reference_link_changelog(
+            "the [migration guide][upgrade]",
+            "[upgrade]: docs/migrations/0.7.0.md\n",
+        ),
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a reference-style link is a link\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_collapsed_and_shortcut_reference_links() {
+    // `[label][]` and a bare `[label]` both resolve to the same definition.
+    for markup in ["[upgrade][]", "[upgrade]"] {
+        let tmp = migration_gate_fixture("0.7.0");
+        write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            reference_link_changelog(markup, "[upgrade]: docs/migrations/0.7.0.md\n"),
+        )
+        .expect("changelog");
+
+        let output = run_migration_gate(tmp.path());
+        assert!(
+            output.status.success(),
+            "`{markup}` resolves to the guide\n{}",
+            gate_report(&output),
+        );
+    }
+}
+
+#[test]
+fn migration_guide_gate_matches_reference_labels_case_insensitively() {
+    // CommonMark folds case when matching a label to its definition.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        reference_link_changelog(
+            "the [migration guide][UpGrade]",
+            "[upgrade]: docs/migrations/0.7.0.md\n",
+        ),
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "labels match case-insensitively\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_ignores_a_reference_definition_inside_a_fence() {
+    // The fail-open counterpart: a definition *displayed* in a code sample
+    // defines nothing, so the entry above it still has no clickable guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        reference_link_changelog(
+            "the [migration guide][upgrade]",
+            "```\n[upgrade]: docs/migrations/0.7.0.md\n```\n",
+        ),
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a definition shown inside a fence defines nothing",
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_a_reference_link_with_no_definition() {
+    // An unresolved label renders as literal text, so there is no link at all.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        reference_link_changelog(
+            "the [migration guide][nope]",
+            "[upgrade]: docs/migrations/0.7.0.md\n",
+        ),
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an undefined label is not a link",
+    );
+}

@@ -382,37 +382,84 @@ function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
   return dest
 }
 
-function links_to(text, path,   pos, at, i, ch, start, slashes, depth) {
-  # A complete inline link `[label](path)`, not a bare `](path)`: the second
-  # renders as literal text, so the reader has nothing to click.
+function normalize_label(text,   out) {
+  # CommonMark matches a reference label case-insensitively and treats any run
+  # of whitespace as a single space.
+  out = tolower(text)
+  gsub(/[[:space:]]+/, " ", out)
+  sub(/^ /, "", out)
+  sub(/ $/, "", out)
+  return out
+}
+
+function load_link_defs(path,   line, label, dest, close_at) {
+  # `label<TAB>destination`, one per line, produced by the definitions pass in
+  # the shell below. That pass runs the same visible_text state machine, so a
+  # definition merely *displayed* inside a fenced sample defines nothing.
+  if (path == "") return
+  while ((getline line < path) > 0) {
+    close_at = index(line, "\t")
+    if (close_at < 2) continue
+    label = normalize_label(substr(line, 1, close_at - 1))
+    dest = substr(line, close_at + 1)
+    if (!(label in md_link_defs)) md_link_defs[label] = dest
+  }
+  close(path)
+}
+
+function reference_target(text, at,   rest, label, close_at) {
+  # Resolve the reference link whose label ends at `at` (the index of its `]`).
+  # Three forms, all normal markdown: `[text][label]`, the collapsed
+  # `[text][]`, and the shortcut `[text]`.
+  rest = substr(text, at + 1)
+  label = ""
+  if (substr(rest, 1, 1) == "[") {
+    close_at = unescaped_index(rest, "]", 2)
+    if (close_at == 0) return ""
+    label = substr(rest, 2, close_at - 2)
+  }
+  # Collapsed and shortcut both fall back to the link text itself, which the
+  # caller passes in as `md_link_label`.
+  if (label ~ /^[[:space:]]*$/) label = md_link_label
+  label = normalize_label(label)
+  return (label in md_link_defs) ? md_link_defs[label] : ""
+}
+
+function links_to(text, path,   at, i, ch, start, slashes, depth, open_at, dest) {
+  # Every `]` that closes a link label is a candidate. What follows decides how
+  # the destination is found: `(` means an inline link, anything else means a
+  # reference link resolved against the definitions collected from the file.
   start = 1
-  while ((pos = index(substr(text, start), "](")) > 0) {
-    at = start + pos - 1
-    if (link_destination(text, at + 2) != path) { start = at + 1; continue }
-    # An escaped `]` does not close the label, so this is not a link either.
-    slashes = 0
-    while (at - slashes - 1 >= 1 && substr(text, at - slashes - 1, 1) == "\\") slashes++
-    if (slashes % 2 == 1) { start = at + 1; continue }
+  while ((at = unescaped_index(text, "]", start)) > 0) {
+    start = at + 1
     # Walk back to the `[` that opens the label. Brackets nest — the label of
     # `[the [migration guide]](path)` contains a balanced pair — so an inner
-    # `]` is counted, not treated as the end of some earlier link.
+    # `]` is counted, not treated as the end of some earlier link. An escaped
+    # bracket renders as literal text and does not nest.
     depth = 0
+    open_at = 0
     for (i = at - 1; i >= 1; i--) {
       ch = substr(text, i, 1)
       if (ch != "[" && ch != "]") continue
-      # An escaped bracket renders as literal text: `\[label](path)` is not a
-      # link, and `\]` does not nest. Odd run of backslashes means escaped.
       slashes = 0
       while (i - slashes - 1 >= 1 && substr(text, i - slashes - 1, 1) == "\\") slashes++
       if (slashes % 2 == 1) continue
       if (ch == "]") { depth++; continue }
       if (depth > 0) { depth--; continue }
-      # An unescaped `!` before the bracket makes this an image, which renders
-      # a picture rather than a path the reader can follow.
-      if (!(i > 1 && substr(text, i - 1, 1) == "!")) return 1
+      open_at = i
       break
     }
-    start = at + 1
+    if (open_at == 0) continue
+    # An unescaped `!` before the bracket makes this an image, which renders a
+    # picture rather than a path the reader can follow.
+    if (open_at > 1 && substr(text, open_at - 1, 1) == "!") continue
+    md_link_label = substr(text, open_at + 1, at - open_at - 1)
+    if (substr(text, at + 1, 1) == "(") {
+      dest = link_destination(text, at + 2)
+    } else {
+      dest = reference_target(text, at)
+    }
+    if (dest == path) return 1
   }
   return 0
 }
@@ -631,11 +678,52 @@ function scan_comments(text,   out, masked, pos, close_at, head, tail) {
 # Every loop below is fed by a here-string, not a pipe: a piped `while read`
 # runs in a subshell and the `failures` counter it increments is discarded.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Link reference definitions, collected per file.
+#
+# `[migration guide][upgrade]` with `[upgrade]: docs/migrations/0.7.0.md`
+# elsewhere is a normal markdown link and renders as a real anchor, so refusing
+# it would fail CI on correct writing. Definitions are gathered in their own
+# pass — over the same visible_text state machine, so one merely *displayed*
+# inside a fenced sample defines nothing — and handed to the parsers that
+# resolve links.
+# ---------------------------------------------------------------------------
+defs_dir="$(mktemp -d)"
+trap 'rm -rf "$defs_dir"' EXIT
+
+collect_link_defs() {
+  local src="$1" out="$2"
+  : >"$out"
+  [[ -f "$src" ]] || return 0
+  awk "$AWK_MARKDOWN_LIB"'
+    {
+      visible = visible_text($0)
+      if (md_fence_hit || md_in_fence) next
+      if (!is_link_definition(visible)) next
+      body = dedent3(visible)
+      close_at = unescaped_index(body, "]", 2)
+      label = substr(body, 2, close_at - 2)
+      dest = substr(body, close_at + 2)
+      sub(/^[[:space:]]+/, "", dest)
+      # Only the destination: a trailing title is metadata, not the target.
+      sub(/[[:space:]].*$/, "", dest)
+      if (dest ~ /^<.*>$/) dest = substr(dest, 2, length(dest) - 2)
+      if (label != "" && dest != "") printf "%s\t%s\n", label, dest
+    }
+  ' "$src" >>"$out"
+}
+
+changelog_defs="$defs_dir/changelog.defs"
+collect_link_defs "$CHANGELOG" "$changelog_defs"
+
 findings="$(
   awk -v floor="$MIGRATION_GUIDE_FLOOR" \
       -v migrations_dir="$MIGRATIONS_DIR" \
       -v unreleased_guide="$UNRELEASED_GUIDE" \
+      -v link_defs="$changelog_defs" \
       "$AWK_MARKDOWN_LIB"'
+  BEGIN { load_link_defs(link_defs) }
+
   function version_ge(a, b,   pa, pb, i, na, nb) {
     na = split(a, pa, ".")
     nb = split(b, pb, ".")
@@ -1163,10 +1251,13 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
     if [[ ! -f "$index_file" ]]; then
       guide_ok=false
       die "$index_file is missing — guides are only findable through the index."
-    elif ! awk -v want_path="$base" "$AWK_MARKDOWN_LIB"'
+    elif ! collect_link_defs "$index_file" "$defs_dir/index.defs" ||
+         ! awk -v want_path="$base" -v link_defs="$defs_dir/index.defs" \
+              "$AWK_MARKDOWN_LIB"'
             # Only a link the reader can click counts. A bullet inside an HTML
             # comment, a code span or a fenced sample renders as anything but a
             # link, so the guide stays undiscoverable.
+            BEGIN { load_link_defs(link_defs) }
             { visible = strip_code_spans(visible_text($0)) }
             heading_text(visible) ~ /^##[[:space:]]+Index$/ { in_index = 1; next }
             heading_text(visible) ~ /^##[[:space:]]/          { in_index = 0 }

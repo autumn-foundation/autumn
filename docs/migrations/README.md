@@ -96,7 +96,10 @@ It fails when:
 - a breaking entry does not *link* its guide — a bare path mention is not a
   link, the reader has to be able to click through. The destination is parsed,
   not searched for, so `[guide](next.md "why")` and `[guide](<next.md>)` both
-  count and a path named only in a link *title* does not;
+  count and a path named only in a link *title* does not. Reference-style links
+  work too — `[guide][upgrade]` with `[upgrade]: next.md` anywhere in the file,
+  plus the collapsed and shortcut forms — as long as the definition itself
+  renders, which one shown inside a fenced sample does not;
 - a guide is missing a required section — *At a glance*, *Summary*, *Before you
   start*, *Breaking changes*, *How to verify*, and *Guide-only upgrade
   walkthrough* — or has a heading with nothing under it, still carries
