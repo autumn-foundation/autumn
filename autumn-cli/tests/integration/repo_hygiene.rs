@@ -2770,3 +2770,87 @@ fn migration_guide_gate_does_not_count_html_comments_as_content() {
         "an HTML comment renders as nothing — it is not migration instructions",
     );
 }
+
+// --- Review round 7: HTML comments in both parsers ------------------------
+
+#[test]
+fn migration_guide_gate_ignores_headings_inside_html_comments() {
+    // Round 6 stopped comments counting as *content* but left the heading and
+    // status rules reading the raw line, so a guide could satisfy its whole
+    // required structure from inside a comment block — reader-invisible.
+    // Two shapes do *not* reproduce this, and it is worth knowing why: a guide
+    // commented out wholesale is caught by the content check, and a one-line
+    // `<!-- ## At a glance -->` never matches the heading rule because the line
+    // starts with `<`. The shape that gets through is a multi-line comment,
+    // where the heading does start at column 0, with visible prose under it —
+    // the gate records structure the reader cannot see.
+    let mut guide = String::from("# Migrating to 0.7.0\n\n");
+    for heading in [
+        "## At a glance",
+        "## Summary",
+        "## Before you start",
+        "## Breaking changes",
+        "## How to verify",
+        "### Guide-only upgrade walkthrough",
+    ] {
+        writeln!(guide, "<!--\n{heading}\n-->\n\nSome prose.\n").expect("write guide");
+    }
+    guide.push_str("<!--\n- **Status:** performed 2026-09-01\n-->\n");
+
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a guide commented out wholesale renders as nothing — its headings are \
+         not the guide's structure",
+    );
+}
+
+#[test]
+fn migration_guide_gate_skips_commented_out_changelog_bullets() {
+    // A bullet parked inside `<!-- ... -->` renders nowhere, so it is not a
+    // declaration and must not demand a guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **api:** a non-breaking addition.\n\n\
+         <!--\n\
+         - **db:** **Breaking:** parked until we decide. No guide yet.\n\
+         -->\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a commented-out bullet is not a changelog entry\n{}",
+        gate_report(&output),
+    );
+
+    // Uncommented, the same bullet is a real declaration again.
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** parked until we decide. No guide yet.\n",
+    )
+    .expect("changelog");
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "the same bullet outside a comment must still demand a guide",
+    );
+}

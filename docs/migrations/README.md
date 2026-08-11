@@ -45,6 +45,11 @@ If a change is *not* breaking, say so in the words the gate recognises —
 passes untouched. A `**Breaking:**` token inside a code span is a mention, not
 a declaration, so documenting the convention costs nothing.
 
+A bullet parked inside `<!-- ... -->` renders nowhere, so it is not an entry and
+declares nothing. The one HTML comment the gate *does* read is the suppression
+token below — deliberately, so it stays invisible to readers and visible in the
+diff.
+
 For an entry that talks *about* breaking changes without being one — release
 tooling, policy docs — append an explicit suppression naming its reason:
 

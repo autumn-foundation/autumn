@@ -162,11 +162,11 @@ findings="$(
 
   function flush_entry(   lower, marked, has_link, i, prose, ticks, scratch) {
     if (entry == "") return
-    if (!in_scope) { entry = ""; return }
+    if (!in_scope) { entry = ""; entry_visible = ""; return }
 
     # Inline code spans hold *mentions* of the marker, not declarations, so an
     # entry documenting the convention must not declare itself breaking.
-    prose = strip_code_spans(entry)
+    prose = strip_code_spans(entry_visible)
 
     lower = tolower(prose)
     marked = (lower ~ /\*\*breaking(:\*\*|\*\*:)/) || entry_breaking_heading
@@ -177,19 +177,21 @@ findings="$(
     # downstream app. Ask for one token rather than guess — the suppression
     # below settles it for a mention, fixing the backticks settles it for a
     # declaration.
-    marker_in_span = (!marked && tolower(entry) ~ /\*\*breaking(:\*\*|\*\*:)/)
+    marker_in_span = (!marked && tolower(entry_visible) ~ /\*\*breaking(:\*\*|\*\*:)/)
 
     # The suppression is for entries that talk *about* breaking changes. It
     # must never override an explicit declaration: one comment on a parent
     # bullet would otherwise silence every nested `**Breaking:**` under it.
     if (!marked && entry ~ /<!--[[:space:]]*migration-guide-gate:/) {
       entry = ""
+      entry_visible = ""
       return
     }
 
     if (marker_in_span) {
       printf "AMBIGUOUS\t%s\t%d\t%s\n", section, entry_line, excerpt(entry)
       entry = ""
+      entry_visible = ""
       return
     }
 
@@ -216,6 +218,35 @@ findings="$(
       }
     }
     entry = ""
+    entry_visible = ""
+  }
+
+  # A bullet parked inside `<!-- ... -->` renders nowhere, so it is not a
+  # changelog entry and must not demand a guide. The suppression token is
+  # itself an HTML comment, though, so the raw line is kept alongside: markers,
+  # links and the prose lint read the visible text, while the suppression is
+  # read from the raw entry. See flush_entry.
+  {
+    visible = $0
+    if (in_comment) {
+      if (index(visible, "-->") > 0) {
+        visible = substr(visible, index(visible, "-->") + 3)
+        in_comment = 0
+      } else {
+        visible = ""
+      }
+    }
+    while (match(visible, /<!--/)) {
+      comment_head = substr(visible, 1, RSTART - 1)
+      comment_tail = substr(visible, RSTART)
+      if (match(comment_tail, /-->/)) {
+        visible = comment_head substr(comment_tail, RSTART + 3)
+      } else {
+        visible = comment_head
+        in_comment = 1
+        break
+      }
+    }
   }
 
   # Fenced code blocks hold TOML/YAML samples whose lines start with "- ".
@@ -258,7 +289,7 @@ findings="$(
     if (fence_hit || in_fence) next
   }
 
-  /^## / {
+  visible ~ /^## / {
     flush_entry()
     breaking_heading = 0
     if (tolower($0) ~ /^##[[:space:]]+\[?unreleased\]?[[:space:]]*$/) {
@@ -287,7 +318,7 @@ findings="$(
     next
   }
 
-  /^### / {
+  visible ~ /^### / {
     flush_entry()
     # Only the documented heading declares a break. A `breaking` *prefix* match
     # turned `### Breaking down request latency` into a section where every
@@ -297,15 +328,21 @@ findings="$(
   }
 
   # `-` and `*` are both legal markdown bullets.
-  /^[-*] / {
+  visible ~ /^[-*] / {
     flush_entry()
     entry_line = FNR
     entry_breaking_heading = breaking_heading
     entry = $0
+    entry_visible = visible
     next
   }
 
-  { if (entry != "") entry = entry " " $0 }
+  {
+    if (entry != "") {
+      entry = entry " " $0
+      entry_visible = entry_visible " " visible
+    }
+  }
 
   END {
     flush_entry()
@@ -565,12 +602,12 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             }
           }
         }
-        /^#+ / {
-          level = heading_level($0)
+        visible ~ /^#+ / {
+          level = heading_level(visible)
           # A deeper heading is content for the section it sits under.
           if (current != "" && level > current_level) content[current] = 1
           flush_section()
-          current = $0
+          current = visible
           sub(/[[:space:]]+$/, "", current)
           current_level = level
           seen[current] = 1
@@ -578,12 +615,12 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
         }
         # Only under the heading the release process points at — a status
         # recorded under Summary is not a recorded walk-through.
-        current == walkthrough_heading && /^-[[:space:]]+\*\*Status:\*\*/ {
-          status = $0
+        current == walkthrough_heading && visible ~ /^-[[:space:]]+\*\*Status:\*\*/ {
+          status = visible
           # Validate the *whole* value, not "does it contain the word
           # performed" — "not performed 2026-08-11" says the opposite of what
           # a substring search concluded from it.
-          status_value = tolower($0)
+          status_value = tolower(visible)
           sub(/^-[[:space:]]+\*\*status:\*\*[[:space:]]*/, "", status_value)
           sub(/[[:space:]]+$/, "", status_value)
         }
