@@ -11,29 +11,38 @@
 # It enforces four things over CHANGELOG.md:
 #
 #   1. Marker convention. A breaking entry is declared either with the inline
-#      token `**Breaking:**` or by sitting under a `### Breaking Changes`
-#      heading. Nothing else counts.
+#      token `**Breaking:**` (any case) or by sitting under a
+#      `### Breaking Changes` heading. Nothing else counts.
 #   2. Unmarked-break lint. An entry that talks about *breaking* something
 #      without the marker fails, unless the wording is explicitly negated
-#      ("non-breaking", "no breaking change", "without breaking ..."). Without
-#      this, an author can strand users by writing prose the coverage check
-#      cannot see -- which is exactly how 0.6.0's rename slipped through.
+#      ("non-breaking", "no breaking change", "without breaking ...") or the
+#      entry carries an explicit suppression comment. Without this, an author
+#      can strand users by writing prose the coverage check cannot see -- which
+#      is exactly how 0.6.0's rename slipped through.
 #   3. Coverage. A section with at least one breaking entry must have a guide:
 #      `docs/migrations/<version>.md` for a release, `docs/migrations/next.md`
 #      (the rolling draft, renamed at release time) for `## [Unreleased]`.
-#   4. Linkage. Every breaking entry must link its own guide, so a reader
-#      lands on the fix path straight from the changelog line.
+#      A release candidate (`## [0.7.0-rc.1]`) is gated against its release's
+#      guide, `docs/migrations/0.7.0.md`.
+#   4. Linkage. Every breaking entry must carry a markdown *link* to its own
+#      guide -- `](docs/migrations/X.Y.Z.md)` -- so a reader lands on the fix
+#      path straight from the changelog line. A bare path mention is not a link.
 #
 # It also checks every guide in `docs/migrations/` for the TEMPLATE.md shape
-# (what breaks, how to verify, the recorded guide-only upgrade walk-through)
-# and for an entry in the `docs/migrations/README.md` index, so a stub that
-# only exists to satisfy check 3 does not pass.
+# (required headings, each with content under it, and the recorded guide-only
+# upgrade walk-through, which may only be `pending` on the rolling draft) and
+# for an entry in the `docs/migrations/README.md` index, so a stub that only
+# exists to satisfy check 3 does not pass.
 #
 # Releases before $MIGRATION_GUIDE_FLOOR are out of scope (issue #1588
 # explicitly excludes backfilling guides earlier than 0.4.0).
 #
-# Residual risk, stated plainly: the lint is textual. An author who describes
-# a break without using the word "breaking" and without the marker still gets
+# The gate FAILS CLOSED on anything it cannot read: a `## ` heading it cannot
+# parse and an unclosed code fence are both hard errors, because either one
+# silently removes whole sections from every check above.
+#
+# Residual risk, stated plainly: the lint is textual. An author who describes a
+# break without using the word "breaking" and without the marker still gets
 # through. Reviewers remain the backstop; this gate removes the *silent*
 # failure mode, it does not replace judgement.
 #
@@ -53,10 +62,14 @@ MIGRATIONS_DIR="${MIGRATIONS_DIR:-docs/migrations}"
 # Rolling draft for `## [Unreleased]`; renamed to <version>.md at release time.
 UNRELEASED_GUIDE="$MIGRATIONS_DIR/next.md"
 
+# Headings every guide must carry, each with content under it. Keep in sync
+# with docs/migrations/TEMPLATE.md and docs/migrations/README.md.
+REQUIRED_SECTIONS='## At a glance|## Summary|## Before you start|## Breaking changes|## How to verify|### Guide-only upgrade walkthrough'
+
 mode="gate"
-case "${1:-}" in
-  --list) mode="list" ;;
-  "") ;;
+case "${#}:${1:-}" in
+  0:) ;;
+  1:--list) mode="list" ;;
   *)
     echo "usage: scripts/check-migration-guides.sh [--list]" >&2
     exit 2
@@ -65,6 +78,8 @@ esac
 
 failures=0
 
+# Unlike the `die` in scripts/check-release-notes.sh, this one does NOT exit:
+# the gate reports every finding in one run so an author fixes them together.
 die() {
   echo "error: $*" >&2
   failures=$((failures + 1))
@@ -87,10 +102,12 @@ ok() {
 # long entry, and the pipeline reports a false negative. That bug already bit
 # scripts/check-release-notes.sh once; do not reintroduce it here.
 #
-# Emitted records (tab separated):
-#   SECTION   <name> <guide-path> <in-scope 0|1>
-#   BREAKING  <name> <line> <links-its-guide 0|1> <guide-path>
-#   UNMARKED  <name> <line> <excerpt>
+# Emitted records (tab separated, message always last):
+#   SECTION   <name>  <guide-path>  <in-scope 0|1>
+#   BREAKING  <name>  <line>        <links-its-guide 0|1>  <guide-path>
+#   UNMARKED  <name>  <line>        <excerpt>
+#   UNPARSED  -       <line>        <the heading we could not read>
+#   UNCLOSED  -       <line>        <the fence that was never closed>
 #
 # Every loop below is fed by a here-string, not a pipe: a piped `while read`
 # runs in a subshell and the `failures` counter it increments is discarded.
@@ -115,38 +132,46 @@ findings="$(
     return (length(flat) > 90) ? substr(flat, 1, 90) "..." : flat
   }
 
-  function flush_entry(   lower, marked, has_link, i, prose) {
+  function flush_entry(   lower, marked, has_link, i, prose, ticks, scratch) {
     if (entry == "") return
     if (!in_scope) { entry = ""; return }
 
-    # Explicit, greppable escape hatch for entries that talk *about* breaking
-    # changes (release tooling, policy docs) rather than being one. Reviewable
-    # like an #[allow]: visible in the diff, and it names its reason.
-    if (entry ~ /<!--[[:space:]]*migration-guide-gate:/) { entry = ""; return }
-
-    # A `**Breaking:**` token inside a code span is a mention, not a
-    # declaration — an entry documenting the convention must not declare
-    # itself breaking. Strip code spans before reading the marker.
+    # Inline code spans hold *mentions* of the marker, not declarations, so an
+    # entry documenting the convention must not declare itself breaking. Strip
+    # them only when the backticks pair up: with an odd backtick the pairing is
+    # guesswork, and guessing here once made a real `**Breaking:**` vanish
+    # along with the word that would have tripped the lint.
+    scratch = entry
+    ticks = gsub(/`/, "x", scratch)
     prose = entry
-    gsub(/`[^`]*`/, " ", prose)
+    if (ticks % 2 == 0) gsub(/`[^`]*`/, " ", prose)
 
-    # A break is declared by the `**Breaking:**` token or by a
-    # `### Breaking Changes` heading above the entry. Nothing else counts.
-    marked = (prose ~ /\*\*Breaking(:\*\*|\*\*:)/) || entry_breaking_heading
+    lower = tolower(prose)
+    marked = (lower ~ /\*\*breaking(:\*\*|\*\*:)/) || entry_breaking_heading
+
+    # The suppression is for entries that talk *about* breaking changes. It
+    # must never override an explicit declaration: one comment on a parent
+    # bullet would otherwise silence every nested `**Breaking:**` under it.
+    if (!marked && entry ~ /<!--[[:space:]]*migration-guide-gate:/) {
+      entry = ""
+      return
+    }
 
     if (marked) {
-      has_link = (index(entry, guide_path) > 0)
+      # A markdown link, not a mention: `](<guide>)`.
+      has_link = (index(entry, "](" guide_path ")") > 0)
       printf "BREAKING\t%s\t%d\t%d\t%s\n", section, entry_line, has_link, guide_path
     } else {
       # Fold to alpha-only words so "non-breaking" and "non breaking" are the
       # same token and word boundaries need no \b (mawk has none).
-      lower = tolower(prose)
       gsub(/[^a-z]+/, " ", lower)
       lower = " " lower " "
-      # Negated wordings are the overwhelming majority in this changelog.
-      # Repeat: a gsub eats the shared separator between adjacent matches.
+      # Only the wordings that unambiguously negate. Anything looser (an
+      # "avoids breaking" / "no <adjective> breaking" catch-all) starts eating
+      # real breaks; entries that need more latitude use the suppression, which
+      # is visible in the diff.
       for (i = 0; i < 3; i++) {
-        gsub(/ (non breaking|no [a-z]+ breaking|no breaking|not breaking|not a breaking|without breaking|rather than a breaking|nothing breaking|never breaking|avoids? breaking|avoiding breaking|prevents? breaking|preventing breaking) /, " ", lower)
+        gsub(/ (non breaking|no breaking|not a breaking|without breaking|rather than a breaking) /, " ", lower)
       }
       if (lower ~ / breaking /) {
         printf "UNMARKED\t%s\t%d\t%s\n", section, entry_line, excerpt(entry)
@@ -157,26 +182,52 @@ findings="$(
 
   # Fenced code blocks hold TOML/YAML samples whose lines start with "- ".
   # They are part of the entry that opened them, never entries themselves.
-  /^[[:space:]]*```/ { if (entry != "") entry = entry " " $0; in_fence = !in_fence; next }
-  in_fence          { if (entry != "") entry = entry " " $0; next }
+  # CommonMark: a closing fence is at least as long as its opener, so a
+  # ````markdown block may contain a ``` sample. A naive toggle read that as an
+  # odd number of flips and swallowed the whole rest of the file.
+  /^[[:space:]]*```/ {
+    fence_line = $0
+    sub(/^[[:space:]]*/, "", fence_line)
+    fence_ticks = 0
+    while (substr(fence_line, fence_ticks + 1, 1) == "`") fence_ticks++
+    if (!in_fence) {
+      in_fence = 1
+      fence_len = fence_ticks
+      fence_opened_at = FNR
+    } else if (fence_ticks >= fence_len && substr(fence_line, fence_ticks + 1) ~ /^[[:space:]]*$/) {
+      in_fence = 0
+    }
+    if (entry != "") entry = entry " " $0
+    next
+  }
+  in_fence { if (entry != "") entry = entry " " $0; next }
 
   /^## / {
     flush_entry()
     breaking_heading = 0
-    if ($0 ~ /^## \[Unreleased\]/) {
+    if (tolower($0) ~ /^##[[:space:]]+\[?unreleased\]?[[:space:]]*$/) {
       section = "Unreleased"
       guide_path = unreleased_guide
       in_scope = 1
-    } else if (match($0, /\[[0-9]+\.[0-9]+\.[0-9]+\]/)) {
+    } else if (match($0, /\[[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\][[:space:]]*(-|$)/)) {
       section = substr($0, RSTART + 1, RLENGTH - 2)
-      guide_path = migrations_dir "/" section ".md"
-      in_scope = version_ge(section, floor)
+      sub(/\].*$/, "", section)
+      # A release candidate is gated against its release`s guide.
+      release = section
+      sub(/-.*$/, "", release)
+      guide_path = migrations_dir "/" release ".md"
+      in_scope = version_ge(release, floor)
     } else {
+      # Fail closed. An unreadable heading used to emit no record at all, so
+      # the section was not merely un-gated -- it was invisible, including to
+      # --list, which is the operator`s only sanity check.
+      printf "UNPARSED\t-\t%d\t%s\n", FNR, $0
       section = ""
       guide_path = ""
       in_scope = 0
+      next
     }
-    if (section != "") printf "SECTION\t%s\t%s\t%d\n", section, guide_path, in_scope
+    printf "SECTION\t%s\t%s\t%d\n", section, guide_path, in_scope
     next
   }
 
@@ -186,7 +237,8 @@ findings="$(
     next
   }
 
-  /^- / {
+  # `-` and `*` are both legal markdown bullets.
+  /^[-*] / {
     flush_entry()
     entry_line = FNR
     entry_breaking_heading = breaking_heading
@@ -196,7 +248,10 @@ findings="$(
 
   { if (entry != "") entry = entry " " $0 }
 
-  END { flush_entry() }
+  END {
+    flush_entry()
+    if (in_fence) printf "UNCLOSED\t-\t%d\tcode fence opened here is never closed\n", fence_opened_at
+  }
   ' "$CHANGELOG"
 )"
 
@@ -221,6 +276,26 @@ if [[ "$mode" == "list" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Check 0: the parser read the whole file.
+# ---------------------------------------------------------------------------
+while IFS=$'\t' read -r kind _ line text; do
+  case "$kind" in
+    UNPARSED)
+      die "$CHANGELOG:$line: unreadable release heading, so this section is
+       invisible to every check below:
+         $text
+       Use '## [X.Y.Z] - YYYY-MM-DD' (a '-rc.N' suffix is fine) or
+       '## [Unreleased]'."
+      ;;
+    UNCLOSED)
+      die "$CHANGELOG:$line: $text.
+       Everything after it is read as part of one entry, which hides whole
+       release sections from the gate. Close the fence."
+      ;;
+  esac
+done <<<"$findings"
+
+# ---------------------------------------------------------------------------
 # Check 1: no unmarked breaking prose.
 # ---------------------------------------------------------------------------
 unmarked=0
@@ -237,7 +312,9 @@ while IFS=$'\t' read -r kind name line text; do
        *about* breaking changes without being one, append the explicit
        suppression: <!-- migration-guide-gate: <reason> -->"
 done <<<"$findings"
-[[ "$unmarked" -eq 0 ]] && ok "no unmarked breaking changes in $CHANGELOG"
+if [[ "$unmarked" -eq 0 ]]; then
+  ok "no unmarked breaking changes in $CHANGELOG"
+fi
 
 # ---------------------------------------------------------------------------
 # Check 2: a section that declares a break has a guide to point at.
@@ -253,8 +330,9 @@ while IFS=$'\t' read -r kind name guide scope; do
     ok "[$name] $count breaking $noun -> $guide"
   else
     die "[$name] declares $count breaking change(s) but there is no migration guide at $guide.
-       Copy $MIGRATIONS_DIR/TEMPLATE.md to $guide and fill it in — a release
-       without an upgrade path is treated as a broken build (issue #1588)."
+       Copy $MIGRATIONS_DIR/TEMPLATE.md to $guide (delete its banner) and fill
+       it in — a release without an upgrade path is treated as a broken build
+       (issue #1588)."
   fi
 done <<<"$findings"
 
@@ -265,21 +343,13 @@ done <<<"$findings"
 while IFS=$'\t' read -r kind name line linked guide; do
   [[ "$kind" == "BREAKING" && "$linked" == "0" ]] || continue
   die "$CHANGELOG:$line: [$name] breaking entry does not link its migration guide.
-       Append: See the [migration guide]($guide)."
+       Append a markdown link: See the [migration guide]($guide)."
 done <<<"$findings"
 
 # ---------------------------------------------------------------------------
-# Check 4: every guide has the TEMPLATE.md shape and is indexed.
+# Check 4: every guide has the TEMPLATE.md shape, records a performed
+# walk-through, and is indexed.
 # ---------------------------------------------------------------------------
-required_sections=(
-  "## At a glance"
-  "## Summary"
-  "## Before you start"
-  "## Breaking changes"
-  "## How to verify"
-  "### Guide-only upgrade walkthrough"
-)
-
 index_file="$MIGRATIONS_DIR/README.md"
 if [[ -d "$MIGRATIONS_DIR" ]]; then
   shopt -s nullglob
@@ -287,27 +357,99 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
     base="$(basename "$guide")"
     [[ "$base" == "README.md" || "$base" == "TEMPLATE.md" ]] && continue
 
-    guide_ok=true
-    for section in "${required_sections[@]}"; do
-      if ! grep -qF -- "$section" "$guide"; then
-        guide_ok=false
-        die "$guide is missing the required section '$section'.
-       Guides follow $MIGRATIONS_DIR/TEMPLATE.md: what breaks, the exact
-       before/after steps, and how to verify. A stub strands the reader as
-       hard as no guide at all."
-      fi
-    done
+    # `pending` is legitimate only on the rolling draft: it is renamed to
+    # <version>.md at release time, and by then the walk-through is required.
+    allow_pending=0
+    [[ "$guide" == "$UNRELEASED_GUIDE" ]] && allow_pending=1
 
-    if ! grep -qE -- '^- \*\*Status:\*\*' "$guide"; then
-      guide_ok=false
-      die "$guide does not record the guide-only upgrade walk-through.
+    guide_findings="$(
+      awk -v required="$REQUIRED_SECTIONS" -v allow_pending="$allow_pending" '
+        function heading_level(line,   n) {
+          n = 0
+          while (substr(line, n + 1, 1) == "#") n++
+          return n
+        }
+        function flush_section() {
+          if (current != "" && (current in want) && !content[current]) {
+            printf "EMPTY\t%s\n", current
+          }
+        }
+        BEGIN {
+          split(required, list, "|")
+          for (i in list) want[list[i]] = 1
+        }
+        /^#+ / {
+          level = heading_level($0)
+          # A deeper heading is content for the section it sits under.
+          if (current != "" && level > current_level) content[current] = 1
+          flush_section()
+          current = $0
+          sub(/[[:space:]]+$/, "", current)
+          current_level = level
+          seen[current] = 1
+          next
+        }
+        /^-[[:space:]]+\*\*Status:\*\*/ { status = $0 }
+        /\{(X\.|Y\.|placeholder|YYYY-|minutes|performed |none, or)/ { placeholder = 1 }
+        { if (current != "" && $0 ~ /[^[:space:]]/) content[current] = 1 }
+        END {
+          flush_section()
+          for (h in want) if (!(h in seen)) printf "MISSING\t%s\n", h
+          if (status == "") {
+            printf "NOSTATUS\t-\n"
+          } else if (!allow_pending &&
+                     tolower(status) !~ /performed[[:space:]]+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ &&
+                     tolower(status) !~ /backfilled/) {
+            printf "PENDING\t%s\n", status
+          }
+          if (placeholder) printf "PLACEHOLDER\t-\n"
+        }
+      ' "$guide"
+    )"
+
+    guide_ok=true
+    while IFS=$'\t' read -r kind detail; do
+      case "$kind" in
+        MISSING)
+          guide_ok=false
+          die "$guide is missing the required section '$detail'.
+       Guides follow $MIGRATIONS_DIR/TEMPLATE.md: what breaks, the exact
+       before/after steps, and how to verify. The heading must match exactly —
+       a deeper '#### ...' does not count."
+          ;;
+        EMPTY)
+          guide_ok=false
+          die "$guide has nothing under '$detail'.
+       Headings with no content are a stub; it strands the reader exactly as
+       hard as no guide at all."
+          ;;
+        NOSTATUS)
+          guide_ok=false
+          die "$guide does not record the guide-only upgrade walk-through.
        Add a '- **Status:** ...' line under '### Guide-only upgrade walkthrough'
        stating whether the walk-through was performed and when (issue #1588)."
-    fi
+          ;;
+        PENDING)
+          guide_ok=false
+          die "$guide does not record a performed walk-through:
+         $detail
+       Perform the guide-only upgrade of an 'autumn new' app from the previous
+       release and record it as '- **Status:** performed YYYY-MM-DD'
+       (docs/release-checklist.md, Migration Guide Gate). A guide written after
+       its release shipped says 'backfilled' instead — visible in the diff, so
+       claiming it for a new release is a reviewable act. 'pending' is only
+       allowed on the rolling $UNRELEASED_GUIDE draft."
+          ;;
+        PLACEHOLDER)
+          guide_ok=false
+          die "$guide still contains TEMPLATE.md placeholders — replace them."
+          ;;
+      esac
+    done <<<"$guide_findings"
 
     if grep -qF -- '> **Template.**' "$guide"; then
       guide_ok=false
-      die "$guide still carries the TEMPLATE.md banner — replace the placeholders."
+      die "$guide still carries the TEMPLATE.md banner — delete the banner block."
     fi
 
     if [[ ! -f "$index_file" ]]; then

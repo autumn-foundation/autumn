@@ -623,11 +623,12 @@ fn release_notes_script_detects_breaking_section_with_long_changelog_entry() {
     let migrations_dir = tmp.path().join("docs/migrations");
     std::fs::create_dir_all(&scripts_dir).expect("scripts dir");
     std::fs::create_dir_all(&migrations_dir).expect("migrations dir");
-    std::fs::copy(
-        root.join("scripts/check-release-notes.sh"),
-        scripts_dir.join("check-release-notes.sh"),
-    )
-    .expect("copy release-notes script");
+    for script in ["check-release-notes.sh", "check-migration-guides.sh"] {
+        // check-release-notes.sh delegates breaking-change detection to the
+        // migration-guide gate, so the fixture needs both scripts.
+        std::fs::copy(root.join("scripts").join(script), scripts_dir.join(script))
+            .unwrap_or_else(|err| panic!("copy {script}: {err}"));
+    }
 
     std::fs::write(
         tmp.path().join("Cargo.toml"),
@@ -1513,22 +1514,39 @@ fn release_checklist_gates_publication_on_the_migration_guide() {
     let checklist = std::fs::read_to_string(&checklist_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", checklist_path.display()));
 
-    assert!(
-        checklist.contains("scripts/check-migration-guides.sh"),
-        "the release checklist must run the migration-guide gate before \
-         publishing to crates.io (issue #1588 AC4)",
-    );
-    assert!(
-        checklist.contains("autumn new"),
-        "the release checklist must require the guide-only upgrade walk-through \
-         of an `autumn new` app from the previous release (issue #1588 AC5)",
-    );
-    assert!(
-        checklist.to_lowercase().contains("walk-through")
-            || checklist.to_lowercase().contains("walkthrough"),
-        "the release checklist must name the recorded upgrade walk-through \
-         (issue #1588 AC5)",
-    );
+    // Anchor on the section itself, not on incidental strings that survive
+    // deleting the very steps this test exists to protect.
+    let gate_section = checklist
+        .split("## Migration Guide Gate")
+        .nth(1)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} must have a `## Migration Guide Gate` section (issue #1588 AC4)",
+                checklist_path.display()
+            )
+        })
+        .split("\n## ")
+        .next()
+        .expect("section body");
+
+    for required in [
+        // The gate itself, run before publishing.
+        "scripts/check-migration-guides.sh",
+        // The rolling draft is renamed and its changelog links repointed.
+        "git mv docs/migrations/next.md",
+        // AC5: the walk-through, against an app scaffolded on the previous
+        // release, following only the guide, recorded in the guide.
+        "autumn new",
+        "cargo install autumn-cli --version",
+        "### Guide-only upgrade walkthrough",
+    ] {
+        assert!(
+            gate_section.contains(required),
+            "the `## Migration Guide Gate` section of {} must require `{required}` \
+             (issue #1588 AC4/AC5)",
+            checklist_path.display(),
+        );
+    }
 }
 
 #[test]
@@ -1538,15 +1556,55 @@ fn ci_runs_the_migration_guide_gate_on_every_pull_request() {
     let workflow = std::fs::read_to_string(&workflow_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
 
+    // `contains("pull_request")` over the whole file is not evidence: the
+    // string also appears in the `concurrency:` expression. Check the `on:`
+    // block, which is everything above `jobs:`.
+    let (triggers, jobs) = workflow
+        .split_once("\njobs:\n")
+        .unwrap_or_else(|| panic!("{} must define jobs", workflow_path.display()));
     assert!(
-        workflow.contains("check-migration-guides.sh"),
-        "{} must run the migration-guide gate so a breaking change without a \
-         guide fails CI on the PR, not at tag time (issue #1588 AC4)",
+        triggers.contains("  pull_request:"),
+        "{} must trigger on pull requests so the gate runs at review time",
+        workflow_path.display(),
+    );
+
+    // Find the job that runs the gate and check it is unguarded — a step
+    // hidden behind `if: github.event_name == 'push'` would never see a PR.
+    // A job starts at a two-space-indented `name:` key at the top level.
+    let is_job_header = |line: &str| {
+        line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+            && !line.trim().contains(' ')
+    };
+    let mut job_blocks: Vec<String> = Vec::new();
+    for line in jobs.lines() {
+        if is_job_header(line) || job_blocks.is_empty() {
+            job_blocks.push(String::new());
+        }
+        let block = job_blocks.last_mut().expect("a block is open");
+        block.push_str(line);
+        block.push('\n');
+    }
+    let job = job_blocks
+        .iter()
+        .find(|job| job.contains("check-migration-guides.sh"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{} must run the migration-guide gate so a breaking change without \
+                 a guide fails CI on the PR, not at tag time (issue #1588 AC4)",
+                workflow_path.display()
+            )
+        });
+    assert!(
+        !job.contains("if:"),
+        "{}: the migration-guide job must not be conditional — it is the gate \
+         that makes the guide mandatory",
         workflow_path.display(),
     );
     assert!(
-        workflow.contains("pull_request"),
-        "{} must run on pull requests",
+        job.contains("actions/checkout"),
+        "{}: the migration-guide job must check the repository out",
         workflow_path.display(),
     );
 }
@@ -1612,11 +1670,13 @@ fn migration_guide_gate_honours_an_explicit_suppression() {
 }
 
 #[test]
-fn workflow_referenced_scripts_are_tracked_by_git() {
+fn every_repository_script_is_tracked_by_git() {
     // `.gitignore` carries a blanket `*.sh`, so a newly added gate script is
     // untracked by default: it runs locally, passes review, and then fails on
-    // a clean CI clone with "No such file or directory". Assert every
-    // `scripts/*.sh` a workflow invokes is actually in the index.
+    // a clean CI clone with "No such file or directory". Walking the directory
+    // rather than scraping workflow text covers scripts nested under
+    // `scripts/lib/`, scripts sourced by other scripts, and scripts a
+    // composite action or `.yaml` workflow invokes.
     let root = workspace_root();
 
     let tracked = Command::new("git")
@@ -1627,36 +1687,511 @@ fn workflow_referenced_scripts_are_tracked_by_git() {
     assert!(tracked.status.success(), "git ls-files scripts/ failed");
     let tracked = String::from_utf8_lossy(&tracked.stdout).into_owned();
 
-    let workflows = root.join(".github/workflows");
-    for entry in std::fs::read_dir(&workflows)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflows.display()))
-    {
-        let path = entry.expect("workflow entry").path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("yml") {
-            continue;
-        }
-        let workflow = std::fs::read_to_string(&path).expect("read workflow");
-
-        for (index, _) in workflow.match_indices("scripts/") {
-            let name: String = workflow[index + "scripts/".len()..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-                .collect();
-            if !std::path::Path::new(&name)
+    fn shell_scripts(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display()))
+        {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                shell_scripts(&path, found);
+            } else if path
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
             {
-                continue;
+                found.push(path);
             }
-            assert!(
-                tracked
-                    .lines()
-                    .any(|line| line == format!("scripts/{name}")),
-                "{} runs scripts/{name}, but git does not track it — the blanket \
-                 `*.sh` entry in .gitignore swallowed it, so CI would fail on a \
-                 clean clone. Add it with `git add -f scripts/{name}`.",
-                path.display(),
-            );
         }
+    }
+
+    let mut scripts = Vec::new();
+    shell_scripts(&root.join("scripts"), &mut scripts);
+    assert!(!scripts.is_empty(), "expected shell scripts under scripts/");
+
+    for script in scripts {
+        let relative = script
+            .strip_prefix(&root)
+            .expect("script lives under the workspace root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            tracked.lines().any(|line| line == relative),
+            "{relative} is not tracked by git — the blanket `*.sh` entry in \
+             .gitignore swallowed it, so anything invoking it fails on a clean \
+             clone. Add it with `git add -f {relative}`.",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Migration guide gate — bypass regressions found in review (issue #1588).
+//
+// Each of these was a fixture that made the gate report OK while a user would
+// have been stranded, or blocked work that was fine.
+// ---------------------------------------------------------------------------
+
+/// A section body with two undeniable breaking entries and no guide anywhere:
+/// any heading spelling that swallows this must fail the gate.
+const TWO_BREAKS: &str = "\n### Breaking Changes\n\n\
+     - **db:** **Breaking:** `with_pool` is renamed to `with_pool_untracked`.\n\
+     - **config:** **Breaking:** `[server] port` must be an integer.\n";
+
+#[test]
+fn migration_guide_gate_rejects_section_headings_it_cannot_parse() {
+    // A `## ` heading the version regex misses used to emit no record at all:
+    // the section was not merely un-gated, it was invisible, and `--list`
+    // reported nothing to do. `## [0.7.0-rc.1]` is the normal shape for the
+    // release-candidate tags docs/release-checklist.md tells operators to cut.
+    for heading in [
+        "## [0.7.0-rc.1] - 2026-09-01",
+        "## [v0.7.0] - 2026-09-01",
+        "## [0.7] - 2026-09-01",
+        "## Unreleased",
+        "## [unreleased]",
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            format!("# Changelog\n\n{heading}\n{TWO_BREAKS}"),
+        )
+        .expect("changelog");
+
+        let output = run_migration_gate(tmp.path());
+        assert!(
+            !output.status.success(),
+            "`{heading}` must not silently drop its section from the gate\n{}",
+            gate_report(&output),
+        );
+    }
+}
+
+#[test]
+fn migration_guide_gate_maps_a_release_candidate_to_the_release_guide() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0-rc.1] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an rc section must be gated against the release's own guide\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_an_unclosed_code_fence() {
+    // One odd fence toggle used to swallow every later section, headings and
+    // all — the gate reported OK for a changelog it had stopped reading.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        format!(
+            "# Changelog\n\n\
+             ## [0.7.0] - 2026-09-01\n\n\
+             ### Added\n\n\
+             - **docs:** an example that forgets to close its fence:\n\n  \
+               ```toml\n  [server]\n\n\
+             ## [0.6.0] - 2026-08-01\n{TWO_BREAKS}"
+        ),
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an unclosed fence hides every section below it — the gate must say so \
+         rather than report OK on a changelog it stopped reading\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_nested_fences() {
+    // A ````markdown fence wrapping a ``` sample is balanced under CommonMark
+    // (a closing fence must be at least as long as its opener) but was an odd
+    // number of toggles under a naive parser.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Added\n\n\
+         - **docs:** how to nest a fence:\n\n  \
+           ````markdown\n  ```\n  ````\n\n\
+         - **api:** a non-breaking addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a balanced nested fence must not confuse the parser\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_suppression_cannot_silence_a_declared_break() {
+    // The suppression exists for entries that talk *about* breaking changes.
+    // It must never override an explicit `**Breaking:**` declaration —
+    // otherwise one comment on a parent bullet kills every nested marker under
+    // it, which is exactly this repo's house style for multi-part entries.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** a multi-part entry. <!-- migration-guide-gate: n/a -->\n  \
+           - **Breaking:** `with_pool` is renamed to `with_pool_untracked`.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a suppression comment must not silence an explicit `**Breaking:**` \
+         marker\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_lose_a_marker_to_a_stray_backtick() {
+    // Pairing backticks positionally made an odd backtick swallow the marker
+    // *and* the word "breaking" — the author did everything right and the gate
+    // required no guide at all.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** the ` character is now rejected in identifiers.\n  \
+           **Breaking:** `with_pool` is renamed to `with_pool_untracked`.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an unbalanced inline code span must not make a declared break \
+         invisible\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_negation_allowlist_does_not_swallow_real_breaks() {
+    // Each of these uses the word "breaking" and is a genuine break; the
+    // negation stripper must not decide they were negated.
+    for entry in [
+        "- **db:** no direct breaking change to the API, but `with_pool` is renamed.",
+        "- **net:** prevents breaking the listener; `port` must now be an integer.",
+        "- **auth:** avoids breaking tenants by removing `Session::from_request`.",
+        "- **ws:** no longer breaking out early; `WsError::Closed` is removed.",
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            format!("# Changelog\n\n## [0.7.0] - 2026-09-01\n\n### Changed\n\n{entry}\n"),
+        )
+        .expect("changelog");
+
+        let output = run_migration_gate(tmp.path());
+        assert!(
+            !output.status.success(),
+            "the negation allowlist swallowed a real break: {entry}\n{}",
+            gate_report(&output),
+        );
+    }
+}
+
+#[test]
+fn migration_guide_gate_reads_asterisk_bullets() {
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes\n\n\
+         * **db:** **Breaking:** `with_pool` is renamed.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "`* ` is a legal markdown bullet — entries written with it must not be \
+         invisible to the gate\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_requires_a_real_link_not_a_mention() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. Someday we will write \
+           `docs/migrations/0.7.0.md`.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a bare path mention is not a link — the reader must be able to click \
+         through to the fix path\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_marker_case_variants() {
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **BREAKING:** `with_pool` is renamed.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "`**BREAKING:**` is the same declaration — it must demand a guide, not \
+         fall through to the prose lint with misleading advice\n{}",
+        gate_report(&output),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("docs/migrations/0.7.0.md"),
+        "the failure must be the missing guide, not 'unmarked breaking change'\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_an_empty_sectioned_stub() {
+    // Every required heading present, no content under any of them.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(
+        &tmp,
+        "0.7.0",
+        "# Migrating to 0.7.0\n\n\
+         ## At a glance\n\n\
+         ## Summary\n\n\
+         ## Before you start\n\n\
+         ## Breaking changes\n\n\
+         ## How to verify\n\n\
+         ### Guide-only upgrade walkthrough\n\n\
+         - **Status:** performed 2026-09-01\n",
+    );
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "headings with nothing under them are a stub — it strands the reader \
+         exactly as hard as no guide\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_requires_real_headings_not_substrings() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(
+        &tmp,
+        "0.7.0",
+        &valid_migration_guide("0.7.0").replace("## At a glance", "#### At a glance"),
+    );
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "`#### At a glance` must not satisfy a required `## At a glance` \
+         heading by substring match",
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_a_pending_walkthrough_on_a_released_guide() {
+    // AC5 is "performed and recorded". `pending` is legitimate only on the
+    // rolling next.md draft.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(
+        &tmp,
+        "0.7.0",
+        &valid_migration_guide("0.7.0").replace("performed 2026-01-01", "pending"),
+    );
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a versioned guide must not ship with a pending walk-through — that is \
+         the whole of issue #1588 AC5\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_list_mode_reports_the_inventory() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = bash_command()
+        .args(["scripts/check-migration-guides.sh", "--list"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run --list");
+    assert!(
+        output.status.success(),
+        "--list must succeed\n{}",
+        gate_report(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("0.7.0") && stdout.contains("docs/migrations/0.7.0.md"),
+        "--list is the release operator's inventory; it must name the section \
+         and its guide\n{}",
+        gate_report(&output),
+    );
+
+    let usage = bash_command()
+        .args(["scripts/check-migration-guides.sh", "--bogus"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run bogus flag");
+    assert!(
+        !usage.status.success(),
+        "an unknown flag must not be silently treated as the gate",
+    );
+}
+
+#[test]
+fn release_notes_and_migration_gates_agree_on_what_is_breaking() {
+    // Two scripts with two regexes drift. `check-release-notes.sh` must reach
+    // the same verdict as the gate on the same changelog, or a release can
+    // pass one and fail the other with no way to satisfy both.
+    let root = workspace_root();
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::copy(
+        root.join("scripts/check-release-notes.sh"),
+        tmp.path().join("scripts/check-release-notes.sh"),
+    )
+    .expect("copy release-notes script");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Added\n\n\
+         - **release:** a gate that reads the `**Breaking:**` marker. This entry \
+           is non-breaking. <!-- migration-guide-gate: documents the marker -->\n",
+    )
+    .expect("changelog");
+
+    let gate = run_migration_gate(tmp.path());
+    let notes = bash_command()
+        .arg("scripts/check-release-notes.sh")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run release-notes check");
+
+    assert_eq!(
+        gate.status.success(),
+        notes.status.success(),
+        "the two release gates disagree on the same changelog.\n\
+         check-migration-guides.sh:\n{}\ncheck-release-notes.sh:\n{}",
+        gate_report(&gate),
+        gate_report(&notes),
+    );
+}
+
+#[test]
+fn migration_guide_gate_requires_a_dated_or_backfilled_walkthrough() {
+    // "not yet performed" is a free pass a new release could write. A versioned
+    // guide records either a dated run or an explicit `backfilled` claim, which
+    // is visible in the diff.
+    for (status, should_pass) in [
+        ("performed 2026-09-01, 18 minutes", true),
+        ("not performed — record backfilled by #1588", true),
+        ("not yet performed", false),
+        ("pending", false),
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        write_fixture_guide(
+            &tmp,
+            "0.7.0",
+            &valid_migration_guide("0.7.0").replace("performed 2026-01-01", status),
+        );
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            "# Changelog\n\n\
+             ## [0.7.0] - 2026-09-01\n\n\
+             ### Changed\n\n\
+             - **db:** **Breaking:** `with_pool` renamed. See the \
+               [migration guide](docs/migrations/0.7.0.md).\n",
+        )
+        .expect("changelog");
+
+        let output = run_migration_gate(tmp.path());
+        assert_eq!(
+            output.status.success(),
+            should_pass,
+            "walk-through status {status:?} should {} the gate\n{}",
+            if should_pass { "pass" } else { "fail" },
+            gate_report(&output),
+        );
     }
 }

@@ -2,11 +2,17 @@
 
 > **Template.** Copy this file to `docs/migrations/next.md` with the first
 > breaking change that lands after a release; it is renamed to
-> `docs/migrations/<version>.md` when that release ships. Replace every
-> `{placeholder}` with concrete content and delete sections that do not
-> apply — except *Breaking changes*, *How to verify* and *Guide-only upgrade
-> walkthrough*, which `scripts/check-migration-guides.sh` requires. Link the
-> new file from [`docs/migrations/README.md`](README.md).
+> `docs/migrations/<version>.md` when that release ships.
+>
+> **Delete this banner block in the copy** — and replace every `{placeholder}`
+> with concrete content. `scripts/check-migration-guides.sh` fails on both.
+>
+> Delete sections that do not apply, **except** these six, which the gate
+> requires and which must each have content under them:
+> *At a glance*, *Summary*, *Before you start*, *Breaking changes*,
+> *How to verify*, *Guide-only upgrade walkthrough*.
+>
+> Link the new file from [`docs/migrations/README.md`](README.md).
 
 ## At a glance
 

@@ -85,11 +85,22 @@ It fails when:
 - a changelog entry describes breaking something without the marker (so an
   unmarked break cannot hide from the coverage check);
 - a section with a breaking entry has no guide at `docs/migrations/<version>.md`
-  (or `next.md` for `## [Unreleased]`);
-- a breaking entry does not link its guide;
+  (or `next.md` for `## [Unreleased]`). A release candidate section
+  (`## [0.7.0-rc.1]`) is gated against its release's guide, `0.7.0.md`;
+- a breaking entry does not *link* its guide — a bare path mention is not a
+  link, the reader has to be able to click through;
 - a guide is missing a required section — *At a glance*, *Summary*, *Before you
-  start*, *Breaking changes*, *How to verify*, and the recorded
-  *Guide-only upgrade walkthrough* — or is not indexed above.
+  start*, *Breaking changes*, *How to verify*, and *Guide-only upgrade
+  walkthrough* — or has a heading with nothing under it, still carries
+  `TEMPLATE.md`'s banner or placeholders, or is not indexed above;
+- a released guide's walk-through is not recorded as `performed YYYY-MM-DD`
+  (or explicitly `backfilled`); `pending` is allowed only on `next.md`;
+- it cannot read the changelog: a `## ` heading it fails to parse and an
+  unclosed code fence are hard errors, because either one silently removes
+  whole sections from every check above.
+
+Details that save a round trip: `**Breaking:**` is matched case-insensitively,
+`- ` and `* ` are both bullets, and a marker inside a code span is a mention.
 
 The lint is textual, so it removes the *silent* failure mode rather than
 replacing review: a break described without the word "breaking" and without the

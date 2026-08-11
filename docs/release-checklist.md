@@ -117,9 +117,11 @@ to compare the public API surface of each publishable crate against the last
 version published on crates.io.
 
 - **Patch / minor releases:** any breaking change fails the gate.
-- **Major releases (or breaking pre-1.0 minor):** failures are expected.
-  The release operator must ensure a migration guide exists at
-  `docs/migrations/<version>.md` before the gate passes.
+- **Major releases (or breaking pre-1.0 minor):** failures are expected, and
+  are cleared with the `skip_semver` `workflow_dispatch` input — not by the
+  migration guide. `check-semver.sh` has no knowledge of `docs/migrations/`;
+  the guide is enforced separately by the
+  [Migration Guide Gate](#migration-guide-gate).
 
 Crates that have never been published are skipped.
 
@@ -212,7 +214,14 @@ guide** — the guide is a gate, not a courtesy (issue #1588). See
   *Before you start*).
 - [ ] Repoint every `docs/migrations/next.md` link in the release's `CHANGELOG.md`
   section to `docs/migrations/X.Y.Z.md`.
-- [ ] Update the index in [`docs/migrations/README.md`](migrations/README.md).
+- [ ] **Recreate `docs/migrations/next.md`** from
+  [`TEMPLATE.md`](migrations/TEMPLATE.md) (banner deleted) so the rolling draft
+  always exists. [`docs/migrations/README.md`](migrations/README.md) and
+  [`STABILITY.md`](../STABILITY.md) both link it by name, and nothing in this
+  repo checks markdown links — a missing `next.md` 404s silently until the next
+  breaking PR happens to recreate it.
+- [ ] Update the index in [`docs/migrations/README.md`](migrations/README.md):
+  add `X.Y.Z.md`, keep `next.md`.
 
 ### Guide-only upgrade walk-through (required before `cargo publish`)
 
@@ -249,7 +258,9 @@ success metric is under 30 minutes.
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`
-- [ ] `cargo test -p autumn-cli --test repo_hygiene`
+- [ ] `cargo test -p autumn-cli --test cli_tests repo_hygiene` — `repo_hygiene`
+  is a module inside the consolidated `cli_tests` binary, not a test target of
+  its own, so `--test repo_hygiene` errors with "no test target named".
 
 ## First-Run Docs Gate
 

@@ -17,15 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `with_pool_untracked` rename with no guide entry at all. The new gate reads
   `CHANGELOG.md` and fails when a section declares a breaking change without a
   guide at `docs/migrations/<version>.md` (`next.md` for `## [Unreleased]`),
-  when a breaking entry does not link its guide, when an entry describes
-  breaking something without the `**Breaking:**` marker the coverage check reads
-  (explicitly non-breaking wording passes untouched), or when a guide is a stub
-  — it must carry the `TEMPLATE.md` sections including *How to verify* and the
-  recorded guide-only upgrade walk-through, and be indexed in
-  `docs/migrations/README.md`. It runs in the `lint` job of `ci.yml` on every
-  pull request, so the guide is written by the author of the break while the
-  change is still in review, and again in the publish gate for tags pushed
-  outside a PR. Docs-only and free of any Rust build, it adds seconds to CI.
+  when a breaking entry does not *link* its guide (a bare path mention is not a
+  link), when an entry describes breaking something without the `**Breaking:**`
+  marker the coverage check reads (explicitly non-breaking wording passes
+  untouched), or when a guide is a stub — it must carry the `TEMPLATE.md`
+  sections including *How to verify*, each with content under it, record the
+  guide-only upgrade walk-through as `performed YYYY-MM-DD` rather than
+  `pending`, and be indexed in `docs/migrations/README.md`. A release-candidate
+  section (`## [0.7.0-rc.1]`) is gated against its release's guide. The gate
+  fails closed on anything it cannot read — an unparseable `## ` heading and an
+  unclosed code fence are hard errors, since either silently removes whole
+  sections from every check. It runs as its own `ci.yml` job on every pull
+  request, so the guide is written by the author of the break while the change
+  is still in review, and again in the publish gate for tags pushed outside a
+  PR. Docs-only and free of any Rust build, it reports in seconds.
   `--list` prints the per-section inventory for the release operator.
   Guides are backfilled for `0.5.0` (new: the centralised
   `[security.trusted_proxies]` boundary and the rate-limit key deprecations)
@@ -4007,9 +4012,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #753, #785 and #791. See the [migration guide](docs/migrations/0.5.0.md).
 - **security:** `security.rate_limit.trusted_proxies` and
   `security.rate_limit.trust_forwarded_headers` are deprecated in favour of the
-  top-level `[security.trusted_proxies]` block. They keep working for one minor
-  release with a startup warning, and `autumn doctor --strict` fails when the
-  old and new keys disagree. See the [migration guide](docs/migrations/0.5.0.md).
+  top-level `[security.trusted_proxies]` block. They keep working (registered
+  for removal in `1.0.0`) with a startup warning, and `autumn doctor --strict`
+  fails when the old and new keys disagree. See the
+  [migration guide](docs/migrations/0.5.0.md).
 
 ### Added
 
@@ -4134,7 +4140,9 @@ To opt out of the generated `page` method: implement your own list handler using
 > release; the changelog section never named the breaks.
 
 - **security:** `prod` / `production` profiles refuse to bind without a stable
-  `security.signing_secret`. See the [migration guide](docs/migrations/0.4.0.md).
+  signing secret (`[security.signing_secret] secret`, or the
+  `AUTUMN_SECURITY__SIGNING_SECRET` override). See the
+  [migration guide](docs/migrations/0.4.0.md).
 - **storage:** the `storage-s3` feature was removed from `autumn-web` and moved
   to the `autumn-storage-s3` crate. See the
   [migration guide](docs/migrations/0.4.0.md).
