@@ -94,7 +94,9 @@ It fails when:
   (or `next.md` for `## [Unreleased]`). A release candidate section
   (`## [0.7.0-rc.1]`) is gated against its release's guide, `0.7.0.md`;
 - a breaking entry does not *link* its guide — a bare path mention is not a
-  link, the reader has to be able to click through;
+  link, the reader has to be able to click through. The destination is parsed,
+  not searched for, so `[guide](next.md "why")` and `[guide](<next.md>)` both
+  count and a path named only in a link *title* does not;
 - a guide is missing a required section — *At a glance*, *Summary*, *Before you
   start*, *Breaking changes*, *How to verify*, and *Guide-only upgrade
   walkthrough* — or has a heading with nothing under it, still carries

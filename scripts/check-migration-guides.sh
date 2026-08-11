@@ -259,13 +259,75 @@ function mask_html_attributes(text,   out, rest, at) {
   return out rest
 }
 
-function links_to(text, path,   needle, pos, at, i, ch, start, slashes) {
+function link_destination(text, p,   n, ch, dest, depth, closer, sq) {
+  # Parse an inline link destination starting just inside the `(`, and return
+  # it only if the construct closes as a link. The destination is parsed rather
+  # than pattern-matched because a link may carry an optional title —
+  # `(path "why")` is as clickable as `(path)` — and because a path that merely
+  # appears *in* the title is not where the link goes.
+  sq = sprintf("%c", 39)
+  n = length(text)
+  while (p <= n && (substr(text, p, 1) == " " || substr(text, p, 1) == "\t")) p++
+  dest = ""
+  if (substr(text, p, 1) == "<") {
+    # Angle-bracket form: everything up to the closing `>`, which an unescaped
+    # `<` invalidates. An unclosed one is not a link.
+    p++
+    while (p <= n) {
+      ch = substr(text, p, 1)
+      if (ch == "\\" && p < n) { dest = dest substr(text, p + 1, 1); p += 2; continue }
+      if (ch == ">") break
+      if (ch == "<") return ""
+      dest = dest ch
+      p++
+    }
+    if (p > n) return ""
+    p++
+  } else {
+    # Bare form: runs to whitespace or to the `)` that closes the link, with
+    # nested parentheses balanced so a path may contain them.
+    depth = 0
+    while (p <= n) {
+      ch = substr(text, p, 1)
+      if (ch == "\\" && p < n) { dest = dest substr(text, p + 1, 1); p += 2; continue }
+      if (ch == " " || ch == "\t") break
+      if (ch == ")") {
+        if (depth == 0) break
+        depth--
+      } else if (ch == "(") {
+        depth++
+      }
+      dest = dest ch
+      p++
+    }
+    if (depth != 0) return ""
+  }
+  while (p <= n && (substr(text, p, 1) == " " || substr(text, p, 1) == "\t")) p++
+  ch = substr(text, p, 1)
+  if (ch == "\"" || ch == sq || ch == "(") {
+    closer = ch == "(" ? ")" : ch
+    p++
+    while (p <= n) {
+      ch = substr(text, p, 1)
+      if (ch == "\\" && p < n) { p += 2; continue }
+      if (ch == closer) break
+      p++
+    }
+    if (p > n) return ""
+    p++
+    while (p <= n && (substr(text, p, 1) == " " || substr(text, p, 1) == "\t")) p++
+  }
+  if (substr(text, p, 1) != ")") return ""
+  return dest
+}
+
+function links_to(text, path,   pos, at, i, ch, start, slashes) {
   # A complete inline link `[label](path)`, not a bare `](path)`: the second
   # renders as literal text, so the reader has nothing to click.
-  needle = "](" path ")"
   start = 1
-  while ((pos = index(substr(text, start), needle)) > 0) {
+  while ((pos = index(substr(text, start), "](")) > 0) {
     at = start + pos - 1
+    if (link_destination(text, at + 2) != path) { start = at + 1; continue }
     # An escaped `]` does not close the label, so this is not a link either.
     slashes = 0
     while (at - slashes - 1 >= 1 && substr(text, at - slashes - 1, 1) == "\\") slashes++

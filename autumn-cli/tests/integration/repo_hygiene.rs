@@ -4019,3 +4019,100 @@ fn migration_guide_gate_still_holds_a_div_block_open_to_the_blank_line() {
         gate_report(&output),
     );
 }
+
+// --- Review round 25: inline link destinations ----------------------------
+
+#[test]
+fn migration_guide_gate_accepts_a_guide_link_carrying_a_title() {
+    // CommonMark allows an optional title after the destination. Matching the
+    // literal `](path)` rejected `](path "title")`, so a link the reader can
+    // click failed the gate.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md \"upgrade instructions\").\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a link title is metadata, not a reason to fail the build\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_an_angle_bracketed_guide_link() {
+    // The other destination form: `<...>` around the path, with optional
+    // whitespace inside the parentheses.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide]( <docs/migrations/0.7.0.md> ).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "`<path>` is a destination, and surrounding whitespace is allowed\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_read_the_guide_path_out_of_a_link_title() {
+    // The counterpart, and the reason the destination is parsed rather than
+    // searched for: this link goes somewhere else and only *mentions* the
+    // guide in its tooltip. Clicking it does not reach the upgrade path.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [release notes](https://example.invalid/notes \
+           \"docs/migrations/0.7.0.md\").\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a path named in a title is not where the link goes",
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_a_guide_link_with_an_unclosed_title() {
+    // An unterminated title is not a link at all — CommonMark falls back to
+    // literal text — so the entry still has no clickable upgrade path.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md \"upgrade instructions).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an unclosed title leaves the whole construct as literal text",
+    );
+}
