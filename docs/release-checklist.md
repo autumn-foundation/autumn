@@ -125,16 +125,21 @@ Crates that have never been published are skipped.
 
 ### 5 · Release Notes Alignment (`release-notes` job)
 
-Script: `scripts/check-release-notes.sh`
+Scripts: `scripts/check-release-notes.sh`, `scripts/check-migration-guides.sh`
 
-Fails if:
+`check-release-notes.sh` fails if:
 
 - The release tag version does not match `[workspace.package].version` in
   `Cargo.toml`.
 - `CHANGELOG.md` has no entry for the current workspace version.
-- The release contains breaking changes (detected via `### Breaking` in the
-  CHANGELOG entry) but no migration guide exists at
-  `docs/migrations/<version>.md`.
+- The release contains breaking changes (a `### Breaking Changes` heading or an
+  inline `**Breaking:**` marker in the CHANGELOG entry) but no migration guide
+  exists at `docs/migrations/<version>.md`.
+
+`check-migration-guides.sh` is the [Migration Guide
+Gate](#migration-guide-gate) below. It also runs on every pull request in the
+`lint` job of `ci.yml`, so a breaking change without a guide fails at review
+time rather than at tag time.
 
 ### 6 · Downstream Smoke Test (`smoke` job)
 
@@ -183,6 +188,54 @@ pushed code — the workspace `[patch.crates-io]` override means no other CI job
 sees the published `autumn-web`), so a red push run means new users are broken
 today, not that the commit is bad.
 
+## Migration Guide Gate
+
+Autumn ships every 2–4 weeks and, pre-1.0, most releases can break existing
+apps. **A release with a breaking change does not go out without a migration
+guide** — the guide is a gate, not a courtesy (issue #1588). See
+[`docs/migrations/README.md`](migrations/README.md) for the process and the
+`**Breaking:**` changelog convention.
+
+### Automated
+
+- [ ] `./scripts/check-migration-guides.sh` is green. It fails on an unmarked
+  breaking changelog entry, a breaking section with no guide, a breaking entry
+  that does not link its guide, and a guide missing a required section or an
+  index entry.
+- [ ] `./scripts/check-migration-guides.sh --list` shows the breaking-entry
+  count for the release being cut, and it matches what you expect to ship.
+
+### Rename the rolling draft
+
+- [ ] `git mv docs/migrations/next.md docs/migrations/X.Y.Z.md`.
+- [ ] Fill in the version placeholders in the renamed guide (*At a glance*,
+  *Before you start*).
+- [ ] Repoint every `docs/migrations/next.md` link in the release's `CHANGELOG.md`
+  section to `docs/migrations/X.Y.Z.md`.
+- [ ] Update the index in [`docs/migrations/README.md`](migrations/README.md).
+
+### Guide-only upgrade walk-through (required before `cargo publish`)
+
+The guide is only proven when someone who has not read the diff can follow it.
+Perform this against the **previous** release and record the result — the
+success metric is under 30 minutes.
+
+- [ ] `cargo install autumn-cli --version <previous-version>`
+- [ ] `autumn new upgrade-probe && cd upgrade-probe && autumn setup`
+- [ ] Give the app something to break against: `autumn generate scaffold Post
+  title:String body:Text published:bool`, `autumn migrate`, `cargo test`, and a
+  `GET /posts` that responds. This is the green baseline.
+- [ ] Upgrade to the release candidate **following only
+  `docs/migrations/X.Y.Z.md`** — no changelog, no source reading, no asking the
+  author. If you have to look outside the guide, that is a gap in the guide:
+  fix the guide and restart from this step.
+- [ ] `cargo check`, `cargo test`, and every step in the guide's *How to verify*
+  section pass.
+- [ ] Record the outcome in the guide's `### Guide-only upgrade walkthrough`
+  section: status, from → to versions, elapsed minutes, and any gap the
+  walk-through exposed. `check-migration-guides.sh` requires the `- **Status:**`
+  line to be present; a release must not ship it as `pending`.
+
 ## Version Alignment
 
 - [ ] `Cargo.toml` workspace `version` and `rust-version` match the README
@@ -220,22 +273,27 @@ Before pushing the release tag:
 2. **Update internal version pins** for inter-crate dependencies
    (e.g. `autumn-web = { version = "X.Y.Z", path = "../autumn" }`).
 3. **Update `CHANGELOG.md`** — move unreleased items under a `## [X.Y.Z]` heading.
-   Add a `### Breaking Changes` section and migration guide stub if needed.
-4. **Run all gate scripts locally** to catch problems before CI sees the tag:
+   Every breaking entry carries the `**Breaking:**` marker (or sits under a
+   `### Breaking Changes` heading) and links its migration guide.
+4. **Complete the [Migration Guide Gate](#migration-guide-gate)** — rename
+   `docs/migrations/next.md`, repoint the changelog links, and perform and
+   record the guide-only upgrade walk-through.
+5. **Run all gate scripts locally** to catch problems before CI sees the tag:
    ```bash
    ./scripts/check-crate-metadata.sh
    ./scripts/check-release-notes.sh
+   ./scripts/check-migration-guides.sh
    ./scripts/check-docs.sh
    ./scripts/check-semver.sh   # requires network; skip offline
    ```
-5. **Tag and push:**
+6. **Tag and push:**
    ```bash
    git tag v0.5.0
    git push origin v0.5.0
    ```
    The `publish-gate` workflow runs automatically. The `release` workflow runs
    only after `publish-gate` succeeds.
-6. **Publish to crates.io** (in dependency order, after the gate passes):
+7. **Publish to crates.io** (in dependency order, after the gate passes):
    ```bash
    cargo publish -p autumn-macros
    cargo publish -p autumn-web
@@ -245,7 +303,7 @@ Before pushing the release tag:
    cargo publish -p autumn-cache-redis
    cargo publish -p autumn-search
    ```
-7. **Gate the published quickstart** (see
+8. **Gate the published quickstart** (see
    [Published Quickstart Gate](#7--published-quickstart-gate-quickstart-gate-workflow-post-publish)):
    ```bash
    gh workflow run quickstart-gate.yml -f cli-version=X.Y.Z

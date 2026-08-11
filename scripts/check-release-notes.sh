@@ -41,6 +41,12 @@ changelog_entry_for_version() {
 
 changelog_has_breaking_section() {
   local version="$1"
+  # Two ways to declare a break, and they must match the convention that
+  # scripts/check-migration-guides.sh enforces (docs/migrations/README.md):
+  # a `### Breaking Changes` heading, or the inline `**Breaking:**` token.
+  # Heading-only detection is why this check never fired: no release section
+  # in this changelog has ever carried one.
+  #
   # Keep this in one awk process. `awk | grep -q` is flaky under `pipefail`:
   # grep exits after the first match, awk can receive SIGPIPE while writing the
   # rest of a long changelog entry, and the pipeline reports a false negative.
@@ -48,8 +54,10 @@ changelog_has_breaking_section() {
     $0 ~ "^## \\[" ver "\\]" { in_version = 1; next }
     /^## \[/                 { in_version = 0 }
     in_version {
-      line = tolower($0)
-      if (line ~ /^[[:space:]]*###[[:space:]]+breaking([[:space:]]|$)/) {
+      if (tolower($0) ~ /^[[:space:]]*###[[:space:]]+breaking([[:space:]]|$)/) {
+        found = 1
+      }
+      if ($0 ~ /\*\*Breaking(:\*\*|\*\*:)/) {
         found = 1
       }
     }

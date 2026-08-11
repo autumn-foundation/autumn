@@ -1547,3 +1547,63 @@ fn ci_runs_the_migration_guide_gate_on_every_pull_request() {
         workflow_path.display(),
     );
 }
+
+#[test]
+fn migration_guide_gate_ignores_markers_inside_code_spans() {
+    // An entry that *documents* the convention (``**Breaking:**`` in a code
+    // span) is a mention, not a declaration. Without this, the changelog entry
+    // that introduces the gate declares itself breaking.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-08-01\n\n\
+         ### Added\n\n\
+         - **release:** a gate that reads the `**Breaking:**` marker. \
+           Non-breaking. <!-- migration-guide-gate: documents the marker -->\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a `**Breaking:**` token inside a code span is a mention, not a \
+         declaration\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_honours_an_explicit_suppression() {
+    // Prose *about* breaking changes (release tooling, policy docs) trips the
+    // unmarked-break lint by construction. The escape hatch is explicit and
+    // greppable rather than a cleverer regex.
+    let tmp = migration_gate_fixture("0.7.0");
+    let changelog = "# Changelog\n\n\
+         ## [0.7.0] - 2026-08-01\n\n\
+         ### Added\n\n\
+         - **release:** the gate fails when a section declares a breaking \
+           change with no guide, or when a breaking entry does not link one.\n";
+    std::fs::write(tmp.path().join("CHANGELOG.md"), changelog).expect("changelog");
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "prose about breaking changes must trip the lint without a suppression",
+    );
+
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        format!(
+            "{}  <!-- migration-guide-gate: describes the gate -->\n",
+            changelog.trim_end()
+        ),
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an explicit `<!-- migration-guide-gate: ... -->` suppression must \
+         clear the entry\n{}",
+        gate_report(&output),
+    );
+}

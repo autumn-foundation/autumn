@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **release:** every release with a breaking change now ships a migration guide,
+  enforced by `scripts/check-migration-guides.sh` (#1588). Autumn ships every
+  2–4 weeks and, pre-1.0, most releases can break existing apps, but the only
+  automated check keyed off a `### Breaking` CHANGELOG heading this repo has
+  never written — so it never fired, and 0.6.0 shipped the `with_pool` →
+  `with_pool_untracked` rename with no guide entry at all. The new gate reads
+  `CHANGELOG.md` and fails when a section declares a breaking change without a
+  guide at `docs/migrations/<version>.md` (`next.md` for `## [Unreleased]`),
+  when a breaking entry does not link its guide, when an entry describes
+  breaking something without the `**Breaking:**` marker the coverage check reads
+  (explicitly non-breaking wording passes untouched), or when a guide is a stub
+  — it must carry the `TEMPLATE.md` sections including *How to verify* and the
+  recorded guide-only upgrade walk-through, and be indexed in
+  `docs/migrations/README.md`. It runs in the `lint` job of `ci.yml` on every
+  pull request, so the guide is written by the author of the break while the
+  change is still in review, and again in the publish gate for tags pushed
+  outside a PR. Docs-only and free of any Rust build, it adds seconds to CI.
+  `--list` prints the per-section inventory for the release operator.
+  Guides are backfilled for `0.5.0` (new: the centralised
+  `[security.trusted_proxies]` boundary and the rate-limit key deprecations)
+  and `0.6.0` (the missing `with_pool` → `with_pool_untracked` section, scoped
+  honestly — the published 0.5.0 crates have no pool constructor, so the rename
+  is invisible to a crates.io upgrade and only bites `trunk-dev` trackers), and
+  the `0.4.0`/`0.5.0` changelog sections gained the `### Breaking Changes`
+  blocks they always deserved. `docs/release-checklist.md` gains a *Migration
+  Guide Gate* section requiring the `next.md` rename, the changelog link
+  repointing, and a **performed and recorded** guide-only upgrade of an
+  `autumn new` app from the previous release — no changelog, no source reading —
+  before `cargo publish`. `scripts/check-release-notes.sh` now shares the same
+  marker convention instead of its own dead heading-only heuristic.
+  The lint is textual and removes the *silent* failure mode rather than
+  replacing review: a break described without the word "breaking" and without
+  the marker still needs a reviewer to catch it. Entries that talk *about*
+  breaking changes rather than being one carry an explicit, greppable
+  `<!-- migration-guide-gate: reason -->` suppression — as this one does.
+  [no-plugin] <!-- migration-guide-gate: describes the gate itself -->
+
+
 - **system-tests:** `SystemTest::layer(...)` registers app-wide Tower
   middleware on the router a browser test serves (#1456). Applications whose
   routes depend on a global layer — tenant scoping bound to a database pool,
@@ -856,10 +894,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extension only for routes that declared something, so routes without
   `seo(...)` pay nothing. As before, the attribute supplies *values*, not
   markup: handlers still decide where to emit them, normally via
-  `SeoMeta::render()` inside a layout. **Breaking for code that constructs
+  `SeoMeta::render()` inside a layout. **Breaking:** code that constructs
   `autumn_web::Route { .. }` or `autumn_web::static_gen::StaticRouteMeta { .. }`
-  literally** (plugins building a `Vec<Route>` by hand rather than through
-  `routes![]`): add `seo: autumn_web::seo::SeoRouteDefaults::EMPTY`.
+  literally (plugins building a `Vec<Route>` by hand rather than through
+  `routes![]`) must add `seo: autumn_web::seo::SeoRouteDefaults::EMPTY`. See the
+  [migration guide](docs/migrations/next.md).
   `SeoRouteDefaults` is itself `#[non_exhaustive]` and built by chaining its
   `const fn with_*` setters from `EMPTY`, so future SEO keys stay additive.
 - **cli:** `autumn console` (alias `autumn c`) — a one-command, pre-wired data
@@ -1550,7 +1589,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier per-crate exclusion of victim crates. Under `--all-features`,
   autumn-cli's `sqlite` forwarded to `autumn-web/sqlite` and (via global cargo
   feature unification) flipped the shared autumn-web dependency to the SQLite
-  backend for the whole graph, breaking every Pg-assuming crate
+  backend for the whole graph, which failed to compile every Pg-assuming crate
   (`autumn-admin-plugin`, `autumn-media-plugin`, the example apps) with E0308.
   Excluding the two feature-owners resolves autumn-web to Postgres in the
   catch-all, so those crates compile again and their earlier `--exclude`s are
@@ -3417,11 +3456,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     statement timeout, slow-query threshold, and shard-tagged route metric
     label are all carried from the `ShardedDb` context rather than reset to
     framework defaults.
-  - The previous `with_pool` constructor is **renamed** to
+  - **Breaking:** the previous `with_pool` constructor is **renamed** to
     `with_pool_untracked` to signal at the call site that request
     observability is bypassed. Uses of `with_pool` on generated repositories
     must be updated to `with_pool_untracked` (only the name changes; the
-    signature and semantics are identical).
+    signature and semantics are identical). See the
+    [migration guide](docs/migrations/0.6.0.md).
   - `ShardedDb` gains a `#[doc(hidden)]` `__autumn_repository_seed()` accessor
     exposing the `ShardRepositorySeed` carrier struct used by generated code.
 
@@ -3839,9 +3879,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `secrecy::SecretString` instead of a plain `String`, so the JWT signing
   secret is redacted from `Debug` output (and any logs that format the
   config) and zeroized on drop. Config-file deserialization is unchanged —
-  a plain TOML string still works. Breaking for code that read or set the
-  field directly: set it with `Some(value.into())` and read it via
-  `secrecy::ExposeSecret::expose_secret()` (supersedes #1304). [no-plugin]
+  a plain TOML string still works. **Breaking:** code that read or set the
+  field directly must set it with `Some(value.into())` and read it via
+  `secrecy::ExposeSecret::expose_secret()` (supersedes #1304). See the
+  [migration guide](docs/migrations/0.6.0.md). [no-plugin]
 - **deps(security):** dependency-vulnerability upgrades (supersedes PR #1557;
   `diesel-async` was already handled separately). `aws-sdk-s3` floored at
   1.122 (1.119.0 → 1.122.0, the last MSRV-1.88 release) with
@@ -3951,6 +3992,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trunk-dev-only).
 
 ## [0.5.0] - 2026-06-16
+
+### Breaking Changes
+
+> Backfilled by #1588. These entries were always in the release — they were
+> spelled out inside the feature bullets below rather than called out here,
+> which is exactly the archaeology this section exists to remove.
+
+- **security:** forwarded-header trust moved to a single `[security.trusted_proxies]`
+  policy and `prod` defaults to trusting **no** proxy until it is configured.
+  An app behind a load balancer or reverse proxy that relied on `X-Forwarded-For`
+  / `X-Forwarded-Host` being honoured implicitly must declare its proxy boundary
+  or it will rate-limit on (and log) the proxy's address. This is the fix for
+  #753, #785 and #791. See the [migration guide](docs/migrations/0.5.0.md).
+- **security:** `security.rate_limit.trusted_proxies` and
+  `security.rate_limit.trust_forwarded_headers` are deprecated in favour of the
+  top-level `[security.trusted_proxies]` block. They keep working for one minor
+  release with a startup warning, and `autumn doctor --strict` fails when the
+  old and new keys disagree. See the [migration guide](docs/migrations/0.5.0.md).
 
 ### Added
 
@@ -4068,6 +4127,23 @@ To opt out of the generated `page` method: implement your own list handler using
 - **deps:** Bump actions/upload-artifact from 4 to 7 (#744)([b6b028c](https://github.com/madmax983/autumn/commit/b6b028cf71a7efee75d1437d2edc1b91f7b5313a))
 - Changelog and release notes([367bcd3](https://github.com/madmax983/autumn/commit/367bcd365df380f974f9cb6d943467e8d9c672a6))
 ## [0.4.0] - 2026-05-12
+
+### Breaking Changes
+
+> Backfilled by #1588 from `docs/migrations/0.4.0.md`, which shipped with the
+> release; the changelog section never named the breaks.
+
+- **security:** `prod` / `production` profiles refuse to bind without a stable
+  `security.signing_secret`. See the [migration guide](docs/migrations/0.4.0.md).
+- **storage:** the `storage-s3` feature was removed from `autumn-web` and moved
+  to the `autumn-storage-s3` crate. See the
+  [migration guide](docs/migrations/0.4.0.md).
+- **auth:** generated repository APIs require a `policy = ...` in production
+  unless `security.allow_unauthorized_repository_api` is set. See the
+  [migration guide](docs/migrations/0.4.0.md).
+- **mail:** `deliver_later` requires a durable `MailDeliveryQueue` in production
+  unless `mail.allow_in_process_deliver_later_in_production` is set. See the
+  [migration guide](docs/migrations/0.4.0.md).
 
 ### Added
 
