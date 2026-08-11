@@ -1272,7 +1272,10 @@ fn migration_guides_are_indexed_and_record_a_walkthrough() {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_owned();
-        if !name.ends_with(".md") || name == "README.md" || name == "TEMPLATE.md" {
+        let is_markdown = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+        if !is_markdown || name == "README.md" || name == "TEMPLATE.md" {
             continue;
         }
 
@@ -1639,7 +1642,10 @@ fn workflow_referenced_scripts_are_tracked_by_git() {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
                 .collect();
-            if !name.ends_with(".sh") {
+            if !std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
+            {
                 continue;
             }
             assert!(
