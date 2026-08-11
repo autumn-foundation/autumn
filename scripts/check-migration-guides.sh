@@ -173,7 +173,10 @@ function links_to(text, path,   needle, pos, at, i, ch, start, slashes) {
       if (ch == "[") {
         slashes = 0
         while (i - slashes - 1 >= 1 && substr(text, i - slashes - 1, 1) == "\\") slashes++
-        if (slashes % 2 == 0) return 1
+        # An unescaped `!` before the bracket makes this an image, which renders
+        # a picture rather than a path the reader can follow.
+        if (slashes % 2 == 0 &&
+            !(i > 1 && substr(text, i - 1, 1) == "!")) return 1
       }
     }
     start = at + 1
@@ -431,10 +434,16 @@ findings="$(
     next
   }
 
-  # `-`, `*` and `+` are all legal markdown bullets. Indentation is NOT
-  # dedented here: an indented bullet is a nested list item, part of the entry
-  # above it, not an entry of its own.
-  visible ~ /^[-*+] / {
+  # `-`, `*` and `+` are all legal markdown bullets, and markdown allows a tab
+  # after the marker.
+  #
+  # Indentation is the subtle half. Up to three leading spaces still starts a
+  # top-level item — but the *same* indentation under an open entry is a nested
+  # list item belonging to it, which is how this changelog writes multi-part
+  # entries (the marker often sits on a sub-bullet). So an indented bullet
+  # starts an entry only when no entry is currently open; otherwise it stays
+  # part of the one above it.
+  visible ~ /^[-*+][ \t]/ || (entry == "" && dedent3(visible) ~ /^[-*+][ \t]/) {
     flush_entry()
     entry_line = FNR
     entry_breaking_heading = breaking_heading

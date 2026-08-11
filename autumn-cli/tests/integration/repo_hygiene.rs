@@ -3319,3 +3319,83 @@ fn migration_guide_gate_rejects_an_invalid_backtick_info_string() {
         "an invalid info string does not open a fence",
     );
 }
+
+// --- Review round 15: bullet whitespace, image openers --------------------
+
+#[test]
+fn migration_guide_gate_reads_indented_and_tabbed_bullets() {
+    // A list item may carry up to three leading spaces, and a tab after the
+    // marker. Both were ignored outright, so the entry's marker, missing guide
+    // and missing link all went unseen.
+    for changelog in [
+        "# Changelog\n\n## [0.7.0] - 2026-09-01\n\n### Changed\n\n  - **db:** **Breaking:** renamed, no guide.\n",
+        "# Changelog\n\n## [0.7.0] - 2026-09-01\n\n### Changed\n\n-\t**db:** **Breaking:** renamed, no guide.\n",
+    ] {
+        let tmp = migration_gate_fixture("0.7.0");
+        std::fs::write(tmp.path().join("CHANGELOG.md"), changelog).expect("changelog");
+        assert!(
+            !run_migration_gate(tmp.path()).status.success(),
+            "markdown renders this as a list entry:\n{changelog}",
+        );
+    }
+}
+
+#[test]
+fn migration_guide_gate_keeps_nested_bullets_inside_their_entry() {
+    // The counterpart, and the reason round 13 did not simply dedent bullets:
+    // an indented bullet *under an open entry* is a nested list item belonging
+    // to it. Splitting those apart would reinterpret this repo's real
+    // changelog, where multi-part entries carry their marker on a sub-bullet.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **sharding:** a multi-part entry. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n  \
+           - **Breaking:** `with_pool` is renamed.\n  \
+           - the signature is unchanged.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "the parent entry carries the link for its nested bullets\n{}",
+        gate_report(&output),
+    );
+    let list = bash_command()
+        .args(["scripts/check-migration-guides.sh", "--list"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run --list");
+    assert!(
+        String::from_utf8_lossy(&list.stdout)
+            .lines()
+            .any(|line| line.starts_with("0.7.0") && line.trim_end().ends_with(" 1")),
+        "the nested bullets are one entry, not three\n{}",
+        String::from_utf8_lossy(&list.stdout),
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_an_image_as_a_guide_link() {
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See \
+           ![migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "`![...](path)` renders an image, not a link the reader can follow",
+    );
+}
