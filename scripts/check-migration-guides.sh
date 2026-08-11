@@ -240,23 +240,79 @@ function heading_text(line,   h) {
   return h
 }
 
-function mask_html_attributes(text,   out, rest, at) {
+function mask_html_attributes(text,   out, n, i, j, k, ch, quote, has_eq, endpos, sq) {
   # Markdown does not render a link inside an HTML attribute, so
   # `<span title="[guide](path)">` supplies no clickable path.
+  #
+  # Quoting is tracked because an attribute value may contain `>`: the tag
+  # `<span title="> [guide](path)">` ends at the *last* `>`, and stopping at
+  # the first one left the link text exposed and looking clickable.
   #
   # The mask is deliberately narrow: only a tag that actually carries an
   # attribute (`<name ... = ... >`). Masking every `<...>` would delete
   # `Option<String>` and `Vec<Route>` from prose the marker and the lint both
   # read — this changelog is full of them — turning a fail-open hole into a
   # fail-open hole somewhere else.
+  sq = sprintf("%c", 39)
   out = ""
-  rest = text
-  while (match(rest, /<[a-zA-Z\/][^<>]*=[^<>]*>/)) {
-    out = out substr(rest, 1, RSTART - 1)
-    for (at = 0; at < RLENGTH; at++) out = out " "
-    rest = substr(rest, RSTART + RLENGTH)
+  n = length(text)
+  i = 1
+  while (i <= n) {
+    ch = substr(text, i, 1)
+    if (ch != "<" || substr(text, i + 1, 1) !~ /^[a-zA-Z\/]$/) {
+      out = out ch
+      i++
+      continue
+    }
+    quote = ""
+    has_eq = 0
+    endpos = 0
+    for (j = i + 1; j <= n; j++) {
+      ch = substr(text, j, 1)
+      if (quote != "") {
+        if (ch == quote) quote = ""
+        continue
+      }
+      if (ch == "\"" || ch == sq) { quote = ch; continue }
+      if (ch == "=") { has_eq = 1; continue }
+      # A second `<` means the first one never opened a tag at all.
+      if (ch == "<") break
+      if (ch == ">") { endpos = j; break }
+    }
+    if (endpos == 0 || !has_eq) {
+      out = out substr(text, i, 1)
+      i++
+      continue
+    }
+    for (k = i; k <= endpos; k++) out = out " "
+    i = endpos + 1
   }
-  return out rest
+  return out
+}
+
+function is_link_definition(text,   body, close_at) {
+  # `[label]: destination "title"` renders nothing at all, so a required
+  # section holding only these is empty to a reader — which is the whole thing
+  # the shape check exists to catch.
+  body = dedent3(text)
+  if (substr(body, 1, 1) != "[") return 0
+  close_at = unescaped_index(body, "]", 2)
+  if (close_at < 3) return 0
+  if (substr(body, close_at + 1, 1) != ":") return 0
+  return substr(body, close_at + 2) ~ /[^[:space:]]/
+}
+
+function is_orphan_title(text,   body, first, last, sq) {
+  # The title of a definition may sit on the following line, where it renders
+  # nothing either. Only the quoted forms count: `(prose on its own line)` is
+  # ordinary writing, and treating it as invisible would fail a real guide.
+  sq = sprintf("%c", 39)
+  body = dedent3(text)
+  sub(/[[:space:]]+$/, "", body)
+  if (length(body) < 2) return 0
+  first = substr(body, 1, 1)
+  last = substr(body, length(body), 1)
+  return (first == "\"" || first == sq) && last == first
 }
 
 function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
@@ -950,7 +1006,14 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           sub(/[[:space:]]+$/, "", status_value)
         }
         {
-          if (visible ~ /[^[:space:]]/) {
+          # A link reference definition, and a title continuing one onto the
+          # next line, render nothing — they populate a section on paper only.
+          if (is_link_definition(visible)) {
+            pending_title = 1
+          } else if (pending_title && is_orphan_title(visible)) {
+            pending_title = 0
+          } else if (visible ~ /[^[:space:]]/) {
+            pending_title = 0
             for (lvl = 1; lvl <= 6; lvl++) {
               if (open_heading[lvl] != "") content[open_heading[lvl]] = 1
             }

@@ -4218,3 +4218,129 @@ fn migration_guide_gate_does_not_treat_an_unknown_tag_as_a_block_opener() {
         gate_report(&output),
     );
 }
+
+// --- Review round 27: attribute values, reference definitions -------------
+
+#[test]
+fn migration_guide_gate_masks_through_a_quoted_attribute_containing_a_bracket() {
+    // A `>` inside a quoted attribute value does not end the tag, so the
+    // whole construct is raw HTML and the link text inside it is literal.
+    // Stopping the mask at the first `>` left it looking clickable.
+    //
+    // Confirmed against the CommonMark reference implementation: this renders
+    // as `<span title="> [guide](…)">x</span>` — no anchor element.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. \
+           <span title=\"> [migration guide](docs/migrations/0.7.0.md)\">details</span>\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a `>` inside a quoted attribute value does not close the tag",
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_count_a_link_definition_as_section_content() {
+    // A link reference definition renders nothing on its own, so a required
+    // section holding only one is empty to the reader — the gate exists to
+    // stop exactly that kind of hollow guide.
+    // Targets `## Summary`, which has no child heading: a required section is
+    // allowed to take its content from a subsection, so `## How to verify`
+    // would be populated by its walkthrough child either way.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "[stub]: https://example.invalid",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an invisible reference definition is not migration guidance\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Summary"),
+        "the failure must name the empty section\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_keeps_a_link_definition_from_hiding_real_content() {
+    // The counterpart: a section that carries a definition *and* prose is not
+    // empty. Dropping the whole line, rather than only definitions, would
+    // start failing guides that use reference-style links.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "[stub]: https://example.invalid\n\nWhy this breaks, in full, with [stub].",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "reference-style links are normal markdown, not an empty section\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_closes_a_type_one_block_on_any_type_one_end_tag() {
+    // CommonMark ends a type-1 block on `</script>`, `</style>`, `</pre>` or
+    // `</textarea>` — spec: "it need not match the start tag". Verified
+    // against the reference implementation: a `<script>` block closed by
+    // `</style>` renders the following line as a paragraph, and its link as a
+    // real anchor, exactly as `</script>` would.
+    //
+    // Recorded as a test because "close only on the matching tag" looks like
+    // the more careful rule and is not: it would hold the block open past
+    // where readers see it end, swallowing links that are clickable.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed.\n  \
+         <script>\n  var demo = 1;\n  </style>\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "any type-1 end tag closes the block, per the spec\n{}",
+        gate_report(&output),
+    );
+}

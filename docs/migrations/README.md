@@ -101,7 +101,8 @@ It fails when:
   start*, *Breaking changes*, *How to verify*, and *Guide-only upgrade
   walkthrough* — or has a heading with nothing under it, still carries
   `TEMPLATE.md`'s banner or any placeholder token `TEMPLATE.md` itself emits
-  (an HTML comment is not content — `<!-- TODO -->` under a heading is a stub)
+  (an HTML comment is not content — `<!-- TODO -->` under a heading is a stub,
+  and neither is a link reference definition, which renders nothing at all)
   (the vocabulary is read from the template, so `{:?}` and `Route { .. }` in a
   guide are fine and `{X.Y.Z}` in a code sample is not), or is not linked from
   the Index above (a mention elsewhere in this file is not an index entry);
