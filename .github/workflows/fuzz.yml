@@ -40,6 +40,31 @@ jobs:
         target: [idempotency, routing, headers, session, body]
     steps:
       - uses: actions/checkout@v7
+      - name: Free disk space
+        # cargo-fuzz builds the whole autumn-web dependency graph in release
+        # mode with ASAN instrumentation, which is the most artifact-heavy
+        # build in the repo. Without this, jobs die mid-compile (~3.5 min in,
+        # while the heavy crates codegen) with exit 143 and "The runner has
+        # received a shutdown signal" — the runner agent going down takes the
+        # log with it, so there is no "No space left on device" line to read.
+        # A DIFFERENT arbitrary 2 of the 5 matrix jobs fail per run
+        # (idempotency+headers on trunk-dev dd9e8ae3, body+routing on #2182),
+        # which is the signature of a per-VM resource ceiling rather than
+        # anything target-specific. This is the same reclamation ci.yml's test
+        # and coverage jobs already do for the same class of failure; the fuzz
+        # workflow never got it. `df -h` is left in deliberately so the next
+        # failure has a headroom number to read.
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
