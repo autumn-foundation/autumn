@@ -358,9 +358,10 @@ fn export_mirrors_the_index_security_posture() {
 
 #[test]
 fn export_carries_a_per_ip_throttle_the_index_does_not_need() {
-    // One export reads up to MAX_EXPORT_ROWS rows over ~100 queries where one
-    // index page reads 100 rows over two, so on an unsecured scaffold the route
-    // is a large cost amplifier on traffic the index already accepts.
+    // One export reads up to MAX_EXPORT_ROWS rows over ~100 page queries plus
+    // ~100 filtered COUNT(*)s (`list` counts before every page), where one index
+    // page costs two round trips — so on an unsecured scaffold the route is a
+    // large cost amplifier on traffic the index already accepts.
     let (_tmp, routes) = scaffold_routes("csv-throttle", &[]);
     assert!(
         routes.contains("#[autumn_web::throttle(limit = 6, per = \"1m\", key = \"ip\")]"),

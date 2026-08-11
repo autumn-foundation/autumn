@@ -45,8 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scaffold whose index carries no `#[secured]` gets an export that carries none
   either. COST does not mirror the index, so the handler additionally carries
   `#[throttle(limit = 6, per = "1m", key = "ip")]`: one export reads up to
-  10 000 rows over ~100 queries where one index page reads 100 over two, and an
-  inline throttle applies regardless of `security.rate_limit.enabled`.
+  10 000 rows over ~100 page queries plus ~100 filtered `COUNT(*)`s — `list`
+  counts before every page, and the export never reads the count but cannot
+  opt out of it — where one index page costs two round trips. An inline
+  throttle applies regardless of `security.rate_limit.enabled`. The emitted
+  docs state that arithmetic so the cap, the throttle and the auth posture can
+  be tuned against the real number rather than the row count.
 
   `NULL` columns serialize to an empty cell rather than the literal `None`, and
   commas/quotes/newlines are RFC 4180 quoted by `export_csv`. Text-backed

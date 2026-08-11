@@ -3979,12 +3979,19 @@ mod attachment_read_back_tests {
              /// including this one's sort/filter allowlist and any owner scoping.\n\
              ///\n\
              /// COST, not row-set, is why this carries a `#[throttle]` the index does\n\
-             /// not: one export reads up to `MAX_EXPORT_ROWS` rows over ~100 queries\n\
-             /// where one index page reads 100 rows over two, so without a per-IP\n\
-             /// bucket this route is a ~100x amplifier on whatever traffic the index\n\
-             /// already accepts. The limit applies per client address and is\n\
-             /// independent of `security.rate_limit.enabled` (that flag governs the\n\
-             /// GLOBAL limiter); raise it freely for an internal back-office.\n\
+             /// not, and the cost is worse than the row count suggests. `list` runs a\n\
+             /// filtered `COUNT(*)` before each page, so a full export is ~100 page\n\
+             /// queries AND ~100 whole-result-set counts — ~200 round trips where one\n\
+             /// index page costs two. The counts are pure waste here: this loop never\n\
+             /// reads `total_elements`, it stops on a short batch. They are paid\n\
+             /// anyway because `list` is also what applies the sort/filter allowlist,\n\
+             /// and the repository exposes no count-free equivalent. On a large or\n\
+             /// poorly indexed table budget accordingly: lower `MAX_EXPORT_ROWS`,\n\
+             /// tighten this throttle, or put the route behind auth.\n\
+             ///\n\
+             /// The limit applies per client address and is independent of\n\
+             /// `security.rate_limit.enabled` (that flag governs the GLOBAL limiter);\n\
+             /// raise it freely for an internal back-office.\n\
              ///\n\
              /// AUTHORIZATION is the index's, not `show`'s: like the index, this lists\n\
              /// rows without calling `authorize(.., \"show\", &row)` per record. If you\n\
