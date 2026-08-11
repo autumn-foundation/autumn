@@ -2673,3 +2673,27 @@ fn migration_guide_gate_only_reads_the_documented_breaking_heading() {
         gate_report(&output),
     );
 }
+
+#[test]
+fn migration_guide_gate_ignores_a_guide_link_inside_a_code_span() {
+    // Marker detection reads the code-span-stripped text; the link check read
+    // the raw entry. A path in backticks renders as code, not as a clickable
+    // link, so the reader is left without the promised path to the guide.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** `with_pool` renamed. Write it as \
+           `[migration guide](docs/migrations/0.7.0.md)`.\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a link that only exists inside a code span renders as code, not as a \
+         link the reader can follow",
+    );
+}

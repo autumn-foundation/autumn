@@ -194,8 +194,10 @@ findings="$(
     }
 
     if (marked) {
-      # A markdown link, not a mention: `](<guide>)`.
-      has_link = (index(entry, "](" guide_path ")") > 0)
+      # A markdown link, not a mention: `](<guide>)`. Read the same code-span
+      # stripped text the marker was read from — a path inside backticks
+      # renders as code, so it is not a link the reader can follow.
+      has_link = (index(prose, "](" guide_path ")") > 0)
       printf "BREAKING\t%s\t%d\t%d\t%s\n", section, entry_line, has_link, guide_path
     } else {
       # Fold to alpha-only words so "non-breaking" and "non breaking" are the
