@@ -808,6 +808,16 @@ fn plan_scaffold_with_options_impl(
         && !options_with_key.live
         && !options_with_key.live_validation
         && !options_with_key.model.sharded;
+    // Issue #1315: the `CsvSchema` impl + `GET /{plural}/export.csv` download.
+    // Must agree exactly with the `export_enabled` gate in `render_routes_file`
+    // (plus `--api`, which emits no HTML routes module at all). The two operands
+    // below are that gate's `owner_scoped_standard` / `owner_scoped_index` spelled
+    // in this scope's vocabulary: `authorize_wiring` IS `owner_authorizes &&
+    // !sharded && !live && !live_validation`, and `owner_authorizes` IS
+    // `authorize && owner.is_some()`.
+    let export_enabled = !options_with_key.api
+        && (authorize_wiring
+            || (!owner_authorizes && !options_with_key.live && !options_with_key.model.sharded));
     // Smoke test under `tests/<snake>.rs`. Uses the same soft-delete-augmented
     // field list as the real migration (see `augment_fields_for_soft_delete`)
     // so the smoke test's throwaway table matches the real schema exactly.
@@ -826,6 +836,8 @@ fn plan_scaffold_with_options_impl(
             metadata.validations(),
             authorize_wiring,
             bulk_delete_enabled,
+            export_enabled,
+            &fields,
         ),
     );
 
@@ -897,6 +909,7 @@ fn plan_scaffold_with_options_impl(
         options_with_key.live,
         search_enabled && !options_with_key.api,
         bulk_delete_enabled,
+        export_enabled,
         &validated_field_names,
         &sm_field_names,
         &rich_text_field_names,
@@ -1004,6 +1017,36 @@ fn plan_scaffold_with_options_impl(
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: "maud".to_owned(),
+            owner_dir: Some(project_root.join("src").join("routes")),
+        });
+    }
+
+    // Issue #1315: the emitted `CsvSchema` impl and `export.csv` handler call
+    // into `autumn_web::data::csv`, which is gated behind autumn-web's `csv`
+    // feature (off by default so the `csv` crate stays out of apps that don't
+    // export). Without this the generated app would not compile. Enabled only
+    // where the export is actually emitted, so a `--api`/`--live`/`--sharded`
+    // scaffold's Cargo.toml is untouched.
+    if export_enabled {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "csv");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // Pushed unconditionally — see the `maud` block above for why.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: "csv".to_owned(),
             owner_dir: Some(project_root.join("src").join("routes")),
         });
     }
@@ -2161,6 +2204,26 @@ fn render_routes_file(
     // current user. The `--sharded`/`--live`/`--live-validation` owner indexes
     // keep the #1830 manual owner-filtered query (no scoped repo methods emitted).
     let owner_scoped_standard = owner_scoped_index && !sharded && !live && !live_validation;
+    // Issue #1315: the `GET /{plural}/export.csv` download + the index's
+    // "Export CSV" link. Emitted exactly where the index's row set is a
+    // repository call the export can reuse VERBATIM — `repo.list_scoped` on the
+    // owner-scoped standard index, `repo.list` on the plain one. That is the
+    // whole security argument for AC5: the export never re-derives a row set of
+    // its own, so it cannot widen past what the index already shows.
+    //
+    // Gated OFF for: `--live` (an SSE `<ul>` on `repo.page`, no `ListQuery` to
+    // honour), `--sharded` (`from_shard` pins the query to one shard, so an
+    // "export everything" file would silently cover a fraction of the table),
+    // and the owner-scoped `--live-validation`/`--sharded` indexes, which run a
+    // MANUAL owner-filtered diesel query rather than a scoped repository method
+    // — re-deriving that filter by hand in a second handler is exactly the kind
+    // of duplication that leaks rows when one side is later edited. Plain
+    // (non-owner) `--live-validation` renders the standard data_table index on
+    // `repo.list`, so it DOES get the export. Must agree exactly with the
+    // matching gate in `plan_scaffold_with_options_impl` (plus `--api`, which
+    // emits no HTML routes module at all), or `main.rs` would mount a route this
+    // module never emitted.
+    let export_enabled = owner_scoped_standard || (!owner_scoped_index && !live && !sharded);
     // The full extractor pair the authorize wiring needs on handlers that do not
     // already carry a `state:` wrapper. No trailing comma — each insertion site
     // supplies its own delimiter.
@@ -3782,6 +3845,93 @@ mod attachment_read_back_tests {
         String::new()
     };
 
+    // Issue #1315: the `CsvSchema` impl + `GET /{plural}/export.csv` download.
+    // Emitted straight after the index (and `bulk_delete`) it exports, so an
+    // author reading the module top-to-bottom meets the schema, then the route
+    // that streams it, right where the list lives.
+    //
+    // The impl lives here rather than in `src/models/{snake}.rs` on purpose: the
+    // orphan rule is satisfied either way (the model type is crate-local), and
+    // keeping it beside its only consumer means the whole feature — impl, route,
+    // link, Cargo feature — is gated in one place. Move it to the model module
+    // if a second consumer (an `import_csv` route, an `autumn data export` task)
+    // appears.
+    let export_csv_fn = if export_enabled {
+        let schema_impl = render_csv_schema_impl(pascal_name, all_fields);
+        // AC5: mirror the index's posture exactly. The owner-scoped index is
+        // `#[secured]` and resolves its owner from the same `PolicyContext` the
+        // mutating handlers authorize against; the plain index carries neither.
+        let (secured_attr, authz_params, owner_let, list_call) = if owner_scoped_standard {
+            (
+                "#[secured]\n",
+                format!("{authz_params_full},"),
+                "    let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;\n    \
+                 let owner_id = ctx.user_id_i64().unwrap_or(-1);\n",
+                "repo.list_scoped(owner_id, &list_query, &page_req)",
+            )
+        } else {
+            ("", String::new(), "", "repo.list(&list_query, &page_req)")
+        };
+        let scope_note = if owner_scoped_standard {
+            "///\n\
+             /// Rows are read through the repository's OWNER-SCOPED `list_scoped`, the\n\
+             /// same method the index uses. This handler never calls the unscoped\n\
+             /// `list`/`page`, so the download can never contain another user's rows.\n"
+        } else {
+            ""
+        };
+        format!(
+            "{schema_impl}\n\
+             /// The most rows one `GET /{plural}/export.csv` will read.\n\
+             ///\n\
+             /// The response is built in memory, so this is the ceiling on how much a\n\
+             /// single request can cost. Raise it if your spreadsheets are bigger than\n\
+             /// this; if you need a genuinely unbounded export, stream the batches\n\
+             /// straight into the response body instead of collecting them first.\n\
+             const MAX_EXPORT_ROWS: usize = 10_000;\n\n\
+             /// `GET /{plural}/export.csv` — the list view as an RFC 4180 CSV download.\n\
+             ///\n\
+             /// Honours the SAME allowlisted `?sort=`/`?filter[col]=` params as `index`\n\
+             /// (the shared [`ListQuery`] extractor), so the file matches the filtered\n\
+             /// view the \"Export CSV\" link was clicked from rather than the whole\n\
+             /// table. `?page=`/`?size=` are ignored on purpose: an export spans every\n\
+             /// page of the current filter.\n\
+             ///\n\
+             /// Rows are read in `MAX_PAGE_SIZE` batches (so no single query loads the\n\
+             /// table) and capped at `MAX_EXPORT_ROWS`. `Content-Type`,\n\
+             /// `Content-Disposition` and `Content-Length` come from `Download`, which\n\
+             /// infers `text/csv` from the `.csv` filename and sanitizes the name.\n\
+             {scope_note}{secured_attr}\
+             #[get(\"/{plural}/export.csv\")]\n\
+             pub async fn export_csv(\n    \
+             list_query: ListQuery,{authz_params}\n    \
+             repo: Pg{pascal_name}Repository,\n\
+             ) -> AutumnResult<autumn_web::download::Download> {{\n\
+             {owner_let}    \
+             let batch_size = autumn_web::pagination::MAX_PAGE_SIZE;\n    \
+             let mut rows: Vec<{pascal_name}> = Vec::new();\n    \
+             let mut page: u32 = 1;\n    \
+             loop {{\n        \
+             let page_req = PageRequest::new(page, batch_size);\n        \
+             let batch: Page<{pascal_name}> = {list_call}.await?;\n        \
+             // A short batch is the last one: nothing after it to ask for.\n        \
+             let exhausted = batch.content.len() < batch_size as usize;\n        \
+             rows.extend(batch.content);\n        \
+             if exhausted || rows.len() >= MAX_EXPORT_ROWS {{\n            \
+             break;\n        \
+             }}\n        \
+             page += 1;\n    \
+             }}\n    \
+             rows.truncate(MAX_EXPORT_ROWS);\n    \
+             let mut body: Vec<u8> = Vec::new();\n    \
+             autumn_web::data::csv::export_csv(rows, &mut body)?;\n    \
+             Ok(autumn_web::download::Download::from_bytes(body).filename(\"{plural}.csv\"))\n\
+             }}\n"
+        )
+    } else {
+        String::new()
+    };
+
     // For non-live paths, generate the data_table columns and call. Both the
     // plain AND sharded index promote displayable `references` columns to
     // render the parent's label from a per-view label map (issue #1146,
@@ -3921,6 +4071,29 @@ mod attachment_read_back_tests {
         r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query)))"
             .to_string()
     };
+    // Issue #1315: the index's "Export CSV" link, and the `let` that builds its
+    // href. The link carries the index's CURRENT query string, so "filter →
+    // sort → export" downloads exactly the rows on screen rather than the whole
+    // table; `pager_query` is the same raw query the pager links already
+    // preserve. Paging params ride along harmlessly — the export handler
+    // extracts no `PageRequest`. Both are empty for a gated-off variant, so its
+    // index stays byte-identical to its pre-#1315 output.
+    //
+    // Rendered as page furniture next to "New {pascal_name}", deliberately
+    // OUTSIDE the #1312 bulk-actions `<form>`: a nested `<form>` is invalid HTML,
+    // and an export is not a selection action.
+    let (export_href_let, export_link) = if export_enabled {
+        (
+            "    let export_href = if pager_query.is_empty() {\n        \
+             paths::export_csv()\n    \
+             } else {\n        \
+             format!(\"{}?{}\", paths::export_csv(), pager_query)\n    \
+             };\n",
+            "\n        (autumn_web::a11y::Link::new(export_href.as_str(), \"Export CSV\"))",
+        )
+    } else {
+        ("", "")
+    };
     // Issue #1312: the list itself (data_table + pager) is wrapped in the
     // bulk-actions `<form>` so each row's checkbox submits with the
     // delete-selected button. The "New {pascal_name}" link, the htmx `<script>`,
@@ -4009,9 +4182,9 @@ pub async fn index(
     let owner_id = ctx.user_id_i64().unwrap_or(-1);
     let page_data: Page<{pascal_name}> = repo.list_scoped(owner_id, &list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
+{export_href_let}{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href=(paths::new()) {{ "New {pascal_name}" }}
+        a href=(paths::new()) {{ "New {pascal_name}" }}{export_link}
         {index_list_block}
     }}))
 }}"#
@@ -4155,9 +4328,9 @@ pub async fn index(
 ) -> AutumnResult<Markup> {{
     let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
+{export_href_let}{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}")){export_link}
         {index_list_block}
     }}))
 }}"#
@@ -4380,6 +4553,12 @@ pub async fn index(
         // block stays byte-identical.
         if bulk_delete_enabled {
             names.push("bulk_delete".to_owned());
+        }
+        // Issue #1315: `paths::export_csv()` backs the index's "Export CSV"
+        // link. Gated with the handler, so a gated-off variant's `paths!` block
+        // stays byte-identical.
+        if export_enabled {
+            names.push("export_csv".to_owned());
         }
         if live {
             names.push("events".to_owned());
@@ -4882,7 +5061,7 @@ fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitF
     }}
 }}
 {bulk_ids_parser}{attachment_read_back_helpers}{private_layout}
-{index_handler}{bulk_delete_fn}{show_section}
+{index_handler}{bulk_delete_fn}{export_csv_fn}{show_section}
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
 #[get("/{plural}/new", name = "new")]
@@ -6214,6 +6393,96 @@ fn cell_value_expr(field: &Field) -> String {
     }
 }
 
+/// The `String`-producing expression for one column's cell in the generated
+/// `CsvSchema::to_csv_record` (issue #1315).
+///
+/// Sibling of [`cell_value_expr`], which produces a Maud-renderable value for a
+/// table cell. A CSV record is a `Vec<String>`, so every arm here must land on
+/// an owned `String` — and, per AC7, a NULL column must land on the EMPTY
+/// string, never the literal `"None"` a `{:?}` of an `Option` would print.
+///
+/// Quoting is deliberately NOT applied here: `export_csv` writes RFC 4180, so a
+/// value carrying a comma, a double quote or a newline is quoted and escaped by
+/// the writer. Pre-quoting would double-escape it.
+fn csv_value_expr(field: &Field) -> String {
+    let name = &field.name;
+    match (field.nullable, field.kind) {
+        // Attachment is always `Option<Blob>`. `Blob` has no `Display`, and the
+        // index's "attachment"/"—" presence marker is useless in a spreadsheet —
+        // export the store KEY, the one value that finds the file again.
+        (_, FieldKind::Attachment) => {
+            format!("self.{name}.as_ref().map(|blob| blob.key.clone()).unwrap_or_default()")
+        }
+        // `Vec<u8>` has no `Display` either. Lossy UTF-8 matches what the index
+        // and show views already render for the column.
+        (true, FieldKind::Bytea) => format!(
+            "self.{name}.as_ref().map(|bytes| String::from_utf8_lossy(bytes).into_owned()).unwrap_or_default()"
+        ),
+        (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&self.{name}).into_owned()"),
+        // Already a `String`: clone rather than round-trip through `Display`.
+        // `Enum` is excluded — its Rust type is the generated enum, not a
+        // `String` (see `Field::rust_type`) — and so falls to the arms below.
+        (true, FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Slug) => {
+            format!("self.{name}.clone().unwrap_or_default()")
+        }
+        (false, FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Slug) => {
+            format!("self.{name}.clone()")
+        }
+        // Every remaining kind is `Display` (numerics, bool, Uuid, chrono,
+        // Decimal, the generated enums, and `references` foreign keys).
+        (true, _) => format!("self.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
+        (false, _) => format!("self.{name}.to_string()"),
+    }
+}
+
+/// Emit the `impl CsvSchema for {Pascal} { … }` block the export route streams
+/// through `export_csv` (issue #1315).
+///
+/// Columns are `id`, every scaffolded column in declaration order, then the
+/// model's always-present `created_at` — exactly the set (and order) the `show`
+/// view renders, which is a superset of the index table's (a `--default`ed
+/// column is dropped from the form and the table, but it is still data an author
+/// downloading a spreadsheet wants). The soft-delete `deleted_at` bookkeeping
+/// column is deliberately excluded: a soft-deleted row never reaches the index,
+/// so it never reaches the export either.
+fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
+    use std::fmt::Write as _;
+    let mut headers = String::from("\"id\"");
+    let mut record = String::from("            self.id.to_string(),\n");
+    for f in fields {
+        let _ = write!(headers, ", \"{}\"", f.name);
+        let _ = writeln!(record, "            {},", csv_value_expr(f));
+    }
+    headers.push_str(", \"created_at\"");
+    record.push_str("            self.created_at.to_string(),\n");
+    format!(
+        "\n\n/// CSV column schema for the `GET /…/export.csv` download (issue #1315).\n\
+         ///\n\
+         /// `csv_columns` is the header row and `to_csv_record` the value row: the\n\
+         /// two MUST stay the same length and in the same order, which is the\n\
+         /// contract `export_csv` writes against. Edit them freely — dropping a\n\
+         /// sensitive column from the export is deleting one entry from each.\n\
+         ///\n\
+         /// A NULL column serializes to an EMPTY cell rather than the string\n\
+         /// `\"None\"`, because a blank spreadsheet cell is what \"no value\" means.\n\
+         /// Values are NOT quoted here: `export_csv` writes RFC 4180, so a value\n\
+         /// containing a comma, a double quote or a newline is quoted and escaped\n\
+         /// by the writer — pre-quoting would double-escape it.\n\
+         ///\n\
+         /// NOTE: a spreadsheet application may interpret a leading `=`, `+`, `-`\n\
+         /// or `@` in a cell as a formula. If this model holds untrusted text and\n\
+         /// the export is opened in Excel, prefix-guard those values here.\n\
+         impl autumn_web::data::csv::CsvSchema for {pascal_name} {{\n    \
+         fn csv_columns() -> &'static [&'static str] {{\n        \
+         &[{headers}]\n    \
+         }}\n\n    \
+         fn to_csv_record(&self) -> Vec<String> {{\n        \
+         vec![\n{record}        ]\n    \
+         }}\n\
+         }}\n"
+    )
+}
+
 /// Whether a column of this kind is server-sortable via the generated
 /// `list()` method (#1126).
 ///
@@ -6809,6 +7078,11 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
 /// also gets a stub target table created first — see
 /// [`render_reference_stub_tables_sql`].
 #[allow(clippy::too_many_arguments)]
+// Each bool is one independently-gated generated test section, all of them
+// already computed by the caller — folding them into an options struct would
+// move the same flags one level out without removing a single call-site
+// decision.
+#[allow(clippy::fn_params_excessive_bools)]
 fn render_smoke_test(
     pascal_name: &str,
     plural: &str,
@@ -6820,6 +7094,12 @@ fn render_smoke_test(
     validations: &BTreeMap<String, Vec<String>>,
     authorize: bool,
     bulk_delete: bool,
+    export_csv: bool,
+    // The model's OWN columns, i.e. `fields` before
+    // `augment_fields_for_soft_delete` adds `deleted_at`. The generated
+    // `CsvSchema` impl is built from the model struct, which carries no
+    // `deleted_at`, so the CSV test's header row must be too (issue #1315).
+    csv_fields: &[Field],
 ) -> String {
     let stub_tables_sql = render_reference_stub_tables_sql(fields, plural);
     let create_table_sql =
@@ -6874,6 +7154,16 @@ fn render_smoke_test(
         base
     } else {
         base + &render_write_path_smoke_test(pascal_name, plural, bulk_delete)
+    };
+
+    // Issue #1315 (AC6): prove the CSV download contract — status, media type,
+    // attachment disposition, header row, RFC 4180 quoting and the empty cell a
+    // NULL column serializes to. Needs no database (the stand-in rows are
+    // in-process), so unlike the index read test it is not `#[ignore]`d.
+    let base = if export_csv {
+        base + &render_csv_export_smoke_test(plural, csv_fields)
+    } else {
+        base
     };
 
     // Issue #1236 (AC6): attachment scaffolds additionally get a multipart
@@ -7099,6 +7389,122 @@ fn render_validation_rejection_smoke_test(
          \x20\x20\x20\x20let valid_body = format!(\"{target_name}={valid_value}&other_field={witness_value}\");\n\
          \x20\x20\x20\x20client.post(\"/{plural}\").form(&valid_body).send().await\n\
          \x20\x20\x20\x20\x20\x20\x20\x20.assert_status(200);\n\
+         }}\n"
+    )
+}
+
+/// Render the generated `tests/<snake>.rs` CSV-download test (issue #1315, AC6).
+///
+/// Like [`render_write_path_smoke_test`] this drives a stand-in resource rather
+/// than the real `routes::{plural}::export_csv` — a `tests/` binary cannot
+/// import a project's own code when the project has no `src/lib.rs`. What it
+/// DOES exercise for real is everything the scaffold does not own: `export_csv`
+/// writing RFC 4180, `Download` deriving `Content-Type`/`Content-Disposition`
+/// from the `.csv` filename, and the full in-process request pipeline. The
+/// header row is the model's actual columns, so the test fails if someone edits
+/// `csv_columns` in `src/routes/{plural}.rs` without updating the expectation.
+///
+/// Needs no database, so it is NOT `#[ignore]`d — it runs on a bare `cargo test`.
+fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
+    use std::fmt::Write as _;
+    // The header row `export_csv` writes: `id` plus the model's own columns, in
+    // the same order the generated `CsvSchema::csv_columns` lists them.
+    let mut columns = String::from("\"id\"");
+    let mut header_row = String::from("id");
+    // `created_at` closes the list, matching `render_csv_schema_impl`.
+    let names: Vec<&str> = fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .chain(std::iter::once("created_at"))
+        .collect();
+    for name in &names {
+        let _ = write!(columns, ", \"{name}\"");
+        let _ = write!(header_row, ",{name}");
+    }
+    // One filled cell per non-id column for the first row. The second row puts
+    // a comma + double quote + newline in its FIRST cell (so RFC 4180 quoting is
+    // asserted, not assumed) and leaves the rest empty — the shape a NULL column
+    // must produce.
+    let filled: Vec<String> = names
+        .iter()
+        .map(|name| format!("\"{name}-value\".to_owned()"))
+        .collect();
+    let awkward: Vec<String> = names
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            if i == 0 {
+                // `a,b "q"` + a newline: every character RFC 4180 has a rule for.
+                "\"a,b \\\"q\\\"\\nz\".to_owned()".to_owned()
+            } else {
+                "String::new()".to_owned()
+            }
+        })
+        .collect();
+    let filled_cells = filled.join(", ");
+    let awkward_cells = awkward.join(", ");
+    format!(
+        "\n\
+         // ── CSV export download (issue #1315) ─────────────────────────────────────\n\
+         //\n\
+         // Drives the same `export_csv` + `Download` pair the generated\n\
+         // `GET /{plural}/export.csv` handler uses, over a stand-in row type carrying\n\
+         // the model's real column list. Proves the download contract (200,\n\
+         // `text/csv`, an `attachment` disposition, the header row) and the two\n\
+         // serialization rules the scaffold depends on: a NULL column is an EMPTY\n\
+         // cell, and a value containing a comma/quote/newline is RFC 4180 quoted.\n\
+         //\n\
+         // No database required, so this runs on a plain `cargo test`.\n\
+         #[tokio::test]\n\
+         async fn {plural}_export_csv_downloads_a_spreadsheet() {{\n    \
+         use autumn_web::test::{{TestApp, TestClient}};\n\n    \
+         /// Stand-in for the scaffolded model: `id` plus one cell per column, in\n    \
+         /// the order `src/routes/{plural}.rs`'s `CsvSchema` impl lists them.\n    \
+         struct ExportRow {{\n        \
+         id: i64,\n        \
+         cells: Vec<String>,\n    \
+         }}\n\n    \
+         impl autumn_web::data::csv::CsvSchema for ExportRow {{\n        \
+         fn csv_columns() -> &'static [&'static str] {{\n            \
+         &[{columns}]\n        \
+         }}\n\n        \
+         fn to_csv_record(&self) -> Vec<String> {{\n            \
+         let mut record = vec![self.id.to_string()];\n            \
+         record.extend(self.cells.iter().cloned());\n            \
+         record\n        \
+         }}\n    \
+         }}\n\n    \
+         #[get(\"/{plural}/export.csv\")]\n    \
+         async fn export_csv() -> AutumnResult<autumn_web::download::Download> {{\n        \
+         let rows = vec![\n            \
+         ExportRow {{ id: 1, cells: vec![{filled_cells}] }},\n            \
+         ExportRow {{ id: 2, cells: vec![{awkward_cells}] }},\n        \
+         ];\n        \
+         let mut body: Vec<u8> = Vec::new();\n        \
+         autumn_web::data::csv::export_csv(rows, &mut body)?;\n        \
+         Ok(autumn_web::download::Download::from_bytes(body).filename(\"{plural}.csv\"))\n    \
+         }}\n\n    \
+         let client: TestClient = TestApp::new().routes(routes![export_csv]).build();\n    \
+         let response = client.get(\"/{plural}/export.csv\").send().await;\n    \
+         response\n        \
+         .assert_ok()\n        \
+         .assert_header_contains(\"content-type\", \"text/csv\")\n        \
+         .assert_header_contains(\"content-disposition\", \"attachment\")\n        \
+         .assert_header_contains(\"content-disposition\", \"filename=\\\"{plural}.csv\\\"\")\n        \
+         // The header row is the model's columns, in `csv_columns` order.\n        \
+         .assert_body_contains(\"{header_row}\");\n\n    \
+         let body = response.text();\n    \
+         // A NULL / absent column is an EMPTY cell -- never the literal `None`.\n    \
+         assert!(\n        \
+         !body.contains(\"None\"),\n        \
+         \"a NULL column must export as an empty cell, not `None`:\\n{{body}}\"\n    \
+         );\n    \
+         // RFC 4180: an embedded double quote is doubled and the whole field is\n    \
+         // quoted, so a comma or newline inside it never splits the row.\n    \
+         assert!(\n        \
+         body.contains(\"\\\"\\\"q\\\"\\\"\"),\n        \
+         \"a value containing a quote must be RFC 4180 escaped:\\n{{body}}\"\n    \
+         );\n\
          }}\n"
     )
 }
@@ -8383,6 +8789,7 @@ fn main_route_entries(
     live: bool,
     search: bool,
     bulk_delete: bool,
+    export_csv: bool,
     validated_field_names: &[String],
     sm_field_names: &[String],
     rich_text_field_names: &[String],
@@ -8415,6 +8822,12 @@ fn main_route_entries(
         // fail the generated app to compile.
         if bulk_delete {
             entries.push(format!("routes::{plural}::bulk_delete"));
+        }
+        // Issue #1315: mount the CSV export next to the index it exports. Gated
+        // with the handler emission in `render_routes_file` for the same reason
+        // as `bulk_delete` above.
+        if export_csv {
+            entries.push(format!("routes::{plural}::export_csv"));
         }
         if live {
             entries.push(format!("routes::{plural}::events"));
@@ -10815,14 +11228,17 @@ async fn main() {
             "write-path tests must not gate on a running server's base URL: {test}"
         );
         // The write-path suite is present and in-process alongside the read one:
-        // the index/read test plus the write-path CRUD test.
+        // the index/read test, the write-path CRUD test, and (issue #1315) the
+        // CSV download test.
         assert_eq!(
             test.matches("#[tokio::test]").count(),
-            2,
-            "expected the read smoke test plus the write-path CRUD test: {test}"
+            3,
+            "expected the read smoke test, the write-path CRUD test and the CSV \
+             export test: {test}"
         );
         assert!(test.contains("posts_index_renders_scaffolded_rows"));
         assert!(test.contains("posts_write_path_crud"));
+        assert!(test.contains("posts_export_csv_downloads_a_spreadsheet"));
     }
 
     #[test]
@@ -12464,6 +12880,125 @@ async fn main() {
         assert!(!kind_is_sortable(FieldKind::Bytea));
         assert!(!kind_is_sortable(FieldKind::Attachment));
         assert!(!kind_is_sortable(FieldKind::Enum));
+    }
+
+    /// A bare `Field` for the `csv_value_expr` table below.
+    fn csv_test_field(name: &str, kind: FieldKind, nullable: bool) -> Field {
+        Field {
+            name: name.to_string(),
+            kind,
+            nullable,
+            variants: Vec::new(),
+            unique: false,
+            constraints: FieldConstraints::default(),
+            state_machine: None,
+        }
+    }
+
+    #[test]
+    fn csv_value_expr_never_stringifies_an_option_as_none() {
+        // #1315 AC7: EVERY nullable kind must land on `unwrap_or_default()`,
+        // i.e. the empty string. A missing arm here is what would silently
+        // export the literal `None` into a spreadsheet cell.
+        for kind in [
+            FieldKind::String,
+            FieldKind::Text,
+            FieldKind::RichText,
+            FieldKind::Slug,
+            FieldKind::I32,
+            FieldKind::I64,
+            FieldKind::Bool,
+            FieldKind::F32,
+            FieldKind::F64,
+            FieldKind::Uuid,
+            FieldKind::NaiveDateTime,
+            FieldKind::DateTime,
+            FieldKind::Bytea,
+            FieldKind::Attachment,
+            FieldKind::References,
+            FieldKind::Enum,
+            FieldKind::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        ] {
+            let expr = csv_value_expr(&csv_test_field("col", kind, true));
+            assert!(
+                expr.ends_with("unwrap_or_default()"),
+                "nullable {kind:?} must serialize to an empty cell, got: {expr}"
+            );
+            assert!(
+                !expr.contains("{:?}"),
+                "nullable {kind:?} must not debug-format an Option, got: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn csv_value_expr_handles_the_kinds_without_a_display_impl() {
+        // `Blob` and `Vec<u8>` have no `Display`, so a bare `.to_string()`
+        // would not compile. Attachment is ALWAYS `Option<Blob>`, hence the
+        // same expression whether or not the field was declared nullable.
+        let attachment = csv_value_expr(&csv_test_field("cover", FieldKind::Attachment, false));
+        assert_eq!(
+            attachment,
+            "self.cover.as_ref().map(|blob| blob.key.clone()).unwrap_or_default()"
+        );
+        assert_eq!(
+            csv_value_expr(&csv_test_field("cover", FieldKind::Attachment, true)),
+            attachment
+        );
+        assert_eq!(
+            csv_value_expr(&csv_test_field("payload", FieldKind::Bytea, false)),
+            "String::from_utf8_lossy(&self.payload).into_owned()"
+        );
+        // An `Enum` column's Rust type is the generated enum, NOT `String`
+        // (see `Field::rust_type`), so it must take the `Display` arm rather
+        // than the `.clone()` one — `.clone()` there yields the wrong type.
+        assert_eq!(
+            csv_value_expr(&csv_test_field("status", FieldKind::Enum, false)),
+            "self.status.to_string()"
+        );
+    }
+
+    #[test]
+    fn csv_schema_impl_headers_and_record_stay_the_same_length() {
+        // `export_csv` writes `csv_columns()` as the header row and
+        // `to_csv_record()` as each data row: a length mismatch is a runtime
+        // `UnequalLengths` error on the very first export.
+        let fields = vec![
+            csv_test_field("title", FieldKind::String, false),
+            csv_test_field("views", FieldKind::I64, true),
+            csv_test_field("cover", FieldKind::Attachment, true),
+        ];
+        let rendered = render_csv_schema_impl("Post", &fields);
+        let headers = rendered
+            .split_once("&[")
+            .expect("csv_columns literal")
+            .1
+            .split_once(']')
+            .expect("csv_columns literal end")
+            .0;
+        let record = rendered
+            .split_once("vec![")
+            .expect("to_csv_record literal")
+            .1
+            .split_once("\n        ]")
+            .expect("to_csv_record literal end")
+            .0;
+        assert_eq!(
+            headers.matches('"').count() / 2,
+            record
+                .lines()
+                .filter(|l| l.trim_end().ends_with(','))
+                .count(),
+            "csv_columns and to_csv_record must have one entry each:\n{rendered}"
+        );
+        // id first, created_at last, declared columns in between.
+        assert!(
+            headers.starts_with("\"id\"") && headers.ends_with("\"created_at\""),
+            "{headers}"
+        );
     }
 
     #[test]

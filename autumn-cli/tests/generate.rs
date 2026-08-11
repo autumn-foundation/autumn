@@ -819,6 +819,9 @@ fn generate_scaffold_full_e2e_post() {
         // Issue #1312: the bulk delete-selected route is mounted alongside the
         // per-row destroy for every non-live, non-sharded HTML scaffold.
         "routes::posts::bulk_delete",
+        // Issue #1315: the CSV export route is mounted for every scaffold whose
+        // index row set is a repository call the export can reuse verbatim.
+        "routes::posts::export_csv",
         "repositories::post::post_api_list",
         "repositories::post::post_api_get",
     ] {
@@ -1260,8 +1263,20 @@ fn generate_scaffold_accepts_metadata_flags() {
     assert!(routes.contains("<Bookmark as autumn_web::form::FormModel>::form_fields()"));
     assert!(routes.contains("autumn_web::form::form_for(changeset, action, \"post\")"));
     assert!(!routes.contains("autumn_web::form::required_text_input(&changeset"));
-    // `alive` is defaulted → excluded from the form entirely.
-    assert!(!routes.contains("\"alive\""));
+    // `alive` is defaulted → excluded from the FORM entirely. Scoped to the
+    // generated form struct + its `form_fields` descriptors rather than the whole
+    // file: since issue #1315 the module also carries a `CsvSchema` impl, whose
+    // column list is the MODEL's columns (what `show` renders), not the form's —
+    // a defaulted column is still data an author downloading a spreadsheet wants.
+    // The ONE remaining `"alive"` string in the module is that CSV header; the
+    // form struct, its descriptors and every rendered control are free of it.
+    assert_eq!(
+        routes.matches("\"alive\"").count(),
+        1,
+        "`alive` is defaulted: its only quoted mention may be the CSV header:\n{routes}"
+    );
+    assert!(routes.contains(r#"&["id", "url", "title", "tag", "alive", "created_at"]"#));
+    assert!(routes.contains("self.alive.to_string(),"));
     assert!(routes.contains("bookmarks::tag.eq(new.tag.clone())"));
     assert!(!routes.contains("bookmarks::alive.eq("));
     assert!(!routes.contains("new.alive"));
