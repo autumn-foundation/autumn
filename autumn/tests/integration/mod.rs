@@ -74,6 +74,13 @@ mod failure_capsule_capture;
     not(feature = "sqlite")
 ))]
 mod failure_capsule_db;
+#[cfg(all(
+    feature = "reporting",
+    feature = "db",
+    feature = "test-support",
+    not(feature = "sqlite")
+))]
+mod failure_capsule_end_to_end;
 #[cfg(all(feature = "reporting", feature = "db", not(feature = "sqlite")))]
 mod failure_capsule_replay;
 mod fake_generators;

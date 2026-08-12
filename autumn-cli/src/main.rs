@@ -36,6 +36,7 @@ mod pg;
 mod plugin_check;
 mod process;
 mod release;
+mod replay;
 mod routes;
 mod routes_audit;
 mod scaling_driver;
@@ -570,6 +571,36 @@ enum Commands {
         /// Model to fake rows for (e.g. `Post`). Requires --count.
         #[arg(long, requires = "count")]
         model: Option<String>,
+    },
+    /// Replay a recorded failure capsule against the application.
+    ///
+    /// A capsule is written by `[failure_capture] enabled = true` whenever a
+    /// request fails (a 5xx or a caught panic). Replaying one rebuilds the app
+    /// offline — the clock and the database are served from the capsule, no
+    /// socket is opened — drives the recorded request through it, and reports
+    /// whether the failure still happens.
+    ///
+    /// Exit codes: 0 the failure reproduced, 1 it did not (a mismatch, or the
+    /// code left the recorded database tape), 2 the capsule was refused and
+    /// nothing was replayed.
+    ///
+    /// # Examples
+    ///
+    ///   autumn replay tmp/autumn-capsules/01JB2K7Q.json
+    ///   autumn replay --package api tmp/autumn-capsules/01JB2K7Q.json
+    #[command(verbatim_doc_comment)]
+    Replay {
+        /// Path to the capsule JSON file to replay.
+        capsule: String,
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        #[arg(long, default_value = "dev")]
+        profile: String,
     },
     /// Run or list one-off operational tasks registered by the application.
     Task {
@@ -3095,6 +3126,12 @@ fn run_command(command: Commands) {
             count,
             model,
         } => seed::run(&profile, package.as_deref(), count, model.as_deref()),
+        Commands::Replay {
+            capsule,
+            package,
+            bin,
+            profile,
+        } => run_replay_command(&capsule, package.as_deref(), bin.as_deref(), &profile),
         Commands::Task {
             package,
             bin,
@@ -3507,6 +3544,15 @@ fn run_command(command: Commands) {
             }
         }
     }
+}
+
+fn run_replay_command(capsule: &str, package: Option<&str>, bin: Option<&str>, profile: &str) {
+    replay::run(&replay::ReplayOptions {
+        capsule,
+        package,
+        bin,
+        profile,
+    });
 }
 
 fn run_task_command(

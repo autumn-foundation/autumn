@@ -2794,6 +2794,32 @@ impl AppBuilder {
             return;
         }
 
+        // ── Capsule replay mode ────────────────────────────────────────
+        // When AUTUMN_REPLAY_CAPSULE=<path> is set, rebuild this application
+        // offline, drive the request the capsule recorded through it, print the
+        // verdict and EXIT — never start the HTTP server, never open a socket
+        // (issue #1598). Triggered by `autumn replay <capsule>`.
+        if is_replay_mode()
+            && let Some(capsule_path) = replay_capsule_from_env()
+        {
+            #[cfg(feature = "reporting")]
+            {
+                self.run_replay_mode(capsule_path).await;
+                return;
+            }
+            // Capsules are a `reporting`-feature surface; without it there is
+            // nothing to load the document with. Refuse (exit 2) rather than
+            // silently booting a server the operator did not ask for.
+            #[cfg(not(feature = "reporting"))]
+            {
+                eprintln!(
+                    "REFUSED  {capsule_path}\n  this binary was built without the `reporting` \
+                     feature, which failure capsules require"
+                );
+                std::process::exit(2);
+            }
+        }
+
         let Self {
             routes,
             api_versions,
@@ -5580,6 +5606,15 @@ impl AppBuilder {
             }
         }
     }
+
+    /// Replay a failure capsule against this application and exit with the
+    /// verdict (issue #1598).
+    #[cfg(feature = "reporting")]
+    async fn run_replay_mode(self, capsule_path: String) {
+        let _ = capsule_path;
+        eprintln!("capsule replay is not implemented");
+        std::process::exit(1);
+    }
 }
 
 pub(crate) fn is_static_build_mode() -> bool {
@@ -5632,6 +5667,27 @@ pub(crate) fn is_list_one_off_tasks_mode() -> bool {
 /// traffic is flipped to the new release.
 pub(crate) fn is_migrate_only_mode() -> bool {
     std::env::var("AUTUMN_MIGRATE").as_deref() == Ok("1")
+}
+
+/// Whether `AUTUMN_REPLAY_CAPSULE=<path>` requests the capsule-replay one-shot:
+/// rebuild the app offline, replay the recorded request, print the verdict and
+/// exit without starting the HTTP server. Set by `autumn replay` (issue #1598).
+pub(crate) fn is_replay_mode() -> bool {
+    replay_capsule_from_env().is_some()
+}
+
+/// The capsule path `AUTUMN_REPLAY_CAPSULE` names, if it names one.
+fn replay_capsule_from_env() -> Option<String> {
+    std::env::var("AUTUMN_REPLAY_CAPSULE")
+        .ok()
+        .as_deref()
+        .and_then(normalize_replay_capsule)
+}
+
+/// Trim a raw `AUTUMN_REPLAY_CAPSULE` value; a blank one selects no mode.
+fn normalize_replay_capsule(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn one_off_task_name_from_env() -> Option<String> {
@@ -10472,6 +10528,144 @@ mod tests {
             helper.contains("std::process::exit(1)"),
             "a failed migration must exit non-zero (abort before cutover)"
         );
+    }
+
+    /// The replay handler's source, between its signature and the next
+    /// top-level item after the `AppBuilder` impl block.
+    #[cfg(feature = "reporting")]
+    fn replay_mode_source(source: &str) -> &str {
+        let start = source
+            .find("async fn run_replay_mode(self, capsule_path: String)")
+            .expect("replay handler exists");
+        let end = source
+            .find("pub(crate) fn is_static_build_mode()")
+            .expect("the mode predicates follow the AppBuilder impl block");
+        source
+            .get(start..end)
+            .expect("the replay handler precedes the mode predicates")
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_one_shot_runs_before_server_start() {
+        // `AUTUMN_REPLAY_CAPSULE=<path>` (set by `autumn replay`) must select an
+        // early one-shot: rebuild the app, replay the recorded request, print a
+        // verdict, exit. The runtime effect ends in `process::exit`, so — like
+        // the migrate one-shot above — the *dispatch decision* and the
+        // *offline contract* are locked structurally here, and the behaviour is
+        // exercised end-to-end by `failure_capsule_end_to_end`.
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let run_start = source.find("pub async fn run(self)").expect("run() exists");
+        let run_end = source
+            .find("async fn run_build_mode(self)")
+            .expect("build mode follows run()");
+        let run_body = source
+            .get(run_start..run_end)
+            .expect("run() precedes build mode");
+
+        let dispatch = run_body
+            .find("if is_replay_mode()")
+            .expect("run() dispatches the replay one-shot");
+        let server_start = run_body
+            .find("let Self {")
+            .expect("run() destructures self to start the server");
+        assert!(
+            dispatch < server_start,
+            "AUTUMN_REPLAY_CAPSULE must be handled before the server-start path"
+        );
+        let replay_branch = run_body
+            .get(dispatch..server_start)
+            .expect("the dispatch precedes server start");
+        assert!(
+            replay_branch.contains("self.run_replay_mode(capsule_path).await;")
+                && replay_branch.contains("return;"),
+            "the replay one-shot must run then return before server start"
+        );
+
+        let handler = replay_mode_source(&source);
+        assert!(
+            handler.contains("std::process::exit("),
+            "the replay handler exits with the verdict's code"
+        );
+        assert!(
+            !handler.contains("axum::serve"),
+            "the replay one-shot must never start the server"
+        );
+
+        // It rebuilds the real thing: same router builder, same state
+        // initializers, same policy registrations as the serving path — a
+        // replay against a stripped-down router would not be a replay (R6).
+        assert!(
+            handler.contains("crate::capsule::load_capsule(")
+                && handler.contains("crate::capsule::execute(")
+                && handler.contains("crate::capsule::print_verdict("),
+            "the replay handler loads the capsule, executes it and prints a verdict"
+        );
+        assert!(
+            handler.contains("crate::router::try_build_router_inner(")
+                && handler.contains("run_state_initializers(state_initializers, &state);")
+                && handler.contains("register(state.policy_registry());"),
+            "the replay handler must rebuild the app's real router and state"
+        );
+
+        // F15: replay is offline. No migrations, no job runtime, no scheduler,
+        // no external session/cache backend — and it must not arm capture
+        // against the stub pool.
+        assert!(
+            !handler.contains("setup_database(")
+                && !handler.contains("initialize_job_runtime")
+                && !handler.contains("start_task_scheduler")
+                && !handler.contains("preflight_storage(")
+                && !handler.contains("install_from_config("),
+            "replay must not run migrations, job workers, storage preflight or capture"
+        );
+        assert!(
+            handler.contains("force_offline_replay_config(&mut config);"),
+            "the replay handler must force the offline configuration knobs"
+        );
+
+        let forcer_start = source
+            .find("fn force_offline_replay_config(")
+            .expect("the offline-knob helper exists");
+        let forcer = source
+            .get(forcer_start..forcer_start.saturating_add(2_000))
+            .unwrap_or_default();
+        assert!(
+            forcer.contains("SessionBackend::Memory"),
+            "replay must force the in-memory session store (no Redis)"
+        );
+        assert!(
+            forcer.contains("failure_capture.enabled = false"),
+            "replay must not capture a capsule of the replay itself"
+        );
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_mode_reads_capsule_env_var() {
+        temp_env::with_var("AUTUMN_REPLAY_CAPSULE", Some("tmp/capsules/abc.json"), || {
+            assert!(is_replay_mode(), "a capsule path selects the replay path");
+            assert_eq!(
+                replay_capsule_from_env().as_deref(),
+                Some("tmp/capsules/abc.json")
+            );
+        });
+        temp_env::with_var("AUTUMN_REPLAY_CAPSULE", Some("  spaced.json  "), || {
+            assert_eq!(
+                replay_capsule_from_env().as_deref(),
+                Some("spaced.json"),
+                "a shell-quoted path must be trimmed"
+            );
+        });
+        temp_env::with_var("AUTUMN_REPLAY_CAPSULE", Some("   "), || {
+            assert!(
+                !is_replay_mode(),
+                "a blank value must fall through to the normal boot path"
+            );
+        });
+        temp_env::with_var("AUTUMN_REPLAY_CAPSULE", None::<&str>, || {
+            assert!(!is_replay_mode(), "unset must not select the replay path");
+        });
     }
 
     #[cfg(feature = "db")]
