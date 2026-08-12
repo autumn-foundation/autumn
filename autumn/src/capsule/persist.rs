@@ -60,6 +60,49 @@ use crate::capsule::schema::{
 /// prevent.
 const PRUNE_GRACE: TimeDelta = TimeDelta::minutes(1);
 
+/// Capsules whose paths a reporter chain is currently reading.
+///
+/// The grace window covers the common case, but a slow reporter can outlast
+/// it; `ErrorEvent::capsule` promises a readable path for as long as the
+/// reporters run, so the reporting task pins the file here for that whole
+/// span and [`prune`] leaves pinned paths alone. Reference-counted, because
+/// overlapping failures can pin the same directory's files independently.
+static PINNED_FOR_REPORTING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Keeps a capsule file unprunable while a reporter chain holds it.
+#[derive(Debug)]
+pub(crate) struct ReportingPin(PathBuf);
+
+impl Drop for ReportingPin {
+    fn drop(&mut self) {
+        if let Ok(mut pinned) = PINNED_FOR_REPORTING.lock()
+            && let Some(count) = pinned.get_mut(&self.0)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pinned.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Pin `path` against pruning until the returned guard drops.
+pub(crate) fn pin_for_reporting(path: &Path) -> ReportingPin {
+    if let Ok(mut pinned) = PINNED_FOR_REPORTING.lock() {
+        *pinned.entry(path.to_path_buf()).or_insert(0) += 1;
+    }
+    ReportingPin(path.to_path_buf())
+}
+
+/// Whether a reporter chain is still reading this capsule.
+fn is_pinned_for_reporting(path: &Path) -> bool {
+    PINNED_FOR_REPORTING
+        .lock()
+        .is_ok_and(|pinned| pinned.contains_key(path))
+}
+
 /// Where a persisted capsule ended up.
 ///
 /// Carried on [`ErrorEvent::capsule`](crate::reporting::ErrorEvent::capsule) so
@@ -341,7 +384,7 @@ fn prune(dir: &Path, keep: usize, now: DateTime<Utc>) {
     names.sort();
     let excess = names.len().saturating_sub(keep);
     for path in names.into_iter().take(excess) {
-        if written_within_grace(&path, now) {
+        if written_within_grace(&path, now) || is_pinned_for_reporting(&path) {
             continue;
         }
         if let Err(error) = std::fs::remove_file(&path) {
@@ -388,6 +431,35 @@ pub fn load_capsule(path: &Path) -> Result<Capsule, CapsuleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pinned_capsule_survives_pruning_past_the_grace_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Names old enough that the grace window has long lapsed; only the
+        // pin can save the first one.
+        let pinned = dir.path().join("20200101T000000.000000-000001-aaa.json");
+        let prunable = dir.path().join("20200101T000001.000000-000002-bbb.json");
+        std::fs::write(&pinned, b"{}").expect("write");
+        std::fs::write(&prunable, b"{}").expect("write");
+
+        let guard = pin_for_reporting(&pinned);
+        prune(dir.path(), 0, Utc::now());
+        assert!(
+            pinned.exists(),
+            "a capsule a reporter chain still holds must not be pruned"
+        );
+        assert!(
+            !prunable.exists(),
+            "an unpinned lapsed capsule prunes as usual"
+        );
+
+        drop(guard);
+        prune(dir.path(), 0, Utc::now());
+        assert!(
+            !pinned.exists(),
+            "dropping the pin makes the capsule prunable again"
+        );
+    }
 
     #[test]
     fn capsule_dir_is_project_relative_by_default() {

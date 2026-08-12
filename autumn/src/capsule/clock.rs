@@ -89,6 +89,18 @@ impl ReplayClock {
     pub fn over_reads(&self) -> usize {
         self.over_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// How many recorded readings were never consumed.
+    ///
+    /// A replayed run that reads the clock fewer times than the recording did
+    /// took a different path through time-dependent code — worth surfacing,
+    /// even though (unlike the database tape) the counts cannot gate the
+    /// verdict: the recording counts only request-scoped reads, while replay
+    /// serves every read of the process clock from this queue.
+    #[must_use]
+    pub fn unconsumed(&self) -> usize {
+        self.readings.lock().map_or(0, |readings| readings.len())
+    }
 }
 
 impl ClockSource for ReplayClock {
@@ -128,6 +140,17 @@ mod tests {
         assert_eq!(clock.now(), at(1));
         assert_eq!(clock.now(), at(2));
         assert_eq!(clock.over_reads(), 0);
+    }
+
+    #[test]
+    fn replay_clock_reports_readings_it_never_served() {
+        let clock = ReplayClock::new(vec![at(1), at(2), at(3)], at(0));
+        assert_eq!(clock.now(), at(1));
+        assert_eq!(
+            clock.unconsumed(),
+            2,
+            "readings the replayed code never asked for must be countable"
+        );
     }
 
     #[test]

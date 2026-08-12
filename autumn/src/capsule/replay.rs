@@ -399,6 +399,14 @@ pub async fn execute(
                  faithful"
             ));
         }
+        let unconsumed = clock.unconsumed();
+        if unconsumed > 0 {
+            warnings.push(format!(
+                "the replayed handler read the clock {unconsumed} fewer time(s) than the recording \
+                 did — a time-dependent branch the recording took was not exercised, so treat a \
+                 reproduced verdict with care"
+            ));
+        }
     }
 
     redaction_warning(capsule, &actual, &mut warnings);
@@ -453,6 +461,19 @@ async fn drive(router: axum::Router, request: Request<Body>) -> CapsuleOutcome {
 /// `reporting::report_response` reads them.
 async fn outcome_from_response(response: axum::response::Response) -> CapsuleOutcome {
     let status = response.status();
+    // A panic the reporting layer caught and converted into a sanitized 500
+    // still carries its identity in the extensions; describe it as the panic
+    // it was, so it is compared against a recorded panic by payload rather
+    // than letting any same-status response pass for it.
+    if let Some(caught) = response.extensions().get::<crate::reporting::CaughtPanic>() {
+        let payload = caught.payload.clone();
+        let _ = axum::body::to_bytes(response.into_body(), MAX_BODY_PEEK).await;
+        return CapsuleOutcome::Panic {
+            status: status.as_u16(),
+            payload,
+            backtrace: None,
+        };
+    }
     let info = response
         .extensions()
         .get::<crate::middleware::exception_filter::AutumnErrorInfo>();
@@ -601,10 +622,14 @@ fn outcomes_match(expected: &CapsuleOutcome, actual: &CapsuleOutcome) -> bool {
                 payload: actual, ..
             },
         ) => panic_payloads_match(expected, actual),
-        (CapsuleOutcome::Panic { status, .. }, CapsuleOutcome::Status { code, .. })
-        | (CapsuleOutcome::Status { code, .. }, CapsuleOutcome::Panic { status, .. }) => {
-            status == code
-        }
+        // A caught panic keeps its identity through the reporting layer (the
+        // `CaughtPanic` response extension), so both sides of a genuinely
+        // reproduced panic present as `Panic` above. A cross-variant pair
+        // therefore means the failure *kind* changed — a fixed panic replaced
+        // by an ordinary error, or the reverse — and a shared status code is
+        // not a reproduction.
+        (CapsuleOutcome::Panic { .. }, CapsuleOutcome::Status { .. })
+        | (CapsuleOutcome::Status { .. }, CapsuleOutcome::Panic { .. }) => false,
     }
 }
 
@@ -915,7 +940,10 @@ mod tests {
 
     #[test]
     fn a_caught_panic_matches_the_recorded_panic_status() {
-        assert!(outcomes_match(&panic_outcome("boom"), &status(500)));
+        // A replayed panic keeps its identity through the reporting layer via
+        // the `CaughtPanic` extension, so a genuine reproduction presents as
+        // Panic↔Panic; a bare status — any status — is a different failure.
+        assert!(!outcomes_match(&panic_outcome("boom"), &status(500)));
         assert!(!outcomes_match(&panic_outcome("boom"), &status(503)));
         assert!(outcomes_match(
             &panic_outcome("boom"),

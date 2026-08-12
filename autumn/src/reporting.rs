@@ -146,6 +146,20 @@ pub struct PanicInfo {
     pub backtrace: Option<String>,
 }
 
+/// Response-extension marker for a panic this layer caught and converted into
+/// a sanitized 500.
+///
+/// The wire never carries the payload — the client sees the generic Problem
+/// Details body — but an in-process caller driving the router directly (the
+/// capsule replay driver) needs to know the 500 *was* a panic, and which one,
+/// so a recorded panic is compared against the replayed panic's identity
+/// rather than against any response that happens to share the status code.
+#[derive(Debug, Clone)]
+pub struct CaughtPanic {
+    /// The panic payload as text, as [`ErrorEvent::message`] would carry it.
+    pub payload: String,
+}
+
 /// A sink for [`ErrorEvent`]s.
 ///
 /// Implement this trait to ship unhandled panics and server errors to an
@@ -241,9 +255,19 @@ impl ReporterChain {
             let chain = Arc::clone(self);
             handle.spawn(async move {
                 let mut event = event;
-                if let Some(capture) = capture {
-                    event.capsule = persist_capsule(capture).await;
-                }
+                // Held for the whole reporter chain: the capsule must stay
+                // out of pruning's reach until every reporter has had its
+                // chance to read the referenced file — a slow reporter must
+                // not outlive its evidence.
+                let _pin = match capture {
+                    Some(capture) => {
+                        event.capsule = persist_capsule(capture).await;
+                        event.capsule.as_ref().map(|capsule| {
+                            crate::capsule::persist::pin_for_reporting(&capsule.path)
+                        })
+                    }
+                    None => None,
+                };
                 if deliver {
                     chain.report_all(&event).await;
                 }
@@ -678,8 +702,16 @@ fn handle_panic(
     // The client gets a clean, sanitized Problem Details 500 — the panic
     // payload only ever reaches the reporter, never the wire. The
     // `AutumnErrorInfo` stashed by `into_response` lets the exception-filter
-    // chain negotiate HTML error pages as usual.
-    crate::error::AutumnError::internal_server_error_msg("Internal server error").into_response()
+    // chain negotiate HTML error pages as usual. The `CaughtPanic` extension
+    // is in-process metadata for the replay driver; extensions are never
+    // serialized onto the wire.
+    let mut response =
+        crate::error::AutumnError::internal_server_error_msg("Internal server error")
+            .into_response();
+    response.extensions_mut().insert(CaughtPanic {
+        payload: format_panic_payload(payload),
+    });
+    response
 }
 
 #[cfg(test)]

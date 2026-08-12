@@ -216,6 +216,20 @@ pub fn mask_binds(binds: &mut [BindValue], redacted: &RedactedValues) {
     }
 }
 
+/// Headers the capsule masks unconditionally, over and above the filter.
+///
+/// These carry credentials by construction, but their names do not normalize
+/// onto any `DEFAULT_FILTER_KEYS` entry (`proxy-authorization` →
+/// `proxyauthorization` ≠ `authorization`), so an exact-match filter would
+/// copy them verbatim. A capsule is a production-data artifact; a standard
+/// credential header must never depend on app configuration to be masked.
+const ALWAYS_SENSITIVE_HEADERS: &[&str] = &["proxy-authorization"];
+
+/// Whether a header must be masked out of the capsule.
+fn header_is_sensitive(name: &str, filter: &ParameterFilter) -> bool {
+    filter.matches_key(name) || ALWAYS_SENSITIVE_HEADERS.contains(&name)
+}
+
 /// Copy the headers in wire order, replacing sensitive values.
 fn redact_headers(
     headers: &axum::http::HeaderMap,
@@ -226,7 +240,7 @@ fn redact_headers(
     let mut out = Vec::with_capacity(headers.len());
     for (name, value) in headers {
         let name = name.as_str().to_owned();
-        if filter.matches_key(&name) {
+        if header_is_sensitive(&name, filter) {
             values.insert(value.as_bytes());
             keys.insert(format!("header:{name}"));
             out.push((name, FILTERED_PLACEHOLDER.to_owned()));
@@ -638,6 +652,25 @@ mod tests {
             mask_echoes("the 123rd attempt", &values),
             "the 123rd attempt",
             "substring masking keeps its length floor"
+        );
+    }
+
+    #[test]
+    fn proxy_authorization_is_masked_unconditionally() {
+        let (request, values) = redact(
+            Request::get("/x").header("proxy-authorization", "Basic cHJveHk6c2VjcmV0cGFzcw=="),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert_eq!(
+            header_value(&request, "proxy-authorization"),
+            FILTERED_PLACEHOLDER,
+            "a standard credential header must not depend on app config to be masked"
+        );
+        assert!(
+            values.contains(b"Basic cHJveHk6c2VjcmV0cGFzcw=="),
+            "the masked value must join the echo set"
         );
     }
 
