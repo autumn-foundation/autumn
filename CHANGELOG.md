@@ -55,11 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marked `unique` (it is DB-managed and defaults to 0, so a unique index would
   reject the second row ever created), and one declared as a scaffold's *only*
   column (the insert struct would be empty and would not compile) are all
-  rejected at generation time rather than silently mis-generated. `--live`,
-  `--sharded`, a `slug` column, and scaffolds with an `Attachment` column write
-  through paths that do not route via the guarded statement, so combining them
-  with `lock_version` is refused up front instead of emitting an edit form that
-  only looks concurrency-safe. (`slug` in particular keys the update off an
+  rejected at generation time rather than silently mis-generated. On HTML scaffolds,
+  `--live`, `--sharded`, a `slug` column, and scaffolds with an `Attachment`
+  column write through paths that do not route via the guarded statement, so
+  combining them with `lock_version` is refused up front instead of emitting an
+  edit form that only looks concurrency-safe (`--api` is exempt from those
+  gates: it emits no form, so `--api --live` and friends keep generating). (`slug` in particular keys the update off an
   editable, reusable identifier, so `WHERE slug = ... AND lock_version = ...`
   would not pin a stable row.) The scaffolded **admin** update and the delete
   actions still bump-or-write without a guard and remain last-write-wins;

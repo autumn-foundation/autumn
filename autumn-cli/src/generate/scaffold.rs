@@ -452,10 +452,14 @@ fn plan_scaffold_with_options_impl(
     // while the write still clobbers. Refuse the combination up front rather
     // than ship silently lossy code (same posture as the `slug` gates above).
     //
-    // `--api` is deliberately NOT gated: it emits no HTML form to wire, and the
-    // model's `#[lock_version]` makes the repository's own JSON update
-    // conflict-check for free.
-    if super::model::lock_version_field(&fields).is_some() {
+    // `--api` is exempt outright — including `--api --live`, `--api --sharded`
+    // and the rest. Those variants only ever change the HTML surface, and an
+    // `--api` scaffold emits no routes file at all, so there is no form and no
+    // raw-diesel update to be inconsistent with. The model's `#[lock_version]`
+    // still lands, which is what makes the repository's own JSON update
+    // conflict-check. Refusing them would break combinations that generated
+    // fine before this feature existed.
+    if !options.api && super::model::lock_version_field(&fields).is_some() {
         // `--live-validation` is supported: it changes only how the form's
         // controls are rendered (raw htmx inputs instead of `form_for`), while
         // its `update` still writes through the same raw-diesel statement.
@@ -17301,6 +17305,61 @@ exempt_paths = [
             assert!(
                 msg.contains("lock_version"),
                 "the {label} refusal must name lock_version: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_scaffolds_are_exempt_from_every_variant_gate() {
+        // `--api` emits no routes file, so none of the HTML-surface variants
+        // can be inconsistent with a guarded update that does not exist. These
+        // combinations generated fine before #1318 and must keep doing so; the
+        // model attribute still lands, which is what conflict-checks the JSON
+        // update. (`--api` is NOT exempt from the empty-insert-struct guard —
+        // that one is about `New{Model}`, which every variant emits.)
+        for (label, cols, options) in [
+            (
+                "--api --live",
+                vec!["title:String".to_owned(), "lock_version:i32".to_owned()],
+                ScaffoldOptions {
+                    api: true,
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--api --sharded",
+                vec!["title:String".to_owned(), "lock_version:i32".to_owned()],
+                ScaffoldOptions {
+                    api: true,
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".to_owned()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "--api + attachment",
+                vec![
+                    "title:String".to_owned(),
+                    "cover:Attachment".to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions {
+                    api: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let plan =
+                plan_scaffold_with_options(tmp.path(), "Post", &cols, "20260427000000", &options);
+            assert!(
+                plan.is_ok(),
+                "{label} + lock_version must still generate: {:?}",
+                plan.err()
             );
         }
     }

@@ -351,9 +351,10 @@ lock_version + 1` in one statement, and a **409 re-render** of that same form â€
 author's input intact, inline `role="alert"` banner, the row's *current*
 version in the hidden field so a second Save applies their edit on top. A
 missing row is still 404. `:states(...)` transitions bump the version too.
-Refused (not silently half-wired) with `--live`, `--sharded`, a `slug` column,
-an `Attachment` field, as the only column, or marked `:unique`;
-`--live-validation` is supported. The scaffolded **admin** update and the
+On HTML scaffolds, refused (not silently half-wired) with `--live`,
+`--sharded`, a `slug` column, or an `Attachment` field; `--live-validation` is
+supported and `--api` is exempt from those gates (no form to wire). Never
+allowed as a model's only insertable column or marked `:unique`. The scaffolded **admin** update and the
 delete actions remain last-write-wins.
 
 ## Db transactions

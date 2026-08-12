@@ -871,10 +871,13 @@ deserializes `NewPost`, which excludes the column, so the expected
 version never reaches it, and locking across deletes is out of scope
 (issues #1021/#1312). Both remain last-write-wins.
 
-**Not yet wired:** `--live`, `--sharded`, a `slug` column, and scaffolds
-with an `Attachment` column write through paths that do not route via the
-guarded statement, so combining them with `lock_version` is refused up
-front instead of emitting an edit form that only looks concurrency-safe.
+**Not yet wired (HTML scaffolds only):** `--live`, `--sharded`, a `slug`
+column, and scaffolds with an `Attachment` column write through paths that
+do not route via the guarded statement, so combining them with
+`lock_version` is refused up front instead of emitting an edit form that
+only looks concurrency-safe. `--api` is exempt from all of these — it emits
+no routes file, so there is no form to be inconsistent with, and
+`--api --live` and friends keep generating.
 (`slug` is refused because a slug scaffold keys its update off the
 editable, reusable slug rather than the primary key, so
 `WHERE slug = … AND lock_version = …` does not identify a stable row.)
