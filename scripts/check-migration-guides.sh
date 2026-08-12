@@ -213,6 +213,19 @@ function expand_tabs(text,   out, i, n, ch, col) {
   return out
 }
 
+function marker_interrupts(body,   n, ch) {
+  # A bullet may interrupt a paragraph; an ordered marker may only when its
+  # number is 1. So after a marked paragraph `2.` is a lazy continuation and
+  # its link belongs to that entry, while `1.` starts a list of its own and
+  # takes its link with it.
+  ch = substr(body, 1, 1)
+  if (ch == "-" || ch == "*" || ch == "+") return 1
+  n = 0
+  while (substr(body, n + 1, 1) ~ /^[0-9]$/) n++
+  if (n == 0) return 0
+  return (substr(body, 1, n) + 0) == 1
+}
+
 function list_marker_width(text,   body, n, ch, pad) {
   # Width of a list marker at the start of `text` (already dedented), counting
   # the marker and the whitespace after it; 0 when this is not a list item.
@@ -1062,6 +1075,10 @@ findings="$(
       }
     } else {
       if (entry_is_paragraph == 0) section_has_list = 1
+      # Link destinations and titles are metadata, not rendered prose: a URL
+      # ending `/breaking-changes` describes nothing, and reading it rejected
+      # ordinary documentation entries.
+      lower = tolower(mask_link_metadata(prose))
       # Fold to alpha-only words so "non-breaking" and "non breaking" are the
       # same token and word boundaries need no \b (mawk has none).
       gsub(/[^a-z]+/, " ", lower)
@@ -1171,7 +1188,8 @@ findings="$(
   # column instead left a middle band — deeper than the marker, left of the
   # content — where the bullet was neither, and the line was dropped outright.
   list_marker_width(dedent3(visible)) > 0 &&
-  (entry == "" || leading_spaces(visible) < entry_content_indent) {
+  (entry == "" || leading_spaces(visible) < entry_content_indent ||
+   (entry_is_paragraph && marker_interrupts(dedent3(visible)))) {
     flush_entry()
     entry_line = FNR
     entry_breaking_heading = breaking_heading

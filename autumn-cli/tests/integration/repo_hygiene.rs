@@ -6088,3 +6088,100 @@ fn migration_guide_gate_still_honours_a_real_suppression_beside_a_link() {
         gate_report(&output),
     );
 }
+
+// --- Review round 47: link targets, ordered-marker interruption -----------
+
+#[test]
+fn migration_guide_gate_ignores_the_word_breaking_in_a_link_target() {
+    // A destination is metadata, not rendered prose, so a URL that happens to
+    // contain "breaking" does not describe a break. The lint read it and
+    // rejected an ordinary documentation entry.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **api:** an addition, see \
+           [compatibility note](https://example.invalid/breaking-changes).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a word in a URL is not prose describing a break\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_lets_a_non_one_ordered_marker_continue_a_paragraph() {
+    // Only a `1.` ordered marker may interrupt a paragraph. After a marked
+    // *paragraph*, `2.` is a lazy continuation — the reference implementation
+    // renders both lines inside one `<p>` — so its link is the entry's link.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         **Breaking:** renamed.\n\
+         2. [migration guide](docs/migrations/0.7.0.md)\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "`2.` cannot interrupt a paragraph, so it continues it\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_keeps_a_non_one_marker_a_sibling_of_a_list_item() {
+    // The counterpart that stops the rule spreading: after a *list item*,
+    // `2.` is a sibling item rather than a continuation, so its link belongs
+    // to that new item and not to the breaking entry above it. Verified
+    // against the reference implementation, which emits a separate `<ol>`.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **Breaking:** renamed, with no link of its own.\n\
+         2. [migration guide](docs/migrations/0.7.0.md)\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "after a list item a numbered marker opens a sibling",
+    );
+}
+
+#[test]
+fn migration_guide_gate_lets_a_one_marker_interrupt_a_paragraph() {
+    // And the other boundary: `1.` *may* interrupt a paragraph, so it starts
+    // its own list and takes its link with it.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         **Breaking:** renamed, with no link of its own.\n\
+         1. [migration guide](docs/migrations/0.7.0.md)\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "`1.` interrupts the paragraph and takes its link with it",
+    );
+}
