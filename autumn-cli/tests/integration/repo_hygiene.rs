@@ -7052,3 +7052,106 @@ fn migration_guide_gate_treats_a_lowercase_declaration_as_a_raw_block() {
         gate_report(&output),
     );
 }
+
+// --- Review round 58: escaped title delimiters, whitespace entities -------
+
+#[test]
+fn migration_guide_gate_rejects_a_definition_with_an_escaped_title_delimiter() {
+    // `"unterminated\"` leaves the title unclosed, so CommonMark creates no
+    // definition — both lines render as paragraphs. Finding the closer with a
+    // plain search accepted the escaped quote and recorded a definition that
+    // does not exist.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n\n\
+         [upgrade]: docs/migrations/0.7.0.md \"unterminated\\\"\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an escaped quote does not close the title, so nothing is defined",
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_accepts_a_closed_definition_title() {
+    // The counterpart: a title that does close leaves the definition intact.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][upgrade].\n\n\
+         [upgrade]: docs/migrations/0.7.0.md \"why it broke\"\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a closed title still leaves a working definition\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_count_whitespace_entities_as_content() {
+    // `&nbsp;` renders as a blank paragraph — the reference implementation
+    // emits `<p> </p>` — so a required section holding only one carries no
+    // instructions, whatever the source text looks like.
+    for entity in ["&nbsp;", "&#160;", "&#xa0;"] {
+        let tmp = migration_gate_fixture("0.7.0");
+        let guide = valid_migration_guide("0.7.0").replace("Why this release breaks.", entity);
+        write_fixture_guide(&tmp, "0.7.0", &guide);
+        std::fs::write(
+            tmp.path().join("CHANGELOG.md"),
+            "# Changelog\n\n\
+             ## [0.7.0] - 2026-09-01\n\n\
+             ### Changed\n\n\
+             - **db:** **Breaking:** renamed. See the \
+               [migration guide](docs/migrations/0.7.0.md).\n",
+        )
+        .expect("changelog");
+
+        let output = run_migration_gate(tmp.path());
+        assert!(
+            !output.status.success(),
+            "`{entity}` renders blank and is not guidance\n{}",
+            gate_report(&output),
+        );
+    }
+}
+
+#[test]
+fn migration_guide_gate_counts_prose_containing_an_entity() {
+    // The counterpart: an entity beside real words is ordinary writing, and
+    // the section is populated by the words.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0")
+        .replace("Why this release breaks.", "Why&nbsp;this release breaks.");
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an entity inside prose does not make the prose vanish\n{}",
+        gate_report(&output),
+    );
+}

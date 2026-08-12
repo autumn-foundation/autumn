@@ -480,6 +480,16 @@ function block_body(text,   strip) {
   return dedent3(substr(expand_tabs(text), strip + 1))
 }
 
+function decode_space_entities(text,   out) {
+  # `&nbsp;` and friends render as blank space, so a required section holding
+  # only them carries no instructions however the source reads.
+  out = text
+  gsub(/&[nN][bB][sS][pP];|&[eE][nN][sS][pP];|&[eE][mM][sS][pP];|&[tT][hH][iI][nN][sS][pP];/, " ", out)
+  gsub(/&#0*32;|&#0*160;/, " ", out)
+  gsub(/&#[xX]0*[aA]0;|&#[xX]0*20;/, " ", out)
+  return out
+}
+
 function strip_inline_tags(text,   out, i, n, at) {
   # What a reader is left with once the tags are gone. `<span></span>` has
   # source text but renders nothing, so a required section holding only it is
@@ -1155,7 +1165,7 @@ collect_link_defs() {
     #
     # Lines are buffered until the definition either completes or is ruled out,
     # which is what makes both of those cases decidable at all.
-    function flush_def(   dest, rest, ch, closer, sq, gap) {
+    function flush_def(   dest, rest, ch, closer, sq, gap, close_at) {
       if (pending == "") return
       sq = sprintf("%c", 39)
       rest = pending_rest
@@ -1185,8 +1195,11 @@ collect_link_defs() {
         ch = substr(rest, 1, 1)
         if (!gap || (ch != "\"" && ch != sq && ch != "(")) { pending = ""; return }
         closer = ch == "(" ? ")" : ch
-        if (index(substr(rest, 2), closer) == 0) return   # title may continue below
-        rest = substr(rest, index(substr(rest, 2), closer) + 2)
+        # The closer has to be unescaped: `"unterminated\\"` leaves the title
+        # open, so CommonMark creates no definition at all.
+        close_at = unescaped_index(rest, closer, 2)
+        if (close_at == 0) return                        # title may continue below
+        rest = substr(rest, close_at + 1)
         if (rest ~ /[^[:space:]]/) { pending = ""; return }
       }
       if (dest != "") printf "%s\t%s\n", pending, dest
@@ -1801,7 +1814,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           } else if (pending_title && strip_inline_tags(visible) ~ /^[[:space:]]*[^[:space:]]+[[:space:]]*$/) {
             # The destination, alone on the line below its opener.
             pending_title = 0
-          } else if (strip_inline_tags(visible) ~ /[^[:space:]]/ &&
+          } else if (strip_inline_tags(decode_space_entities(visible)) ~ /[^[:space:]]/ &&
                      !is_thematic_break(visible) && !is_empty_list_item(visible)) {
             pending_title = 0
             for (lvl = 1; lvl <= 6; lvl++) {
