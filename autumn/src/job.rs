@@ -3,6 +3,13 @@
 //! Provides [`JobInfo`] metadata used by `#[job]` and `jobs![]`, plus local
 //! and Redis-backed queue backends.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -1011,11 +1018,20 @@ struct JobAdminStoredRecord {
 }
 
 impl JobAdminStoredRecord {
+    /// Sort key for the admin dashboard: the newest timestamp the record
+    /// carries, newest-first after the caller's `reverse()`.
+    ///
+    /// A record with no timestamp at all sorts as if it were the newest thing
+    /// in the list. That used to be spelled `unwrap_or_else(Utc::now)`, which
+    /// both read the clock off-seam and made an ordering depend on when the
+    /// dashboard happened to be rendered; `MAX_UTC` expresses the same
+    /// "sorts newest" intent as a constant, since every real recorded timestamp
+    /// is in the past.
     fn sort_time(&self) -> chrono::DateTime<chrono::Utc> {
         self.finished_at
             .or(self.started_at)
             .or(self.enqueued_at)
-            .unwrap_or_else(chrono::Utc::now)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
     }
 
     fn to_public(&self) -> JobAdminRecord {
@@ -1816,28 +1832,36 @@ enum RedisStaleRecovery {
     DeadLetter(RedisJobRecord),
 }
 
+/// Rate-limits a periodic maintenance sweep inside the redis worker loop.
+///
+/// Deadlines are [`tokio::time::Instant`]s, not `std::time::Instant`s, because
+/// the thing that wakes this loop is `tokio::time::sleep` — a throttle is only
+/// meaningful against its own counterparty, and putting both on tokio's
+/// timeline keeps them from disagreeing. It also makes the throttle virtual for
+/// free: `Sim::advance` steps tokio's paused timer wheel, so a `#[sim_test]`
+/// drives these sweeps deterministically with no real waiting.
 #[cfg(feature = "redis")]
 struct RedisMaintenanceThrottle {
-    next_run_at: std::time::Instant,
+    next_run_at: tokio::time::Instant,
     interval: std::time::Duration,
 }
 
 #[cfg(feature = "redis")]
 impl RedisMaintenanceThrottle {
-    const fn new(now: std::time::Instant, interval: std::time::Duration) -> Self {
+    const fn new(now: tokio::time::Instant, interval: std::time::Duration) -> Self {
         Self {
             next_run_at: now,
             interval,
         }
     }
 
-    fn take_due(&mut self, now: std::time::Instant) -> bool {
+    fn take_due(&mut self, now: tokio::time::Instant) -> bool {
         if now < self.next_run_at {
             return false;
         }
         // The interval is config-derived (`retry_promotion_interval`), and
         // `Instant + Duration` panics when the sum is not representable.
-        self.next_run_at = crate::time_math::saturating_deadline(now, self.interval);
+        self.next_run_at = crate::time_math::saturating_tokio_deadline(now, self.interval);
         true
     }
 }
@@ -1978,6 +2002,11 @@ struct RedisWorkerConfig {
     default_attempts: u32,
     default_backoff: u64,
     retry_promotion_interval: std::time::Duration,
+    /// The app's injected clock. Redis job records carry absolute
+    /// millisecond timestamps (`enqueued_at_ms`, due-at scores, visibility
+    /// deadlines), so they must be minted from the same clock the rest of the
+    /// runtime reads — never `SystemTime::now()` off-seam.
+    clock: Arc<dyn crate::time::ClockSource>,
 }
 
 #[cfg(feature = "redis")]
@@ -3473,9 +3502,27 @@ pub fn start_runtime(
 /// map is sufficient: a crashed process loses the queue itself along with any
 /// held keys, which means a dead worker can never deadlock a key beyond the
 /// process lifetime.
-#[derive(Default)]
 pub(crate) struct LocalJobCoordination {
     inner: std::sync::Mutex<LocalJobCoordinationInner>,
+    /// Injected clock backing unique-hold TTL expiry.
+    ///
+    /// Read inside the mutex critical section (so the `Arc` deref is free) and
+    /// only when a `unique_for` window is configured. Under a `#[sim_test]` this
+    /// makes a uniqueness window expire when `Sim::advance` crosses it rather
+    /// than when the real machine clock does.
+    clock: Arc<dyn crate::time::ClockSource>,
+}
+
+impl Default for LocalJobCoordination {
+    /// Coordination on the real system clock — the behaviour before the clock
+    /// became injectable. The runtime installs the app's clock via
+    /// [`with_clock`](LocalJobCoordination::with_clock).
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::default(),
+            clock: Arc::new(crate::time::SystemClock),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3487,7 +3534,7 @@ struct LocalJobCoordinationInner {
 
 struct LocalUniqueHold {
     job_id: String,
-    expires_at: Option<std::time::Instant>,
+    expires_at: Option<crate::time::MonotonicInstant>,
 }
 
 fn local_unique_hold_key(name: &str, unique_key: &str) -> String {
@@ -3504,6 +3551,14 @@ enum LocalSlotDecision {
 }
 
 impl LocalJobCoordination {
+    /// Coordination reading TTL expiry from `clock` (the app's injected clock).
+    fn with_clock(clock: Arc<dyn crate::time::ClockSource>) -> Self {
+        Self {
+            inner: std::sync::Mutex::default(),
+            clock,
+        }
+    }
+
     /// Try to hold the unique key for `job_id`; `false` means an equivalent
     /// job already holds it (the enqueue should coalesce).
     fn try_acquire_unique(
@@ -3517,7 +3572,7 @@ impl LocalJobCoordination {
             return true;
         };
         let key = local_unique_hold_key(name, unique_key);
-        let now = std::time::Instant::now();
+        let now = self.clock.monotonic();
         if let Some(hold) = inner.unique_holds.get(&key) {
             let expired = hold.expires_at.is_some_and(|expires_at| expires_at <= now);
             if !expired {
@@ -3528,10 +3583,9 @@ impl LocalJobCoordination {
             // `unique_for` is app-supplied, and `Instant + Duration` panics
             // when the sum is not representable on the platform clock; clamp
             // so an absurd window means "holds effectively forever".
-            JobUniquenessWindow::TtlMs(ms) => Some(crate::time_math::saturating_deadline(
-                now,
-                std::time::Duration::from_millis(ms),
-            )),
+            JobUniquenessWindow::TtlMs(ms) => {
+                Some(now.saturating_add(std::time::Duration::from_millis(ms)))
+            }
             JobUniquenessWindow::Pending | JobUniquenessWindow::Running => None,
         };
         inner.unique_holds.insert(
@@ -3670,7 +3724,7 @@ pub(crate) fn start_local_runtime_inner(
     // `workers.max(1)` floor so zero worker loops run.
     let worker_count = if run_workers { workers.max(1) } else { 0 };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<QueuedJob>(1024);
-    let coordination = Arc::new(LocalJobCoordination::default());
+    let coordination = Arc::new(LocalJobCoordination::with_clock(state.clock_arc()));
 
     // Build the priority drain schedule from `[jobs] queues`, appending any
     // queue declared on a job but missing from config at lowest priority so it
@@ -4377,6 +4431,12 @@ fn finish_local_slot(
 #[derive(Clone)]
 struct RedisClient {
     connection: redis::aio::ConnectionManager,
+    /// The app's injected clock. Redis job records carry absolute
+    /// millisecond timestamps (`enqueued_at_ms`, due-at scores, visibility
+    /// deadlines), so they must be minted from the same clock the rest of the
+    /// runtime reads — never `SystemTime::now()` off-seam.
+    clock: Arc<dyn crate::time::ClockSource>,
+
     /// Base key prefix (e.g. `autumn:jobs`) used to derive per-queue list keys.
     key_prefix: String,
     /// ZSET keyed by due-time-ms used for delayed enqueues and retries. A
@@ -4387,13 +4447,13 @@ struct RedisClient {
     unique_prefix: String,
 }
 
+/// Current Unix time in milliseconds, read from the injected `clock`.
+///
+/// Redis job records are keyed and scored on absolute millisecond timestamps,
+/// so every producer of one goes through here rather than `SystemTime::now()`.
 #[cfg(feature = "redis")]
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
+fn now_unix_ms(clock: &dyn crate::time::ClockSource) -> u64 {
+    u64::try_from(crate::time::clock_unix_duration(clock).as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(feature = "redis")]
@@ -4558,7 +4618,7 @@ impl RedisClient {
             attempt: 1,
             max_attempts: default_max_attempts,
             initial_backoff_ms: default_initial_backoff_ms,
-            enqueued_at_ms: Some(now_unix_ms()),
+            enqueued_at_ms: Some(now_unix_ms(self.clock.as_ref())),
             started_at_ms: None,
             finished_at_ms: None,
             claimed_by: None,
@@ -4602,7 +4662,7 @@ impl RedisClient {
                         Some(JobUniquenessWindow::TtlMs(_))
                     ) =>
                 {
-                    let delay_ms = due_ms.saturating_sub(now_unix_ms());
+                    let delay_ms = due_ms.saturating_sub(now_unix_ms(self.clock.as_ref()));
                     delay_ms
                         .saturating_add(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
                         .max(base)
@@ -4659,6 +4719,14 @@ struct RedisJobAdminBackend {
     unique_prefix: String,
     history_limit: usize,
     registry: crate::actuator::JobRegistry,
+    /// The app's injected clock. Redis job records carry absolute
+    /// millisecond timestamps (`enqueued_at_ms`, due-at scores, visibility
+    /// deadlines), so they must be minted from the same clock the rest of the
+    /// runtime reads — never `SystemTime::now()` off-seam.
+    clock: Arc<dyn crate::time::ClockSource>,
+    /// The app's injected entropy source, used to mint the fresh job id an
+    /// admin "retry dead job" operation assigns.
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 #[cfg(feature = "redis")]
@@ -4678,6 +4746,8 @@ impl RedisJobAdminBackend {
         unique_prefix: String,
         history_limit: usize,
         registry: crate::actuator::JobRegistry,
+        clock: Arc<dyn crate::time::ClockSource>,
+        entropy: Arc<dyn crate::entropy::Entropy>,
     ) -> Self {
         Self {
             connection,
@@ -4693,13 +4763,15 @@ impl RedisJobAdminBackend {
             unique_prefix,
             history_limit: history_limit.max(1),
             registry,
+            clock,
+            entropy,
         }
     }
 
     async fn snapshot_redis(&self, query: &JobAdminQuery) -> AutumnResult<JobAdminSnapshot> {
         let mut connection = self.connection.clone();
         let per_page = query.per_page.clamp(1, 100);
-        let now_ms = now_unix_ms();
+        let now_ms = now_unix_ms(self.clock.as_ref());
         let completed_since = now_ms.saturating_sub(86_400_000);
         let failed_since = now_ms.saturating_sub(604_800_000);
 
@@ -4762,7 +4834,7 @@ impl RedisJobAdminBackend {
 
     async fn retry_failed_redis(&self, id: &str) -> AutumnResult<()> {
         let mut connection = self.connection.clone();
-        let new_id = uuid::Uuid::new_v4().to_string();
+        let new_id = self.entropy.uuid_v4().to_string();
         let dead_record_key = format!("{}{id}", self.dead_record_prefix);
         // Fetch the record's payload first (for a tracked-status reset on
         // success below) — the script below moves this same dead record.
@@ -4845,7 +4917,7 @@ return 1
             .arg(&self.key_prefix)
             .arg(&self.unique_prefix)
             .arg(new_id)
-            .arg(now_unix_ms())
+            .arg(now_unix_ms(self.clock.as_ref()))
             .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
             .query_async(&mut connection)
             .await
@@ -5372,7 +5444,7 @@ end
 return nil
 ";
 
-    let now_ms = now_unix_ms();
+    let now_ms = now_unix_ms(worker_config.clock.as_ref());
     let deadline_ms = now_ms.saturating_add(worker_config.visibility_timeout_ms);
     let blocked_due_ms = now_ms.saturating_add(REDIS_CONCURRENCY_REQUEUE_DELAY_MS);
     let mut cmd = redis::cmd("EVAL");
@@ -5506,7 +5578,7 @@ async fn record_enqueues_for_redis_ids(
 
     for body in bodies.into_iter().flatten() {
         if let Ok(mut record) = serde_json::from_str::<RedisJobRecord>(&body) {
-            record.enqueued_at_ms = Some(now_unix_ms());
+            record.enqueued_at_ms = Some(now_unix_ms(worker_config.clock.as_ref()));
             record.started_at_ms = None;
             record.finished_at_ms = None;
             clear_redis_claim(&mut record);
@@ -5573,7 +5645,7 @@ return promoted
         .arg(2)
         .arg(&worker_config.delayed_key)
         .arg(&worker_config.record_prefix)
-        .arg(now_unix_ms())
+        .arg(now_unix_ms(worker_config.clock.as_ref()))
         .arg(64_usize)
         .arg(&worker_config.key_prefix)
         .query_async(connection)
@@ -5620,7 +5692,7 @@ return #ids
         .arg(2)
         .arg(&worker_config.blocked_key)
         .arg(&worker_config.record_prefix)
-        .arg(now_unix_ms())
+        .arg(now_unix_ms(worker_config.clock.as_ref()))
         .arg(64_usize)
         .arg(&worker_config.key_prefix)
         .query_async(connection)
@@ -5734,7 +5806,7 @@ async fn update_redis_queue_depth_gauges(
     record_prefix: &str,
     state: &AppState,
 ) -> Result<(), redis::RedisError> {
-    let now = now_unix_ms();
+    let now = now_unix_ms(state.clock());
     let mut per_queue: HashMap<String, (u64, Option<u64>)> = HashMap::new();
     let mut per_name: HashMap<String, u64> = HashMap::new();
 
@@ -6071,7 +6143,7 @@ async fn ack_redis_success(
 ) -> Result<bool, redis::RedisError> {
     let mut completed = record.clone();
     clear_redis_claim(&mut completed);
-    completed.finished_at_ms = Some(now_unix_ms());
+    completed.finished_at_ms = Some(now_unix_ms(worker_config.clock.as_ref()));
     completed.last_error = None;
     let Ok(encoded) = encode_redis_record(&completed) else {
         tracing::warn!(job_id = %record.id, "failed to serialize redis completed record");
@@ -6295,7 +6367,7 @@ async fn recover_stale_redis_jobs(
     let stale_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
         .arg(&worker_config.processing_key)
         .arg("-inf")
-        .arg(now_unix_ms())
+        .arg(now_unix_ms(worker_config.clock.as_ref()))
         .arg("LIMIT")
         .arg(0)
         .arg(64)
@@ -6334,7 +6406,7 @@ async fn recover_stale_redis_jobs(
         };
         let Some(action) = recover_stale_redis_record(
             record.clone(),
-            now_unix_ms(),
+            now_unix_ms(worker_config.clock.as_ref()),
             worker_config.visibility_timeout_ms,
         ) else {
             continue;
@@ -6395,15 +6467,15 @@ fn spawn_redis_worker(
 
     tokio::spawn(async move {
         let mut retry_promotion_throttle = RedisMaintenanceThrottle::new(
-            std::time::Instant::now(),
+            tokio::time::Instant::now(),
             worker_config.retry_promotion_interval,
         );
         let mut stale_recovery_throttle = RedisMaintenanceThrottle::new(
-            std::time::Instant::now(),
+            tokio::time::Instant::now(),
             REDIS_STALE_MAINTENANCE_INTERVAL,
         );
         let mut blocked_promotion_throttle = RedisMaintenanceThrottle::new(
-            std::time::Instant::now(),
+            tokio::time::Instant::now(),
             REDIS_BLOCKED_PROMOTION_INTERVAL,
         );
         let idle_sleep = redis_worker_idle_sleep(worker_config.retry_promotion_interval);
@@ -6414,7 +6486,7 @@ fn spawn_redis_worker(
                 break;
             }
 
-            if retry_promotion_throttle.take_due(std::time::Instant::now()) {
+            if retry_promotion_throttle.take_due(tokio::time::Instant::now()) {
                 match promote_due_redis_retries(&mut connection, &worker_config, &state, &job_admin)
                     .await
                 {
@@ -6425,7 +6497,7 @@ fn spawn_redis_worker(
                 }
             }
 
-            if stale_recovery_throttle.take_due(std::time::Instant::now()) {
+            if stale_recovery_throttle.take_due(tokio::time::Instant::now()) {
                 match recover_stale_redis_jobs(&mut connection, &worker_config, &state, &job_admin)
                     .await
                 {
@@ -6441,7 +6513,7 @@ fn spawn_redis_worker(
                 }
             }
 
-            if blocked_promotion_throttle.take_due(std::time::Instant::now())
+            if blocked_promotion_throttle.take_due(tokio::time::Instant::now())
                 && let Err(error) =
                     promote_due_blocked_redis_jobs(&mut connection, &worker_config).await
             {
@@ -6547,7 +6619,11 @@ async fn settle_failed_redis_job(
     outcome: &str,
     job_admin: &JobAdminMemoryBackend,
 ) {
-    let action = prepare_redis_failure_action(record.clone(), error.clone(), now_unix_ms());
+    let action = prepare_redis_failure_action(
+        record.clone(),
+        error.clone(),
+        now_unix_ms(worker_config.clock.as_ref()),
+    );
     match action {
         RedisFailureAction::Retry(schedule) => {
             match schedule_redis_retry(connection, worker_config, record, &schedule).await {
@@ -6629,7 +6705,11 @@ async fn dead_letter_panicked_redis_job(
     error: String,
     job_admin: &JobAdminMemoryBackend,
 ) {
-    let dead = prepare_redis_panic_dead_letter(record.clone(), error.clone(), now_unix_ms());
+    let dead = prepare_redis_panic_dead_letter(
+        record.clone(),
+        error.clone(),
+        now_unix_ms(worker_config.clock.as_ref()),
+    );
     match dead_letter_redis_job(connection, worker_config, record, &dead).await {
         Ok(true) => {
             state
@@ -6927,6 +7007,8 @@ fn start_redis_runtime(
             unique_prefix.clone(),
             DEFAULT_JOB_ADMIN_HISTORY_LIMIT,
             state.job_registry.clone(),
+            state.clock_arc(),
+            state.entropy_arc(),
         ))));
     }
 
@@ -6960,6 +7042,7 @@ fn start_redis_runtime(
                 delayed_key: delayed_key.clone(),
                 record_prefix: record_prefix.clone(),
                 unique_prefix: unique_prefix.clone(),
+                clock: state.clock_arc(),
             }),
             #[cfg(feature = "db")]
             pg_pool: None,
@@ -7023,11 +7106,12 @@ fn start_redis_runtime(
                 dead_record_prefix: dead_record_prefix.clone(),
                 unique_prefix: unique_prefix.clone(),
                 concurrency_prefix: concurrency_prefix.clone(),
-                worker_id: format!("{}:{}", std::process::id(), uuid::Uuid::new_v4()),
+                worker_id: format!("{}:{}", std::process::id(), state.entropy().uuid_v4()),
                 visibility_timeout_ms: config.redis.visibility_timeout_ms,
                 default_attempts: config.max_attempts,
                 default_backoff: config.initial_backoff_ms,
                 retry_promotion_interval,
+                clock: state.clock_arc(),
             },
         )?;
     }
@@ -9057,7 +9141,7 @@ fn start_postgres_runtime(
         let schedule = schedule.clone();
         let slots = Arc::clone(&slots);
         tokio::spawn(async move {
-            let worker_id = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
+            let worker_id = format!("{}:{}", std::process::id(), state.entropy().uuid_v4());
             pg_worker_loop(
                 pool,
                 worker_id,
@@ -10728,7 +10812,7 @@ mod tests {
     #[cfg(feature = "redis")]
     #[test]
     fn redis_maintenance_throttle_runs_immediately_then_waits_for_interval() {
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let mut throttle = RedisMaintenanceThrottle::new(start, Duration::from_secs(1));
 
         assert!(throttle.take_due(start));
@@ -10744,7 +10828,7 @@ mod tests {
         // sum is not representable. A pathological interval must clamp the
         // next-run deadline (making the maintenance pass effectively one-shot)
         // rather than crash the Redis worker task.
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         for interval in [Duration::MAX, Duration::from_secs(u64::MAX)] {
             let mut throttle = RedisMaintenanceThrottle::new(start, interval);
             assert!(throttle.take_due(start), "the first pass always runs");
@@ -10977,6 +11061,7 @@ mod tests {
             default_attempts: 3,
             default_backoff: 1,
             retry_promotion_interval: Duration::from_millis(1),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         }
     }
 
@@ -11027,6 +11112,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         producer
             .enqueue(
@@ -11072,6 +11158,8 @@ mod tests {
             worker_config.unique_prefix.clone(),
             128,
             crate::actuator::JobRegistry::new(),
+            std::sync::Arc::new(crate::time::SystemClock),
+            std::sync::Arc::new(crate::entropy::OsEntropy),
         )
     }
 
@@ -11291,8 +11379,12 @@ mod tests {
         let worker_config = redis_test_worker_config("autumn:test:admin", "worker-a", 30_000);
         let backend = redis_admin_test_backend(&client, &worker_config);
         let mut connection = new_redis_connection_manager(&client, "test redis setup").unwrap();
-        let records =
-            seed_redis_admin_storage(&mut connection, &worker_config, now_unix_ms()).await;
+        let records = seed_redis_admin_storage(
+            &mut connection,
+            &worker_config,
+            now_unix_ms(&crate::time::SystemClock),
+        )
+        .await;
 
         let snapshot = backend
             .snapshot(JobAdminQuery {
@@ -11347,6 +11439,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         // Low enqueued first, then critical.
@@ -11739,7 +11832,7 @@ mod tests {
             let base = redis_unique_lock_ttl_ms(window);
             match due_at_ms {
                 Some(due_ms) if !matches!(window, Some(JobUniquenessWindow::TtlMs(_))) => {
-                    let delay_ms = due_ms.saturating_sub(now_unix_ms());
+                    let delay_ms = due_ms.saturating_sub(now_unix_ms(&crate::time::SystemClock));
                     delay_ms
                         .saturating_add(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
                         .max(base)
@@ -11749,7 +11842,7 @@ mod tests {
         }
 
         let two_days_ms: u64 = 2 * 24 * 60 * 60 * 1_000;
-        let due_ms = now_unix_ms() + two_days_ms;
+        let due_ms = now_unix_ms(&crate::time::SystemClock) + two_days_ms;
 
         // Non-TTL window + long delay: lock must outlast the 24h backstop.
         let ttl_running = compute_lock_ttl(Some(JobUniquenessWindow::Running), Some(due_ms));
@@ -11965,6 +12058,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let constraints = ResolvedJobConstraints {
             unique_key: None,
@@ -12034,7 +12128,7 @@ mod tests {
             .unwrap();
         let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
 
-        let now = now_unix_ms();
+        let now = now_unix_ms(&crate::time::SystemClock);
         let record = RedisJobRecord {
             id: "job-failed-tracked".to_string(),
             name: "send_email".to_string(),
@@ -12108,6 +12202,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let constraints = ResolvedJobConstraints {
             unique_key: Some("dropped-pending-lock".to_string()),
@@ -12208,6 +12303,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         producer
             .enqueue(
@@ -12407,6 +12503,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         // max_attempts = 1 so stale recovery dead-letters instead of requeueing.
         assert_eq!(
@@ -12500,6 +12597,7 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let constraints = ResolvedJobConstraints {
             unique_key: None,
@@ -12571,10 +12669,11 @@ mod tests {
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
 
         // Enqueue due ~2s in the future.
-        let due_at_ms = now_unix_ms() + 2_000;
+        let due_at_ms = now_unix_ms(&crate::time::SystemClock) + 2_000;
         assert_eq!(
             producer
                 .enqueue(

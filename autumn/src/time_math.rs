@@ -64,6 +64,27 @@ pub fn saturating_deadline(now: Instant, ttl: Duration) -> Instant {
     })
 }
 
+/// Compute an expiry [`tokio::time::Instant`] for `ttl`, saturating instead of
+/// panicking on overflow.
+///
+/// The tokio-timeline twin of [`saturating_deadline`], with the identical clamp
+/// policy. It exists because a deadline whose counterparty is
+/// `tokio::time::sleep` must live on tokio's timeline (and is virtualized for
+/// free under a paused runtime), while `tokio::time::Instant` is a distinct type
+/// from `std::time::Instant` and cannot reuse the same function.
+#[must_use]
+// Currently reached only from the `redis` job worker's maintenance throttle, so
+// a default-feature build has no caller. Kept ungated (and not `#[cfg(feature =
+// "redis")]`) because it is a general helper: the moment any other tokio-timeline
+// deadline needs clamping it should reach for this, not re-derive the policy.
+#[cfg_attr(not(feature = "redis"), allow(dead_code))]
+pub fn saturating_tokio_deadline(now: tokio::time::Instant, ttl: Duration) -> tokio::time::Instant {
+    now.checked_add(ttl).unwrap_or_else(|| {
+        now.checked_add(Duration::from_secs(SATURATING_DEADLINE_HORIZON_SECS))
+            .unwrap_or(now)
+    })
+}
+
 /// Add `delta` to `now`, clamping to chrono's representable range instead of
 /// panicking.
 ///
@@ -108,6 +129,28 @@ mod tests {
             now + Duration::from_secs(60)
         );
         assert_eq!(saturating_deadline(now, Duration::ZERO), now);
+    }
+
+    #[test]
+    fn saturating_tokio_deadline_matches_the_std_clamp_policy() {
+        // The tokio-timeline twin must behave identically: exact for ordinary
+        // TTLs, clamped (never panicking) for a pathological one. The redis
+        // maintenance throttle derives its interval from app config, so an
+        // absurd value must make the sweep one-shot rather than crash the
+        // worker (issue #1611's regression, now on tokio's timeline).
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            saturating_tokio_deadline(now, Duration::from_secs(60)),
+            now + Duration::from_secs(60)
+        );
+        assert_eq!(saturating_tokio_deadline(now, Duration::ZERO), now);
+        for extreme in [Duration::MAX, Duration::from_secs(u64::MAX)] {
+            let deadline = saturating_tokio_deadline(now, extreme);
+            assert!(
+                deadline > now + Duration::from_secs(3_600),
+                "a clamped deadline must still be far in the future"
+            );
+        }
     }
 
     #[test]

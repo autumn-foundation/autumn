@@ -51,6 +51,14 @@
 //! # }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -65,6 +73,12 @@ use chrono::{DateTime, Utc};
 /// reading is an offset from this single instant, which is what makes
 /// [`MonotonicInstant`] a plain [`Duration`] and therefore constructible at an
 /// arbitrary *virtual* point — something [`std::time::Instant`] can never be.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "this IS the seam: the single process-monotonic origin every real \
+              MonotonicInstant is measured from. There is nothing further to \
+              inject it from."
+)]
 static MONOTONIC_ORIGIN: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
 /// A monotonic instant read from a [`ClockSource`], for measuring *elapsed
@@ -281,6 +295,11 @@ impl axum::extract::FromRequestParts<crate::state::AppState> for Clock {
 pub struct SystemClock;
 
 impl ClockSource for SystemClock {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "this IS the seam: SystemClock is the production ClockSource, \
+                  the one place the real wall clock is allowed to be read."
+    )]
     fn now(&self) -> DateTime<Utc> {
         Utc::now()
     }
@@ -504,6 +523,130 @@ mod tests {
         let clock = FixedClock::at(pinned);
         let secs = clock_unix_secs(&clock);
         assert_eq!(secs, pinned.timestamp().cast_unsigned());
+    }
+
+    // ── Monotonic seam (issue #1797) ─────────────────────────────────────
+
+    #[test]
+    fn monotonic_saturates_instead_of_underflowing_on_inversion() {
+        // The one behaviour every caller depends on: subtracting a LATER
+        // instant from an earlier one yields zero rather than panicking or
+        // wrapping. `Duration` has no negative representation, so an unchecked
+        // subtraction here would be an arithmetic panic in production.
+        let early = MonotonicInstant::from_origin_elapsed(Duration::from_secs(1));
+        let late = MonotonicInstant::from_origin_elapsed(Duration::from_secs(5));
+        assert_eq!(
+            late.saturating_duration_since(early),
+            Duration::from_secs(4)
+        );
+        assert_eq!(early.saturating_duration_since(late), Duration::ZERO);
+        assert_eq!(early.elapsed_at(late), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn monotonic_add_saturates_instead_of_panicking() {
+        // `Instant + Duration` panics when the sum is not representable; the
+        // replacement must clamp, because these TTLs are app-supplied.
+        let base = MonotonicInstant::ORIGIN;
+        assert_eq!(
+            base.saturating_add(Duration::from_secs(30)).since_origin(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            base.checked_add(Duration::MAX),
+            Some(MonotonicInstant::from_origin_elapsed(Duration::MAX))
+        );
+        let high = MonotonicInstant::from_origin_elapsed(Duration::MAX);
+        assert_eq!(high.checked_add(Duration::from_secs(1)), None);
+        assert_eq!(high.saturating_add(Duration::from_secs(1)), high);
+    }
+
+    #[test]
+    fn ticking_clock_monotonic_moves_in_lockstep_with_wall_time() {
+        let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(start);
+        assert_eq!(clock.monotonic(), MonotonicInstant::ORIGIN);
+
+        clock.advance(Duration::from_secs(90));
+        assert_eq!(clock.monotonic().since_origin(), Duration::from_secs(90));
+        assert_eq!(clock.now(), start + chrono::Duration::seconds(90));
+
+        // A clone shares the instant, so it reports the same elapsed time — the
+        // property `TestApp::with_clock` and `Sim::advance` both rely on.
+        let clone = clock.clone();
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(clone.monotonic().since_origin(), Duration::from_secs(100));
+    }
+
+    #[test]
+    fn ticking_clock_monotonic_is_reproducible_across_instances() {
+        // Two clocks constructed identically and stepped identically must agree
+        // exactly — this is what makes a sim run replay from its seed.
+        let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let a = TickingClock::starting_at(start);
+        let b = TickingClock::starting_at(start);
+        for step in [1u64, 60, 3_600, 86_400] {
+            a.advance(Duration::from_secs(step));
+            b.advance(Duration::from_secs(step));
+        }
+        assert_eq!(a.monotonic(), b.monotonic());
+        assert_eq!(a.monotonic().since_origin(), Duration::from_secs(90_061));
+    }
+
+    #[test]
+    fn fixed_clock_monotonic_never_advances() {
+        // A clock whose wall time is pinned must not let elapsed time tick past,
+        // or a test that pins the clock would still see real durations.
+        let clock = FixedClock::at(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+        let first = clock.monotonic();
+        std::thread::yield_now();
+        assert_eq!(first, MonotonicInstant::ORIGIN);
+        assert_eq!(clock.monotonic(), first);
+    }
+
+    #[test]
+    fn system_clock_monotonic_is_real_and_non_decreasing() {
+        let clock = SystemClock;
+        let first = clock.monotonic();
+        let second = clock.monotonic();
+        assert!(
+            second >= first,
+            "the real monotonic clock must never go backwards"
+        );
+        // And it is the same timeline the free helper reads.
+        assert!(monotonic_now() >= second);
+    }
+
+    #[test]
+    fn a_custom_clock_keeps_compiling_and_gets_real_monotonic_by_default() {
+        // Backward-compatibility guard: `monotonic()` ships with a default body,
+        // so a downstream `impl ClockSource` that predates it still compiles and
+        // still reports real process-monotonic time. If someone ever removes the
+        // default body, this test stops compiling — which is the point.
+        #[derive(Debug)]
+        struct LegacyClock;
+        impl ClockSource for LegacyClock {
+            fn now(&self) -> DateTime<Utc> {
+                Utc.with_ymd_and_hms(1999, 12, 31, 23, 59, 59).unwrap()
+            }
+        }
+        let clock = LegacyClock;
+        let first = clock.monotonic();
+        assert!(clock.monotonic() >= first);
+    }
+
+    #[test]
+    fn a_backwards_wall_clock_cannot_produce_a_negative_elapsed() {
+        // A clock whose `now()` runs backwards (a crude NTP-jump model) must not
+        // be able to corrupt an elapsed measurement taken through the seam.
+        // `TickingClock` derives monotonic from its own start, and its
+        // subtraction saturates, so the worst case is zero — never a panic.
+        let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(start);
+        clock.advance(Duration::from_secs(10));
+        let later = clock.monotonic();
+        let earlier = MonotonicInstant::from_origin_elapsed(Duration::from_secs(100));
+        assert_eq!(later.saturating_duration_since(earlier), Duration::ZERO);
     }
 
     #[test]

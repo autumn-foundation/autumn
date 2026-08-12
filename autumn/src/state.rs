@@ -9,6 +9,14 @@
 //! from the state. However, custom extractors can access the state via
 //! `crate::extract::State<AppState>`.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -826,6 +834,10 @@ impl AppState {
 
 #[cfg(feature = "db")]
 impl DbState for AppState {
+    fn clock(&self) -> Arc<dyn ClockSource> {
+        self.clock_arc()
+    }
+
     fn metrics(&self) -> Option<&crate::middleware::MetricsCollector> {
         Some(&self.metrics)
     }

@@ -1784,6 +1784,7 @@ impl Shards {
             metrics: ctx.metrics,
             slow_query_threshold: ctx.slow_query_threshold,
             interceptors: ctx.interceptors,
+            clock: ctx.clock,
         })
         .await
     }
@@ -2704,6 +2705,7 @@ mod tests {
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(500),
             interceptors: Vec::new(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let seed = ShardRepositorySeed::from_ctx(
             shard.primary_pool(),
@@ -2729,6 +2731,7 @@ mod tests {
                 metrics: None,
                 slow_query_threshold: std::time::Duration::from_millis(500),
                 interceptors: Vec::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
             },
         }
     }
@@ -2757,6 +2760,7 @@ mod tests {
                 metrics: None,
                 slow_query_threshold: std::time::Duration::from_millis(500),
                 interceptors: Vec::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
             },
         };
 
@@ -2945,6 +2949,7 @@ mod tests {
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(200),
             interceptors: Vec::new(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let seed =
             ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0", shard.read_route());
@@ -2997,6 +3002,7 @@ mod tests {
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(250),
             interceptors: Vec::new(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let seed = cross_shard_seed(&set, &ctx).expect("seed");
         // The route carries only the base key — the fan-out re-tags it per
@@ -3021,6 +3027,7 @@ mod tests {
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(500),
             interceptors: Vec::new(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let seed =
             ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0", shard.read_route());
@@ -3038,6 +3045,7 @@ mod tests {
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(500),
             interceptors: Vec::new(),
+            clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         let seed =
             ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0", shard.read_route());
@@ -3127,6 +3135,7 @@ mod tests {
                 metrics: None,
                 slow_query_threshold: std::time::Duration::from_millis(500),
                 interceptors: Vec::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
             },
         };
         let Err(error) = shards.read_replica_for("tenant-1").await else {

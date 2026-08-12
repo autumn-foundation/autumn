@@ -67,6 +67,15 @@ step() {
 step "./scripts/check-panic-gate.sh   (self-test + manifest gate; no toolchain)"
 ./scripts/check-panic-gate.sh
 
+# --- 1b. Determinism seam gate (#1797) ---------------------------------------
+# Mirrors ci.yml `lint` job: `./scripts/check-determinism-gate.sh`. Same
+# rationale as the panic gate above — no toolchain, seconds, self-testing — and
+# it catches the class of break the clippy legs cannot report on their own: a
+# dropped gate header, an emptied `disallowed-methods` array, a module-wide
+# `allow` spoof, or a crate-local `clippy.toml` shadowing the root config.
+step "./scripts/check-determinism-gate.sh   (self-test + seam gate; no toolchain)"
+./scripts/check-determinism-gate.sh
+
 # --- 2. Formatting -----------------------------------------------------------
 # Mirrors ci.yml `lint` job: `cargo fmt --all -- --check`.
 step "cargo fmt --all -- --check"
@@ -98,7 +107,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # `--all-targets` form.
 step "cargo clippy -p autumn-web --features \"<gated request-path set>\" --lib -- -D warnings"
 cargo clippy -p autumn-web \
-  --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage" \
+  --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls" \
   --lib -- -D warnings
 
 # --- 5. Compile every workspace test target (compile-only) -------------------
