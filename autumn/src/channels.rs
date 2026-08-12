@@ -30,6 +30,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -563,16 +565,15 @@ fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &s
 /// before it, e.g. `<li id="x">` → `<li hx-swap-oob="true" id="x">`.
 #[cfg(feature = "maud")]
 pub(crate) fn inject_oob_attr(html: &str, value: &str) -> String {
-    if let Some(lt) = html.find('<') {
-        let after_lt = &html[lt + 1..];
-        if let Some(pos) = after_lt.find([' ', '>']) {
-            let insert_at = lt + 1 + pos;
-            return format!(
-                "{} hx-swap-oob=\"{value}\"{}",
-                &html[..insert_at],
-                &html[insert_at..]
-            );
-        }
+    // Split at the first `<`, then at the first byte that terminates the tag
+    // name (a space or `>`); the attribute goes between the two. Splitting
+    // rather than index-slicing keeps every boundary char-safe by
+    // construction, so no UTF-8 reasoning is needed here.
+    if let Some((before_tag, after_lt)) = html.split_once('<')
+        && let Some(name_end) = after_lt.find([' ', '>'])
+        && let Some((tag_name, rest)) = after_lt.split_at_checked(name_end)
+    {
+        return format!("{before_tag}<{tag_name} hx-swap-oob=\"{value}\"{rest}");
     }
     html.to_string()
 }
@@ -1241,20 +1242,16 @@ impl InterceptedChannelsBackend {
 }
 
 #[cfg(feature = "ws")]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "idx < interceptors.len() is checked immediately before the index"
-)]
 fn run_chain(
     topic: &str,
     msg: &ChannelMessage,
     interceptors: &[Arc<dyn crate::interceptor::ChannelsInterceptor>],
     inner: &dyn ChannelsBackend,
-    idx: usize,
 ) -> Result<usize, ChannelPublishError> {
-    if idx < interceptors.len() {
-        let interceptor = &interceptors[idx];
-        let next = |t: &str, m: &ChannelMessage| run_chain(t, m, interceptors, inner, idx + 1);
+    // Walking the chain by `split_first` instead of an index cursor keeps the
+    // recursion free of both slice indexing and index arithmetic.
+    if let Some((interceptor, rest)) = interceptors.split_first() {
+        let next = |t: &str, m: &ChannelMessage| run_chain(t, m, rest, inner);
         interceptor.intercept_publish(topic, msg, &next)
     } else {
         inner.publish(topic, msg.clone())
@@ -1267,7 +1264,7 @@ impl ChannelsBackend for InterceptedChannelsBackend {
         let inner = &self.inner;
         let interceptors = &self.interceptors;
 
-        run_chain(topic, &msg, interceptors, &**inner, 0)
+        run_chain(topic, &msg, interceptors, &**inner)
     }
 
     fn ensure_topic(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {

@@ -16,6 +16,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 // The durable Postgres job backend (queue claiming, worker/maintenance loops,
@@ -289,12 +291,15 @@ impl QueueCursor {
         let total: i64 = self.weights.iter().map(|w| i64::from(*w)).sum();
         let mut best = 0_usize;
         for i in 0..self.names.len() {
-            self.current[i] += i64::from(self.weights[i]);
+            // Credits stay within `sum(weights)` of zero across a cycle, so
+            // these are exact; saturating keeps a pathological weight config
+            // from aborting a worker mid-claim.
+            self.current[i] = self.current[i].saturating_add(i64::from(self.weights[i]));
             if self.current[i] > self.current[best] {
                 best = i;
             }
         }
-        self.current[best] -= total;
+        self.current[best] = self.current[best].saturating_sub(total);
         // Chosen queue first, then the rest by descending remaining credit.
         let mut rest: Vec<usize> = (0..self.names.len()).filter(|&i| i != best).collect();
         rest.sort_by(|&a, &b| self.current[b].cmp(&self.current[a]));
@@ -542,8 +547,9 @@ impl QueueSlots {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (running, total) = &mut *guard;
-            *running.entry(queue.to_string()).or_insert(0) += 1;
-            *total += 1;
+            let slot = running.entry(queue.to_string()).or_insert(0);
+            *slot = slot.saturating_add(1);
+            *total = total.saturating_add(1);
         }
         QueueSlotGuard {
             slots: Arc::clone(self),
@@ -584,8 +590,9 @@ impl QueueSlots {
         if !queue_may_claim(queue, running, *total, &self.limits, self.total_slots) {
             return None;
         }
-        *running.entry(queue.to_string()).or_insert(0) += 1;
-        *total += 1;
+        let slot = running.entry(queue.to_string()).or_insert(0);
+        *slot = slot.saturating_add(1);
+        *total = total.saturating_add(1);
         Some(QueueSlotGuard {
             slots: Arc::clone(self),
             queue: queue.to_string(),
@@ -1385,14 +1392,20 @@ impl JobAdminMemoryBackend {
             completed: paginate_job_admin_records(
                 &inner,
                 JobAdminStatus::Completed,
-                Some(now - chrono::TimeDelta::hours(24)),
+                Some(crate::time_math::saturating_dt_add(
+                    now,
+                    chrono::TimeDelta::hours(-24),
+                )),
                 query.completed_page,
                 per_page,
             ),
             failed: paginate_job_admin_records(
                 &inner,
                 JobAdminStatus::Failed,
-                Some(now - chrono::TimeDelta::days(7)),
+                Some(crate::time_math::saturating_dt_add(
+                    now,
+                    chrono::TimeDelta::days(-7),
+                )),
                 query.failed_page,
                 per_page,
             ),
@@ -1539,7 +1552,7 @@ fn prune_job_admin_history(inner: &mut JobAdminMemoryInner) {
         });
         if is_active {
             inner.order.push_back(id);
-            scanned += 1;
+            scanned = scanned.saturating_add(1);
         } else {
             inner.records.remove(&id);
         }
@@ -2710,7 +2723,11 @@ impl JobClient {
                     // Recompute remaining delay at the moment actual_enqueue
                     // runs (after any interceptor) so the sleep duration stays
                     // accurate even if the interceptor took non-trivial time.
-                    let delay = (due - self.clock.now())
+                    // `signed_duration_since` is the operator's own body and
+                    // is total: the difference of two representable
+                    // `DateTime<Utc>` values always fits in a `TimeDelta`.
+                    let delay = due
+                        .signed_duration_since(self.clock.now())
                         .to_std()
                         .unwrap_or(std::time::Duration::ZERO);
                     let sender = sender.clone();
@@ -3526,7 +3543,8 @@ impl LocalJobCoordination {
                 .push_back(job);
             return LocalSlotDecision::Parked;
         }
-        *inner.running_slots.entry(group.to_string()).or_insert(0) += 1;
+        let slot = inner.running_slots.entry(group.to_string()).or_insert(0);
+        *slot = slot.saturating_add(1);
         LocalSlotDecision::Acquired(job)
     }
 
@@ -4008,8 +4026,11 @@ impl LocalQueueBuffer {
 /// half the base and never more than the base itself.
 fn jittered_retry_delay_ms(entropy: &dyn crate::entropy::Entropy, base_delay_ms: u64) -> u64 {
     let half = base_delay_ms.div_ceil(2);
-    let spread = base_delay_ms - half + 1;
-    half + entropy.next_u64() % spread
+    // `half <= base_delay_ms` (it is the ceiling half), so `spread >= 1` and
+    // the reduction below is always defined; the sum is capped at
+    // `base_delay_ms` by construction.
+    let spread = base_delay_ms.saturating_sub(half).saturating_add(1);
+    half.saturating_add(entropy.next_u64().checked_rem(spread).unwrap_or_default())
 }
 
 /// Exponential backoff delay in ms for `attempt` (1-indexed) on the local
@@ -4230,14 +4251,14 @@ async fn execute_local_job(
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     registry.record_enqueue(&name);
-                    job_admin.record_requeued(&id, job.attempt + 1);
+                    job_admin.record_requeued(&id, job.attempt.saturating_add(1));
                     let _ = sender
                         .send(QueuedJob {
                             id,
                             name,
                             queue,
                             payload,
-                            attempt: job.attempt + 1,
+                            attempt: job.attempt.saturating_add(1),
                             max_attempts,
                             initial_backoff_ms: backoff_ms,
                             #[cfg(feature = "telemetry-otlp")]
@@ -5596,7 +5617,8 @@ async fn update_redis_blocked_gauges(
             redis::cmd("MGET").arg(keys).query_async(connection).await?;
         for body in bodies.into_iter().flatten() {
             if let Ok(record) = serde_json::from_str::<RedisJobRecord>(&body) {
-                *counts.entry(record.name).or_insert(0) += 1;
+                let slot = counts.entry(record.name).or_insert(0);
+                *slot = slot.saturating_add(1);
             }
         }
     }
@@ -5647,7 +5669,8 @@ fn fold_due_delayed_records(
     per_name: &mut HashMap<String, u64>,
 ) {
     for (queue, name, ready_at) in records {
-        *per_name.entry(name).or_insert(0) += 1;
+        let name_slot = per_name.entry(name).or_insert(0);
+        *name_slot = name_slot.saturating_add(1);
         let entry = per_queue.entry(queue).or_insert((0, None));
         entry.0 = entry.0.saturating_add(1);
         if let Some(ts) = ready_at {
@@ -5725,7 +5748,8 @@ async fn update_redis_queue_depth_gauges(
                     redis::cmd("MGET").arg(keys).query_async(connection).await?;
                 for body in bodies.into_iter().flatten() {
                     if let Ok(record) = serde_json::from_str::<RedisJobRecord>(&body) {
-                        *per_name.entry(record.name).or_insert(0) += 1;
+                        let slot = per_name.entry(record.name).or_insert(0);
+                        *slot = slot.saturating_add(1);
                     }
                 }
             }
@@ -5811,7 +5835,7 @@ async fn survey_due_delayed_gauges(
             });
             fold_due_delayed_records(records, per_queue, per_name);
         }
-        scanned += page_len;
+        scanned = scanned.saturating_add(page_len);
         // A short page means the due range is exhausted — stop cleanly.
         if page_len < page_size {
             break;
@@ -5826,7 +5850,7 @@ async fn survey_due_delayed_gauges(
             );
             break;
         }
-        offset += REDIS_QUEUE_DEPTH_SAMPLE;
+        offset = offset.saturating_add(REDIS_QUEUE_DEPTH_SAMPLE);
     }
     Ok(())
 }
@@ -7089,7 +7113,7 @@ fn record_pg_lifecycle_after_ack(
                 Some(ready) => state.job_registry.record_enqueue_scheduled(job_name, ready),
                 None => state.job_registry.record_enqueue(job_name),
             }
-            job_admin.record_requeued(job_id, attempt + 1);
+            job_admin.record_requeued(job_id, attempt.saturating_add(1));
         }
         PgLifecycleRecord::Failure { error } => {
             state
@@ -8450,7 +8474,10 @@ impl PgJobAdminBackend {
             &mut conn,
             PG_STATUS_COMPLETED,
             "finished_at",
-            Some(now - chrono::TimeDelta::hours(24)),
+            Some(crate::time_math::saturating_dt_add(
+                now,
+                chrono::TimeDelta::hours(-24),
+            )),
             query.completed_page,
             per_page,
         )
@@ -8459,7 +8486,10 @@ impl PgJobAdminBackend {
             &mut conn,
             PG_STATUS_FAILED,
             "finished_at",
-            Some(now - chrono::TimeDelta::days(7)),
+            Some(crate::time_math::saturating_dt_add(
+                now,
+                chrono::TimeDelta::days(-7),
+            )),
             query.failed_page,
             per_page,
         )
@@ -8663,8 +8693,11 @@ async fn pg_admin_page(
     use diesel_async::RunQueryDsl as _;
 
     let page = page.max(1);
-    let offset = i64::try_from((page - 1).saturating_mul(u64::try_from(per_page).unwrap_or(10)))
-        .unwrap_or(0);
+    let offset = i64::try_from(
+        page.saturating_sub(1)
+            .saturating_mul(u64::try_from(per_page).unwrap_or(10)),
+    )
+    .unwrap_or(0);
     let admin_status = match status {
         PG_STATUS_ENQUEUED => JobAdminStatus::Enqueued,
         PG_STATUS_RUNNING => JobAdminStatus::Running,
@@ -8766,9 +8799,12 @@ async fn pg_enqueued_and_scheduled_pages(
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin count: {e}")))?;
 
     let enq_page = enqueued_page.max(1);
-    let enq_offset =
-        i64::try_from((enq_page - 1).saturating_mul(u64::try_from(per_page).unwrap_or(10)))
-            .unwrap_or(0);
+    let enq_offset = i64::try_from(
+        enq_page
+            .saturating_sub(1)
+            .saturating_mul(u64::try_from(per_page).unwrap_or(10)),
+    )
+    .unwrap_or(0);
     let enqueued_rows = diesel::sql_query(format!(
         "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
          WHERE status = 'enqueued' AND (run_at IS NULL OR run_at <= NOW()) \
@@ -8782,9 +8818,12 @@ async fn pg_enqueued_and_scheduled_pages(
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin page: {e}")))?;
 
     let sch_page = scheduled_page.max(1);
-    let sch_offset =
-        i64::try_from((sch_page - 1).saturating_mul(u64::try_from(per_page).unwrap_or(10)))
-            .unwrap_or(0);
+    let sch_offset = i64::try_from(
+        sch_page
+            .saturating_sub(1)
+            .saturating_mul(u64::try_from(per_page).unwrap_or(10)),
+    )
+    .unwrap_or(0);
     let scheduled_rows = diesel::sql_query(format!(
         "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
          WHERE status = 'enqueued' AND run_at > NOW() \
@@ -18646,6 +18685,23 @@ mod queue_schedule_tests {
             saw_low_first,
             "low queue must be served within one weight cycle"
         );
+    }
+
+    #[test]
+    fn weighted_schedule_credits_saturate_instead_of_overflowing() {
+        // The smooth-weighted-round-robin credit ledger is `i64` arithmetic
+        // driven by operator-supplied `u32` weights. With the weights pinned at
+        // `u32::MAX` the per-iteration credit bump and the `-= total` rebate
+        // approach `i64` limits; the saturating form must keep producing a
+        // full attempt order instead of overflow-panicking a worker's claim
+        // loop in a debug build.
+        let cfg = JobQueuesConfig::weighted([("critical", u32::MAX), ("low", u32::MAX)]);
+        let schedule = QueueSchedule::from_config(&cfg);
+        let mut cursor = schedule.cursor();
+        for _ in 0..1_000 {
+            let order = cursor.next_order();
+            assert_eq!(order.len(), 2, "order must include all queues: {order:?}");
+        }
     }
 
     #[test]

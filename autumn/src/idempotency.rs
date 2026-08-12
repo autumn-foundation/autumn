@@ -11,6 +11,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -65,7 +67,7 @@ fn compute_body_hash(bytes: &[u8], content_type: Option<&[u8]>) -> Vec<u8> {
 
 fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
+        String::with_capacity(bytes.as_ref().len().saturating_mul(2)),
         |mut out, byte| {
             use std::fmt::Write as _;
             let _ = write!(out, "{byte:02x}");

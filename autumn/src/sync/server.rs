@@ -29,6 +29,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -636,7 +638,7 @@ struct MemoryState {
 
 impl MemoryState {
     const fn allocate_version(&mut self) -> Version {
-        self.next_version += 1;
+        self.next_version = self.next_version.saturating_add(1);
         self.next_version
     }
 }
@@ -788,7 +790,7 @@ impl SyncBackend for MemorySyncBackend {
             if stored.row.deleted && stored.row.version <= up_to {
                 let max = per_scope.entry(row_scope.clone()).or_insert(0);
                 *max = (*max).max(stored.row.version);
-                removed += 1;
+                removed = removed.saturating_add(1);
                 false
             } else {
                 true
