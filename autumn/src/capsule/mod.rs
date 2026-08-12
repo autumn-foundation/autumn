@@ -27,16 +27,21 @@
 //! * [`persist`] — writing, pruning, and reading capsules back.
 //! * [`capture`] — the request-scoped buffer and the Tower layer.
 //! * [`clock`] — the recording and replaying clock sources.
+//! * [`replay`] — the replay driver, the divergence log and the verdict.
+//! * `replay_db` — the in-process stub `PostgreSQL` server replay reads from.
 
 pub mod capture;
 pub mod clock;
 pub mod persist;
 pub mod redact;
+pub mod replay;
 pub mod schema;
 
 // DB wire submodules (PostgreSQL only; the sqlite backend has no wire capture).
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub mod record_db;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+pub mod replay_db;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub(crate) mod wire;
 
@@ -50,8 +55,15 @@ pub use persist::{CapsuleRef, capsule_dir, load_capsule, persist};
 /// database without reaching into the submodule path.
 #[cfg(all(feature = "test-support", feature = "db", not(feature = "sqlite")))]
 pub use record_db::build_recording_pool;
+pub use replay::{
+    Divergence, DivergenceKind, DivergenceLog, EXIT_DIVERGED, EXIT_REFUSED, EXIT_REPRODUCED,
+    ReplayOutcome, Verdict, execute, print_refusal, print_verdict, refusal_exit_code,
+    refusal_reason,
+};
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+pub use replay_db::{StubServer, pool_from_capsule};
 pub use schema::{
-    BindValue, CAPSULE_FORMAT_VERSION, Capsule, CapsuleBody, CapsuleDb, CapsuleError,
+    AppInfo, BindValue, CAPSULE_FORMAT_VERSION, Capsule, CapsuleBody, CapsuleDb, CapsuleError,
     CapsuleOutcome, CapsuleRequest, ConnectionTape, Exchange, ExchangeProtocol,
 };
 
