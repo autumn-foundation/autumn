@@ -642,6 +642,14 @@ the first. No error is raised, no conflict is detected, data is lost.
 
 Add the attribute to any model field named `lock_version`:
 
+> **Generated apps get this for free.** Declaring a `lock_version` column
+> in `autumn generate model` / `autumn generate scaffold` emits the
+> attribute (and the column's `DEFAULT 0`) for you, and a scaffold
+> additionally wires the whole conflict-aware HTML edit flow — hidden
+> version field, guarded `UPDATE`, and a 409 re-render instead of a lost
+> update. See
+> [Concurrent edits: `lock_version`](./generators.md#concurrent-edits-lock_version-optimistic-locking).
+
 ```rust
 #[autumn_web::model]
 pub struct Article {
