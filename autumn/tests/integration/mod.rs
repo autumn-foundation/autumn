@@ -67,6 +67,13 @@ mod factory_fake;
 mod factory_integration;
 #[cfg(feature = "reporting")]
 mod failure_capsule_capture;
+#[cfg(all(
+    feature = "reporting",
+    feature = "db",
+    feature = "test-support",
+    not(feature = "sqlite")
+))]
+mod failure_capsule_db;
 mod fake_generators;
 mod feature_flags_integration;
 mod feed;
