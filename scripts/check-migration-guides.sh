@@ -52,6 +52,20 @@
 
 set -euo pipefail
 
+# Byte semantics for every awk below, and identical behaviour on every
+# platform. The macOS awk decodes multibyte characters when the locale asks it
+# to, and aborts the whole program when a byte does not decode in the locale
+# the runner happens to have:
+#
+#   awk: towc: multibyte conversion failure on: '<byte>'
+#
+# CHANGELOG.md contains an en dash ("2-4 weeks" written with U+2013), so the
+# per-character scanning below hit that on the first entry and the gate exited
+# 2 without reading anything. Nothing here interprets non-ASCII: the parser
+# compares against ASCII structure and treats everything else as opaque, so
+# bytes are exactly the right unit.
+export LC_ALL=C
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 

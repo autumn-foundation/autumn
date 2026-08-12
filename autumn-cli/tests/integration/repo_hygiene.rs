@@ -6583,3 +6583,52 @@ fn migration_guide_gate_counts_a_bullet_that_carries_words() {
         gate_report(&output),
     );
 }
+
+#[test]
+fn migration_gate_scripts_pin_a_byte_oriented_locale() {
+    // macOS awk decodes multibyte characters according to the ambient locale
+    // and aborts the program when a byte does not decode:
+    //
+    //   awk: towc: multibyte conversion failure on: '<byte>'
+    //
+    // CHANGELOG.md contains an en dash, so the gate exited 2 on the real
+    // repository without reading a line. Neither awk available here reproduces
+    // it, and the Linux CI job cannot either, so the requirement is pinned as
+    // a lint rather than as behaviour.
+    let root = workspace_root();
+    let script = std::fs::read_to_string(root.join("scripts/check-migration-guides.sh"))
+        .expect("read migration gate");
+    assert!(
+        script.contains("export LC_ALL=C"),
+        "the gate must pin a byte-oriented locale for awk",
+    );
+}
+
+#[test]
+fn migration_guide_gate_reads_a_changelog_containing_non_ascii() {
+    // The behaviour that lint protects: an en dash in an entry must not stop
+    // the gate reading the file, whatever locale the caller has set.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** ships every 2\u{2013}4 weeks \u{2014} renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = bash_command()
+        .arg("scripts/check-migration-guides.sh")
+        .current_dir(tmp.path())
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run migration-guide gate");
+    assert!(
+        output.status.success(),
+        "non-ASCII prose must not stop the gate\n{}",
+        gate_report(&output),
+    );
+}
