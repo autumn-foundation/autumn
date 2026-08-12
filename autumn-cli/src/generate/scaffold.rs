@@ -504,21 +504,6 @@ fn plan_scaffold_with_options_impl(
         } else {
             None
         };
-        // `lock_version` is DB-managed, so it contributes nothing to the form
-        // field set. A scaffold declaring it and nothing else therefore builds
-        // an EMPTY `New{Model}`, which does not implement `Insertable` and fails
-        // to compile — the same failure a fieldless `generate scaffold Post`
-        // already produces, but reachable here by a user who did declare a
-        // field and has no reason to suspect it doesn't count as one.
-        if fields.len() == 1 {
-            return Err(GenerateError::Config(format!(
-                "`{col}` cannot be a scaffold's only column: it is managed by the database, so \
-                 the generated New{pascal} insert struct would have no fields at all and the \
-                 app would not compile. Declare at least one ordinary column alongside it.",
-                col = super::model::LOCK_VERSION_COLUMN,
-                pascal = pascal(name),
-            )));
-        }
         if let Some((variant, why, remedy)) = unsupported {
             return Err(GenerateError::Config(format!(
                 "a `lock_version` column is not yet supported together with {variant}: {why}. \
@@ -573,6 +558,28 @@ fn plan_scaffold_with_options_impl(
         .filter(|field| !metadata.defaults().contains_key(&field.name))
         .cloned()
         .collect::<Vec<_>>();
+    // Issue #1318: `lock_version` is DB-managed, so it contributes nothing to
+    // the insert struct — and neither does any `--default` column. A scaffold
+    // whose columns are ALL database-managed therefore builds an empty
+    // `New{Model}`, which does not implement `Insertable` and fails to compile.
+    // Counting declared tokens would miss the mixed case (`title:String
+    // lock_version:i32 --default title=x` declares two and leaves none), so the
+    // guard is on the effective set — `form_fields` is exactly the columns that
+    // survive into `New{Model}`.
+    //
+    // Scoped to lock-version scaffolds deliberately: an all-`--default` scaffold
+    // has always emitted this same broken struct, and widening the refusal to
+    // that pre-existing case is a separate change from wiring #1318.
+    if form_fields.is_empty() && super::model::lock_version_field(&fields).is_some() {
+        return Err(GenerateError::Config(format!(
+            "this scaffold has no insertable columns: `{col}` is managed by the database (and \
+             so is every `--default` column), so the generated New{pascal} struct would have no \
+             fields at all and the app would not compile. Declare at least one ordinary column \
+             alongside `{col}`.",
+            col = super::model::LOCK_VERSION_COLUMN,
+            pascal = pascal(name),
+        )));
+    }
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let plural = pluralize(&snake_name);
@@ -17325,6 +17332,34 @@ exempt_paths = [
     }
 
     #[test]
+    fn lock_version_scaffold_with_no_insertable_columns_is_refused() {
+        // Counting declared tokens would miss this: two columns are declared,
+        // but `--default` drops `title` from the insert struct and
+        // `#[lock_version]` drops the version, leaving `NewPost` empty — which
+        // does not implement `Insertable` and would not compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["title=x".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no insertable columns") && msg.contains("NewPost"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
     fn lock_version_cannot_be_the_only_column() {
         // The column is DB-managed, so it contributes no form field — a
         // scaffold declaring only `lock_version` would emit an empty
@@ -17339,7 +17374,7 @@ exempt_paths = [
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("only column") && msg.contains("NewPost"),
+            msg.contains("no insertable columns") && msg.contains("NewPost"),
             "the refusal must explain why one column is not enough: {msg}"
         );
     }

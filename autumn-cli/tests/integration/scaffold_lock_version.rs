@@ -283,7 +283,12 @@ fn unsupported_variants_are_refused_up_front_with_an_actionable_message() {
             &[],
             "slug",
         ),
-        ("onlyrefuse", &["lock_version:i32"], &[], "only column"),
+        (
+            "onlyrefuse",
+            &["lock_version:i32"],
+            &[],
+            "no insertable columns",
+        ),
     ];
     for (app, cols, flags, needle) in cases {
         let out = scaffold_err(app, cols, flags);

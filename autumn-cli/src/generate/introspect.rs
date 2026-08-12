@@ -349,6 +349,16 @@ fn is_lock_version_column(col: &Column) -> bool {
     col.name == super::model::LOCK_VERSION_COLUMN
         && !col.nullable
         && matches!(col.kind, FieldKind::I32 | FieldKind::I64)
+        // `has_default` is load-bearing, not incidental. `#[lock_version]`
+        // excludes the column from `New{Model}`, so the INSERT stops naming it
+        // — and `db pull` deliberately emits no migration, so nothing here can
+        // add the default that would fill the gap. On a legacy table whose
+        // application supplied `lock_version` itself, annotating would turn
+        // every insert into a NOT NULL violation. A greenfield-generated table
+        // always carries `DEFAULT 0` (see `parse_model_metadata`), so the
+        // round-trip property still holds; a defaultless legacy column is
+        // pulled as the ordinary integer it has always been.
+        && col.has_default
 }
 
 /// Build a `diesel::table!` block from introspected columns.
@@ -1607,5 +1617,60 @@ mod tests {
             greenfield, re_derived,
             "introspected model must be byte-identical to greenfield"
         );
+    }
+
+    // ── optimistic locking round-trip (issue #1318) ─────────────────────────
+
+    fn lock_version_column(has_default: bool) -> Column {
+        Column {
+            name: "lock_version".into(),
+            kind: FieldKind::I32,
+            nullable: false,
+            is_pk: false,
+            has_default,
+            has_sequence_default: false,
+            is_generated: false,
+            is_identity: false,
+        }
+    }
+
+    fn id_column() -> Column {
+        Column {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+            is_pk: true,
+            has_default: true,
+            has_sequence_default: true,
+            is_generated: false,
+            is_identity: false,
+        }
+    }
+
+    #[test]
+    fn pulling_a_generated_lock_version_column_reproduces_the_attribute() {
+        // A greenfield-generated table carries `lock_version INTEGER NOT NULL
+        // DEFAULT 0`, so pulling it must give back the same model — otherwise
+        // `db pull` silently downgrades the column to a plain editable integer
+        // and the conflict check disappears.
+        let model = render_model("Post", "posts", &[id_column(), lock_version_column(true)]);
+        assert!(
+            model.contains("#[lock_version]\n    pub lock_version: i32,"),
+            "model:\n{model}"
+        );
+    }
+
+    #[test]
+    fn pulling_a_defaultless_lock_version_column_leaves_it_an_ordinary_integer() {
+        // A legacy table whose application set `lock_version` itself has no
+        // database default. Annotating would drop the column from `New{Model}`
+        // — and `db pull` emits no migration to add a default — so every insert
+        // would then violate the NOT NULL constraint. Pull it as-is instead.
+        let model = render_model("Post", "posts", &[id_column(), lock_version_column(false)]);
+        assert!(
+            !model.contains("#[lock_version]"),
+            "a defaultless column must not be annotated:\n{model}"
+        );
+        assert!(model.contains("pub lock_version: i32,"), "model:\n{model}");
     }
 }
