@@ -5460,3 +5460,59 @@ fn migration_guide_gate_still_treats_a_block_quote_note_as_an_aside() {
         gate_report(&output),
     );
 }
+
+// --- Review round 39: link syntax inside a link title ---------------------
+
+#[test]
+fn migration_guide_gate_ignores_link_syntax_inside_a_link_title() {
+    // A parsed link's title is tooltip text, so link syntax written inside it
+    // renders as characters — the reference implementation emits
+    // `title="[migration guide](…)"` and no second anchor. Scanning every `]`
+    // independently re-read the title as a candidate of its own.
+    //
+    // Stronger than the round-25 case, which only put a bare *path* in the
+    // title: this one puts a complete, well-formed link there.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. \
+           [release note](https://example.invalid \
+           \"[migration guide](docs/migrations/0.7.0.md)\")\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "a link written inside a title is tooltip text, not a link",
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_finds_a_guide_link_after_another_link() {
+    // The counterpart: skipping past a parsed link must resume scanning after
+    // it, not abandon the rest of the line. A guide link following an
+    // unrelated one still has to be found.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, see the \
+           [release note](https://example.invalid \"context\") and the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "scanning resumes after a parsed link\n{}",
+        gate_report(&output),
+    );
+}

@@ -398,6 +398,7 @@ function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
   # `(path "why")` is as clickable as `(path)` — and because a path that merely
   # appears *in* the title is not where the link goes.
   sq = sprintf("%c", 39)
+  md_link_end = 0
   n = length(text)
   while (p <= n && (substr(text, p, 1) == " " || substr(text, p, 1) == "\t")) p++
   dest = ""
@@ -455,6 +456,10 @@ function link_destination(text, p,   n, ch, dest, depth, closer, sq, gap) {
     while (p <= n && (substr(text, p, 1) == " " || substr(text, p, 1) == "\t")) p++
   }
   if (substr(text, p, 1) != ")") return ""
+  # Where this link ends, so the caller can resume past it. A title is tooltip
+  # text: link syntax written inside one renders as characters, and rescanning
+  # it turned a tooltip into a guide link the reader never gets.
+  md_link_end = p
   return dest
 }
 
@@ -563,6 +568,10 @@ function links_to(text, path,   at, i, ch, start, slashes, depth, open_at, dest)
     md_link_label = substr(text, open_at + 1, at - open_at - 1)
     if (substr(text, at + 1, 1) == "(") {
       dest = link_destination(text, at + 2)
+      # Resume after the whole construct — destination and title — but only
+      # when it actually parsed as a link. A bare `](` is not one, and skipping
+      # on it would swallow the rest of the line.
+      if (md_link_end > 0) start = md_link_end + 1
     } else {
       dest = reference_target(text, at)
     }
