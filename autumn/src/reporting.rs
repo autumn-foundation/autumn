@@ -222,6 +222,14 @@ impl ReporterChain {
     /// [`ErrorEvent::capsule`](ErrorEvent::capsule) must find the file already
     /// on disk. That also means persistence is not gated on `enabled` or the
     /// sample rate — an app with reporting turned off still writes capsules.
+    ///
+    /// Writing the capsule is blocking filesystem work (a directory scan, a
+    /// `write` + `sync_all`, a rename), so it goes to the blocking pool rather
+    /// than running inline on an async worker: an error storm against slow
+    /// storage would otherwise stall the workers that serve everyone else's
+    /// requests — and stall a current-thread runtime outright. Awaiting the
+    /// join handle before reporting keeps the ordering guarantee: the file is
+    /// on disk before any reporter sees the reference to it.
     fn dispatch(self: &Arc<Self>, event: ErrorEvent, capture: Option<CaptureContext>) {
         let deliver = self.enabled && sampled(self.sample_rate);
         if !deliver && capture.is_none() {
@@ -234,7 +242,7 @@ impl ReporterChain {
             handle.spawn(async move {
                 let mut event = event;
                 if let Some(capture) = capture {
-                    event.capsule = persist_capsule(capture);
+                    event.capsule = persist_capsule(capture).await;
                 }
                 if deliver {
                     chain.report_all(&event).await;
@@ -270,9 +278,34 @@ struct CaptureContext {
     outcome: crate::capsule::CapsuleOutcome,
 }
 
-/// Write the capsule for a failed request, if capture was armed for it.
-fn persist_capsule(capture: CaptureContext) -> Option<crate::capsule::CapsuleRef> {
-    crate::capsule::persist(capture.handle.scope(), capture.outcome)
+/// Write the capsule for a failed request on the blocking pool, and wait for
+/// it.
+///
+/// The wait is the point: [`ErrorEvent::capsule`](ErrorEvent::capsule) is only
+/// worth carrying if the file it names is already on disk when a reporter
+/// follows it, so this resolves before `report_all` runs. Moving the work off
+/// the async worker is what keeps a slow disk (or a burst of failures) from
+/// blocking the runtime while that happens.
+///
+/// A join failure — the blocking task panicked or the runtime is shutting down
+/// — is logged and reported as "no capsule", exactly like a write failure:
+/// capsule persistence must never make a bad request worse.
+async fn persist_capsule(capture: CaptureContext) -> Option<crate::capsule::CapsuleRef> {
+    let written = tokio::task::spawn_blocking(move || {
+        crate::capsule::persist(capture.handle.scope(), capture.outcome)
+    })
+    .await;
+    match written {
+        Ok(reference) => reference,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "failure capsule could not be written on the blocking pool; \
+                 the failure itself is still reported"
+            );
+            None
+        }
+    }
 }
 
 thread_local! {
@@ -664,6 +697,15 @@ mod tests {
         assert_eq!(format_panic_payload(&owned), "kaboom");
         let other: u32 = 7;
         assert_eq!(format_panic_payload(&other), "handler panicked");
+    }
+
+    #[test]
+    fn capture_context_can_cross_to_the_blocking_pool() {
+        // `persist_capsule` hands the context to `spawn_blocking`, which needs
+        // `Send + 'static`. A future field that is neither would only show up
+        // as a confusing error inside `dispatch`, so pin it here.
+        const fn assert_send_static<T: Send + 'static>() {}
+        assert_send_static::<CaptureContext>();
     }
 
     #[test]

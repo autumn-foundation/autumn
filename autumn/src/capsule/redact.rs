@@ -13,7 +13,11 @@
 //! not reappear in the `INSERT` that stored it.
 //!
 //! What is **not** masked: unstructured bodies (no keys to match on), URL path
-//! segments, and database result rows. See `docs/guide/failure-capsules.md`.
+//! segments, and database result rows. A body that *declares* structure but
+//! does not parse as it — malformed JSON, or the prefix teed before a handler
+//! abandoned the read — is not copied at all: with no keys to match on there
+//! is nothing to mask, so it is recorded as skipped with a note. See
+//! `docs/guide/failure-capsules.md`.
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
@@ -127,20 +131,28 @@ const MIN_ECHO_LEN: usize = 4;
 /// obtains them at different times: the head up front, the body as the handler
 /// streams it.
 ///
-/// Returns the redacted record plus the set of pre-mask values, for
-/// [`mask_binds`] and [`mask_echoes`].
+/// Returns the redacted record, the set of pre-mask values for [`mask_binds`]
+/// and [`mask_echoes`], and any notes about a body redaction refused to copy.
 #[must_use]
 pub fn redact_request(
     raw: &RawRequest,
     raw_body: &CapturedBody,
     filter: &ParameterFilter,
-) -> (CapsuleRequest, RedactedValues) {
+) -> (CapsuleRequest, RedactedValues, Vec<String>) {
     let mut values = RedactedValues::default();
     let mut keys = BTreeSet::new();
+    let mut notes = Vec::new();
 
     let headers = redact_headers(&raw.headers, filter, &mut values, &mut keys);
     let uri = redact_uri(&raw.uri, filter, &mut values, &mut keys);
-    let body = redact_body(&raw.headers, raw_body, filter, &mut values, &mut keys);
+    let body = redact_body(
+        &raw.headers,
+        raw_body,
+        filter,
+        &mut values,
+        &mut keys,
+        &mut notes,
+    );
 
     let request = CapsuleRequest {
         method: raw.method.clone(),
@@ -151,7 +163,7 @@ pub fn redact_request(
         body,
         redacted_keys: keys.into_iter().collect(),
     };
-    (request, values)
+    (request, values, notes)
 }
 
 /// Replace every occurrence of a redacted request value inside `text` with the
@@ -286,6 +298,19 @@ fn key_segments(key: &str) -> Vec<String> {
     }
 }
 
+/// `redacted_keys` entry recording that a body was masked wholesale because it
+/// did not parse as the structure it declared.
+const UNPARSEABLE_BODY_KEY: &str = "body:<unparseable>";
+
+/// Note recorded when a body declared JSON but did not parse as JSON.
+const UNPARSEABLE_JSON_NOTE: &str = "request body declared a JSON content type but did not parse as JSON; it was masked out of \
+     the capsule rather than copied verbatim, because there are no keys to redact on";
+
+/// Note recorded when a body declared a urlencoded form but did not parse as
+/// one.
+const UNPARSEABLE_FORM_NOTE: &str = "request body declared a urlencoded form but did not parse as one; it was masked out of the \
+     capsule rather than copied verbatim, because there are no keys to redact on";
+
 /// Redact the request body according to its content type.
 fn redact_body(
     headers: &axum::http::HeaderMap,
@@ -293,6 +318,7 @@ fn redact_body(
     filter: &ParameterFilter,
     values: &mut RedactedValues,
     keys: &mut BTreeSet<String>,
+    notes: &mut Vec<String>,
 ) -> CapsuleBody {
     let bytes = match raw_body {
         CapturedBody::Absent => return CapsuleBody::Absent,
@@ -313,16 +339,31 @@ fn redact_body(
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    if content_type.contains("json")
-        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(bytes)
-    {
+    if content_type.contains("json") {
+        // A body that claims to be JSON but is not one — malformed, or the
+        // prefix the tap copied before the handler abandoned the read — has no
+        // keys for the filter to match, so copying it verbatim would write
+        // `{"password":"secret",` straight into the capsule. Mask it instead:
+        // an unparsed body also contributes nothing to `values`, so nothing
+        // downstream could catch the echo either.
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return unparseable_body(bytes, UNPARSEABLE_JSON_NOTE, keys, notes);
+        };
         let scrubbed = scrub_value(&parsed, filter, "body", values, keys);
         return serde_json::to_string(&scrubbed).map_or(CapsuleBody::Absent, CapsuleBody::Text);
     }
 
     if content_type.contains("application/x-www-form-urlencoded") {
+        // Same conservatism, one step earlier: the urlencoded parser is lossy
+        // and accepts anything, so a JSON document sent under a form content
+        // type would come back as one giant key that matches no filter and is
+        // then re-serialized verbatim. `form_pairs` says whether this really
+        // is a form before any of it is copied.
+        let Some(pairs) = form_pairs(bytes) else {
+            return unparseable_body(bytes, UNPARSEABLE_FORM_NOTE, keys, notes);
+        };
         let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-        for (key, value) in url::form_urlencoded::parse(bytes) {
+        for (key, value) in pairs {
             if key_is_sensitive(&key, filter) {
                 values.insert(value.as_bytes());
                 keys.insert(format!("body:{key}"));
@@ -340,6 +381,70 @@ fn redact_body(
         |_| CapsuleBody::Base64(STANDARD.encode(bytes)),
         |text| CapsuleBody::Text(text.to_owned()),
     )
+}
+
+/// Record a body that declared a structure it does not have, without copying
+/// any of it.
+///
+/// Reusing [`CapsuleBody::Skipped`] says the one thing a reader needs to know —
+/// the bytes were deliberately not carried, only their length — and replay
+/// already handles it by sending an empty body with a warning. The note says
+/// *why* this one was skipped.
+fn unparseable_body(
+    bytes: &[u8],
+    note: &'static str,
+    keys: &mut BTreeSet<String>,
+    notes: &mut Vec<String>,
+) -> CapsuleBody {
+    keys.insert(UNPARSEABLE_BODY_KEY.to_owned());
+    notes.push(note.to_owned());
+    CapsuleBody::Skipped {
+        declared_len: Some(bytes.len()),
+    }
+}
+
+/// Decode a urlencoded form body, or `None` if it is not one.
+///
+/// `url::form_urlencoded::parse` never fails, so this validates the shape
+/// first: UTF-8, every `&`-separated segment a `key=value` pair, and every key
+/// made of characters a client would not have had to percent-encode. Rejecting
+/// costs a captured body; accepting a non-form costs an unredactable copy of
+/// it, so the doubt is resolved towards rejecting.
+fn form_pairs(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut pairs = 0usize;
+    for segment in text.split('&') {
+        // A trailing or doubled separator is sloppy but still a form.
+        if segment.is_empty() {
+            continue;
+        }
+        let (key, _) = segment.split_once('=')?;
+        if key.is_empty() || key.contains(is_not_form_key_char) {
+            return None;
+        }
+        pairs += 1;
+    }
+    if pairs == 0 {
+        return None;
+    }
+    Some(
+        url::form_urlencoded::parse(bytes)
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect(),
+    )
+}
+
+/// Whether a character disqualifies the string it appears in from being a
+/// urlencoded form key.
+///
+/// Deliberately narrow: it names the characters a form key cannot carry
+/// unencoded (structural JSON punctuation, quotes, whitespace, controls)
+/// rather than trying to enumerate the ones it can, so unencoded-but-harmless
+/// keys such as `user[email]` still pass.
+const fn is_not_form_key_char(c: char) -> bool {
+    c.is_ascii_control()
+        || c.is_whitespace()
+        || matches!(c, '{' | '}' | '"' | '\'' | '<' | '>' | '\\')
 }
 
 /// Recursively mask sensitive leaves of a JSON body, recording what was hit.
@@ -409,6 +514,19 @@ mod tests {
         body: CapturedBody,
         filter: &ParameterFilter,
     ) -> (CapsuleRequest, RedactedValues) {
+        let (request, values, _) = redact_with_notes(builder, body, filter);
+        (request, values)
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "fixture bodies read better handed over than borrowed at every call site"
+    )]
+    fn redact_with_notes(
+        builder: axum::http::request::Builder,
+        body: CapturedBody,
+        filter: &ParameterFilter,
+    ) -> (CapsuleRequest, RedactedValues, Vec<String>) {
         let request = builder.body(()).expect("test request builds");
         let (parts, ()) = request.into_parts();
         let raw = RawRequest {
@@ -598,6 +716,126 @@ mod tests {
         );
         assert!(body.contains("visible"));
         assert!(values.contains(b"deep-secret-value"));
+    }
+
+    #[test]
+    fn malformed_json_body_is_masked_not_copied_verbatim() {
+        let (request, values, notes) = redact_with_notes(
+            Request::post("/users").header(header::CONTENT_TYPE, "application/json"),
+            CapturedBody::Buffered(Bytes::from_static(br#"{"password":"hunter2secret", oops"#)),
+            &filter_with(&[]),
+        );
+
+        assert_eq!(
+            request.body,
+            CapsuleBody::Skipped {
+                declared_len: Some(33)
+            },
+            "a body that declared JSON but did not parse must never be copied verbatim, got {:?}",
+            request.body
+        );
+        assert!(
+            values.is_empty(),
+            "an unparsed body yields no keys, so it contributes nothing to the echo set"
+        );
+        assert!(
+            request
+                .redacted_keys
+                .contains(&UNPARSEABLE_BODY_KEY.to_owned()),
+            "redacted_keys must record that the body was masked, got {:?}",
+            request.redacted_keys
+        );
+        assert_eq!(notes, vec![UNPARSEABLE_JSON_NOTE.to_owned()]);
+    }
+
+    #[test]
+    fn truncated_json_prefix_is_masked() {
+        // The body tap copies bytes as the handler reads them, so a request
+        // that fails mid-stream leaves a prefix that cannot parse.
+        let (request, _, notes) = redact_with_notes(
+            Request::post("/users").header(header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            CapturedBody::Buffered(Bytes::from_static(br#"{"token":"deep-secret-value","#)),
+            &filter_with(&[]),
+        );
+
+        assert!(
+            matches!(request.body, CapsuleBody::Skipped { .. }),
+            "a truncated JSON prefix must be masked, got {:?}",
+            request.body
+        );
+        assert_eq!(notes, vec![UNPARSEABLE_JSON_NOTE.to_owned()]);
+    }
+
+    #[test]
+    fn body_that_is_not_a_form_under_a_form_content_type_is_masked() {
+        // The urlencoded parser is lossy: it accepts anything, turning a JSON
+        // document into one giant key that no filter can match.
+        let (request, _, notes) = redact_with_notes(
+            Request::post("/users")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded"),
+            CapturedBody::Buffered(Bytes::from_static(br#"{"password":"hunter2secret"}"#)),
+            &filter_with(&[]),
+        );
+
+        assert!(
+            matches!(request.body, CapsuleBody::Skipped { .. }),
+            "a body that declared a form but did not parse as one must be masked, got {:?}",
+            request.body
+        );
+        assert_eq!(notes, vec![UNPARSEABLE_FORM_NOTE.to_owned()]);
+    }
+
+    #[test]
+    fn valid_structured_bodies_still_parse_without_a_note() {
+        let (request, values, notes) = redact_with_notes(
+            Request::post("/users").header(header::CONTENT_TYPE, "application/json"),
+            CapturedBody::Buffered(Bytes::from_static(
+                br#"{"password":"hunter2secret","keep":"visible"}"#,
+            )),
+            &filter_with(&[]),
+        );
+        let CapsuleBody::Text(body) = &request.body else {
+            panic!("valid JSON must still be parsed and scrubbed, got {request:?}");
+        };
+        assert!(!body.contains("hunter2secret") && body.contains("visible"));
+        assert!(values.contains(b"hunter2secret"));
+        assert!(
+            notes.is_empty(),
+            "a parsed body needs no note, got {notes:?}"
+        );
+
+        let (request, _, notes) = redact_with_notes(
+            Request::post("/users")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded"),
+            CapturedBody::Buffered(Bytes::from_static(b"email=ada%40example.com&flag=&page=2")),
+            &filter_with(&[]),
+        );
+        assert!(
+            matches!(&request.body, CapsuleBody::Text(body) if body.contains("page=2")),
+            "an ordinary form body — empty values included — must still parse, got {:?}",
+            request.body
+        );
+        assert!(
+            notes.is_empty(),
+            "a parsed body needs no note, got {notes:?}"
+        );
+    }
+
+    #[test]
+    fn unstructured_bodies_are_unaffected() {
+        // No declared structure means nothing claimed to parse, so the existing
+        // verbatim copy stands.
+        let (request, _, notes) = redact_with_notes(
+            Request::post("/notes").header(header::CONTENT_TYPE, "text/plain"),
+            CapturedBody::Buffered(Bytes::from_static(b"{not json, not a form")),
+            &filter_with(&[]),
+        );
+
+        assert_eq!(
+            request.body,
+            CapsuleBody::Text("{not json, not a form".to_owned())
+        );
+        assert!(notes.is_empty());
     }
 
     #[test]

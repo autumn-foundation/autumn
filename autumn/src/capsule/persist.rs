@@ -133,8 +133,11 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     if let Some(note) = scope.body_note() {
         scope.note(note);
     }
-    let (request, redacted) =
+    let (request, redacted, body_notes) =
         crate::capsule::redact::redact_request(raw, &raw_body, scope.filter());
+    for note in body_notes {
+        scope.note(note);
+    }
 
     let mut db = scope.db_snapshot();
     if let Some(db) = db.as_mut() {
@@ -389,6 +392,62 @@ mod tests {
                 problem_type: None,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn persist_on_the_blocking_pool_still_yields_a_capsule_ref() {
+        use std::sync::Arc;
+
+        use crate::capsule::CaptureSettings;
+        use crate::capsule::capture::CaptureScope;
+        use crate::capsule::redact::RawRequest;
+        use crate::log::filter::ParameterFilter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = CaptureSettings {
+            dir: dir.path().to_string_lossy().into_owned(),
+            ..CaptureSettings::default()
+        };
+        let scope = Arc::new(CaptureScope::new(
+            "req-blocking".to_owned(),
+            Arc::new(settings),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        ));
+        scope.set_request(RawRequest {
+            method: "GET".to_owned(),
+            uri: "/boom".parse().expect("uri parses"),
+            version: axum::http::Version::HTTP_11,
+            headers: axum::http::HeaderMap::new(),
+            route: Some("/boom".to_owned()),
+        });
+
+        // `reporting::dispatch` hands persistence to `spawn_blocking`, so the
+        // whole scope has to survive the trip to another thread and the write
+        // has to land there — not just when it runs inline on the worker.
+        let written = tokio::task::spawn_blocking(move || {
+            persist(
+                &scope,
+                CapsuleOutcome::Status {
+                    code: 500,
+                    message: "boom".to_owned(),
+                    problem_type: None,
+                },
+            )
+        })
+        .await
+        .expect("the blocking task must join cleanly");
+
+        let reference = written.expect("persisting on the blocking pool must still return a ref");
+        assert_eq!(reference.id, "req-blocking");
+        assert!(
+            reference.path.exists(),
+            "the capsule must be on disk by the time the join handle resolves, so a \
+             reporter following the reference cannot race the writer"
+        );
+        assert_eq!(
+            load_capsule(&reference.path).expect("loads").request.uri,
+            "/boom"
+        );
     }
 
     #[test]

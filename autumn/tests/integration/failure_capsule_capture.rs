@@ -480,6 +480,47 @@ async fn outcome_does_not_echo_a_redacted_request_value() {
 }
 
 #[tokio::test]
+async fn malformed_json_body_never_reaches_the_capsule() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = TestApp::new()
+        .config(capture_config(dir.path()))
+        .routes(routes![echo_fail])
+        .build();
+
+    // Declares JSON, is not JSON — the shape a truncated or hand-rolled
+    // payload arrives in. There are no keys to redact on, so none of it may be
+    // copied.
+    client
+        .post("/echo-fail")
+        .header("content-type", "application/json")
+        .body(r#"{"password":"hunter2secret", "#)
+        .send()
+        .await
+        .assert_status(500);
+
+    let paths = await_capsules(dir.path(), 1).await;
+    let capsule = read_capsule(&paths[0]);
+    assert!(
+        matches!(capsule.request.body, CapsuleBody::Skipped { .. }),
+        "a body that declared JSON but did not parse must be masked, got {:?}",
+        capsule.request.body
+    );
+    assert!(
+        capsule
+            .notes
+            .iter()
+            .any(|note| note.contains("did not parse")),
+        "the capsule must say why the body is missing, got {:?}",
+        capsule.notes
+    );
+    let whole = std::fs::read_to_string(&paths[0]).expect("capsule readable");
+    assert!(
+        !whole.contains("hunter2secret"),
+        "no part of the capsule may contain an unredactable body's contents"
+    );
+}
+
+#[tokio::test]
 async fn max_capsules_prunes_oldest() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = capture_config(dir.path());
