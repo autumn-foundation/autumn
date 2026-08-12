@@ -50,7 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the markers record the relationship durably, `--belongs-to` is a one-time
   flag: a later `generate … --force` without it keeps the nesting (with a
   warning) instead of half-dismantling it, and `destroy` finds the parent
-  without it.
+  without it. Re-pointing a nested child at a *different* parent, or dropping
+  its foreign key, is refused before anything is written — the parent's section
+  passes its own `row.id`, so the change would leave that call compiling while
+  reading another table's ids. Un-nest with `destroy` first.
   When the child carries an owner column, the nested list inherits the flat
   index's `#[secured]` + owner scoping, so nesting never opens a second, wider
   door onto the same rows.

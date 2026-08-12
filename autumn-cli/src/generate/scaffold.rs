@@ -845,21 +845,6 @@ fn plan_scaffold_with_options_impl(
             pascal = n.parent_pascal,
         ));
     }
-    // Markers present, but nothing to infer from — the foreign key this resource
-    // was nested on is gone from the field list. The parent still calls
-    // `children_section`, which the regenerated module will not define, and the
-    // generator cannot repair a relationship whose column no longer exists.
-    if !for_revert && nesting.is_none() && !nested_parents.is_empty() && !options_with_key.api {
-        plan.warn(format!(
-            "src/routes/ still nests {plural} (a `--belongs-to` scaffold), but this field \
-             list has no `references` column pointing at that parent, so the relationship \
-             could not be recovered. The nested routes have been unmounted from src/main.rs \
-             to match the regenerated module, but the parent's `children_section` call \
-             remains and will not compile — restore the foreign-key column, or run \
-             `autumn destroy scaffold {name} …` to remove the parent-side section."
-        ));
-    }
-
     // Route file under `src/routes/<plural>.rs`
     if !options_with_key.api {
         // The shared-layout preflight applies only to standard scaffolds, which
@@ -1162,23 +1147,6 @@ fn plan_scaffold_with_options_impl(
     if policy_on {
         mods.push("policies");
     }
-    // Markers say this resource WAS nested, but nothing could be recovered (its
-    // foreign key is gone). `update_main_rs` only ever adds entries, so the two
-    // mounts from the earlier nested generation would survive and reference
-    // handlers the regenerated module no longer emits. Drop them so at least
-    // `main.rs` and the module agree; the parent's own call is warned about
-    // above and needs a human.
-    let main_existing = if !for_revert && nesting.is_none() && !nested_parents.is_empty() {
-        super::schema_edit::remove_routes_entries(
-            &main_existing,
-            &[
-                format!("routes::{plural}::nested_index"),
-                format!("routes::{plural}::nested_create"),
-            ],
-        )
-    } else {
-        main_existing
-    };
     let updated = update_main_rs(&main_existing, &mods, &route_entries);
     // Fold the policy/scope builder registration into the same `updated` content
     // (issue #1125) so main.rs gets a single `Modify` action.
@@ -19281,36 +19249,91 @@ exempt_paths = [
     }
 
     #[test]
-    fn regenerating_after_dropping_the_foreign_key_warns_instead_of_guessing() {
+    fn regenerating_after_dropping_the_foreign_key_is_refused_before_anything_is_written() {
         // Nothing to nest on any more, so there is no relationship to recover —
-        // and the parent's `children_section` call will not compile. The
-        // generator can't repair that, but it must say so rather than emit a
-        // half-wired project in silence.
+        // and the parent's `children_section` call would be left pointing at a
+        // helper the regenerated module no longer defines. A warning is not
+        // enough: the command would report success on an app that no longer
+        // compiles. Refuse instead, having written nothing.
         let tmp = project_with_scaffolded_parent();
         nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+        let parent_before = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        let regen = plan_scaffold_with_options(
+        let err = plan_scaffold_with_options(
             tmp.path(),
             "Comment",
             &["body:Text".into()],
             "20260428000000",
             &ScaffoldOptions::default(),
         )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("already nested under posts"), "got: {msg}");
+        assert!(msg.contains("Nothing has been written"), "got: {msg}");
+        assert!(msg.contains("no longer compile"), "got: {msg}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap(),
+            parent_before,
+            "a refusal must not touch the parent"
+        );
+    }
+
+    #[test]
+    fn re_parenting_an_already_nested_resource_is_refused() {
+        // The nastiest shape: it COMPILES. `posts.rs` keeps calling
+        // `children_section(&mut db, row.id, …)`, but the regenerated helper now
+        // filters on `user_id` — so Post #3's page would list User #3's comments
+        // and its inline form would create rows owned by that user.
+        let tmp = project_with_scaffolded_parent();
+        // A second scaffolded parent to re-point at.
+        plan_scaffold(
+            tmp.path(),
+            "User",
+            &["name:String".into()],
+            "20260427000001",
+        )
+        .unwrap()
+        .execute(Flags::default())
         .unwrap();
-        let routes = action_contents(&regen, "src/routes/comments.rs");
-        assert!(!routes.contains("nested_index"), "{routes}");
-        let main = action_contents(&regen, "src/main.rs");
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &[
+                "body:Text".into(),
+                "post:references".into(),
+                "user:references".into(),
+            ],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &[
+                "body:Text".into(),
+                "post:references".into(),
+                "user:references".into(),
+            ],
+            "20260428000000",
+            &ScaffoldOptions {
+                belongs_to: Some("User".to_owned()),
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("already nested under posts"), "got: {msg}");
         assert!(
-            !main.contains("nested_index"),
-            "stale markers must not mount handlers the fresh module never emits:\n{main}"
+            msg.contains("binds comments to users instead"),
+            "got: {msg}"
         );
         assert!(
-            regen
-                .warnings
-                .iter()
-                .any(|w| w.contains("no `references` column pointing at that parent")),
-            "expected a warning about the dropped foreign key; got: {:?}",
-            regen.warnings
+            msg.contains("quietly serves the wrong rows"),
+            "the message must name the failure mode — this shape COMPILES:\n{msg}"
         );
     }
 

@@ -265,7 +265,18 @@ free on the flat index has to be spelled out in `children_section_with`
 Because the markers record the relationship durably, `--belongs-to` is a
 **one-time** flag: re-running `generate … --force` without it keeps the nesting
 (and says so in a warning) rather than half-dismantling it, and `autumn destroy`
-finds the parent without it. To actually un-nest, destroy the child resource.
+finds the parent without it.
+
+Changing or dropping the parent is refused, before anything is written. The
+parent's section hands `children_section` its own `row.id`, so re-pointing the
+child at a different parent would leave that call compiling but reading the
+wrong table's ids — a post's page listing whichever *user* shares its id.
+Un-nest first, then re-nest:
+
+```bash
+autumn destroy scaffold Comment body:Text post:references user:references --belongs-to Post
+autumn generate scaffold Comment body:Text post:references user:references --belongs-to User
+```
 
 The edits to the parent's routes file are marker-delimited
 (`// autumn:nested:comments`), so re-running the generator never double-injects

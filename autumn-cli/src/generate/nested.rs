@@ -191,7 +191,59 @@ pub(super) fn resolve(
         None
     };
     let inferred = options.belongs_to.is_none() && inferred_parent.is_some();
-    let Some(raw_parent) = options.belongs_to.as_deref().or(inferred_parent.as_deref()) else {
+    let effective = options.belongs_to.as_deref().or(inferred_parent.as_deref());
+
+    // A parent's injected section must never outlive the relationship it calls
+    // into. That section passes `row.id` — the PARENT's own key — to
+    // `children_section`, so if this run rebinds the child to a DIFFERENT parent
+    // (or to none), the call keeps compiling while meaning something else
+    // entirely: `posts.rs` would hand a post id to a helper now filtering on
+    // `user_id`, and Post #3's page would quietly list User #3's comments and
+    // create rows owned by them. Nothing on the child's side can fix that, and
+    // silently rewriting the other parent's view is not this command's
+    // business — so refuse before a single file is written, which leaves the
+    // project exactly as it was.
+    if !for_revert && !options.api {
+        let effective_plural = effective.map(|parent| pluralize(&snake(parent)));
+        let stale: Vec<String> = parents_carrying_child(project_root, child_plural)
+            .iter()
+            .filter_map(|path| path.file_stem()?.to_str().map(ToOwned::to_owned))
+            .filter(|parent_plural| Some(parent_plural.as_str()) != effective_plural.as_deref())
+            .collect();
+        if let Some(stale_parent) = stale.first() {
+            // Each shape fails differently, and saying which is the whole
+            // value of the message: a dropped foreign key stops the project
+            // COMPILING (loud), while a re-parent leaves it compiling and
+            // reading the wrong rows (silent, and much worse).
+            let because = effective_plural.as_deref().map_or_else(
+                || {
+                    format!(
+                        "this field list has no `references` column pointing at {stale_parent}, so \
+                     the nested routes that section calls would not be regenerated at all and \
+                     that call would no longer compile"
+                    )
+                },
+                |new_parent| {
+                    format!(
+                        "this run binds {child_plural} to {new_parent} instead, so the same helper \
+                     would start reading THAT parent's id — the call keeps compiling and \
+                     quietly serves the wrong rows"
+                    )
+                },
+            );
+            return Err(GenerateError::Config(format!(
+                "{child_plural} is already nested under {stale_parent}: \
+                 src/routes/{stale_parent}.rs renders their children section and calls \
+                 `crate::routes::{child_plural}::children_section(…)` with its own row id. But \
+                 {because}. \
+                 Run `autumn destroy scaffold` for this resource first (it removes the \
+                 parent-side section from src/routes/{stale_parent}.rs), then generate again. \
+                 Nothing has been written."
+            )));
+        }
+    }
+
+    let Some(raw_parent) = effective else {
         return Ok(None);
     };
     let parent_pascal = pascal(raw_parent);
