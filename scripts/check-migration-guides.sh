@@ -1295,6 +1295,12 @@ collect_link_defs() {
         pending = ""
         next
       }
+      # CommonMark caps a label at 999 characters; a longer one creates no
+      # definition, so the reference renders as literal text.
+      if (length(pending) > 999) {
+        pending = ""
+        next
+      }
       pending_rest = substr(body, close_at + 2)
       flush_def()
     }
@@ -1473,8 +1479,13 @@ findings="$(
       section = "Unreleased"
       guide_path = unreleased_guide
       in_scope = 1
-    } else if (match(heading, /\[[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\][[:space:]]*(-|$)/)) {
-      section = substr(heading, RSTART + 1, RLENGTH - 2)
+    } else if (match(heading, /^##[[:space:]]+\[[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\][[:space:]]*(-|$)/)) {
+      # Anchored, so the version token is the bracketed run at the start of the
+      # heading text — a bare `match` accepted `## notes [0.3.0]` and filed a
+      # malformed heading as an out-of-scope release, swallowing its entries
+      # instead of failing closed.
+      section = substr(heading, RSTART, RLENGTH)
+      sub(/^##[[:space:]]+\[/, "", section)
       sub(/\].*$/, "", section)
       # A release candidate is gated against its release`s guide.
       release = section

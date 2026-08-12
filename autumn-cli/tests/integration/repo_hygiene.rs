@@ -7563,3 +7563,109 @@ fn migration_guide_gate_still_suppresses_a_destination_continuation() {
         gate_report(&output),
     );
 }
+
+// --- Review round 63: anchored version headings, label length -------------
+
+#[test]
+fn migration_guide_gate_fails_closed_on_a_heading_that_merely_mentions_a_version() {
+    // `## notes [0.3.0]` is not a release heading. Matching the version
+    // anywhere in the line classified it as the out-of-scope 0.3.0 section, so
+    // a breaking entry beneath it needed no guide and the gate passed — the
+    // exact silent-swallow the unparseable-heading guard exists to prevent.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## notes [0.3.0]\n\n\
+         - **db:** **Breaking:** renamed, with no guide.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a heading it cannot parse is a hard error\n{}",
+        gate_report(&output),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unreadable release heading"),
+        "the failure must name the unparseable heading\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_reads_the_documented_heading_shapes() {
+    // The counterpart: anchoring must not stop the real shapes parsing, both
+    // the dated release heading and the bare unreleased one.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [Unreleased]\n\n\
+         - **api:** an addition.\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "the documented heading shapes still parse\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_an_overlong_reference_label() {
+    // CommonMark caps a reference label at 999 characters, so a longer one
+    // creates no definition and the reference renders as literal text.
+    let label = "a".repeat(1000);
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        format!(
+            "# Changelog\n\n\
+             ## [0.7.0] - 2026-09-01\n\n\
+             ### Changed\n\n\
+             - **db:** **Breaking:** renamed. See the [migration guide][{label}].\n\n\
+             [{label}]: docs/migrations/0.7.0.md\n"
+        ),
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an overlong label defines nothing",
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_a_label_at_the_length_limit() {
+    // The boundary: 999 characters is still a valid label and still resolves.
+    let label = "b".repeat(999);
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        format!(
+            "# Changelog\n\n\
+             ## [0.7.0] - 2026-09-01\n\n\
+             ### Changed\n\n\
+             - **db:** **Breaking:** renamed. See the [migration guide][{label}].\n\n\
+             [{label}]: docs/migrations/0.7.0.md\n"
+        ),
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a label at the limit still resolves\n{}",
+        gate_report(&output),
+    );
+}
