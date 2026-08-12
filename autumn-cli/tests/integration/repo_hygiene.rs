@@ -5052,3 +5052,81 @@ fn migration_guide_gate_accepts_a_marked_paragraph_that_links_its_guide() {
         gate_report(&output),
     );
 }
+
+// --- Review round 34: paragraph state, prose under a breaking heading -----
+
+#[test]
+fn migration_guide_gate_closes_a_paragraph_at_an_interrupting_html_block() {
+    // A complete raw block such as `<pre></pre>` ends the paragraph it
+    // interrupts, so the standalone tag on the next line starts a block of its
+    // own. Leaving the paragraph flag set kept that tag inline and let the
+    // link below it count, though the reference implementation renders the
+    // whole run literally.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n  \
+         <pre></pre>\n  <x-widget>\n  \
+         See the [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an interrupting block ends the paragraph it interrupts",
+    );
+}
+
+#[test]
+fn migration_guide_gate_counts_prose_under_a_breaking_changes_heading() {
+    // The heading is a documented alternative to the inline marker, so prose
+    // beneath it declares a break without repeating the token. Requiring the
+    // token there left a section able to ship with no guide at all.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes\n\n\
+         Removed the `page` trait method.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "prose under the heading declares a break and needs a guide\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_treat_a_breaking_section_note_as_an_entry() {
+    // The counterpart, and the shape this repository's own changelog uses: a
+    // block quote introducing the section is an aside, not a declaration, so
+    // it must not demand a guide link of its own. Without this the fix above
+    // would fail the real CHANGELOG.md.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes\n\n\
+         > Backfilled from the guide, which shipped with the release.\n\n\
+         - **db:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a block quote note is not a breaking entry\n{}",
+        gate_report(&output),
+    );
+}

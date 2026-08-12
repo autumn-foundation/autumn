@@ -616,6 +616,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # under a `- ` item is a two-space indent and opens a block. This is the same
   # measurement the fence rule above uses.
   if (md_in_html_block) {
+    md_paragraph_open = 0
     if (md_html_type == 1) {
       if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
     } else if (md_html_end != "") {
@@ -631,6 +632,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     md_in_html_block = 1
     md_html_type = 1
     md_html_end = ""
+    md_paragraph_open = 0
     md_html_opened_at = FNR
     if (tolower(line) ~ /<\/(script|style|pre|textarea)>/) md_in_html_block = 0
     return ""
@@ -652,6 +654,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   }
   if (md_html_end != "") {
     md_in_html_block = 1
+    md_paragraph_open = 0
     md_html_opened_at = FNR
     # The terminator may sit on the opening line, after the opener itself —
     # `<?demo ?>` is a complete block. Searched past the opener so a `>` inside
@@ -667,6 +670,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   if (tolower(body) ~ /^<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([[:space:]/>]|$)/) {
     md_in_html_block = 1
     md_html_type = 6
+    md_paragraph_open = 0
     md_html_opened_at = FNR
     return ""
   }
@@ -681,6 +685,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   if (!md_paragraph_open && is_standalone_tag(body) && body !~ /^<!/) {
     md_in_html_block = 1
     md_html_type = 6
+    md_paragraph_open = 0
     md_html_opened_at = FNR
     return ""
   }
@@ -956,7 +961,10 @@ findings="$(
   # rule and still demand no guide, because nothing was ever counted as an
   # entry. Scoped to the explicit inline marker: a bare paragraph under a
   # `### Breaking Changes` heading is usually the intro to the list below it.
-  entry == "" && tolower(strip_code_spans(visible)) ~ /\*\*breaking(:\*\*|\*\*:)/ {
+  entry == "" &&
+  (tolower(strip_code_spans(visible)) ~ /\*\*breaking(:\*\*|\*\*:)/ ||
+   (breaking_heading && block_body(visible) ~ /[^[:space:]]/ &&
+    block_body(visible) !~ /^>/)) {
     entry_line = FNR
     entry_breaking_heading = breaking_heading
     entry = $0
