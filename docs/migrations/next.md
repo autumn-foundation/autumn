@@ -90,6 +90,45 @@ last time this particular field costs you an edit.
 rg -n 'Route \{|StaticRouteMeta \{' src/
 ```
 
+### Optimistic locking on scaffolded models (#1318)
+
+Only affects apps that (a) declare a column literally named `lock_version` and
+(b) re-run `autumn generate model` / `generate scaffold` over it. `lock_version`
+is now a load-bearing name: the generator treats it as a database-managed
+optimistic-locking column.
+
+**What changes**
+
+- `lock_version` is dropped from `New{Model}`, so it can no longer be set on
+  create.
+- It disappears from a scaffold's HTML form in favour of a hidden field, and the
+  model gains a derived `etag()` method.
+- Generation is now *refused* — rather than emitting something subtly wrong —
+  when a `lock_version` scaffold is paired with `--live`, `--sharded`, a `slug`
+  column, or an `Attachment` column, or when the column is the only one, is
+  marked `unique`, or is typed as anything but a non-nullable `i32`/`i64`.
+  Generation prints a warning naming the escape hatch whenever the name is
+  detected.
+
+**Breaking for `--api` scaffolds.** `#[lock_version]` puts a *required*
+`lock_version` on `Update{Model}`, so a JSON `PUT`/`PATCH` client must send the
+version it read:
+
+```jsonc
+// Before
+{ "title": "New title" }
+
+// After — send the version returned by the previous GET
+{ "title": "New title", "lock_version": 7 }
+```
+
+A client that omits the field now fails deserialization with `422`. That
+required field is what gives the JSON path its conflict checking: a stale
+version comes back `409` instead of silently overwriting a concurrent edit.
+
+**If you do not want this**, rename the column (for example to `revision`) and
+re-run the generator; the name is the only trigger.
+
 ## Deprecations (non-breaking)
 
 ### `scheduler::now_unix_secs` / `scheduler::now_unix_duration`
