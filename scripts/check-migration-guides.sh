@@ -840,6 +840,12 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
     return scan_comments(out)
   }
 
+  # Computed before the in-block branch, which measures blankness against it.
+  # Moving that branch above the fence rule last round left this assignment
+  # below its only reader, so `body` was empty, every line looked blank, and a
+  # type-6 block closed after swallowing one line.
+  body = strip_quote_markers(block_body(line))
+
   if (md_in_html_block) {
     md_paragraph_open = 0
     if (md_html_type == 1) {
@@ -872,7 +878,6 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # Sliced from the *expanded* line: leading_spaces counts visual columns, so
   # feeding that count to substr on a tab-indented line started the slice
   # mid-marker and the fence went unseen.
-  body = strip_quote_markers(block_body(line))
   ch = substr(body, 1, 1)
   if (ch == "`" || ch == "~") {
     run = 0
@@ -1037,7 +1042,7 @@ function scan_comments(text,   out, masked, pos, close_at, head, tail) {
       return head
     }
     out = head substr(tail, close_at + 3)
-    masked = mask_code_spans(out)
+    masked = mask_link_metadata(mask_code_spans(out))
   }
   return out
 }

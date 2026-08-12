@@ -6797,3 +6797,57 @@ fn migration_guide_gate_keeps_an_inline_comment_inline() {
         gate_report(&output),
     );
 }
+
+// --- Review round 55: block body computation, comment re-masking ----------
+
+#[test]
+fn migration_guide_gate_keeps_a_multi_line_html_block_open() {
+    // A type-6 block runs to the next blank line, however many lines it holds.
+    // Testing blankness against a body that had not been computed yet closed
+    // the block after one line and handed the rest back as markdown, so a
+    // literal bullet inside it became a real entry.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         <div>\n\
+         literal first line\n\
+         - **db:** **Breaking:** renamed, with no link of its own.\n\n\
+         - **api:** an addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "everything up to the blank line is literal, so nothing declares\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_remasks_link_metadata_after_a_comment() {
+    // Once a completed comment is removed, the rest of the line is rescanned —
+    // and a `<!--` in a link title further along is still tooltip text. Masking
+    // only code spans on the rescan reported an unclosed comment and rejected
+    // a valid changelog.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **api:** an addition. <!-- note --> \
+           [details](https://example.invalid \"<!-- tooltip\")\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a tooltip after a comment is still a tooltip\n{}",
+        gate_report(&output),
+    );
+}
