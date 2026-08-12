@@ -7502,3 +7502,64 @@ fn migration_guide_gate_accepts_an_image_labelled_guide_link() {
         gate_report(&output),
     );
 }
+
+// --- Review round 62: continuations only follow an incomplete definition --
+
+#[test]
+fn migration_guide_gate_counts_prose_after_a_complete_definition() {
+    // A definition that carries its destination is finished, so the line below
+    // it is ordinary prose — the reference implementation renders `Details.`
+    // as a paragraph. Treating every line after a definition as a possible
+    // destination suppressed it and reported the section empty.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "[ref]: https://example.invalid\nDetails.",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "prose after a finished definition is content\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_suppresses_a_destination_continuation() {
+    // The counterpart that must survive: an opener with no destination is
+    // continued by the line below it, and the whole definition renders
+    // nothing — so a section holding only that is still a stub.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace(
+        "Why this release breaks.",
+        "[ref]:\n    https://example.invalid",
+    );
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a split definition still renders nothing\n{}",
+        gate_report(&output),
+    );
+}

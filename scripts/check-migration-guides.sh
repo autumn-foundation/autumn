@@ -1876,18 +1876,23 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           # A link reference definition, and a title continuing one onto the
           # next line, render nothing — they populate a section on paper only.
           # A definition opener whose destination sits on the next line is
-          # still a definition, and the whole of it renders nothing. Tracking
-          # only the single-line shape let the destination line populate the
-          # section on its own.
-          if (is_link_definition(visible) || is_definition_opener(visible)) {
+          # still a definition, and the whole of it renders nothing. Two
+          # separate expectations, because conflating them suppressed ordinary
+          # prose: a destination is only awaited after an opener that lacked
+          # one, while a title may follow either shape.
+          if (is_definition_opener(visible)) {
+            pending_dest = !is_link_definition(visible)
+            pending_title = 1
+          } else if (pending_dest && strip_inline_tags(visible) ~ /^[[:space:]]*[^[:space:]]+[[:space:]]*$/) {
+            # The destination, alone on the line below its opener.
+            pending_dest = 0
             pending_title = 1
           } else if (pending_title && is_orphan_title(visible)) {
-            pending_title = 0
-          } else if (pending_title && strip_inline_tags(visible) ~ /^[[:space:]]*[^[:space:]]+[[:space:]]*$/) {
-            # The destination, alone on the line below its opener.
+            pending_dest = 0
             pending_title = 0
           } else if (rendered_content(visible) ~ /[^[:space:]]/ &&
                      !is_thematic_break(visible) && !is_empty_list_item(visible)) {
+            pending_dest = 0
             pending_title = 0
             for (lvl = 1; lvl <= 6; lvl++) {
               if (open_heading[lvl] != "") content[open_heading[lvl]] = 1
