@@ -5516,3 +5516,81 @@ fn migration_guide_gate_still_finds_a_guide_link_after_another_link() {
         gate_report(&output),
     );
 }
+
+// --- Review round 40: indented code, introductory prose -------------------
+
+#[test]
+fn migration_guide_gate_does_not_read_indented_code_as_a_breaking_entry() {
+    // Four spaces makes an indented code block: literal text, so neither the
+    // words nor the link inside it render. `block_body` strips only the three
+    // markdown allows on a block construct, so the leftover space is exactly
+    // the signal that this is code.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes\n\n    \
+         Removed API, in a sample with no link of its own.\n\n\
+         - **db:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a code sample is not an entry, and its link is not clickable\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_allows_introductory_prose_before_a_breaking_list() {
+    // The conventional shape of the section: a sentence introducing the list
+    // beneath it. The introduction is not itself an entry, so demanding its
+    // own guide link rejects a correct changelog.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes\n\n\
+         The following changes require action:\n\n\
+         - **db:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "an introduction to a list is not an entry of its own\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_counts_a_prose_only_breaking_section() {
+    // And the counterpart that must survive it: with no list at all, the prose
+    // *is* the entry. This is the round-34 hole, and relaxing introductions
+    // must not reopen it.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Breaking Changes\n\n\
+         Removed the `page` trait method.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "prose is the entry when the section has no list\n{}",
+        gate_report(&output),
+    );
+}

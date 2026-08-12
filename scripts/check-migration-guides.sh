@@ -919,6 +919,18 @@ findings="$(
     return 1
   }
 
+  function release_held(   i) {
+    # Called at every heading and at EOF: the section is over, so it is now
+    # known whether the prose was introducing a list or standing in for one.
+    if (!section_has_list) {
+      for (i = 0; i < held_n; i++) {
+        printf "BREAKING\t%s\t%d\t%d\t%s\n", held_section, held_line[i], held_link[i], held_guide
+      }
+    }
+    held_n = 0
+    section_has_list = 0
+  }
+
   function excerpt(text,   flat) {
     flat = text
     gsub(/[[:space:]]+/, " ", flat)
@@ -969,8 +981,25 @@ findings="$(
       # stripped text the marker was read from — a path inside backticks
       # renders as code, so it is not a link the reader can follow.
       has_link = links_to(mask_html_attributes(prose), guide_path)
-      printf "BREAKING\t%s\t%d\t%d\t%s\n", section, entry_line, has_link, guide_path
+      # Prose that is breaking only because of the heading is held back until
+      # the section ends. A paragraph introducing a list ("The following
+      # changes require action:") is not an entry, and demanding its own guide
+      # link rejects the conventional shape of the section — but with no list
+      # beneath it the prose *is* the entry, which is the hole round 34 closed.
+      # Which one it is cannot be known until the section is read.
+      if (entry_is_paragraph && entry_breaking_heading &&
+          tolower(prose) !~ /\*\*breaking(:\*\*|\*\*:)/) {
+        held_section = section
+        held_guide = guide_path
+        held_line[held_n] = entry_line
+        held_link[held_n] = has_link
+        held_n++
+      } else {
+        if (entry_is_paragraph == 0) section_has_list = 1
+        printf "BREAKING\t%s\t%d\t%d\t%s\n", section, entry_line, has_link, guide_path
+      }
     } else {
+      if (entry_is_paragraph == 0) section_has_list = 1
       # Fold to alpha-only words so "non-breaking" and "non breaking" are the
       # same token and word boundaries need no \b (mawk has none).
       gsub(/[^a-z]+/, " ", lower)
@@ -1017,6 +1046,7 @@ findings="$(
 
   heading_text(visible) ~ /^##[ \t]/ {
     flush_entry()
+    release_held()
     breaking_heading = 0
     heading = heading_text(visible)
     if (tolower(heading) ~ /^##[[:space:]]+\[?unreleased\]?[[:space:]]*$/) {
@@ -1047,6 +1077,7 @@ findings="$(
 
   heading_text(visible) ~ /^###[ \t]/ {
     flush_entry()
+    release_held()
     # Only the documented heading declares a break. A `breaking` *prefix* match
     # turned `### Breaking down request latency` into a section where every
     # additive bullet demanded a migration guide.
@@ -1102,7 +1133,7 @@ findings="$(
   #
   # Block quotes stay out: they carry this changelog\047s section notes, which
   # are asides rather than entries.
-  entry == "" && block_body(visible) ~ /[^[:space:]]/ && block_body(visible) !~ /^>/ {
+  entry == "" && block_body(visible) ~ /[^[:space:]]/ && block_body(visible) !~ /^[> ]/ {
     entry_line = FNR
     entry_breaking_heading = breaking_heading
     entry = $0
@@ -1147,6 +1178,7 @@ findings="$(
 
   END {
     flush_entry()
+    release_held()
     if (md_in_fence) printf "UNCLOSED\t-\t%d\tcode fence opened here is never closed\n", md_fence_opened_at
     if (md_in_comment) printf "UNCLOSED\t-\t%d\tHTML comment opened here is never closed\n", md_comment_opened_at
     # Same failure as the two above: everything after the opener is treated as

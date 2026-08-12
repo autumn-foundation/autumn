@@ -33,9 +33,11 @@ changelog, and prose it cannot see strands users.
 The token is what declares, not the bullet: a marked *paragraph* is an entry
 too, and needs its own guide and link exactly as a marked bullet does. The same
 holds under a `### Breaking Changes` heading, where the heading does the
-declaring and the prose beneath it need not repeat the token. A block quote
-introducing such a section is an aside, not an entry — which is how the
-sections in this changelog carry their backfill notes.
+declaring and the prose beneath it need not repeat the token — but only when
+there is no list for that prose to introduce. A sentence like "The following
+changes require action:" above a list is an introduction, and so is a block
+quote anywhere in the section, which is how the sections in this changelog
+carry their backfill notes. With no list at all, the prose *is* the entry.
 
 ```markdown
 - **repository:** **Breaking:** `with_pool` is renamed to `with_pool_untracked`.
