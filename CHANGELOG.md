@@ -46,7 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The parent-side edit is marker-delimited, so re-running the generator never
   double-injects and `autumn destroy scaffold … --belongs-to Post` takes exactly
-  those lines back out — including when one parent has several nested children.
+  those lines back out — including when one parent has several nested children. Because
+  the markers record the relationship durably, `--belongs-to` is a one-time
+  flag: a later `generate … --force` without it keeps the nesting (with a
+  warning) instead of half-dismantling it, and `destroy` finds the parent
+  without it.
   When the child carries an owner column, the nested list inherits the flat
   index's `#[secured]` + owner scoping, so nesting never opens a second, wider
   door onto the same rows.

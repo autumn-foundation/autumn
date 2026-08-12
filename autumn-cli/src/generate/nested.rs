@@ -130,6 +130,11 @@ pub(super) struct Nesting {
     pub parent_plural: String,
     /// `post_id` — the child's own `references` column pointing at the parent.
     pub fk: String,
+    /// `true` when this binding was recovered from the markers already in the
+    /// parent's routes file rather than from an explicit `--belongs-to`. The
+    /// planner surfaces a warning in that case, so the inference is never
+    /// silent.
+    pub inferred: bool,
 }
 
 impl Nesting {
@@ -172,7 +177,21 @@ pub(super) fn resolve(
     options: &ScaffoldOptions,
     for_revert: bool,
 ) -> Result<Option<Nesting>, GenerateError> {
-    let Some(raw_parent) = options.belongs_to.as_deref() else {
+    // `--belongs-to` is typed once, when the relationship is created. A later
+    // `generate … --force` (the ordinary "I changed a field, re-scaffold it"
+    // move) rarely repeats it — and dropping the nesting there would rewrite the
+    // child module without its nested handlers while the parent kept calling
+    // `children_section`, leaving the project uncompilable. The markers in the
+    // parent's routes file are a durable record of the relationship, so recover
+    // it. `destroy` already reads the same evidence, which keeps the two
+    // directions symmetric.
+    let inferred_parent = if options.belongs_to.is_none() {
+        infer_parent_from_markers(project_root, child_plural, fields)
+    } else {
+        None
+    };
+    let inferred = options.belongs_to.is_none() && inferred_parent.is_some();
+    let Some(raw_parent) = options.belongs_to.as_deref().or(inferred_parent.as_deref()) else {
         return Ok(None);
     };
     let parent_pascal = pascal(raw_parent);
@@ -262,6 +281,7 @@ pub(super) fn resolve(
         parent_snake: parent_snake.clone(),
         parent_plural: parent_plural.clone(),
         fk: fk_field.name.clone(),
+        inferred,
     };
 
     if for_revert {
@@ -314,6 +334,40 @@ pub(super) fn resolve(
     }
 
     Ok(Some(nesting))
+}
+
+/// Recover the parent this resource is already nested under from the markers in
+/// `src/routes/*.rs`, as the `snake_case` base name `--belongs-to` would have
+/// been given (`posts.rs` -> `post`).
+///
+/// Resolved through the child's OWN `references` columns rather than by
+/// singularising the file name: the column that targets that table is the
+/// foreign key, and its `_id`-stripped base is exactly the name the flag takes.
+/// That also means a regeneration which DROPPED the foreign key infers nothing —
+/// correctly, since there is no longer a column to nest on.
+///
+/// `None` unless exactly one parent matches: with several, guessing which one
+/// the author meant would be worse than asking for the flag.
+fn infer_parent_from_markers(
+    project_root: &Path,
+    child_plural: &str,
+    fields: &[Field],
+) -> Option<String> {
+    let mut bases: Vec<String> = parents_carrying_child(project_root, child_plural)
+        .iter()
+        .filter_map(|path| path.file_stem()?.to_str().map(ToOwned::to_owned))
+        .filter_map(|parent_plural| {
+            let fk = fields
+                .iter()
+                .find(|f| f.reference_table().as_deref() == Some(parent_plural.as_str()))?;
+            Some(fk.name.strip_suffix("_id").unwrap_or(&fk.name).to_owned())
+        })
+        .collect();
+    bases.dedup();
+    match bases.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// The parent `show` handler's signature text, joined onto one line when the
