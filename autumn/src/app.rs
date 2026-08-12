@@ -3049,6 +3049,14 @@ impl AppBuilder {
         // the recording factory so a failing request's database traffic is
         // captured at the wire (#1598). An app that installed its own
         // `DatabasePoolProvider` keeps it, and DB capture stands down.
+        //
+        // This wraps the **control topology only**. `[[database.shards]]` pools
+        // are built by `create_shard_set` below, out of `setup_database`, and
+        // are not recorded in this slice. Rather than let a capsule claim
+        // completeness it does not have, `Db::checkout` notes the gap and marks
+        // the capsule truncated for any request that actually checks out a
+        // shard connection (`capsule::record_db::note_shard_capture_gap`), and
+        // `maybe_capture_pool_provider` warns at boot when both are configured.
         #[cfg(all(feature = "db", feature = "reporting", not(feature = "sqlite")))]
         let pool_provider_factory =
             crate::capsule::record_db::maybe_capture_pool_provider(pool_provider_factory, &config);
@@ -5614,8 +5622,11 @@ impl AppBuilder {
     /// The capsule supplies the request, every clock reading and every database
     /// answer, so this path must not reach anything outside it. Exits `0` when
     /// the recorded failure reproduced, `1` when it did not (a different
-    /// outcome, or code that left the recorded database tape), `2` when the
-    /// capsule was refused and nothing ran at all.
+    /// outcome, code that left the recorded database tape, or code that
+    /// reached the recorded outcome without asking for all of it), `2` when the
+    /// capsule was refused and nothing ran at all — which includes any capsule
+    /// marked truncated, such as one whose request used an unrecorded
+    /// `[[database.shards]]` connection.
     ///
     /// # Deltas from [`run`](Self::run)
     ///

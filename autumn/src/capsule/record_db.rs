@@ -161,6 +161,31 @@ pub fn note_db_capture_unavailable(scope: &CaptureScope) {
     }
 }
 
+/// What a capsule says when its request used a shard connection.
+pub const SHARD_CAPTURE_NOTE: &str = "shard database traffic is not captured in this slice: this request checked out a \
+     `[[database.shards]]` connection, and its queries are absent from the tape";
+
+/// Record that the in-flight request reached for a shard connection.
+///
+/// Only the control topology's pools are built through the recording factory
+/// (see [`maybe_capture_pool_provider`]); shard pools come from
+/// [`create_shard_set`](crate::sharding::create_shard_set) and tee nothing. A
+/// capsule for a request that used one therefore holds *less* than the request
+/// did, so it is noted **and marked truncated**: a capsule that is missing
+/// effects must not be presented as replayable, and
+/// [`refusal_reason`](crate::capsule::refusal_reason) turns truncation into a
+/// refusal with a reason instead of a run that looks faithful.
+///
+/// Called from the connection-checkout path, which is the one place that knows
+/// a *particular request* touched a shard — a coarser "shards are configured"
+/// test would truncate capsules for requests that never went near one.
+pub fn note_shard_capture_gap() {
+    if let Some(scope) = crate::capsule::current_scope() {
+        scope.note(SHARD_CAPTURE_NOTE);
+        scope.mark_truncated();
+    }
+}
+
 // ── Pool construction ───────────────────────────────────────────────────────
 
 /// The boot-time pool factory shape `App::run` stores in its provider slot.
@@ -284,6 +309,13 @@ fn first_tcp_endpoint(config: &tokio_postgres::Config) -> Option<(String, u16)> 
 /// [`DatabasePoolProvider`](crate::db::DatabasePoolProvider) is left completely
 /// alone — Autumn will not second-guess a custom pool — at the cost of DB
 /// capture, which is logged and noted on every capsule (F25).
+///
+/// The slot this fills is the **control topology's** only. `[[database.shards]]`
+/// pools are built separately by
+/// [`create_shard_set`](crate::sharding::create_shard_set) and are not recorded
+/// in this slice; a boot with both capture and shards configured says so, and
+/// any request that actually checks a shard connection out has its capsule
+/// noted and truncated by [`note_shard_capture_gap`].
 #[must_use]
 pub fn maybe_capture_pool_provider(
     existing: Option<CapturePoolProvider>,
@@ -291,6 +323,14 @@ pub fn maybe_capture_pool_provider(
 ) -> Option<CapturePoolProvider> {
     if !config.failure_capture.enabled {
         return existing;
+    }
+    if !config.database.shards.is_empty() {
+        tracing::warn!(
+            shard_count = config.database.shards.len(),
+            "failure-capsule capture does not record `[[database.shards]]` traffic; a request \
+             that checks out a shard connection will have its capsule marked truncated, and \
+             `autumn replay` will refuse it"
+        );
     }
     if existing.is_some() {
         disable_db_capture(
@@ -1214,5 +1254,46 @@ mod tests {
             capture_unavailable_reason("postgres:///db?host=/var/run/postgresql").is_some(),
             "a Unix-socket URL has no stream to tee"
         );
+    }
+
+    fn scope_for_test(id: &str) -> Arc<CaptureScope> {
+        Arc::new(CaptureScope::new(
+            id.to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::new(&[], &[])),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_shard_checkout_notes_and_truncates_the_in_flight_capsule() {
+        let scope = scope_for_test("shard-gap");
+        crate::capsule::CAPSULE_SCOPE
+            .scope(Arc::clone(&scope), async {
+                note_shard_capture_gap();
+            })
+            .await;
+
+        assert!(
+            scope.notes().iter().any(|note| note == SHARD_CAPTURE_NOTE),
+            "the capsule must say the shard traffic is missing, got {:?}",
+            scope.notes()
+        );
+        assert!(
+            scope.is_truncated(),
+            "a capsule missing its shard effects must be refused by replay, not \
+             presented as complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shard_checkout_outside_a_capture_scope_is_a_no_op() {
+        // Nothing is being captured: the checkout path must not reach for a
+        // scope that is not there.
+        note_shard_capture_gap();
+
+        // And a scope untouched by a shard checkout stays complete.
+        let scope = scope_for_test("no-shard");
+        assert!(scope.notes().is_empty());
+        assert!(!scope.is_truncated());
     }
 }

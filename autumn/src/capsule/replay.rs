@@ -13,10 +13,11 @@
 //!   still there (or the capsule records a fixed one and you are looking at a
 //!   regression test).
 //! * [`Verdict::Diverged`] — the replayed code asked the database something the
-//!   recording never asked. The tape cannot answer it, so the run is not a fair
-//!   comparison: the code has changed underneath the capsule. A divergence wins
-//!   over a matching status, because a status that matches by luck while the
-//!   queries differ is not a reproduction.
+//!   recording never asked, *or* left part of the recording unasked. The tape
+//!   cannot answer the first and the second is not a reproduction either, so
+//!   the run is not a fair comparison: the code has changed underneath the
+//!   capsule. A divergence wins over a matching status, because a status that
+//!   matches by luck while the queries differ is not a reproduction.
 //! * [`Verdict::Mismatch`] — the database tape lined up but the outcome did
 //!   not. Usually what you want to see after a fix.
 //!
@@ -43,6 +44,7 @@
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -52,7 +54,9 @@ use serde::Serialize;
 use tower::ServiceExt as _;
 
 use crate::capsule::clock::ReplayClock;
-use crate::capsule::schema::{Capsule, CapsuleBody, CapsuleOutcome, CapsuleRequest};
+use crate::capsule::schema::{
+    Capsule, CapsuleBody, CapsuleOutcome, CapsuleRequest, ConnectionTape,
+};
 
 /// Process exit code for a faithful reproduction.
 pub const EXIT_REPRODUCED: i32 = 0;
@@ -80,6 +84,8 @@ pub enum DivergenceKind {
     TapeExhausted,
     /// A prepared statement was described that the tape holds no metadata for.
     UnknownStatement,
+    /// The run finished with recorded exchanges left unasked on a connection.
+    UnconsumedExchanges,
 }
 
 impl DivergenceKind {
@@ -92,6 +98,7 @@ impl DivergenceKind {
             Self::BindMismatch => "bind mismatch",
             Self::TapeExhausted => "tape exhausted",
             Self::UnknownStatement => "unknown statement",
+            Self::UnconsumedExchanges => "unconsumed exchanges",
         }
     }
 }
@@ -114,13 +121,100 @@ pub struct Divergence {
     pub detail: String,
 }
 
-/// Shared, append-only record of every divergence a replay run produced.
+/// How much of one recorded connection tape the replayed run actually asked
+/// for.
+///
+/// A replay is only a reproduction if it *follows* the recording, and a
+/// divergence log alone cannot see that: it only hears about statements the run
+/// issued. A run that returns the recorded 500 without ever touching the
+/// database issues nothing, so it would look flawless. The cursor lives here,
+/// behind an atomic, because the stub server tasks are detached over a duplex
+/// pipe — the driver has to be able to read their progress *after* the response
+/// has resolved.
+///
+/// Only the ordered `exchanges` are tracked. The keyed buckets (`prologue`,
+/// `statements`, `catalog`) are re-askable metadata rather than effects: a warm
+/// recorded connection carries entries a cold replayed one may legitimately
+/// never need.
+#[derive(Debug)]
+pub struct TapeProgress {
+    connection: u64,
+    /// SQL of every recorded exchange, in recorded order.
+    exchanges: Vec<String>,
+    consumed: AtomicUsize,
+}
+
+impl TapeProgress {
+    /// A cursor over `exchanges` (their SQL, in order) for connection
+    /// `connection`.
+    #[must_use]
+    pub const fn new(connection: u64, exchanges: Vec<String>) -> Self {
+        Self {
+            connection,
+            exchanges,
+            consumed: AtomicUsize::new(0),
+        }
+    }
+
+    /// The recorder-assigned id of the connection this tape came from.
+    #[must_use]
+    pub const fn connection(&self) -> u64 {
+        self.connection
+    }
+
+    /// How many recorded exchanges the run has consumed so far — which is also
+    /// the index of the next one the tape expects.
+    #[must_use]
+    pub fn consumed(&self) -> usize {
+        self.consumed.load(Ordering::SeqCst)
+    }
+
+    /// Mark the exchange at the current position as served.
+    pub fn advance(&self) {
+        self.consumed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many recorded exchanges were never asked for.
+    #[must_use]
+    pub fn unconsumed(&self) -> usize {
+        self.exchanges.len().saturating_sub(self.consumed())
+    }
+
+    /// The divergence the leftovers amount to, if there are any.
+    fn leftover_divergence(&self) -> Option<Divergence> {
+        let consumed = self.consumed();
+        let first = self.exchanges.get(consumed)?;
+        let total = self.exchanges.len();
+        let left = total.saturating_sub(consumed);
+        Some(Divergence {
+            kind: DivergenceKind::UnconsumedExchanges,
+            connection: self.connection,
+            exchange_index: consumed,
+            expected_sql: Some(first.clone()),
+            actual_sql: String::new(),
+            detail: format!(
+                "the capsule recorded {total} exchange(s) on connection {} but the replayed run \
+                 asked for only {consumed}; {left} recorded statement(s) were never issued, the \
+                 first being {first:?} — the replayed code reached its outcome without following \
+                 the recorded database effects",
+                self.connection
+            ),
+        })
+    }
+}
+
+/// Everything a replay run learns about its database traffic.
+///
+/// Two halves: an append-only record of every divergence the run produced, and
+/// the per-connection consumption cursors that catch the divergences *nobody
+/// issues* — a recorded exchange the run never asked for.
 ///
 /// The stub server writes into it from the connection tasks while the router
 /// runs, so it is an `Arc`-shared mutex rather than a return value.
 #[derive(Debug, Default)]
 pub struct DivergenceLog {
     entries: Mutex<Vec<Divergence>>,
+    tapes: Mutex<Vec<Arc<TapeProgress>>>,
 }
 
 impl DivergenceLog {
@@ -141,7 +235,49 @@ impl DivergenceLog {
         }
     }
 
-    /// `true` when the run stayed on the tape.
+    /// Register a recorded tape and hand back its consumption cursor.
+    ///
+    /// Every tape in a capsule must be registered — including ones no
+    /// connection ever claims, because a pool that opens fewer connections than
+    /// the recording did leaves those recordings unfollowed just as surely as a
+    /// half-read one does.
+    pub fn register_tape(&self, tape: &ConnectionTape) -> Arc<TapeProgress> {
+        let progress = Arc::new(TapeProgress::new(
+            tape.id,
+            tape.exchanges
+                .iter()
+                .map(|exchange| exchange.sql.clone())
+                .collect(),
+        ));
+        if let Ok(mut tapes) = self.tapes.lock() {
+            tapes.push(Arc::clone(&progress));
+        }
+        progress
+    }
+
+    /// One divergence per registered tape that still holds unasked exchanges.
+    ///
+    /// Read by [`execute`] once the router has finished; the stub tasks advance
+    /// their cursors before writing each recorded response, so everything the
+    /// run consumed is already counted by the time its response resolves.
+    #[must_use]
+    pub fn unconsumed(&self) -> Vec<Divergence> {
+        self.tapes
+            .lock()
+            .map(|tapes| {
+                tapes
+                    .iter()
+                    .filter_map(|tape| tape.leftover_divergence())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `true` when no divergence has been *recorded*.
+    ///
+    /// This is about statements the run issued; leftover recorded exchanges are
+    /// reported separately by [`unconsumed`](Self::unconsumed), which [`execute`]
+    /// folds in before reaching a verdict.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.lock().is_ok_and(|entries| entries.is_empty())
@@ -220,7 +356,11 @@ pub struct ReplayOutcome {
 ///
 /// `divergences` must be the same log the replay database pool was built with
 /// (see `capsule::replay_db::pool_from_capsule`) — it is read *after* the
-/// router has finished, so every query the handler made is already in it.
+/// router has finished, so every query the handler made is already in it, and
+/// so are the consumption cursors of every registered tape. Both halves count:
+/// a statement the tape cannot answer is a divergence, and so is a recorded
+/// exchange the run never asked for, because reaching the recorded outcome
+/// without the recorded database traffic is not a reproduction.
 /// `clock` is the [`ReplayClock`] installed on the rebuilt state, when there is
 /// one; it is only read for the over-read warning.
 ///
@@ -263,8 +403,11 @@ pub async fn execute(
 
     redaction_warning(capsule, &actual, &mut warnings);
 
-    let divergences = divergences.entries();
-    let verdict = if divergences.is_empty() {
+    // Statements the run issued that the tape could not answer, then recorded
+    // statements the run never issued at all.
+    let mut entries = divergences.entries();
+    entries.extend(divergences.unconsumed());
+    let verdict = if entries.is_empty() {
         if outcomes_match(&capsule.outcome, &actual) {
             Verdict::Reproduced
         } else {
@@ -278,7 +421,7 @@ pub async fn execute(
         verdict,
         expected: capsule.outcome.clone(),
         actual,
-        divergences,
+        divergences: entries,
         warnings,
     }
 }
@@ -762,6 +905,105 @@ mod tests {
         assert_eq!(
             log.entries().first().map(|entry| entry.actual_sql.clone()),
             Some("SELECT 1".to_owned())
+        );
+    }
+
+    fn tape(id: u64, sqls: &[&str]) -> ConnectionTape {
+        ConnectionTape {
+            id,
+            prologue: Vec::new(),
+            statements: Vec::new(),
+            catalog: Vec::new(),
+            exchanges: sqls
+                .iter()
+                .map(|sql| crate::capsule::schema::Exchange {
+                    protocol: crate::capsule::schema::ExchangeProtocol::Extended,
+                    sql: (*sql).to_owned(),
+                    binds: Vec::new(),
+                    response: Vec::new(),
+                    row_count: 0,
+                    error: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_fully_consumed_tape_leaves_no_divergence() {
+        let log = DivergenceLog::new();
+        let progress = log.register_tape(&tape(1, &["SELECT 1", "SELECT 2"]));
+        progress.advance();
+        progress.advance();
+        assert_eq!(progress.unconsumed(), 0);
+        assert!(log.unconsumed().is_empty());
+    }
+
+    #[test]
+    fn leftover_exchanges_name_the_connection_count_and_first_statement() {
+        let log = DivergenceLog::new();
+        let progress = log.register_tape(&tape(4, &["SELECT 1", "SELECT 2", "SELECT 3"]));
+        progress.advance();
+
+        let divergences = log.unconsumed();
+        let [divergence] = divergences.as_slice() else {
+            panic!("expected exactly one divergence, got {divergences:?}");
+        };
+        assert_eq!(divergence.kind, DivergenceKind::UnconsumedExchanges);
+        assert_eq!(divergence.connection, 4);
+        assert_eq!(divergence.exchange_index, 1);
+        assert_eq!(divergence.expected_sql.as_deref(), Some("SELECT 2"));
+        assert!(
+            divergence.detail.contains('2') && divergence.detail.contains("SELECT 2"),
+            "the detail must give the count and the first unissued statement, got {:?}",
+            divergence.detail
+        );
+    }
+
+    #[test]
+    fn a_tape_no_connection_ever_claimed_is_wholly_unconsumed() {
+        let log = DivergenceLog::new();
+        let _progress = log.register_tape(&tape(9, &["SELECT 1"]));
+        let divergences = log.unconsumed();
+        assert_eq!(divergences.len(), 1);
+        assert_eq!(
+            divergences.first().map(|entry| entry.exchange_index),
+            Some(0),
+            "nothing was consumed, so the report starts at the first exchange"
+        );
+    }
+
+    #[test]
+    fn an_empty_tape_is_never_a_divergence() {
+        let log = DivergenceLog::new();
+        let _progress = log.register_tape(&tape(2, &[]));
+        assert!(log.unconsumed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_capsule_without_a_database_reproduces_unaffected() {
+        let router = axum::Router::new().route("/orders", axum::routing::get(|| async { "ok" }));
+        let mut capsule = fixture(status(200));
+        capsule.db = None;
+        let outcome = execute(router, &capsule, Arc::new(DivergenceLog::new()), None).await;
+        assert_eq!(outcome.verdict, Verdict::Reproduced, "{outcome:?}");
+        assert!(outcome.divergences.is_empty(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn unconsumed_exchanges_turn_a_matching_outcome_into_a_divergence() {
+        let router = axum::Router::new().route("/orders", axum::routing::get(|| async { "ok" }));
+        let capsule = fixture(status(200));
+        let log = Arc::new(DivergenceLog::new());
+        // Registered but never served: the run reaches the recorded outcome
+        // without following the recorded effects.
+        let _progress = log.register_tape(&tape(1, &["SELECT 1"]));
+
+        let outcome = execute(router, &capsule, Arc::clone(&log), None).await;
+        assert_eq!(outcome.verdict, Verdict::Diverged, "{outcome:?}");
+        assert_eq!(
+            outcome.divergences.first().map(|entry| entry.kind),
+            Some(DivergenceKind::UnconsumedExchanges),
+            "{outcome:?}"
         );
     }
 

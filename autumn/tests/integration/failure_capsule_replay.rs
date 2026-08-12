@@ -8,6 +8,9 @@
 //!   * a recorded 500 and a recorded panic both replay to the same outcome;
 //!   * a query the tape never recorded, or a bind that does not match, is
 //!     reported as a divergence rather than silently answered;
+//!   * a *recorded* exchange the replayed run never issued is reported too, so
+//!     a run that reaches the recorded outcome without following the recorded
+//!     database effects cannot claim a reproduction;
 //!   * a bind the capsule masked is excluded from that comparison;
 //!   * replay never dials a socket;
 //!   * clock reads come out of the capsule, and over-reading warns;
@@ -505,6 +508,147 @@ async fn replay_reports_divergence_on_unrecorded_query() {
             .any(|entry| entry.detail.contains("gadgets")),
         "the outcome must carry the divergence detail, got {:?}",
         outcome.divergences
+    );
+}
+
+#[tokio::test]
+async fn replay_reports_divergence_when_a_recorded_exchange_is_never_issued() {
+    // The recording executed the query twice; the replayed handler issues it
+    // once. The status still matches, so without an accounting of the *whole*
+    // tape this run would be reported as a faithful reproduction.
+    let mut tape = widgets_tape(WIDGETS_SQL, &[], Vec::new());
+    tape.exchanges.push(widgets_rows(WIDGETS_SQL, Vec::new()));
+    let recorded = with_connections(
+        capsule(
+            request("GET", "/widgets"),
+            CapsuleOutcome::Status {
+                code: 200,
+                message: String::new(),
+                problem_type: None,
+            },
+        ),
+        vec![tape],
+    );
+
+    let divergences = Arc::new(DivergenceLog::new());
+    let pool = pool_from_capsule(&recorded, Arc::clone(&divergences)).expect("replay pool builds");
+    let router = TestApp::new()
+        .config(test_config())
+        .routes(routes![widgets])
+        .with_db(pool)
+        .build()
+        .into_router();
+
+    let outcome = execute(router, &recorded, Arc::clone(&divergences), None).await;
+
+    assert_eq!(
+        outcome.verdict,
+        Verdict::Diverged,
+        "a run that skipped a recorded exchange has not reproduced the recording: {outcome:?}"
+    );
+    let entry = outcome
+        .divergences
+        .iter()
+        .find(|entry| entry.kind == DivergenceKind::UnconsumedExchanges)
+        .unwrap_or_else(|| {
+            panic!(
+                "the leftover exchange must be reported, got {:?}",
+                outcome.divergences
+            )
+        });
+    assert_eq!(
+        entry.connection, 7,
+        "the divergence must name the connection"
+    );
+    assert_eq!(
+        entry.exchange_index, 1,
+        "the divergence must point at the first unconsumed exchange"
+    );
+    assert_eq!(
+        entry.expected_sql.as_deref(),
+        Some(WIDGETS_SQL),
+        "the divergence must quote the SQL that was never issued"
+    );
+    assert!(
+        entry.detail.contains(WIDGETS_SQL),
+        "the detail must name the unissued statement, got {:?}",
+        entry.detail
+    );
+}
+
+#[tokio::test]
+async fn replay_reports_divergence_when_a_whole_tape_is_never_claimed() {
+    // The recording used the database; the replayed handler does not touch it
+    // at all, so the pool never opens a connection and the tape is never
+    // claimed. The 500 comes back either way — that is exactly the run that
+    // must not be called a reproduction.
+    let recorded = with_connections(
+        capsule(
+            request("GET", "/fail"),
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "database on fire".to_owned(),
+                problem_type: None,
+            },
+        ),
+        vec![widgets_tape(WIDGETS_SQL, &[], Vec::new())],
+    );
+
+    let divergences = Arc::new(DivergenceLog::new());
+    let pool = pool_from_capsule(&recorded, Arc::clone(&divergences)).expect("replay pool builds");
+    let router = TestApp::new()
+        .config(test_config())
+        .routes(routes![fail])
+        .with_db(pool)
+        .build()
+        .into_router();
+
+    let outcome = execute(router, &recorded, Arc::clone(&divergences), None).await;
+
+    assert_eq!(
+        outcome.verdict,
+        Verdict::Diverged,
+        "the same 500 without any of the recorded database traffic is not a reproduction: \
+         {outcome:?}"
+    );
+    assert!(
+        outcome.divergences.iter().any(|entry| {
+            entry.kind == DivergenceKind::UnconsumedExchanges
+                && entry.connection == 7
+                && entry.exchange_index == 0
+        }),
+        "an unclaimed tape must be accounted for like a partly-consumed one, got {:?}",
+        outcome.divergences
+    );
+}
+
+#[tokio::test]
+async fn a_capsule_without_database_traffic_is_unaffected_by_the_tape_audit() {
+    // `db: None`: there is nothing to consume, so the verdict must be decided
+    // by the outcome alone.
+    let recorded = capsule(
+        request("GET", "/fail"),
+        CapsuleOutcome::Status {
+            code: 500,
+            message: "database on fire".to_owned(),
+            problem_type: None,
+        },
+    );
+    let divergences = Arc::new(DivergenceLog::new());
+    let pool = pool_from_capsule(&recorded, Arc::clone(&divergences)).expect("replay pool builds");
+    let router = TestApp::new()
+        .config(test_config())
+        .routes(routes![fail])
+        .with_db(pool)
+        .build()
+        .into_router();
+
+    let outcome = execute(router, &recorded, divergences, None).await;
+
+    assert_eq!(
+        outcome.verdict,
+        Verdict::Reproduced,
+        "a capsule with no database tape must still reproduce: {outcome:?}"
     );
 }
 

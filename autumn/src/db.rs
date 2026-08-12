@@ -2710,6 +2710,19 @@ impl Db {
             span.record("db.shard", shard);
         }
 
+        // Failure-capsule slice one records only the *control* topology's pools
+        // (#1598): `[[database.shards]]` pools are built by `create_shard_set`,
+        // never through the capture factory, so a request that reaches for a
+        // shard generates database traffic no capsule can hold. Flag it here —
+        // before the checkout, because whether the connection is obtained does
+        // not change the fact that this request's tape is incomplete — so the
+        // capsule says so and replay refuses it, rather than presenting a tape
+        // that silently omits the shard's effects.
+        #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+        if params.shard.is_some() {
+            crate::capsule::record_db::note_shard_capture_gap();
+        }
+
         let pool = params.pool;
         let mut checkout_future: std::pin::Pin<
             Box<

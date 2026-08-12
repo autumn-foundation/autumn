@@ -57,7 +57,7 @@ pub use persist::{CapsuleRef, capsule_dir, load_capsule, persist};
 pub use record_db::build_recording_pool;
 pub use replay::{
     Divergence, DivergenceKind, DivergenceLog, EXIT_DIVERGED, EXIT_REFUSED, EXIT_REPRODUCED,
-    ReplayOutcome, Verdict, execute, print_refusal, print_verdict, refusal_exit_code,
+    ReplayOutcome, TapeProgress, Verdict, execute, print_refusal, print_verdict, refusal_exit_code,
     refusal_reason,
 };
 #[cfg(all(feature = "db", not(feature = "sqlite")))]

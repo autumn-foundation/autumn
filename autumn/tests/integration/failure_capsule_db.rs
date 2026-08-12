@@ -16,6 +16,8 @@
 //!   * a checkout with no capture scope *clears* the connection's binding, so
 //!     unattributed work cannot leak into a live request's capsule (F2);
 //!   * blowing the capsule byte budget marks the capsule truncated (F13);
+//!   * a request that checks out a **shard** connection says so and marks its
+//!     capsule truncated, because shard pools are not recorded in this slice;
 //!   * a TLS-required database URL turns DB capture off with a note (F7).
 //!
 //! All but the last need a live `PostgreSQL`, so they are Docker-gated.
@@ -519,6 +521,81 @@ async fn exceeding_max_capsule_bytes_marks_truncated() {
     assert!(
         capsule.truncated,
         "blowing max_capsule_bytes must mark the capsule truncated so replay refuses it"
+    );
+}
+
+/// Slice-one honesty: `[[database.shards]]` pools are **not** built through the
+/// recording factory (only the control topology is), so a request that reaches
+/// for a shard connection generates database traffic no capsule can hold. Such
+/// a capsule must say so and be marked truncated, so `autumn replay` refuses it
+/// instead of presenting a tape that silently omits the shard's effects.
+///
+/// Needs no Docker: deadpool builds shard pools lazily, so the checkout is
+/// attempted (which is what flags the scope) and then fails against a URL
+/// nothing is listening on.
+#[tokio::test]
+async fn a_shard_checkout_marks_the_capsule_truncated_with_a_note() {
+    use autumn_web::AppState;
+    use autumn_web::capsule::CAPSULE_SCOPE;
+    use autumn_web::config::ShardConfig;
+    use autumn_web::sharding::{HashShardRouter, ShardKeyOverride, ShardedDb, create_shard_set};
+    use axum::extract::FromRequestParts as _;
+
+    let database = DatabaseConfig {
+        // Keep the doomed checkout fast: nothing listens on this URL.
+        connect_timeout_secs: 1,
+        shards: vec![ShardConfig {
+            name: "alpha".to_owned(),
+            primary_url: "postgres://127.0.0.1:1/alpha".to_owned(),
+            slots: None,
+            replica_url: None,
+            primary_pool_size: None,
+            replica_pool_size: None,
+            replica_fallback: None,
+        }],
+        ..Default::default()
+    };
+    let shards = create_shard_set(&database, Arc::new(HashShardRouter))
+        .expect("lazy shard pools build without a server")
+        .expect("shards are configured");
+    let state = AppState::for_test().with_shards(shards);
+    state.insert_extension(AutumnConfig::default());
+
+    let scope = Arc::new(CaptureScope::new(
+        "shard-gap".to_owned(),
+        Arc::new(CaptureSettings::default()),
+        Arc::new(autumn_web::log::filter::ParameterFilter::new(&[], &[])),
+    ));
+
+    CAPSULE_SCOPE
+        .scope(Arc::clone(&scope), async {
+            let (mut parts, ()) = axum::http::Request::builder()
+                .uri("/orders")
+                .body(())
+                .expect("request builds")
+                .into_parts();
+            parts
+                .extensions
+                .insert(ShardKeyOverride("tenant-1".to_owned()));
+            // The checkout cannot succeed (no server); flagging the scope must
+            // not depend on it succeeding.
+            let _ = ShardedDb::from_request_parts(&mut parts, &state).await;
+        })
+        .await;
+
+    assert!(
+        scope
+            .notes()
+            .iter()
+            .any(|note| note.to_ascii_lowercase().contains("shard")),
+        "a capsule for a shard-using request must explain the missing shard traffic, \
+         got {:?}",
+        scope.notes()
+    );
+    assert!(
+        scope.is_truncated(),
+        "a capsule whose request used an unrecorded shard pool must be truncated so \
+         replay refuses it rather than presenting it as complete"
     );
 }
 

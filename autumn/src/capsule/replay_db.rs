@@ -67,7 +67,7 @@ use diesel_async::pooled_connection::{
 use futures::FutureExt as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::capsule::replay::{Divergence, DivergenceKind, DivergenceLog};
+use crate::capsule::replay::{Divergence, DivergenceKind, DivergenceLog, TapeProgress};
 use crate::capsule::schema::{BindValue, Capsule, ConnectionTape, Exchange};
 use crate::capsule::wire::{FrameSplitter, FrontendMessage, build, is_catalog_sql, parse_frontend};
 use crate::db::PoolError;
@@ -128,8 +128,10 @@ fn split_statements(sql: &str) -> Vec<&str> {
 pub struct StubServer {
     tape: ConnectionTape,
     divergences: Arc<DivergenceLog>,
-    /// Position in `tape.exchanges`.
-    cursor: usize,
+    /// Position in `tape.exchanges`. Shared with the driver, which reads it
+    /// after the response has resolved to check that nothing recorded was left
+    /// unasked — these tasks are detached, so the cursor cannot be returned.
+    progress: Arc<TapeProgress>,
     /// Prepared-statement name (`s0`, `s1`, …) to SQL. The names are minted by
     /// a process-global counter in `tokio-postgres`, so they are never stable
     /// across runs and must be learnt from the `Parse` messages.
@@ -147,13 +149,26 @@ enum Resolution {
 }
 
 impl StubServer {
-    /// A server bound to one recorded tape.
+    /// A server bound to one recorded tape, registering that tape's
+    /// consumption cursor with `divergences`.
     #[must_use]
     pub fn new(tape: ConnectionTape, divergences: Arc<DivergenceLog>) -> Self {
+        let progress = divergences.register_tape(&tape);
+        Self::with_progress(tape, divergences, progress)
+    }
+
+    /// A server bound to a tape whose cursor is already registered — the shape
+    /// [`pool_from_capsule`] needs, because it registers *every* tape up front
+    /// so unclaimed ones are accounted for too.
+    fn with_progress(
+        tape: ConnectionTape,
+        divergences: Arc<DivergenceLog>,
+        progress: Arc<TapeProgress>,
+    ) -> Self {
         Self {
             tape,
             divergences,
-            cursor: 0,
+            progress,
             statements: HashMap::new(),
             portals: HashMap::new(),
         }
@@ -165,11 +180,15 @@ impl StubServer {
     /// or sends something the framing refuses to model. I/O errors end the
     /// conversation quietly: the client is a pool connection being torn down,
     /// and there is nobody to report to.
-    pub async fn serve<S>(stream: S, tape: ConnectionTape, divergences: Arc<DivergenceLog>)
-    where
+    pub async fn serve<S>(
+        stream: S,
+        tape: ConnectionTape,
+        divergences: Arc<DivergenceLog>,
+        progress: Arc<TapeProgress>,
+    ) where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let mut server = Self::new(tape, divergences);
+        let mut server = Self::with_progress(tape, divergences, progress);
         let _ = server.run(stream).await;
     }
 
@@ -257,7 +276,7 @@ impl StubServer {
 
     /// Simple-protocol `Query` — one statement (or a `;`-joined batch),
     /// answered as one blob up to `ReadyForQuery` (F8).
-    fn simple_query(&mut self, sql: &str) -> Vec<u8> {
+    fn simple_query(&self, sql: &str) -> Vec<u8> {
         if is_housekeeping(sql) {
             let mut reply = Vec::new();
             for _ in split_statements(sql) {
@@ -371,7 +390,11 @@ impl StubServer {
     }
 
     /// Answer a `Bind`/`Execute` (or a simple `Query`) from the tape.
-    fn resolve_execute(&mut self, sql: &str, params: &[Option<Vec<u8>>]) -> Resolution {
+    ///
+    /// Takes `&self`: the tape cursor moved into the shared [`TapeProgress`],
+    /// which the driver reads after the run, so advancing it no longer needs
+    /// exclusive access to the server.
+    fn resolve_execute(&self, sql: &str, params: &[Option<Vec<u8>>]) -> Resolution {
         if let Some(exchange) = find_by_sql(&self.tape.prologue, sql) {
             return Resolution::Recorded(exchange.response.clone());
         }
@@ -384,7 +407,7 @@ impl StubServer {
             return Resolution::Recorded(exchange.response.clone());
         }
 
-        let Some(expected) = self.tape.exchanges.get(self.cursor) else {
+        let Some(expected) = self.tape.exchanges.get(self.progress.consumed()) else {
             // A driver catalog probe is never an *ordering* problem: it is a
             // type-info lookup the recorded connection's cache already had, so
             // it is reported as unrecorded with the F4 hint rather than as a
@@ -443,7 +466,7 @@ impl StubServer {
         }
 
         let response = expected.response.clone();
-        self.cursor = self.cursor.saturating_add(1);
+        self.progress.advance();
         Resolution::Recorded(response)
     }
 
@@ -470,7 +493,7 @@ impl StubServer {
         Divergence {
             kind,
             connection: self.tape.id,
-            exchange_index: self.cursor,
+            exchange_index: self.progress.consumed(),
             expected_sql,
             actual_sql: actual_sql.to_owned(),
             detail,
@@ -615,6 +638,11 @@ fn hex_preview(bytes: &[u8]) -> String {
 /// Recycling is set to [`RecyclingMethod::Fast`] so returning a connection to
 /// the pool does not issue a `SELECT 1` ping the tape never recorded.
 ///
+/// Every tape is registered with `divergences` here rather than when a
+/// connection claims it, so a run that opens *fewer* connections than the
+/// recording did — up to and including a run that never touches the database —
+/// is still held to the whole recording.
+///
 /// # Errors
 ///
 /// Returns [`PoolError::Build`] when the underlying deadpool builder rejects
@@ -632,6 +660,12 @@ pub fn pool_from_capsule(
     );
     let max_size = tapes.len().max(1);
     let next_tape = Arc::new(AtomicUsize::new(0));
+    let progress: Arc<Vec<Arc<TapeProgress>>> = Arc::new(
+        tapes
+            .iter()
+            .map(|tape| divergences.register_tape(tape))
+            .collect(),
+    );
 
     let mut config = ManagerConfig::<AsyncPgConnection>::default();
     config.recycling_method = RecyclingMethod::Fast;
@@ -639,12 +673,20 @@ pub fn pool_from_capsule(
         let tapes = Arc::clone(&tapes);
         let next_tape = Arc::clone(&next_tape);
         let divergences = Arc::clone(&divergences);
+        let progress = Arc::clone(&progress);
         async move {
             let index = next_tape.fetch_add(1, Ordering::SeqCst);
             let tape = tapes.get(index).cloned().unwrap_or_default();
+            // A connection past the end of the recording claims an empty tape,
+            // and an unregistered cursor with it: there is nothing recorded for
+            // it to leave unconsumed.
+            let progress = progress.get(index).map_or_else(
+                || Arc::new(TapeProgress::new(tape.id, Vec::new())),
+                Arc::clone,
+            );
 
             let (client_half, server_half) = tokio::io::duplex(DUPLEX_CAPACITY);
-            tokio::spawn(StubServer::serve(server_half, tape, divergences));
+            tokio::spawn(StubServer::serve(server_half, tape, divergences, progress));
 
             let mut pg = tokio_postgres::Config::new();
             pg.ssl_mode(tokio_postgres::config::SslMode::Disable)
@@ -741,7 +783,7 @@ mod tests {
             exchanges: vec![exchange("SELECT 1", Vec::new())],
         };
         let log = Arc::new(DivergenceLog::new());
-        let mut server = StubServer::new(tape, Arc::clone(&log));
+        let server = StubServer::new(tape, Arc::clone(&log));
 
         assert!(matches!(
             server.resolve_execute("SELECT 1", &[]),
@@ -757,6 +799,39 @@ mod tests {
     }
 
     #[test]
+    fn serving_an_exchange_advances_the_shared_consumption_cursor() {
+        let tape = ConnectionTape {
+            id: 5,
+            prologue: Vec::new(),
+            statements: Vec::new(),
+            catalog: Vec::new(),
+            exchanges: vec![
+                exchange("SELECT 1", Vec::new()),
+                exchange("SELECT 2", vec![]),
+            ],
+        };
+        let log = Arc::new(DivergenceLog::new());
+        let server = StubServer::new(tape, Arc::clone(&log));
+
+        // Nothing served yet: the whole tape is outstanding.
+        assert_eq!(log.unconsumed().len(), 1);
+
+        let _ = server.resolve_execute("SELECT 1", &[]);
+        let outstanding = log.unconsumed();
+        assert_eq!(
+            outstanding.first().map(|entry| entry.exchange_index),
+            Some(1),
+            "one exchange served must leave the cursor on the second: {outstanding:?}"
+        );
+
+        let _ = server.resolve_execute("SELECT 2", &[]);
+        assert!(
+            log.unconsumed().is_empty(),
+            "a fully replayed tape must leave nothing outstanding"
+        );
+    }
+
+    #[test]
     fn an_unrecorded_statement_names_itself() {
         let tape = ConnectionTape {
             id: 1,
@@ -765,7 +840,7 @@ mod tests {
             catalog: Vec::new(),
             exchanges: vec![exchange("SELECT 1", Vec::new())],
         };
-        let mut server = StubServer::new(tape, Arc::new(DivergenceLog::new()));
+        let server = StubServer::new(tape, Arc::new(DivergenceLog::new()));
         match server.resolve_execute("SELECT * FROM gadgets", &[]) {
             Resolution::Diverged(divergence) => {
                 assert_eq!(divergence.kind, DivergenceKind::UnrecordedQuery);
@@ -778,7 +853,7 @@ mod tests {
 
     #[test]
     fn a_catalog_probe_diverges_with_a_type_hint() {
-        let mut server = StubServer::new(ConnectionTape::default(), Arc::new(DivergenceLog::new()));
+        let server = StubServer::new(ConnectionTape::default(), Arc::new(DivergenceLog::new()));
         match server.resolve_execute("SELECT typname FROM pg_catalog.pg_type WHERE oid = $1", &[]) {
             Resolution::Diverged(divergence) => {
                 assert!(
