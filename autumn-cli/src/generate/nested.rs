@@ -62,6 +62,23 @@ const EXTRACTOR_PARAM_DECLS: &[&str] = &[
     "__nested_submit_field: Option<SubmitFormField>",
 ];
 
+/// The lint allowance the spliced signature needs, stamped with
+/// [`EXTRACTORS_MARKER`] so it is removed with the extractors it exists for.
+///
+/// A generated project's own CI runs `cargo clippy --all-targets -- -D warnings`,
+/// and every standard `show` already takes three parameters — so adding six
+/// extractors trips `too_many_arguments` (9/7) and fails that CI on a project
+/// whose code the author never wrote. `cargo check` passes, which is exactly why
+/// this was invisible until someone ran the generated project's own lint step.
+fn extractors_allow_line() -> String {
+    format!("{ALLOW_ATTR} {EXTRACTORS_MARKER}")
+}
+
+/// The attribute [`extractors_allow_line`] stamps. Also emitted, unmarked, by
+/// the flat templates on `index` and `<snake>_form_for` — which is precisely
+/// why removal only ever matches it WITH the marker.
+const ALLOW_ATTR: &str = "#[allow(clippy::too_many_arguments)]";
+
 /// [`EXTRACTOR_PARAM_DECLS`] as the single-line suffix spliced into a
 /// one-line `show` signature — the shape the flat scaffold emits.
 fn extractor_params_inline() -> String {
@@ -414,12 +431,33 @@ pub(super) fn children_nested_under(project_root: &Path, parent_plural: &str) ->
 /// regeneration would quietly drop the children list and the markers with it —
 /// and a later child regeneration, having no markers left to read, would emit no
 /// nested handlers while `main.rs` still mounted them.
-pub(super) fn reapply_children(previous: &str, fresh: &str) -> String {
-    children_nested_under_src(previous)
-        .iter()
-        .fold(fresh.to_owned(), |acc, child| {
-            inject_into_parent_show(&acc, child)
-        })
+pub(super) fn reapply_children(previous: &str, fresh: &str) -> Result<String, Vec<String>> {
+    let children = children_nested_under_src(previous);
+    if children.is_empty() {
+        return Ok(fresh.to_owned());
+    }
+    // The CHILD's own generate preflights the parent's shape in `resolve`, but a
+    // PARENT regeneration runs none of that — it has no `--belongs-to` of its
+    // own. So check the same preconditions here against the FRESH render before
+    // putting anything back: a variant change can reshape `show` into something
+    // the section cannot live in, and "the marker landed" is not the test —
+    // a `--sharded` parent's `show` still takes the injection cleanly and then
+    // fails to compile, because `children_section` borrows `&mut Db` and the
+    // handler now holds a `ShardedDb`.
+    if !show_accepts_children_section(fresh) {
+        return Err(children);
+    }
+    Ok(children.iter().fold(fresh.to_owned(), |acc, child| {
+        inject_into_parent_show(&acc, child)
+    }))
+}
+
+/// Whether `src`'s `show` can host an injected children section: every anchor
+/// the injection needs, on a handler holding the connection type the section
+/// borrows. The two halves `resolve` checks for a child's declared parent.
+fn show_accepts_children_section(src: &str) -> bool {
+    injection_anchors(src).is_some()
+        && show_signature(src).is_some_and(|sig| sig.contains(SHOW_DB_PARAM))
 }
 
 /// [`children_nested_under`] against source text already in hand.
@@ -654,6 +692,15 @@ pub(super) fn inject_into_parent_show(parent_src: &str, child_plural: &str) -> S
     });
     let mut shift = 0usize;
     if !already_injected {
+        // The allowance goes above the signature — and above any `#[get(...)]`
+        // route attribute already sitting there, which must stay adjacent to the
+        // function it annotates.
+        let attrs_start = lines[..signature]
+            .iter()
+            .rposition(|line| !line.trim_start().starts_with('#'))
+            .map_or(signature, |last_non_attr| last_non_attr + 1);
+        lines.insert(attrs_start, extractors_allow_line());
+        let (signature, signature_close) = (signature + 1, signature_close + 1);
         if signature == signature_close {
             // One-line signature (as generated): splice the declarations in
             // front of the return type and stamp the marker on the line.
@@ -675,6 +722,7 @@ pub(super) fn inject_into_parent_show(parent_src: &str, child_plural: &str) -> S
             }
             shift = EXTRACTOR_PARAM_DECLS.len();
         }
+        shift += 1; // the allowance line inserted above
     }
     let (ok_tail, render_anchor) = (ok_tail + shift, render_anchor + shift);
 
@@ -791,10 +839,17 @@ pub(super) fn remove_nested_child_section(content: &str, child_plural: &str) -> 
             if trimmed == EXTRACTORS_MARKER {
                 return false; // the orphaned marker `rustfmt` left in the body
             }
-            let without_marker = trimmed
-                .strip_suffix(EXTRACTORS_MARKER)
-                .map_or(trimmed, str::trim_end);
-            !decl_lines.iter().any(|decl| without_marker == decl)
+            let Some(marked) = trimmed.strip_suffix(EXTRACTORS_MARKER) else {
+                // Unmarked: only the parameter declarations themselves qualify,
+                // and only because `rustfmt` strips their markers when it
+                // explodes the signature. `ALLOW_ATTR` deliberately does NOT,
+                // since the flat templates emit that very attribute on `index`
+                // and `<snake>_form_for` — matching it unmarked would have
+                // destroy quietly delete lines this injection never added.
+                return !decl_lines.iter().any(|decl| trimmed == decl);
+            };
+            let marked = marked.trim_end();
+            !(decl_lines.iter().any(|decl| marked == decl) || marked == ALLOW_ATTR)
         });
         // …and un-splice the inline form from a one-line signature. If the
         // declarations are not the ones THIS version emits (a project injected

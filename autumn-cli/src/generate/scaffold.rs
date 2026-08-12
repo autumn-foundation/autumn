@@ -939,31 +939,43 @@ fn plan_scaffold_with_options_impl(
         } else {
             read_or_empty(&own_routes_path)
         };
-        plan.create(
-            own_routes_path,
-            super::nested::reapply_children(
-                &previous_own_routes,
-                &render_routes_file(
-                    project_root,
-                    &pascal_name,
-                    &snake_name,
-                    &plural,
-                    &form_fields,
-                    &fields,
-                    options_with_key.model.sharded,
-                    options_with_key.model.soft_delete,
-                    options_with_key.model.id_type,
-                    options_with_key.live,
-                    options_with_key.live_validation,
-                    metadata.validations(),
-                    &missing_reference_targets,
-                    authorize_routes,
-                    owner_column.as_ref().map(|o| o.name.as_str()),
-                    &options_with_key.model.searchable,
-                    nesting.as_ref(),
-                ),
-            ),
+        let fresh_own_routes = render_routes_file(
+            project_root,
+            &pascal_name,
+            &snake_name,
+            &plural,
+            &form_fields,
+            &fields,
+            options_with_key.model.sharded,
+            options_with_key.model.soft_delete,
+            options_with_key.model.id_type,
+            options_with_key.live,
+            options_with_key.live_validation,
+            metadata.validations(),
+            &missing_reference_targets,
+            authorize_routes,
+            owner_column.as_ref().map(|o| o.name.as_str()),
+            &options_with_key.model.searchable,
+            nesting.as_ref(),
         );
+        let own_routes = super::nested::reapply_children(&previous_own_routes, &fresh_own_routes)
+            .map_err(|refused| {
+            GenerateError::Config(format!(
+                "{} nested under {plural}, but this run re-renders src/routes/{plural}.rs \
+                     into a shape their children section cannot be put back into (a \
+                     `--sharded` parent holds a `ShardedDb` the section cannot borrow; \
+                     `--live` and `--api` reshape the `show` view it renders in). Re-running \
+                     would silently drop the children list. Destroy {} first — that removes \
+                     the section — then regenerate {plural}. Nothing has been written.",
+                if refused.len() == 1 {
+                    format!("{} is", refused[0])
+                } else {
+                    format!("{} are", refused.join(", "))
+                },
+                refused.join(", "),
+            ))
+        })?;
+        plan.create(own_routes_path, own_routes);
         let route_mod_path = routes_dir.join("mod.rs");
         plan.modify(
             route_mod_path.clone(),
@@ -4832,6 +4844,7 @@ mod attachment_read_back_tests {
 /// unscoped `list`/`page`, so it cannot return another user's rows.
 #[secured]
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
@@ -4871,6 +4884,7 @@ pub async fn index(
 /// `{pascal_name}Scope` enforces for `#[repository(scope = ...)]` index routes.
 #[secured]
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     page_req: PageRequest,
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
@@ -4910,6 +4924,7 @@ pub async fn index(
 /// Out-of-range or missing values are clamped silently — list endpoints never
 /// return HTTP 400 for bad paging parameters.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     page_req: PageRequest,
     db: ShardedDb,
@@ -4934,6 +4949,7 @@ pub async fn index(
 /// so this never 400s and can never inject SQL. `from_shard` keeps the query
 /// pinned to a single shard.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
@@ -4960,6 +4976,7 @@ pub async fn index(
 /// Out-of-range or missing values are clamped silently — list endpoints never
 /// return HTTP 400 for bad paging parameters.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
@@ -4982,6 +4999,7 @@ pub async fn index(
 /// malicious sort/filter keys are ignored against the model's column allowlist,
 /// so this never 400s and can never inject SQL.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
@@ -6287,7 +6305,7 @@ async fn nested_view(
 ) -> AutumnResult<Markup> {{
     require_{parent_snake}(db, {fk}).await?;
     let section = children_section_with(db, {fk}, page_req, changeset, state, session, csrf, csrf_field, submit_token, submit_field).await?;
-    Ok({layout_fn}(&format!("{pascal_name}s for {parent_pascal} #{{}}", {fk}), {cp_nested}flash, html! {{
+    Ok({layout_fn}(&format!("{pascal_name}s for {parent_pascal} #{{{fk}}}"), {cp_nested}flash, html! {{
         h1 {{ "{pascal_name}s for {parent_pascal} #" ({fk}) }}
         (section)
         (autumn_web::a11y::Link::new(crate::routes::{parent_plural}::paths::show({fk}), "Back to {parent_pascal}"))
@@ -6829,6 +6847,7 @@ fn render_form_for_helper(
          /// column requires no edits here — any enum/decimal/attachment overrides\n\
          /// below are the only schema-specific lines, and regeneration maintains\n\
          /// them.\n\
+         #[allow(clippy::too_many_arguments)]\n\
          fn {snake_name}_form_for(\n    \
          changeset: &Changeset<{pascal_name}Form>,\n    \
          action: String,\n    \
@@ -19445,6 +19464,67 @@ exempt_paths = [
             &ScaffoldOptions::default(),
         )
         .expect("destroying the CHILD must still be allowed");
+    }
+
+    #[test]
+    fn regenerating_a_nested_parent_into_an_incompatible_variant_is_refused() {
+        // "The marker landed" is not the test: a `--sharded` parent's `show`
+        // takes the injection perfectly cleanly and then fails to compile,
+        // because `children_section` borrows `&mut Db` and the handler now holds
+        // a `ShardedDb`. The parent's own regeneration runs none of the
+        // preflights `resolve` does for a child, so it checks them here.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+        let before = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    sharded: true,
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("comments is nested under posts"), "got: {msg}");
+        assert!(msg.contains("Nothing has been written"), "got: {msg}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap(),
+            before,
+            "a refusal must not touch the parent"
+        );
+    }
+
+    #[test]
+    fn the_injected_show_carries_the_lint_allowance_its_extra_extractors_need() {
+        // A generated project's own CI runs `cargo clippy --all-targets -- -D
+        // warnings`. Every standard `show` already takes three parameters, so
+        // six extractors trip `too_many_arguments` (9/7) — `cargo check` passes,
+        // which is why this stayed invisible. The allowance is reversible: it
+        // carries the extractors marker and comes off with them.
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let parent = action_contents(&plan, "src/routes/posts.rs");
+        let allow = parent
+            .find("#[allow(clippy::too_many_arguments)] // autumn:nested-extractors")
+            .expect("the injected show needs a lint allowance");
+        let sig = parent.find("pub async fn show(").expect("show");
+        assert!(
+            allow < sig,
+            "the allowance must precede the signature:\n{parent}"
+        );
+
+        let reverted = super::super::nested::remove_nested_child_section(&parent, "comments");
+        assert!(
+            !reverted.contains("#[allow(clippy::too_many_arguments)] // autumn:nested"),
+            "the allowance must come off with the extractors:\n{reverted}"
+        );
     }
 
     #[test]

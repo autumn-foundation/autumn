@@ -54,9 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its foreign key, is refused before anything is written — the parent's section
   passes its own `row.id`, so the change would leave that call compiling while
   reading another table's ids. Un-nest with `destroy` first.
-  Regenerating the PARENT re-applies the child sections it carried, and
-  destroying a parent that still has nested children is refused with the order
-  to follow.
+  Regenerating the PARENT re-applies the child sections it carried (and is
+  refused when the re-render would reshape `show` into something the section
+  cannot live in, such as a `--sharded` parent's `ShardedDb`), and destroying a
+  parent that still has nested children is refused with the order to follow.
+  The injected signature carries a reversible `#[allow(clippy::too_many_arguments)]`,
+  since a generated project's own CI runs `cargo clippy --all-targets -- -D warnings`
+  and nine parameters trips it — as the flat `index` and `<snake>_form_for`
+  helpers already did, which this also fixes.
   When the child carries an owner column, the nested list inherits the flat
   index's `#[secured]` + owner scoping, so nesting never opens a second, wider
   door onto the same rows.
