@@ -459,7 +459,13 @@ fn plan_scaffold_with_options_impl(
     // still lands, which is what makes the repository's own JSON update
     // conflict-check. Refusing them would break combinations that generated
     // fine before this feature existed.
-    if !options.api && super::model::lock_version_field(&fields).is_some() {
+    // `for_revert` skips the whole gate: `autumn destroy scaffold` recomputes the
+    // plan it is about to revert, and a scaffold created before these refusals
+    // existed (`lock_version:i32 --live`, say) must still be removable. The
+    // refusal would fire during the recompute — before `Plan::revert` ever sees
+    // `--force` — and strand exactly the files the user asked to delete. Same
+    // posture as the shared-layout preflight below (issue #1834).
+    if !for_revert && !options.api && super::model::lock_version_field(&fields).is_some() {
         // `--live-validation` is supported: it changes only how the form's
         // controls are rendered (raw htmx inputs instead of `form_for`), while
         // its `update` still writes through the same raw-diesel statement.
@@ -531,13 +537,23 @@ fn plan_scaffold_with_options_impl(
         live_validation: options.live_validation,
         no_policy: options.no_policy,
     };
-    let mut plan = plan_model_with_options(
-        project_root,
-        name,
-        field_tokens,
-        timestamp,
-        &options_with_key.model,
-    )?;
+    let mut plan = if for_revert {
+        super::model::plan_model_with_options_for_revert(
+            project_root,
+            name,
+            field_tokens,
+            timestamp,
+            &options_with_key.model,
+        )?
+    } else {
+        plan_model_with_options(
+            project_root,
+            name,
+            field_tokens,
+            timestamp,
+            &options_with_key.model,
+        )?
+    };
     let metadata = parse_model_metadata(&fields, &options_with_key.model)?;
     // A `--default field=value` column is dropped from `form_fields` (see
     // below) and therefore from the generated `New{Pascal}` insert struct
@@ -17132,6 +17148,10 @@ exempt_paths = [
     // through the edit form and guard the UPDATE with it, so two concurrent
     // editors get a 409 re-render instead of silently clobbering each other.
 
+    /// A slug column token, held in a const so its `{from:title}` braces never
+    /// sit inside a macro invocation (clippy reads them as a format argument).
+    const SLUG_COL: &str = "slug:slug{from:title}";
+
     /// The `Post` scaffold field list with a `lock_version` column.
     fn lock_fields() -> Vec<String> {
         vec!["title:String".into(), "lock_version:i32".into()]
@@ -17432,6 +17452,68 @@ exempt_paths = [
             assert!(
                 plan.is_ok(),
                 "{label} + lock_version must still generate: {:?}",
+                plan.err()
+            );
+        }
+    }
+
+    #[test]
+    fn destroying_a_legacy_lock_version_scaffold_is_never_blocked_by_the_new_gates() {
+        // A scaffold generated before these refusals existed must stay
+        // removable. `destroy` recomputes the plan it is about to revert, so a
+        // refusal here lands BEFORE `Plan::revert` sees `--force` — stranding
+        // exactly the files the user asked to delete, with no way out.
+        for (label, cols, options) in [
+            (
+                "--live",
+                lock_fields(),
+                ScaffoldOptions {
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--sharded",
+                lock_fields(),
+                ScaffoldOptions {
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".to_owned()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "slug",
+                vec![
+                    "title:String".to_owned(),
+                    SLUG_COL.to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions::default(),
+            ),
+            (
+                "attachment",
+                vec![
+                    "title:String".to_owned(),
+                    "cover:Attachment".to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions::default(),
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let plan = plan_scaffold_with_options_for_revert(
+                tmp.path(),
+                "Post",
+                &cols,
+                "20260427000000",
+                &options,
+            );
+            assert!(
+                plan.is_ok(),
+                "destroying a legacy {label} + lock_version scaffold must plan: {:?}",
                 plan.err()
             );
         }

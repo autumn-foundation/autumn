@@ -3798,13 +3798,27 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 ..Default::default()
             };
             let timestamp = generate::timestamp_now();
-            let plan = generate::model::plan_model_with_options(
-                &std::env::current_dir().unwrap_or_default(),
-                &name,
-                &fields,
-                &timestamp,
-                &options,
-            );
+            // `destroy model` recomputes the plan it is about to revert, so it
+            // must not be blocked by generation-only semantic checks: a model
+            // created before those checks existed still has to be removable, and
+            // the refusal would land before `Plan::revert` ever sees `--force`.
+            let project_root = std::env::current_dir().unwrap_or_default();
+            let plan = match mode {
+                ApplyMode::Generate => generate::model::plan_model_with_options(
+                    &project_root,
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+                ApplyMode::Destroy => generate::model::plan_model_with_options_for_revert(
+                    &project_root,
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Migration {

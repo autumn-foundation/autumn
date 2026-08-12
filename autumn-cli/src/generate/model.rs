@@ -125,17 +125,57 @@ pub fn plan_model(
 ///
 /// # Errors
 /// Surfaces project-layout, DSL, naming, and metadata errors before any file is written.
-#[allow(
-    clippy::too_many_lines,
-    reason = "linear sequence of independent file/revert steps mirroring the files this \
-              generator emits; splitting it up would not make any single step clearer"
-)]
 pub fn plan_model_with_options(
     project_root: &Path,
     name: &str,
     field_tokens: &[String],
     timestamp: &str,
     options: &ModelOptions,
+) -> Result<Plan, GenerateError> {
+    plan_model_with_options_impl(project_root, name, field_tokens, timestamp, options, false)
+}
+
+/// [`plan_model_with_options`], but for `autumn destroy model` (and the
+/// scaffold's own destroy path), which recomputes the plan it is about to
+/// revert.
+///
+/// Skips the *generation-only* semantic checks: a model created before those
+/// checks existed — a `lock_version:String` column, say, or a lock-only model —
+/// must still be removable. Refusing during the recompute happens before
+/// [`Plan::revert`] ever sees `--force`, so it would strand exactly the files
+/// the user is asking to delete. Same posture as the scaffold's shared-layout
+/// preflight (issue #1834) and the migration destroy fallback (issue #1048).
+///
+/// Structural errors (project layout, bad field syntax, name collisions) still
+/// apply: without them there is no plan to revert at all.
+///
+/// # Errors
+/// Surfaces project-layout, DSL, and naming errors before any file is touched.
+pub fn plan_model_with_options_for_revert(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    options: &ModelOptions,
+) -> Result<Plan, GenerateError> {
+    plan_model_with_options_impl(project_root, name, field_tokens, timestamp, options, true)
+}
+
+/// Shared implementation of [`plan_model_with_options`]. `for_revert` skips the
+/// generation-only compatibility checks — see
+/// [`plan_model_with_options_for_revert`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear sequence of independent file/revert steps mirroring the files this \
+              generator emits; splitting it up would not make any single step clearer"
+)]
+fn plan_model_with_options_impl(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    options: &ModelOptions,
+    for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     validate_resource_name(name)?;
@@ -206,7 +246,11 @@ pub fn plan_model_with_options(
     // cases is a separate change from wiring #1318, and would move a fieldless
     // `generate scaffold Post` from a compile error to a planning error that an
     // existing test pins.
-    if lock_version_field(&fields).is_some()
+    if !for_revert {
+        validate_lock_version_field(&fields)?;
+    }
+    if !for_revert
+        && lock_version_field(&fields).is_some()
         && fields
             .iter()
             .all(|f| metadata.defaults().contains_key(&f.name))
@@ -1681,8 +1725,11 @@ pub fn parse_model_metadata(
     // filter): the version is machinery the handler carries in a hidden field,
     // not content the author edits. An explicit `--default lock_version=<n>`
     // wins, so a project seeding versions from a non-zero base keeps its value.
-    validate_lock_version_field(fields)?;
-    if lock_version_field(fields).is_some() {
+    // NOT validated here: `validate_lock_version_field` is a *generation* policy,
+    // and this function also runs while planning a `destroy`, where refusing a
+    // legacy column would strand files the user is trying to remove. The
+    // planning entry points call it themselves when they are generating.
+    if fields.iter().any(is_lock_version_column) {
         metadata
             .defaults
             .entry(LOCK_VERSION_COLUMN.to_owned())
@@ -2310,7 +2357,7 @@ fn render_model_file(
         // `RepositoryError::Conflict` on a stale write — the whole point of
         // declaring the column. `parse_model_metadata` records its SQL
         // `DEFAULT 0` separately, so the migration still backfills the INSERT.
-        if f.name == LOCK_VERSION_COLUMN {
+        if is_lock_version_column(f) {
             out.push_str("    #[lock_version]\n");
         } else if metadata.defaults.contains_key(&f.name) {
             out.push_str("    #[default]\n");
@@ -5591,6 +5638,50 @@ autumn-web = \"0.3\"\n";
     }
 
     #[test]
+    fn destroying_a_legacy_lock_version_model_is_never_blocked_by_the_new_checks() {
+        // Same hazard as the scaffold gates: `destroy model` recomputes the plan
+        // it is about to revert, so a generation-only refusal would fire before
+        // `Plan::revert` ever sees `--force`, permanently stranding the files.
+        for cols in [
+            vec!["title:String".to_owned(), "lock_version:String".to_owned()],
+            vec![
+                "title:String".to_owned(),
+                "lock_version:Option<i32>".to_owned(),
+            ],
+            vec!["lock_version:i32".to_owned()],
+        ] {
+            let tmp = project();
+            let plan = plan_model_with_options_for_revert(
+                tmp.path(),
+                "Post",
+                &cols,
+                "20260427000000",
+                &ModelOptions::default(),
+            );
+            assert!(
+                plan.is_ok(),
+                "destroying a legacy model with {cols:?} must plan: {:?}",
+                plan.err()
+            );
+        }
+
+        // Structural errors still apply on the revert path — without a valid
+        // field list there is no plan to revert at all.
+        let tmp = project();
+        assert!(
+            plan_model_with_options_for_revert(
+                tmp.path(),
+                "Post",
+                &["title:NotAType".to_owned()],
+                "20260427000000",
+                &ModelOptions::default(),
+            )
+            .is_err(),
+            "a malformed field list must still fail on the revert path"
+        );
+    }
+
+    #[test]
     fn unique_lock_version_is_rejected() {
         // The column is DB-managed and defaults to 0 on every insert, so a
         // unique index on it would reject the second row ever created — and
@@ -5652,15 +5743,21 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn nullable_lock_version_is_rejected() {
+        // `Option<i32>`, not `i32?` — the latter is not this DSL's nullable
+        // spelling, so it fails in the type parser and never reaches the
+        // optimistic-locking guard this test is about.
         let tmp = project();
         let err = plan_model(
             tmp.path(),
             "Post",
-            &["title:String".into(), "lock_version:i32?".into()],
+            &["title:String".into(), "lock_version:Option<i32>".into()],
             "20260427000000",
         )
         .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("lock_version"), "got: {msg}");
+        assert!(
+            msg.contains("lock_version") && msg.contains("non-nullable"),
+            "the nullability guard must be what rejects it: {msg}"
+        );
     }
 }
