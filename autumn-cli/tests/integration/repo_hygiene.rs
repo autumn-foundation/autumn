@@ -5594,3 +5594,84 @@ fn migration_guide_gate_still_counts_a_prose_only_breaking_section() {
         gate_report(&output),
     );
 }
+
+// --- Review round 41: indented code in the index --------------------------
+
+#[test]
+fn migration_guide_gate_ignores_an_index_entry_in_indented_code() {
+    // Four spaces at top level is an indented code block, so the bullet
+    // renders as code and the guide is not linked from the Index at all —
+    // which is the only route a reader has to it.
+    //
+    // The indented entry comes *first* on purpose: four spaces after an open
+    // bullet is a nested list item, which does index the guide. Only with no
+    // list open is it code. The next test pins the other half.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("docs/migrations/0.7.0.md"),
+        valid_migration_guide("0.7.0"),
+    )
+    .expect("guide");
+    std::fs::write(
+        tmp.path().join("docs/migrations/README.md"),
+        "# Migration Guides\n\n\
+         ## Index\n\n    \
+         - [`0.7.0.md`](0.7.0.md)\n\n\
+         - [`next.md`](next.md)\n",
+    )
+    .expect("index");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "an index bullet rendered as code does not index the guide\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_accepts_a_nested_index_entry() {
+    // The counterpart: the same four spaces *under a bullet* is a nested list
+    // item, not code, and indexes the guide perfectly well. The difference is
+    // the enclosing item content column, which is why the check measures from
+    // it rather than from column 0.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("docs/migrations/0.7.0.md"),
+        valid_migration_guide("0.7.0"),
+    )
+    .expect("guide");
+    std::fs::write(
+        tmp.path().join("docs/migrations/README.md"),
+        "# Migration Guides\n\n\
+         ## Index\n\n\
+         - [`next.md`](next.md)\n    \
+         - [`0.7.0.md`](0.7.0.md)\n",
+    )
+    .expect("index");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "a nested index bullet is a real link\n{}",
+        gate_report(&output),
+    );
+}

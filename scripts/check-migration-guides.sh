@@ -1526,7 +1526,12 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             }
             heading_text(visible) ~ /^##[[:space:]]+Index$/ { in_index = 1; next }
             heading_text(visible) ~ /^##[[:space:]]/          { in_index = 0 }
-            in_index && links_to(mask_html_attributes(visible), want_path) > 0 { found = 1 }
+            # Indented code renders as code: a bullet four columns past the
+            # enclosing content column is a sample of an index entry, not one.
+            # The same four spaces *under* a bullet is a nested item and does
+            # index the guide, which is why this measures from the container.
+            in_index && block_body(visible) !~ /^ / &&
+            links_to(mask_html_attributes(visible), want_path) > 0 { found = 1 }
             END { exit found ? 0 : 1 }
           ' "$index_file"; then
       guide_ok=false
