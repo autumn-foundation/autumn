@@ -1,6 +1,6 @@
 //! AC7 for issue #1598: the whole loop, end to end.
 //!
-//! Phase 1 runs a real request against a real PostgreSQL through the
+//! Phase 1 runs a real request against a real `PostgreSQL` through the
 //! *recording* pool: a route reads rows with diesel and then fails, and the
 //! failure-capture layer writes a capsule to disk. Phase 2 loads that capsule
 //! back off disk — nothing is passed in memory between the phases — rebuilds
@@ -12,7 +12,7 @@
 //! response is the response the client originally got — for a returned 500 and
 //! for a panic alike.
 //!
-//! Docker-gated: phase 1 needs a live PostgreSQL. Phase 2 needs no database at
+//! Docker-gated: phase 1 needs a live `PostgreSQL`. Phase 2 needs no database at
 //! all (the "server" is an in-process stub fed from the capsule), which is the
 //! point.
 
@@ -92,7 +92,9 @@ async fn seed(url_source: &TestDb) {
              )",
         )
         .await;
-    url_source.execute_sql("DELETE FROM capsule_e2e_widgets").await;
+    url_source
+        .execute_sql("DELETE FROM capsule_e2e_widgets")
+        .await;
     url_source
         .execute_sql(
             "INSERT INTO capsule_e2e_widgets (id, kind, name) VALUES
@@ -174,7 +176,7 @@ fn replay_clock(capsule: &Capsule) -> Arc<ReplayClock> {
     Arc::new(ReplayClock::new(capsule.clock.clone(), fallback))
 }
 
-fn status_of(outcome: &CapsuleOutcome) -> u16 {
+const fn status_of(outcome: &CapsuleOutcome) -> u16 {
     match outcome {
         CapsuleOutcome::Status { code, .. } => *code,
         CapsuleOutcome::Panic { status, .. } => *status,
@@ -200,7 +202,11 @@ async fn forced_500_on_a_db_reading_route_is_captured_and_replayed_identically()
         .with_db(recording_pool)
         .build();
 
-    client.get("/widgets/broken").send().await.assert_status(500);
+    client
+        .get("/widgets/broken")
+        .send()
+        .await
+        .assert_status(500);
 
     let path = await_one_capsule(dir.path()).await;
     // Nothing is handed between the phases in memory: the capsule is read back
@@ -215,7 +221,10 @@ async fn forced_500_on_a_db_reading_route_is_captured_and_replayed_identically()
         ..
     } = &capsule.outcome
     else {
-        panic!("a returned error must record a Status outcome: {:?}", capsule.outcome);
+        panic!(
+            "a returned error must record a Status outcome: {:?}",
+            capsule.outcome
+        );
     };
     assert!(
         recorded_message.contains("read 2 widget(s) (1:anvil,2:rope)"),
@@ -226,12 +235,10 @@ async fn forced_500_on_a_db_reading_route_is_captured_and_replayed_identically()
         .as_ref()
         .expect("the capsule must carry the database traffic the handler generated");
     assert!(
-        tape.connections
+        tape.connections.iter().any(|connection| connection
+            .exchanges
             .iter()
-            .any(|connection| connection
-                .exchanges
-                .iter()
-                .any(|exchange| exchange.sql == WIDGETS_SQL)),
+            .any(|exchange| exchange.sql == WIDGETS_SQL)),
         "the handler's SELECT must be on the tape: {:?}",
         tape.connections
             .iter()
@@ -275,7 +282,10 @@ async fn forced_500_on_a_db_reading_route_is_captured_and_replayed_identically()
         ..
     } = &outcome.actual
     else {
-        panic!("the replay must produce a Status outcome: {:?}", outcome.actual);
+        panic!(
+            "the replay must produce a Status outcome: {:?}",
+            outcome.actual
+        );
     };
     assert_eq!(
         replayed_message, recorded_message,

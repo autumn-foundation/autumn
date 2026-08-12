@@ -5607,13 +5607,203 @@ impl AppBuilder {
         }
     }
 
-    /// Replay a failure capsule against this application and exit with the
-    /// verdict (issue #1598).
+    /// Replay a recorded failure capsule against this application and exit with
+    /// the verdict (issue #1598).
+    ///
+    /// Triggered by `AUTUMN_REPLAY_CAPSULE=<path>`, which `autumn replay` sets.
+    /// The capsule supplies the request, every clock reading and every database
+    /// answer, so this path must not reach anything outside it. Exits `0` when
+    /// the recorded failure reproduced, `1` when it did not (a different
+    /// outcome, or code that left the recorded database tape), `2` when the
+    /// capsule was refused and nothing ran at all.
+    ///
+    /// # Deltas from [`run`](Self::run)
+    ///
+    /// **Kept**, because a replay against a stripped-down app is not a replay:
+    /// the app's own configuration, the route table and scoped groups, merged
+    /// and nested routers, custom Tower layers, the exception-filter chain, the
+    /// error-page renderer, the i18n bundle, the custom session store, policy
+    /// and scope registrations, state initializers, the DB interceptor, and the
+    /// real router builder ([`try_build_router_inner`](crate::router::try_build_router_inner)).
+    ///
+    /// **Dropped** (F15 — a replay is offline by construction):
+    ///
+    /// * `setup_database` is never called: no pool is dialled and no migration
+    ///   runs. The pool is
+    ///   [`pool_from_capsule`](crate::capsule::pool_from_capsule), which answers
+    ///   from the capsule's recorded wire traffic over an in-process pipe.
+    /// * Capture is never armed —
+    ///   [`install_from_config`](crate::capsule::install_from_config) is not
+    ///   called and `[failure_capture]` is forced off — so the replay neither
+    ///   points the checkout marker at the stub pool nor writes a capsule of
+    ///   itself.
+    /// * The session store is forced to memory and the process cache is
+    ///   cleared, so no Redis or external cache is dialled.
+    /// * No job runtime, no scheduler, no startup/shutdown hooks, and only
+    ///   *sync* event listeners (a durable listener needs the job runtime).
+    /// * No storage preflight, no mailer, no fail-fast configuration gates: a
+    ///   machine replaying a production capsule generally has none of that
+    ///   configured, and none of it is on the recorded path. A handler that
+    ///   extracts one of those subsystems is reported as a mismatch rather than
+    ///   killing the replay.
+    /// * No port is bound.
     #[cfg(feature = "reporting")]
+    #[allow(clippy::too_many_lines)]
     async fn run_replay_mode(self, capsule_path: String) {
-        let _ = capsule_path;
-        eprintln!("capsule replay is not implemented");
-        std::process::exit(1);
+        let Self {
+            routes,
+            api_versions,
+            listeners,
+            exception_filters,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            custom_layers,
+            state_initializers,
+            config_loader_factory,
+            telemetry_provider,
+            session_store,
+            policy_registrations,
+            #[cfg(feature = "db")]
+            db_interceptor,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            #[cfg(feature = "i18n")]
+            i18n_bundle,
+            #[cfg(feature = "i18n")]
+            i18n_auto_load,
+            #[cfg(feature = "maud")]
+            error_page_renderer,
+            #[cfg(feature = "embed-assets")]
+            embedded_static,
+            #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+            embedded_locales,
+            plugin_config_roots,
+            ..
+        } = self;
+
+        let path = std::path::PathBuf::from(&capsule_path);
+        let capsule = match crate::capsule::load_capsule(&path) {
+            Ok(capsule) => capsule,
+            Err(error) => {
+                std::process::exit(crate::capsule::print_refusal(&error.to_string(), &path))
+            }
+        };
+        if let Some(reason) = crate::capsule::refusal_reason(&capsule) {
+            std::process::exit(crate::capsule::print_refusal(&reason, &path));
+        }
+
+        let (mut config, telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
+        force_offline_replay_config(&mut config);
+
+        #[cfg(feature = "embed-assets")]
+        register_embedded_static_dir(embedded_static);
+        #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+        let i18n_bundle = embedded_i18n_bundle(i18n_bundle, embedded_locales, &config);
+        #[cfg(feature = "i18n")]
+        let i18n_bundle =
+            resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
+
+        // One log, shared: the stub connections write into it while the router
+        // runs, and the verdict reads it once the router is done.
+        let divergences = std::sync::Arc::new(crate::capsule::DivergenceLog::new());
+        #[cfg(feature = "db")]
+        let topology = replay_database_topology(&capsule, &divergences, &path);
+
+        let mut state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            topology.as_ref(),
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+
+        // Time is an input like any other: serve the readings the capture took,
+        // in order.
+        let fallback = capsule
+            .clock
+            .first()
+            .copied()
+            .unwrap_or(capsule.captured_at);
+        let clock = std::sync::Arc::new(crate::capsule::ReplayClock::new(
+            capsule.clock.clone(),
+            fallback,
+        ));
+        state = state.with_clock(
+            std::sync::Arc::clone(&clock) as std::sync::Arc<dyn crate::time::ClockSource>
+        );
+        if let Some(buf) = telemetry_guard.log_buffer.clone() {
+            state.insert_extension(buf);
+        }
+        // No startup barrier is applied on this path (`try_build_router_inner`
+        // does not add one), and a replayed request should meet the app as a
+        // warm process, not one still starting.
+        state.probes = crate::probe::ProbeState::default();
+        state.insert_extension(RegisteredApiVersions(api_versions));
+        #[cfg(feature = "db")]
+        if let Some(interceptor) = db_interceptor {
+            state.insert_extension(interceptor);
+        }
+        crate::cache::clear_global_cache();
+
+        for register in policy_registrations {
+            register(state.policy_registry());
+        }
+
+        #[cfg(feature = "i18n")]
+        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+
+        install_webhook_registry(&state, &config);
+        run_state_initializers(state_initializers, &state);
+        // Durable listeners need the job runtime this path never starts, so —
+        // as in static builds — only sync listeners are registered, and a
+        // durable side effect is a clean no-op.
+        let sync_listeners: Vec<_> = listeners
+            .into_iter()
+            .filter(|listener| listener.mode == crate::events::DispatchMode::Sync)
+            .collect();
+        finalize_event_bus(sync_listeners, &mut Vec::new(), &state);
+        // Refresh the AppState-stored config snapshot — see the matching
+        // comment in `run()`.
+        state.insert_extension(config.clone());
+
+        let router = crate::router::try_build_router_inner(
+            routes,
+            &config,
+            state,
+            crate::router::RouterContext {
+                exception_filters,
+                scoped_groups,
+                merge_routers,
+                nest_routers,
+                custom_layers,
+                static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
+                error_page_renderer,
+                session_store,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
+            },
+        )
+        .unwrap_or_else(|error| {
+            std::process::exit(crate::capsule::print_refusal(
+                &format!("the application's router could not be rebuilt: {error}"),
+                &path,
+            ))
+        });
+
+        let outcome =
+            crate::capsule::execute(router, &capsule, divergences, Some(clock.as_ref())).await;
+        std::process::exit(crate::capsule::print_verdict(&outcome, &path));
     }
 }
 
@@ -5688,6 +5878,64 @@ fn replay_capsule_from_env() -> Option<String> {
 fn normalize_replay_capsule(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Force the configuration knobs a replay must not honour (F15).
+///
+/// A capsule is replayed on a laptop or in CI, where the recording app's Redis,
+/// object storage and mail transport are not reachable — and where reaching
+/// them would be a side effect of *diagnosing* a failure, not part of it. Every
+/// other setting stays the application's own, because status codes, CSRF,
+/// locale routing and error rendering all depend on them.
+#[cfg(feature = "reporting")]
+const fn force_offline_replay_config(config: &mut AutumnConfig) {
+    // Capturing the replay would write a capsule of a capsule, and arming
+    // capture would point the connection-checkout marker at the stub pool.
+    config.failure_capture.enabled = false;
+    // Sessions in process memory: no Redis is dialled, and the
+    // memory-in-production warning is noise for a one-shot replay.
+    config.session.backend = crate::session::SessionBackend::Memory;
+    config.session.allow_memory_in_production = true;
+}
+
+/// The database topology a replay runs against: an in-process pool answering
+/// from the capsule's recorded wire traffic, or none when the capsule recorded
+/// no database work at all.
+#[cfg(all(feature = "reporting", feature = "db", not(feature = "sqlite")))]
+fn replay_database_topology(
+    capsule: &crate::capsule::Capsule,
+    divergences: &std::sync::Arc<crate::capsule::DivergenceLog>,
+    capsule_path: &std::path::Path,
+) -> Option<crate::db::DatabaseTopology> {
+    capsule.db.as_ref()?;
+    let pool = crate::capsule::pool_from_capsule(capsule, std::sync::Arc::clone(divergences))
+        .unwrap_or_else(|error| {
+            std::process::exit(crate::capsule::print_refusal(
+                &format!("the capsule's database tape could not be served: {error}"),
+                capsule_path,
+            ))
+        });
+    Some(crate::db::DatabaseTopology::primary_only(pool))
+}
+
+/// SQLite builds have no wire capture and no wire replay (F18), so a capsule
+/// carrying a database tape — which is `PostgreSQL` protocol traffic — cannot be
+/// replayed by this binary.
+#[cfg(all(feature = "reporting", feature = "db", feature = "sqlite"))]
+fn replay_database_topology(
+    capsule: &crate::capsule::Capsule,
+    _divergences: &std::sync::Arc<crate::capsule::DivergenceLog>,
+    capsule_path: &std::path::Path,
+) -> Option<crate::db::DatabaseTopology> {
+    if capsule.db.is_some() {
+        std::process::exit(crate::capsule::print_refusal(
+            "the capsule carries a PostgreSQL database tape, but this binary was built with the \
+             `sqlite` backend, which has neither wire capture nor wire replay. Replay it with a \
+             PostgreSQL build of the application.",
+            capsule_path,
+        ));
+    }
+    None
 }
 
 fn one_off_task_name_from_env() -> Option<String> {
@@ -10643,13 +10891,17 @@ mod tests {
     #[cfg(feature = "reporting")]
     #[test]
     fn replay_mode_reads_capsule_env_var() {
-        temp_env::with_var("AUTUMN_REPLAY_CAPSULE", Some("tmp/capsules/abc.json"), || {
-            assert!(is_replay_mode(), "a capsule path selects the replay path");
-            assert_eq!(
-                replay_capsule_from_env().as_deref(),
-                Some("tmp/capsules/abc.json")
-            );
-        });
+        temp_env::with_var(
+            "AUTUMN_REPLAY_CAPSULE",
+            Some("tmp/capsules/abc.json"),
+            || {
+                assert!(is_replay_mode(), "a capsule path selects the replay path");
+                assert_eq!(
+                    replay_capsule_from_env().as_deref(),
+                    Some("tmp/capsules/abc.json")
+                );
+            },
+        );
         temp_env::with_var("AUTUMN_REPLAY_CAPSULE", Some("  spaced.json  "), || {
             assert_eq!(
                 replay_capsule_from_env().as_deref(),
