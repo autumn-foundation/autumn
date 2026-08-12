@@ -116,39 +116,61 @@ CI summary.
 Autumn enforces a [#1611][issue-1611] invariant: **request-path modules must not
 panic on the production code path.** A request that reaches a runtime module
 should never be able to bring the process down through an `unwrap`, `expect`,
-`panic!`, out-of-bounds index, or an unfinished `todo!`/`unimplemented!`.
+`panic!`, out-of-bounds index, a `&s[a..b]` slice on a byte offset that is not a
+char boundary, an integer or time overflow, or an unfinished
+`todo!`/`unimplemented!`.
 
 ### What counts as "request path"
 
 Per AC2, the gate covers modules that run **per request** or in
-**framework-owned background loops** — extractors, form/body decoding, session
-and idempotency stores, the scheduler and job queues, channels, and the
-per-request middleware stack. These are the files listed in the
-`REQUEST_PATH_MODULES` array in `scripts/check-panic-gate.sh`.
+**framework-owned background loops** — extractors, form/body decoding (including
+`nested_form`), session and idempotency stores, the scheduler and job queues,
+channels, inbound-mail webhook parsing (`inbound_mail`, which turns unauthenticated
+RFC 5322 / MIME bytes into typed values), the shared saturating-arithmetic helpers
+those modules call (`time_math`), and the per-request middleware stack. These are
+the 30 files listed in the `REQUEST_PATH_MODULES` array in
+`scripts/check-panic-gate.sh`, each entry carrying the Cargo feature that gates
+its `mod` declaration.
 
 Explicitly **exempt** surfaces (a panic there cannot take down a live request):
 
 - `#[cfg(test)]` code, benches, and examples;
 - build scripts;
 - the `autumn-cli` crate (a short-lived operator tool);
-- application-author code (your route handlers are yours to write).
+- application-author code (your route handlers are yours to write);
+- **proc-macro internals** in `autumn-macros`: they run at compile time, so a
+  panic there fails a build rather than a request. Code a macro *generates* and
+  expands into a user crate is likewise outside the gate — the deny header is
+  per-module and does not follow an expansion across crates. So macro-emitted
+  request-path logic must stay a thin shim that **delegates to a gated runtime
+  function** in `autumn-web`; do not inline fallible parsing or arithmetic into
+  the tokens a macro emits, where nothing will ever lint it.
 
 ### What the gate checks
 
-Each gated module carries a header that opts its **production** target into a
-set of panic-class clippy denials:
+Each gated module carries a header that opts its **production** target into the
+panic-class clippy denials. Copy it verbatim — this is the rustfmt-normalized
+form, and `scripts/check-panic-gate.sh` requires the **complete** set of nine
+lints, not a subset:
 
 ```rust
 // autumn-panic-gate: request-path module — production code path must be panic-free.
-#![cfg_attr(not(test), deny(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing,
-))]
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
 ```
 
 The `cfg_attr(not(test), …)` scope means the denials apply to the library build
@@ -156,12 +178,66 @@ but auto-exempt the module's own `#[cfg(test)] mod tests`. Enforcement happens
 in the CI `lint` job (same workflow as `fmt`/`clippy`, no new services):
 
 - `cargo clippy --workspace --all-targets -- -D warnings` fails on any un-justified
-  panic-class site in a gated module; and
-- `scripts/check-panic-gate.sh` verifies every module in the canonical manifest
-  still exists and still carries the gate header, so the gate cannot be silently
-  removed.
+  panic-class site in a gated module built with default features;
+- a second clippy run with the gated request-path features
+  (`ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage`)
+  does the same for the feature-gated modules, whose deny blocks the
+  default-feature run never even compiles; and
+- `scripts/check-panic-gate.sh` verifies the manifest itself.
 
-Run the manifest check locally with `./scripts/check-panic-gate.sh`.
+That last script is the gate on the gate, and it checks more than "the file still
+exists":
+
+- every manifest module exists, carries the `autumn-panic-gate:` marker, and the
+  marker is **immediately followed** by its `#![cfg_attr(…)]` header — a marker
+  floating free in a doc comment or in test code proves nothing, and an unrelated
+  `cfg_attr` earlier in the file cannot stand in for the gate;
+- the header is terminated and lists all nine lints;
+- **anti-spoof**: no inner attribute (`#![…]`) anywhere in the module may combine
+  `allow(` with a gated lint — a module-wide inner allow would silently defeat the
+  deny while leaving it in place to read;
+- every per-site `#[allow(<gated lint>…)]` carries a `reason = "…"`;
+- **reverse manifest**: every `*.rs` file under `autumn/src` and `autumn-search/src`
+  that carries the marker is listed in `REQUEST_PATH_MODULES` (a module gated
+  in-file but missing from the manifest is unchecked — this is how `nested_form.rs`
+  drifted out);
+- the manifest never shrinks below `MODULE_COUNT_FLOOR`;
+- **feature reachability**: a module gated behind a non-default Cargo feature must
+  have that feature enabled by one of `ci.yml`'s `cargo clippy` invocations,
+  otherwise its deny block is never compiled and the gate is decorative there.
+
+Run it locally with `./scripts/check-panic-gate.sh` — the default invocation runs
+its own `--self-test` (synthetic fixtures in a temp dir, asserting the checker
+still *fails* on each spoof it claims to catch) before checking the real tree, and
+both legs together take under a second. `./scripts/pre-push-check.sh` runs it as
+its first step, alongside the gated-features clippy run.
+
+### Falsifying the gate (AC1)
+
+A gate nobody has ever seen fail is a gate nobody should trust. To watch it go
+red, add an unannotated panic-class site to any gated module — for example, in
+`autumn/src/idempotency.rs`:
+
+```rust
+let n: u64 = "1".parse().unwrap();   // clippy::unwrap_used
+let m = n + 1;                       // clippy::arithmetic_side_effects
+let s = &"hello"[1..];               // clippy::string_slice
+```
+
+then run the same command CI runs for that module's feature set:
+
+```sh
+cargo clippy -p autumn-web \
+  --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage" \
+  --all-targets -- -D warnings
+```
+
+Each line is reported as `error: …` and the build fails. Revert, re-run, green.
+Note the site must be **outside** `#[cfg(test)]` — the header exempts the module's
+own tests on purpose, so a `.unwrap()` added inside `mod tests` will *not* go red.
+The complementary experiment for the manifest half — delete a lint from a header,
+or add a marker to an unlisted file — is exactly what
+`./scripts/check-panic-gate.sh --self-test` automates on fixtures.
 
 ### Justifying an exception
 
@@ -182,12 +258,53 @@ let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
 This `unwrap_or_else(PoisonError::into_inner)` idiom is the established
 lock-poisoning recovery contract (AC4); see `circuit_breaker.rs`.
 
-### Deferred: arithmetic
+### Arithmetic and slicing
 
-Unchecked time/duration/integer arithmetic (`clippy::arithmetic_side_effects`)
-is a deferred follow-up and is **not** in the automated lint set yet. It is
-currently guarded by the saturating-arithmetic idiom (e.g. `saturating_deadline`
-in `idempotency.rs`) plus review rather than by the gate.
+Unchecked arithmetic and byte slicing are no longer deferred: the gate denies
+`clippy::arithmetic_side_effects` and `clippy::string_slice` in every gated
+module, so `a + b`, `a - b`, `a * b`, `now + ttl` and `&s[a..b]` are all errors
+on the production path unless you use one of the sanctioned idioms below. The
+lints exist because each of those operators panics on inputs that are routinely
+*attacker- or config-supplied*: an overflowing counter, a TTL from a config file,
+a byte offset from a parser mid-UTF-8.
+
+Which idiom is correct depends on what the value *means*:
+
+- **Counters, capacities, sizes → saturate.** `saturating_add` / `saturating_sub`
+  (or `saturating_mul`). A request counter that pins at `u64::MAX` is a
+  metrics blemish; a panicking one is an outage.
+- **Deadlines and durations → `checked_*` with an explicit fallback,** or the
+  crate-private helpers in `autumn/src/time_math.rs` that wrap that pattern:
+  `time_math::saturating_deadline` (`Instant + Duration`),
+  `time_math::saturating_dt_add` (`DateTime<Utc> + TimeDelta`) and
+  `time_math::saturating_time_delta_secs` (`TimeDelta::seconds`, which panics
+  above `i64::MAX / 1_000`). For a `TimeDelta` you build yourself, use
+  `TimeDelta::try_seconds(..)` and handle the `None`. Clamping to a far-future
+  horizon is the safe direction for an expiry: a pathological TTL yields an
+  effectively non-expiring entry rather than a dead process.
+- **Parser offsets and lengths → `checked_*` and early-reject.** Clamping is for
+  time and capacity, *not* for parsers: a malformed MIME boundary or a length
+  field that overflows must make the parse **fail**, not silently truncate to a
+  clamped value and hand the caller a plausible-looking wrong answer. Prefer
+  `get(a..b)` / `split_at_checked` / `char_indices` over `&s[a..b]` — that also
+  answers `clippy::string_slice`, which fires because a byte range that lands
+  mid-UTF-8 panics.
+
+A per-site `#[allow(clippy::arithmetic_side_effects, reason = "…")]` is legal
+when the invariant is genuinely local and you state it (`reason = "i < len,
+checked above"`). It is never legal at module level: an inner
+`#![allow(clippy::arithmetic_side_effects)]` re-permits the lint for the whole
+file, and `scripts/check-panic-gate.sh` rejects it as a spoof of the gate.
+
+### Toolchain caveat
+
+`arithmetic_side_effects`, `string_slice` and `indexing_slicing` are clippy
+**restriction** lints: their exact firing set can shift between clippy releases,
+so a routine `dtolnay/rust-toolchain@stable` bump can turn an unrelated PR red in
+a gated module nobody touched. When that happens, do **not** delete a lint from
+the headers to get green. Pin the toolchain action to the previous version
+(`dtolnay/rust-toolchain@<ver>`), land the PR, and file a burn-down issue for the
+new findings. Losing a lint is permanent; a pin is a week.
 
 ## Fuzzing
 
@@ -207,9 +324,18 @@ There are five targets, one per parsing surface:
 | `routing` | path/router matching and extraction |
 | `headers` | request header parsing |
 | `session` | session cookie decode/verify |
-| `body` | request body decoding |
+| `body` | request body decoding **and the inbound-mail parsers** |
 
 Each target has a committed seed corpus at `fuzz/corpus/<target>/`.
+
+`body` multiplexes on its first input byte, so one target covers several
+parsers: urlencoded form decoding plus `inbound_mail`'s SES/SNS JSON reader, the
+RFC 5322 / MIME body parser (including nested `multipart/*`), the address-list
+parser, and the Mailgun `multipart/form-data` webhook parser
+(`__fuzz::parse_mailgun_form_data`, which drives the boundary splitter and the
+quote-aware `Content-Disposition` reader). Adding a parser to `inbound_mail`
+therefore means adding a seam in its "Fuzzing seams" block and a discriminant arm
+in `fuzz/fuzz_targets/body.rs` — not a new target.
 
 ### Running locally
 

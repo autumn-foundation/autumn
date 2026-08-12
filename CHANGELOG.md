@@ -1684,6 +1684,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`gated`, `public`, `framework`), completing the deferred items from #1604's
   first slice (#1850).
 
+### Security
+
+- **inbound_mail:** cap `multipart/*` nesting at 16 levels (`MAX_MIME_DEPTH`). A
+  deeply nested MIME body on an unauthenticated inbound-mail webhook could
+  previously recurse until the stack overflowed, aborting the process. Past the
+  cap the remaining subtree is kept verbatim as an opaque attachment — never
+  dropped (#1611).
+- **inbound_mail:** reject MIME boundaries RFC 2046 §5.1.1 does not permit —
+  empty, or longer than 70 characters. Such a `Content-Type` now takes the
+  existing single-part fallback instead of driving a boundary scan (#1611).
+
+### Fixed
+
+- **inbound_mail:** quoted MIME parameter values are no longer Latin-1 mangled
+  (`filename="café.pdf"` came back as `cafÃ©.pdf`); the parser scans `char`s
+  instead of casting bytes (#1611).
+- **jobs:** a large `jobs.tracking.ttl_secs` no longer panics the process — the
+  tracking stores clamp the TTL and every expiry stamp instead of hitting
+  `TimeDelta::seconds`' out-of-bounds panic and `DateTime + TimeDelta` overflow
+  (#1611).
+- **jobs:** retry on the in-process backend no longer underflows computing
+  exponential backoff for a zero attempt counter; the local backend now matches
+  the Redis/Postgres backends' saturating exponent (#1611).
+- **jobs:** pathological `#[job(unique_for = ...)]` windows and Redis maintenance
+  intervals clamp their deadlines instead of overflowing `Instant + Duration`
+  (#1611).
+
+### Changed
+
+- **panic gate:** the request-path panic gate (#1611) now also denies
+  `clippy::string_slice` and `clippy::arithmetic_side_effects` in every gated
+  module, and the manifest grows to 30 modules (adds `inbound_mail.rs`,
+  `nested_form.rs` — which carried the header but had drifted out of the
+  manifest — and the new crate-private `time_math` saturating-arithmetic
+  helpers). `scripts/check-panic-gate.sh` gains header anchoring, anti-spoof
+  checks for module-wide `allow`s, `reason =` hygiene on per-site allows,
+  reverse-manifest drift detection, a module-count floor, a CI
+  feature-reachability check, and a `--self-test` mode that runs by default;
+  `scripts/pre-push-check.sh` now runs the gate and the gated-features clippy
+  lane. CI lints the `inbound-mail`/`inbound-mailgun`/`inbound-ses`/`storage`
+  features and runs the inbound-mail test suites. [no-plugin]
+- **inbound_mail:** `compute_mailgun_signature` delegates to
+  `security::config::hmac_sha256_hex` (output byte-identical); removed a dead
+  re-parse in the SNS certificate DER reader (#1611). [no-plugin]
+
 ## [0.6.0] - 2026-07-18
 
 ### Added
