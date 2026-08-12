@@ -288,6 +288,19 @@ function dedent3(text,   n, expanded) {
   return substr(expanded, n + 1)
 }
 
+function is_atx_heading(text,   h, n, ch) {
+  # One to six `#` then whitespace or end of line. Seven or more is not a
+  # heading at all — it renders as a paragraph, and skipping it as one took
+  # the line out of the unmarked-break lint. Written as a count rather than a
+  # `{1,6}` interval, which not every awk supports.
+  h = heading_text(text)
+  n = 0
+  while (substr(h, n + 1, 1) == "#") n++
+  if (n < 1 || n > 6) return 0
+  ch = substr(h, n + 1, 1)
+  return (ch == "" || ch == " " || ch == "\t")
+}
+
 function heading_text(line,   h) {
   # The rendered text of an ATX heading: markdown allows a tab after the
   # marker, and an optional trailing run of hashes is a closing sequence, not
@@ -907,7 +920,7 @@ function visible_text(line,   body, ch, run, out, head, tail, masked, pos, close
   # line.
   out = scan_comments(line)
   md_paragraph_open = (block_body(out) ~ /[^[:space:]]/ &&
-                       heading_text(block_body(out)) !~ /^#+[ \t]/ &&
+                       !is_atx_heading(block_body(out)) &&
                        !(md_paragraph_open == 0 && is_link_definition(out))) ? 1 : 0
   return out
 }
@@ -1025,6 +1038,13 @@ collect_link_defs() {
       if (!is_definition_opener(visible)) next
       close_at = unescaped_index(body, "]", 2)
       pending = substr(body, 2, close_at - 2)
+      # A label may not contain an unescaped bracket: CommonMark creates no
+      # definition, and both lines render as plain paragraphs, so a reference
+      # to it resolves to nothing.
+      if (unescaped_index(pending, "[", 1) > 0 || unescaped_index(pending, "]", 1) > 0) {
+        pending = ""
+        next
+      }
       pending_rest = substr(body, close_at + 2)
       flush_def()
     }
@@ -1234,7 +1254,7 @@ findings="$(
   # levels still end whatever preceded them, and are never entries themselves:
   # left of an open item they close it, and a heading is not prose, so
   # "#### Breaking down latency" must not reach the unmarked-break lint.
-  heading_text(visible) ~ /^#+[ \t]/ {
+  is_atx_heading(visible) {
     if (entry != "" && leading_spaces(visible) < entry_content_indent) flush_entry()
     if (entry == "") next
   }
@@ -1566,7 +1586,7 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
             next
           }
         }
-        heading_text(visible) ~ /^#+[ \t]/ {
+        is_atx_heading(visible) {
           level = heading_level(heading_text(visible))
           current = heading_text(visible)
           current_level = level
@@ -1604,7 +1624,8 @@ if [[ -d "$MIGRATIONS_DIR" ]]; then
           } else if (pending_title && strip_inline_tags(visible) ~ /^[[:space:]]*[^[:space:]]+[[:space:]]*$/) {
             # The destination, alone on the line below its opener.
             pending_title = 0
-          } else if (strip_inline_tags(visible) ~ /[^[:space:]]/) {
+          } else if (strip_inline_tags(visible) ~ /[^[:space:]]/ &&
+                     !is_thematic_break(visible)) {
             pending_title = 0
             for (lvl = 1; lvl <= 6; lvl++) {
               if (open_heading[lvl] != "") content[open_heading[lvl]] = 1

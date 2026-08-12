@@ -6337,3 +6337,97 @@ fn migration_guide_gate_resolves_an_escaped_punctuation_destination() {
         gate_report(&output),
     );
 }
+
+// --- Review round 50: heading levels, separators, label validity ----------
+
+#[test]
+fn migration_guide_gate_reads_seven_hashes_as_prose() {
+    // ATX headings stop at six markers, so a seven-hash line is an ordinary
+    // paragraph. Skipping it as a heading took it out of the unmarked-break
+    // lint entirely.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         ####### This is a breaking API rename\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "seven hashes render as prose and must reach the lint",
+    );
+}
+
+#[test]
+fn migration_guide_gate_still_reads_six_hashes_as_a_heading() {
+    // The boundary on the other side: six is still a heading, so wording in
+    // one is not prose and must not be linted.
+    let tmp = migration_gate_fixture("0.7.0");
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         ###### Breaking down request latency\n\n\
+         - **api:** an addition.\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        output.status.success(),
+        "six hashes is a heading, not prose\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_does_not_count_a_thematic_break_as_content() {
+    // A separator renders as a rule and carries no migration instructions, so
+    // a required section holding only one is a stub.
+    let tmp = migration_gate_fixture("0.7.0");
+    let guide = valid_migration_guide("0.7.0").replace("Why this release breaks.", "---");
+    write_fixture_guide(&tmp, "0.7.0", &guide);
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the \
+           [migration guide](docs/migrations/0.7.0.md).\n",
+    )
+    .expect("changelog");
+
+    let output = run_migration_gate(tmp.path());
+    assert!(
+        !output.status.success(),
+        "a rule is not migration guidance\n{}",
+        gate_report(&output),
+    );
+}
+
+#[test]
+fn migration_guide_gate_rejects_a_definition_label_with_a_stray_bracket() {
+    // An unescaped bracket inside a label means CommonMark creates no
+    // definition at all — both lines render as plain paragraphs — so the
+    // reference above it resolves to nothing.
+    let tmp = migration_gate_fixture("0.7.0");
+    write_fixture_guide(&tmp, "0.7.0", &valid_migration_guide("0.7.0"));
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "# Changelog\n\n\
+         ## [0.7.0] - 2026-09-01\n\n\
+         ### Changed\n\n\
+         - **db:** **Breaking:** renamed. See the [migration guide][up[grade].\n\n\
+         [up[grade]: docs/migrations/0.7.0.md\n",
+    )
+    .expect("changelog");
+
+    assert!(
+        !run_migration_gate(tmp.path()).status.success(),
+        "an invalid label defines nothing",
+    );
+}
