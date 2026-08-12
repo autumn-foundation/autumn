@@ -42,10 +42,6 @@
         clippy::indexing_slicing,
     )
 )]
-// The consumers of this module (`capsule::record_db`, `capsule::replay_db`)
-// land in later commits of #1598; until then several framing helpers are
-// exercised only by the unit tests at the bottom of this file.
-#![allow(dead_code)]
 // `pub` throughout this file is crate-visible only: the enclosing `wire` module
 // is itself `pub(crate)`, so nothing here escapes the crate
 // (clippy::redundant_pub_crate).
@@ -72,6 +68,12 @@ pub const TAG_PARAMETER_STATUS: u8 = b'S';
 /// `BackendKeyData`.
 pub const TAG_BACKEND_KEY_DATA: u8 = b'K';
 /// `RowDescription`.
+#[allow(
+    dead_code,
+    reason = "tag-table completeness: the recorder matches RowDescription frames by \
+              position inside an exchange rather than by tag, so only the builder and \
+              this module's tests name it"
+)]
 pub const TAG_ROW_DESCRIPTION: u8 = b'T';
 /// `DataRow`.
 pub const TAG_DATA_ROW: u8 = b'D';
@@ -92,6 +94,12 @@ pub const GSSENC_REQUEST_CODE: u32 = 80_877_104;
 /// `CancelRequest` request code.
 pub const CANCEL_REQUEST_CODE: u32 = 80_877_102;
 /// Protocol version 3.0, as sent in the startup packet.
+#[allow(
+    dead_code,
+    reason = "startup-code table completeness: the recorder only needs to tell a startup \
+              packet from the SSL/GSS/cancel codes, so the version itself is named by \
+              this module's tests"
+)]
 pub const PROTOCOL_VERSION_3: u32 = 196_608;
 
 /// The GUC Autumn sets to bind a pooled connection to a capsule scope.
@@ -140,6 +148,12 @@ impl Frame {
     }
 
     /// The bare `S`/`N` byte when this frame is a backend SSL answer.
+    #[allow(
+        dead_code,
+        reason = "the splitter reacts to an SSL answer where it is read (an `S` marks the \
+                  connection unrecordable) rather than through this accessor, which \
+                  documents the frame shape and is exercised by this module's tests"
+    )]
     pub fn ssl_answer(&self) -> Option<u8> {
         if self.is_untagged() && self.bytes.len() == 1 {
             self.bytes.first().copied()
@@ -209,6 +223,12 @@ impl FrameSplitter {
     }
 
     /// Which half of the connection this splitter reads.
+    #[allow(
+        dead_code,
+        reason = "the recorder owns one splitter per direction and knows which is which \
+                  from the field it reads it out of; the accessor keeps the type \
+                  self-describing and is exercised by this module's tests"
+    )]
     pub const fn direction(&self) -> Direction {
         self.direction
     }
@@ -219,6 +239,11 @@ impl FrameSplitter {
     }
 
     /// Bytes currently held back as a partial frame.
+    #[allow(
+        dead_code,
+        reason = "the accumulator bound is enforced inside `push`, so production code never \
+                  asks; the partial-frame tests assert on it"
+    )]
     pub fn buffered(&self) -> usize {
         self.buf.len()
     }
@@ -712,6 +737,12 @@ pub const fn terminates_exchange(frame: &Frame) -> bool {
 }
 
 /// Transaction status byte (`I`, `T`, `E`) of a `ReadyForQuery` frame.
+#[allow(
+    dead_code,
+    reason = "recording and replay both treat ReadyForQuery as an opaque terminator and \
+              replay its recorded bytes verbatim, so the status byte is only read by this \
+              module's tests; keeping it documents what the terminator carries"
+)]
 pub fn ready_for_query_state(frame: &Frame) -> Option<u8> {
     if frame.tag != TAG_READY_FOR_QUERY {
         return None;
@@ -728,7 +759,13 @@ pub const fn is_copy_start(tag: u8) -> bool {
     )
 }
 
-/// Key/value of a `ParameterStatus` frame, for replaying the handshake (F7).
+/// Key/value of a `ParameterStatus` frame.
+#[allow(
+    dead_code,
+    reason = "the stub server replays a recorded handshake verbatim and otherwise sends a \
+              canned parameter set, so it never has to take one apart; the accessor is \
+              exercised by this module's tests and is the tool for reading one back"
+)]
 pub fn parameter_status_pair(frame: &Frame) -> Option<(String, String)> {
     if frame.tag != TAG_PARAMETER_STATUS {
         return None;
@@ -838,6 +875,12 @@ pub mod build {
     /// Table OID and column attnum are reported as zero (the column is not
     /// identifiable as a table column), type length as `-1` and atttypmod as
     /// `-1`; every field is declared in text format.
+    #[allow(
+        dead_code,
+        reason = "the stub server answers from recorded response bytes rather than \
+                  synthesising result frames, so the row builders serve this module's \
+                  tests and any future synthetic tape"
+    )]
     pub fn row_description(cols: &[(String, u32)]) -> Vec<u8> {
         let mut payload = Vec::new();
         push_count(&mut payload, cols.len());
@@ -854,6 +897,11 @@ pub mod build {
     }
 
     /// `DataRow`; `None` is SQL NULL.
+    #[allow(
+        dead_code,
+        reason = "companion to `row_description`: recorded tapes carry their own result \
+                  bytes, so this builds rows for tests and synthetic tapes"
+    )]
     pub fn data_row(fields: &[Option<Vec<u8>>]) -> Vec<u8> {
         let mut payload = Vec::new();
         push_count(&mut payload, fields.len());
@@ -886,6 +934,12 @@ pub mod build {
     }
 
     /// `EmptyQueryResponse`.
+    #[allow(
+        dead_code,
+        reason = "an empty query is recorded like any other exchange and replayed from its \
+                  own bytes; the builder completes the backend vocabulary and is exercised \
+                  by this module's tests"
+    )]
     pub fn empty_query_response() -> Vec<u8> {
         frame(b'I', &[])
     }

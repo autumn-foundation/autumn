@@ -122,9 +122,13 @@ should never be able to bring the process down through an `unwrap`, `expect`,
 
 Per AC2, the gate covers modules that run **per request** or in
 **framework-owned background loops** — extractors, form/body decoding, session
-and idempotency stores, the scheduler and job queues, channels, and the
-per-request middleware stack. These are the files listed in the
-`REQUEST_PATH_MODULES` array in `scripts/check-panic-gate.sh`.
+and idempotency stores, the scheduler and job queues, channels, the
+per-request middleware stack, and the failure-capsule capture path
+(`autumn/src/capsule/capture.rs`, `wire.rs`, `record_db.rs`: they tee a live
+request's body and its database connection, so a panic there would take down
+the very request they exist to record). These are the files listed in the
+`REQUEST_PATH_MODULES` array in `scripts/check-panic-gate.sh`; the array is the
+canonical list, and this paragraph must be kept in step with it.
 
 Explicitly **exempt** surfaces (a panic there cannot take down a live request):
 

@@ -5918,7 +5918,7 @@ fn replay_database_topology(
     Some(crate::db::DatabaseTopology::primary_only(pool))
 }
 
-/// SQLite builds have no wire capture and no wire replay (F18), so a capsule
+/// `SQLite` builds have no wire capture and no wire replay (F18), so a capsule
 /// carrying a database tape — which is `PostgreSQL` protocol traffic — cannot be
 /// replayed by this binary.
 #[cfg(all(feature = "reporting", feature = "db", feature = "sqlite"))]

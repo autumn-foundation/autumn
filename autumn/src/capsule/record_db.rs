@@ -269,7 +269,10 @@ fn first_tcp_endpoint(config: &tokio_postgres::Config) -> Option<(String, u16)> 
                     .unwrap_or(DEFAULT_PG_PORT),
             )),
             // A Unix-socket host: nothing to tee, and replay has no socket to
-            // stand in for it.
+            // stand in for it. The variant itself is `cfg(unix)` in
+            // tokio-postgres, so the arm has to be too — on Windows `Host` has
+            // only `Tcp` and this match is already exhaustive without it.
+            #[cfg(unix)]
             tokio_postgres::config::Host::Unix(_) => None,
         })
 }
