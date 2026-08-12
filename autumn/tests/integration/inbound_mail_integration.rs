@@ -4,7 +4,15 @@
 //! `autumn_web::inbound_mail`.
 
 #![cfg(feature = "inbound-mail")]
+// Every handler here has to match the `InboundMailHandlerFn` signature
+// (`fn(InboundEmail) -> Pin<Box<…>>`), so `InboundEmail` is taken by value even
+// where the test body only reads one field.
+#![allow(
+    clippy::needless_pass_by_value,
+    reason = "handler signature is fixed by InboundMailHandlerFn"
+)]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_web::inbound_mail::{
@@ -32,17 +40,7 @@ fn encode_form(pairs: &[(&str, &str)]) -> String {
 /// Build a valid Mailgun form body with the correct signature.
 fn mailgun_form(key: &str, ts: &str, token: &str, extra: &[(&str, &str)]) -> String {
     let sig = compute_mailgun_signature(ts, token, key);
-    let mut pairs: Vec<(&str, &str)> = vec![
-        ("timestamp", ts),
-        ("token", token),
-        ("signature", sig.as_str()),
-    ];
-    pairs.extend_from_slice(extra);
-    // We need the sig to be in the pairs — clone it first
-    let sig_owned = sig;
-    let _ = sig_owned; // already captured via sig.as_str() above... but that borrow doesn't live long enough
-    // Build manually to avoid lifetime issues
-    let base = format!("timestamp={ts}&token={token}&signature={sig_owned}");
+    let base = format!("timestamp={ts}&token={token}&signature={sig}");
     let extras = extra
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -72,9 +70,7 @@ fn inbound_email_has_all_required_fields() {
         subject: "Test subject".to_string(),
         text_body: Some("Hello world".to_string()),
         html_body: Some("<p>Hello</p>".to_string()),
-        headers: [("x-mailer".to_string(), "Test/1.0".to_string())]
-            .into_iter()
-            .collect(),
+        headers: std::iter::once(("x-mailer".to_string(), "Test/1.0".to_string())).collect(),
         attachments: vec![],
         spam_report: None,
         raw: Bytes::from_static(b""),
@@ -113,7 +109,7 @@ fn inbound_email_plus_token_accessor() {
         subject: "Re: ticket".to_string(),
         text_body: None,
         html_body: None,
-        headers: Default::default(),
+        headers: HashMap::default(),
         attachments: vec![],
         spam_report: None,
         raw: Bytes::new(),
@@ -129,9 +125,9 @@ fn inbound_email_plus_token_accessor() {
 
 #[test]
 fn provider_enum_has_all_variants() {
-    let _m = InboundMailProvider::Mailgun;
-    let _s = InboundMailProvider::Ses;
-    let _g = InboundMailProvider::Generic;
+    assert_ne!(InboundMailProvider::Mailgun, InboundMailProvider::Ses);
+    assert_ne!(InboundMailProvider::Ses, InboundMailProvider::Generic);
+    assert_ne!(InboundMailProvider::Generic, InboundMailProvider::Mailgun);
 }
 
 #[test]
@@ -710,7 +706,7 @@ fn generic_fn(
     Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
 > {
     GENERIC_CALLS.fetch_add(1, Ordering::SeqCst);
-    *GENERIC_SUBJECT.lock().unwrap() = email.subject.clone();
+    GENERIC_SUBJECT.lock().unwrap().clone_from(&email.subject);
     Box::pin(async { Ok(()) })
 }
 
@@ -918,7 +914,7 @@ fn multipart_fn(
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
 > {
-    *MULTIPART_SUBJECT.lock().unwrap() = email.subject.clone();
+    MULTIPART_SUBJECT.lock().unwrap().clone_from(&email.subject);
     Box::pin(async { Ok(()) })
 }
 
