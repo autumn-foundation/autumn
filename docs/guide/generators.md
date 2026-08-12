@@ -789,6 +789,73 @@ selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks
 for a second, explicit submit.
 
+### Export CSV from the list view
+
+Every standard HTML scaffold's index also ships a working **Export CSV**
+download (issue #1315) — zero lines of user code:
+
+- A `CsvSchema` impl for the model is emitted in
+  `src/routes/<plural>.rs`, listing `id`, every scaffolded column in
+  declaration order, then `created_at` — the same set the `show` view
+  renders. It is ordinary editable Rust: drop a sensitive column from the
+  export by deleting one entry from `csv_columns` and its matching slot in
+  `to_csv_record`.
+- A `#[get("/<plural>/export.csv")]` handler feeds those rows through
+  `autumn_web::data::csv::export_csv` and answers with a
+  [`Download`](downloads.md), which derives
+  `Content-Type: text/csv; charset=utf-8`,
+  `Content-Disposition: attachment; filename="<plural>.csv"` and
+  `Content-Length` from the `.csv` filename.
+- The index renders an **Export CSV** link next to "New …", carrying the
+  index's current query string — so *filter → sort → export* downloads
+  exactly the rows on screen.
+- `autumn-web`'s `csv` feature is added to `Cargo.toml` (and removed again
+  by `autumn destroy scaffold`, unless hand-written code still uses
+  `autumn_web::data::csv`).
+- The generated `tests/<name>.rs` gains a database-free test asserting the
+  download contract: 200, `text/csv`, an `attachment` disposition, the
+  model's header row, RFC 4180 quoting, empty cells for NULLs, and the
+  formula guard below.
+
+Contract of the generated handler:
+
+| Situation | Behaviour |
+| --------- | --------- |
+| `?sort=`/`?filter[col]=` | Honoured through the same `ListQuery` extractor and the same `repo.list` call the index uses, so the file reflects the filtered view rather than the whole table. Unknown or malicious keys are ignored against the model's column allowlist. |
+| `?page=`/`?size=` | Ignored. An export spans every page of the current filter. |
+| `?q=` (`--searchable`) | **Not** honoured — `ListQuery` carries no full-text term, so the export cannot reproduce a `/<plural>/search` result set. Because of that the link is *placed* differently on a searchable scaffold: it renders **inside** the `#<plural>-search-results` container rather than beside "New …", so the htmx swap that shows search results also takes the link away. That matters because `active_search_input` pushes no URL — a link left outside the container would survive the swap still pointing at the unsearched set, and a user who narrowed the list would silently download the rows they just excluded. Searched results therefore offer no export; clear the search to get the link back. Filter with `?filter[col]=` instead, or add a `q` param to the handler and call the repository's `search_page` yourself. |
+| Row volume | Read in `MAX_PAGE_SIZE` (100) batches, so no single query loads the table, and capped at `MAX_EXPORT_ROWS` (10 000). That caps the **row count**, not bytes: the response is collected in memory, so a model with an unbounded `Text` column can still build a large body. Put a `{max}` length on such columns, lower the constant, or stream with `Download::from_stream` for a genuinely unbounded export. |
+| Hitting the cap | The file is truncated to `MAX_EXPORT_ROWS`, a `warn!` is logged, and the response carries `x-export-truncated: true`. To tell a complete export of exactly `MAX_EXPORT_ROWS` rows from a truncated one, the loop reads one batch **past** the cap and trims the surplus — so neither signal fires on an export that merely fills the cap exactly. There is no in-band marker in the CSV (it would parse as data), so narrow the filter (or raise the cap) rather than trusting a capped export for reconciliation. |
+| Concurrent writes | Consistency is **per batch, not per export**. Each batch is an independent `LIMIT`/`OFFSET` query on its own pooled connection, so a row inserted or deleted mid-export shifts the offsets under the batches still to come and can be written twice or skipped. The index has the same property; an export spans more pages and more wall-clock, so it is likelier to notice. A point-in-time exact download means reading the batches yourself inside `Db::tx_with(TxOptions::repeatable_read().read_only(), ..)` — repository reads cannot be routed through a caller's transaction today, so that path also means re-deriving the sort/filter allowlist and any owner scoping by hand. |
+| Request cost | The handler carries `#[throttle(limit = 6, per = "1m", key = "ip")]` that the index does not, and the cost is worse than the row count suggests: `list` runs a filtered `COUNT(*)` before each page, so a full export is ~100 page queries **and** ~100 whole-result-set counts — ~200 round trips where one index page costs two. The counts are waste (the export loop never reads `total_elements`; it stops on a short batch) but unavoidable, since `list` is also what applies the sort/filter allowlist and the repository exposes no count-free equivalent. On a large or poorly indexed table, lower `MAX_EXPORT_ROWS`, tighten the throttle, or put the route behind auth. Inline throttles apply regardless of `security.rate_limit.enabled` (that flag governs the *global* limiter); raise the limit freely for an internal back-office. |
+| `NULL` column | An **empty cell**, never the literal string `None`. |
+| Commas, quotes, newlines | Quoted and escaped per RFC 4180 by `export_csv`. Do not pre-quote values in `to_csv_record` — it would double-escape them. |
+| Values that look like formulas | Text-backed columns pass through an emitted `csv_text_cell` helper that prefixes an apostrophe to a value starting `=`, `+`, `-`, `@`, TAB or CR. Numeric, boolean, UUID, timestamp and enum columns are **not** guarded — they render from typed values and cannot carry a formula, and guarding them would corrupt a negative number. |
+| `Attachment` column | Exports the blob's storage **key**, not the signed, time-bounded URL the `show` view renders (a spreadsheet cell has no use for a URL that expires). Drop the column from `csv_columns` if those keys should not leave the app. |
+| `references` column | Exports the raw **foreign key**, not the parent label the index and `show` views resolve. An id round-trips back through `import_csv`; a label does not, and resolving one per row would be an N+1 inside the export loop. |
+| `--default`ed column | **Included.** It is dropped from the form and the index table, but it is model data the `show` view already renders, and a spreadsheet wants it. |
+| `--soft-delete`'s `deleted_at` | Excluded. `list`/`list_scoped` filter `deleted_at IS NULL`, so the column is blank for every exportable row. |
+| Record policy wiring on (an owner column, the default) | The handler is `#[secured]` and reads through the repository's owner-scoped `list_scoped` — the same method the index uses. It never calls the unscoped `list`, so the download cannot contain another user's rows. |
+| No owner column | No `#[secured]`, exactly matching the generated index. The export opens no data path the list view did not already open. |
+| Route vs `/<plural>/{id}` | The static `export.csv` segment outranks the `{id}` parameter in the router, the same way `/<plural>/new` already does. With a `slug` route key that also means a record whose slug is literally `export.csv` is unreachable at its canonical URL — the same caveat `new` already carries. |
+
+The export is emitted wherever the index's row set is a repository call it
+can reuse verbatim: the plain `repo.list` index (including
+`--live-validation`) and the owner-scoped `repo.list_scoped` one. It is
+**not** emitted for `--live` (an SSE `<ul>` on `repo.page`, with no
+`ListQuery` to honour), `--sharded` (`from_shard` pins the query to a
+single shard, so "export everything" would silently cover a fraction of
+the table), an owner-scoped `--live-validation` index (it runs a manual
+owner-filtered query rather than a scoped repository method), or `--api`
+(no HTML index at all). Those variants' output is byte-identical to their
+pre-#1315 shape.
+
+> **Spreadsheet formula injection.** A cell beginning `=`, `+`, `-` or `@`
+> may be interpreted as a formula by Excel. If the model holds untrusted
+> text and you expect exports to be opened there, prefix-guard those values
+> in the generated `to_csv_record` — the emitted impl carries a note at the
+> same spot.
+
 Metadata flags let you keep common model and repository polish in the
 generation step:
 
